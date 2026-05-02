@@ -108,10 +108,11 @@ jobs:
           rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
           echo "Disk usage after vLLM install:" && df -h .
 
-      - name: Pre-download test models
+      - name: Sync models from GCS
         run: |
-          huggingface-cli download Qwen/Qwen3-0.6B
-          huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct
+          mkdir -p /tmp/hf_cache
+          gcloud storage rsync -r gs://hf-llm-model-checkpoints/ /tmp/hf_cache
+          echo "HF_HOME=/tmp/hf_cache" >> "$GITHUB_ENV"
 
       - name: Wait For Connection
         uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d

@@ -129,6 +129,12 @@ jobs:
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
 
+      - name: Sync models from GCS
+        run: |
+          mkdir -p /tmp/hf_cache
+          gcloud storage rsync -r gs://hf-llm-model-checkpoints/ /tmp/hf_cache
+          echo "HF_HOME=/tmp/hf_cache" >> "$GITHUB_ENV"
+
       - name: Run perf and eval guard configs
         shell: bash
         env:
@@ -341,6 +347,12 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
           rm -rf /tmp/vllm
           rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
+
+      - name: Sync models from GCS
+        run: |
+          mkdir -p /tmp/hf_cache
+          gcloud storage rsync -r gs://hf-llm-model-checkpoints/ /tmp/hf_cache
+          echo "HF_HOME=/tmp/hf_cache" >> "$GITHUB_ENV"
 
       - name: Run 480B nightly perf and eval
         shell: bash
