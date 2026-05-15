@@ -21,14 +21,8 @@ on:
         description: 'Should this workflow run wait for a remote connection?'
         type: string
         default: 'no'
-      wheel-gcs-path:
-        description: 'GCS path to the built wheel to test. If provided, installs this instead of source.'
-        type: string
-        default: ''
-      nightly:
-        description: 'Whether this is a nightly run (runs all tests including nightly-only).'
-        type: string
-        default: 'false'
+
+
 
 jobs:
   run_tests:
@@ -38,13 +32,14 @@ jobs:
         job_info: [
           {
             runner: "linux-x86-tpu7x-224-4tpu",
-            container: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest",
+            container: "us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest",
           }
         ]
         python-version: [3.12]
     runs-on: ${{ matrix.job_info.runner }}
     container:
       image: ${{ matrix.job_info.container }}
+      options: --privileged --net=host --shm-size=16g
 
     env:
       FORCE_COLOR: "1"
@@ -64,54 +59,19 @@ jobs:
       - name: Mark git directory as safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Setup Virtual Environment
+      - name: Mount GCS bucket via gcsfuse
         run: |
-          uv venv
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          mkdir -p /root/.cache/huggingface
+          gcsfuse --implicit-dirs hf-llm-model-checkpoints /root/.cache/huggingface
 
+      - name: Setup UV Auth Env Vars
+        run: |
           # UV uses these to auth into the torch-tpu index defined in pyproject.toml
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
           echo UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
 
       - name: Install torchtpu-vllm from source
-        if: ${{ inputs.wheel-gcs-path == '' }}
-        run: uv sync --extra test --prerelease allow --no-install-package vllm
-
-      # In nightly workflow, we test the torchtpu-vllm package by installing the
-      # prebuilt wheel instead of building from source.
-      - name: Install torchtpu-vllm using prebuilt wheel
-        if: ${{ inputs.wheel-gcs-path != '' }}
-        run: |
-          # Install Dependencies
-          uv sync --no-install-project --extra test --prerelease allow --no-install-package vllm
-
-          # Download the torchtpu-vllm wheel from GCS
-          mkdir -p dist
-          gcloud storage cp "${{ inputs.wheel-gcs-path }}/*.whl" dist/
-
-          WHEEL_FILE=$(ls dist/*.whl)
-          uv pip install "${WHEEL_FILE}"
-
-      - name: Install vLLM from source (TPU)
-        run: |
-          git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git /tmp/vllm
-          cd /tmp/vllm
-          sed -i '/tpu-inference/d' requirements/tpu.txt
-          uv pip install -r requirements/tpu.txt
-          # --no-build-isolation avoids creating a temp venv with duplicate build deps (~GBs)
-          SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" uv pip install --no-build-isolation .
-          rm -rf /tmp/vllm
-          rm -rf /tmp/pip-* /tmp/uv-* 2>/dev/null || true
-          echo "Disk usage after vLLM install:" && df -h .
-
-      - name: Pre-download test models
-        run: |
-          huggingface-cli download Qwen/Qwen3-0.6B
-          huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct
+        run: uv pip install --system --prerelease allow ".[test]"
 
       - name: Wait For Connection
         uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
@@ -128,8 +88,4 @@ jobs:
           # Run tests from a temp dir to force Python to test the installed package, not local source files.
           TEST_DIR="$PWD/tests"
           cd "$(mktemp -d)"
-          if [ "${{ inputs.nightly }}" = "yes" ]; then
-            pytest "$TEST_DIR" -sv --timeout=300
-          else
-            pytest "$TEST_DIR" -sv --timeout=300 -m "not nightly"
-          fi
+          pytest "$TEST_DIR" -sv --timeout=300 -m "not nightly"

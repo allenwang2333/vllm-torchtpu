@@ -115,11 +115,13 @@ jobs:
         python3 -m twine upload --repository-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry dist/*.whl
         python3 -m twine upload --repository-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-vllm-testing-registry dist/*.tar.gz
 
-  run-tests:
-    needs: build
-    uses: ./.github/workflows/tests.yml
-    name: "Run Tests"
-    with:
-      halt-for-connection: ${{ inputs.halt-for-connection }}
-      wheel-gcs-path: ${{ needs.build.outputs.gcs_path }}
-      nightly: 'yes'
+  build-docker:
+    runs-on: linux-x86-n2-16
+    steps:
+    - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+    - name: Mark git directory as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    - name: Authenticate to Artifact Registry
+      run: gcloud auth configure-docker us-docker.pkg.dev
+    - name: Build and Push Nightly Docker Images
+      run: bash docker/build_nightly_images.sh
