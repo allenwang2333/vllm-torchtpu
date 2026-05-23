@@ -33,7 +33,7 @@ All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmark
 
 Configs are shell files in `configs/`. Add your own by copying an existing one.
 
-CI (`.github/workflows/perf.yml`) runs `check_regression.py` three times against
+CI workflows (separated by config, e.g., `.github/workflows/qwen3-coder-30b-fp8-tp8-ep.yml`) run `check_regression.py` three times against
 the same live server:
 
 - `--mode perf` compares benchmark JSON to `baselines/perf/<config>.baseline.json`

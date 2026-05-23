@@ -56,14 +56,14 @@ Then, run the following command from your local machine (Cloudtop) to trigger th
 **Template:**
 
 ```bash
-ssh <TPU_VM_NAME> "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+ssh <TPU_VM_NAME> "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config <CONFIG_NAME> --run-lm-eval'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config <CONFIG_NAME> --run-lm-eval'"
 ```
 
 Replace `<TPU_VM_NAME>` with your TPU VM hostname and `<CONFIG_NAME>` with one of the available configs.
@@ -73,68 +73,68 @@ Replace `<TPU_VM_NAME>` with your TPU VM hostname and `<CONFIG_NAME>` with one o
 **1. PR Guard: Qwen3-Coder-30B-A3B-Instruct-FP8**
 
 ```bash
-tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-30b-fp8-tp8-ep --run-lm-eval'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-30b-fp8-tp8-ep --run-lm-eval'"
 ```
 
 **2. PR Guard: Qwen3-Coder-30B-A3B-Instruct**
 
 ```bash
-tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-30b-tp8-ep --run-lm-eval'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-30b-tp8-ep --run-lm-eval'"
 ```
 
 **3. Nightly: Qwen3-Coder-480B-A35B-Instruct-FP8**
 
 ```bash
-tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   -e EVALPLUS_DATASETS=\"humaneval mbpp\" \\
   -e EVALPLUS_PARALLEL=8 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-evalplus'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-480b-fp8-tp8-ep --run-lm-eval --run-evalplus'"
 ```
 
 **4. Nightly: Qwen 3.5-397B**
 
 ```bash
-tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-tp8 --run-lm-eval --run-evalplus'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test,benchmarking]\" && bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-tp8 --run-lm-eval --run-evalplus'"
 ```
 
 **5. Unit Tests**
 
 ```bash
-tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g \\
+tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileged --net=host --shm-size=16g --device /dev/fuse \\
   -v /mnt/pd/projects/torchtpu-vllm:/root/tpu_inference \\
-  -v /mnt/pd/.cache/huggingface:/root/.cache/huggingface \\
+  -e HF_HOME=/tmp/hf_cache \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \\
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'cd /root/tpu_inference && bash ./scripts/vllm/benchmarking/run_unit_test.sh false'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && bash ./scripts/vllm/benchmarking/run_unit_test.sh false'"
 ```
 
 ## Script Details
@@ -150,3 +150,17 @@ This is the unified script used by both CI and manual runs. It handles:
 
 ### `cleanup_server.sh`
 A robust script to kill any zombie vLLM servers and free up TPU resources (`/dev/vfio/*`) and port 8000. It is called automatically by `run_eval_flow.sh` but can be run manually if needed. It includes a pure Bash fallback to scan `/proc` if tools like `lsof` or `fuser` are missing in the container.
+
+## Updating Model Cache in GCS
+
+If you need to add new models to the CI tests or update existing ones, you can use the provided script to upload them from your local machine (or a dev VM) to the GCS bucket.
+
+### Usage
+
+```bash
+./scripts/upload_hf_cache.sh <local_hf_cache_dir> [gcs_bucket]
+```
+
+We can upload to a gcs bucket used by CI/CD. It uses `rsync` to only upload new or modified files.
+
+If we add new models to the CI tests, we need to update the `MODELS` array in the script to include the new model name and rerun this.
