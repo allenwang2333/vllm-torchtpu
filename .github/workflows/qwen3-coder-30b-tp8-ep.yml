@@ -110,6 +110,10 @@ jobs:
           uv pip install --system --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
+      - name: Install crc32c for gsutil
+        run: |
+          uv pip install --system crc32c
+
       - name: Copy model to local cache
         # Use gsutil with multi-threading for faster download
         run: |
