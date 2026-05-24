@@ -73,7 +73,7 @@ jobs:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
       options: --privileged --net=host --shm-size=16g --device /dev/fuse
       env:
-        HF_HOME: /tmp/hf_cache
+        HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 180
@@ -110,6 +110,12 @@ jobs:
           uv pip install --system --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
+      - name: Copy model to local cache
+        # Use gsutil with multi-threading for faster download
+        run: |
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct-FP8/ /local_hf_cache/hub/
+
       - name: Run perf and eval guard configs
         shell: bash
         env:
@@ -119,11 +125,18 @@ jobs:
           uv pip install --system ".[test,benchmarking]"
           bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-coder-30b-fp8-tp8-ep --run-lm-eval
 
+      - name: Stage artifacts for upload
+        if: always()
+        # Copy files to workspace to avoid path traversal error in 'gh run download'
+        run: |
+          mkdir -p perf_eval_results
+          cp -r /tmp/perf_eval_* perf_eval_results/ || true
+
       - name: Upload guard JSON results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-eval-guard-results-qwen3-coder-30b-fp8-tp8-ep
-          path: /tmp/perf_eval_*
+          path: perf_eval_results/
           retention-days: 14
           if-no-files-found: warn

@@ -36,7 +36,7 @@ jobs:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
       options: --privileged --net=host --shm-size=16g --device /dev/fuse
       env:
-        HF_HOME: /tmp/hf_cache
+        HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 360
@@ -65,6 +65,12 @@ jobs:
           uv pip install --system --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
+      - name: Copy model to local cache
+        # Use gsutil with multi-threading for faster download
+        run: |
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-397B-TP8/ /local_hf_cache/hub/
+
       - name: Run 397B nightly perf and eval
         shell: bash
         env:
@@ -75,11 +81,18 @@ jobs:
           uv pip install --system ".[test,benchmarking]"
           bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-tp8 --run-lm-eval --run-evalplus
 
+      - name: Stage artifacts for upload
+        if: always()
+        # Copy files to workspace to avoid path traversal error in 'gh run download'
+        run: |
+          mkdir -p perf_eval_results
+          cp -r /tmp/perf_eval_* perf_eval_results/ || true
+
       - name: Upload nightly JSON results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-eval-nightly-results-qwen3.5-397b-tp8
-          path: /tmp/perf_eval_*
+          path: perf_eval_results/
           retention-days: 30
           if-no-files-found: warn
