@@ -134,7 +134,7 @@ tpu-vm-ssh "TOKEN=\$(gcloud auth print-access-token); docker run --rm --privileg
   -e UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=\"\$TOKEN\" \\
   -e SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \\
   us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest \\
-  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && bash ./scripts/vllm/benchmarking/run_unit_test.sh false'"
+  bash -c 'mkdir -p /tmp/hf_cache/hub && gcsfuse --implicit-dirs tpu-inference-hf-llm-model-checkpoints /tmp/hf_cache/hub && cd /root/tpu_inference && uv pip install --system \".[test]\" && bash ./scripts/vllm/benchmarking/run_unit_test.sh false'"
 ```
 
 ## Script Details
