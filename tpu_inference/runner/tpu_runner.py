@@ -3,16 +3,17 @@
 import bisect
 import contextlib
 import dataclasses
+import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
 import numpy as np
 import torch
-import torch.nn as nn
 import torch_tpu  # noqa: F401
 import vllm.envs as envs
 # TODO: Remove this after jax dependency is removed
@@ -167,28 +168,6 @@ def _torch_tpu_wrapper():
                     delattr(torch.cuda, k)
             else:
                 setattr(torch.cuda, k, v)
-
-
-@contextlib.contextmanager
-def _bypass_torch_compile(model: nn.Module):
-    """HACK: vLLM wraps the model backbone with
-    `TorchCompileWithNoGuardsWrapper` which overrides `__call__` to route
-    through `torch.compile`, making neither
-    `torch.compiler.set_stance("force_eager")` nor
-    `torch._dynamo.config.patch(disable=True)` work here.
-    """
-    if hasattr(model, "get_language_model"):
-        compiled_model = model.get_language_model().model
-    else:
-        compiled_model = model.model
-
-    compiled_model_cls = compiled_model.__class__
-    original_call = compiled_model_cls.__call__
-    compiled_model_cls.__call__ = compiled_model_cls.forward
-    try:
-        yield
-    finally:
-        compiled_model_cls.__call__ = original_call
 
 
 # Recompilation-avoidance contract:
@@ -1686,36 +1665,33 @@ class TPUModelRunner(GPUModelRunner):
                 sync.synchronize(out.logprobs, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
-    def _precompile_async_token_substitution(self) -> None:
+    def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-
-        with self._precompile_timed("async token substitution"):
+        with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
-                cur_indices_cpu = torch.from_numpy(
-                    np.arange(num_tokens, dtype=np.int32))
-                pre_next_indices_cpu = torch.full((num_tokens, ),
-                                                  -1,
-                                                  dtype=torch.int32)
-                input_ids = torch.zeros((num_tokens, ),
+                input_ids = torch.zeros(num_tokens,
                                         dtype=torch.int32,
                                         device=self.device)
-                cur_indices = cur_indices_cpu.to(self.device,
-                                                 non_blocking=True)
-                pre_next_indices = pre_next_indices_cpu.to(self.device,
-                                                           non_blocking=True)
-
+                cur_input_indices = torch.zeros(num_tokens,
+                                                dtype=torch.int32,
+                                                device=self.device)
+                # -1 sentinel marks every slot as padding so the precompiled
+                # program is byte-identical to the runtime JIT call.
+                pre_next_tokens_indices = torch.full((num_tokens, ),
+                                                     -1,
+                                                     dtype=torch.int32,
+                                                     device=self.device)
                 for num_reqs in self.num_reqs_paddings:
-                    next_tokens = torch.zeros((num_reqs, ),
-                                              dtype=torch.int32,
+                    next_tokens = torch.zeros(num_reqs,
+                                              dtype=torch.int64,
                                               device=self.device)
                     out = _substitute_placeholder_token(
-                        input_ids, cur_indices, pre_next_indices, next_tokens)
+                        input_ids, cur_input_indices, pre_next_tokens_indices,
+                        next_tokens)
                     sync.synchronize(out, wait=True)
                     logger.info("  -- num_tokens: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
-                    if num_reqs >= min(num_tokens, self.max_num_reqs):
-                        break
 
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
@@ -1724,7 +1700,6 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
-        self._precompile_async_token_substitution()
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
@@ -1746,27 +1721,67 @@ class TPUModelRunner(GPUModelRunner):
 
             self._precompile_sampling_subgraphs()
 
+    @contextmanager
+    def _profile_no_cache_writes(self) -> Iterator[None]:
+        # Keep the kv=0-specialized profile compile out of the persistent
+        # serving cache. Flips only the disable flag; does not touch
+        # compile_sizes / compile_ranges_split_points / cache_dir, so
+        # capture_model sees its normal compile config.
+        saved_env = os.environ.get("VLLM_DISABLE_COMPILE_CACHE")
+        clear_envs = getattr(envs.__getattr__, "cache_clear", None)
+        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+        if clear_envs:
+            clear_envs()
+        try:
+            yield
+        finally:
+            if saved_env is None:
+                os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
+            else:
+                os.environ["VLLM_DISABLE_COMPILE_CACHE"] = saved_env
+            if clear_envs:
+                clear_envs()
+
     def profile_run(
         self,
         num_tokens: int,
     ) -> None:
-        self._initialize_attention_kernels()
+        from vllm.compilation.wrapper import reset_compile_wrapper
 
-        # KV cache isn't allocated yet; torch.compile would specialize on
-        # the kv_cache.numel() == 0 early-return in attention. Compile the
-        # backbone later in capture_model() after KV alloc.
-        with _bypass_torch_compile(self.model):
-            self._dummy_run(num_tokens,
-                            self.num_reqs_max_model_len,
-                            self.max_num_blocks_per_req,
-                            use_max_model_len=True)
+        from tpu_inference.layers.vllm.linear_common import \
+            _get_quantized_matmul_op
 
-        # Sampling-path subgraphs don't depend on kv_cache; compile them
-        # now so their bottom-HBM reservations are visible to vLLM's
-        # available-memory probe and counted in the KV-cache budget.
-        if not self.enforce_eager:
-            with self.maybe_setup_dummy_loras(self.lora_config):
-                self._precompile_sampling_subgraphs()
+        # set_current_vllm_config is required for the post-reset compile
+        # path: reset_compile_wrapper restores the wrapper's original
+        # forward code, so the next trace re-instantiates CustomOps that
+        # call get_current_vllm_config().
+        cc = self.vllm_config.compilation_config
+        saved_cache = (cc.cache_dir, cc.local_cache_dir)
+        with set_current_vllm_config(self.vllm_config):
+            self._initialize_attention_kernels()
+            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
+            _get_quantized_matmul_op()
+
+            # Compile backbone here so XLA materializes the FP8 activation
+            # slab; vLLM's post-probe sees the real HBM. Cache writes are
+            # disabled so the kv=0-specialized graph never lands in the
+            # persistent serving cache.
+            with self._profile_no_cache_writes():
+                self._dummy_run(num_tokens, self.num_reqs_max_model_len,
+                                self.max_num_blocks_per_req)
+            compiled = (self.model.get_language_model().model if hasattr(
+                self.model, "get_language_model") else self.model.model)
+            reset_compile_wrapper(compiled)
+            # reset_compile_wrapper wipes cache_dir; restore so
+            # capture_model can read/write the persistent cache.
+            cc.cache_dir, cc.local_cache_dir = saved_cache
+            torch._dynamo.reset()
+            sync.synchronize()
+
+            # Sampling subgraphs (Phase A) — uses the restored cache_dir.
+            if not self.enforce_eager:
+                with self.maybe_setup_dummy_loras(self.lora_config):
+                    self._precompile_sampling_subgraphs()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -1966,6 +1981,11 @@ class TPUModelRunner(GPUModelRunner):
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
 
+        # Precompile after KV cache allocation so XLA's buffer assignment sees
+        # the same HBM pressure as runtime.
+        if not self.enforce_eager:
+            self._precompile_substitute_placeholder_token()
+
     def forward_model(self, input_ids, positions, inputs_embeds=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
@@ -1991,7 +2011,8 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
-        return self.model.compute_logits(hidden_states[indices_do_sample])
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_logits(selected)
 
     def _apply_temperature(self, logits: torch.Tensor,
                            temperatures: torch.Tensor) -> torch.Tensor:
