@@ -130,6 +130,7 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
     echo "=== Checking Eval Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode eval \
+      --tolerance 0.02 \
       --results-dir "$RESULTS_DIR" \
       --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || fail=1
 fi
