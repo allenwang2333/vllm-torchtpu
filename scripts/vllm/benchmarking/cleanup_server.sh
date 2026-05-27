@@ -55,7 +55,7 @@ if timeout 30s bash -c '
 '; then
   echo "vLLM server cleanup complete and port 8000 is free."
 else
-  echo "Port 8000 is still occupied after 30 seconds (waiting for OS to release it)."
+  echo "Port 8000 is still occupied after 30 seconds!"
 fi
 
 # 5. Remove lock files
