@@ -132,7 +132,7 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
       --mode eval \
       --tolerance 0.02 \
       --results-dir "$RESULTS_DIR" \
-      --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || fail=1
+      --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || { echo "::error::Eval regression check failed! See logs above for details."; fail=1; }
 fi
 
 # ========================================================
@@ -151,7 +151,7 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
         python3 scripts/vllm/benchmarking/check_regression.py \
           --mode evalplus \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || fail=1
+          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
     fi
 fi
 
@@ -163,7 +163,7 @@ if [ -f "$PERF_BASELINE" ]; then
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode perf \
       --results-dir "$RESULTS_DIR" \
-      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || fail=1
+      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
 exit "$fail"
