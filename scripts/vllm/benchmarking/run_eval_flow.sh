@@ -42,7 +42,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Register cleanup trap
-trap 'echo "Executing trap cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
 
 if [ -z "$RESULTS_DIR" ]; then
     RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
@@ -155,11 +155,7 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
 fi
 
 # ========================================================
-# 5. Cleanup after tests (Handled by trap)
-# ========================================================
-
-# ========================================================
-# 6. Check Perf Regression
+# 5. Check Perf Regression
 # ========================================================
 if [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="

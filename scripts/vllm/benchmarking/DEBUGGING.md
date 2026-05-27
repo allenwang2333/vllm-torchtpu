@@ -154,13 +154,3 @@ A robust script to kill any zombie vLLM servers and free up TPU resources (`/dev
 ## Updating Model Cache in GCS
 
 If you need to add new models to the CI tests or update existing ones, you can use the provided script to upload them from your local machine (or a dev VM) to the GCS bucket.
-
-### Usage
-
-```bash
-./scripts/upload_hf_cache.sh <local_hf_cache_dir> [gcs_bucket]
-```
-
-We can upload to a gcs bucket used by CI/CD. It uses `rsync` to only upload new or modified files.
-
-If we add new models to the CI tests, we need to update the `MODELS` array in the script to include the new model name and rerun this.

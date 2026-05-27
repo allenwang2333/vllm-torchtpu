@@ -117,9 +117,17 @@ jobs:
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
 
+      # TODO: Consider installing crc32c via apt or baking it into the CI image
+      # to avoid using --system entirely.
+      - name: Setup Virtual Environment
+        run: |
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
       - name: Setup Keyring for Auth
         run: |
-          uv pip install --system --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
+          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
       - name: Install crc32c for gsutil
@@ -136,7 +144,7 @@ jobs:
           MODEL_IMPL_TYPE: vllm
           BENCHMARK_WARMUP_RUNS: "1"
         run: |
-          uv pip install --system ".[test,benchmarking]"
+          uv pip install ".[test,benchmarking]"
           bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval
 
       - name: Stage artifacts for upload
@@ -196,9 +204,15 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Setup Virtual Environment
+        run: |
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
       - name: Setup Keyring for Auth
         run: |
-          uv pip install --system --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
+          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
           echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
 
       - name: Install crc32c for gsutil
@@ -216,7 +230,7 @@ jobs:
           EVALPLUS_DATASETS: "humaneval mbpp"
           EVALPLUS_PARALLEL: "8"
         run: |
-          uv pip install --system ".[test,benchmarking]"
+          uv pip install ".[test,benchmarking]"
           bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval --run-evalplus
 
       - name: Stage artifacts for upload
