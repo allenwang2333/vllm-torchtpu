@@ -15,10 +15,13 @@ Use this image for CI and test infrastructure. It includes extra tooling on top 
 - `lsof`
 - `psmisc` / `fuser`
 
-Example build:
+> [!NOTE]
+> This image does not install the `vllm` project itself, only the dependencies and tools needed for CI.
+
+Example build using the standard helper script:
 
 ```bash
-docker build -f docker/Dockerfile --target ci -t ci:latest .
+./docker/build_image.sh --target ci -t ci:latest
 ```
 
 ### `dev:latest`
@@ -29,10 +32,10 @@ This image is based on the `ci` stage, copies the repository into the image, and
 - editable install: `-e ".[test,benchmarking]"`
 - intended for local development, debugging, and running tests
 
-Example build:
+Example build using the standard helper script:
 
 ```bash
-docker build -f docker/Dockerfile --target dev -t dev:latest .
+./docker/build_image.sh --target dev -t dev:latest
 ```
 
 ### `prod:latest`
@@ -40,10 +43,10 @@ Production image target built from `--target prod`.
 
 This image is intended for regular runtime usage. It performs a standard install of the project and is the best target for production-style execution.
 
-Example build:
+Example build using the standard helper script:
 
 ```bash
-docker build -f docker/Dockerfile --target prod -t prod:latest .
+./docker/build_image.sh --target prod -t prod:latest
 ```
 
 ## Useful build arguments
@@ -56,13 +59,11 @@ The Dockerfile also supports a few build arguments that may be useful in advance
 - `TORCH_TPU_VERSION`: explicit `torch-tpu` version override
 - `VLLM_SOURCE`: when set, installs `vllm` from the copied local source tree
 
-Example with build args:
+Example using the helper script with build arguments:
 
 ```bash
-docker build \
-  -f docker/Dockerfile \
+./docker/build_image.sh \
   --target prod \
-  --build-arg USE_TORCH_TPU_REGISTRY=1 \
-  --build-arg TORCH_TPU_VERSION=<version> \
-  -t prod:latest .
+  --torch-tpu-registry \
+  -t prod:latest
 ```
