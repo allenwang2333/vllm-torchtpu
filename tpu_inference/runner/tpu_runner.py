@@ -8,6 +8,7 @@ import bisect
 import contextlib
 import dataclasses
 import os
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -183,6 +184,14 @@ def _torch_tpu_wrapper():
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
 
+    @property
+    def _attn_metadata_builder_ctx(self):
+        return getattr(self._thread_local, "attn_metadata_builder_ctx", None)
+
+    @_attn_metadata_builder_ctx.setter
+    def _attn_metadata_builder_ctx(self, value):
+        self._thread_local.attn_metadata_builder_ctx = value
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -337,6 +346,8 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
+
+        self._thread_local = threading.local()
 
         # JAX Mesh for shard_map ops in TPU kernels (data=1, model=tp_size).
         self.mesh = self._create_mesh_for_parallelism()
@@ -1711,6 +1722,7 @@ class TPUModelRunner(GPUModelRunner):
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
             return
+
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 for num_tokens in self.num_tokens_paddings:
