@@ -89,6 +89,7 @@ ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
 RANDOM_RANGE_RATIO=""
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
@@ -195,12 +196,13 @@ start_vllm_server() {
     echo "Server started (pid=$SERVER_PID)"
     echo "Server log: $RESULTS_DIR/server.log"
 
-    # Wait for server to be ready (up to 90 minutes for large model compilation)
-    local max_wait=$((90 * 60))
+    # Wait for server to be ready (env-overridable; large hybrid models need a
+    # long AOT-precompile window before /health is up).
+    local max_wait=$(( ${SERVER_READY_WAIT_MIN:-90} * 60 ))
     local waited=0
     while ! curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; do
         if [ "$waited" -ge "$max_wait" ]; then
-            echo "ERROR: Server did not become ready within 90 minutes."
+            echo "ERROR: Server did not become ready within $((max_wait / 60)) minutes."
             stop_vllm_server
             exit 1
         fi
@@ -284,9 +286,9 @@ run_benchmark_once() {
 # =============================================================================
 # Covers the worst-case sampled length for ISL/OSL=8192 with --random-range-ratio=0.8
 # (max ≈ 1.8*8192 + 1.8*1024 = 16590); pre-16384 runs silently dropped ~40% of these.
-max_model_len=16384
-max_batched_tokens=8192
-max_num_seqs=512
+max_model_len=${MAX_MODEL_LEN:-16384}
+max_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
+max_num_seqs=${MAX_NUM_SEQS:-512}
 
 # JSON-encode capture_profile + profile_dir for config.json.
 capture_profile_json=${CAPTURE_PROFILE:-0}
@@ -312,7 +314,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_num_seqs": $max_num_seqs,
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
-    "timestamp": "$TIMESTAMP"
+    "timestamp": "$TIMESTAMP",
+    "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS
 }
 EOF
 

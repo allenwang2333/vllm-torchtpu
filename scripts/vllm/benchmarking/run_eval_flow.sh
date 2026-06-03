@@ -2,6 +2,7 @@
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
+PORT="${PORT:-8000}"
 CONFIG_NAME=""
 RESULTS_DIR=""
 RUN_LM_EVAL=0
@@ -40,16 +41,17 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Register cleanup trap
+trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT
+
 if [ -z "$RESULTS_DIR" ]; then
     RESULTS_DIR="/tmp/perf_eval_$CONFIG_NAME"
 fi
 mkdir -p "$RESULTS_DIR"
 
-EVAL_BASELINE="scripts/vllm/benchmarking/baselines/eval/$CONFIG_NAME.baseline.json"
 PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.json"
 EVALPLUS_BASELINE="scripts/vllm/benchmarking/baselines/evalplus/$CONFIG_NAME.baseline.json"
 
-EVAL_LOG="$RESULTS_DIR/eval_check.md"
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 EVALPLUS_LOG="$RESULTS_DIR/evalplus_check.md"
 
@@ -70,7 +72,7 @@ run_evalplus() {
         evalplus.evaluate "$dataset" \
             --model "$model" \
             --backend openai \
-            --base_url http://localhost:8000/v1 \
+            --base_url "http://localhost:$PORT/v1" \
             --root "$root" \
             --greedy \
             --n_samples 1 \
@@ -84,6 +86,44 @@ run_evalplus() {
         fi
     done
     return "$rc"
+}
+
+run_lm_eval() {
+    local task="$1"
+    local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
+    local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
+
+    local lm_eval_args=(
+        --model local-chat-completions
+        --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/chat/completions,num_concurrent=128"
+        --tasks "$task"
+        --apply_chat_template
+        --limit 100
+        --seed "0,1234,None,1234"
+        --output_path "$RESULTS_DIR"
+    )
+
+    if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
+        lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
+    else
+        lm_eval_args+=(--fewshot_as_multiturn true)
+        lm_eval_args+=(--gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}')
+    fi
+
+    echo "Running lm_eval for task: $task..."
+    echo "[cmd] lm_eval ${lm_eval_args[*]}"
+    lm_eval "${lm_eval_args[@]}"
+
+    if [ -f "$baseline" ]; then
+        echo "=== Checking Eval Regression for $task ==="
+        python3 scripts/vllm/benchmarking/check_regression.py \
+          --mode eval \
+          --tolerance 0.02 \
+          --results-dir "$RESULTS_DIR" \
+          --baseline "$baseline" 2>&1 | tee "$eval_log" || { echo "::error::Eval regression check failed for $task! See logs above for details."; fail=1; }
+    else
+        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
+    fi
 }
 
 # ========================================================
@@ -103,35 +143,32 @@ echo "Running benchmarks for $CONFIG_NAME..."
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
+MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 
 fail=0
 evalplus_rc=0
 
 # ========================================================
-# 3. Run lm_eval
+# 3. Check Perf Regression
 # ========================================================
-if [ "$RUN_LM_EVAL" = "1" ] && [ -f "$EVAL_BASELINE" ]; then
-    echo "Running lm_eval..."
-    lm_eval \
-      --model local-chat-completions \
-      --model_args model="$MODEL",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=128 \
-      --tasks mmlu_llama,mmlu_pro \
-      --apply_chat_template \
-      --fewshot_as_multiturn true \
-      --limit 100 \
-      --seed "0,1234,None,1234" \
-      --gen_kwargs continue_final_message=True add_generation_prompt=False 'chat_template_kwargs={"enable_thinking": False}' \
-      --output_path "$RESULTS_DIR"
-
-    echo "=== Checking Eval Regression ==="
+if [ -f "$PERF_BASELINE" ]; then
+    echo "=== Checking Perf Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
-      --mode eval \
+      --mode perf \
       --results-dir "$RESULTS_DIR" \
-      --baseline "$EVAL_BASELINE" 2>&1 | tee "$EVAL_LOG" || fail=1
+      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
 fi
 
 # ========================================================
-# 4. Run EvalPlus
+# 4. Run lm_eval
+# ========================================================
+if [ "$RUN_LM_EVAL" = "1" ]; then
+    run_lm_eval "mmlu_llama"
+    run_lm_eval "mmlu_pro"
+fi
+
+# ========================================================
+# 5. Run EvalPlus
 # ========================================================
 if [ "$RUN_EVALPLUS" = "1" ]; then
     echo "=== Running EvalPlus ==="
@@ -146,25 +183,8 @@ if [ "$RUN_EVALPLUS" = "1" ]; then
         python3 scripts/vllm/benchmarking/check_regression.py \
           --mode evalplus \
           --results-dir "$RESULTS_DIR" \
-          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || fail=1
+          --baseline "$EVALPLUS_BASELINE" 2>&1 | tee "$EVALPLUS_LOG" || { echo "::error::EvalPlus regression check failed! See logs above for details."; fail=1; }
     fi
-fi
-
-# ========================================================
-# 5. Cleanup after tests
-# ========================================================
-echo "=== Final Cleanup ==="
-bash "$SCRIPT_DIR/cleanup_server.sh"
-
-# ========================================================
-# 6. Check Perf Regression
-# ========================================================
-if [ -f "$PERF_BASELINE" ]; then
-    echo "=== Checking Perf Regression ==="
-    python3 scripts/vllm/benchmarking/check_regression.py \
-      --mode perf \
-      --results-dir "$RESULTS_DIR" \
-      --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || fail=1
 fi
 
 exit "$fail"

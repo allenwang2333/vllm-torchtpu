@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Ensure environment overrides are applied before any other imports,
+# especially torch_tpu which might read them at import time.
+import tpu_inference.env_override  # noqa: F401  # isort: skip
+
 import os
 import time
 from typing import TYPE_CHECKING, Optional, Tuple, Union
@@ -327,6 +331,12 @@ class TpuPlatform(Platform):
                        == "CUSTOM" else PallasAttentionBackend)
         is_hybrid = getattr(vllm_config.model_config, "is_hybrid", False)
         cls._is_hybrid = is_hybrid
+        cls._speculative_enabled = vllm_config.speculative_config is not None
+        if cls._speculative_enabled and \
+                vllm_config.scheduler_config.async_scheduling:
+            raise NotImplementedError(
+                "Speculative decoding with async scheduling is not yet "
+                "supported on TPU; run with async_scheduling=False.")
         if not is_hybrid and block_size_was_unspecified:
             default = backend_cls.get_page_size(vllm_config)
             cache_config.block_size = (  # type: ignore[assignment]
@@ -357,9 +367,11 @@ class TpuPlatform(Platform):
                         single host without tensor/pipeline parallelism.")
                 parallel_config.distributed_executor_backend = "uni"
             else:
-                logger.info("Force using MultiprocExecutor for TPU on \
+                logger.info("Force using TpuMultiprocExecutor for TPU on \
                         single host with tensor/pipeline parallelism.")
-                parallel_config.distributed_executor_backend = "mp"
+                from tpu_inference.executors.tpu_multiproc_executor import \
+                    TpuMultiprocExecutor
+                parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
             from tpu_inference.executors.ray_distributed_executor import \
                 RayDistributedExecutor
@@ -383,6 +395,8 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
+                "TPUConnectorHMA",
+                "OffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (
@@ -440,6 +454,11 @@ class TpuPlatform(Platform):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
                 )
+            if getattr(cls, "_speculative_enabled",
+                       False) and params.sampling_type != SamplingType.GREEDY:
+                raise NotImplementedError(
+                    "Speculative decoding currently only supports greedy "
+                    "sampling (temperature=0) on TPU.")
             if params.top_k != 0 or params.top_p != 1.0:
                 logger.warning(
                     "Top-K and Top-P are not yet supported on TPU and will be ignored."

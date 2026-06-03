@@ -7,6 +7,7 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import \
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder
+from vllm.v1.kv_cache_interface import MambaSpec
 
 
 @functools.partial(
@@ -17,6 +18,7 @@ from vllm.v1.attention.backend import \
         "seq_lens",
         "query_start_loc",
         "request_distribution",
+        "mamba_state_indices",
     ],
     meta_fields=[],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
@@ -33,6 +35,15 @@ class AttentionMetadata(object):
     query_start_loc: jax.Array = None
     # (3,)
     request_distribution: jax.Array = None
+    # (max_num_seqs,) int32 — physical slot id (∈ [0, _mamba_num_blocks))
+    # in the mamba kv-cache for the request currently in each persistent-
+    # batch position. Mamba/GDN ops read/write recurrent state through this
+    # instead of `block_tables[:, 0]`, since under compact-mamba sizing the
+    # mamba pool is smaller than the attention pool and vLLM's attention
+    # block IDs no longer index it. None for the attention group / for
+    # non-mamba models (keeps AttentionMetadata byte-identical to the
+    # pre-compact-mamba layout for those).
+    mamba_state_indices: jax.Array | None = None
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -43,17 +54,23 @@ class AttentionMetadataBuilderContext:
     """Per-call inputs the TPU metadata builder reads from the runner.
 
     Stashed on TPUModelRunner before invoking _build_attention_metadata so
-    builder.build() can pick them up. Fields already on CommonAttentionMetadata
-    are read off `cm` directly (num_reqs / seq_lens / query_start_loc); only
-    TPU-specific control state (start_index, use_max_model_len) and fields
-    with no cm equivalent (request_distribution, position_ids_override) live
-    here.
+    builder.build() can pick them up. Only fields TPU populates differently from
+    the parent runner (seq_lens / query_start_loc) live in TPU's own _cpu
+    staging tensors, not parent's CpuGpuBuffers) or that have no
+    `CommonAttentionMetadata` equivalent (num_reqs, use_max_model_len,
+    start_index, request_distribution, position_ids_override) live here.
     """
     num_reqs: int
     start_index: int
     use_max_model_len: bool
+    seq_lens: torch.Tensor
+    query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
+    # Compact-mamba per-request recurrent-slot ids (device int32, length =
+    # target_num_reqs). Only the mamba group's builder reads it; None when the
+    # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
+    mamba_state_indices: torch.Tensor | None = None
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
@@ -67,6 +84,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.kv_cache_group_id = kv_cache_group_id
         self.target_block_size = getattr(self.kv_cache_spec, "block_size",
                                          runner.block_size)
+        # Only mamba/GDN layers consume the compact-mamba slot ids; attention
+        # groups leave AttentionMetadata.mamba_state_indices None.
+        self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
 
         block_table_obj = runner.input_batch.block_table[
             self.kv_cache_group_id]
@@ -110,10 +130,18 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                                                            non_blocking=True)
             input_positions = runner.position_ids
 
+        # Attach the per-request mamba recurrent-slot ids only for the mamba
+        # group; attention groups keep it None (byte-identical to the
+        # pre-compact-mamba layout). The runner stages a device tensor of
+        # length target_num_reqs on the ctx (see _build_mamba_state_indices).
+        mamba_state_indices = (ctx.mamba_state_indices
+                               if self.is_mamba_group else None)
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc=common_attn_metadata.query_start_loc,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
+            mamba_state_indices=mamba_state_indices,
         )

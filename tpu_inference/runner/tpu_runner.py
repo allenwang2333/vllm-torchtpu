@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Ensure environment overrides are applied before any other imports,
+# especially torch_tpu which might read them at import time.
+import tpu_inference.env_override  # noqa: F401  # isort: skip
+
 import bisect
 import contextlib
 import dataclasses
@@ -38,8 +42,9 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists,
-                             LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
+                             LogprobsLists, LogprobsTensors, ModelRunnerOutput)
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -51,9 +56,12 @@ from tpu_inference.layers.common.attention_metadata import (
 from tpu_inference.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
+from tpu_inference.layers.vllm.sample.rejection_sampler import RejectionSampler
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from tpu_inference.runner.speculative_decoding_manager import (
+    SpecDecodeMetadata, SpeculativeDecodingManager)
 from tpu_inference.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
@@ -67,6 +75,7 @@ class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
     logits_list: list[torch.Tensor]
     num_reqs_list: list[int]
+    spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -208,6 +217,27 @@ class TPUModelRunner(GPUModelRunner):
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
 
+        # Compact-mamba sizing.
+        # When set, mamba/GDN layers allocate only `_mamba_num_blocks`
+        # recurrent slots (= max_num_reqs + 1, slot 0 = null block) instead of
+        # the full attention `num_blocks`, and the per-request slot id is
+        # carried in `AttentionMetadata.mamba_state_indices` instead of being
+        # derived from the attention `block_tables[:, 0]`. None until the
+        # override runs (and stays None if it is skipped, e.g. CPU-only tests
+        # or a user-pinned num_gpu_blocks_override) — in which case mamba and
+        # attention share the uniform `num_blocks` as before.
+        self._mamba_num_blocks: int | None = None
+        # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
+        # allocated when a request first appears and returned when it leaves
+        # the persistent batch. Keying on req_id (rather than persistent-batch
+        # position) makes the mapping immune to condense/swap reordering in
+        # upstream vLLM's InputBatch, which we do not subclass.
+        self._mamba_slot_by_req_id: dict[str, int] = {}
+        self._free_mamba_slots: list[int] = []
+        # True once the slot pool is initialized (hybrid model with mamba
+        # layers); gates per-step mamba_state_indices construction.
+        self._has_mamba_state: bool = False
+
         # TPU env-var flags.
         self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = envs.VLLM_XLA_USE_SPMD
@@ -267,6 +297,11 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu")
+        # CPU staging for compact-mamba per-request recurrent-slot ids; H2D
+        # copied each step into `AttentionMetadata.mamba_state_indices`.
+        self.mamba_state_indices_cpu = torch.zeros(self.max_num_reqs,
+                                                   dtype=torch.int32,
+                                                   device="cpu")
         if self.uses_mrope:
             # Override parent's int64 mrope buffer with int32 so the H2D copy is
             # dtype-identical to what the TPU model expects. Parent's
@@ -274,12 +309,16 @@ class TPUModelRunner(GPUModelRunner):
             self.mrope_positions = self._make_buffer(3,
                                                      self.max_num_tokens + 1,
                                                      dtype=torch.int32)
-        # Reuse parent's CpuGpuBuffer (query_start_loc) and CPU staging tensor
-        # (optimistic_seq_lens_cpu) so cm.query_start_loc / cm.seq_lens are
-        # populated correctly when our builder runs. Keep numpy aliases for
-        # fast in-place arithmetic in _prepare_inputs.
-        self.query_start_loc_np = self.query_start_loc.np
-        self.seq_lens_np = self.optimistic_seq_lens_cpu.numpy()
+        self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
+                                               dtype=torch.int32,
+                                               device="cpu",
+                                               pin_memory=self.pin_memory)
+        self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+        self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.int32,
+                                        device="cpu",
+                                        pin_memory=self.pin_memory)
+        self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
@@ -330,6 +369,9 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
 
+        self.speculative_config = self.vllm_config.speculative_config
+        self.spec_decode_manager = SpeculativeDecodingManager(self)
+        self._init_speculative_decoding()
         # JAX Mesh for shard_map ops in TPU kernels (data=1, model=tp_size).
         self.mesh = self._create_mesh_for_parallelism()
 
@@ -367,6 +409,18 @@ class TPUModelRunner(GPUModelRunner):
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return finished
+
+    def _init_speculative_decoding(self) -> None:
+        self.drafter = None
+        self.rejection_sampler = None
+        if self.speculative_config:
+            self.rejection_sampler = RejectionSampler()
+            if self.speculative_config.method == "ngram":
+                self.drafter = NgramProposer(self.vllm_config)
+            else:
+                raise NotImplementedError(
+                    "Unsupported speculative decoding method: "
+                    f"{self.speculative_config.method}")
 
     def _create_mesh_for_parallelism(self) -> Mesh:
         # Per-worker JAX mesh is always single-chip; vLLM native multiprocess
@@ -682,17 +736,198 @@ class TPUModelRunner(GPUModelRunner):
         self._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
         self.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
 
-        # Pin vLLM's num_blocks via a two-step flooring that keeps peak
-        # HBM within `gpu_memory_utilization × total_hbm` at high
-        # utilization. See `_maybe_set_num_blocks_override` for the
-        # formula and rationale; the short version is that vLLM's
-        # single-step `floor(avail / (uniform × group_size))` can land
-        # one block higher than the two-step value, and that extra
-        # block × group_size × uniform bytes is enough to push past the
-        # budget against imprecision in vLLM's `avail` estimate.
-        self._maybe_set_num_blocks_override(attn_page_size_bytes,
-                                            int(uniform_page_size_bytes),
-                                            group_size)
+        # Prefer compact-mamba sizing: cap each mamba layer at
+        # `max_num_reqs + 1` recurrent slots and give the freed HBM to the
+        # attention pool. Mamba state is recurrent — one slot per active
+        # request — so the uniform layout wastes `num_blocks - max_num_reqs`
+        # mamba slots forever. On success this pins
+        # `num_gpu_blocks_override` to the (larger) attention block count and
+        # sets `_mamba_num_blocks`.
+        self._maybe_set_compact_mamba_num_blocks_override(
+            attn_page_size_bytes, int(unpadded_mamba_page_size),
+            num_attn_groups, num_mamba_groups, group_size)
+
+        # Fallback (compact sizing skipped, e.g. CPU-only tests or a
+        # user-pinned override): pin vLLM's num_blocks via the two-step
+        # flooring that keeps peak HBM within `gpu_memory_utilization ×
+        # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
+        # for the formula and rationale; the short version is that vLLM's
+        # single-step `floor(avail / (uniform × group_size))` can land one
+        # block higher than the two-step value, and that extra block ×
+        # group_size × uniform bytes is enough to push past the budget against
+        # imprecision in vLLM's `avail` estimate.
+        if self._mamba_num_blocks is None:
+            self._maybe_set_num_blocks_override(attn_page_size_bytes,
+                                                int(uniform_page_size_bytes),
+                                                group_size)
+
+    def _maybe_set_compact_mamba_num_blocks_override(
+            self, attn_page_size_bytes: int,
+            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
+            num_mamba_groups: int, group_size: int) -> None:
+        """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
+        `cache_config.num_gpu_blocks_override` so the freed HBM grows the
+        attention pool.
+
+        Tradeoff vs. the uniform num_blocks layout
+        ------------------------------------------
+        Mamba state is recurrent: one slot per *active* request, regardless of
+        context length. The uniform layout (set by
+        `_maybe_set_num_blocks_override`) gives every layer the same
+        `num_blocks`, leaving `num_blocks - max_num_reqs` mamba slots idle
+        forever. The compact layout caps mamba at `max_num_reqs + 1` (the `+1`
+        is the null/sentinel slot), which is strictly better for any model
+        where `num_blocks > max_num_reqs` — i.e. all production hybrid configs
+        we run. Cost: the GDN op must index mamba state by per-request slot id
+        (`AttentionMetadata.mamba_state_indices`) rather than by
+        `block_tables[:, 0]`, since the mamba leading dim is now smaller than
+        the attention pool.
+
+        Sizing math
+        -----------
+        vLLM allocates `group_size` KVCacheTensors, each shared across
+        `num_attn_groups` attention layers + `num_mamba_groups` mamba layers.
+        With per-tensor budget `B = avail / group_size` and
+        `N_mamba = max_num_reqs + 1`,
+            N_attn = floor((B - num_mamba_groups × N_mamba × mamba_unpadded)
+                            / (num_attn_groups × attn_page)).
+
+        We do NOT round to a sharding divisor: our single-process
+        TP layout does not shard the mamba/attention block (leading) dim — TP
+        sharding is on the head dims via the model — so any positive block
+        count is valid.
+
+        Args:
+            attn_page_size_bytes: TPU-actual bytes per block per attention
+                layer (accounts for dtype packing like fp8).
+            unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
+                (`prod(shape) × dtype_size`, no padding).
+            num_attn_groups: # attention layers backed by each KVCacheTensor.
+            num_mamba_groups: # mamba layers backed by each KVCacheTensor.
+            group_size: # KVCacheTensors vLLM allocates (= layers per
+                kv-cache group); the same value passed to
+                `_maybe_set_num_blocks_override`.
+
+        On success: sets `cache_config.num_gpu_blocks_override` (attention
+        block count) and `_mamba_num_blocks`. On any precondition-fail path:
+        leaves both unset so the caller falls back to uniform sizing.
+        """
+        cache_config = self.cache_config
+        if cache_config.num_gpu_blocks_override is not None:
+            return
+        if group_size <= 0:
+            return
+
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block counts
+        # match the KV-cache budget vLLM is given (incl. the headroom knob).
+        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
+        avail = budget.available
+        if avail <= 0:
+            return
+
+        # +1 reserves slot 0 as the null/sentinel block (never handed to a
+        # request); padded tail positions in `mamba_state_indices` also point
+        # here, so their writes can never corrupt an active request's state.
+        mamba_num_blocks = self.max_num_reqs + 1
+
+        avail_per_tensor = avail // group_size
+        mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
+                            unpadded_mamba_page_size_bytes)
+        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
+        if attn_per_tensor_avail <= 0:
+            # Mamba alone saturates the budget — pathological config. Skip the
+            # override and let the uniform fallback run; if the model genuinely
+            # doesn't fit it will OOM there too, and we want that signal.
+            logger.warning(
+                "Compact-mamba sizing skipped: mamba alone (mamba_num_blocks="
+                "%d × num_mamba_groups=%d × mamba_unpadded=%d) exceeds "
+                "per-tensor budget %d. Lower `gpu_memory_utilization` or "
+                "`max_num_seqs`.", mamba_num_blocks, num_mamba_groups,
+                unpadded_mamba_page_size_bytes, avail_per_tensor)
+            return
+
+        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                    attn_page_size_bytes)
+        if attn_num_blocks <= 0:
+            logger.warning(
+                "Compact-mamba sizing skipped: attn_num_blocks=0 "
+                "(avail_per_tensor=%d, mamba_per_tensor=%d).",
+                avail_per_tensor, mamba_per_tensor)
+            return
+
+        cache_config.num_gpu_blocks_override = int(attn_num_blocks)
+        self._mamba_num_blocks = int(mamba_num_blocks)
+
+        # Total HBM = group_size KVCacheTensors, each holding num_attn_groups
+        # attention blocks + num_mamba_groups mamba slots.
+        attn_bytes = (group_size * num_attn_groups * attn_num_blocks *
+                      attn_page_size_bytes)
+        mamba_bytes = (group_size * num_mamba_groups * mamba_num_blocks *
+                       unpadded_mamba_page_size_bytes)
+        logger.info(
+            "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
+            "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
+            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
+            attn_num_blocks, mamba_num_blocks, attn_bytes / (2**30),
+            mamba_bytes / (2**30), (attn_bytes + mamba_bytes) / (2**30),
+            avail / (2**30))
+
+    def _init_mamba_slot_pool(self, mamba_num_blocks: int) -> None:
+        """(Re)initialize the per-request mamba recurrent-slot allocator.
+
+        Slot 0 is the null/sentinel block (used for padded persistent-batch
+        positions and never handed to a request). Usable slots are
+        `[1, mamba_num_blocks)`, popped from the high end so the first request
+        gets slot 1 (stable pool ordering for easier debugging).
+        Called once after KV cache allocation, when the true mamba block count
+        is known. The mapping itself is keyed on req_id and rebuilt lazily in
+        `_build_mamba_state_indices`, so re-init only resets the free pool.
+        """
+        self._mamba_slot_by_req_id = {}
+        self._free_mamba_slots = list(range(mamba_num_blocks - 1, 0, -1))
+        self._has_mamba_state = True
+
+    def _build_mamba_state_indices(self, start_index: int, num_reqs: int,
+                                   target_num_reqs: int) -> torch.Tensor:
+        """Build the device `mamba_state_indices` for the current chunk.
+
+        Reconciles the req_id->slot map against the live persistent batch:
+          * frees slots whose req_id is no longer present (request finished),
+          * allocates a fresh unique slot for any new req_id.
+        Returns an int32 device tensor of length `target_num_reqs`: positions
+        `[0, num_reqs)` hold the slot for `req_ids[start_index + i]`; the
+        padded tail `[num_reqs, target_num_reqs)` holds slot 0 (null block) so
+        the GDN op (which scans the full length every step) cannot alias an
+        active slot — the null-tail invariant.
+
+        Slot assignment follows the request through upstream vLLM's
+        condense/swap reordering automatically because the map is keyed on the
+        stable req_id, not the moving persistent-batch position.
+        """
+        live_req_ids = set(self.input_batch.req_id_to_index.keys())
+        # Free slots for requests that left the batch.
+        for req_id in list(self._mamba_slot_by_req_id.keys()):
+            if req_id not in live_req_ids:
+                self._free_mamba_slots.append(
+                    self._mamba_slot_by_req_id.pop(req_id))
+
+        indices = self.mamba_state_indices_cpu[:target_num_reqs]
+        indices.fill_(0)
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            req_id = req_ids[start_index + i]
+            assert req_id is not None
+            slot = self._mamba_slot_by_req_id.get(req_id)
+            if slot is None:
+                # New request: take a fresh unique slot. The pool is sized to
+                # max_num_reqs + 1, so it can never be exhausted while the
+                # batch holds at most max_num_reqs requests.
+                slot = self._free_mamba_slots.pop()
+                self._mamba_slot_by_req_id[req_id] = slot
+            indices[i] = slot
+        return indices.to(self.device, non_blocking=True)
 
     def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
                                        uniform_page_size_bytes: int,
@@ -1035,12 +1270,14 @@ class TPUModelRunner(GPUModelRunner):
                                                        self.device,
                                                        non_blocking=True)
         if use_max_model_len:
+            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
+                self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
+            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
+                self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_most_model_len
-        self.seq_lens = self.optimistic_seq_lens_cpu[:target_num_reqs].to(
-            self.device, non_blocking=True)
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -1050,26 +1287,51 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs, self.max_num_reqs)
         decode_cache_key = (num_reqs, padded_num_reqs, use_max_model_len)
 
-        if is_decode_only and decode_cache_key == self._decode_device_cache_key:
+        # Speculative decoding metadata.
+        spec_decode_metadata = None
+        if self.speculative_config:
+            num_draft_tokens = np.array([
+                len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, ())) for req_id in
+                self.input_batch.req_ids[start_index:start_index + num_reqs]
+            ],
+                                        dtype=np.int32)
+            if num_draft_tokens.any():
+                spec_decode_metadata = self.spec_decode_manager.get_spec_decode_metadata(
+                    num_draft_tokens, self.query_start_loc_np[1:num_reqs + 1],
+                    padded_num_reqs)
+
+        if is_decode_only and decode_cache_key == self._decode_device_cache_key and spec_decode_metadata is None:
             # Reuse cached device tensors — skip 3 H2D copies.
-            self.query_start_loc.gpu = self._cached_query_start_loc
+            query_start_loc = self._cached_query_start_loc
             logits_indices = self._cached_logits_indices
             request_distribution = self._cached_request_distribution
         else:
-            # Re-assign self.query_start_loc.gpu to a new device tensor to avoid
-            # in-place modification of pending XLA graphs.
-            self.query_start_loc.gpu = self.query_start_loc.cpu[:
-                                                                target_num_reqs
-                                                                + 1].to(
-                                                                    self.
-                                                                    device,
-                                                                    non_blocking
-                                                                    =True)
+            # Compute and copy to device (first call or shape changed).
+            if use_max_model_len:
+                query_start_loc = self.query_start_loc_cpu[:self.
+                                                           num_reqs_max_model_len
+                                                           + 1].to(
+                                                               self.device,
+                                                               non_blocking=True
+                                                           )
+            else:
+                query_start_loc = self.query_start_loc_cpu[:self.
+                                                           num_reqs_most_model_len
+                                                           + 1].to(
+                                                               self.device,
+                                                               non_blocking=True
+                                                           )
 
-            # Indices at which we sample (positions of last token in the
-            # sequence). Padded to avoid recompiling when `num_reqs` varies.
-            logits_indices = (self.query_start_loc.cpu[1:padded_num_reqs + 1] -
-                              1).to(self.device, non_blocking=True)
+            if spec_decode_metadata is not None:
+                logits_indices = spec_decode_metadata.final_logits_indices
+            else:
+                # Indices at which we sample (positions of last token in the
+                # sequence). Padded to avoid recompiling when `num_reqs` varies.
+                logits_indices = (
+                    self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1).to(
+                        self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -1082,18 +1344,29 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
-            if is_decode_only:
+            if is_decode_only and spec_decode_metadata is None:
                 # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
-                self._cached_query_start_loc = self.query_start_loc.gpu
+                self._cached_query_start_loc = query_start_loc
                 self._cached_logits_indices = logits_indices
                 self._cached_request_distribution = request_distribution
+
+        # Compact-mamba: per-request recurrent-slot ids for this chunk. Only
+        # built for hybrid models (slot pool initialized in
+        # initialize_kv_cache); None otherwise so non-mamba models are
+        # unaffected.
+        mamba_state_indices = (self._build_mamba_state_indices(
+            start_index, num_reqs, target_num_reqs)
+                               if self._has_mamba_state else None)
 
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            mamba_state_indices=mamba_state_indices,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -1128,6 +1401,7 @@ class TPUModelRunner(GPUModelRunner):
             end_index,
             cur_input_indices,
             pre_next_tokens_indices,
+            spec_decode_metadata,
         )
 
     def _get_model_inputs(
@@ -1180,6 +1454,7 @@ class TPUModelRunner(GPUModelRunner):
         start_index = 0
         logits_list = []
         num_reqs_list = []
+        spec_decode_metadata_list = []
 
         # NOTE: setup current batch's metadata for kv connector.
         # Currently, only verified with NixlConnector
@@ -1188,8 +1463,8 @@ class TPUModelRunner(GPUModelRunner):
 
         while start_index < self.input_batch.num_reqs:
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
-             end_index, cur_input_indices,
-             pre_next_tokens_indices) = (self._prepare_inputs(
+             end_index, cur_input_indices, pre_next_tokens_indices,
+             spec_decode_metadata) = (self._prepare_inputs(
                  scheduler_output, start_index, num_decode_reqs))
 
             input_ids = self._apply_async_token_substitution(
@@ -1216,6 +1491,7 @@ class TPUModelRunner(GPUModelRunner):
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
+            spec_decode_metadata_list.append(spec_decode_metadata)
 
             start_index = end_index
 
@@ -1223,8 +1499,14 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output=scheduler_output,
             logits_list=logits_list,
             num_reqs_list=num_reqs_list,
+            spec_decode_metadata_list=spec_decode_metadata_list,
         )
         return None
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self.spec_decode_manager is None:
+            return None
+        return self.spec_decode_manager.take_draft_token_ids()
 
     @torch.no_grad()
     def sample_tokens(
@@ -1258,61 +1540,107 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
 
-        cur_start_idx = 0
-        req_ids = cast(list[str],
-                       self.input_batch.req_ids[:self.input_batch.num_reqs])
-        all_greedy = self.input_batch.all_greedy
-        for logits, num_reqs in zip(state.logits_list, state.num_reqs_list):
-            cur_end_idx = cur_start_idx + num_reqs
-            if grammar_output is not None:
-                require_struct_decoding, grammar_bitmask_padded, arange = (
-                    self.prepare_structured_decoding_input(
-                        logits, grammar_output))
-                logits = self.structured_decode(require_struct_decoding,
-                                                grammar_bitmask_padded, logits,
-                                                arange)
-            if all_greedy:
-                dummy_placeholder = torch.empty((1, 1),
-                                                dtype=logits.dtype,
-                                                device=logits.device)
-                selected_token_ids = self.sample_from_logits_func(
-                    logits,
-                    dummy_placeholder,
-                    dummy_placeholder,
-                    all_greedy=True)
-            else:
-                temperatures_tpu = self._build_padded_temperatures(
-                    cur_start_idx, cur_end_idx, logits)
-                u = torch.rand_like(logits)
-                selected_token_ids = self.sample_from_logits_func(
-                    logits, temperatures_tpu, u, all_greedy=all_greedy)
-            # NOTE (NickLucche) Use the original logits (before any penalties or
-            # temperature scaling) for the top-k logprobs. We can't enforce it
-            # due to recompilations outside torch.compiled code, so just make
-            # sure `sample_from_logits` does not modify the logits in-place.
-            logprobs = (self.gather_logprobs(logits, selected_token_ids)
-                        if needs_logprobs else None)
-
-            # Keep the bucketed (padded) tensor; trim happens on the host
-            # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
-            combined_selected_tokens.append(selected_token_ids)
-            combined_selected_tokens_real_lens.append(num_reqs)
-            if self.scheduler_config.async_scheduling:
-                next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
-                for req_idx in range(cur_start_idx, cur_end_idx):
-                    next_token_indices[req_idx] = (next_tokens_tpu_offset +
-                                                   req_idx - cur_start_idx)
-                next_tokens_tpu_offset += selected_token_ids.shape[0]
+        use_spec = any(md is not None
+                       for md in state.spec_decode_metadata_list)
+        if use_spec:
             if needs_logprobs:
-                sliced_logprobs = LogprobsTensors(
-                    logprobs.logprob_token_ids[:num_reqs],
-                    logprobs.logprobs[:num_reqs],
-                    logprobs.selected_token_ranks[:num_reqs],
-                    logprobs.cu_num_generated_tokens)
-                combined_logprobs.append(sliced_logprobs)
+                raise NotImplementedError(
+                    "Logprobs are not supported with speculative decoding on "
+                    "TPU yet.")
+            for logits, num_reqs, md in zip(state.logits_list,
+                                            state.num_reqs_list,
+                                            state.spec_decode_metadata_list):
+                if md is not None:
+                    # Extract bonus tokens from the target model logits.
+                    bonus_token_ids = torch.argmax(
+                        logits[md.bonus_logits_indices], dim=-1)
+                    next_tokens = self.rejection_sampler(
+                        draft_token_ids=md.draft_token_ids,
+                        num_draft_tokens=md.draft_lengths,
+                        target_logits=logits[md.target_logits_indices],
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=md.segment_ids,
+                        group_indices=md.group_indices,
+                        max_draft_tokens=self.speculative_config.
+                        num_speculative_tokens,
+                    )
+                    combined_selected_tokens.append(next_tokens)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+                else:
+                    dummy = torch.empty((1, 1),
+                                        dtype=logits.dtype,
+                                        device=logits.device)
+                    selected = self.sample_from_logits_func(logits,
+                                                            dummy,
+                                                            dummy,
+                                                            all_greedy=True)
+                    padded = torch.full(
+                        (selected.shape[0],
+                         self.speculative_config.num_speculative_tokens + 1),
+                        INVALID_TOKEN_ID,
+                        dtype=selected.dtype,
+                        device=selected.device)
+                    padded[:, 0] = selected.view(-1)
+                    combined_selected_tokens.append(padded)
+                    combined_selected_tokens_real_lens.append(num_reqs)
+        else:
+            cur_start_idx = 0
+            req_ids = cast(
+                list[str],
+                self.input_batch.req_ids[:self.input_batch.num_reqs])
+            all_greedy = self.input_batch.all_greedy
+            for logits, num_reqs in zip(state.logits_list,
+                                        state.num_reqs_list):
+                cur_end_idx = cur_start_idx + num_reqs
+                if grammar_output is not None:
+                    require_struct_decoding, grammar_bitmask_padded, arange = (
+                        self.prepare_structured_decoding_input(
+                            logits, grammar_output))
+                    logits = self.structured_decode(require_struct_decoding,
+                                                    grammar_bitmask_padded,
+                                                    logits, arange)
+                if all_greedy:
+                    dummy_placeholder = torch.empty((1, 1),
+                                                    dtype=logits.dtype,
+                                                    device=logits.device)
+                    selected_token_ids = self.sample_from_logits_func(
+                        logits,
+                        dummy_placeholder,
+                        dummy_placeholder,
+                        all_greedy=True)
+                else:
+                    temperatures_tpu = self._build_padded_temperatures(
+                        cur_start_idx, cur_end_idx, logits)
+                    u = torch.rand_like(logits)
+                    selected_token_ids = self.sample_from_logits_func(
+                        logits, temperatures_tpu, u, all_greedy=all_greedy)
+                # NOTE (NickLucche) Use the original logits (before any penalties or
+                # temperature scaling) for the top-k logprobs. We can't enforce it
+                # due to recompilations outside torch.compiled code, so just make
+                # sure `sample_from_logits` does not modify the logits in-place.
+                logprobs = (self.gather_logprobs(logits, selected_token_ids)
+                            if needs_logprobs else None)
 
-            self._update_num_xla_graphs("decoding_step")
-            cur_start_idx = cur_end_idx
+                # Keep the bucketed (padded) tensor; trim happens on the host
+                # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
+                combined_selected_tokens.append(selected_token_ids)
+                combined_selected_tokens_real_lens.append(num_reqs)
+                if self.scheduler_config.async_scheduling:
+                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    for req_idx in range(cur_start_idx, cur_end_idx):
+                        next_token_indices[req_idx] = (next_tokens_tpu_offset +
+                                                       req_idx - cur_start_idx)
+                    next_tokens_tpu_offset += selected_token_ids.shape[0]
+                if needs_logprobs:
+                    sliced_logprobs = LogprobsTensors(
+                        logprobs.logprob_token_ids[:num_reqs],
+                        logprobs.logprobs[:num_reqs],
+                        logprobs.selected_token_ranks[:num_reqs],
+                        logprobs.cu_num_generated_tokens)
+                    combined_logprobs.append(sliced_logprobs)
+
+                self._update_num_xla_graphs("decoding_step")
+                cur_start_idx = cur_end_idx
 
         # NOTE: current kv load and save get h2d/d2h copies involved.
         # Those copies are blocking. Once they become async., kv_save
@@ -1429,13 +1757,20 @@ class TPUModelRunner(GPUModelRunner):
                 if not valid_tokens:
                     continue
                 req_idx = self.input_batch.req_id_to_index[req_id]
-                self.input_batch.num_tokens_no_spec[req_idx] += len(
-                    valid_tokens)
-                target_slice = slice(seq_len - len(valid_tokens) + 1,
-                                     seq_len + 1)
-                self.input_batch.token_ids_cpu[req_idx,
-                                               target_slice] = valid_tokens
+
+                # Update the persistent batch.
+                start_tok_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_tok_idx = start_tok_idx + len(valid_tokens)
+                self.input_batch.token_ids_cpu[
+                    req_idx, start_tok_idx:end_tok_idx] = valid_tokens
+                self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+
                 req_state.output_token_ids.extend(valid_tokens)
+
+            if self.speculative_config:
+                self.spec_decode_manager.propose_draft_token_ids(
+                    final_output.sampled_token_ids)
+
             return final_output
 
         return async_output
@@ -1512,6 +1847,12 @@ class TPUModelRunner(GPUModelRunner):
         else:
             position_ids = torch.zeros(num_tokens,
                                        dtype=torch.int32).to(self.device)
+        query_lens = [1] * num_reqs
+        query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
+                                                    dtype=torch.int32),
+                                       dim=0,
+                                       dtype=torch.int32).to(self.device)
+        seq_lens = torch.ones((num_reqs, ), dtype=torch.int32).to(self.device)
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
         # Dummy runs use one scheduled token per active request, so model
         # them as pure decode to match the real single-chip path.
@@ -1520,18 +1861,22 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int32).to(self.device)
 
         if getattr(self, "kv_cache_config", None) is not None:
-            self.query_start_loc.gpu = torch.arange(num_reqs + 1,
-                                                    device=self.device,
-                                                    dtype=torch.int32)
-            self.seq_lens = torch.ones(num_reqs,
-                                       device=self.device,
-                                       dtype=torch.int32)
+            # Dummy compact-mamba slot ids (all null slot 0): the dummy run
+            # only traces shapes/HBM, so the recurrent state read/written is
+            # never consumed. Shape must match the GDN op's max_reqs
+            # (= seq_lens length = num_reqs).
+            dummy_mamba_state_indices = (torch.zeros(
+                (num_reqs, ), dtype=torch.int32).to(self.device)
+                                         if self._has_mamba_state else None)
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
                 use_max_model_len=use_max_model_len,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                mamba_state_indices=dummy_mamba_state_indices,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -1549,13 +1894,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._attn_layer_names = list(
                     get_layers_from_vllm_config(self.vllm_config,
                                                 (Attention, MambaBase)).keys())
-            query_lens = [1] * num_reqs
-            query_start_loc = torch.cumsum(torch.tensor([0] + query_lens,
-                                                        dtype=torch.int32),
-                                           dim=0,
-                                           dtype=torch.int32).to(self.device)
-            seq_lens = torch.ones((num_reqs, ),
-                                  dtype=torch.int32).to(self.device)
             block_tables = torch.zeros((num_reqs * num_blocks, ),
                                        dtype=torch.int32).to(self.device)
             attn_metadata = AttentionMetadata(
@@ -1776,6 +2114,23 @@ class TPUModelRunner(GPUModelRunner):
                 with self.maybe_setup_dummy_loras(self.lora_config):
                     self._precompile_sampling_subgraphs()
 
+    def get_kv_prewarm_shapes(self) -> list[int]:
+        if not has_kv_transfer_group():
+            return []
+        kv_connector = get_kv_transfer_group()
+        cw = getattr(kv_connector, "connector_worker", None)
+        if cw is None or not hasattr(cw.spec, "prewarm_shapes"):
+            return []
+        return cw.spec.prewarm_shapes
+
+    def prewarm_kv_offload_shape(self, p: int) -> None:
+        if not has_kv_transfer_group():
+            return
+        kv_connector = get_kv_transfer_group()
+        cw = getattr(kv_connector, "connector_worker", None)
+        if cw is not None and hasattr(cw.spec, "prewarm_shape"):
+            cw.spec.prewarm_shape(p)
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -1858,6 +2213,10 @@ class TPUModelRunner(GPUModelRunner):
                 layer_name_to_spec[layer_name] = group.kv_cache_spec
 
         kv_caches: dict[str, torch.Tensor] = {}
+        # Actual leading-dim block count used for mamba state arrays, captured
+        # at allocation time so the slot pool below is sized to exactly what
+        # was allocated (compact `_mamba_num_blocks`, or uniform `num_blocks`).
+        allocated_mamba_num_blocks: int | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # If the KV cache tensor is shared by multiple layers, then we
             # duplicate cache for each layer and `num_blocks` is calculated
@@ -1903,10 +2262,18 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_spec = layer_name_to_spec[layer_name]
 
                 if isinstance(kv_cache_spec, MambaSpec):
+                    # Compact-mamba: allocate only `_mamba_num_blocks`
+                    # recurrent slots (= max_num_reqs + 1) when the override
+                    # succeeded; otherwise fall back to the uniform
+                    # `num_blocks`. Attention layers always keep `num_blocks`.
+                    mamba_num_blocks = (self._mamba_num_blocks
+                                        if self._mamba_num_blocks is not None
+                                        else num_blocks)
+                    allocated_mamba_num_blocks = mamba_num_blocks
                     mamba_states = []
                     for _, (shape, dtype) in enumerate(
                             zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)):
-                        cache_shape = (num_blocks, *shape)
+                        cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
@@ -1973,6 +2340,12 @@ class TPUModelRunner(GPUModelRunner):
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
+
+        # Initialize the compact-mamba slot allocator now that the true mamba
+        # block count is known. When compact sizing was skipped, mamba shares
+        # the attention `num_blocks`, so the pool spans that range instead.
+        if allocated_mamba_num_blocks is not None:
+            self._init_mamba_slot_pool(allocated_mamba_num_blocks)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
