@@ -146,6 +146,12 @@ jobs:
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "Decision for ${{ matrix.config.name }}: $RUN"
 
+      - name: Expand /dev/shm size
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          mount -o remount,size=800g /dev/shm || true
+          df -h /dev/shm
+
       - name: Redirect torch_tpu cache off /dev/shm
         if: steps.decide.outputs.run == 'true'
         run: |

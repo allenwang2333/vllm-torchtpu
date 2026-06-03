@@ -58,6 +58,11 @@ jobs:
       UV_NO_CACHE: "1"
 
     steps:
+      - name: Expand /dev/shm size
+        run: |
+          mount -o remount,size=800g /dev/shm || true
+          df -h /dev/shm
+
       - name: Redirect torch_tpu cache off /dev/shm
         run: |
           # /dev/shm is too small on K8s runners; symlink to disk so the
