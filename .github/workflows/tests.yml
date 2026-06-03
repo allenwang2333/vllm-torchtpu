@@ -46,9 +46,9 @@ jobs:
     container:
       image: ${{ matrix.job_info.container }}
       # TODO investigate making a GH Action to make all this preamble reusable.
-      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      options: --privileged --net=host --shm-size=900g --device /dev/fuse
       env:
-        HF_HOME: /local_hf_cache
+        HF_HOME: /dev/shm/huggingface
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
 
@@ -109,8 +109,8 @@ jobs:
 
       - name: Copy model to local cache
         run: |
-          mkdir -p /local_hf_cache/hub
-          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/ /local_hf_cache/hub/
+          mkdir -p /dev/shm/huggingface/hub
+          gsutil -m cp -r gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/ /dev/shm/huggingface/hub/
 
       - name: Run tests
         run: bash ./scripts/vllm/benchmarking/run_unit_test.sh ${{ inputs.nightly }}

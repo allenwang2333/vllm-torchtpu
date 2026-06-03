@@ -88,9 +88,9 @@ jobs:
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
-      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      options: --privileged --net=host --shm-size=900g --device /dev/fuse
       env:
-        HF_HOME: /local_hf_cache
+        HF_HOME: /dev/shm/huggingface
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 360
@@ -193,8 +193,8 @@ jobs:
       - name: Copy model to local cache
         if: steps.decide.outputs.run == 'true'
         run: |
-          mkdir -p /local_hf_cache/hub
-          gsutil -m cp -r ${{ matrix.config.gs_path }} /local_hf_cache/hub/
+          mkdir -p /dev/shm/huggingface/hub
+          gsutil -m cp -r ${{ matrix.config.gs_path }} /dev/shm/huggingface/hub/
 
       - name: Run perf and eval
         if: steps.decide.outputs.run == 'true'
