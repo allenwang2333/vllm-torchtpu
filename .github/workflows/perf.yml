@@ -88,9 +88,9 @@ jobs:
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
-      options: --privileged --net=host --shm-size=900g --device /dev/fuse
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
       env:
-        HF_HOME: /dev/shm/huggingface
+        HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 360
@@ -146,12 +146,6 @@ jobs:
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "Decision for ${{ matrix.config.name }}: $RUN"
 
-      - name: Expand /dev/shm size
-        if: steps.decide.outputs.run == 'true'
-        run: |
-          mount -o remount,size=800g /dev/shm || true
-          df -h /dev/shm
-
       - name: Redirect torch_tpu cache off /dev/shm
         if: steps.decide.outputs.run == 'true'
         run: |
@@ -199,8 +193,8 @@ jobs:
       - name: Copy model to local cache
         if: steps.decide.outputs.run == 'true'
         run: |
-          mkdir -p /dev/shm/huggingface/hub
-          gsutil -m cp -r ${{ matrix.config.gs_path }} /dev/shm/huggingface/hub/
+          mkdir -p "$HF_HOME"/hub
+          gsutil -m cp -r ${{ matrix.config.gs_path }} "$HF_HOME"/hub/
 
       - name: Run perf and eval
         if: steps.decide.outputs.run == 'true'
@@ -232,3 +226,10 @@ jobs:
           path: perf_eval_results/
           retention-days: ${{ matrix.config.retention }}
           if-no-files-found: warn
+
+      - name: Clean up model cache from disk
+        if: always() && steps.decide.outputs.run == 'true'
+        run: |
+          echo "Cleaning up HF cache to free disk space..."
+          rm -rf "$HF_HOME"/hub/* || true
+          df -h
