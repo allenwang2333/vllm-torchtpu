@@ -1,0 +1,189 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI - Disagg Serving E2E on TPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      halt-for-connection:
+        description: 'Should this workflow run wait for a remote connection?'
+        type: choice
+        default: 'no'
+        options:
+          - 'yes'
+          - 'no'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+# Cancel old PR runs when superseded by new commits, but not on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check_changes:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            src:
+              - '!**.md'
+              - '!docs/**'
+              - '!docker/**'
+              - '!.gitignore'
+              - '!.dockerignore'
+              - '!.pre-commit-config.yaml'
+              - '!.readthedocs.yaml'
+              - '!mkdocs.yml'
+              - '!LICENSE'
+              - '!DCO'
+              - '!MANIFEST.in'
+
+  run_disagg:
+    needs: check_changes
+    if: |
+      always() &&
+      github.event.repository.fork == false &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' && needs.check_changes.outputs.should_run == 'true')
+      )
+    runs-on: linux-x86-tpu7x-224-4tpu
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      env:
+        HF_HOME: /local_hf_cache
+        SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
+    timeout-minutes: 60
+
+    env:
+      FORCE_COLOR: "1"
+      UV_NO_CACHE: "1"
+      TQDM_MININTERVAL: "30"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: qwen3-0.6b
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/
+            hub_dir_name: models--Qwen--Qwen3-0.6B
+            model_id: Qwen/Qwen3-0.6B
+            run_on: ["pr"]
+
+    name: "Disagg E2E (${{ matrix.config.name }})"
+
+    steps:
+      - name: Decide if to run
+        id: decide
+        shell: bash
+        run: |
+          RUN=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RUN=true
+          elif [[ "${{ github.event_name }}" == "pull_request" ]] && [[ "${{ contains(matrix.config.run_on, 'pr') }}" == "true" ]]; then
+            RUN=true
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "Decision for ${{ matrix.config.name }}: $RUN"
+
+      - name: Redirect torch_tpu cache off /dev/shm
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          mkdir -p /tmp/torch_tpu_cache
+          ln -sfn /tmp/torch_tpu_cache /dev/shm/torch_tpu_cache
+
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        if: steps.decide.outputs.run == 'true'
+
+      - name: Mark git directory as safe
+        if: steps.decide.outputs.run == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup uv
+        if: steps.decide.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Save installed packages list
+        if: steps.decide.outputs.run == 'true'
+        run: uv pip list > /tmp/disagg_e2e_pip_list.txt
+
+      - name: Wait For Connection
+        if: steps.decide.outputs.run == 'true'
+        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
+        with:
+          halt-dispatch-input: ${{ inputs.halt-for-connection }}
+
+      - name: Setup Virtual Environment
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          uv venv
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Keyring for Auth
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          uv pip install --no-config --index-url https://pypi.org/simple keyring keyrings.google-artifactregistry-auth
+          echo UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken" >> "$GITHUB_ENV"
+
+      - name: Install crc32c for gsutil
+        if: steps.decide.outputs.run == 'true'
+        run: uv pip install --system crc32c
+
+      - name: Copy model to local cache
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          mkdir -p /local_hf_cache/hub
+          gsutil -m cp -r ${{ matrix.config.gs_path }} /local_hf_cache/hub/
+
+      - name: Restructure model cache for HF hub layout
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          MODEL_DIR="/local_hf_cache/hub/${{ matrix.config.hub_dir_name }}"
+          if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/config.json" ]; then
+            echo "Restructuring flat model cache into HF Hub cache layout..."
+            mkdir -p "$MODEL_DIR/snapshots/default"
+            find "$MODEL_DIR" -maxdepth 1 -type f -exec mv {} "$MODEL_DIR/snapshots/default/" \;
+            mkdir -p "$MODEL_DIR/refs"
+            echo "default" > "$MODEL_DIR/refs/main"
+          fi
+
+      - name: Install packages
+        if: steps.decide.outputs.run == 'true'
+        run: uv pip install ".[test,benchmarking]"
+
+      - name: Run disagg single host test
+        if: steps.decide.outputs.run == 'true'
+        shell: bash
+        env:
+          MODEL: ${{ matrix.config.model_id }}
+        run: |
+          bash ./examples/disagg/run_disagg_single_host.sh

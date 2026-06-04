@@ -40,6 +40,13 @@ print_logs_on_exit() {
     else
       echo "File not found."
     fi
+
+    echo "--- Contents of $LOG_DIR/proxy_0.txt ---"
+    if [ -f "$LOG_DIR/proxy_0.txt" ]; then
+      cat "$LOG_DIR/proxy_0.txt"
+    else
+      echo "File not found."
+    fi
   else
     echo "Log directory '$LOG_DIR' not found."
   fi
@@ -180,7 +187,8 @@ done
 
 
 # Start proxy server
-python $HOME/tpu-inference/examples/disagg/toy_proxy_server.py \
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python "${SCRIPT_DIR}/toy_proxy_server.py" \
 --host localhost \
 --port 8000 \
 --prefiller-hosts ${PREFILL_HOSTS[@]} \
