@@ -104,6 +104,14 @@ PREFILL_PORTS=()
 DECODE_HOSTS=()
 DECODE_PORTS=()
 
+echo "=== Raw tpu-info output ==="
+tpu-info || true
+echo "==========================="
+
+echo "=== Contents of /dev/vfio ==="
+ls -la /dev/vfio || true
+echo "============================="
+
 # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
 TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
 
