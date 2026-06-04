@@ -76,7 +76,7 @@ jobs:
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
-      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      options: --net=host --shm-size=16g --device /dev/fuse
       env:
         HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
