@@ -104,24 +104,26 @@ PREFILL_PORTS=()
 DECODE_HOSTS=()
 DECODE_PORTS=()
 
-echo "=== Raw tpu-info output ==="
-tpu-info || true
-echo "==========================="
-
-echo "=== Contents of /dev/vfio ==="
-ls -la /dev/vfio || true
-echo "============================="
-
-# Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
-TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
-
-# Fallback to direct /dev/vfio/* group detection if tpu-info failed or returned nothing
-if [ ${#TPU_DEVICE_PATHS[@]} -eq 0 ]; then
-  for dev in /dev/vfio/[0-9]*; do
-    if [ -e "$dev" ]; then
-      TPU_DEVICE_PATHS+=("$dev")
+# Retrieve per-chip vfio device paths for Google TPU devices using sysfs vfio-pci driver queries
+TPU_DEVICE_PATHS=()
+if [ -d "/sys/bus/pci/drivers/vfio-pci" ]; then
+  for dev_dir in /sys/bus/pci/drivers/vfio-pci/[0-9]*; do
+    if [ -d "$dev_dir" ] && [ -f "$dev_dir/vendor" ]; then
+      vendor=$(cat "$dev_dir/vendor")
+      # 0x1ae0 is Google's PCI Vendor ID for TPUs
+      if [ "$vendor" = "0x1ae0" ]; then
+        if [ -L "$dev_dir/iommu_group" ]; then
+          group_num=$(basename "$(readlink "$dev_dir/iommu_group")")
+          TPU_DEVICE_PATHS+=("/dev/vfio/$group_num")
+        fi
+      fi
     fi
   done
+fi
+
+# Sort the paths numerically
+if [ ${#TPU_DEVICE_PATHS[@]} -gt 0 ]; then
+  TPU_DEVICE_PATHS=($(printf '%s\n' "${TPU_DEVICE_PATHS[@]}" | sort -V))
 fi
 
 echo "Detected TPU device paths: ${TPU_DEVICE_PATHS[*]}"
