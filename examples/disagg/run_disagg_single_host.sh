@@ -3,6 +3,20 @@
 # shellcheck disable=all
 set -e
 
+DRY_RUN=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --dry-run|--dryrun|-d)
+      DRY_RUN=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
 
 
 wait_for_server() {
@@ -37,6 +51,13 @@ print_logs_on_exit() {
     echo "--- Contents of $LOG_DIR/benchmark_0.txt ---"
     if [ -f "$LOG_DIR/benchmark_0.txt" ]; then
       cat "$LOG_DIR/benchmark_0.txt"
+    else
+      echo "File not found."
+    fi
+
+    echo "--- Contents of $LOG_DIR/proxy_0.txt ---"
+    if [ -f "$LOG_DIR/proxy_0.txt" ]; then
+      cat "$LOG_DIR/proxy_0.txt"
     else
       echo "File not found."
     fi
@@ -76,10 +97,8 @@ cleanup_instances() {
   fuser -k -9 /dev/accel* || true
   rm -rf /tmp/jax_cache_* || true
   rm -f /tmp/libtpu_lockfile || true
+  rm -f /dev/shm/tpu_conn_* || true
 }
-
-# Register the cleanup function to be called on script exit (normal or error)
-trap print_logs_on_exit EXIT
 
 MODEL=${MODEL:="Qwen/Qwen3-0.6B"}
 INPUT_LEN=${INPUT_LEN:=512}
@@ -99,17 +118,59 @@ DECODE_PORTS=()
 
 # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
 TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
-
-LOG_DIR=$HOME/logs
-
-if [ ! -d $LOG_DIR ]; then
-  mkdir -p $LOG_DIR
-else
-  # Delete old log files to avoid printing stale logs at the end
-  rm -f $LOG_DIR/prefill_0.txt $LOG_DIR/decode_0.txt $LOG_DIR/benchmark_0.txt $LOG_DIR/proxy_0.txt
+if [ ${#TPU_DEVICE_PATHS[@]} -eq 0 ]; then
+  # Fallback to listing /dev/vfio/ entries if tpu-info is not installed or returned nothing.
+  # On 2-cores-per-chip systems (v4, v5p, v7), sequential dev numbers (e.g. 0 and 1) belong to the same chip.
+  # We only take even numbered device files to ensure we don't allocate different processes to the same physical chip.
+  if [ -d /dev/vfio ]; then
+    for f in /dev/vfio/[0-9]*; do
+      if [ -e "$f" ]; then
+        dev_num=$(basename "$f")
+        if (( dev_num % 2 == 0 )); then
+          TPU_DEVICE_PATHS+=("$f")
+        fi
+      fi
+    done
+  fi
 fi
 
-cleanup_instances
+REQUIRED_CHIPS=$((NUM_PREFILL_INSTANCES + NUM_DECODE_INSTANCES))
+FOUND_CHIPS=${#TPU_DEVICE_PATHS[@]}
+
+if [ "$DRY_RUN" = true ]; then
+  echo "--- Dry Run: Checking TPU Device Setup ---"
+fi
+
+echo "TPU_DEVICE_PATHS: ${TPU_DEVICE_PATHS[*]}"
+echo "Number of TPU chips found: $FOUND_CHIPS"
+echo "Number of TPU chips required: $REQUIRED_CHIPS"
+
+if [ "$FOUND_CHIPS" -lt "$REQUIRED_CHIPS" ]; then
+  echo "Error: Not enough TPU chips. Found $FOUND_CHIPS, but need at least $REQUIRED_CHIPS."
+  if [ "$DRY_RUN" = false ]; then
+    exit 1
+  fi
+else
+  if [ "$DRY_RUN" = true ]; then
+    echo "TPU device setup check PASSED."
+  fi
+fi
+
+if [ "$DRY_RUN" = false ]; then
+  # Register the cleanup function to be called on script exit (normal or error)
+  trap print_logs_on_exit EXIT
+
+  LOG_DIR=$HOME/logs
+
+  if [ ! -d $LOG_DIR ]; then
+    mkdir -p $LOG_DIR
+  else
+    # Delete old log files to avoid printing stale logs at the end
+    rm -f $LOG_DIR/prefill_0.txt $LOG_DIR/decode_0.txt $LOG_DIR/benchmark_0.txt $LOG_DIR/proxy_0.txt
+  fi
+
+  cleanup_instances
+fi
 
 # Start prefill instances
 for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
@@ -117,25 +178,33 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     KV_PORT=$((7100 + i))
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$i
+    TPU_VISIBLE_DEVICE_PATH=${TPU_DEVICE_PATHS[$CHIP_IDX]}
 
-    TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
-    TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
-    \
-    TPU_KV_TRANSFER_PORT=$KV_PORT \
-    TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
-    \
-    vllm serve $MODEL \
-    --port $PORT \
-    --gpu-memory-utilization 0.2 \
-    --tensor-parallel-size $PREFILLER_TP_SIZE \
-    --attention-backend CUSTOM \
-    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
-    > $LOG_DIR/prefill_$i.txt 2>&1 &
+    cmd=(
+      env
+      TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1
+      TPU_PROCESS_BOUNDS=1,1,1
+      TPU_VISIBLE_DEVICE_PATHS="$TPU_VISIBLE_DEVICE_PATH"
+      TPU_KV_TRANSFER_PORT="$KV_PORT"
+      TPU_SIDE_CHANNEL_PORT="$SIDE_PORT"
+      SKIP_JAX_PRECOMPILE=1
+      vllm serve "$MODEL"
+      --port "$PORT"
+      --gpu-memory-utilization 0.2
+      --tensor-parallel-size "$PREFILLER_TP_SIZE"
+      --attention-backend CUSTOM
+      --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}"
+    )
+
+    echo "Prefill instance $i command:"
+    echo "  ${cmd[*]}"
+
+    if [ "$DRY_RUN" = false ]; then
+      "${cmd[@]}" > "$LOG_DIR/prefill_$i.txt" 2>&1 &
+    fi
 
     PREFILL_HOSTS+=("localhost")
-    PREFILL_PORTS+=($PORT)
+    PREFILL_PORTS+=("$PORT")
 done
 
 
@@ -146,72 +215,98 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     # Same as prefill SIDE_PORT
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$((NUM_PREFILL_INSTANCES + i))
+    TPU_VISIBLE_DEVICE_PATH=${TPU_DEVICE_PATHS[$CHIP_IDX]}
 
-    TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
-    TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
-    \
-    TPU_KV_TRANSFER_PORT=$KV_PORT \
-    TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
-    SKIP_JAX_PRECOMPILE=1 \
-    \
-    vllm serve $MODEL \
-    --port $PORT \
-    --gpu-memory-utilization 0.2 \
-    --tensor-parallel-size $DECODER_TP_SIZE \
-    --attention-backend CUSTOM \
-    --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
-    > $LOG_DIR/decode_$i.txt 2>&1 &
+    cmd=(
+      env
+      TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1
+      TPU_PROCESS_BOUNDS=1,1,1
+      TPU_VISIBLE_DEVICE_PATHS="$TPU_VISIBLE_DEVICE_PATH"
+      TPU_KV_TRANSFER_PORT="$KV_PORT"
+      TPU_SIDE_CHANNEL_PORT="$SIDE_PORT"
+      SKIP_JAX_PRECOMPILE=1
+      vllm serve "$MODEL"
+      --port "$PORT"
+      --gpu-memory-utilization 0.2
+      --tensor-parallel-size "$DECODER_TP_SIZE"
+      --attention-backend CUSTOM
+      --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"tpu_inference.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}"
+    )
+
+    echo "Decode instance $i command:"
+    echo "  ${cmd[*]}"
+
+    if [ "$DRY_RUN" = false ]; then
+      "${cmd[@]}" > "$LOG_DIR/decode_$i.txt" 2>&1 &
+    fi
 
     DECODE_HOSTS+=("localhost")
-    DECODE_PORTS+=($PORT)
+    DECODE_PORTS+=("$PORT")
 done
 
-# Wait for all instances to start
-for PORT in "${PREFILL_PORTS[@]}"; do
-    echo "Waiting for prefill on port $PORT to start..."
-    wait_for_server $PORT
-done
+if [ "$DRY_RUN" = false ]; then
+  # Wait for all instances to start
+  for PORT in "${PREFILL_PORTS[@]}"; do
+      echo "Waiting for prefill on port $PORT to start..."
+      wait_for_server "$PORT"
+  done
 
-for PORT in "${DECODE_PORTS[@]}"; do
-    echo "Waiting for decode on port $PORT to start..."
-    wait_for_server $PORT
-done
+  for PORT in "${DECODE_PORTS[@]}"; do
+      echo "Waiting for decode on port $PORT to start..."
+      wait_for_server "$PORT"
+  done
+fi
 
 
 # Start proxy server
-python $HOME/tpu-inference/examples/disagg/toy_proxy_server.py \
---host localhost \
---port 8000 \
---prefiller-hosts ${PREFILL_HOSTS[@]} \
---prefiller-ports ${PREFILL_PORTS[@]} \
---decoder-hosts ${DECODE_HOSTS[@]} \
---decoder-ports ${DECODE_PORTS[@]} \
-> $LOG_DIR/proxy_0.txt 2>&1 &
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cmd=(
+  python "${SCRIPT_DIR}/toy_proxy_server.py"
+  --host localhost
+  --port 8000
+  --prefiller-hosts "${PREFILL_HOSTS[@]}"
+  --prefiller-ports "${PREFILL_PORTS[@]}"
+  --decoder-hosts "${DECODE_HOSTS[@]}"
+  --decoder-ports "${DECODE_PORTS[@]}"
+)
 
-# run benchmark for both disagg and non-disagg
-LOG_FILE="$LOG_DIR/benchmark_0.txt"
-echo "--- Running Disagg Benchmark ---" > $LOG_FILE
+echo "Proxy server command:"
+echo "  ${cmd[*]}"
 
-# run ben for disagg
-set -x
-vllm bench serve \
-  --model=$MODEL \
-  --num-warmups=3 \
-  --dataset-name=random \
-  --random-input-len=${INPUT_LEN} \
-  --random-output-len=${OUTPUT_LEN} \
-  --num-prompts=${NUM_PROMPTS} \
-  --ignore-eos \
-  --host=localhost \
-  --port 8000 \
-  --request-rate=${REQUEST_RATE} \
-  >> $LOG_FILE 2>&1
-set +x
+if [ "$DRY_RUN" = false ]; then
+  "${cmd[@]}" > "$LOG_DIR/proxy_0.txt" 2>&1 &
+fi
 
-check_failed_requests "$LOG_FILE"
+cmd=(
+  vllm bench serve
+  --model="$MODEL"
+  --num-warmups=3
+  --dataset-name=random
+  --random-input-len="${INPUT_LEN}"
+  --random-output-len="${OUTPUT_LEN}"
+  --num-prompts="${NUM_PROMPTS}"
+  --ignore-eos
+  --host=localhost
+  --port 8000
+  --request-rate="${REQUEST_RATE}"
+)
 
-cat <<'EOF'
+echo "Benchmark serve command:"
+echo "  ${cmd[*]}"
+
+if [ "$DRY_RUN" = false ]; then
+  # run benchmark for both disagg and non-disagg
+  LOG_FILE="$LOG_DIR/benchmark_0.txt"
+  echo "--- Running Disagg Benchmark ---" > "$LOG_FILE"
+
+  # run ben for disagg
+  set -x
+  "${cmd[@]}" >> "$LOG_FILE" 2>&1
+  set +x
+
+  check_failed_requests "$LOG_FILE"
+
+  cat <<'EOF'
 The proxy server has been launched on: 127.0.0.1:7080
 
 >> Send example request:
@@ -225,3 +320,4 @@ http://127.0.0.1:7080/v1/completions \
 
 pkill -f "vllm serve" && pkill -f "toy_proxy_server" && pkill -f "run_disagg_single_host"
 EOF
+fi
