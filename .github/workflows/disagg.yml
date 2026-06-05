@@ -196,7 +196,7 @@ jobs:
           MODEL: ${{ matrix.config.model_id }}
         run: |
           EXTRA_ARGS=""
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'dry-run') }}" == "true" ]] || [[ "${{ github.event.inputs.dry-run }}" == "yes" ]]; then
+          if [[ "${{ github.event.inputs.dry-run }}" == "yes" ]]; then
             EXTRA_ARGS="--dry-run"
           fi
           bash ./examples/disagg/run_disagg_single_host.sh $EXTRA_ARGS
