@@ -116,32 +116,46 @@ PREFILL_PORTS=()
 DECODE_HOSTS=()
 DECODE_PORTS=()
 
-# Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
-TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
-if [ ${#TPU_DEVICE_PATHS[@]} -eq 0 ]; then
-  # Fallback to listing /dev/vfio/ entries if tpu-info is not installed or returned nothing.
-  # On 2-cores-per-chip systems (v4, v5p, v7), sequential dev numbers (e.g. 0 and 1) belong to the same chip.
-  # We only take even numbered device files to ensure we don't allocate different processes to the same physical chip.
-  if [ -d /dev/vfio ]; then
-    for f in /dev/vfio/[0-9]*; do
-      if [ -e "$f" ]; then
-        dev_num=$(basename "$f")
-        if (( dev_num % 2 == 0 )); then
-          TPU_DEVICE_PATHS+=("$f")
+# Parse allocated chip indices
+if [ -n "$TPU_VISIBLE_CHIPS" ]; then
+  IFS=',' read -ra ALLOCATED_CHIPS <<< "$TPU_VISIBLE_CHIPS"
+  FOUND_CHIPS=${#ALLOCATED_CHIPS[@]}
+else
+  # Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
+  TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
+  if [ ${#TPU_DEVICE_PATHS[@]} -eq 0 ]; then
+    # Fallback to listing /dev/vfio/ entries if tpu-info is not installed or returned nothing.
+    # On 2-cores-per-chip systems (v4, v5p, v7), sequential dev numbers (e.g. 0 and 1) belong to the same chip.
+    # We only take even numbered device files to ensure we don't allocate different processes to the same physical chip.
+    if [ -d /dev/vfio ]; then
+      for f in /dev/vfio/[0-9]*; do
+        if [ -e "$f" ]; then
+          dev_num=$(basename "$f")
+          if (( dev_num % 2 == 0 )); then
+            TPU_DEVICE_PATHS+=("$f")
+          fi
         fi
-      fi
-    done
+      done
+    fi
   fi
+  FOUND_CHIPS=${#TPU_DEVICE_PATHS[@]}
+  ALLOCATED_CHIPS=()
+  for i in $(seq 0 $((FOUND_CHIPS-1))); do
+    ALLOCATED_CHIPS+=("$i")
+  done
 fi
 
 REQUIRED_CHIPS=$((NUM_PREFILL_INSTANCES + NUM_DECODE_INSTANCES))
-FOUND_CHIPS=${#TPU_DEVICE_PATHS[@]}
 
 if [ "$DRY_RUN" = true ]; then
   echo "--- Dry Run: Checking TPU Device Setup ---"
 fi
 
-echo "TPU_DEVICE_PATHS: ${TPU_DEVICE_PATHS[*]}"
+if [ -n "$TPU_VISIBLE_CHIPS" ]; then
+  echo "TPU_VISIBLE_CHIPS: ${TPU_VISIBLE_CHIPS}"
+else
+  echo "TPU_DEVICE_PATHS: ${TPU_DEVICE_PATHS[*]}"
+fi
 echo "Number of TPU chips found: $FOUND_CHIPS"
 echo "Number of TPU chips required: $REQUIRED_CHIPS"
 
@@ -178,13 +192,14 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     KV_PORT=$((7100 + i))
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$i
-    TPU_VISIBLE_DEVICE_PATH=${TPU_DEVICE_PATHS[$CHIP_IDX]}
+    TARGET_CHIP=${ALLOCATED_CHIPS[$CHIP_IDX]}
 
     cmd=(
       env
       TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1
       TPU_PROCESS_BOUNDS=1,1,1
-      TPU_VISIBLE_DEVICE_PATHS="$TPU_VISIBLE_DEVICE_PATH"
+      TPU_VISIBLE_DEVICE_PATHS=""
+      TPU_VISIBLE_CHIPS="$TARGET_CHIP"
       TPU_KV_TRANSFER_PORT="$KV_PORT"
       TPU_SIDE_CHANNEL_PORT="$SIDE_PORT"
       SKIP_JAX_PRECOMPILE=1
@@ -215,13 +230,14 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     # Same as prefill SIDE_PORT
     SIDE_PORT=$((6100 + i))
     CHIP_IDX=$((NUM_PREFILL_INSTANCES + i))
-    TPU_VISIBLE_DEVICE_PATH=${TPU_DEVICE_PATHS[$CHIP_IDX]}
+    TARGET_CHIP=${ALLOCATED_CHIPS[$CHIP_IDX]}
 
     cmd=(
       env
       TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1
       TPU_PROCESS_BOUNDS=1,1,1
-      TPU_VISIBLE_DEVICE_PATHS="$TPU_VISIBLE_DEVICE_PATH"
+      TPU_VISIBLE_DEVICE_PATHS=""
+      TPU_VISIBLE_CHIPS="$TARGET_CHIP"
       TPU_KV_TRANSFER_PORT="$KV_PORT"
       TPU_SIDE_CHANNEL_PORT="$SIDE_PORT"
       SKIP_JAX_PRECOMPILE=1
