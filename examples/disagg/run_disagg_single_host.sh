@@ -104,55 +104,8 @@ PREFILL_PORTS=()
 DECODE_HOSTS=()
 DECODE_PORTS=()
 
-# Retrieve per-chip vfio device paths for Google TPU devices using sysfs vfio-pci driver queries
-TPU_DEVICE_PATHS=()
-if [ -d "/sys/bus/pci/drivers/vfio-pci" ]; then
-  for dev_dir in /sys/bus/pci/drivers/vfio-pci/[0-9]*; do
-    if [ -d "$dev_dir" ] && [ -f "$dev_dir/vendor" ]; then
-      vendor=$(cat "$dev_dir/vendor")
-      # 0x1ae0 is Google's PCI Vendor ID for TPUs
-      if [ "$vendor" = "0x1ae0" ]; then
-        if [ -L "$dev_dir/iommu_group" ]; then
-          group_num=$(basename "$(readlink "$dev_dir/iommu_group")")
-          TPU_DEVICE_PATHS+=("/dev/vfio/$group_num")
-        fi
-      fi
-    fi
-  done
-fi
-
-# Sort the paths numerically
-if [ ${#TPU_DEVICE_PATHS[@]} -gt 0 ]; then
-  TPU_DEVICE_PATHS=($(printf '%s\n' "${TPU_DEVICE_PATHS[@]}" | sort -V))
-fi
-
-echo "Detected TPU device paths: ${TPU_DEVICE_PATHS[*]}"
-
-# Filter out busy devices
-FREE_TPU_DEVICE_PATHS=()
-for path in "${TPU_DEVICE_PATHS[@]}"; do
-  # Try to open the device in write/read mode to see if it is busy
-  if python3 -c "
-import os
-try:
-    fd = os.open('$path', os.O_RDWR)
-    os.close(fd)
-    exit(0)
-except Exception:
-    exit(1)
-" 2>/dev/null; then
-    FREE_TPU_DEVICE_PATHS+=("$path")
-  else
-    echo "TPU device $path is busy, skipping."
-  fi
-done
-
-echo "Available free TPU device paths: ${FREE_TPU_DEVICE_PATHS[*]}"
-
-if [ ${#FREE_TPU_DEVICE_PATHS[@]} -lt 2 ]; then
-  echo "Error: Need at least 2 free TPU devices for disaggregated serving E2E test, but found only ${#FREE_TPU_DEVICE_PATHS[@]}." >&2
-  exit 1
-fi
+# Retrieve per-chip vfio device paths (e.g. /dev/vfio/1) from `tpu-info`.
+TPU_DEVICE_PATHS=($(tpu-info 2>/dev/null | awk '/^\| \/dev\/vfio/ {print $2}'))
 
 LOG_DIR=$HOME/logs
 
@@ -174,7 +127,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
 
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_DEVICE_PATHS=${FREE_TPU_DEVICE_PATHS[$CHIP_IDX]} \
+    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
@@ -203,7 +156,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
 
     TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_BOUNDS=1,1,1 \
-    TPU_VISIBLE_DEVICE_PATHS=${FREE_TPU_DEVICE_PATHS[$CHIP_IDX]} \
+    TPU_VISIBLE_DEVICE_PATHS=${TPU_DEVICE_PATHS[$CHIP_IDX]} \
     \
     TPU_KV_TRANSFER_PORT=$KV_PORT \
     TPU_SIDE_CHANNEL_PORT=$SIDE_PORT \
