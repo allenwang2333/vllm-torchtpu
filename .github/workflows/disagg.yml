@@ -85,7 +85,7 @@ jobs:
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
-      options: --privileged --net=host --shm-size=16g --device /dev/fuse
+      options: --privileged --net=host --ipc=host --shm-size=16g --device /dev/fuse
       env:
         HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
@@ -122,6 +122,14 @@ jobs:
           fi
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "Decision for ${{ matrix.config.name }}: $RUN"
+
+
+      - name: Clean up leaked semaphores and shared memory
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          echo "=== Cleaning up orphaned semaphores and shared memory on host ==="
+          rm -rf /dev/shm/sem.* || true
+          rm -rf /dev/shm/torch_* || true
 
       - name: Redirect torch_tpu cache off /dev/shm
         if: steps.decide.outputs.run == 'true'
