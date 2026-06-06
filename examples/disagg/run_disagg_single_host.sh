@@ -215,6 +215,20 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
 
     if [ "$DRY_RUN" = false ]; then
       "${cmd[@]}" > "$LOG_DIR/prefill_$i.txt" 2>&1 &
+
+      echo "Waiting for prefill on port $PORT to start..."
+      wait_for_server "$PORT"
+
+      echo "Scanning and unlinking locked VFIO device nodes..."
+      for fd in /proc/*/fd/*; do
+        link=$(readlink "$fd" 2>/dev/null || true)
+        if [[ "$link" == /dev/vfio/* && "$link" != "/dev/vfio/vfio" ]]; then
+          if [ -w "$link" ] 2>/dev/null; then
+            echo "Unlinking busy device node: $link"
+            rm -f "$link" 2>/dev/null || true
+          fi
+        fi
+      done
     fi
 
     PREFILL_HOSTS+=("localhost")
@@ -252,24 +266,25 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
 
     if [ "$DRY_RUN" = false ]; then
       "${cmd[@]}" > "$LOG_DIR/decode_$i.txt" 2>&1 &
+
+      echo "Waiting for decode on port $PORT to start..."
+      wait_for_server "$PORT"
+
+      echo "Scanning and unlinking locked VFIO device nodes..."
+      for fd in /proc/*/fd/*; do
+        link=$(readlink "$fd" 2>/dev/null || true)
+        if [[ "$link" == /dev/vfio/* && "$link" != "/dev/vfio/vfio" ]]; then
+          if [ -w "$link" ] 2>/dev/null; then
+            echo "Unlinking busy device node: $link"
+            rm -f "$link" 2>/dev/null || true
+          fi
+        fi
+      done
     fi
 
     DECODE_HOSTS+=("localhost")
     DECODE_PORTS+=("$PORT")
 done
-
-if [ "$DRY_RUN" = false ]; then
-  # Wait for all instances to start
-  for PORT in "${PREFILL_PORTS[@]}"; do
-      echo "Waiting for prefill on port $PORT to start..."
-      wait_for_server "$PORT"
-  done
-
-  for PORT in "${DECODE_PORTS[@]}"; do
-      echo "Waiting for decode on port $PORT to start..."
-      wait_for_server "$PORT"
-  done
-fi
 
 
 # Start proxy server
