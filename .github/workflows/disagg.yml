@@ -85,7 +85,7 @@ jobs:
     runs-on: linux-x86-tpu7x-224-4tpu
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
-      options: --privileged --net=host --ipc=host --shm-size=16g --device /dev/fuse
+      options: --privileged --net=host --shm-size=16g --device /dev/fuse
       env:
         HF_HOME: /local_hf_cache
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
@@ -127,7 +127,10 @@ jobs:
       - name: Clean up leaked semaphores and shared memory
         if: steps.decide.outputs.run == 'true'
         run: |
-          echo "=== Cleaning up orphaned semaphores and shared memory on host ==="
+          echo "=== Remounting /dev/shm to 16G (bypassing K8s 64MB limit) ==="
+          mount -o remount,size=16G /dev/shm || true
+
+          echo "=== Cleaning up orphaned semaphores and shared memory ==="
           rm -rf /dev/shm/sem.* || true
           rm -rf /dev/shm/torch_* || true
 
