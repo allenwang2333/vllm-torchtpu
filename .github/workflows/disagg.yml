@@ -87,7 +87,7 @@ jobs:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
       options: --privileged --net=host --ipc=host --shm-size=16g --device /dev/fuse
       env:
-        HF_HOME: /local_hf_cache
+        HF_HOME: /root/.cache/huggingface
         SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
         UV_INDEX_TORCH_TPU_REGISTRY_USERNAME: oauth2accesstoken
     timeout-minutes: 60
@@ -178,13 +178,13 @@ jobs:
       - name: Copy model to local cache
         if: steps.decide.outputs.run == 'true'
         run: |
-          mkdir -p /local_hf_cache/hub
-          gsutil -m cp -r ${{ matrix.config.gs_path }} /local_hf_cache/hub/
+          mkdir -p /root/.cache/huggingface/hub
+          gsutil -m cp -r ${{ matrix.config.gs_path }} /root/.cache/huggingface/hub/
 
       - name: Restructure model cache for HF hub layout
         if: steps.decide.outputs.run == 'true'
         run: |
-          MODEL_DIR="/local_hf_cache/hub/${{ matrix.config.hub_dir_name }}"
+          MODEL_DIR="/root/.cache/huggingface/hub/${{ matrix.config.hub_dir_name }}"
           if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/config.json" ]; then
             echo "Restructuring flat model cache into HF Hub cache layout..."
             mkdir -p "$MODEL_DIR/snapshots/default"
