@@ -127,8 +127,8 @@ jobs:
       - name: Clean up leaked semaphores and shared memory
         if: steps.decide.outputs.run == 'true'
         run: |
-          echo "=== Remounting /dev/shm to 16G (bypassing K8s 64MB limit) ==="
-          mount -o remount,size=16G /dev/shm || true
+          echo "=== Mounting new 32G tmpfs over /dev/shm (bypassing K8s 64MB limit) ==="
+          mount -t tmpfs -o size=32G,mode=1777 tmpfs /dev/shm
 
           echo "=== Cleaning up orphaned semaphores and shared memory ==="
           rm -rf /dev/shm/sem.* || true
