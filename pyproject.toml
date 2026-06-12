@@ -78,7 +78,11 @@ markers = [
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
