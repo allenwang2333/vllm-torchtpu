@@ -69,9 +69,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Install dependencies directly from pyproject.toml
 # We use cache mount for uv to speed up downloads!
 # This layer will be cached!
+# Create temporary overrides file to force uv resolver to respect version constraints
+RUN echo "torch==2.10.0" > /tmp/overrides.txt && \
+    echo "numba>=0.62.1" >> /tmp/overrides.txt && \
+    echo "fastapi<0.137" >> /tmp/overrides.txt
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --index-url https://pypi.org/simple .
+    uv pip install --system --no-config --overrides /tmp/overrides.txt --index-url https://pypi.org/simple .
 
 # Install torch-tpu either from a fresh artifact image or the pinned registry version.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -100,7 +105,7 @@ FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config --index-url https://pypi.org/simple -e ".[test,benchmarking]"
+    uv pip install --system --no-config --overrides /tmp/overrides.txt --index-url https://pypi.org/simple -e ".[test,benchmarking]"
 
 
 ENV PYTHONPATH="/root/tpu_inference/src:/root/tpu_inference"
@@ -109,13 +114,14 @@ CMD ["/bin/bash"]
 # Stage 4: Production/Full Image (Regular Install)
 FROM base AS prod
 COPY . .
+COPY --from=ci /tmp/overrides.txt /tmp/overrides.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
     TOKEN=""; \
     if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system --no-config \
+    uv pip install --system --no-config --overrides /tmp/overrides.txt \
       --index-url https://pypi.org/simple \
       --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       .
