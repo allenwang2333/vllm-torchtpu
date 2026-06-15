@@ -3,13 +3,13 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tpu_inference"
+name = "vllm_torchtpu"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
-    { name = "tpu_inference Contributors" }
+    { name = "vllm_torchtpu Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -24,7 +24,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    "vllm==0.19.0",
+    "vllm==0.22.1",
     "torch-tpu==0.1.1.dev20260605101937",
     # jaxlib 0.10.0 is required by the fused GDN prefill scan kernel
     # (recurrent_scan_v2 / chunked_kernel_pd): jaxlib 0.9.2's Mosaic rejects its
@@ -68,7 +68,7 @@ benchmarking = [
 # Standard vLLM out-of-tree platform plugin discovery. The function returns
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
-torchtpu = "tpu_inference.platforms:register_tpu_platform"
+torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [tool.pytest.ini_options]
 markers = [
@@ -78,8 +78,12 @@ markers = [
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.setuptools.packages.find]
-include = ["tpu_inference*"]
+where = ["src"]
+include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 
@@ -88,7 +92,11 @@ keyring-provider = "subprocess"
 # vLLM 0.17.1 pins numba==0.61.2, which conflicts with our requirements.
 # We override the numba version to >=0.62.1 to allow resolution to succeed.
 override-dependencies = [
-    "numba>=0.62.1"
+    "numba>=0.62.1",
+    "torch==2.10.0",
+    # Restrict fastapi version due to https://github.com/vllm-project/vllm/pull/45629
+    # TODO(shobhitbehl): Remove this pin after the fix is released in vLLM 0.23.0 or later.
+    "fastapi<0.137",
 ]
 
 

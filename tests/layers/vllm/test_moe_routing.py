@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for tpu_inference.layers.vllm.moe_routing helpers."""
+"""Unit tests for vllm_torchtpu.layers.vllm.moe_routing helpers."""
 
 from types import SimpleNamespace
 
 import pytest
 
-from tpu_inference.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing
 
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):
@@ -44,7 +44,8 @@ def test_get_experts_start_matches_determine_expert_map(
         ep_size, global_num_experts):
     """Parity against vLLM's linear-placement contract for every rank."""
     determine_expert_map = pytest.importorskip(
-        "vllm.model_executor.layers.fused_moe.layer").determine_expert_map
+        "vllm.model_executor.layers.fused_moe.expert_map_manager"
+    ).determine_expert_map
     for ep_rank in range(ep_size):
         _, expert_map, _ = determine_expert_map(
             ep_size=ep_size,
