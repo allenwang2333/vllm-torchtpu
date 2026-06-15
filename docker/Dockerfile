@@ -46,6 +46,10 @@ COPY pyproject.toml .
 # Hide torch-tpu to allow resolution of other dependencies.
 RUN cp pyproject.toml /tmp/pyproject.toml && sed -i '/torch-tpu==/d' pyproject.toml
 
+# Create dummy src directory and README.md to satisfy setuptools metadata validation
+# without invalidating Docker build cache on source code changes.
+RUN mkdir -p src/vllm_torchtpu && touch src/vllm_torchtpu/__init__.py README.md
+
 ARG VLLM_SOURCE
 # Copy vllm source (might be empty if not provided)
 COPY vllm /root/tpu_inference/vllm
