@@ -455,6 +455,13 @@ class ZmqShmKvConnectorBase:
             "dtype": str(self._coord_pool_spec.dtype),
             "layer_shard_shape":
             list(self._coord_pool_spec.layer_shard_shape[1:]),
+            # Wire format negotiated by the producer:
+            #   "L" = per-layer frames (one per (rank, layer))
+            #   "B" = bundled frame (one per rank, holds all layers
+            #         in block-major byte order)
+            # Both ends MUST agree at deploy time (same env flag); the
+            # consumer rejects mismatched wire mode with a clear error.
+            "wire_mode": "B" if self._block_major_wire else "L",
         }
 
     def _replace_runner_kv_cache(self, layer_idx: int,
@@ -482,6 +489,47 @@ class ZmqShmKvConnectorBase:
         for layer in static_forward_context.values():
             if getattr(layer, "kv_cache", None) is old_cache:
                 layer.kv_cache = new_cache
+
+    def _replace_runner_kv_cache_bundle(self,
+                                        new_bundle: torch.Tensor) -> None:
+        """Block-major analogue of ``_replace_runner_kv_cache``: after
+        a bundled scatter returns a new (donated, aliased) bundle, swap
+        the runner's ``_kv_cache_bundle`` reference AND rebind every
+        per-layer view in ``runner.kv_caches`` plus each attention
+        layer's static forward context. Attention forward reads through
+        ``ctx.kv_cache_bundle`` so the bundle replacement is the
+        load-bearing one; the per-layer view refresh is for any
+        shape/dtype probes that still look at ``runner.kv_caches[i]``.
+        """
+        assert self.runner is not None
+        old_bundle = getattr(self.runner, "_kv_cache_bundle", None)
+        if old_bundle is None:
+            raise RuntimeError(
+                "_replace_runner_kv_cache_bundle: runner has no "
+                "_kv_cache_bundle; this helper is block-major-only.")
+        layer_index = self.runner._kv_cache_bundle_layer_index
+        self.runner._kv_cache_bundle = new_bundle
+
+        kv_caches = self.runner.kv_caches
+        compilation_config = getattr(self.vllm_config, "compilation_config",
+                                     None)
+        static_forward_context = getattr(compilation_config,
+                                         "static_forward_context", None)
+        if not isinstance(static_forward_context, dict):
+            static_forward_context = {}
+        layer_name_by_idx: dict[int, str] = {}
+        for name, idx in layer_index.items():
+            layer_name_by_idx[idx] = name
+
+        for idx in range(len(kv_caches)):
+            new_view = new_bundle[:, idx]
+            old_view = kv_caches[idx]
+            kv_caches[idx] = new_view
+            # vLLM attention layers may reference the old per-layer view;
+            # refresh whichever still match.
+            for layer in static_forward_context.values():
+                if getattr(layer, "kv_cache", None) is old_view:
+                    layer.kv_cache = new_view
 
     def _warmup_block_sizes(self) -> list[int]:
         """Block count to pre-compile: the worst-case max_blocks only."""
@@ -533,31 +581,60 @@ class ZmqShmKvConnectorBase:
         slot_idx = 0
         if self.is_producer:
             self._stage_d2h_sync(slot_idx, num_blocks, list(range(num_blocks)))
-        else:
-            # Mirror _coord_scatter_shard exactly. An earlier
-            # `.to(device)` warmup compiled a different HLO than the hot
-            # path (batch_transfer_h2d into a pre-allocated torch.empty),
-            # so the first real request paid a 3-8s recompile.
-            use_kv_scatter = self._kv_scatter_enabled
-            src_views = [
-                self._coord_pool.layer_view(slot_idx, self.local_tp_rank,
-                                            layer_idx, num_blocks)
-                for layer_idx in range(len(kv_caches))
-            ]
-            h2d_future, device_shards = self._h2d_into_device_async(src_views)
-            self._wait_stage(h2d_future)
-            if use_kv_scatter:
-                new_caches = self._try_fast_scatter(device_shards,
-                                                    list(kv_caches),
-                                                    list(range(num_blocks)))
-                for c in new_caches:
-                    self._synchronize_device(c)
-                for i, c in enumerate(new_caches):
-                    self._replace_runner_kv_cache(i, c)
+            return
+        if self._block_major_wire:
+            # Block-major consumer warmup: mirror
+            # _coord_scatter_shard_bundled exactly. Single H2D of the
+            # bundled per-rank view + single bundled scatter compile.
+            from vllm_torchtpu.distributed.kv_transfer import \
+                kv_scatter as _kv_scatter  # local
+            src_view = self._coord_pool.bundle_view(slot_idx,
+                                                    self.local_tp_rank,
+                                                    num_blocks)
+            device_staging = self._h2d_into_device([src_view])[0]
+            if _kv_scatter.scatter_available() and self._kv_scatter_enabled:
+                dest_blocks_dev = torch.tensor(list(range(num_blocks)),
+                                               dtype=torch.int32,
+                                               device=self.device)
+                prebuilt = _kv_scatter.prepare_scatter_args(
+                    dest_blocks_dev, self.device)
+                new_bundle = _kv_scatter.single_bundle_scatter_into(
+                    device_staging,
+                    self.runner._kv_cache_bundle,
+                    dest_blocks_dev,
+                    prebuilt_args=prebuilt)
+                self._synchronize_device(new_bundle)
+                self._replace_runner_kv_cache_bundle(new_bundle)
             else:
-                for layer_idx, cache in enumerate(kv_caches):
-                    cache.index_put_((indices, ), device_shards[layer_idx])
-                    self._synchronize_device(cache)
+                bundle = self.runner._kv_cache_bundle
+                for layer_idx in range(len(kv_caches)):
+                    bundle[:, layer_idx].index_put_(
+                        (indices, ), device_staging[:, layer_idx])
+                    self._synchronize_device(bundle)
+            return
+        # Layer-major path: mirror _coord_scatter_shard exactly. An
+        # earlier `.to(device)` warmup compiled a different HLO than the
+        # hot path (batch_transfer_h2d into a pre-allocated torch.empty),
+        # so the first real request paid a 3-8s recompile.
+        use_kv_scatter = self._kv_scatter_enabled
+        src_views = [
+            self._coord_pool.layer_view(slot_idx, self.local_tp_rank,
+                                        layer_idx, num_blocks)
+            for layer_idx in range(len(kv_caches))
+        ]
+        h2d_future, device_shards = self._h2d_into_device_async(src_views)
+        self._wait_stage(h2d_future)
+        if use_kv_scatter:
+            new_caches = self._try_fast_scatter(device_shards, list(kv_caches),
+                                                list(range(num_blocks)))
+            for c in new_caches:
+                self._synchronize_device(c)
+            for i, c in enumerate(new_caches):
+                self._replace_runner_kv_cache(i, c)
+        else:
+            for layer_idx, cache in enumerate(kv_caches):
+                cache.index_put_((indices, ), device_shards[layer_idx])
+                self._synchronize_device(cache)
 
     # ---- Main dispatch driven by start_load_kv --------------------------
     def process_send_load(self, metadata: TPUConnectorMetadata):
@@ -620,11 +697,13 @@ class ZmqShmKvConnectorBase:
         per_slot_bytes = self.ranks_per_host * self.num_layers * per_layer_bytes
         budget_bytes = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         num_slots = max(1, budget_bytes // per_slot_bytes)
+        block_major = self._runner_uses_block_major_bundle()
         logger.info(
-            "TPUConnectorWorker(%s) rank=%d (local_rank=%d)--> shm pool budget=%.2fGB "
-            "per_slot=%.2fMB -> num_slots=%d", self.node_id, self.tp_rank,
-            self.local_tp_rank, budget_bytes / (1024**3),
-            per_slot_bytes / (1024**2), num_slots)
+            "TPUConnectorWorker(%s) rank=%d (local_rank=%d) --> shm pool "
+            "budget=%.2fGB per_slot=%.2fMB -> num_slots=%d block_major=%s",
+            self.node_id, self.tp_rank, self.local_tp_rank,
+            budget_bytes / (1024**3), per_slot_bytes / (1024**2), num_slots,
+            block_major)
 
         return PoolSpec(
             num_slots=num_slots,
@@ -633,7 +712,23 @@ class ZmqShmKvConnectorBase:
             max_blocks=max_blocks,
             layer_shard_shape=layer_shard_shape,
             dtype=kv_layer.dtype,
+            block_major=block_major,
         )
+
+    def _runner_uses_block_major_bundle(self) -> bool:
+        """True when the runner allocated a block-major KV bundle. The
+        connector then negotiates the bundled wire format (one ZMQ
+        frame per rank, single DMA on each end) instead of the per-
+        layer wire format. Subclasses (the TPU connector) override
+        this via the runner's ``_kv_cache_bundle`` attribute."""
+        return getattr(self.runner, "_kv_cache_bundle", None) is not None
+
+    @property
+    def _block_major_wire(self) -> bool:
+        """Convenience: True when this worker's pool spec is block-major.
+        Set after ``_coord_setup`` populates ``_coord_pool_spec``."""
+        spec = getattr(self, "_coord_pool_spec", None)
+        return bool(spec is not None and getattr(spec, "block_major", False))
 
     def _pool_create(self, spec: Any, shm_name: str) -> Any:
         """Rank-0: create the per-host shm pool."""
@@ -1370,17 +1465,38 @@ class ZmqShmKvConnectorBase:
                     "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f", h,
                     ch, entry.uuid, time.time())
 
-                # Wire format after OK:
+                # Wire format after OK (see producer's
+                # _coord_rank0_build_pull_response):
                 #   frames[1]=uuid echo, frames[2]=n_ranks ascii
-                #   ch 0: frames[3]=header, then per-rank blocks
+                #   ch 0: frames[3]=header pickle, then per-rank blocks
                 #   ch >0: per-rank blocks start at frames[3]
-                # Per-rank block = (rank_idx, layer0, layer1, ..., layer_{L-1})
+                # Per-rank block depends on header['wire_mode']:
+                #   'L' (layer-major): (rank_idx, layer0, ..., layer_{L-1})
+                #   'B' (bundle):       (rank_idx, bundle_blob)
+                # Mode must match both ends; channels > 0 use the
+                # consumer's own _block_major_wire (set at register_runner
+                # time) and ch 0 cross-checks against the header.
                 n_ranks = int(bytes(frames[2].buffer).decode("utf-8"))
                 idx = 3
                 header_frame: Optional[zmq.Frame] = None
+                bundled = self._block_major_wire
                 if ch == 0:
                     header_frame = frames[idx]
                     idx += 1
+                    try:
+                        header = pickle.loads(bytes(header_frame.buffer))
+                    except Exception as parse_exc:
+                        raise RuntimeError(
+                            f"PULL ch={ch} header parse failed: "
+                            f"{parse_exc!r}") from parse_exc
+                    producer_mode = header.get("wire_mode", "L")
+                    consumer_mode = "B" if bundled else "L"
+                    if producer_mode != consumer_mode:
+                        raise RuntimeError(
+                            f"PULL ch={ch} wire_mode mismatch: producer="
+                            f"{producer_mode!r} consumer={consumer_mode!r}. "
+                            "Both ends must enable VLLM_TPU_BLOCK_MAJOR_KV "
+                            "(or both must disable it).")
 
                 ranks_handled: list[int] = []
                 # Construct reverse mapping global_rank -> local_rank
@@ -1395,16 +1511,25 @@ class ZmqShmKvConnectorBase:
                     global_rank = int(
                         bytes(frames[idx].buffer).decode("utf-8"))
                     idx += 1
-                    layer_buffers = [
-                        frames[idx + li].buffer for li in range(num_layers)
-                    ]
-                    idx += num_layers
+                    if bundled:
+                        bundle_buf = frames[idx].buffer
+                        idx += 1
+                    else:
+                        layer_buffers = [
+                            frames[idx + li].buffer for li in range(num_layers)
+                        ]
+                        idx += num_layers
 
                     if global_rank in global_to_local:
                         local_rank = global_to_local[global_rank]
-                        self._coord_pool.unpack_rank_layers(
-                            entry.slot_idx, local_rank, entry.num_blocks,
-                            layer_buffers)
+                        if bundled:
+                            self._coord_pool.unpack_rank_bundle(
+                                entry.slot_idx, local_rank, entry.num_blocks,
+                                bundle_buf)
+                        else:
+                            self._coord_pool.unpack_rank_layers(
+                                entry.slot_idx, local_rank, entry.num_blocks,
+                                layer_buffers)
                         ranks_handled.append(global_rank)
                 t_unpack_done = time.perf_counter()
                 wire_ms = (t_wire_done - t0) * 1000.0
@@ -1555,15 +1680,24 @@ class ZmqShmKvConnectorBase:
                              local_blocks: list[int]) -> None:
         """H2D + scatter this rank's shard from shm into the kv cache.
 
-        Two paths:
-          * Multi-layer fused scatter (default when ``_kv_scatter_enabled``):
+        Three paths:
+          * Block-major bundled (when ``_block_major_wire``): single H2D
+            of the per-rank bundle ``[num_blocks, num_layers, *trailing]``
+            into one device tensor, then a single
+            ``single_bundle_scatter_into`` writes all layers in one
+            dispatch. The bundle is donated+aliased to its output.
+          * Layer-major fused (default when ``_kv_scatter_enabled``):
             sync H2D into freshly allocated device buffers, then one fused
             ``_try_fast_scatter`` call writes all layers at once with each
             destination donated+aliased to its output.
-          * Naive fallback (smoke test failed): async H2D + explicit wait
-            so issue/wait timings are observable, then per-layer
+          * Layer-major naive (smoke test failed): async H2D + explicit
+            wait so issue/wait timings are observable, then per-layer
             ``index_put_`` followed by ``_synchronize_device``."""
         if not local_blocks:
+            return
+        if self._block_major_wire:
+            self._coord_scatter_shard_bundled(slot_idx, num_blocks,
+                                              local_blocks)
             return
         kv_caches = self.runner.kv_caches
         use_fast_scatter = self._kv_scatter_enabled
@@ -1649,6 +1783,77 @@ class ZmqShmKvConnectorBase:
             "h2d_wait=%.2fms insert=%.2fms h2d_throughput=%.2fMiB/s path=%s",
             self.node_id, self.tp_rank, slot_idx, num_blocks, len(kv_caches),
             alloc_ms_total, h2d_ms_total, h2d_issue_ms, h2d_wait_ms,
+            insert_ms_total, h2d_mbps, path)
+
+    def _coord_scatter_shard_bundled(self, slot_idx: int, num_blocks: int,
+                                     local_blocks: list[int]) -> None:
+        """Block-major scatter: one H2D for the full per-rank bundle,
+        one ``single_bundle_scatter_into`` dispatch into the HBM bundle.
+
+        Falls back to per-layer ``index_put_`` (looping over the bundle's
+        per-layer strided views) if the bundle-scatter kernel is not
+        available."""
+        from vllm_torchtpu.distributed.kv_transfer import kv_scatter  # local
+        runner = self.runner
+        bundle = runner._kv_cache_bundle
+        kv_caches = runner.kv_caches
+        alloc_t0 = time.perf_counter()
+        src_view = self._coord_pool.bundle_view(slot_idx, self.local_tp_rank,
+                                                num_blocks)
+        h2d_total_bytes = src_view.numel() * src_view.element_size()
+        alloc_t1 = time.perf_counter()
+
+        h2d_t0 = time.perf_counter()
+        device_staging = self._h2d_into_device([src_view])[0]
+        h2d_t1 = time.perf_counter()
+
+        path: str
+        if kv_scatter.scatter_available() and self._kv_scatter_enabled:
+            dest_blocks_dev = torch.tensor(local_blocks,
+                                           dtype=torch.int32,
+                                           device=self.device)
+            prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev,
+                                                       self.device)
+            new_bundle = kv_scatter.single_bundle_scatter_into(
+                device_staging,
+                bundle,
+                dest_blocks_dev,
+                prebuilt_args=prebuilt)
+            self._synchronize_device(new_bundle)
+            self._replace_runner_kv_cache_bundle(new_bundle)
+            path = "kv_scatter_bundled"
+        else:
+            # Fallback: scatter each layer via index_put_ on the strided
+            # per-layer view. The view writes through to the bundle's
+            # storage so we don't need to publish a new bundle ref.
+            indices = torch.tensor(local_blocks,
+                                   dtype=torch.int64,
+                                   device=self.device)
+            for layer_idx in range(len(kv_caches)):
+                # device_staging[:, layer_idx] gives the per-layer slice
+                # at the SHM-arrived blocks (dim 0). Then scatter into
+                # the bundle's per-layer view at local_blocks.
+                bundle[:, layer_idx].index_put_((indices, ),
+                                                device_staging[:, layer_idx])
+                self._synchronize_device(bundle)
+            path = "index_put_bundled"
+        k_wait_t = time.perf_counter()
+        h2d_ms_total = (h2d_t1 - h2d_t0) * 1000.0
+        h2d_issue_ms = h2d_ms_total
+        insert_ms_total = (k_wait_t - h2d_t1) * 1000.0
+        alloc_ms_total = (alloc_t1 - alloc_t0) * 1000.0
+        self._lat.record(_LAT_H2D, h2d_ms_total)
+        self._lat.record(_LAT_INSERT, insert_ms_total)
+        self._lat.record(_LAT_SCATTER, h2d_ms_total + insert_ms_total)
+        self.transfer_stats.record_h2d_transfer(h2d_ms_total)
+        h2d_mb = h2d_total_bytes / (1024 * 1024)
+        h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
+        logger.info(
+            "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%d "
+            "layers=%d alloc=%.2fms h2d=%.2fms h2d_issue=%.2fms "
+            "h2d_wait=0.00ms insert=%.2fms h2d_throughput=%.2fMiB/s "
+            "path=%s", self.node_id, self.tp_rank, slot_idx, num_blocks,
+            len(kv_caches), alloc_ms_total, h2d_ms_total, h2d_issue_ms,
             insert_ms_total, h2d_mbps, path)
 
     def _coord_rank0_register_copy(self, uuid: int, rank_idx: int = 0) -> None:
@@ -2126,15 +2331,22 @@ class ZmqShmKvConnectorBase:
                 "stage_failed; sending ERR", self.node_id, channel_idx, uuid)
             return None
         # Wire format (per channel, after the ROUTER envelope):
+        #
+        # Layer-major (wire_mode='L'):
         #   ch 0:  [OK, uuid, n_ranks, header,
         #            (rank_idx, layer_mv_0, ..., layer_mv_{L-1})*]
         #   ch >0: [OK, uuid, n_ranks,
         #            (rank_idx, layer_mv_0, ..., layer_mv_{L-1})*]
-        # Each layer_mv is a memoryview straight into the shm slot for
-        # that (rank, layer); there is no bytearray/bytes staging on
-        # the producer. Consumer knows num_layers from self.num_layers
-        # so it doesn't need to be inline; the header on ch 0 carries
-        # the sanity-check metadata.
+        #
+        # Bundled (wire_mode='B'):
+        #   ch 0:  [OK, uuid, n_ranks, header, (rank_idx, bundle_mv)*]
+        #   ch >0: [OK, uuid, n_ranks, (rank_idx, bundle_mv)*]
+        #
+        # Each layer_mv / bundle_mv is a memoryview straight into the
+        # shm slot for that rank; there is no bytearray/bytes staging on
+        # the producer. The wire mode lives in the header (channel 0);
+        # the producer always emits in its negotiated mode, and the
+        # consumer requires the modes to match.
         frames: list = [
             _MSG_OK, uuid_bytes,
             str(len(ranks_on_channel)).encode("utf-8")
@@ -2144,13 +2356,20 @@ class ZmqShmKvConnectorBase:
             frames.append(
                 pickle.dumps(header, protocol=pickle.HIGHEST_PROTOCOL))
         total_bytes = 0
+        bundled = self._block_major_wire
         for r in ranks_on_channel:
             global_rank = self._coord_local_to_global_rank[r]
             frames.append(str(global_rank).encode("utf-8"))
-            layer_views = self._coord_pool.rank_layer_views(
-                entry.slot_idx, r, entry.num_blocks)
-            frames.extend(layer_views)
-            total_bytes += sum(len(v) for v in layer_views)
+            if bundled:
+                bundle_mv = self._coord_pool.rank_bundle_view(
+                    entry.slot_idx, r, entry.num_blocks)
+                frames.append(bundle_mv)
+                total_bytes += len(bundle_mv)
+            else:
+                layer_views = self._coord_pool.rank_layer_views(
+                    entry.slot_idx, r, entry.num_blocks)
+                frames.extend(layer_views)
+                total_bytes += sum(len(v) for v in layer_views)
         self.transfer_stats.record_mb_transferred(total_bytes / (1024 * 1024))
         logger.info(
             "TPUConnectorWorker(%d) rank0 --> serving PULL ch=%d uuid=%s "

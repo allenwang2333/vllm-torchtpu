@@ -136,8 +136,43 @@ if _jax_import_error is None:
             donate_argnums=donate_argnums,
         )
 
+    @functools.lru_cache(maxsize=4)
+    def _make_single_bundle_scatter_kernel():
+        """Block-major variant: bundle has shape
+        ``[num_blocks, num_layers, ...]`` and src has shape
+        ``[num_src_blocks, num_layers, ...]``. The same per-block async
+        copy body works -- we treat the layer axis as part of the trailing
+        per-block payload. One pallas_call total (vs. N for the layer-major
+        path). The destination bundle is donated and aliases the output."""
+
+        def _jax_single_bundle_scatter(num_chunks, src_offsets, dest_offsets,
+                                       src, dst):
+            return pl.pallas_call(
+                _scatter_kernel_body,
+                out_shape=jax.ShapeDtypeStruct(shape=dst.shape,
+                                               dtype=dst.dtype),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    grid=(1, ),
+                    num_scalar_prefetch=3,
+                    in_specs=[
+                        pl.BlockSpec(memory_space=pl.ANY),
+                        pl.BlockSpec(memory_space=pl.ANY),
+                    ],
+                    out_specs=pl.BlockSpec(memory_space=pl.ANY),
+                ),
+                input_output_aliases={4: 0},
+            )(num_chunks, src_offsets, dest_offsets, src, dst)
+
+        return ttpu_pallas.custom_jax_kernel(
+            _jax_single_bundle_scatter,
+            name="kv_d2d_single_bundle_scatter",
+            input_output_aliases={4: 0},
+            donate_argnums=(4, ),
+        )
+
 else:  # pragma: no cover
     _make_multi_layer_scatter_kernel = None  # type: ignore[assignment]
+    _make_single_bundle_scatter_kernel = None  # type: ignore[assignment]
 
 
 def prepare_scatter_args(
@@ -190,6 +225,74 @@ def multi_layer_scatter_into(
     if isinstance(result, (list, tuple)):
         return list(result)
     return [result]
+
+
+def single_bundle_scatter_into(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    local_blocks: torch.Tensor,
+    *,
+    prebuilt_args: Optional[tuple[torch.Tensor, torch.Tensor,
+                                  torch.Tensor]] = None,
+) -> torch.Tensor:
+    """Scatter ``src[i]`` into ``dst[local_blocks[i]]`` for all blocks ``i``,
+    in one kernel dispatch. Used for the block-major KV bundle, where
+    src has shape ``[num_src_blocks, num_layers, ...]`` and dst has shape
+    ``[num_dst_blocks, num_layers, ...]``. ``dst`` is donated and the
+    returned tensor aliases it.
+    """
+    if _jax_import_error is not None:
+        raise RuntimeError(
+            f"KV single-bundle scatter unavailable: {_jax_import_error!r}")
+    num_blocks = int(local_blocks.shape[0])
+    if num_blocks == 0:
+        return dst
+    if prebuilt_args is not None:
+        num_chunks, src_offsets, dest_offsets = prebuilt_args
+    else:
+        num_chunks, src_offsets, dest_offsets = prepare_scatter_args(
+            local_blocks, dst.device)
+    kernel = _make_single_bundle_scatter_kernel()
+    result = kernel(num_chunks, src_offsets, dest_offsets, src, dst)
+    if isinstance(result, (list, tuple)):
+        return result[0]
+    return result
+
+
+def smoke_test_single_bundle_scatter(
+        device: torch.device,
+        num_layers: int = 4,
+        num_blocks: int = 4,
+        trailing_shape: tuple[int, ...] = (16, 2, 128),
+        dtype: torch.dtype = torch.bfloat16) -> bool:
+    """Round-trip a small single-bundle scatter and verify per-layer
+    contents. Returns False on any mismatch or exception."""
+    if _jax_import_error is not None:
+        logger.warning("KV single-bundle scatter smoke test skipped: %s",
+                       _jax_import_error)
+        return False
+    try:
+        src_shape = (num_blocks, num_layers) + trailing_shape
+        dst_shape = (num_blocks * 2, num_layers) + trailing_shape
+        src_cpu = torch.randn(src_shape).to(dtype)
+        src = src_cpu.to(device)
+        dst = torch.zeros(dst_shape, dtype=dtype, device=device)
+        local_blocks = torch.tensor(list(
+            range(num_blocks * 2 - 1, num_blocks - 1, -1)),
+                                    dtype=torch.int32,
+                                    device=device)
+        out = single_bundle_scatter_into(src, dst, local_blocks)
+        out_cpu = out.cpu()
+        expected = torch.zeros(dst_shape, dtype=dtype)
+        for i, idx in enumerate(local_blocks.tolist()):
+            expected[idx] = src_cpu[i]
+        if not torch.equal(out_cpu, expected):
+            logger.warning("KV single-bundle scatter smoke test mismatch")
+            return False
+        return True
+    except Exception as e:
+        logger.warning("KV single-bundle scatter smoke test raised: %r", e)
+        return False
 
 
 def smoke_test_multi_layer_scatter(

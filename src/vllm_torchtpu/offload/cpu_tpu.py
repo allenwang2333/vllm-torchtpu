@@ -1339,6 +1339,36 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             )
             per_block_shape = tuple(full_5d_shape[1:])
 
+            # Cross-layer bundle detection: vLLM's
+            # OffloadingConnectorWorker.register_cross_layers_kv_cache
+            # produces a single CanonicalKVCacheTensor whose
+            # page_size_bytes is num_layers x per-layer page bytes
+            # (offloading/worker.py:200-204), because all layers share
+            # one storage in the block-major bundle layout. Reflect
+            # that in the rebuilt 5D view by inserting num_layers as
+            # the second physical dim; downstream stride(0) then
+            # naturally accounts for all layers per block so the DMA
+            # transfers one bundled block at a time.
+            assert len(kv_caches.tensors) >= 1
+            actual_page_bytes = kv_caches.tensors[0].page_size_bytes
+            per_layer_page_bytes = spec0.page_size_bytes
+            assert actual_page_bytes % per_layer_page_bytes == 0, (
+                f"CanonicalKVCacheTensor page_size_bytes "
+                f"({actual_page_bytes}) is not a multiple of the "
+                f"per-layer spec page_size_bytes ({per_layer_page_bytes})")
+            layers_per_canonical = actual_page_bytes // per_layer_page_bytes
+            if layers_per_canonical > 1:
+                per_block_shape = (layers_per_canonical, ) + per_block_shape
+                logger.info(
+                    "[kv-offload] Cross-layer bundle detected: "
+                    "page_size_bytes=%d = %d layers x %d per-layer; "
+                    "per_block_shape now %s",
+                    actual_page_bytes,
+                    layers_per_canonical,
+                    per_layer_page_bytes,
+                    per_block_shape,
+                )
+
             self._tpu_handlers = CpuTpuOffloadingHandlers(
                 gpu_block_size=gpu_block_size,
                 cpu_block_size=offloaded_block_size,

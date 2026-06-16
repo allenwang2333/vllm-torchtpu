@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    VLLM_TPU_BLOCK_MAJOR_KV: bool = False
 
 
 def env_with_choices(
@@ -226,6 +227,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES":
     lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Opt-in: allocate the KV cache as one bundled tensor of shape
+    # [num_blocks, num_layers, block_size, K2/p, p, H] (block-major: each
+    # block's all-layer payload is contiguous in HBM) and route every
+    # attention forward through `ragged_paged_attention_bundled` (the
+    # bundle stays a top-level allocation so JAX-level donation works).
+    #
+    # Disagg KV connector: collapses N per-layer HBM gathers + N per-
+    # layer DMAs into a single bundled gather + single per-rank DMA.
+    # Both ends MUST share the flag value — the shm pool layout, frame
+    # count per rank, and consumer scatter all switch in lockstep; mode
+    # is encoded in the pull-response header (`wire_mode='B'` for bundle,
+    # `'L'` for layer-major) and a mismatch produces a clean error
+    # pointing at this env var. Microbench (Qwen3-0.6B): 27× HBM gather,
+    # 1.3-1.5× end-to-end gather + D2H at 64-block payload.
+    #
+    # Correctness AND per-step perf under torch.compile are delivered
+    # by the combination of:
+    #   * torch_tpu's `pallas.declare_jax_op(..., inplace_donate=True)`
+    #     + the `inplace_donate_ssa_rename` FX pass (each per-layer
+    #     pallas op call donates a fresh SSA value to satisfy XLA, and
+    #     the chain's terminus is plumbed as an executable-level
+    #     output whose buffer is rebound onto the runner's
+    #     `_kv_cache_bundle` Python reference after the executable
+    #     runs), and
+    #   * the reshape-and-reindex implementation of
+    #     `ragged_paged_attention_bundled` in
+    #     `kernels/ragged_paged_attention/v3/{kernel,kernel_hd64}.py`
+    #     which flattens the bundle
+    #     ``[num_pages, num_layers, page_size, ...]`` →
+    #     ``[num_pages * num_layers, page_size, ...]`` (a no-copy view)
+    #     and offsets the page indices into bundle-flat namespace as
+    #     ``pi * num_layers + layer_idx``. The inner per-layer kernel
+    #     then writes only the touched layer's slot in HBM in-place;
+    #     no `dynamic_update_slice` is emitted at the JAX/HLO level
+    #     and per-step bandwidth equals the layer-major path.
+    #
+    # Bench on Qwen3-0.6B (TPU7x, single chip): block-major
+    # 0.135 s/iter / 3764 tok/s vs layer-major 0.142 s/iter / 3603
+    # tok/s. Block-major is at parity (slightly faster in practice on
+    # this model — the bundle's contiguous all-layer-per-block layout
+    # interacts well with the per-token access pattern). For
+    # deployments where the disagg connector D2H/H2D win matters,
+    # block-major is now a free choice.
+    #
+    # Requires homogeneous attention layers (no Mamba/HMA, no SPMD).
+    "VLLM_TPU_BLOCK_MAJOR_KV":
+    env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
 }
 
 

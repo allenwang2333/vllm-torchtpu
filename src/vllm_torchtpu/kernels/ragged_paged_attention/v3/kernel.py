@@ -1922,3 +1922,85 @@ def ragged_paged_attention(
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
         kv_cache,
     )
+
+
+@jax.jit(
+    static_argnames=(
+        "use_causal_mask",
+        "skip_kv_mask",
+        "sm_scale",
+        "sliding_window",
+        "soft_cap",
+        "out_dtype",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "d_block_sizes",
+        "p_block_sizes",
+        "m_block_sizes",
+        "vmem_limit_bytes",
+        "debug_mode",
+        "disable_bounds_checks",
+        "disable_semaphore_checks",
+    ),
+    donate_argnames=("queries", "keys", "values", "kv_cache_bundle"),
+)
+def ragged_paged_attention_bundled(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache_bundle: jax.
+    Array,  # [num_pages, num_layers, page_size, K2/p, p, H]
+    layer_idx: jax.Array,  # i32 scalar, dynamic
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    **kwargs,
+):
+    """Block-major variant of ragged_paged_attention.
+
+    Eliminates the bundle-bandwidth ``dynamic_update_slice`` tax of the
+    prior slice→pallas→DUS implementation by reshaping the bundle
+    ``[num_pages, num_layers, page_size, ...]`` to the flat per-layer
+    page space ``[num_pages * num_layers, page_size, ...]`` (a view: no
+    copy, the underlying buffer is unchanged) and offsetting the
+    caller's per-layer page indices into the bundle-flat namespace:
+
+      flat_page_indices[i] = page_indices[i] * num_layers + layer_idx
+
+    Because the bundle is laid out block-major (axis 0 = num_pages
+    outermost, axis 1 = num_layers next), logical entry
+    ``bundle[page, layer]`` lives at flat row ``page * num_layers +
+    layer`` in HBM. Reshape is therefore a pure metadata change and the
+    flat-page indices select exactly the bytes the kernel touches for
+    this layer.
+
+    Bundle layout is block-major: num_pages outermost so each block's
+    all-layer payload is contiguous in HBM. The connector's KV-transfer
+    path leverages this for a single bundled HBM gather per rank.
+
+    The inner per-layer kernel writes only the touched layer's slot
+    in-place; the other (num_layers - 1) layers' bytes are never read
+    or written. Donation flows through the reshape (a no-copy view), so
+    the bundled function's ``new_bundle`` output aliases
+    ``kv_cache_bundle``'s storage with ``layer_idx``'s slot replaced by
+    the updated KV cache and every other slot untouched. No
+    ``dynamic_update_slice`` is emitted at the JAX/HLO level — the
+    per-layer HBM update is the only memory traffic, matching the
+    layer-major bandwidth profile exactly.
+    """
+    num_blocks = kv_cache_bundle.shape[0]
+    num_layers = kv_cache_bundle.shape[1]
+    flat_bundle = kv_cache_bundle.reshape(num_blocks * num_layers,
+                                          *kv_cache_bundle.shape[2:])
+    flat_page_indices = page_indices * num_layers + layer_idx
+    out, new_flat_bundle = ragged_paged_attention(queries, keys, values,
+                                                  flat_bundle, kv_lens,
+                                                  flat_page_indices, cu_q_lens,
+                                                  distribution, **kwargs)
+    new_bundle = new_flat_bundle.reshape(num_blocks, num_layers,
+                                         *new_flat_bundle.shape[1:])
+    return out, new_bundle

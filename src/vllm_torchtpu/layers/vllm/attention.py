@@ -17,8 +17,10 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
+import vllm_torchtpu.envs as tpu_envs
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, ragged_paged_attention, ragged_paged_attention_batched)
+    attention, attention_bundled, ragged_paged_attention,
+    ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
                                                       quantize_kv)
@@ -234,6 +236,90 @@ def _pallas_rpa_kernel_local(
     )
 
 
+def _pallas_rpa_kernel_bundled_impl(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    metadata = AttentionMetadata(
+        input_positions=None,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        request_distribution=request_distribution,
+    )
+    new_bundle, outputs = attention_bundled(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        metadata,
+        mesh,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sinks=sinks,
+        attention_chunk_size=sliding_window,
+    )
+    return new_bundle, outputs
+
+
+def _pallas_rpa_kernel_default_bundled(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    """Block-major (bundled) Pallas RPA kernel entry — used by
+    `PallasAttentionBackendImpl` when `VllmModelWrapperContext.kv_cache_bundle`
+    is set. Same signature as the default entry, except the first arg is
+    the whole bundle and the second is a dynamic int32 scalar layer_idx.
+    """
+    return _pallas_rpa_kernel_bundled_impl(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
+    )
+
+
 def _pallas_rpa_kernel_batched(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -344,6 +430,22 @@ class PallasAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
+        # Maps physical_pos -> logical_dim. Per-layer logical shape is
+        # (num_blocks, block_size, K2/p, p, H); when num_layers is included
+        # vLLM prepends it logically, so logical dims are
+        # (num_layers=0, num_blocks=1, block_size=2, K2/p=3, p=4, H=5).
+        # We want num_blocks at physical dim 0 and num_layers at physical
+        # dim 1 so the bundle is (num_blocks, num_layers, ...) — each
+        # block's all-layer payload is contiguous, matching the existing
+        # _kv_cache_bundle layout. stride_order[0] != 0 signals to
+        # use_uniform_kv_cache() that we support the cross-layer layout.
+        if include_num_layers_dimension:
+            return (1, 0, 2, 3, 4, 5)
+        return (0, 1, 2, 3, 4)
+
+    @staticmethod
     def get_kv_cache_page_size_bytes(
         block_size: int,
         num_kv_heads: int,
@@ -447,6 +549,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
 
+    # Bundled (block-major) RPA kernel entry; same signature as the
+    # default but takes the whole KV cache bundle plus a dynamic
+    # layer_idx scalar. Registered separately so it doesn't collide with
+    # the layer-major op in the shared registry.
+    _kernel_entry_bundled: ClassVar = staticmethod(
+        _pallas_rpa_kernel_default_bundled)
+    _kernel_op_prefix_bundled: ClassVar[str] = "pallas::rpa_kernel_bundled"
+
+    # Class-level registry of declared bundled CustomOpDefs, keyed by
+    # `(prefix, sliding_window)` (the only attributes known at
+    # `__init__` time that affect the JAX kernel choice). All attention
+    # layers with the same key share one declared op + one bound
+    # JaxCallable, mirroring the layer-major `_kernel_registry` sharing
+    # pattern. The shared op is bound exactly once (in the first
+    # layer's `setup_bundled` to fire). Heterogeneous KV scales (fp8)
+    # are not supported by this sharing yet.
+    _bundled_op_registry: ClassVar[dict] = {}
+
     def __init__(
         self,
         num_heads: int,
@@ -496,6 +616,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
+        # Block-major bundled kernel.
+        #
+        # Declared here (at attention __init__) so the `CustomOpDef`'s
+        # `OpOverload` exists in the torch.library schema — carrying the
+        # ``_pallas_inplace_donate_argnums`` attribute that
+        # torch_tpu's compile-backend `inplace_donate_ssa_rename` FX
+        # pass keys off — BEFORE vLLM's first compile trace
+        # (profile_run / capture_model). The JAX-side kernel is bound
+        # later in `setup_bundled`, once the bundle exists and the
+        # mesh / KV scales are known. Until bind, eager invocation
+        # raises a clear RuntimeError; during the profile-run trace
+        # the bundled branch is skipped because
+        # ``ctx.kv_cache_bundle is None`` so the op is never invoked.
+        # Gated on VLLM_TPU_BLOCK_MAJOR_KV so layer-major deployments
+        # don't pay the cost — and don't require the torch_tpu build
+        # to ship `pallas.declare_jax_op` / `bind_jax_kernel`.
+        if tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV:
+            self.rpa_kernel_bundled = self._declare_bundled_op()
+        else:
+            self.rpa_kernel_bundled = None
+        self._bundle_layer_idx_tensor: torch.Tensor | None = None
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -658,6 +799,96 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         pcp_mesh = get_pcp_streaming_mesh()
         return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+    def _declare_bundled_op(self):
+        """Declares (but does not bind) the bundled RPA op, sharing one
+        `CustomOpDef` across all attention layers that have the same
+        config knobs known at `__init__` time. The corresponding JAX
+        kernel is bound later in `setup_bundled` once the wrapper-
+        context mesh and per-layer scales are known.
+
+        Sharing matters: with N distinct ops the FX graph contains N
+        distinct `OpOverload` nodes, and torch_tpu lowers each to its
+        own MLIR module with its own JAX trace. Donation chains
+        cleanly through identical-op nodes (cf. the layer-major
+        sharing pattern in `_build_rpa_kernel`); chains across N
+        distinct kernel ops do not, even when the underlying JAX
+        function is byte-identical.
+
+        The fake_fn signature mirrors the tensor args of
+        `_pallas_rpa_kernel_default_bundled` (the static mesh /
+        sliding_window / scales are baked into the bound wrapped_fn
+        via functools.partial and don't appear in the torch op
+        schema). It must not use *args / **kwargs because
+        `torch.library.infer_schema` rejects those forms."""
+
+        key = (self._kernel_op_prefix_bundled, self.sliding_window)
+        existing = self._bundled_op_registry.get(key)
+        if existing is not None:
+            return existing
+
+        def _fake_rpa_op(
+            kv_cache_bundle: torch.Tensor,
+            layer_idx: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            sinks: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.empty_like(kv_cache_bundle), torch.empty_like(query)
+
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"{self._kernel_op_prefix_bundled}_{kernel_instance_id}"
+        op_def = pallas.declare_jax_op(
+            op_name,
+            fake_fn=_fake_rpa_op,
+            donate_argnums=(0, ),
+            inplace_donate=True,
+        )
+        self._bundled_op_registry[key] = op_def
+        return op_def
+
+    def setup_bundled(self, layer_idx: int, bundle_device: torch.device,
+                      layer: "AttentionLayer") -> None:
+        """Binds the JAX kernel into the pre-declared bundled op and
+        pre-allocates the per-layer layer_idx tensor. Called by the
+        runner right after the bundle is allocated, BEFORE
+        torch.compile traces `capture_model`. Mesh / sliding_window /
+        scales are baked into the bound `wrapped_fn`; after bind the
+        op is callable both eagerly and under torch.compile.
+        """
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value != 0.0 and v_scale_value != 0.0:
+                k_scale = k_scale_value
+                v_scale = v_scale_value
+        # Pre-allocate so we don't H2D-copy a scalar on every forward call.
+        self._bundle_layer_idx_tensor = torch.tensor(int(layer_idx),
+                                                     dtype=torch.int32,
+                                                     device=bundle_device)
+
+        # Bind the JAX kernel into the shared op exactly once. Layers
+        # with the same (sliding_window, scales) wrapped_fn share the
+        # binding via `_bundled_op_registry`; the second layer to call
+        # setup_bundled finds the op already bound and skips.
+        lazy = getattr(self.rpa_kernel_bundled, "_pallas_lazy_callable", None)
+        if lazy is not None and lazy._bound is None:
+            ctx = get_vllm_model_wrapper_context()
+            mesh = ctx.mesh
+            wrapped_fn = functools.partial(
+                self._kernel_entry_bundled,
+                mesh=mesh,
+                sliding_window=self.sliding_window,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            pallas.bind_jax_kernel(self.rpa_kernel_bundled, wrapped_fn)
 
     def initialize_kernel(self, layer: AttentionLayer) -> None:
         """Pre-build the RPA kernel before torch.compile traces the model.
@@ -810,6 +1041,37 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # This line will only influence performance, not functionality
         # # Mark kv_cache avaliable for donation
         # pallas.set_buffer_donor_(kv_cache, True)
+
+        # Block-major fast path: when the runner has allocated a bundle
+        # and pre-built our bundled kernel, route through it. The
+        # per-layer `kv_cache` arg passed by vLLM (a view into the
+        # bundle) is intentionally unused on this path — the kernel
+        # operates on the full bundle and the bundle's storage is what
+        # gets updated in place.
+        # Bundled (block-major) path: pre-declared at __init__, the JAX
+        # kernel is bound by `setup_bundled` once the runner has the
+        # bundle. The first sentinel here gates on whether the runner
+        # has actually allocated a bundle (None during profile_run);
+        # under torch.compile Dynamo's guard on this `is not None` check
+        # is what makes capture_model retrace and emit the bundled op
+        # into the FX graph.
+        ctx = get_vllm_model_wrapper_context()
+        if ctx.kv_cache_bundle is not None:
+            _, outputs = self.rpa_kernel_bundled(
+                ctx.kv_cache_bundle,
+                self._bundle_layer_idx_tensor,
+                query,
+                key,
+                value,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                sink,
+            )
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
 
         # Call the operator
         outputs = rpa_kernel(

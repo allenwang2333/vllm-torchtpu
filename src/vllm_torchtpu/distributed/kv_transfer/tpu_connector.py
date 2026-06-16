@@ -475,6 +475,22 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         tpu_tensors: list = []
         cpu_tensors: list = []
         d2h_total_bytes = 0
+        bundle = getattr(self.runner, "_kv_cache_bundle", None)
+        if bundle is not None:
+            # Block-major bundle layout: [num_blocks, num_layers, *trailing].
+            # `bundle[block_ids]` is a single contiguous gather on dim 0:
+            # for each requested block, all-layer bytes are read in one
+            # range. Output shape [len(indices), num_layers, *trailing]
+            # matches the block-major shm rank region produced by
+            # PoolSpec(block_major=True), so a single DMA per rank
+            # transfers the full bundled payload.
+            gather = torch.index_select(bundle, 0, indices)
+            dest_view = self._coord_pool.bundle_view(slot_idx, self.tp_rank,
+                                                     num_blocks)
+            tpu_tensors.append(gather)
+            cpu_tensors.append(dest_view)
+            d2h_total_bytes = dest_view.numel() * dest_view.element_size()
+            return tpu_tensors, cpu_tensors, d2h_total_bytes
         for layer_idx, cache in enumerate(kv_caches):
             src_shard = torch.index_select(cache, 0, indices)
             dest_view = self._coord_pool.layer_view(slot_idx,
@@ -528,6 +544,13 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
             local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
         if not self._kv_scatter_enabled:
             return None
+        # Block-major scatter goes through _coord_scatter_shard_bundled
+        # (single H2D + single_bundle_scatter_into); this layer-major
+        # fast scatter is only used when block-major wire is OFF, so the
+        # bundle should not be visible here. Defensive guard: skip if a
+        # bundle is somehow present.
+        if getattr(self.runner, "_kv_cache_bundle", None) is not None:
+            return None
         dest_blocks_dev = torch.tensor(local_blocks,
                                        dtype=torch.int32,
                                        device=self.device)
@@ -539,11 +562,14 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
                                                    prebuilt_args=prebuilt)
 
     def _maybe_enable_kv_scatter(self) -> None:
-        """Run the startup smoke test for the multi-layer scatter kernel
-        (``kv_scatter``) and flip it on if it passes. Consumer-only. On
-        by default; any failure falls back permanently to ``index_put_``
-        with a warning. Smoke-tests with a small num_layers; compile for
-        the real per-worker num_layers happens on first invocation
+        """Run the startup smoke test for the scatter kernel and flip it
+        on if it passes. Consumer-only. On by default; any failure falls
+        back permanently to ``index_put_`` with a warning.
+
+        In block-major mode we smoke-test ``single_bundle_scatter_into``
+        (one dispatch over the whole bundle). In layer-major mode we
+        smoke-test ``multi_layer_scatter_into`` (N pallas_calls, one per
+        layer). Compile for the real shapes happens on first invocation
         (typically during warmup)."""
         if self.is_producer:
             return
@@ -554,23 +580,34 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
                 self.tp_rank)
             return
         trailing = tuple(self.shape[1:]) if len(self.shape) > 1 else (128, )
-        ok = kv_scatter.smoke_test_multi_layer_scatter(
-            device=self.device,
-            num_layers=2,
-            num_blocks=4,
-            trailing_shape=trailing,
-            dtype=self.dtype,
-        )
+        if self._block_major_wire:
+            ok = kv_scatter.smoke_test_single_bundle_scatter(
+                device=self.device,
+                num_layers=2,
+                num_blocks=4,
+                trailing_shape=trailing,
+                dtype=self.dtype,
+            )
+            label = "single-bundle"
+        else:
+            ok = kv_scatter.smoke_test_multi_layer_scatter(
+                device=self.device,
+                num_layers=2,
+                num_blocks=4,
+                trailing_shape=trailing,
+                dtype=self.dtype,
+            )
+            label = "multi-layer"
         if ok:
             self._kv_scatter_enabled = True
             logger.info(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "enabled for insert path", self.node_id, self.tp_rank)
+                "TPUConnectorWorker %s rank%d --> %s scatter enabled "
+                "for insert path", self.node_id, self.tp_rank, label)
         else:
             logger.warning(
-                "TPUConnectorWorker %s rank%d --> multi-layer scatter "
-                "smoke test failed; falling back to index_put_", self.node_id,
-                self.tp_rank)
+                "TPUConnectorWorker %s rank%d --> %s scatter smoke "
+                "test failed; falling back to index_put_", self.node_id,
+                self.tp_rank, label)
 
 
 class TPURaidenConnectorScheduler(TPUConnectorScheduler):

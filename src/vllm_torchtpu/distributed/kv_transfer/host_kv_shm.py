@@ -72,7 +72,23 @@ def _dtype_bytes(dtype: torch.dtype) -> int:
 
 @dataclass(frozen=True)
 class PoolSpec:
-    """Describes the per-host pool. Must match byte-for-byte across ranks."""
+    """Describes the per-host pool. Must match byte-for-byte across ranks.
+
+    Two internal layouts are supported, selected by ``block_major``:
+
+    * ``block_major=False`` (default, layer-major): each rank's region
+      holds ``num_layers`` consecutive per-layer shards, each of which
+      is ``[max_blocks, *trailing]`` contiguous bytes. Suitable for the
+      per-layer DMA wire format (one ZMQ frame per (rank, layer)).
+
+    * ``block_major=True`` (bundled): each rank's region holds a single
+      ``[max_blocks, num_layers, *trailing]`` block-major bundle. Each
+      block's all-layer payload is contiguous. The producer can DMA
+      the full per-rank bundle in one shot and the connector emits a
+      single ZMQ frame per rank.
+
+    Both layouts use the same per-rank byte budget; only the internal
+    ordering differs."""
     num_slots: int
     tp_size: int
     num_layers: int
@@ -81,11 +97,22 @@ class PoolSpec:
     # E.g. [max_blocks, block_size, kv_heads_per_rank, 2, head_dim].
     layer_shard_shape: tuple
     dtype: torch.dtype
+    block_major: bool = False
 
     @property
     def per_layer_bytes(self) -> int:
+        """Total bytes for one layer at max_blocks (contiguous when
+        ``block_major=False``, otherwise strided across the rank region).
+        """
         n = 1
         for d in self.layer_shard_shape:
+            n *= d
+        return n * _dtype_bytes(self.dtype)
+
+    @property
+    def _trailing_bytes(self) -> int:
+        n = 1
+        for d in self.layer_shard_shape[1:]:
             n *= d
         return n * _dtype_bytes(self.dtype)
 
@@ -265,10 +292,30 @@ class HostKVShmPool:
                    num_blocks: int) -> torch.Tensor:
         """Return a CPU tensor view over the (slot, rank, layer) region.
 
-        Shape is (num_blocks,) + layer_shard_shape[1:], so callers can copy
-        the exact request-sized slice in/out without touching the padding.
+        Shape is ``(num_blocks,) + layer_shard_shape[1:]``. In layer-major
+        layout this is a contiguous view; in block-major layout it's a
+        strided view into the bundle region. Either way, callers can
+        copy the exact request-sized slice in/out without touching the
+        padding.
         """
         spec = self.spec
+        if spec.block_major:
+            # Block-major: rank region is [max_blocks, num_layers,
+            # *trailing]; slice on dim 1 at layer_idx. The resulting
+            # torch view is strided, but valid for index_put_/copy_.
+            rank_offset = (slot_idx * spec.per_slot_bytes +
+                           rank * spec.per_rank_bytes)
+            count = spec.max_blocks * spec.num_layers
+            for d in spec.layer_shard_shape[1:]:
+                count *= d
+            flat = torch.frombuffer(self._shm.buf,
+                                    dtype=spec.dtype,
+                                    count=count,
+                                    offset=rank_offset)
+            full_shape = (spec.max_blocks, spec.num_layers) + tuple(
+                spec.layer_shard_shape[1:])
+            return flat.view(full_shape)[:num_blocks, layer_idx, ...]
+        # Layer-major: per-layer region is contiguous.
         offset = (slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes +
                   layer_idx * spec.per_layer_bytes)
         count = num_blocks
@@ -283,12 +330,66 @@ class HostKVShmPool:
         view_shape = (num_blocks, ) + tuple(spec.layer_shard_shape[1:])
         return flat.view(view_shape)
 
+    def bundle_view(self, slot_idx: int, rank: int,
+                    num_blocks: int) -> torch.Tensor:
+        """Return a CPU tensor view covering this (slot, rank)'s "used"
+        bundled payload, shaped as
+        ``[num_blocks, num_layers, *layer_shard_shape[1:]]`` (block-major)
+        or ``[num_layers, num_blocks, *layer_shard_shape[1:]]`` (legacy
+        layer-major; only valid at ``num_blocks == max_blocks``).
+
+        Block-major: the per-rank region is laid out as
+        ``[max_blocks, num_layers, *trailing]``, so slicing on dim 0 to
+        ``num_blocks`` is contiguous for any ``num_blocks ≤ max_blocks``.
+
+        Layer-major: per-layer regions are spaced
+        ``per_layer_bytes = num_blocks_max * trailing_bytes`` apart, so
+        a single contiguous bundled view exists only when
+        ``num_blocks == max_blocks``.
+        """
+        spec = self.spec
+        rank_offset = (slot_idx * spec.per_slot_bytes +
+                       rank * spec.per_rank_bytes)
+        if spec.block_major:
+            count = num_blocks * spec.num_layers
+            for d in spec.layer_shard_shape[1:]:
+                count *= d
+            flat = torch.frombuffer(self._shm.buf,
+                                    dtype=spec.dtype,
+                                    count=count,
+                                    offset=rank_offset)
+            view_shape = (num_blocks, spec.num_layers) + tuple(
+                spec.layer_shard_shape[1:])
+            return flat.view(view_shape)
+        if num_blocks != spec.max_blocks:
+            raise ValueError(
+                "bundle_view requires num_blocks == spec.max_blocks "
+                f"(got {num_blocks} vs {spec.max_blocks}); the per-layer "
+                "regions in shm are otherwise non-contiguous and a "
+                "single bundled view does not exist. Use layer_view in "
+                "the per-block path, or build the pool with "
+                "block_major=True.")
+        count = spec.num_layers
+        for d in spec.layer_shard_shape:  # includes max_blocks at dim 0
+            count *= d
+        flat = torch.frombuffer(self._shm.buf,
+                                dtype=spec.dtype,
+                                count=count,
+                                offset=rank_offset)
+        view_shape = (spec.num_layers, ) + tuple(spec.layer_shard_shape)
+        return flat.view(view_shape)
+
     def _used_per_layer(self, num_blocks: int) -> int:
         """Bytes used by one layer's shard at the actual block count."""
         bytes_per_block = _dtype_bytes(self.spec.dtype)
         for d in self.spec.layer_shard_shape[1:]:
             bytes_per_block *= d
         return bytes_per_block * num_blocks
+
+    def _used_per_rank_bundle(self, num_blocks: int) -> int:
+        """Bytes used by the full per-rank bundle at the actual block
+        count: ``num_blocks * num_layers * trailing_bytes``."""
+        return self._used_per_layer(num_blocks) * self.spec.num_layers
 
     def pack_rank(self, slot_idx: int, rank: int, num_blocks: int) -> bytes:
         """Copy the `num_blocks`-sized shard of each layer into a single
@@ -313,8 +414,17 @@ class HostKVShmPool:
         with copy=False, which turns the 4-copy path
         (shm->bytearray->bytes->zmq->kernel) into a single scatter-gather
         sendmsg from shm straight to the NIC buffer. The returned views
-        alias live shm and must not outlive the current slot."""
+        alias live shm and must not outlive the current slot.
+
+        Layer-major layout only — in block-major layout per-layer regions
+        are strided so a single contiguous memoryview per layer doesn't
+        exist; use ``rank_bundle_view`` instead.
+        """
         spec = self.spec
+        if spec.block_major:
+            raise RuntimeError(
+                "rank_layer_views: not supported in block-major layout; "
+                "use rank_bundle_view() and the bundled wire format.")
         rank_start = (slot_idx * spec.per_slot_bytes +
                       rank * spec.per_rank_bytes)
         used = self._used_per_layer(num_blocks)
@@ -325,13 +435,42 @@ class HostKVShmPool:
             out.append(base[layer_off:layer_off + used])
         return out
 
+    def rank_bundle_view(self, slot_idx: int, rank: int,
+                         num_blocks: int) -> memoryview:
+        """Return a single memoryview over this (slot, rank)'s "used"
+        bundled payload (``num_blocks * num_layers * trailing_bytes``).
+        Block-major only — the bytes are contiguous in shm.
+
+        Used by the bundled wire format: one ZMQ frame per rank instead
+        of ``num_layers`` per-layer frames. The view aliases live shm
+        and must not outlive the current slot."""
+        spec = self.spec
+        if not spec.block_major:
+            raise RuntimeError(
+                "rank_bundle_view: requires block_major layout; in "
+                "layer-major mode the per-rank used bytes are spaced "
+                "apart by per-layer padding so no single contiguous "
+                "view exists.")
+        rank_start = (slot_idx * spec.per_slot_bytes +
+                      rank * spec.per_rank_bytes)
+        used = self._used_per_rank_bundle(num_blocks)
+        return memoryview(self._shm.buf)[rank_start:rank_start + used]
+
     def unpack_rank_layers(self, slot_idx: int, rank: int, num_blocks: int,
                            layer_buffers: list) -> None:
         """Inverse of rank_layer_views. `layer_buffers` is a list of
         buffer-protocol objects (zmq.Frame.buffer, memoryview, bytes)
         sized per-layer `used` bytes, one per layer. Each is memcpy'd into
-        its shm slot -- one copy on the consumer instead of two."""
+        its shm slot -- one copy on the consumer instead of two.
+
+        Layer-major only. In block-major mode the consumer receives a
+        single per-rank bundle frame; use ``unpack_rank_bundle``.
+        """
         spec = self.spec
+        if spec.block_major:
+            raise RuntimeError(
+                "unpack_rank_layers: not supported in block-major layout; "
+                "use unpack_rank_bundle() and the bundled wire format.")
         if len(layer_buffers) != spec.num_layers:
             raise RuntimeError(
                 f"unpack_rank_layers: got {len(layer_buffers)} layers, "
@@ -347,6 +486,28 @@ class HostKVShmPool:
                     f"expected {used} (num_blocks={num_blocks})")
             layer_off = rank_start + li * spec.per_layer_bytes
             self._copy_into_shm(layer_off, src, used)
+
+    def unpack_rank_bundle(self, slot_idx: int, rank: int, num_blocks: int,
+                           buf) -> None:
+        """Inverse of ``rank_bundle_view``. `buf` is a single
+        buffer-protocol object holding the rank's block-major bundle
+        (``num_blocks * num_layers * trailing_bytes`` bytes). Block-major
+        only; single memcpy."""
+        spec = self.spec
+        if not spec.block_major:
+            raise RuntimeError(
+                "unpack_rank_bundle: requires block_major layout; in "
+                "layer-major mode the consumer receives one frame per "
+                "layer (see unpack_rank_layers).")
+        src = memoryview(buf)
+        used = self._used_per_rank_bundle(num_blocks)
+        if src.nbytes != used:
+            raise RuntimeError(
+                f"unpack_rank_bundle: payload size {src.nbytes} != "
+                f"expected {used} (num_blocks={num_blocks})")
+        rank_start = (slot_idx * spec.per_slot_bytes +
+                      rank * spec.per_rank_bytes)
+        self._copy_into_shm(rank_start, src, used)
 
     def _copy_into_shm(self, offset: int, src: memoryview,
                        nbytes: int) -> None:

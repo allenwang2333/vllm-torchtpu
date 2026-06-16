@@ -22,7 +22,8 @@ import torch
 
 from vllm_torchtpu.distributed.kv_transfer.kv_scatter import (
     multi_layer_scatter_into, prepare_scatter_args, scatter_available,
-    smoke_test_multi_layer_scatter)
+    single_bundle_scatter_into, smoke_test_multi_layer_scatter,
+    smoke_test_single_bundle_scatter)
 
 
 def _subprocess_worker(target, queue):
@@ -262,3 +263,69 @@ class TestSmokeTestMultiLayerScatter:
 
     def test_smoke_test_passes_on_tpu(self):
         _run_in_subprocess(_body_smoke_test_passes_on_tpu)
+
+
+# ---------------------------------------------------------------------------
+# TestSingleBundleScatter — block-major variant
+# ---------------------------------------------------------------------------
+
+
+def _body_single_bundle_scatter_correctness():
+    """Round-trip the bundled-scatter kernel and verify per-layer contents."""
+    device = torch.device("tpu")
+    num_layers = 4
+    num_src_blocks = 3
+    num_dst_blocks = 8
+    dtype = torch.bfloat16
+    t = _TRAILING
+
+    src_shape = (num_src_blocks, num_layers, *t)
+    dst_shape = (num_dst_blocks, num_layers, *t)
+    src_cpu = torch.randn(src_shape).to(dtype)
+    src = src_cpu.to(device)
+    dst = torch.zeros(dst_shape, dtype=dtype, device=device)
+    dest_ids = torch.tensor([2, 5, 7], dtype=torch.int32, device=device)
+
+    out = single_bundle_scatter_into(src, dst, dest_ids)
+    out_cpu = out.cpu()
+    expected = torch.zeros(dst_shape, dtype=dtype)
+    for i, dest_idx in enumerate([2, 5, 7]):
+        expected[dest_idx] = src_cpu[i]
+    assert torch.equal(out_cpu, expected), "bundled scatter content mismatch"
+
+
+def _body_single_bundle_scatter_zero_blocks_returns_dst():
+    """num_blocks=0 short-circuits and returns dst unchanged."""
+    device = torch.device("tpu")
+    num_layers = 2
+    dtype = torch.bfloat16
+    t = _TRAILING
+    dst = torch.zeros((4, num_layers, *t), dtype=dtype, device=device)
+    src = torch.zeros((0, num_layers, *t), dtype=dtype, device=device)
+    empty_ids = torch.tensor([], dtype=torch.int32, device=device)
+    out = single_bundle_scatter_into(src, dst, empty_ids)
+    assert out is dst
+
+
+def _body_single_bundle_smoke_test_passes_on_tpu():
+    device = torch.device("tpu")
+    assert smoke_test_single_bundle_scatter(device) is True
+
+
+@pytest.mark.skipif(not scatter_available(), reason="JAX/Pallas not available")
+class TestSingleBundleScatter:
+    """Correctness for the block-major bundled-scatter kernel.
+
+    Same dispatch model as multi_layer_scatter_into but treats the layer
+    axis as part of the per-block payload, so only one pallas_call is
+    issued per scatter regardless of layer count.
+    """
+
+    def test_correctness(self):
+        _run_in_subprocess(_body_single_bundle_scatter_correctness)
+
+    def test_zero_blocks_returns_dst_unchanged(self):
+        _run_in_subprocess(_body_single_bundle_scatter_zero_blocks_returns_dst)
+
+    def test_smoke_test_passes_on_tpu(self):
+        _run_in_subprocess(_body_single_bundle_smoke_test_passes_on_tpu)

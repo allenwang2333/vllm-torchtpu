@@ -394,6 +394,89 @@ def sharded_ragged_paged_attention(
     )(*args)
 
 
+def attention_bundled(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_metadata: AttentionMetadata,
+    mesh: Mesh,
+    head_dim_original: int | None = None,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    sinks: jax.Array | None = None,
+) -> Tuple[jax.Array, jax.Array]:
+    """Block-major attention entry point.
+
+    Calls `ragged_paged_attention_bundled` with the whole KV cache bundle
+    of shape `[num_pages, num_layers, page_size, K2/p, p, head_dim]` plus
+    a dynamic `layer_idx` scalar. The JAX wrapper folds the slice into
+    the kernel's input ref so donation flows through the bundle.
+
+    Bundle layout is block-major (num_pages outermost): each block's
+    all-layer payload is contiguous in HBM, which lets the KV-transfer
+    connector do a single bundled gather + DMA per rank.
+
+    Sharding: for the single-chip path (TP=1) we skip shard_map entirely;
+    JAX propagates sharding through dynamic_index_in_dim naturally. For
+    TP>1 a parallel sharded variant will need to wrap shard_map with the
+    bundle's `num_layers` dim left unsharded (deferred follow-up).
+    """
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import \
+        ragged_paged_attention_bundled
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 import \
+        ragged_paged_attention_hd64_bundled
+
+    if head_dim_original is None:
+        head_dim_original = q.shape[-1]
+    md = attention_metadata
+    use_hd64 = (q.shape[-1] == 64)
+    if use_hd64:
+        output, new_bundle = ragged_paged_attention_hd64_bundled(
+            q,
+            k,
+            v,
+            kv_cache_bundle,
+            layer_idx,
+            md.seq_lens,
+            md.block_tables,
+            md.query_start_loc,
+            md.request_distribution,
+            sinks,
+            sm_scale=head_dim_original**-0.5,
+            sliding_window=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return new_bundle, output
+
+    if sinks is not None:
+        raise NotImplementedError(
+            "Attention sink is supported only in the hd64 bundled path.")
+
+    output, new_bundle = ragged_paged_attention_bundled(
+        q,
+        k,
+        v,
+        kv_cache_bundle,
+        layer_idx,
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+        sm_scale=head_dim_original**-0.5,
+        sliding_window=attention_chunk_size,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    return new_bundle, output
+
+
 def attention(
     kv_cache: jax.Array,
     q: jax.Array,

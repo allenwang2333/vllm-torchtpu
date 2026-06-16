@@ -1583,3 +1583,65 @@ def ragged_paged_attention_hd64(
                         actual_head_dim),
         updated_kv_cache,
     )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "sliding_window",
+        "strict_sliding_window",
+        "soft_cap",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "debug_mode",
+    ),
+    donate_argnames=("kv_cache_bundle", ),
+)
+def ragged_paged_attention_hd64_bundled(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache_bundle: jax.
+    Array,  # [num_pages, num_layers, page_size, K/p, p, head_dim_x2]
+    layer_idx: jax.Array,  # i32 scalar, dynamic
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sink: jax.Array | None = None,
+    **kwargs,
+):
+    """Block-major variant of ragged_paged_attention_hd64.
+
+    Same reshape-and-reindex trick as the v3
+    ``ragged_paged_attention_bundled``: bundle
+    ``[num_pages, num_layers, page_size, ...]`` is reshaped to the flat
+    per-layer page space ``[num_pages * num_layers, page_size, ...]``
+    (no copy) and the caller's page indices are offset into that flat
+    namespace by ``flat_pi[i] = pi[i] * num_layers + layer_idx``. The
+    inner hd64 kernel then writes only the touched layer's slot in
+    HBM; no ``dynamic_update_slice`` is emitted, so per-step bandwidth
+    matches the layer-major hd64 path.
+
+    Bundle layout is block-major: num_pages outermost so each block's
+    all-layer payload is contiguous in HBM (used by the connector's KV-
+    transfer fast path).
+    """
+    num_blocks = kv_cache_bundle.shape[0]
+    num_layers = kv_cache_bundle.shape[1]
+    flat_bundle = kv_cache_bundle.reshape(num_blocks * num_layers,
+                                          *kv_cache_bundle.shape[2:])
+    flat_page_indices = page_indices * num_layers + layer_idx
+    out, new_flat_bundle = ragged_paged_attention_hd64(
+        queries, keys, values, flat_bundle, kv_lens, flat_page_indices,
+        cu_q_lens, distribution, attention_sink, **kwargs)
+    new_bundle = new_flat_bundle.reshape(num_blocks, num_layers,
+                                         *new_flat_bundle.shape[1:])
+    return out, new_bundle
