@@ -9,7 +9,7 @@ on:
 
 jobs:
   pypi_publish:
-    if: github.repository == 'vllm-project/vllm-torchtpu'
+    if: false && github.repository == 'vllm-project/vllm-torchtpu'
     name: Build and Publish
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
