@@ -932,13 +932,21 @@ class _RaidenOffloadingHandler(OffloadingHandler):
     lives inside raiden (DmaMapped), so there is no `cpu_pool` tensor here.
     """
 
-    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
-                 dst_block_size_factor: int, bytes_per_kernel_block: int):
+    def __init__(self,
+                 mgr,
+                 tpu_to_cpu: bool,
+                 src_block_size_factor: int,
+                 dst_block_size_factor: int,
+                 bytes_per_kernel_block: int,
+                 device_tensors: list | None = None):
         self._mgr = mgr
         self.tpu_to_cpu = tpu_to_cpu
         self.src_block_size_factor = src_block_size_factor
         self.dst_block_size_factor = dst_block_size_factor
         self._bytes_per_kernel_block = bytes_per_kernel_block
+        # The live device KV tensors the store (D2h) reads. Synced before the
+        # copy so it cannot read a block the forward is still writing.
+        self._device_tensors = device_tensors
         self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
         self._pending: dict[int, tuple] = {}
 
@@ -979,9 +987,12 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         n = len(dst_ids)
         sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
         if self.tpu_to_cpu:
-            # Barrier so the D2h store reads these blocks only after the
-            # forward step's in-place KV write to them has completed.
-            _tpu_sync(wait=True)
+            # Order the store copy after the forward's in-place KV write so it
+            # cannot read a block mid-write. Scoped to the KV tensors (not a
+            # global device sync); waits on their PJRT readiness event, the
+            # same event raiden's raw copy would otherwise race.
+            if self._device_tensors:
+                _tpu_sync(self._device_tensors, wait=True)
             fut = self._mgr.D2h(src_ids.tolist(), dst_ids.tolist(), sizes)
         else:
             fut = self._mgr.H2d(src_ids.tolist(), dst_ids.tolist(), sizes)
@@ -1168,6 +1179,7 @@ class CpuTpuOffloadingHandlers:
                 src_block_size_factor=gpu_block_size_factor,
                 dst_block_size_factor=cpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
+                device_tensors=tpu_tensors,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,
