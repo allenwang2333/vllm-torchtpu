@@ -272,6 +272,12 @@ def apply_tpu_patches() -> None:
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
+    # Install the Pallas fused_add_rmsnorm patch. Falls through to
+    # ``forward_native`` on any tensor that doesn't match the gate
+    # (non-bf16 dtype, sub-128 hidden, CPU device, etc.).
+    from vllm_torchtpu.layers.vllm.rmsnorm_patch import \
+        _install_gemma_rmsnorm_pallas_patch
+    _install_gemma_rmsnorm_pallas_patch()
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
