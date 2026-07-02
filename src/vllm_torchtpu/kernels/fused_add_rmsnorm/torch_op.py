@@ -7,17 +7,13 @@ kernel as a torch custom op, matching the pattern used by
 Exposed via ``fused_add_rmsnorm_torch(x, residual, weight, eps)``.
 """
 
-from threading import Lock
-from typing import Callable, Optional
+from typing import Callable
 
 import jax
 import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.fused_add_rmsnorm.kernel import fused_add_rmsnorm
-
-_op: Optional[Callable] = None
-_op_lock = Lock()
 
 # eps as a Python int-cast (Pallas kernel takes fp32; we bake a static
 # default here since vLLM's RMSNorm always uses 1e-6 for Qwen3.5).
@@ -38,17 +34,17 @@ def _fake(x: torch.Tensor, residual: torch.Tensor,
     )
 
 
+# Eagerly register the op at module import. Lazy registration behind a
+# ``threading.Lock`` breaks torch.compile / Dynamo tracing: Dynamo does
+# not know how to enter a lock context manager, and the model's forward
+# is traced under torch.compile, so a Lock inside the hot path would
+# hard-crash the worker at compile time.
+_op: Callable = pallas.jax_op("pallas::fused_add_rmsnorm", _jax_fn)
+_op.register_fake(_fake)
+
+
 def _get_op() -> Callable:
-    global _op
-    if _op is not None:
-        return _op
-    with _op_lock:
-        if _op is not None:
-            return _op
-        op = pallas.jax_op("pallas::fused_add_rmsnorm", _jax_fn)
-        op.register_fake(_fake)
-        _op = op
-        return op
+    return _op
 
 
 def fused_add_rmsnorm_torch(
