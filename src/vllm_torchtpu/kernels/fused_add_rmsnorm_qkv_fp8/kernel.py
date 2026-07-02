@@ -92,8 +92,7 @@ def fused_add_rmsnorm_qkv_fp8(
     M, H = x.shape
     OUT, H2 = qkv_w_q.shape
     if H != H2:
-        raise ValueError(
-            f"Hidden dim mismatch: x has {H}, qkv_w_q has {H2}.")
+        raise ValueError(f"Hidden dim mismatch: x has {H}, qkv_w_q has {H2}.")
     if residual.shape != x.shape:
         raise ValueError(
             f"residual shape {residual.shape} != x shape {x.shape}.")
@@ -130,13 +129,13 @@ def fused_add_rmsnorm_qkv_fp8(
             in_specs=[
                 pl.BlockSpec((BM, BK), lambda b, n: (b, 0)),  # x
                 pl.BlockSpec((BM, BK), lambda b, n: (b, 0)),  # residual
-                pl.BlockSpec((BK, ), lambda b, n: (0, )),      # rms_w
-                pl.BlockSpec((BN, BK), lambda b, n: (n, 0)),   # qkv_w_q
-                pl.BlockSpec((BN, ), lambda b, n: (n, )),      # qkv_w_scale
+                pl.BlockSpec((BK, ), lambda b, n: (0, )),  # rms_w
+                pl.BlockSpec((BN, BK), lambda b, n: (n, 0)),  # qkv_w_q
+                pl.BlockSpec((BN, ), lambda b, n: (n, )),  # qkv_w_scale
             ],
             out_specs=[
-                pl.BlockSpec((BM, BN), lambda b, n: (b, n)),   # qkv_out
-                pl.BlockSpec((BM, BK), lambda b, n: (b, 0)),   # new_residual
+                pl.BlockSpec((BM, BN), lambda b, n: (b, n)),  # qkv_out
+                pl.BlockSpec((BM, BK), lambda b, n: (b, 0)),  # new_residual
             ],
             scratch_shapes=[pltpu.VMEM((BM, BK), jnp.bfloat16)],
         ),

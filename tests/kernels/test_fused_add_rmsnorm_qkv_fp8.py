@@ -45,10 +45,12 @@ def _rmsnorm_ref(x, w, eps=1e-6):
 def _reference(x, residual, rms_w, qkv_w_q, qkv_w_scale):
     """Unfused composition: fused_add → RMSNorm → xla_quantized_matmul."""
     new_residual = (x.astype(jnp.float32) +
-                     residual.astype(jnp.float32)).astype(x.dtype)
+                    residual.astype(jnp.float32)).astype(x.dtype)
     normed = _rmsnorm_ref(new_residual, rms_w)
-    qkv = xla_quantized_matmul(normed, qkv_w_q, qkv_w_scale,
-                                quantize_activation=False)
+    qkv = xla_quantized_matmul(normed,
+                               qkv_w_q,
+                               qkv_w_scale,
+                               quantize_activation=False)
     return qkv, new_residual
 
 
@@ -76,8 +78,8 @@ def test_matches_reference(M, H, OUT):
     w_f32 = w.astype(jnp.float32)
     w_abs = jnp.max(jnp.abs(w_f32), axis=-1, keepdims=True)
     w_scale_val = jnp.clip(w_abs / 448.0, 1e-12, None)
-    w_q = jnp.clip(w_f32 / w_scale_val,
-                   -448.0, 448.0).astype(jnp.float8_e4m3fn)
+    w_q = jnp.clip(w_f32 / w_scale_val, -448.0,
+                   448.0).astype(jnp.float8_e4m3fn)
     w_scale = jnp.squeeze(w_scale_val, axis=-1).astype(jnp.float32)
 
     qkv_actual, resid_actual = fused_add_rmsnorm_qkv_fp8(
@@ -86,12 +88,14 @@ def test_matches_reference(M, H, OUT):
 
     # Residual is exact (bf16 addition).
     np.testing.assert_allclose(np.asarray(resid_actual),
-                                np.asarray(resid_ref),
-                                atol=1e-3, rtol=1e-3)
+                               np.asarray(resid_ref),
+                               atol=1e-3,
+                               rtol=1e-3)
     # QKV output — bf16 tolerance matching the quantized_matmul test.
     np.testing.assert_allclose(np.asarray(qkv_actual),
-                                np.asarray(qkv_ref),
-                                atol=0.5, rtol=0.5)
+                               np.asarray(qkv_ref),
+                               atol=0.5,
+                               rtol=0.5)
 
 
 def test_shape_validation_hidden_mismatch():
