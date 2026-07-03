@@ -20,8 +20,28 @@ Output contract:
 Activation numerics: RMSNorm accumulates in fp32; FP8 weights are cast
 to bf16 inside VMEM before the ``dot_general``; the accumulator is fp32
 and multiplied by the per-channel weight scale before the final cast to
-bf16. This is the same numeric contract as the shipped
-`quantized_matmul_kernel` per-channel path.
+bf16.
+
+.. warning::
+   **This kernel is W8A16, NOT the production W8A8 path — superseded by
+   the arena-discovered kernel.** It multiplies bf16 activations by
+   bf16-dequantized weights and applies ONLY the per-channel weight
+   scale. The production Qwen3.5 path (``xla_quantized_matmul`` with
+   ``quantize_activation=True``) additionally quantizes the activation
+   to ``float8_e4m3fn`` with a per-token scale and applies BOTH scales.
+   Because fp8-e4m3 has 3 mantissa bits, the two differ materially (not
+   by rounding), so this kernel does **not** reproduce production
+   numerics and — carrying bf16 activations — is not even on the fast
+   fp8-activation MXU path (part of why it showed no end-to-end win).
+
+   An adversarial review of this session's work surfaced this. The
+   correct, W8A8, activation-quantizing reference is the arena-generated
+   kernel at
+   ``vllm_torchtpu/kernels/agent_winners/qwen35_residual_rmsnorm_qkv_fp8.py``
+   (branch ``kernel-agents/winner-qwen35-residual-rmsnorm-qkv``), which
+   the arena produced correctly where this hand-authored version did
+   not. Prefer that kernel; this one is retained only as a documented
+   baseline.
 """
 
 import jax

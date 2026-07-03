@@ -51,16 +51,19 @@ def _install_gemma_rmsnorm_pallas_patch() -> None:
         residual: Optional[torch.Tensor] = None,
     ):
         # Gate: only take the Pallas path when it's a clear win. Falls
-        # through to the reference on anything unusual.
-        take_pallas = (
-            residual is not None
-            and x.device.type == "tpu"
-            and residual.device.type == "tpu"
-            and x.dtype == torch.bfloat16
-            and residual.dtype == torch.bfloat16
-            and x.shape == residual.shape
-            and (x.shape[-1] % 128 == 0)
-        )
+        # through to the reference on anything unusual. The eps check
+        # matters because this patch is installed on GemmaRMSNorm
+        # GLOBALLY, but the fused kernel bakes eps=1e-6 (torch_op._EPS);
+        # a module with a different variance_epsilon must NOT take the
+        # Pallas path or its normalization denominator would be wrong.
+        from vllm_torchtpu.kernels.fused_add_rmsnorm.torch_op import _EPS
+        take_pallas = (residual is not None and x.device.type == "tpu"
+                       and residual.device.type == "tpu"
+                       and x.dtype == torch.bfloat16
+                       and residual.dtype == torch.bfloat16
+                       and x.shape == residual.shape
+                       and (x.shape[-1] % 128 == 0)
+                       and float(self.variance_epsilon) == _EPS)
         if not take_pallas:
             return _orig_forward_native(self, x, residual)
 
@@ -68,10 +71,16 @@ def _install_gemma_rmsnorm_pallas_patch() -> None:
         from vllm_torchtpu.kernels.fused_add_rmsnorm.torch_op import \
             fused_add_rmsnorm_torch
 
-        # Cache (weight + 1) once per module — GemmaRMSNorm semantics.
+        # GemmaRMSNorm applies the gain as ``x * (1 + w)`` computed in
+        # fp32 (upstream: ``self.weight.data.float() + 1.0``). Compute
+        # ``eff = (1 + w)`` in FP32 — NOT bf16 — so the per-channel gain
+        # is not pre-rounded to bf16 ULP (~0.008 near 1.0, a systematic
+        # ~0.4% error the adversarial review flagged). The kernel keeps
+        # the whole norm in fp32 and casts once at the end, matching
+        # upstream's rounding point. Cache per module + device.
         eff = getattr(self, "_torchtpu_eff_weight", None)
-        if eff is None or eff.dtype != x.dtype or eff.device != x.device:
-            eff = (self.weight.data.to(dtype=x.dtype, device=x.device) +
+        if eff is None or eff.device != x.device:
+            eff = (self.weight.data.to(dtype=torch.float32, device=x.device) +
                    1.0)
             self._torchtpu_eff_weight = eff
 
