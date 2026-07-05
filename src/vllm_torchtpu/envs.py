@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
     USE_MOE_SPARSE_CORE: bool = True
+    USE_MOE_DENSE_SPARSE_CORE: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_VERSION: str = "v2"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -203,6 +204,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    # Route the non-EP MoE gather+weight+reduce combine through the SparseCore
+    # dense_gather_reduce kernel instead of the JAX fallback (gather → reshape →
+    # weight → mask → sum). Opt-in: keeps existing default. Only meaningful for
+    # non-EP configs (e.g., pure TP MoE); the EP path already uses SC via
+    # ragged_gather_reduce. The valid-mask path is degenerate for non-EP (mask
+    # is all-True), so the SC kernel (which does not take a mask) is equivalent.
+    "USE_MOE_DENSE_SPARSE_CORE":
+    lambda: bool(int(os.getenv("USE_MOE_DENSE_SPARSE_CORE") or "0")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.

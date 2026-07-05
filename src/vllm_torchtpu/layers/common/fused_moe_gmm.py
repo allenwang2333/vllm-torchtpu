@@ -19,6 +19,8 @@ from jax import numpy as jnp
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.sparse_core.dense_gather_reduce import \
+    dense_gather_reduce
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import \
     ragged_gather as ragged_gather_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
@@ -242,6 +244,18 @@ def moe_gmm(
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
+        ).astype(x.dtype)
+
+    if envs.USE_MOE_DENSE_SPARSE_CORE and not use_ep:
+        # Non-EP dense combine via SparseCore. valid_mask is all-True in the
+        # non-EP path (see prepare_routed_gmm_inputs), so the mask branch is
+        # equivalent to weight+gather+reduce, which is exactly what
+        # dense_gather_reduce does. Ports tpu-inference PR #2979.
+        return dense_gather_reduce(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            topk,
         ).astype(x.dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
