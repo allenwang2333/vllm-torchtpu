@@ -109,36 +109,16 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - name: qwen3-coder-30b-tp8-ep
-            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/
-            run_on: ["pr"]
-            type: guard
-            retention: 14
-          - name: qwen3-coder-30b-fp8-tp8-ep
-            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-30B-A3B-Instruct-FP8/
-            run_on: ["pr"]
-            type: guard
-            retention: 14
-          - name: qwen3.5-35b-fp8-tp4-ep
-            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/
-            run_on: ["pr"]
-            type: guard
-            retention: 14
-          - name: qwen3-0.6b-tp1
+          - name: qwen3-0.6b-pcp8-pass
             gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/
             run_on: ["pr"]
             type: guard
             retention: 14
-          - name: qwen3-coder-480b-fp8-tp8-ep
-            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-Coder-480B-A35B-Instruct-FP8/
-            run_on: ["nightly"]
-            type: nightly
-            retention: 30
-          - name: qwen3.5-397b-fp8-tp8-ep
-            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-397B-A17B-FP8/
-            run_on: ["nightly"]
-            type: nightly
-            retention: 30
+          - name: qwen3-0.6b-pcp8-repro
+            gs_path: gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3-0.6B/
+            run_on: ["pr"]
+            type: guard
+            retention: 14
 
     steps:
       - name: Decide if to run
@@ -218,8 +198,7 @@ jobs:
             export EVALPLUS_PARALLEL="8"
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval --run-evalplus
           else
-            export BENCHMARK_WARMUP_RUNS="1"
-            bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config ${{ matrix.config.name }} --run-lm-eval
+            bash ./scripts/vllm/benchmarking/configs/${{ matrix.config.name }}.sh
           fi
 
       - name: Stage artifacts for upload

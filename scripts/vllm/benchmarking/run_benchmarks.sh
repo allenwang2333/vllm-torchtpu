@@ -283,7 +283,7 @@ run_benchmark_once() {
         --random-input-len "$input_len" \
         --random-output-len "$output_len" \
         --random-range-ratio "$RANDOM_RANGE_RATIO" \
-        --num-prompts 320 \
+        --num-prompts "${BENCHMARK_NUM_PROMPTS:-320}" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --save-result \
