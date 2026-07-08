@@ -2705,7 +2705,8 @@ class TPUModelRunner(GPUModelRunner):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
                             torch.zeros(cache_shape,
-                                        dtype=dtype).to(self.device))
+                                        dtype=dtype,
+                                        device=self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
@@ -2725,7 +2726,8 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     dtype = kv_cache_spec.dtype
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
-                                               dtype=dtype).to(self.device)
+                                               dtype=dtype,
+                                               device=self.device)
 
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
