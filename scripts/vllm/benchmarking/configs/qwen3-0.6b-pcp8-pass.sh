@@ -18,6 +18,8 @@
 
 set -e
 
+export XLA_FLAGS="--xla_dump_to=/tmp/perf_eval_hlo_dump --xla_dump_hlo_as_text"
+
 MODEL=${MODEL:-Qwen/Qwen3-0.6B}
 PORT=${PORT:-8000}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
