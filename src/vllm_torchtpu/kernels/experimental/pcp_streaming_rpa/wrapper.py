@@ -13,8 +13,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import \
     wrapper as batched_rpa_wrapper
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import \
     get_dtype_packing
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import \
-    pcp_streaming_attention_page_groups_packed_local_from_metadata
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
+    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    pcp_streaming_attention_page_groups_packed_local_from_metadata)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import \
     _reshape_metadata_page_indices_jax
 
@@ -290,6 +291,8 @@ def sharded_pcp_ragged_paged_attention(
     max_context_tokens: int | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
+    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_compute_size: int | None = None,
     return_local_shards: bool = False,
 ):
     """Runs streaming PCP RPA over local Q/K/V shards."""
@@ -388,6 +391,8 @@ def sharded_pcp_ragged_paged_attention(
             sm_scale=sm_scale,
             collective_id=23,
             max_context_tokens=max_context_tokens,
+            q_block_size=q_block_size,
+            q_compute_size=q_compute_size,
             kv_pages_per_block=1,
             k_scale=k_scale,
             v_scale=v_scale,
