@@ -184,7 +184,7 @@ class TestTPURunner:
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
@@ -272,7 +272,7 @@ class TestTPURunner:
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
-    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
@@ -560,7 +560,7 @@ class TestTPURunner:
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
         return_value=(100, 16, 2, 1, 128))
-    @patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache')
+    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
     @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
            return_value=False)
     @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
@@ -731,7 +731,7 @@ class TestTPURunner:
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(1, 16, 2, 1, 128)
-        ), patch('vllm_torchtpu.runner.tpu_runner.bind_kv_cache'), patch(
+        ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
                 'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
                 return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
@@ -797,11 +797,10 @@ class TestTPURunner:
 
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(1, 16, 2, 1, 128)), patch(
-                    'vllm_torchtpu.runner.tpu_runner.bind_kv_cache'
-                ) as mock_bind, patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
+                return_value=(1, 16, 2, 1, 128)
+        ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, patch(
+                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config)
 
         mock_bind.assert_called_once()
@@ -846,7 +845,7 @@ class TestTPURunner:
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(10, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.runner.tpu_runner.bind_kv_cache'
+                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
                 ), patch(
                     'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
                     return_value=False):
@@ -869,7 +868,7 @@ class TestTPURunner:
         with patch(
                 'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
                 return_value=(5, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.runner.tpu_runner.bind_kv_cache'
+                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
                 ), patch(
                     'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
                     return_value=False):
