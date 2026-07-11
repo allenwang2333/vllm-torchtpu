@@ -1006,7 +1006,6 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         pcp_size: int,
         q_block_size: int,
         sm_scale: float,
-        collective_id: int | None,
         q_compute_size: int | None = None,
         kv_pages_per_block: int = 1,
         k_scale: float | None = None,
@@ -1094,10 +1093,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             grid=(1, ),
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=collective_id,
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
-            allow_collective_id_without_custom_barrier=True,
-        ),
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes),
         name="pcp_streaming_attention_current_state_page_groups_multi_head",
     )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule)
 
@@ -1114,7 +1110,6 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         pcp_size: int,
         q_block_size: int,
         sm_scale: float,
-        collective_id: int | None,
         q_compute_size: int | None = None,
         kv_pages_per_block: int = 1,
         k_scale: float | None = None,
@@ -1189,10 +1184,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             grid=(1, ),
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=collective_id,
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
-            allow_collective_id_without_custom_barrier=True,
-        ),
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes),
         input_output_aliases={1: 0},
         name="pcp_streaming_attention_history_output_page_groups_multi_head",
     )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule,
@@ -1280,7 +1272,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         interleave_size: int,
         q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
         sm_scale: float,
-        collective_id: int | None = 13,
         q_compute_size: int | None = None,
         max_context_tokens: int | None = None,
         num_lanes: int = 1,
@@ -1319,8 +1310,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         q_compute_size: Static Q rows consumed per multi-head softmax compute
             step. Defaults to `q_block_size`.
         sm_scale: Softmax scale applied to QK scores.
-        collective_id: Base Pallas collective id for ring remote-copy
-            semaphores.
         max_context_tokens: Optional cap used when estimating the static
             schedule shape.
         num_lanes: Number of independent schedule lanes. The metadata path
@@ -1361,7 +1350,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
              kv_pages_per_block=kv_pages_per_block,
          ))
 
-    history_collective_id = None if collective_id is None else collective_id + 1
     m_state, l_state, acc_state = (
         _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             q_local,
@@ -1372,7 +1360,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
-            collective_id=collective_id,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -1392,7 +1379,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
-            collective_id=history_collective_id,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,

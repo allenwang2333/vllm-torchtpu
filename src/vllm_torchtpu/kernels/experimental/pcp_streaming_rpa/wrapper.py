@@ -389,7 +389,6 @@ def sharded_pcp_ragged_paged_attention(
             pcp_size=pcp_size,
             interleave_size=cp_kv_cache_interleave_size,
             sm_scale=sm_scale,
-            collective_id=23,
             max_context_tokens=max_context_tokens,
             q_block_size=q_block_size,
             q_compute_size=q_compute_size,
