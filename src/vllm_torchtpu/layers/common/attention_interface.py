@@ -434,47 +434,81 @@ def attention_bundled(
         head_dim_original = q.shape[-1]
     md = attention_metadata
     use_hd64 = (q.shape[-1] == 64)
-    if use_hd64:
-        output, new_bundle = ragged_paged_attention_hd64_bundled(
-            q,
-            k,
-            v,
-            kv_cache_bundle,
-            layer_idx,
-            md.seq_lens,
-            md.block_tables,
-            md.query_start_loc,
-            md.request_distribution,
-            sinks,
-            sm_scale=head_dim_original**-0.5,
-            sliding_window=attention_chunk_size,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
+    sm_scale = head_dim_original**-0.5
+
+    def _run(q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
+             query_start_loc, request_distribution, sinks_arg):
+        if use_hd64:
+            output, new_bundle = ragged_paged_attention_hd64_bundled(
+                q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
+                query_start_loc, request_distribution, sinks_arg,
+                sm_scale=sm_scale, sliding_window=attention_chunk_size,
+                q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+            return new_bundle, output
+        if sinks_arg is not None:
+            raise NotImplementedError(
+                "Attention sink is supported only in the hd64 bundled path.")
+        output, new_bundle = ragged_paged_attention_bundled(
+            q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
+            query_start_loc, request_distribution,
+            sm_scale=sm_scale, sliding_window=attention_chunk_size,
+            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
         return new_bundle, output
 
-    if sinks is not None:
-        raise NotImplementedError(
-            "Attention sink is supported only in the hd64 bundled path.")
+    # TP=1 (or no ATTN_HEAD axis): run directly, no shard_map (matches the
+    # original single-chip bundled path).
+    try:
+        tp_size = int(mesh.shape[ShardingAxisName.ATTN_HEAD])
+    except (KeyError, TypeError):
+        tp_size = 1
+    if tp_size <= 1:
+        return _run(q, k, v, kv_cache_bundle, layer_idx, md.seq_lens,
+                    md.block_tables, md.query_start_loc,
+                    md.request_distribution, sinks)
 
-    output, new_bundle = ragged_paged_attention_bundled(
-        q,
-        k,
-        v,
-        kv_cache_bundle,
-        layer_idx,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
-        md.request_distribution,
-        sm_scale=head_dim_original**-0.5,
-        sliding_window=attention_chunk_size,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
+    # TP>1: shard on KV heads. The bundle is
+    # [num_pages, num_layers, page_size, K2/p, p, head_dim]; it shards on the
+    # same KV-head axis as the layer-major cache (now dim 3 because num_layers
+    # was inserted at dim 1) with num_layers LEFT UNSHARDED. q/k/v shard on the
+    # head axis (dim 1); per-request metadata shards on ATTN_DATA; the scalar
+    # layer_idx is replicated.
+    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+    bundle_spec = P(ShardingAxisName.ATTN_DATA, None, None,
+                    ShardingAxisName.ATTN_HEAD, None, None)
+    data_spec = P(ShardingAxisName.ATTN_DATA)
+    in_specs = (
+        qkv_spec,  # q
+        qkv_spec,  # k
+        qkv_spec,  # v
+        bundle_spec,  # kv_cache_bundle (num_layers dim unsharded)
+        P(),  # layer_idx (replicated scalar)
+        data_spec,  # seq_lens
+        data_spec,  # block_tables
+        data_spec,  # query_start_loc
+        data_spec,  # request_distribution
     )
-    return new_bundle, output
+    args = (q, k, v, kv_cache_bundle, layer_idx, md.seq_lens, md.block_tables,
+            md.query_start_loc, md.request_distribution)
+    if use_hd64 and sinks is not None:
+        in_specs = in_specs + (P(ShardingAxisName.ATTN_HEAD), )
+        args = args + (sinks, )
+
+        def _shard_fn(*a):
+            return _run(*a[:9], sinks_arg=a[9])
+    else:
+
+        def _shard_fn(*a):
+            return _run(*a, sinks_arg=None)
+
+    # out_specs mirror (new_bundle, output).
+    out_specs = (bundle_spec, qkv_spec)
+    return shard_map.shard_map(
+        _shard_fn,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False,
+    )(*args)
 
 
 def attention(
