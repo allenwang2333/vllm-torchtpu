@@ -21,6 +21,7 @@ the same schedule and communication once per head pair.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +30,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
-    broadcast_minor, convert_to_target_bitwidth, strided_load)
+    broadcast_minor, convert_to_target_bitwidth, get_dtype_packing,
+    strided_load)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField, build_pcp_streaming_schedule_inputs_from_metadata_jax)
 
@@ -39,29 +41,87 @@ TPU_HBM_ROW_TILE = 16
 ONLINE_STATE_PADDED_LANES = 128
 
 
-def _strided_load_packed_kv_head(kv_vmem_ref, slot, kv_head_idx):
+def _validate_packed_kv_layout(q_local,
+                               kv_cache_local,
+                               *,
+                               k_scale: float | None = None,
+                               v_scale: float | None = None):
+    """Validate PCP's physical packed KV layout against logical Q heads."""
+    if q_local.ndim != 4:
+        raise ValueError("PCP q_local must have shape "
+                         "[tokens, kv_heads, q_per_kv, head_dim], got "
+                         f"{q_local.shape}.")
+    if kv_cache_local.ndim != 5:
+        raise ValueError("PCP kv_cache_local must have shape "
+                         "[pages, page_size, packed_kv_groups, kv_packing, "
+                         f"head_dim], got {kv_cache_local.shape}.")
+
+    kv_heads = q_local.shape[1]
+    q_per_kv = q_local.shape[2]
+    head_dim = q_local.shape[-1]
+    packed_kv_groups = kv_cache_local.shape[2]
+    kv_packing = kv_cache_local.shape[3]
+    dtype_packing = get_dtype_packing(kv_cache_local.dtype)
+    if kv_heads <= 0 or q_per_kv <= 0:
+        raise ValueError("PCP requires positive kv_heads and q_per_kv, got "
+                         f"{kv_heads=} {q_per_kv=}.")
+    if kv_packing not in (2, 4):
+        raise NotImplementedError(
+            "PCP streaming RPA supports only BF16/FP8 packed KV cache "
+            f"layouts with packing 2 or 4, got {kv_packing}.")
+    if kv_packing != dtype_packing:
+        raise ValueError("PCP KV cache packing does not match dtype: "
+                         f"shape_packing={kv_packing}, "
+                         f"dtype_packing={dtype_packing}, "
+                         f"dtype={kv_cache_local.dtype}.")
+    expected_packed_kv_groups = math.ceil((2 * kv_heads) / kv_packing)
+    if packed_kv_groups != expected_packed_kv_groups:
+        raise ValueError(
+            "PCP KV cache packed layout does not match logical KV heads: "
+            f"packed_kv_groups={packed_kv_groups}, "
+            f"expected={expected_packed_kv_groups}, {kv_heads=}, "
+            f"{kv_packing=}.")
+    if kv_cache_local.shape[-1] != head_dim:
+        raise ValueError("PCP KV cache head_dim must match Q head_dim: "
+                         f"{kv_cache_local.shape[-1]} vs {head_dim}.")
+    if (k_scale is None) != (v_scale is None):
+        raise ValueError("PCP FP8 KV cache requires k_scale and v_scale to "
+                         "be both None or both non-None.")
+    if kv_packing == 4:
+        if k_scale is None or v_scale is None:
+            raise ValueError(
+                "PCP FP8 KV cache requires positive finite k_scale and "
+                "v_scale.")
+        if (not math.isfinite(float(k_scale)) or float(k_scale) <= 0
+                or not math.isfinite(float(v_scale)) or float(v_scale) <= 0):
+            raise ValueError(
+                "PCP FP8 KV cache requires positive finite k_scale and "
+                "v_scale.")
+    return kv_heads, packed_kv_groups, kv_packing
+
+
+def _strided_load_packed_kv_group(kv_vmem_ref, slot, packed_group_idx):
     page_size = kv_vmem_ref.shape[2]
     kv_block_tokens = kv_vmem_ref.shape[1] * page_size
-    kv_heads = kv_vmem_ref.shape[3]
+    packed_kv_groups = kv_vmem_ref.shape[3]
     head_dim = kv_vmem_ref.shape[-1]
     kv_ref = kv_vmem_ref.bitcast(jnp.uint32).at[slot]
-    kv_flat_ref = kv_ref.reshape(kv_block_tokens * kv_heads, head_dim)
-    kv_head_loaded = strided_load(
+    kv_flat_ref = kv_ref.reshape(kv_block_tokens * packed_kv_groups, head_dim)
+    kv_group_loaded = strided_load(
         kv_flat_ref,
-        kv_head_idx,
-        kv_block_tokens * kv_heads,
-        kv_heads,
+        packed_group_idx,
+        kv_block_tokens * packed_kv_groups,
+        packed_kv_groups,
     )
     bitwidth = jax.dtypes.itemsize_bits(kv_vmem_ref.dtype)
-    k, v = convert_to_target_bitwidth(
-        kv_head_loaded,
+    pairs = convert_to_target_bitwidth(
+        kv_group_loaded,
         target_bitwidth=bitwidth,
         kv_dtype=kv_vmem_ref.dtype,
-    )[0]
-    return (
-        k.reshape(kv_block_tokens, head_dim),
-        v.reshape(kv_block_tokens, head_dim),
     )
+    return [(k.reshape(kv_block_tokens,
+                       head_dim), v.reshape(kv_block_tokens, head_dim))
+            for k, v in pairs]
 
 
 def _consume_scheduled_kv_page_multi_head(
@@ -98,128 +158,134 @@ def _consume_scheduled_kv_page_multi_head(
     num_q_compute_blocks = q_vmem_ref.shape[0] // q_compute_size
     compute_dtype = q_vmem_ref.dtype
 
-    for kv_head_idx in range(q_vmem_ref.shape[1]):
-        k, v = _strided_load_packed_kv_head(kv_vmem_ref, slot, kv_head_idx)
-        if k_scale is not None:
-            k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
-        if v_scale is not None:
-            v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
-        if not causal:
-            k = k * sm_scale
+    heads_per_group = kv_vmem_ref.shape[4] // 2
+    for packed_group_idx in range(kv_vmem_ref.shape[3]):
+        kv_pairs = _strided_load_packed_kv_group(kv_vmem_ref, slot,
+                                                 packed_group_idx)
+        for pair_idx, (k, v) in enumerate(kv_pairs):
+            kv_head_idx = packed_group_idx * heads_per_group + pair_idx
+            if kv_head_idx >= q_vmem_ref.shape[1]:
+                continue
+            if k_scale is not None:
+                k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
+            if v_scale is not None:
+                v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
+            if not causal:
+                k = k * sm_scale
 
-        def _q_compute_loop(q_compute_idx, carry):
-            del carry
-            q_start = pl.multiple_of(q_compute_idx * q_compute_size,
-                                     q_compute_size)
-            q_slice = q_vmem_ref.at[
-                pl.ds(q_start, q_compute_size),
-                kv_head_idx,
-                :,
-                :,
-            ][...]
-            m_head = m_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...]
-            l_head = l_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...]
-            acc_head = acc_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...]
+            def _q_compute_loop(q_compute_idx, carry):
+                del carry
+                q_start = pl.multiple_of(q_compute_idx * q_compute_size,
+                                         q_compute_size)
+                q_slice = q_vmem_ref.at[
+                    pl.ds(q_start, q_compute_size),
+                    kv_head_idx,
+                    :,
+                    :,
+                ][...]
+                m_head = m_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...]
+                l_head = l_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...]
+                acc_head = acc_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...]
 
-            scores = lax.dot_general(
-                q_slice,
-                k,
-                (((2, ), (1, )), ((), ())),
-                preferred_element_type=jnp.float32,
+                scores = lax.dot_general(
+                    q_slice,
+                    k,
+                    (((2, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+
+                if causal:
+                    scores = scores * sm_scale
+                    q_row = (
+                        q_start +
+                        lax.broadcasted_iota(jnp.int32,
+                                             (q_compute_size, q_per_kv, 1), 0))
+                    q_interleave = page_size
+                    q_chunk_idx = lax.div(q_row, q_interleave)
+                    q_chunk_offset = lax.rem(q_row, q_interleave)
+                    q_pos = (q_global_start +
+                             q_chunk_idx * pcp_size * q_interleave +
+                             q_chunk_offset)
+                    kv_local_pos = lax.broadcasted_iota(
+                        jnp.int32, (1, 1, kv_block_tokens), 2)
+                    kv_page_offset = lax.div(kv_local_pos, page_size)
+                    kv_token_offset = lax.rem(kv_local_pos, page_size)
+                    kv_pos = (kv_global_start +
+                              kv_page_offset * pcp_size * page_size +
+                              kv_token_offset)
+                    kv_valid = kv_local_pos < kv_valid_len
+                    q_valid = q_row < q_tile_size
+                    entry_valid = req_id != -1
+                    row_active = jnp.logical_and(entry_valid, q_valid)
+                    mask = jnp.logical_and(
+                        jnp.logical_and(q_pos >= kv_pos, kv_valid), q_valid)
+                    scores = jnp.where(mask, scores, -jnp.inf)
+                    scores = jnp.where(row_active, scores, 0.0)
+
+                m_curr = jnp.max(scores, axis=2, keepdims=True)
+                if causal:
+                    m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr),
+                                       m_head)
+                else:
+                    m_next = jnp.maximum(m_head, m_curr)
+                m_next_broadcast = broadcast_minor(m_next, scores.shape)
+                p = jnp.exp(scores - m_next_broadcast)
+                alpha = jnp.exp(m_head - m_next)
+                if causal:
+                    p = jnp.where(row_active, p, 0.0)
+                    alpha = jnp.where(row_active, alpha, 1.0)
+                l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
+                pv = lax.dot_general(
+                    p.astype(compute_dtype),
+                    v,
+                    (((2, ), (0, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                alpha_broadcast = broadcast_minor(alpha, acc_head.shape)
+                acc_next = alpha_broadcast * acc_head + pv
+
+                m_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...] = m_next
+                l_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...] = l_next
+                acc_scratch_ref.at[
+                    kv_head_idx,
+                    pl.ds(q_start, q_compute_size),
+                    :,
+                    :,
+                ][...] = acc_next
+                return jnp.array(0, dtype=jnp.int32)
+
+            lax.fori_loop(
+                0,
+                num_q_compute_blocks,
+                _q_compute_loop,
+                jnp.array(0, dtype=jnp.int32),
+                unroll=True,
             )
-
-            if causal:
-                scores = scores * sm_scale
-                q_row = (
-                    q_start +
-                    lax.broadcasted_iota(jnp.int32,
-                                         (q_compute_size, q_per_kv, 1), 0))
-                q_interleave = page_size
-                q_chunk_idx = lax.div(q_row, q_interleave)
-                q_chunk_offset = lax.rem(q_row, q_interleave)
-                q_pos = (q_global_start +
-                         q_chunk_idx * pcp_size * q_interleave +
-                         q_chunk_offset)
-                kv_local_pos = lax.broadcasted_iota(jnp.int32,
-                                                    (1, 1, kv_block_tokens), 2)
-                kv_page_offset = lax.div(kv_local_pos, page_size)
-                kv_token_offset = lax.rem(kv_local_pos, page_size)
-                kv_pos = (kv_global_start +
-                          kv_page_offset * pcp_size * page_size +
-                          kv_token_offset)
-                kv_valid = kv_local_pos < kv_valid_len
-                q_valid = q_row < q_tile_size
-                entry_valid = req_id != -1
-                row_active = jnp.logical_and(entry_valid, q_valid)
-                mask = jnp.logical_and(
-                    jnp.logical_and(q_pos >= kv_pos, kv_valid), q_valid)
-                scores = jnp.where(mask, scores, -jnp.inf)
-                scores = jnp.where(row_active, scores, 0.0)
-
-            m_curr = jnp.max(scores, axis=2, keepdims=True)
-            if causal:
-                m_next = jnp.where(row_active, jnp.maximum(m_head, m_curr),
-                                   m_head)
-            else:
-                m_next = jnp.maximum(m_head, m_curr)
-            m_next_broadcast = broadcast_minor(m_next, scores.shape)
-            p = jnp.exp(scores - m_next_broadcast)
-            alpha = jnp.exp(m_head - m_next)
-            if causal:
-                p = jnp.where(row_active, p, 0.0)
-                alpha = jnp.where(row_active, alpha, 1.0)
-            l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
-            pv = lax.dot_general(
-                p.astype(compute_dtype),
-                v,
-                (((2, ), (0, )), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            alpha_broadcast = broadcast_minor(alpha, acc_head.shape)
-            acc_next = alpha_broadcast * acc_head + pv
-
-            m_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...] = m_next
-            l_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...] = l_next
-            acc_scratch_ref.at[
-                kv_head_idx,
-                pl.ds(q_start, q_compute_size),
-                :,
-                :,
-            ][...] = acc_next
-            return jnp.array(0, dtype=jnp.int32)
-
-        lax.fori_loop(
-            0,
-            num_q_compute_blocks,
-            _q_compute_loop,
-            jnp.array(0, dtype=jnp.int32),
-            unroll=True,
-        )
 
 
 def _reset_multi_head_online_state(m_scratch_ref, l_scratch_ref,
@@ -464,7 +530,8 @@ def _source_page_idx_from_staged_schedule(sched_vmem_ref,
 
 def _load_local_kv_page_block_all_heads_packed(kv_cache_ref, kv_vmem_ref, sem,
                                                sched_vmem_ref, source_rank,
-                                               lane, *, pcp_size, kv_heads,
+                                               lane, *, pcp_size,
+                                               packed_kv_groups,
                                                kv_pages_per_block):
     for page_offset in range(kv_pages_per_block):
         local_page_idx = _source_page_idx_from_staged_schedule(
@@ -479,7 +546,7 @@ def _load_local_kv_page_block_all_heads_packed(kv_cache_ref, kv_vmem_ref, sem,
                 0,
                 local_page_idx,
                 :,
-                pl.ds(0, kv_heads),
+                pl.ds(0, packed_kv_groups),
                 :,
                 :,
             ],
@@ -523,6 +590,8 @@ def _run_pcp_page_groups_multi_head(
     q_compute_size,
     sm_scale,
     kv_heads,
+    packed_kv_groups,
+    kv_packing,
     kv_pages_per_block,
     k_scale,
     v_scale,
@@ -603,7 +672,7 @@ def _run_pcp_page_groups_multi_head(
             my_id,
             lane,
             pcp_size=pcp_size,
-            kv_heads=kv_heads,
+            packed_kv_groups=packed_kv_groups,
             kv_pages_per_block=kv_pages_per_block,
         )
 
@@ -785,6 +854,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     num_page_groups,
     sm_scale,
     kv_heads,
+    packed_kv_groups,
+    kv_packing,
     kv_pages_per_block,
     k_scale,
     v_scale,
@@ -821,6 +892,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
+            packed_kv_groups=packed_kv_groups,
+            kv_packing=kv_packing,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -859,6 +932,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     num_page_groups,
     sm_scale,
     kv_heads,
+    packed_kv_groups,
+    kv_packing,
     kv_pages_per_block,
     k_scale,
     v_scale,
@@ -901,6 +976,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
             q_compute_size=q_compute_size,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
+            packed_kv_groups=packed_kv_groups,
+            kv_packing=kv_packing,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -1018,6 +1095,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
     head_dim = q_multi_head.shape[-1]
+    packed_kv_groups = kv_cache_local.shape[3]
+    kv_packing = kv_cache_local.shape[4]
     num_page_groups = packed_schedule.shape[0] // pcp_size
     num_lanes = packed_schedule.shape[2]
     q_compute_size = _normalize_q_compute_size(q_block_size, q_compute_size)
@@ -1048,6 +1127,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             num_page_groups=num_page_groups,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
+            packed_kv_groups=packed_kv_groups,
+            kv_packing=kv_packing,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -1083,9 +1164,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
                     packed_schedule.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
-                pltpu.VMEM(
-                    (2, kv_pages_per_block, page_size, kv_heads, 2, head_dim),
-                    kv_cache_local.dtype),
+                pltpu.VMEM((2, kv_pages_per_block, page_size, packed_kv_groups,
+                            kv_packing, head_dim), kv_cache_local.dtype),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_acc_scratch_shape, jnp.float32),
@@ -1121,6 +1201,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
     head_dim = q_multi_head.shape[-1]
+    packed_kv_groups = kv_cache_local.shape[3]
+    kv_packing = kv_cache_local.shape[4]
     num_page_groups = packed_schedule.shape[0] // pcp_size
     num_lanes = packed_schedule.shape[2]
     q_compute_size = _normalize_q_compute_size(q_block_size, q_compute_size)
@@ -1144,6 +1226,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             num_page_groups=num_page_groups,
             sm_scale=sm_scale,
             kv_heads=kv_heads,
+            packed_kv_groups=packed_kv_groups,
+            kv_packing=kv_packing,
             kv_pages_per_block=kv_pages_per_block,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -1174,9 +1258,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
                     packed_schedule.dtype),
                 pltpu.VMEM((q_block_size, kv_heads, q_per_kv, head_dim),
                            q_multi_head.dtype),
-                pltpu.VMEM(
-                    (2, kv_pages_per_block, page_size, kv_heads, 2, head_dim),
-                    kv_cache_local.dtype),
+                pltpu.VMEM((2, kv_pages_per_block, page_size, packed_kv_groups,
+                            kv_packing, head_dim), kv_cache_local.dtype),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_lm_scratch_shape, jnp.float32),
                 pltpu.VMEM(state_acc_scratch_shape, jnp.float32),
@@ -1324,12 +1407,10 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     Returns:
         [local_tokens, kv_heads, q_per_kv, head_dim] local attention output.
     """
-    kv_heads = q_local.shape[1]
-    q_per_kv = q_local.shape[2]
-    kv_packing = kv_cache_local.shape[3]
-    if not (kv_packing == 2 and kv_heads >= 2 and q_per_kv >= 2):
-        raise NotImplementedError(
-            "split PCP path currently requires the packed multi-head path.")
+    _validate_packed_kv_layout(q_local,
+                               kv_cache_local,
+                               k_scale=k_scale,
+                               v_scale=v_scale)
 
     page_size = kv_cache_local.shape[1]
     (current_schedule, current_active_page_groups, history_schedule,
