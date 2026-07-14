@@ -281,6 +281,14 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     def shard_tokens(x):
         return jax.device_put(x, NamedSharding(mesh, P('pcp', None)))
 
+    def shard_conv_state(x):
+        return jax.device_put(x, NamedSharding(mesh, P(None, None, 'pcp')))
+
+    def shard_rec_state(x):
+        return jax.device_put(x,
+                              NamedSharding(mesh,
+                                            P(None, 'pcp', None, None)))
+
     def replicate(x):
         return jax.device_put(x, NamedSharding(mesh, P()))
 
@@ -288,8 +296,8 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
         shard_tokens(packed_qkv),
         shard_tokens(packed_b),
         shard_tokens(packed_a),
-        replicate(conv_state0),
-        replicate(rec_state0),
+        shard_conv_state(conv_state0),
+        shard_rec_state(rec_state0),
         replicate(conv_weight0),
         replicate(conv_bias0),
         replicate(A_log0),
