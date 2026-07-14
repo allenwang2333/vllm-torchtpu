@@ -18,7 +18,6 @@ import functools
 import jax
 import torch
 from einops import rearrange
-from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
@@ -27,12 +26,11 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
-                                           get_pcp_rank, get_pcp_world_size)
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
-    pcp_streaming_jax_op
+from vllm_torchtpu.distributed.pcp import (get_pcp_group, get_pcp_rank,
+                                           get_pcp_world_size)
 from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, run_jax_gdn_attention,
+    run_jax_gdn_attention_pcp_local_prefill,
     run_jax_gdn_attention_pcp_tp_prefill)
 from vllm_torchtpu.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
@@ -94,6 +92,92 @@ def _pcp_slice_reordered_concatenated_torch(
             tensor.narrow(axis, offset + pcp_rank * shard_size, shard_size))
         offset += split_size
     return torch.cat(parts, dim=axis).contiguous()
+
+
+def _pcp_reorder_concatenated_torch(
+    tensor: torch.Tensor,
+    split_sizes: list[int],
+    pcp_size: int,
+    *,
+    axis: int,
+) -> torch.Tensor:
+    """Group concatenated Q/K/V slices by destination PCP rank."""
+    axis = _normalize_dim(axis, tensor.dim())
+    if sum(split_sizes) != tensor.shape[axis]:
+        raise RuntimeError(
+            "PCP concatenated splits do not cover the reorder axis: "
+            f"shape={tuple(tensor.shape)} axis={axis} "
+            f"split_sizes={split_sizes}")
+    split_tensors = torch.split(tensor, split_sizes, dim=axis)
+    rank_parts: list[torch.Tensor] = []
+    for pcp_rank in range(pcp_size):
+        for split_tensor, split_size in zip(split_tensors, split_sizes):
+            if split_size % pcp_size != 0:
+                raise RuntimeError(
+                    "PCP split is not divisible by pcp_size: "
+                    f"split_size={split_size} pcp_size={pcp_size}")
+            shard_size = split_size // pcp_size
+            rank_parts.append(
+                split_tensor.narrow(axis, pcp_rank * shard_size, shard_size))
+    return torch.cat(rank_parts, dim=axis).contiguous()
+
+
+def _pcp_all_to_all_single_torch(send: torch.Tensor) -> torch.Tensor:
+    """Run an equal-split Torch all-to-all over the native PCP group."""
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return send
+    if not send.is_contiguous():
+        send = send.contiguous()
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(
+        recv.view(-1),
+        send.view(-1),
+        group=group.device_group,
+        async_op=False,
+    )
+    return recv
+
+
+def _pcp_exchange_token_shards_for_head_shards_torch(
+    tensor: torch.Tensor,
+    pcp_size: int,
+) -> torch.Tensor:
+    """Exchange local-token/all-head input for all-token/local-head input."""
+    if tensor.dim() != 2:
+        raise RuntimeError(
+            "Torch PCP token/head exchange expects a 2D tensor, got "
+            f"shape={tuple(tensor.shape)}")
+    local_tokens, width = tensor.shape
+    if width % pcp_size != 0:
+        raise RuntimeError("PCP head width is not divisible by pcp_size: "
+                           f"width={width} pcp_size={pcp_size}")
+    width_per_rank = width // pcp_size
+    send = tensor.reshape(local_tokens, pcp_size, width_per_rank).permute(
+        1, 0, 2).contiguous()
+    recv = _pcp_all_to_all_single_torch(send)
+    return recv.reshape(pcp_size * local_tokens, width_per_rank)
+
+
+def _pcp_exchange_head_shards_for_token_shards_torch(
+    tensor: torch.Tensor,
+    pcp_size: int,
+) -> torch.Tensor:
+    """Inverse exchange restoring local-token/full-head output."""
+    if tensor.dim() != 2:
+        raise RuntimeError(
+            "Torch PCP head/token exchange expects a 2D tensor, got "
+            f"shape={tuple(tensor.shape)}")
+    packed_tokens, width_per_rank = tensor.shape
+    if packed_tokens % pcp_size != 0:
+        raise RuntimeError(
+            "Packed PCP token count is not divisible by pcp_size: "
+            f"tokens={packed_tokens} pcp_size={pcp_size}")
+    local_tokens = packed_tokens // pcp_size
+    send = tensor.reshape(pcp_size, local_tokens, width_per_rank).contiguous()
+    recv = _pcp_all_to_all_single_torch(send)
+    return recv.permute(1, 0, 2).reshape(local_tokens,
+                                         pcp_size * width_per_rank)
 
 
 def gdn_attention_core_tpu(
@@ -200,6 +284,59 @@ def gdn_attention_core_tpu_pcp_prefill(
     return new_conv_state, new_recurrent_state, output
 
 
+def gdn_attention_core_tpu_pcp_torch_a2a_prefill(
+    packed_mixed_qkv: jax.Array,
+    packed_b: jax.Array,
+    packed_a: jax.Array,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array | None,
+    A_log: jax.Array,
+    dt_bias: jax.Array,
+    state_indices: jax.Array,
+    query_start_loc: jax.Array,
+    distribution: jax.Array,
+    seq_lens: jax.Array,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    config: GdnAttentionConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Worker-local GDN entry used between two Torch PCP all-to-alls."""
+    (new_conv_state,
+     new_recurrent_state), packed_output = (
+         run_jax_gdn_attention_pcp_local_prefill(
+             packed_mixed_qkv,
+             packed_b,
+             packed_a,
+             conv_state,
+             recurrent_state,
+             conv_weight,
+             conv_bias,
+             A_log,
+             dt_bias,
+             state_indices,
+             query_start_loc,
+             distribution,
+             seq_lens,
+             n_kq=n_kq,
+             n_v=n_v,
+             d_k=d_k,
+             d_v=d_v,
+             kernel_size=kernel_size,
+             pcp_size=pcp_size,
+             interleave_size=interleave_size,
+             config=config,
+         ))
+    return new_conv_state, new_recurrent_state, packed_output
+
+
 def _get_pcp_size(vllm_config: VllmConfig) -> int:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
@@ -289,7 +426,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             ragged_gated_delta_rule_impl=ragged_gated_delta_rule_impl)
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.num_k_heads // self.tp_size
-        has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
         parallel_config = getattr(vllm_context.vllm_config, "parallel_config",
                                   None)
@@ -301,12 +437,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if not isinstance(interleave_size, int) or interleave_size <= 0:
                 raise ValueError("GDN PCP streaming requires "
                                  "cp_kv_cache_interleave_size > 0.")
-            pcp_mesh = get_or_create_pcp_mesh(axis_name="pcp")
             pcp_size = get_pcp_world_size()
-            if pcp_size != pcp_mesh.shape["pcp"]:
-                raise ValueError(
-                    f"PCP world size {pcp_size} does not match mesh shape "
-                    f"{pcp_mesh.shape['pcp']}.")
             if local_num_kq_heads % pcp_size != 0:
                 raise ValueError("local GDN K/Q heads "
                                  f"{local_num_kq_heads} must be divisible by "
@@ -318,10 +449,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             op_name = ("pallas::gdn_attention_pcp_"
                        f"{self.prefix.replace('.', '_')}")
             wrapped_fn = functools.partial(
-                gdn_attention_core_tpu_pcp_prefill,
-                mesh=pcp_mesh,
-                n_kq=local_num_kq_heads,
-                n_v=local_num_v_heads,
+                gdn_attention_core_tpu_pcp_torch_a2a_prefill,
+                n_kq=local_num_kq_heads // pcp_size,
+                n_v=local_num_v_heads // pcp_size,
                 d_k=self.head_k_dim,
                 d_v=self.head_v_dim,
                 kernel_size=self.conv_kernel_size,
@@ -329,41 +459,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 interleave_size=interleave_size,
                 config=config,
             )
-            input_partition_specs = (
-                PartitionSpec("pcp"),  # mixed_qkv
-                PartitionSpec("pcp"),  # b
-                PartitionSpec("pcp"),  # a
-                PartitionSpec(None, None, "pcp"),  # conv_state
-                PartitionSpec(None, "pcp", None, None),  # recurrent_state
-                PartitionSpec("pcp", None, None),  # conv_weight
-                PartitionSpec("pcp") if has_conv_bias else None,  # conv_bias
-                PartitionSpec("pcp"),  # A_log
-                PartitionSpec("pcp"),  # dt_bias
-                PartitionSpec(),  # state_indices
-                PartitionSpec(),  # query_start_loc
-                PartitionSpec(),  # request_distribution
-                PartitionSpec(),  # seq_lens
-            )
-            output_partition_specs = (
-                PartitionSpec(None, None, "pcp"),  # new_conv_state
-                PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec("pcp"),  # output
-            )
             donate_argnums = _gdn_state_donate_argnums(
                 vllm_context.vllm_config, op_name)
-            gdn_jax_op = pcp_streaming_jax_op(
-                op_name,
-                wrapped_fn,
-                donate_argnums=donate_argnums,
-                mesh=pcp_mesh,
-                input_partition_specs=input_partition_specs,
-                output_partition_specs=output_partition_specs,
-            )
+            gdn_jax_op = pallas.jax_op(op_name,
+                                       wrapped_fn,
+                                       donate_argnums=donate_argnums)
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens, local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads // pcp_size *
+                             self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
@@ -451,6 +557,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     pcp_size,
                     axis=0,
                 ).contiguous()
+                mixed_qkv_arg = _pcp_reorder_concatenated_torch(
+                    mixed_qkv,
+                    split_sizes,
+                    pcp_size,
+                    axis=-1,
+                )
+                mixed_qkv_arg = (
+                    _pcp_exchange_token_shards_for_head_shards_torch(
+                        mixed_qkv_arg, pcp_size))
+                b_arg = _pcp_exchange_token_shards_for_head_shards_torch(
+                    b, pcp_size)
+                a_arg = _pcp_exchange_token_shards_for_head_shards_torch(
+                    a, pcp_size)
             else:
                 conv_state_arg = conv_state
                 recurrent_state_arg = recurrent_state
@@ -458,12 +577,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_bias_arg = conv_bias
                 A_log_arg = A_log
                 dt_bias_arg = dt_bias
+                mixed_qkv_arg = mixed_qkv
+                b_arg = b
+                a_arg = a
 
             new_conv, new_rec, outputs = gdn_jax_op(
-                mixed_qkv, b, a, conv_state_arg, recurrent_state_arg,
+                mixed_qkv_arg, b_arg, a_arg, conv_state_arg,
+                recurrent_state_arg,
                 conv_weight_arg, conv_bias_arg, A_log_arg, dt_bias_arg,
                 state_indices, query_start_loc, request_distribution, seq_lens)
             if pcp_streaming:
+                outputs = _pcp_exchange_head_shards_for_token_shards_torch(
+                    outputs, pcp_size)
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
             # Both PCP and non-PCP caches are complete from this worker's
@@ -510,7 +635,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                # ``z`` crosses the GDN splitting-op boundary while still
+                # being a tail view of ``mixed_qkvz``.  Materialize it so the
+                # next compiled piece does not have to reconstruct a
+                # non-zero-offset, non-contiguous view.
+                z = z.reshape(z.size(0), -1, self.head_v_dim).clone(
+                    memory_format=torch.contiguous_format)
                 b, a = ba.chunk(2, dim=-1)
                 b = b.contiguous()
                 a = a.contiguous()

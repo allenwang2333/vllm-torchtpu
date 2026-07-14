@@ -493,6 +493,91 @@ def _derive_pcp_rank_major_reorder_indices(
     return jnp.where(valid_mask, reorder_indices, -1).astype(jnp.int32)
 
 
+def run_jax_gdn_attention_pcp_local_prefill(
+    packed_mixed_qkv: jnp.ndarray,
+    packed_b: jnp.ndarray,
+    packed_a: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    conv_weight: jnp.ndarray,
+    conv_bias: Optional[jnp.ndarray],
+    A_log: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    config: GdnAttentionConfig = GdnAttentionConfig(),
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Run one PCP head shard after an external token/head exchange.
+
+    ``packed_*`` contains equal-size token shards from every PCP source in
+    PCP-rank-major order. This worker-local entry contains no JAX collective;
+    callers can use Torch collectives before and after it.
+    """
+    if pcp_size <= 0:
+        raise ValueError(f"pcp_size must be positive, got {pcp_size}.")
+    if packed_mixed_qkv.shape[0] % pcp_size != 0:
+        raise ValueError(
+            "Packed GDN tokens must be divisible by pcp_size: "
+            f"tokens={packed_mixed_qkv.shape[0]}, pcp_size={pcp_size}.")
+
+    local_padded_num_tokens = packed_mixed_qkv.shape[0] // pcp_size
+    full_reorder = _derive_pcp_rank_major_reorder_indices(
+        query_start_loc,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        local_padded_num_tokens=local_padded_num_tokens,
+        seq_lens=seq_lens,
+    )
+    valid_mask = full_reorder >= 0
+    scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+    gather_indices = jnp.where(valid_mask, full_reorder, 0)
+
+    mixed_qkv = jnp.zeros_like(packed_mixed_qkv).at[scatter_indices].set(
+        packed_mixed_qkv, mode="drop")
+    b = jnp.zeros_like(packed_b).at[scatter_indices].set(packed_b,
+                                                         mode="drop")
+    a = jnp.zeros_like(packed_a).at[scatter_indices].set(packed_a,
+                                                         mode="drop")
+
+    (new_conv_state,
+     new_recurrent_state), seq_output = run_jax_gdn_attention_local(
+         mixed_qkv,
+         b,
+         a,
+         conv_state,
+         recurrent_state,
+         conv_weight,
+         conv_bias,
+         A_log,
+         dt_bias,
+         query_start_loc,
+         state_indices,
+         distribution,
+         seq_lens,
+         n_kq=n_kq,
+         n_v=n_v,
+         d_k=d_k,
+         d_v=d_v,
+         kernel_size=kernel_size,
+         dp_enabled=False,
+         config=config,
+     )
+
+    packed_output = seq_output[gather_indices]
+    packed_output = jnp.where(valid_mask[:, None], packed_output, 0.0)
+    return (new_conv_state, new_recurrent_state), packed_output
+
+
 def run_jax_gdn_attention_pcp_tp_prefill(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,

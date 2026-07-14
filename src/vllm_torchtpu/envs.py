@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_VERSION: str = "v2"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
+    TORCHTPU_EAGER_MODE: str = "AUTO"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
 
@@ -214,6 +215,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_gather_reduce.
     "RAGGED_GATHER_REDUCE_VERSION":
     env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    # TorchTPU runtime execution mode. AUTO follows vLLM's compilation mode:
+    # --enforce-eager selects DEFER_NEVER, compiled execution selects
+    # DEFER_AND_FUSE. Explicit values are useful for diagnostic A/B runs.
+    "TORCHTPU_EAGER_MODE":
+    env_with_choices("TORCHTPU_EAGER_MODE", "AUTO",
+                     ["AUTO", "DEFER_AND_FUSE", "DEFER_NEVER"]),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

@@ -70,18 +70,22 @@ def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
     return bool(multimodal_config.language_model_only)
 
 
-def _configure_torchtpu_eager_mode() -> None:
+def _configure_torchtpu_eager_mode(
+        default_mode_name: str = "DEFER_AND_FUSE") -> None:
     from torch_tpu._internal import execution_mode
     previous_mode = execution_mode.eager_mode
+    mode_name = envs.TORCHTPU_EAGER_MODE
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
     # kernel program is context-free, so a swap costs one kernel compile.
-    if envs.TPU_KERNEL_ITER_MODE:
+    if mode_name == "AUTO" and envs.TPU_KERNEL_ITER_MODE:
         logger.info("TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).",
                     previous_mode.name)
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    if mode_name == "AUTO":
+        mode_name = default_mode_name
+    execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_name)
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
                 execution_mode.eager_mode.name, previous_mode.name)
 
@@ -233,7 +237,7 @@ def _patch_scheduler_mamba_external_kv() -> None:
         "Applied TPU patch: allow mamba-align scheduler with external KV.")
 
 
-def apply_tpu_patches() -> None:
+def apply_tpu_patches(default_mode_name: str = "DEFER_AND_FUSE") -> None:
     """Apply all module-level patches required for TorchTPU.
 
     Must run in **every** process (including spawned workers) because
@@ -256,7 +260,7 @@ def apply_tpu_patches() -> None:
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
     import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
-    _configure_torchtpu_eager_mode()
+    _configure_torchtpu_eager_mode(default_mode_name)
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
 
@@ -285,7 +289,7 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TORCHTPU_EAGER_MODE"
     ]
 
     @classmethod
@@ -445,7 +449,12 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        apply_tpu_patches()
+        from vllm.config import CompilationMode
+        compilation_config = vllm_config.compilation_config
+        default_mode_name = (
+            "DEFER_NEVER" if compilation_config.mode == CompilationMode.NONE
+            else "DEFER_AND_FUSE")
+        apply_tpu_patches(default_mode_name)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -463,8 +472,6 @@ class TpuPlatform(Platform):
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
 
-        from vllm.config import CompilationMode
-        compilation_config = vllm_config.compilation_config
         if compilation_config.mode == CompilationMode.NONE:
             # --enforce-eager is set
             pass

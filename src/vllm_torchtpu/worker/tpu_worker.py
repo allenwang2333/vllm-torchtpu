@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import torch
 import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import profiler_api
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           get_kv_transfer_group,
                                           has_kv_transfer_group)
@@ -66,7 +66,11 @@ class TPUWorker(WorkerBase):
         # Workers may be spawned (not forked) so module-level patches
         # from the parent process are lost.
         from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
-        apply_tpu_patches()
+        default_mode_name = (
+            "DEFER_NEVER"
+            if vllm_config.compilation_config.mode == CompilationMode.NONE else
+            "DEFER_AND_FUSE")
+        apply_tpu_patches(default_mode_name)
 
         if envs.MODEL_IMPL_TYPE != "vllm":
             raise ValueError("Only vLLM models are supported")
