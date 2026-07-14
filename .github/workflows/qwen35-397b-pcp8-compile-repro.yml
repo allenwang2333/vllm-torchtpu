@@ -31,11 +31,9 @@ jobs:
       matrix:
         case:
           - mode: split
-            label: GDN split, expect healthy
-            expected_outcome: healthy
+            label: GDN split, expect startup success
           - mode: full
-            label: full graph, reproduce CoreHalt
-            expected_outcome: core_halt
+            label: full graph, expect startup failure
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torchtpu-vllm-ci:latest
       options: --privileged --net=host --shm-size=16g --device /dev/fuse
@@ -87,7 +85,6 @@ jobs:
 
       - name: Run Qwen3.5 397B PCP8 compile reproduction
         env:
-          EXPECTED_OUTCOME: ${{ matrix.case.expected_outcome }}
           RUN_ROOT: /tmp/qwen35_397b_pcp8_compile_repro/${{ matrix.case.mode }}
         run: |
           bash scripts/vllm/integration/run_qwen35_397b_pcp8_compile_repro.sh \

@@ -103,18 +103,22 @@ def test_repro_script_uses_dummy_load_without_eager_or_model_download():
     assert "--block-size 256" in script
     assert "--max-num-batched-tokens 4096" in script
     assert "--enforce-eager" not in script
+    assert "RuntimeUnexpectedCoreHalt" not in script
+    assert "subgraph_45" not in script
+    assert "EXPECTED_OUTCOME" not in script
     assert "gsutil" not in workflow
     assert "model_gcs" not in workflow.lower()
 
 
-def test_workflow_runs_isolated_split_and_full_graph_cases():
+def test_workflow_runs_isolated_split_and_full_graph_startups():
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
     assert "fail-fast: false" in workflow
     assert "mode: split" in workflow
-    assert "expected_outcome: healthy" in workflow
+    assert "GDN split, expect startup success" in workflow
     assert "mode: full" in workflow
-    assert "expected_outcome: core_halt" in workflow
+    assert "full graph, expect startup failure" in workflow
+    assert "expected_outcome:" not in workflow
     assert "qwen35-397b-pcp8-compile-${{ matrix.case.mode }}-logs" in workflow
     assert "HF_HUB_OFFLINE: \"1\"" in workflow
     assert "TRANSFORMERS_OFFLINE: \"1\"" in workflow

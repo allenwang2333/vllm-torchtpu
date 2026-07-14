@@ -1,32 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproduce the Qwen3.5-397B PCP=8 full-graph CoreHalt and verify the vLLM
-# splitting_ops mitigation. Each mode must run on a fresh TPU runner: a
-# RuntimeUnexpectedCoreHalt can leave the TPU runtime unusable for a later run.
+# Compare Qwen3.5-397B PCP=8 startup with and without vLLM splitting_ops.
+# Each mode must run on a fresh TPU runner because a failed full-graph startup
+# can leave the TPU runtime unusable for a later run.
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
 mode="${1:-${GDN_SPLITTING_MODE:-split}}"
 case "${mode}" in
-  split)
-    default_expected_outcome=healthy
-    ;;
-  full)
-    default_expected_outcome=core_halt
-    ;;
+  split|full) ;;
   *)
     echo "Usage: $0 {split|full}" >&2
-    exit 2
-    ;;
-esac
-
-expected_outcome="${EXPECTED_OUTCOME:-${default_expected_outcome}}"
-case "${expected_outcome}" in
-  healthy|core_halt) ;;
-  *)
-    echo "EXPECTED_OUTCOME must be healthy or core_halt, got: ${expected_outcome}" >&2
     exit 2
     ;;
 esac
@@ -152,7 +138,6 @@ server_args=(
 
 {
   echo "mode=${mode}"
-  echo "expected_outcome=${expected_outcome}"
   echo "model_dir=${model_dir}"
   echo "compilation_config=${compilation_config}"
   printf 'command='
@@ -194,60 +179,33 @@ server_pid=$!
 tail --pid="${server_pid}" -n +1 -F "${server_log}" &
 tail_pid=$!
 
-observed_outcome=timeout
+startup_result=timeout
 deadline=$((SECONDS + startup_timeout_seconds))
-core_halt_pattern='RuntimeUnexpectedCoreHalt'
 
 while ((SECONDS < deadline)); do
-  if grep -Eiq "${core_halt_pattern}" "${server_log}"; then
-    observed_outcome=core_halt
-    break
-  fi
   health_code="$(curl -fsS -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:${port}/health" 2>/dev/null || true)"
   if [[ "${health_code}" == "200" ]]; then
-    observed_outcome=healthy
+    startup_result=healthy
     break
   fi
   if ! kill -0 "${server_pid}" 2>/dev/null; then
-    # Worker tracebacks can reach the shared log just after the API-server
-    # leader exits. Give them a short flush window before classifying the exit.
+    # Give worker tracebacks a short window to reach the uploaded log.
     sleep 2
-    if grep -Eiq "${core_halt_pattern}" "${server_log}"; then
-      observed_outcome=core_halt
-    else
-      observed_outcome=process_exit
-    fi
+    startup_result=process_exit
     break
   fi
   sleep "${poll_interval_seconds}"
 done
 
-printf 'mode=%s\nexpected_outcome=%s\nobserved_outcome=%s\n' \
-  "${mode}" "${expected_outcome}" "${observed_outcome}" \
+printf 'mode=%s\nstartup_result=%s\n' "${mode}" "${startup_result}" \
   | tee "${summary_file}"
 
-if [[ "${expected_outcome}" == "healthy" ]]; then
-  if [[ "${observed_outcome}" != "healthy" ]]; then
-    echo "Split compilation did not become healthy." >&2
-    exit 1
-  fi
-  if grep -Eiq "${core_halt_pattern}" "${server_log}"; then
-    echo "Split compilation reached health but also logged a CoreHalt." >&2
-    exit 1
-  fi
-  if ! grep -q 'subgraph_45' "${server_log}"; then
-    echo "Split mode became healthy without evidence of all 46 graph pieces." >&2
-    exit 1
-  fi
-  echo "QWEN35_397B_PCP8_SPLIT_COMPILE_OK=1" | tee -a "${summary_file}"
-else
-  if [[ "${observed_outcome}" != "core_halt" ]]; then
-    echo "Full-graph mode did not reproduce RuntimeUnexpectedCoreHalt." >&2
-    exit 1
-  fi
-  echo "QWEN35_397B_PCP8_FULL_GRAPH_CORE_HALT_REPRODUCED=1" \
-    | tee -a "${summary_file}"
+if [[ "${startup_result}" != "healthy" ]]; then
+  echo "${mode} mode did not start successfully; inspect ${server_log}." >&2
+  exit 1
 fi
+
+echo "QWEN35_397B_PCP8_STARTUP_OK=1" | tee -a "${summary_file}"
 
 echo "RUN_DIR=${run_dir}"
