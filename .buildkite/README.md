@@ -25,8 +25,11 @@ which:
 | [`pipeline_integration.yml`](pipeline_integration.yml) | Integration cases (e.g. qwen3.5 P4D2 disaggregated correctness). | `tpu_v7x_8_queue` |
 | [`pipeline_perf.yml`](pipeline_perf.yml) | Perf + eval flows (`scripts/vllm/benchmarking/run_eval_flow.sh`, lm-eval/evalplus). Small configs run on every build; large models (480B, 397B) are nightly-only. Results are uploaded as Buildkite artifacts under `perf_eval_results/**`. | `tpu_v7x_2_queue` / `tpu_v7x_8_queue` |
 
-Steps gated with `if: build.env("NIGHTLY") == "1"` show as `broken` (skipped)
-on regular PR builds — that is expected, not a failure.
+Steps gated with `if: build.env("NIGHTLY") == "1"` never run on regular PR
+builds; the Buildkite API reports them with state `broken` (its term for steps
+filtered out by an `if:` condition — distinct from `skipped`, which Buildkite
+uses for superseded builds). The UI shows them grayed out. Either way it is
+expected, not a failure.
 
 ## Test execution on TPU agents
 
