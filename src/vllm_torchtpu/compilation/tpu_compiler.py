@@ -18,17 +18,16 @@ import torch
 import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.utils import _pytree as pytree
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
+from vllm.config.utils import Range
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Type alias for the compile range tuple
-Range = tuple[int, int]
 
 _tpu_backend = TpuBackend()
 
@@ -49,6 +48,105 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/kernels/causal_conv1d",
     "vllm_torchtpu/kernels/experimental/pcp_streaming_rpa",
 )
+
+
+StaticScalarOutputPlan = tuple[Any, tuple[tuple[int, int], ...]]
+
+
+def _strip_exact_static_scalar_outputs(
+    graph: fx.GraphModule,
+    compile_range: Range,
+    forced_values: tuple[tuple[int, int], ...] | None = None,
+) -> StaticScalarOutputPlan | None:
+    """Remove static scalar outputs unsupported by TorchTPU export.
+
+    vLLM piecewise partitioning may carry shape expressions between pieces.
+    TorchTPU cannot lower a graph with scalar outputs, while this backend uses
+    exact shape buckets. Replace backed integer leaves with None for the device
+    executable and restore their per-bucket Python values in the wrapper.
+    """
+    if not compile_range.is_single_size():
+        return None
+
+    output_nodes = list(graph.graph.find_nodes(op="output"))
+    if len(output_nodes) != 1:
+        return None
+    output_node = output_nodes[0]
+    flat_outputs, output_spec = pytree.tree_flatten(output_node.args[0])
+
+    if forced_values is None:
+        static_values: list[tuple[int, int]] = []
+        for index, leaf in enumerate(flat_outputs):
+            if isinstance(leaf, fx.Node):
+                meta_value = leaf.meta.get(
+                    "val", leaf.meta.get("example_value", None))
+            else:
+                meta_value = leaf
+            if isinstance(meta_value, torch.SymInt):
+                if not meta_value.node.has_hint():
+                    continue
+                expression = meta_value.node.expr
+                bindings = {
+                    symbol: compile_range.start
+                    for symbol in expression.free_symbols
+                }
+                concrete_value = int(expression.subs(bindings))
+                static_values.append((index, concrete_value))
+            elif type(meta_value) is int:
+                static_values.append((index, meta_value))
+        values = tuple(static_values)
+    else:
+        values = forced_values
+
+    if not values:
+        return None
+    for index, _value in values:
+        if index < 0 or index >= len(flat_outputs):
+            raise RuntimeError(
+                "Cached TPU static-output plan does not match the FX graph: "
+                f"leaf {index} is outside {len(flat_outputs)} outputs")
+        flat_outputs[index] = None
+
+    output_node.args = (pytree.tree_unflatten(flat_outputs, output_spec), )
+    graph.graph.lint()
+    graph.recompile()
+    logger.info(
+        "[TpuCompilerAdaptor] Lowering exact-bucket static scalar outputs "
+        "through host reconstruction: range=%s values=%s",
+        compile_range,
+        values,
+    )
+    return output_spec, values
+
+
+def _restore_static_scalar_outputs(
+    compiled_fn: Callable[..., Any],
+    plan: StaticScalarOutputPlan | None,
+) -> Callable[..., Any]:
+    if plan is None:
+        return compiled_fn
+    output_spec, static_values = plan
+
+    def restore_fn(*args, **kwargs):
+        result = compiled_fn(*args, **kwargs)
+        flat_result, _result_spec = pytree.tree_flatten(result)
+        # AOTAutograd normalizes FX tuple outputs to a list. The leaf ABI is
+        # stable even when the intermediate Python container type changes.
+        if len(flat_result) != output_spec.num_leaves:
+            raise RuntimeError(
+                "TPU static-output reconstruction received an incompatible "
+                f"pytree: expected {output_spec.num_leaves} leaves, "
+                f"got {len(flat_result)}")
+        for index, value in static_values:
+            if flat_result[index] is not None:
+                raise RuntimeError(
+                    "TPU static-output reconstruction expected a None "
+                    f"placeholder at leaf {index}, got "
+                    f"{type(flat_result[index]).__name__}")
+            flat_result[index] = value
+        return pytree.tree_unflatten(flat_result, output_spec)
+
+    return restore_fn
 
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
@@ -178,6 +276,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         hash_obj.update(
             f"torch_tpu={getattr(torch_tpu, '__version__', 'unknown')}".encode(
             ))
+        hash_obj.update(b"tpu_compiler_output_protocol=2")
         # Kernel choice (default vs batched RPA) no longer needs to be in the
         # cache key — each Impl registers under a distinct op name
         # (`pallas::rpa_kernel_*` vs `pallas::rpa_kernel_batched_*`), so the
@@ -244,6 +343,8 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
+        static_output_plan = _strip_exact_static_scalar_outputs(
+            graph, compile_range)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         # `_tpu_backend` calls detect_fake_mode(), which asserts a single
@@ -276,6 +377,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
+        compiled_fn = _restore_static_scalar_outputs(compiled_fn,
+                                                     static_output_plan)
 
         # Save the per-shape PjRt executable to disk.
         # We pickle the inner _TorchTpuCompiledExecutable (which has
@@ -291,7 +394,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 with open(save_path, "wb") as f:
                     pickle.dump(inner_exe, f)
-                handle = (key, save_path, was_wrapped)
+                static_values = (() if static_output_plan is None else
+                                 static_output_plan[1])
+                handle = (key, save_path, was_wrapped, static_values)
                 logger.info(
                     "[TpuCompilerAdaptor] Saved compiled executable to %s",
                     save_path,
@@ -317,8 +422,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         callable. This skips FX->MLIR->compile but still sets up the
         aot_autograd runtime wrapper that handles input mutations.
         """
-        assert isinstance(handle, tuple) and len(handle) == 3
-        key, path, was_wrapped = handle
+        assert isinstance(handle, tuple) and len(handle) == 4
+        key, path, cached_was_wrapped, cached_static_values = handle
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
@@ -332,7 +437,16 @@ class TpuCompilerAdaptor(CompilerInterface):
         from torch._dynamo.backends.common import aot_autograd
 
         graph = copy.deepcopy(graph)
+        static_output_plan = _strip_exact_static_scalar_outputs(
+            graph,
+            compile_range,
+            forced_values=cached_static_values,
+        )
         graph, was_wrapped = _ensure_tuple_output(graph)
+        if cached_was_wrapped != was_wrapped:
+            raise RuntimeError(
+                "Cached TPU output wrapper metadata does not match the FX "
+                f"graph: cached={cached_was_wrapped}, current={was_wrapped}")
 
         def _cached_compiler(*_args, **_kwargs):
             return inner_exe
@@ -358,5 +472,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
+
+        compiled_fn = _restore_static_scalar_outputs(compiled_fn,
+                                                     static_output_plan)
 
         return compiled_fn

@@ -22,7 +22,8 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention, _pcp_slice_dim_torch,
+    VllmGatedDeltaNetAttention, _gdn_state_donate_argnums,
+    _pcp_slice_dim_torch,
     _pcp_slice_reordered_concatenated_torch)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -35,7 +36,8 @@ def _mesh():
 def _vllm_config(*,
                  pcp_size: int = 1,
                  interleave_size: int = 16,
-                 mamba_page_size_padded: int | None = None):
+                 mamba_page_size_padded: int | None = None,
+                 splitting_ops: list[str] | None = None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
@@ -47,6 +49,7 @@ def _vllm_config(*,
             mamba_cache_mode=None,
         ),
         speculative_config=None,
+        compilation_config=SimpleNamespace(splitting_ops=splitting_ops),
     )
 
 
@@ -65,6 +68,16 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
 
 
 class TestVllmGatedDeltaNetAttention:
+
+    @pytest.mark.parametrize("configured_name",
+                             ["pallas::gdn", "pallas::gdn.default"])
+    def test_gdn_state_donation_tracks_exact_splitting_op(
+            self, configured_name):
+        config = _vllm_config(splitting_ops=[configured_name])
+
+        assert _gdn_state_donate_argnums(config, "pallas::gdn") is None
+        assert _gdn_state_donate_argnums(config,
+                                         "pallas::other_gdn") == (3, 4)
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
@@ -223,6 +236,58 @@ class TestVllmGatedDeltaNetAttention:
                 PartitionSpec("pcp"),
             )
         assert fake_jax_op.register_fake.call_count == 2
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_split_pcp_gdn_op_disables_state_donation(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+        prefix = "language_model.model.layers.0.linear_attn"
+        op_name = ("pallas::gdn_attention_pcp_"
+                   "language_model_model_layers_0_linear_attn")
+        attn = _qwen35_397b_gdn_attn(prefix)
+        fake_jax_op = MagicMock()
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=8,
+                                         splitting_ops=[op_name])), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 return_value=fake_jax_op,
+             ) as mock_pcp_jax_op:
+            attn._build_gdn_op(pcp_streaming=True)
+
+        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] is None
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_unsplit_pcp_gdn_op_keeps_state_donation(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        fake_jax_op = MagicMock()
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(), vllm_config=_vllm_config(pcp_size=8)), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 return_value=fake_jax_op,
+             ) as mock_pcp_jax_op:
+            attn._build_gdn_op(pcp_streaming=True)
+
+        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (3, 4)
 
     def test_pcp_torch_weight_helpers_slice_local_head_shard(self):
         split_sizes = [4, 4, 8]

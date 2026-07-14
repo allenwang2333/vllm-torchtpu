@@ -206,6 +206,22 @@ def _get_pcp_size(vllm_config: VllmConfig) -> int:
     return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
 
 
+def _gdn_state_donate_argnums(vllm_config: VllmConfig,
+                              op_name: str) -> tuple[int, int] | None:
+    """Donate GDN state only while the op stays inside a compiled graph.
+
+    vLLM executes an op named in ``splitting_ops`` between the compiled graph
+    pieces. Donating state in that mode invalidates the Torch buffers that
+    ``gdn_impl`` refills immediately after the custom-op call. Full-graph
+    compilation rewires the aliases, so keep the existing donation there.
+    """
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    splitting_ops = getattr(compilation_config, "splitting_ops", None) or ()
+    is_split = (op_name in splitting_ops
+                or f"{op_name}.default" in splitting_ops)
+    return None if is_split else (3, 4)
+
+
 def _localize_gdn_mamba_spec_for_pcp(
     spec: MambaSpec,
     pcp_size: int,
@@ -334,10 +350,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
                 PartitionSpec("pcp"),  # output
             )
+            donate_argnums = _gdn_state_donate_argnums(
+                vllm_context.vllm_config, op_name)
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
                 wrapped_fn,
-                donate_argnums=(3, 4),
+                donate_argnums=donate_argnums,
                 mesh=pcp_mesh,
                 input_partition_specs=input_partition_specs,
                 output_partition_specs=output_partition_specs,
@@ -366,9 +384,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 config=config,
                 dp_enabled=dp_enabled,
             )
+            donate_argnums = _gdn_state_donate_argnums(
+                vllm_context.vllm_config, op_name)
             gdn_jax_op = pallas.jax_op(op_name,
                                        wrapped_fn,
-                                       donate_argnums=(3, 4))
+                                       donate_argnums=donate_argnums)
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):

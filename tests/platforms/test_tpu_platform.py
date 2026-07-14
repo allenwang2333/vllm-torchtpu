@@ -107,6 +107,8 @@ class TestTpuPlatform:
         mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
+        explicit_splitting_ops = ["pallas::user_configured_split"]
+        vllm_config.compilation_config.splitting_ops = explicit_splitting_ops
 
         mock_pallas = MagicMock()
         mock_pallas.get_page_size.return_value = 999
@@ -124,6 +126,8 @@ class TestTpuPlatform:
 
         # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
+        assert (vllm_config.compilation_config.splitting_ops
+                is explicit_splitting_ops)
         # And get_page_size shouldn't even be called because is_hybrid is True
         mock_pallas.get_page_size.assert_not_called()
 

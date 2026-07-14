@@ -16,6 +16,10 @@ import importlib
 import os
 from unittest.mock import patch
 
+import torch
+from torch.utils import _pytree as pytree
+from vllm.config.utils import Range
+
 
 class TestTpuCompilerCache:
 
@@ -88,3 +92,36 @@ class TestTpuCompilerCache:
                 compiler.initialize_cache(cache_dir="/original/cache/dir")
                 # Should fallback to the original directory
                 assert compiler.cache_dir == "/original/cache/dir"
+
+
+def test_exact_bucket_static_scalar_output_round_trip():
+    """Static scalar piece outputs are reconstructed on the host."""
+
+    class StaticScalarOutput(torch.nn.Module):
+
+        def forward(self, value):
+            return value + 1, 4096
+
+    from vllm_torchtpu.compilation.tpu_compiler import (
+        _restore_static_scalar_outputs,
+        _strip_exact_static_scalar_outputs,
+    )
+
+    graph = torch.fx.symbolic_trace(StaticScalarOutput())
+    plan = _strip_exact_static_scalar_outputs(
+        graph,
+        Range(start=512, end=512),
+    )
+    assert plan is not None
+    assert plan[1] == ((1, 4096), )
+
+    output = graph.graph.find_nodes(op="output")[0]
+    leaves, _ = pytree.tree_flatten(output.args[0])
+    assert leaves[1] is None
+
+    # AOTAutograd returns a list even when the Dynamo FX graph returns a tuple.
+    restore = _restore_static_scalar_outputs(lambda value: [value, None], plan)
+    value = torch.tensor([1.0])
+    restored_value, restored_scalar = restore(value)
+    assert restored_value is value
+    assert restored_scalar == 4096
