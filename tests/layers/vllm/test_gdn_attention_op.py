@@ -23,8 +23,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention, _gdn_state_donate_argnums,
-    _pcp_slice_dim_torch,
-    _pcp_slice_reordered_concatenated_torch)
+    _pcp_slice_dim_torch, _pcp_slice_reordered_concatenated_torch)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -76,8 +75,7 @@ class TestVllmGatedDeltaNetAttention:
         config = _vllm_config(splitting_ops=[configured_name])
 
         assert _gdn_state_donate_argnums(config, "pallas::gdn") is None
-        assert _gdn_state_donate_argnums(config,
-                                         "pallas::other_gdn") == (3, 4)
+        assert _gdn_state_donate_argnums(config, "pallas::other_gdn") == (3, 4)
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
@@ -271,8 +269,8 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
-    def test_unsplit_pcp_gdn_op_keeps_state_donation(
-            self, mock_get_pcp_mesh, _mock_get_pcp_world_size):
+    def test_unsplit_pcp_gdn_op_keeps_state_donation(self, mock_get_pcp_mesh,
+                                                     _mock_get_pcp_world_size):
         attn = _qwen35_397b_gdn_attn(
             "language_model.model.layers.0.linear_attn")
         fake_jax_op = MagicMock()

@@ -240,26 +240,18 @@ def apply_tpu_patches() -> None:
     module-level state is re-initialized on import in spawned processes.
     All patches are idempotent.
     """
-    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
-                               _patch_disable_sequence_parallel_moe,
-                               _patch_vllm_hybrid_pcp_block_sizes,
-                               _patch_moe_no_ep_tp_scope,
-                               _patch_rowparallel_defer_bias,
-                               _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_tpu_group_custom_ops)
+    import vllm_torchtpu
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
     _register_custom_ops()
-    _patch_vllm_tpu_group_custom_ops()
-    _patch_default_moe_runner_select_forward()
-    _patch_vllm_disable_compile_ranges()
-    _patch_disable_sequence_parallel_moe()
-    _patch_moe_no_ep_tp_scope()
-    _patch_rowparallel_defer_bias()
-    _patch_vllm_hybrid_pcp_block_sizes()
-    from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
-    _patch_disable_dp_ubatch()
-    _patch_multiproc_worker_global_rank_env()
+    vllm_torchtpu._patch_vllm_tpu_group_custom_ops()
+    vllm_torchtpu._patch_default_moe_runner_select_forward()
+    vllm_torchtpu._patch_vllm_disable_compile_ranges()
+    vllm_torchtpu._patch_disable_sequence_parallel_moe()
+    vllm_torchtpu._patch_moe_no_ep_tp_scope()
+    vllm_torchtpu._patch_rowparallel_defer_bias()
+    vllm_torchtpu._patch_vllm_hybrid_pcp_block_sizes()
+    vllm_torchtpu._patch_disable_dp_ubatch()
+    vllm_torchtpu._patch_multiproc_worker_global_rank_env()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).

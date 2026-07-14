@@ -103,9 +103,7 @@ def test_exact_bucket_static_scalar_output_round_trip():
             return value + 1, 4096
 
     from vllm_torchtpu.compilation.tpu_compiler import (
-        _restore_static_scalar_outputs,
-        _strip_exact_static_scalar_outputs,
-    )
+        _restore_static_scalar_outputs, _strip_exact_static_scalar_outputs)
 
     graph = torch.fx.symbolic_trace(StaticScalarOutput())
     plan = _strip_exact_static_scalar_outputs(

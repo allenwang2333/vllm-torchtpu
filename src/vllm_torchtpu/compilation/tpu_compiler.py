@@ -49,7 +49,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/kernels/experimental/pcp_streaming_rpa",
 )
 
-
 StaticScalarOutputPlan = tuple[Any, tuple[tuple[int, int], ...]]
 
 

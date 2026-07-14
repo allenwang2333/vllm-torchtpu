@@ -305,8 +305,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
 
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
-                                             MambaSpec,
-                                             UniformTypeKVCacheSpecs)
+                                            MambaSpec, UniformTypeKVCacheSpecs)
 
     already_patched = getattr(kv_cache_utils,
                               "_tpu_hybrid_pcp_block_sizes_patch", False)
@@ -323,13 +322,13 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             yield spec
 
     def _has_spec_type(spec: KVCacheSpec, spec_type: type) -> bool:
-        return any(isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
+        return any(
+            isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
 
     def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            return math.lcm(
-                *(_effective_block_size(leaf, pcp)
-                  for leaf in spec.kv_cache_specs.values()))
+            return math.lcm(*(_effective_block_size(leaf, pcp)
+                              for leaf in spec.kv_cache_specs.values()))
         if isinstance(spec, MambaSpec):
             return spec.block_size
         if isinstance(spec, AttentionSpec):
@@ -370,8 +369,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info(
             "Applied TPU PCP hybrid KV cache block-size resolution: "
             "pcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
-            "hash_block_size=%d", pcp, group_block_sizes,
-            scheduler_block_size, hash_block_size)
+            "hash_block_size=%d", pcp, group_block_sizes, scheduler_block_size,
+            hash_block_size)
         return scheduler_block_size, hash_block_size
 
     patched_resolve = (kv_cache_utils.resolve_kv_cache_block_sizes

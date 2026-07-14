@@ -2,10 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, MambaSpec,
                                         SlidingWindowSpec)
+
 from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
 
@@ -43,8 +43,8 @@ def _mamba_spec(block_size: int = 4096):
 
 def test_hybrid_full_attention_mamba_pcp_resolves_effective_block_size():
     _patch_vllm_hybrid_pcp_block_sizes()
-    from vllm.v1.engine import core as engine_core
     from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+    from vllm.v1.engine import core as engine_core
 
     assert engine_core.resolve_kv_cache_block_sizes is resolve_kv_cache_block_sizes
 
