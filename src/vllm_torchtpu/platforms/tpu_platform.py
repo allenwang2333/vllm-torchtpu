@@ -242,6 +242,7 @@ def apply_tpu_patches() -> None:
     """
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
+                               _patch_vllm_hybrid_pcp_block_sizes,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_disable_compile_ranges,
@@ -254,6 +255,7 @@ def apply_tpu_patches() -> None:
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
+    _patch_vllm_hybrid_pcp_block_sizes()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
