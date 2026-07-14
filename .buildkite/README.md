@@ -12,24 +12,27 @@ The pipeline's only fixed step runs [`scripts/bootstrap.sh`](scripts/bootstrap.s
 which:
 
 1. Determines the job priority for the build type (post-merge on `main` >
-   pre-merge PR > integration > benchmark > default > nightly; constants in
+   pre-merge PR > default; constants in
    [`scripts/configs/pipeline_config.sh`](scripts/configs/pipeline_config.sh)).
-2. Uploads the four pipeline YAMLs below, injecting the priority into each.
+   That priority applies to the build and unit-test pipelines; integration and
+   perf always get their own fixed, lower priorities (3 and 2). Nightly builds
+   drop everything to 0 (lowest).
+2. Uploads the four pipeline YAMLs below, injecting those priorities.
    They are uploaded in reverse order so they display as Build → Tests →
    Integration → Perf.
 
 | File | What it runs | Queue |
 |---|---|---|
-| [`pipeline_build.yml`](pipeline_build.yml) | Builds the CI Docker image (`docker/build_image.sh --target dev`), tags it with the build commit, and pushes it to Artifact Registry. All other jobs depend on this step. | `cpu_64_core` |
-| [`pipeline_tests.yml`](pipeline_tests.yml) | Unit tests, split into speculative-decoding tests and everything else. PR builds run `pytest -m "not nightly"`; nightly builds run the full set. | `tpu_v7x_2_queue` / `tpu_v7x_8_queue` |
+| [`pipeline_build.yml`](pipeline_build.yml) | Builds the CI Docker image ([`../docker/build_image.sh`](../docker/build_image.sh) `--target dev`), tags it with the build commit, and pushes it to Artifact Registry. Note the image builds FROM the floating base `torch-tpu-base:nightly-latest`, so the same commit can produce different images across days — the first thing to suspect when CI goes red with no code change. All other jobs depend on this step. | `cpu_64_core` |
+| [`pipeline_tests.yml`](pipeline_tests.yml) | Unit tests, split into speculative-decoding tests and everything else. Non-nightly builds (PRs, post-merge, manual) run `pytest -m "not nightly"`; nightly builds run the full set. | `tpu_v7x_2_queue` / `tpu_v7x_8_queue` |
 | [`pipeline_integration.yml`](pipeline_integration.yml) | Integration cases (e.g. qwen3.5 P4D2 disaggregated correctness). | `tpu_v7x_8_queue` |
-| [`pipeline_perf.yml`](pipeline_perf.yml) | Perf + eval flows (`scripts/vllm/benchmarking/run_eval_flow.sh`, lm-eval/evalplus). Small configs run on every build; large models (480B, 397B) are nightly-only. Results are uploaded as Buildkite artifacts under `perf_eval_results/**`. | `tpu_v7x_2_queue` / `tpu_v7x_8_queue` |
+| [`pipeline_perf.yml`](pipeline_perf.yml) | Perf + eval flows ([`../scripts/vllm/benchmarking/run_eval_flow.sh`](../scripts/vllm/benchmarking/run_eval_flow.sh), lm-eval/evalplus). Small configs run on every build; large models (480B, 397B) are nightly-only. Results are uploaded as Buildkite artifacts under `perf_eval_results/**`. | `tpu_v7x_2_queue` / `tpu_v7x_8_queue` |
 
 Steps gated with `if: build.env("NIGHTLY") == "1"` never run on regular PR
 builds; the Buildkite API reports them with state `broken` (its term for steps
-filtered out by an `if:` condition — distinct from `skipped`, which Buildkite
-uses for superseded builds). The UI shows them grayed out. Either way it is
-expected, not a failure.
+filtered out by an `if:` condition — distinct from the `skipped` state used
+for `skip:` attributes and superseded builds). The UI shows them grayed out.
+Either way it is expected, not a failure.
 
 ## Test execution on TPU agents
 
