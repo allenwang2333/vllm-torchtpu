@@ -529,8 +529,12 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
                         lambda _signature: ())
     monkeypatch.setattr(pcp_adapter.pallas_impl, "_get_kernel_invocation_key",
                         lambda *_args, **_kwargs: "trace_key")
-    monkeypatch.setattr(pcp_adapter, "_named_shardings",
-                        lambda *_args, **_kwargs: ("out0", "out1"))
+
+    def fake_named_shardings(mesh, specs):
+        captured["output_specs"] = (mesh, specs)
+        return tuple(f"out{index}" for index, _ in enumerate(specs))
+
+    monkeypatch.setattr(pcp_adapter, "_named_shardings", fake_named_shardings)
     monkeypatch.setattr(pcp_adapter.jax, "jit", lambda fn, **kwargs:
                         ("jit_fn", fn, kwargs))
     monkeypatch.setattr(pcp_adapter.torch.library, "custom_op", fake_custom_op)
@@ -538,19 +542,25 @@ def test_adapter_pcp_jax_op_uses_scoped_callable(monkeypatch):
     def fn(tensor):
         return tensor
 
+    mesh = object()
+    output_specs = ("custom_out0", "custom_out1", "custom_out2")
     result = pcp_adapter.pcp_streaming_jax_op(
         "pcp::op",
         fn,
         donate_argnums=(0, ),
-        mesh=object(),
+        mesh=mesh,
         input_partition_specs=("input_spec", ),
+        output_partition_specs=output_specs,
     )
 
     assert isinstance(result, FakeCustomOp)
     assert isinstance(captured["custom_op"][1], FakePcpCallable)
     assert captured["callable_kwargs"]["name"] == "pcp::op"
     assert captured["callable_kwargs"]["jit_fn"][0] == "jit_fn"
+    assert captured["callable_kwargs"]["jit_fn"][2]["out_shardings"] == (
+        "out0", "out1", "out2")
     assert captured["callable_kwargs"]["donate_argnums"] == (0, )
+    assert captured["output_specs"] == (mesh, output_specs)
     assert captured["custom_op"][2] == ()
     assert pcp_adapter.pallas_impl.JaxCallable.__call__ is original_call
 

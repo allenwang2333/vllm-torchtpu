@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     pcp_local_token_counts as _pcp_local_token_counts
 from vllm_torchtpu.layers.common.gdn_attention import (
     GdnAttentionConfig, _derive_pcp_rank_major_reorder_indices,
+    _exchange_pcp_head_shards_for_token_shards,
     _exchange_pcp_token_shards_for_head_shards,
     _select_replicated_shard_for_pcp_rank, run_jax_gdn_attention_local,
     run_jax_gdn_attention_pcp_tp_prefill)
@@ -36,6 +37,7 @@ from vllm_torchtpu.layers.common.utils import (
 
 def test_pcp_gdn_helpers_are_available():
     assert callable(_exchange_pcp_token_shards_for_head_shards)
+    assert callable(_exchange_pcp_head_shards_for_token_shards)
     assert callable(run_jax_gdn_attention_pcp_tp_prefill)
 
 
@@ -199,14 +201,18 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     dim = 2 * n_kq * d_k + n_v * d_v
 
     rng = jax.random.key(0)
-    keys = jax.random.split(rng, 8)
+    keys = jax.random.split(rng, 10)
     mixed_qkv0 = jax.random.normal(keys[0], (num_tokens, dim),
                                    dtype=jnp.bfloat16)
     b0 = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a0 = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
-    conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim),
-                            dtype=jnp.bfloat16)
-    rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+    # Non-zero state makes the test sensitive to rank/head mapping at the
+    # physical PCP-local cache boundary, not just to the newly produced state.
+    conv_state0 = (jax.random.normal(keys[7],
+                                     (num_blocks, kernel_size - 1, dim),
+                                     dtype=jnp.bfloat16) * 0.01)
+    rec_state0 = (jax.random.normal(keys[8], (num_blocks, n_v, d_k, d_v),
+                                    dtype=jnp.float32) * 0.01)
     conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size),
                                      dtype=jnp.bfloat16)
     conv_bias0 = jax.random.normal(keys[4], (dim, ), dtype=jnp.bfloat16)
@@ -281,27 +287,37 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
     def shard_tokens(x):
         return jax.device_put(x, NamedSharding(mesh, P('pcp', None)))
 
-    def shard_conv_state(x):
-        return jax.device_put(x, NamedSharding(mesh, P(None, None, 'pcp')))
-
-    def shard_rec_state(x):
-        return jax.device_put(x,
-                              NamedSharding(mesh,
-                                            P(None, 'pcp', None, None)))
-
     def replicate(x):
         return jax.device_put(x, NamedSharding(mesh, P()))
+
+    split_sizes = [n_kq * d_k, n_kq * d_k, n_v * d_v]
+    conv_state_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_state0, split_sizes, pcp_size, -1)
+    conv_weight_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_weight0, split_sizes, pcp_size, 0)
+    conv_bias_interleaved = reorder_concatenated_tensor_for_sharding(
+        conv_bias0, split_sizes, pcp_size, 0)
+    conv_state_input = jax.device_put(
+        conv_state_interleaved, NamedSharding(mesh, P(None, None, 'pcp')))
+    rec_state_input = jax.device_put(
+        rec_state0, NamedSharding(mesh, P(None, 'pcp', None, None)))
+    conv_weight_input = jax.device_put(
+        conv_weight_interleaved, NamedSharding(mesh, P('pcp', None, None)))
+    conv_bias_input = jax.device_put(conv_bias_interleaved,
+                                     NamedSharding(mesh, P('pcp')))
+    A_log_input = jax.device_put(A_log0, NamedSharding(mesh, P('pcp')))
+    dt_bias_input = jax.device_put(dt_bias0, NamedSharding(mesh, P('pcp')))
 
     (pcp_conv, pcp_rec), pcp_output = run_jax_gdn_attention_pcp_tp_prefill(
         shard_tokens(packed_qkv),
         shard_tokens(packed_b),
         shard_tokens(packed_a),
-        shard_conv_state(conv_state0),
-        shard_rec_state(rec_state0),
-        replicate(conv_weight0),
-        replicate(conv_bias0),
-        replicate(A_log0),
-        replicate(dt_bias0),
+        conv_state_input,
+        rec_state_input,
+        conv_weight_input,
+        conv_bias_input,
+        A_log_input,
+        dt_bias_input,
         replicate(state_indices),
         replicate(query_start_loc),
         replicate(distribution),
@@ -325,7 +341,9 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout():
                                np.array(ref_output),
                                rtol=5e-2,
                                atol=5e-2)
-    np.testing.assert_allclose(np.array(pcp_conv),
+    pcp_conv_for_compare = inverse_reorder_for_sharding(
+        pcp_conv, split_sizes, pcp_size, -1)
+    np.testing.assert_allclose(np.array(pcp_conv_for_compare),
                                np.array(ref_conv),
                                rtol=5e-2,
                                atol=5e-2)

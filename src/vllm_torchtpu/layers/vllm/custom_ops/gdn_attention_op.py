@@ -43,6 +43,59 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.utils import get_dp_size
 
 
+def _normalize_dim(dim: int, ndim: int) -> int:
+    if not -ndim <= dim < ndim:
+        raise RuntimeError(f"axis={dim} is invalid for a {ndim}D tensor")
+    return dim + ndim if dim < 0 else dim
+
+
+def _validate_pcp_rank(pcp_rank: int, pcp_size: int) -> None:
+    if pcp_size <= 0:
+        raise RuntimeError(f"pcp_size must be positive, got {pcp_size}")
+    if not 0 <= pcp_rank < pcp_size:
+        raise RuntimeError(f"pcp_rank={pcp_rank} is outside [0, {pcp_size})")
+
+
+def _pcp_slice_dim_torch(tensor: torch.Tensor, pcp_rank: int, pcp_size: int, *,
+                         axis: int) -> torch.Tensor:
+    _validate_pcp_rank(pcp_rank, pcp_size)
+    axis = _normalize_dim(axis, tensor.dim())
+    if tensor.shape[axis] % pcp_size != 0:
+        raise RuntimeError(
+            "PCP shard axis is not divisible by pcp_size: "
+            f"shape={tuple(tensor.shape)} axis={axis} pcp_size={pcp_size}")
+    shard_size = tensor.shape[axis] // pcp_size
+    return tensor.narrow(axis, pcp_rank * shard_size, shard_size)
+
+
+def _pcp_slice_reordered_concatenated_torch(
+    tensor: torch.Tensor,
+    split_sizes: list[int],
+    pcp_rank: int,
+    pcp_size: int,
+    *,
+    axis: int,
+) -> torch.Tensor:
+    _validate_pcp_rank(pcp_rank, pcp_size)
+    axis = _normalize_dim(axis, tensor.dim())
+    if sum(split_sizes) != tensor.shape[axis]:
+        raise RuntimeError(
+            "PCP concatenated splits do not cover the shard axis: "
+            f"shape={tuple(tensor.shape)} axis={axis} "
+            f"split_sizes={split_sizes}")
+    parts = []
+    offset = 0
+    for split_size in split_sizes:
+        if split_size % pcp_size != 0:
+            raise RuntimeError("PCP split is not divisible by pcp_size: "
+                               f"split_size={split_size} pcp_size={pcp_size}")
+        shard_size = split_size // pcp_size
+        parts.append(
+            tensor.narrow(axis, offset + pcp_rank * shard_size, shard_size))
+        offset += split_size
+    return torch.cat(parts, dim=axis).contiguous()
+
+
 def gdn_attention_core_tpu(
     mixed_qkv: jax.Array,
     b: jax.Array,
@@ -267,10 +320,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 PartitionSpec("pcp"),  # a
                 PartitionSpec(None, None, "pcp"),  # conv_state
                 PartitionSpec(None, "pcp", None, None),  # recurrent_state
-                PartitionSpec(),  # conv_weight
-                PartitionSpec() if has_conv_bias else None,  # conv_bias
-                PartitionSpec(),  # A_log
-                PartitionSpec(),  # dt_bias
+                PartitionSpec("pcp", None, None),  # conv_weight
+                PartitionSpec("pcp") if has_conv_bias else None,  # conv_bias
+                PartitionSpec("pcp"),  # A_log
+                PartitionSpec("pcp"),  # dt_bias
                 PartitionSpec(),  # state_indices
                 PartitionSpec(),  # query_start_loc
                 PartitionSpec(),  # request_distribution
@@ -279,7 +332,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output_partition_specs = (
                 PartitionSpec(None, None, "pcp"),  # new_conv_state
                 PartitionSpec(None, "pcp", None, None),  # new_recurrent_state
-                PartitionSpec(),  # output
+                PartitionSpec("pcp"),  # output
             )
             gdn_jax_op = pcp_streaming_jax_op(
                 op_name,
@@ -293,8 +346,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
                 num_tokens = mixed_qkv.size(0)
-                out_shape = (num_tokens * pcp_size,
-                             local_num_v_heads * self.head_v_dim)
+                out_shape = (num_tokens, local_num_v_heads * self.head_v_dim)
                 return torch.empty_like(conv_state), torch.empty_like(
                     recurrent_state), torch.empty(out_shape,
                                                   dtype=mixed_qkv.dtype,
@@ -344,14 +396,59 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             request_distribution: torch.Tensor,
             seq_lens: torch.Tensor,
         ) -> torch.Tensor:
+            if pcp_streaming:
+                pcp_rank = get_pcp_rank()
+                local_key_dim = local_num_kq_heads * self.head_k_dim
+                local_value_dim = local_num_v_heads * self.head_v_dim
+                split_sizes = [local_key_dim, local_key_dim, local_value_dim]
+                # The KV cache spec is already physically PCP-local. Only
+                # model weights still need to be sliced at the torch boundary.
+                conv_state_arg = conv_state
+                recurrent_state_arg = recurrent_state
+                conv_weight_arg = _pcp_slice_reordered_concatenated_torch(
+                    conv_weight,
+                    split_sizes,
+                    pcp_rank,
+                    pcp_size,
+                    axis=0,
+                )
+                conv_bias_arg = (None if conv_bias is None else
+                                 _pcp_slice_reordered_concatenated_torch(
+                                     conv_bias,
+                                     split_sizes,
+                                     pcp_rank,
+                                     pcp_size,
+                                     axis=0,
+                                 ))
+                A_log_arg = _pcp_slice_dim_torch(
+                    A_log,
+                    pcp_rank,
+                    pcp_size,
+                    axis=0,
+                ).contiguous()
+                dt_bias_arg = _pcp_slice_dim_torch(
+                    dt_bias,
+                    pcp_rank,
+                    pcp_size,
+                    axis=0,
+                ).contiguous()
+            else:
+                conv_state_arg = conv_state
+                recurrent_state_arg = recurrent_state
+                conv_weight_arg = conv_weight
+                conv_bias_arg = conv_bias
+                A_log_arg = A_log
+                dt_bias_arg = dt_bias
+
             new_conv, new_rec, outputs = gdn_jax_op(
-                mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
-                conv_bias, A_log, dt_bias, state_indices, query_start_loc,
-                request_distribution, seq_lens)
+                mixed_qkv, b, a, conv_state_arg, recurrent_state_arg,
+                conv_weight_arg, conv_bias_arg, A_log_arg, dt_bias_arg,
+                state_indices, query_start_loc, request_distribution, seq_lens)
             if pcp_streaming:
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
-
+            # Both PCP and non-PCP caches are complete from this worker's
+            # perspective, so refill the whole physical local state.
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
 
@@ -459,19 +556,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     self.dt_bias, state_indices, attn_metadata.query_start_loc,
                     attn_metadata.request_distribution, attn_metadata.seq_lens)
             if core_attn_out.shape[0] != num_tokens:
-                if not use_pcp_streaming:
-                    raise RuntimeError(
-                        "GDN op returned an incompatible output shape.")
-                start = get_pcp_rank() * num_tokens
-                core_attn_out = core_attn_out[start:start + num_tokens]
-            if use_pcp_streaming:
-                local_core_attn_out = torch.empty(
-                    tuple(core_attn_out.shape),
-                    dtype=core_attn_out.dtype,
-                    device=core_attn_out.device,
-                )
-                local_core_attn_out.copy_(core_attn_out)
-                core_attn_out = local_core_attn_out
+                raise RuntimeError("GDN op returned an incompatible output "
+                                   f"shape: {tuple(core_attn_out.shape)}.")
 
         # ============================================================
         # Part 3: Output Projection

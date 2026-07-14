@@ -21,8 +21,9 @@ from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
-    VllmGatedDeltaNetAttention
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
+    VllmGatedDeltaNetAttention, _pcp_slice_dim_torch,
+    _pcp_slice_reordered_concatenated_torch)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -200,16 +201,181 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_pcp_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
         assert mock_pcp_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
         assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "input_partition_specs"][3] == PartitionSpec(None, None, "pcp")
-        assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "input_partition_specs"][4] == PartitionSpec(
-                None, "pcp", None, None)
-        assert mock_pcp_jax_op.call_args_list[0].kwargs[
-            "output_partition_specs"][:2] == (
+            "input_partition_specs"] == (
+                PartitionSpec("pcp"),
+                PartitionSpec("pcp"),
+                PartitionSpec("pcp"),
                 PartitionSpec(None, None, "pcp"),
                 PartitionSpec(None, "pcp", None, None),
+                PartitionSpec("pcp", None, None),
+                None,
+                PartitionSpec("pcp"),
+                PartitionSpec("pcp"),
+                PartitionSpec(),
+                PartitionSpec(),
+                PartitionSpec(),
+                PartitionSpec(),
+            )
+        assert mock_pcp_jax_op.call_args_list[0].kwargs[
+            "output_partition_specs"] == (
+                PartitionSpec(None, None, "pcp"),
+                PartitionSpec(None, "pcp", None, None),
+                PartitionSpec("pcp"),
             )
         assert fake_jax_op.register_fake.call_count == 2
+
+    def test_pcp_torch_weight_helpers_slice_local_head_shard(self):
+        split_sizes = [4, 4, 8]
+        full = torch.arange(32).reshape(2, 16)
+
+        contiguous_shard = _pcp_slice_dim_torch(full,
+                                                pcp_rank=1,
+                                                pcp_size=2,
+                                                axis=-1)
+        torch.testing.assert_close(contiguous_shard, full[:, 8:16])
+
+        reordered_shard = _pcp_slice_reordered_concatenated_torch(
+            full,
+            split_sizes,
+            pcp_rank=1,
+            pcp_size=2,
+            axis=-1,
+        )
+        expected = torch.cat((full[:, 2:4], full[:, 6:8], full[:, 12:16]),
+                             dim=-1)
+        torch.testing.assert_close(reordered_shard, expected)
+        assert reordered_shard.is_contiguous()
+
+    def test_pcp_torch_weight_helpers_reject_invalid_shards(self):
+        with pytest.raises(RuntimeError, match="not divisible"):
+            _pcp_slice_dim_torch(torch.zeros(3), 0, 2, axis=0)
+        with pytest.raises(RuntimeError, match="not divisible"):
+            _pcp_slice_reordered_concatenated_torch(torch.zeros(6), [3, 3],
+                                                    0,
+                                                    2,
+                                                    axis=0)
+        with pytest.raises(RuntimeError, match="outside"):
+            _pcp_slice_dim_torch(torch.zeros(4), 2, 2, axis=0)
+        with pytest.raises(RuntimeError, match="do not cover"):
+            _pcp_slice_reordered_concatenated_torch(torch.zeros(8), [2, 2],
+                                                    0,
+                                                    2,
+                                                    axis=0)
+
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_rank",
+        return_value=1)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=2)
+    @patch(
+        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pcp_gdn_impl_reuses_local_state_shard_across_chunks(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size,
+            _mock_get_pcp_rank):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.prefix = "test_layer"
+        attn.num_k_heads = 4
+        attn.num_v_heads = 4
+        attn.tp_size = 1
+        attn.head_k_dim = 2
+        attn.head_v_dim = 2
+        attn.conv_kernel_size = 3
+        attn.conv1d = SimpleNamespace(bias=torch.zeros(24))
+
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 2})
+        fake_jax_op = MagicMock()
+        kernel_inputs = []
+
+        def fake_kernel(_qkv, _b, _a, conv_state, recurrent_state, conv_weight,
+                        conv_bias, A_log, dt_bias, *_metadata):
+            kernel_inputs.append({
+                "conv_state": conv_state.clone(),
+                "recurrent_state": recurrent_state.clone(),
+                "conv_weight": conv_weight.clone(),
+                "conv_bias": conv_bias.clone(),
+                "A_log": A_log.clone(),
+                "dt_bias": dt_bias.clone(),
+            })
+            output = torch.full((_qkv.shape[0], 8), 7, dtype=_qkv.dtype)
+            return conv_state + 100, recurrent_state + 200, output
+
+        fake_jax_op.side_effect = fake_kernel
+        with set_vllm_model_wrapper_context(
+                mesh=_mesh(),
+                vllm_config=_vllm_config(pcp_size=2, interleave_size=1)), \
+             patch(
+                 "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 return_value=fake_jax_op,
+             ):
+            gdn_impl = attn._build_gdn_op(pcp_streaming=True)
+
+        num_blocks = 3
+        num_tokens = 2
+        # The KV cache is already physically PCP-local: PCP=2 owns half the
+        # conv width and half the recurrent heads.
+        conv_state = torch.arange(num_blocks * 2 * 12,
+                                  dtype=torch.float32).reshape(
+                                      num_blocks, 2, 12)
+        recurrent_state = torch.arange(num_blocks * 2 * 2 * 2,
+                                       dtype=torch.float32).reshape(
+                                           num_blocks, 2, 2, 2)
+        original_conv_state = conv_state.clone()
+        original_recurrent_state = recurrent_state.clone()
+        conv_weight = torch.arange(24 * 3,
+                                   dtype=torch.float32).reshape(24, 1, 3)
+        conv_bias = torch.arange(24, dtype=torch.float32)
+        A_log = torch.arange(4, dtype=torch.float32)
+        dt_bias = torch.arange(4, dtype=torch.float32)
+        mixed_qkv = torch.zeros(num_tokens, 24)
+        b = torch.zeros(num_tokens, 4)
+        a = torch.zeros(num_tokens, 4)
+        state_indices = torch.tensor([1], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32)
+        distribution = torch.tensor([0, 1, 1], dtype=torch.int32)
+        seq_lens = torch.tensor([num_tokens], dtype=torch.int32)
+
+        args = (mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
+                conv_bias, A_log, dt_bias, state_indices, query_start_loc,
+                distribution, seq_lens)
+        first_output = gdn_impl(*args)
+        second_output = gdn_impl(*args)
+
+        assert fake_jax_op.call_count == 2
+        first_call = fake_jax_op.call_args_list[0].args
+        second_call = fake_jax_op.call_args_list[1].args
+        assert first_call[3] is conv_state
+        assert second_call[3] is conv_state
+        assert first_call[4] is recurrent_state
+        assert second_call[4] is recurrent_state
+        torch.testing.assert_close(kernel_inputs[0]["conv_state"],
+                                   original_conv_state)
+        torch.testing.assert_close(kernel_inputs[1]["conv_state"],
+                                   original_conv_state + 100)
+        torch.testing.assert_close(kernel_inputs[0]["recurrent_state"],
+                                   original_recurrent_state)
+        torch.testing.assert_close(kernel_inputs[1]["recurrent_state"],
+                                   original_recurrent_state + 200)
+
+        expected_conv_weight = torch.cat(
+            (conv_weight[4:8], conv_weight[12:16], conv_weight[20:24]), dim=0)
+        expected_conv_bias = torch.cat(
+            (conv_bias[4:8], conv_bias[12:16], conv_bias[20:24]), dim=0)
+        for kernel_input in kernel_inputs:
+            torch.testing.assert_close(kernel_input["conv_weight"],
+                                       expected_conv_weight)
+            torch.testing.assert_close(kernel_input["conv_bias"],
+                                       expected_conv_bias)
+            torch.testing.assert_close(kernel_input["A_log"], A_log[2:4])
+            torch.testing.assert_close(kernel_input["dt_bias"], dt_bias[2:4])
+
+        torch.testing.assert_close(conv_state, original_conv_state + 200)
+        torch.testing.assert_close(recurrent_state,
+                                   original_recurrent_state + 400)
+        assert torch.equal(first_output, torch.full((num_tokens, 8), 7.0))
+        assert torch.equal(second_output, first_output)
 
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
@@ -455,11 +621,8 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
-    @patch(
-        "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_pcp_rank",
-        return_value=1)
     def test_forward_uses_native_gdn_pcp_op_for_pcp_prefill(
-            self, _mock_rank, mock_get_forward_context):
+            self, mock_get_forward_context):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.head_v_dim = 16
         attn.num_v_heads = 4
@@ -495,12 +658,9 @@ class TestVllmGatedDeltaNetAttention:
                                                   dim=-1), None)
         attn.norm.side_effect = lambda core, _z: core
         attn.out_proj.return_value = (torch.ones(num_tokens, 64) * 5, None)
-        native_output = torch.stack([
-            torch.full((64, ), 10.0),
-            torch.full((64, ), 11.0),
-            torch.full((64, ), 12.0),
-            torch.full((64, ), 13.0),
-        ])
+        native_output = torch.stack(
+            [torch.full((64, ), 10.0),
+             torch.full((64, ), 11.0)])
         attn.gdn_pcp_op.return_value = native_output
 
         mock_fc = MagicMock()
@@ -537,8 +697,8 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[12] is mock_attn_metadata.seq_lens
         assert len(core_args) == 13
         expected_local = torch.stack(
-            [torch.full((4, 16), 12.0),
-             torch.full((4, 16), 13.0)])
+            [torch.full((4, 16), 10.0),
+             torch.full((4, 16), 11.0)])
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
         assert torch.all(output[:num_tokens] == 5)
         assert torch.all(output[num_tokens:] == 0)
