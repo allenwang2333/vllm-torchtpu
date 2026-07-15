@@ -49,6 +49,14 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.src }}
     steps:
+      - name: Check Repository Migration & Freeze Deadline
+        run: |
+          CUTOFF_TIMESTAMP=$(date -d "2026-07-16T12:00:00Z" +%s)
+          NOW_TIMESTAMP=$(date -u +%s)
+          if [ "$NOW_TIMESTAMP" -gt "$CUTOFF_TIMESTAMP" ]; then
+            echo "::error::This repository has migrated to https://github.com/vllm-project/vllm-torchtpu. Merges to main on google-pytorch/torchtpu-vllm are blocked after July 16, 2026 12:00 UTC. Please submit pull requests to the new repository."
+            exit 1
+          fi
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         id: filter
