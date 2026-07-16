@@ -96,6 +96,9 @@ class LoadMeta:
     remote_host: str | list[str]
     remote_port: int | list[int]
     remote_side_channel_port: Optional[int] = None
+    # Producer's tensor-parallel size. When it differs from the consumer's,
+    # the Raiden worker reshards instead of pulling whole blocks.
+    remote_tp_size: Optional[int] = None
 
 
 @dataclass

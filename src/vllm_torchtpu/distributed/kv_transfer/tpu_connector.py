@@ -17,11 +17,14 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import torch
+import zmq
 from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
                                                 batch_transfer_d2h_sync,
                                                 batch_transfer_h2d,
@@ -44,7 +47,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer import kv_scatter, reshard_schedule
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm_hma import (
     HostKVShmPoolHMA, PoolSpecHMA)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -83,6 +86,12 @@ class _DoneFuture:
 
 _DONE_FUTURE = _DoneFuture()
 
+# ZMQ multipart header for the consumer -> producer resharded-push request
+# (asymmetric-TP disagg): "push req R's blocks strided into my KV cache".
+RESHARD_PUSH_REQ = b"RAIDEN_RESHARD_PUSH"
+# poll_stats() surfaces resharded transfers under this req-id prefix.
+_RESHARD_XFER_PREFIX = "resharded_transfer_"
+
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
     config = vllm_config.kv_transfer_config
@@ -117,6 +126,13 @@ def _use_hma_connector(vllm_config: VllmConfig) -> bool:
     if "use_hma_connector" in extra_config:
         return _as_bool(extra_config["use_hma_connector"])
     return False
+
+
+def _use_raiden_reshard(vllm_config: VllmConfig) -> bool:
+    extra_config = _get_extra_config(vllm_config)
+    if "use_raiden_reshard" in extra_config:
+        return _as_bool(extra_config["use_raiden_reshard"])
+    return dist_utils.get_raiden_reshard_enabled()
 
 
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
@@ -586,8 +602,28 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             self.kv_port = [int(p) + 2 * dp_rank * tp_size for p in port_base]
         else:
             self.kv_port = int(port_base) + 2 * dp_rank * tp_size
+        self.tp_size = tp_size
+        # Reshard push-request channel: worker rank r binds
+        # side_channel_port + r, so the consumer can derive every producer
+        # rank's channel from this base. The 2*dp*tp stagger keeps DP
+        # replicas' per-rank ranges disjoint (mirrors kv_port above).
+        self.side_channel_port = (int(dist_utils.get_side_channel_port()) +
+                                  2 * dp_rank * tp_size)
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        delay_free_blocks, kv_transfer_params = super().request_finished(
+            request, block_ids)
+        # The consumer compares this against its own TP size to decide
+        # between the whole-block pull path and strided push-resharding.
+        if kv_transfer_params:
+            kv_transfer_params["remote_tp_size"] = self.tp_size
+        return delay_free_blocks, kv_transfer_params
 
     def get_num_new_matched_tokens(
         self,
@@ -652,6 +688,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 remote_block_ids=remote_block_ids,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
+                remote_tp_size=params.get("remote_tp_size"),
             )
         else:
             self.reqs_to_load[request.request_id] = LoadMeta(
@@ -660,6 +699,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                remote_side_channel_port=params.get(
+                    "remote_side_channel_port"),
+                remote_tp_size=params.get("remote_tp_size"),
             )
         logger.info(
             "TPURaidenConnectorScheduler update_state_after_alloc --> "
@@ -676,6 +718,16 @@ class TPURaidenConnectorWorker:
 
     Python owns vLLM request metadata only. Raiden C++ owns host slots, D2H,
     H2H, H2D, readiness, and completion state.
+
+    When consumer TP < producer TP (e.g. 8TP prefill -> 4TP decode under
+    DP-attention), a consumer rank's kv-head slice spans several producer
+    ranks, so a whole-block pull cannot place it. That case auto-engages
+    Raiden's strided push-resharding per request: the consumer registers a
+    receive plan assembling all its sources (auto-H2D into HBM) and sends
+    each source a RESHARD_PUSH_REQ over a per-rank ZMQ channel; each producer
+    stages its blocks device->host and pushes its head slice strided into the
+    consumer block's sub-region. Schedules are built in
+    ``reshard_schedule.py``. Symmetric traffic keeps the pull path.
     """
 
     def __init__(self, vllm_config: VllmConfig):
@@ -706,11 +758,36 @@ class TPURaidenConnectorWorker:
         self._load_block_ids: dict[str, list[int]] = {}
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
+        # ---- asymmetric-TP resharding state ------------------------------
+        self._reshard_enabled = _use_raiden_reshard(vllm_config)
+        self.block_size = vllm_config.cache_config.block_size
+        self._reshard_lock = threading.Lock()
+        # Producer: send meta and consumer push requests per req_id, matched
+        # by _maybe_reshard_push whichever side arrives last.
+        self._reshard_send_meta: dict[str, SendMeta] = {}
+        self._reshard_push_reqs: dict[str, dict[str, Any]] = {}
+        self._reshard_pushed: set[str] = set()
+        # Producer: send completions from the push path (the data is fully
+        # staged and pushed when set), merged into _done_sending by
+        # get_finished.
+        self._reshard_done_sending: set[str] = set()
+        # req_id -> report time. A resharded (pushed) request's parked
+        # register_read expires timeout_s later into a second done_sending;
+        # this filters the duplicate so the scheduler sees each req once.
+        self._reported_sending: dict[str, float] = {}
+        # Consumer: uuid -> req_id; poll_stats reports resharded receives as
+        # "resharded_transfer_<uuid>".
+        self._reshard_uuid_req: dict[int, str] = {}
+        self._zmq_ctx: Optional[zmq.Context] = None
+        self._reshard_push_socks: dict[str, zmq.Socket] = {}
+        if self._reshard_enabled and self.is_producer:
+            self._start_reshard_listener()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
-            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
-            self.host_ip, self.kv_transfer_port, self.is_producer,
-            self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
+            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | "
+            "dp_rank=%d | reshard=%s", self.host_ip, self.kv_transfer_port,
+            self.is_producer, self.node_id, self.tp_rank, self.tp_size,
+            self.dp_rank, self._reshard_enabled)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         return None
@@ -732,18 +809,47 @@ class TPURaidenConnectorWorker:
                     "TPURaidenConnectorWorker rank%d --> registered send "
                     "req_id=%s uuid=%s blocks=%d", self.tp_rank, req_id,
                     req_meta.uuid, len(req_meta.local_block_ids))
+                if self._reshard_enabled:
+                    with self._reshard_lock:
+                        self._reshard_send_meta[req_id] = req_meta
+                    self._maybe_reshard_push(req_id)
+            if self._reshard_enabled:
+                self._reshard_gc(time.perf_counter())
             return
 
         submitted_loads: set[str] = set()
         for req_id, req_meta in metadata.reqs_to_load.items():
-            endpoint = self._resolve_remote_endpoint(req_meta)
+            src_tp = (None if req_meta.remote_tp_size is None else int(
+                req_meta.remote_tp_size))
+            asymmetric = src_tp is not None and src_tp != self.tp_size
+            if asymmetric and not self._reshard_enabled:
+                raise NotImplementedError(
+                    f"TPURaidenConnector: producer TP ({src_tp}) != consumer "
+                    f"TP ({self.tp_size}) needs strided push-resharding, but "
+                    "it is disabled (TPU_RAIDEN_RESHARD=0); unset it to "
+                    "enable.")
+            if asymmetric and src_tp < self.tp_size:
+                raise NotImplementedError(
+                    f"TPURaidenConnector: consumer TP ({self.tp_size}) > "
+                    f"producer TP ({src_tp}) is not supported (a consumer "
+                    "rank would need a sub-block slice of one producer rank)")
             if (req_meta.remote_block_ids is None
                     and req_meta.local_block_ids is None):
-                engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
-                logger.debug(
-                    "TPURaidenConnectorWorker rank%d --> released remote "
-                    "send req_id=%s uuid=%s endpoint=%s", self.tp_rank, req_id,
-                    req_meta.uuid, endpoint)
+                # Full prefix hit: release the producer's parked send. Under
+                # asymmetric TP this rank is fed by several producer ranks;
+                # release each of them (their tp_rank-matched consumer does
+                # not exist).
+                if asymmetric:
+                    endpoints = self._reshard_source_endpoints(
+                        req_meta, src_tp)
+                else:
+                    endpoints = [self._resolve_remote_endpoint(req_meta)]
+                for endpoint in endpoints:
+                    engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
+                    logger.debug(
+                        "TPURaidenConnectorWorker rank%d --> released remote "
+                        "send req_id=%s uuid=%s endpoint=%s", self.tp_rank,
+                        req_id, req_meta.uuid, endpoint)
                 continue
             if (req_meta.remote_block_ids is None
                     or req_meta.local_block_ids is None):
@@ -751,6 +857,13 @@ class TPURaidenConnectorWorker:
                     "TPURaidenConnector load metadata must contain both "
                     "remote and local block ids, or neither")
 
+            if asymmetric:
+                self._register_reshard_receiver(req_id, req_meta, src_tp)
+                submitted_loads.add(req_id)
+                self._load_block_ids[req_id] = list(req_meta.local_block_ids)
+                continue
+
+            endpoint = self._resolve_remote_endpoint(req_meta)
             remote_blocks = req_meta.remote_block_ids
             local_blocks = req_meta.local_block_ids
             engine.start_read(req_id, req_meta.uuid, endpoint, remote_blocks,
@@ -773,7 +886,21 @@ class TPURaidenConnectorWorker:
     ) -> tuple[set[str], set[str]]:
         engine = self._ensure_raiden_transfer_engine()
         self._poll_finished(engine)
+        with self._reshard_lock:
+            self._done_sending.update(self._reshard_done_sending)
+            self._reshard_done_sending = set()
         done_sending = self._done_sending
+        if self._reshard_enabled:
+            # A resharded req completes its send eagerly at push time; drop
+            # the second done_sending its parked register_read emits when it
+            # expires.
+            done_sending = {
+                r
+                for r in done_sending if r not in self._reported_sending
+            }
+            now = time.perf_counter()
+            for req_id in done_sending:
+                self._reported_sending[req_id] = now
         # Report failed recvs as finished too, so the scheduler stops waiting in
         # WAITING_FOR_REMOTE_KVS until the API timeout; the affected blocks are
         # surfaced via get_block_ids_with_load_errors() in the same pass so vLLM
@@ -795,12 +922,41 @@ class TPURaidenConnectorWorker:
             self._failed_recving -= finished_req_ids
             for req_id in finished_req_ids:
                 self._load_block_ids.pop(req_id, None)
+            if self._reshard_uuid_req:
+                self._reshard_uuid_req = {
+                    u: r
+                    for u, r in self._reshard_uuid_req.items()
+                    if r not in finished_req_ids
+                }
         self._done_sending = set()
         self._done_recving = set()
         return done_sending, done_recving
 
+    def _resolve_reshard_req_ids(self, req_ids: list[str]) -> list[str]:
+        """Map poll_stats' "resharded_transfer_<uuid>" ids back to the vLLM
+        request id the receive plan was registered under."""
+        if not self._reshard_enabled:
+            return req_ids
+        out = []
+        for rid in req_ids:
+            if not rid.startswith(_RESHARD_XFER_PREFIX):
+                out.append(rid)
+                continue
+            uuid = int(rid[len(_RESHARD_XFER_PREFIX):])
+            req_id = self._reshard_uuid_req.get(uuid)
+            if req_id is None:
+                logger.warning(
+                    "TPURaidenConnectorWorker rank%d --> completion for "
+                    "unknown resharded transfer uuid=%d", self.tp_rank, uuid)
+                continue
+            out.append(req_id)
+        return out
+
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         done_sending, done_recving, failed_recving = engine.poll_stats()
+        done_sending = self._resolve_reshard_req_ids(done_sending)
+        done_recving = self._resolve_reshard_req_ids(done_recving)
+        failed_recving = self._resolve_reshard_req_ids(failed_recving)
         self._done_sending.update(done_sending)
         self._done_recving.update(done_recving)
         newly_failed = set(failed_recving) - self._failed_recving
@@ -854,11 +1010,21 @@ class TPURaidenConnectorWorker:
                 "register_runner must be called before transfer")
         max_blocks = self._max_request_blocks()
         num_slots = self._num_raiden_slots(max_blocks)
+        if self._reshard_enabled:
+            # The reshard push and receive paths index the host staging pool
+            # 1-to-1 by device block id (the producer stages device block b
+            # into host block b; the receiver's auto-H2D copies host block b
+            # to device block b), so the pool must be a full device shadow.
+            max_blocks = int(self.runner.kv_caches[0].shape[0])
+            num_slots = 1
         local_control_port = self._rank_control_port(self.kv_transfer_port)
         from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
         engine = KVCacheManager(
             kv_caches=list(self.runner.kv_caches),
-            node_id=self.tp_rank,
+            # Unique engine id across DP replicas. The reshard receiver keys
+            # each source's schedule by the pushing engine's node_id, i.e.
+            # the producer's global TP rank (producers run dp_rank 0).
+            node_id=self.dp_rank * self.tp_size + self.tp_rank,
             local_control_port=local_control_port,
             max_blocks=max_blocks,
             num_slots=num_slots,
@@ -883,6 +1049,287 @@ class TPURaidenConnectorWorker:
             host = req_meta.remote_host
             base_port = int(req_meta.remote_port)
         return f"{host}:{self._rank_control_port(base_port)}"
+
+    # ---- asymmetric-TP resharding (producer-push) ------------------------
+    #
+    # Data flows producer -> consumer, but the handshake is consumer-driven
+    # and needs only ONE message: kv_transfer_params already carry the
+    # producer's block ids and TP size through the proxy, so the consumer
+    # registers its receive plan first and then tells each source to push:
+    #   1. consumer: register_active_plan(receiver, dst_mem_type=HBM) with
+    #      one schedule per source rank (keyed by that engine's node_id)
+    #   2. consumer -> each source: RESHARD_PUSH_REQ (uuid + consumer blocks
+    #      + consumer TP + consumer push endpoint) over the ZMQ channel
+    #   3. producer: d2h stage -> register_active_plan(sender) ->
+    #      push_registered_plan per layer -> report done_sending
+    # The strided head-interleave is realized on the receive side; raiden
+    # auto-H2Ds the assembled host staging into HBM and reports the request
+    # via poll_stats once every (block, layer) push arrived.
+
+    def _reshard_channel_port(self, base_port: int, prefill_rank: int) -> int:
+        return int(base_port) + prefill_rank
+
+    def _source_ranks(self, src_tp: int) -> list[int]:
+        ratio = reshard_schedule.reshard_ratio(src_tp, self.tp_size)
+        return reshard_schedule.source_ranks_for(self.tp_rank, ratio)
+
+    def _reshard_source_host_port(self, req_meta: LoadMeta, src_tp: int,
+                                  prefill_rank: int) -> tuple[str, int]:
+        """Host and kv base port of one producer rank, assuming producer
+        ranks are split evenly over the advertised hosts."""
+        hosts = (req_meta.remote_host if isinstance(req_meta.remote_host, list)
+                 else [req_meta.remote_host])
+        ports = (req_meta.remote_port if isinstance(req_meta.remote_port, list)
+                 else [req_meta.remote_port])
+        host_idx = prefill_rank * len(hosts) // src_tp
+        return hosts[host_idx], int(ports[host_idx])
+
+    def _reshard_source_endpoints(self, req_meta: LoadMeta,
+                                  src_tp: int) -> list[str]:
+        """Raiden control endpoints of this rank's producer sources."""
+        endpoints = []
+        for p in self._source_ranks(src_tp):
+            host, base_port = self._reshard_source_host_port(
+                req_meta, src_tp, p)
+            endpoints.append(f"{host}:{base_port + 2 * p}")
+        return endpoints
+
+    def _make_reshard_geometry(
+            self, src_tp: int,
+            dst_tp: int) -> reshard_schedule.ReshardGeometry:
+        assert self.runner is not None
+        model_config = self.vllm_config.model_config
+        if model_config.get_head_size() == 64:
+            raise NotImplementedError(
+                "Raiden resharding does not support the hd64 KV layout "
+                "(K/V packed along head_dim)")
+        tensor = self.runner.kv_caches[0]
+        if len(tensor.shape) != 5 or int(tensor.shape[3]) != 2:
+            raise NotImplementedError(
+                "Raiden resharding expects the fused [blocks, page, heads, "
+                "kv_packing=2, padded_head_dim] KV layout (16-bit KV cache); "
+                f"got shape {tuple(tensor.shape)}")
+        total_kv_heads = int(model_config.get_total_num_kv_heads())
+        local_heads = max(1, total_kv_heads // self.tp_size)
+        packed_heads = reshard_schedule.per_rank_head_count(tensor)
+        if packed_heads != local_heads:
+            raise NotImplementedError(
+                f"Raiden resharding: local KV tensor holds {packed_heads} "
+                f"packed kv-heads but {local_heads} were expected from "
+                f"total_kv_heads={total_kv_heads} tp={self.tp_size} (padded "
+                "or packed head layouts are unsupported)")
+        hp_bytes = reshard_schedule.head_pair_bytes(tensor)
+        return reshard_schedule.ReshardGeometry(src_tp, dst_tp, hp_bytes,
+                                                total_kv_heads)
+
+    # ---- consumer side ----------------------------------------------------
+
+    def _register_reshard_receiver(self, req_id: str, req_meta: LoadMeta,
+                                   src_tp: int) -> None:
+        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+        engine = self._ensure_raiden_transfer_engine()
+        local_blocks = list(req_meta.local_block_ids)
+        # The scheduler already trimmed remote to the tail len(local) pages
+        # (consumer prefix-cache hit); block tables are uniform across a
+        # producer engine's ranks, so every source pairs the same pages.
+        remote_blocks = list(req_meta.remote_block_ids)
+        source_ranks = self._source_ranks(src_tp)
+        geom = self._make_reshard_geometry(src_tp, self.tp_size)
+        req = reshard_schedule.build_receiver_request(
+            pb2,
+            uuid=req_meta.uuid,
+            req_id=req_id,
+            peer=engine.transfer_address,
+            decode_rank=self.tp_rank,
+            geom=geom,
+            sources=[(p, remote_blocks) for p in source_ranks],
+            dst_block_ids=local_blocks,
+            live_tokens=[self.block_size] * len(local_blocks),
+        )
+        # Arms the completion barrier (one block-push per (block, layer)
+        # across all writers) and the strided receive + auto-H2D geometry.
+        engine.register_active_plan(req_meta.uuid, req, is_sender=False)
+        self._reshard_uuid_req[int(req_meta.uuid)] = req_id
+
+        if req_meta.remote_side_channel_port is None:
+            raise ValueError(
+                "TPURaidenConnector resharding needs the producer's "
+                "remote_side_channel_port in kv_transfer_params")
+        payload = [
+            RESHARD_PUSH_REQ,
+            req_id.encode("ascii"),
+            str(int(req_meta.uuid)).encode("ascii"),
+            str(self.tp_size).encode("ascii"),
+            engine.transfer_address.encode("ascii"),
+            np.asarray(local_blocks, dtype=np.int64).tobytes(),
+        ]
+        for p in source_ranks:
+            host, _ = self._reshard_source_host_port(req_meta, src_tp, p)
+            port = self._reshard_channel_port(
+                req_meta.remote_side_channel_port, p)
+            self._reshard_push_sock(f"tcp://{host}:{port}").send_multipart(
+                payload)
+        logger.debug(
+            "TPURaidenConnectorWorker rank%d --> reshard receive registered "
+            "req_id=%s uuid=%s src_tp=%d sources=%s blocks=%d", self.tp_rank,
+            req_id, req_meta.uuid, src_tp, source_ranks, len(local_blocks))
+
+    def _reshard_push_sock(self, endpoint: str) -> zmq.Socket:
+        sock = self._reshard_push_socks.get(endpoint)
+        if sock is None:
+            if self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context(io_threads=1)
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(endpoint)
+            self._reshard_push_socks[endpoint] = sock
+        return sock
+
+    # ---- producer side ----------------------------------------------------
+
+    def _start_reshard_listener(self) -> None:
+        port = (int(dist_utils.get_side_channel_port()) +
+                2 * self.dp_rank * self.tp_size + self.tp_rank)
+        self._zmq_ctx = zmq.Context(io_threads=1)
+        self._reshard_listener_sock = self._zmq_ctx.socket(zmq.PULL)
+        self._reshard_listener_sock.setsockopt(zmq.LINGER, 0)
+        self._reshard_listener_sock.bind(f"tcp://*:{port}")
+        threading.Thread(target=self._reshard_listen,
+                         name=f"raiden-reshard-listen-r{self.tp_rank}",
+                         daemon=True).start()
+        logger.info(
+            "TPURaidenConnectorWorker rank%d --> reshard push-request "
+            "channel listening on port %d", self.tp_rank, port)
+
+    def _reshard_listen(self) -> None:
+        while True:
+            try:
+                msg = self._reshard_listener_sock.recv_multipart()
+            except (zmq.ContextTerminated, zmq.ZMQError):
+                return
+            try:
+                if msg[0] != RESHARD_PUSH_REQ:
+                    logger.warning(
+                        "TPURaidenConnectorWorker rank%d --> unknown reshard "
+                        "channel header: %s", self.tp_rank, msg[0])
+                    continue
+                req_id = msg[1].decode("ascii")
+                push_req = dict(
+                    uuid=int(msg[2].decode("ascii")),
+                    dst_tp=int(msg[3].decode("ascii")),
+                    push_endpoint=msg[4].decode("ascii"),
+                    decode_blocks=np.frombuffer(msg[5],
+                                                dtype=np.int64).tolist(),
+                    recv_time=time.perf_counter(),
+                )
+                with self._reshard_lock:
+                    self._reshard_push_reqs[req_id] = push_req
+                self._maybe_reshard_push(req_id)
+            except Exception:
+                # The affected request surfaces on the consumer as a recv
+                # timeout -> failed_recving -> block recompute.
+                logger.exception(
+                    "TPURaidenConnectorWorker rank%d --> reshard push "
+                    "request failed", self.tp_rank)
+
+    def _maybe_reshard_push(self, req_id: str) -> None:
+        """Stage and push one request's KV once both the send meta (from the
+        scheduler) and the consumer's push request (from the ZMQ channel)
+        are present. Runs on the listener thread or the worker thread,
+        whichever supplies the second half."""
+        with self._reshard_lock:
+            req_meta = self._reshard_send_meta.get(req_id)
+            push_req = self._reshard_push_reqs.get(req_id)
+            if (req_meta is None or push_req is None
+                    or req_id in self._reshard_pushed):
+                return
+            self._reshard_pushed.add(req_id)
+        if self.dp_rank != 0:
+            raise NotImplementedError(
+                "Raiden resharding from a dp_rank>0 producer is not "
+                "supported (the receiver keys schedules by the producer's "
+                "global TP rank)")
+        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+        engine = self._ensure_raiden_transfer_engine()
+        uuid = push_req["uuid"]
+        peer = push_req["push_endpoint"]
+        decode_blocks = push_req["decode_blocks"]
+        n = len(decode_blocks)
+        src_blocks = list(req_meta.local_block_ids)
+        if len(src_blocks) < n:
+            raise ValueError(
+                f"resharded push for req {req_id} pairs {n} consumer blocks "
+                f"but the producer only published {len(src_blocks)}")
+        # A consumer prefix-cache hit trims the head pages; pair the tail.
+        src_blocks = src_blocks[-n:]
+        geom = self._make_reshard_geometry(self.tp_size, push_req["dst_tp"])
+
+        # The host staging pool is a full device shadow (see
+        # _ensure_raiden_transfer_engine): stage each device block into the
+        # host block with the SAME id, which is the src_block_id the
+        # receiver's schedule expects.
+        fut = engine.d2h(src_blocks, src_blocks, [1] * n)
+        deadline = time.perf_counter() + float(
+            dist_utils.get_p2p_wait_pull_timeout())
+        while fut is not None and not fut.is_ready():
+            if time.perf_counter() > deadline:
+                raise TimeoutError(
+                    f"raiden reshard D2H stage for req {req_id} timed out")
+            time.sleep(0.0005)
+
+        req = reshard_schedule.build_sender_request(
+            pb2,
+            uuid=uuid,
+            req_id=req_id,
+            peer=peer,
+            prefill_rank=self.tp_rank,
+            decode_rank=reshard_schedule.decode_rank_for(
+                self.tp_rank, geom.ratio),
+            geom=geom,
+            src_block_ids=src_blocks,
+            dst_block_ids=decode_blocks,
+            live_tokens=[self.block_size] * n,
+        )
+        engine.register_active_plan(uuid, req, is_sender=True)
+        # The receiver counts one block-push per (block, layer) and only
+        # advances a layer's H2D when that layer's push arrives; an
+        # all-layers push (layer_idx=-1) delivers each block once and only
+        # advances layer 0, so push each layer as its own request.
+        for layer_idx in range(len(self.runner.kv_caches)):
+            engine.push_registered_plan(uuid, peer, src_blocks, decode_blocks,
+                                        layer_idx)
+        with self._reshard_lock:
+            self._reshard_done_sending.add(req_id)
+        logger.debug(
+            "TPURaidenConnectorWorker rank%d --> reshard push done "
+            "req_id=%s uuid=%s peer=%s dst_tp=%d blocks=%d", self.tp_rank,
+            req_id, uuid, peer, push_req["dst_tp"], n)
+
+    def _reshard_gc(self, now: float) -> None:
+        """Drop producer-side reshard state for requests whose send window
+        expired (the consumer never asked, or asked long ago)."""
+        timeout = float(dist_utils.get_p2p_wait_pull_timeout())
+        with self._reshard_lock:
+            expired = [
+                r for r, m in self._reshard_send_meta.items()
+                if now > m.expiration_time
+            ]
+            for req_id in expired:
+                del self._reshard_send_meta[req_id]
+                self._reshard_push_reqs.pop(req_id, None)
+                self._reshard_pushed.discard(req_id)
+            stale = [
+                r for r, p in self._reshard_push_reqs.items()
+                if r not in self._reshard_send_meta and now -
+                p["recv_time"] > timeout
+            ]
+            for req_id in stale:
+                self._reshard_push_reqs.pop(req_id, None)
+                self._reshard_pushed.discard(req_id)
+        self._reported_sending = {
+            r: t
+            for r, t in self._reported_sending.items() if now - t < 2 * timeout
+        }
 
     def _max_request_blocks(self) -> int:
         block_size = self.vllm_config.cache_config.block_size

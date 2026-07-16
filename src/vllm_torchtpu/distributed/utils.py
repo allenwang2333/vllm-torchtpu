@@ -245,3 +245,15 @@ def get_raiden_transfer_num_slots() -> int:
 def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return _get_bool_env("TPU_RAIDEN_INLINE_LOAD", False)
+
+
+def get_raiden_reshard_enabled() -> bool:
+    """Strided push-resharding for asymmetric prefill/decode TP.
+
+    On by default and auto-engaged per request only when the producer TP
+    differs from the consumer TP; symmetric traffic never enters this path.
+    Disabling it (an asymmetric topology then raises) keeps the multi-slot
+    host staging pool instead of the full device-shadow sizing the reshard
+    push/receive paths need.
+    """
+    return _get_bool_env("TPU_RAIDEN_RESHARD", True)
