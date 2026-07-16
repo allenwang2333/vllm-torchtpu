@@ -69,7 +69,9 @@ esac
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 # Scale batched tokens based on input sequence length, but not too small.
 MAX_NUM_BATCHED_TOKENS=$(( ISL / DP_SIZE > 1024 ? ISL / DP_SIZE : 1024 ))
-
+# Cap at 2048 since larger prefill may run into XLA unimplemented
+# async-all-reduce-start error.
+[ "$MAX_NUM_BATCHED_TOKENS" -gt 2048 ] && MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
