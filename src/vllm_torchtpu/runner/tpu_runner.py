@@ -350,6 +350,18 @@ class TPUModelRunner(GPUModelRunner):
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
+        # Every scheduled chunk is padded up to one of num_tokens_paddings,
+        # and the CPU staging buffers are sized to the largest bucket, so the
+        # ladder must cover the scheduler's per-step token budget.
+        if self.max_num_tokens < self.scheduler_config.max_num_batched_tokens:
+            raise ValueError(
+                f"compilation_config.compile_sizes defines the complete token "
+                f"padding ladder on TPU, but its largest bucket "
+                f"({self.max_num_tokens}) is smaller than "
+                f"scheduler max_num_batched_tokens "
+                f"({self.scheduler_config.max_num_batched_tokens}); chunks "
+                f"larger than the largest bucket cannot be padded. Extend "
+                f"compile_sizes or lower --max-num-batched-tokens.")
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention")
         self.num_kv_heads = self.model_config.get_num_kv_heads(
@@ -3670,6 +3682,7 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 return spec.kv_cache_specs[layer_name]
             return spec
+
         # ---- Block-major KV: optionally bundle all attention layers into ----
         # one [num_blocks, num_layers, page_size, K2/p, p, H] tensor and
         # bind per-layer (strided) views into vLLM's per-layer slots.

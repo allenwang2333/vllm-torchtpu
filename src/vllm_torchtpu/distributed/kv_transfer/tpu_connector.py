@@ -914,8 +914,9 @@ class TPURaidenConnectorWorker:
                 bad.append(f"[{i}] {type(t).__name__}")
                 continue
             try:
-                props = (f"[{i}] dev={t.device} shape={tuple(t.shape)} "
-                         f"contig={t.is_contiguous()} off={t.storage_offset()}")
+                props = (
+                    f"[{i}] dev={t.device} shape={tuple(t.shape)} "
+                    f"contig={t.is_contiguous()} off={t.storage_offset()}")
                 logger.info("TPURaidenConnectorWorker rank%d --> kv_cache %s",
                             self.tp_rank, props)
             except Exception as e:  # undefined tensor -> .device throws
@@ -933,7 +934,8 @@ class TPURaidenConnectorWorker:
             raise RuntimeError(
                 "register_runner must be called before transfer")
         kv_caches = self._raiden_kv_caches()
-        block_major = getattr(self.runner, "_kv_cache_bundle", None) is not None
+        block_major = getattr(self.runner, "_kv_cache_bundle",
+                              None) is not None
         max_blocks = self._max_request_blocks()
         num_slots = self._num_raiden_slots(max_blocks)
         local_control_port = self._rank_control_port(self.kv_transfer_port)

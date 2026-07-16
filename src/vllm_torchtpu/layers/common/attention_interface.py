@@ -440,19 +440,40 @@ def attention_bundled(
              query_start_loc, request_distribution, sinks_arg):
         if use_hd64:
             output, new_bundle = ragged_paged_attention_hd64_bundled(
-                q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
-                query_start_loc, request_distribution, sinks_arg,
-                sm_scale=sm_scale, sliding_window=attention_chunk_size,
-                q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+                q,
+                k,
+                v,
+                kv_cache_bundle,
+                layer_idx,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                sinks_arg,
+                sm_scale=sm_scale,
+                sliding_window=attention_chunk_size,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale)
             return new_bundle, output
         if sinks_arg is not None:
             raise NotImplementedError(
                 "Attention sink is supported only in the hd64 bundled path.")
         output, new_bundle = ragged_paged_attention_bundled(
-            q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
-            query_start_loc, request_distribution,
-            sm_scale=sm_scale, sliding_window=attention_chunk_size,
-            q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+            q,
+            k,
+            v,
+            kv_cache_bundle,
+            layer_idx,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale,
+            sliding_window=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale)
         return new_bundle, output
 
     # TP=1 (or no ATTN_HEAD axis): run directly, no shard_map (matches the
