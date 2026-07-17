@@ -762,11 +762,13 @@ class TPURaidenConnectorWorker:
         self._reshard_enabled = _use_raiden_reshard(vllm_config)
         self.block_size = vllm_config.cache_config.block_size
         self._reshard_lock = threading.Lock()
-        # Producer: send meta and consumer push requests per req_id, matched
-        # by _maybe_reshard_push whichever side arrives last.
-        self._reshard_send_meta: dict[str, SendMeta] = {}
-        self._reshard_push_reqs: dict[str, dict[str, Any]] = {}
-        self._reshard_pushed: set[str] = set()
+        # Producer: send meta and consumer push requests, matched by
+        # _maybe_reshard_push whichever side arrives last. Keyed by the
+        # transfer uuid: each engine mints its own request id for the same
+        # completion, so req_ids do not match across producer and consumer.
+        self._reshard_send_meta: dict[int, tuple[str, SendMeta]] = {}
+        self._reshard_push_reqs: dict[int, dict[str, Any]] = {}
+        self._reshard_pushed: set[int] = set()
         # Producer: send completions from the push path (the data is fully
         # staged and pushed when set), merged into _done_sending by
         # get_finished.
@@ -811,8 +813,9 @@ class TPURaidenConnectorWorker:
                     req_meta.uuid, len(req_meta.local_block_ids))
                 if self._reshard_enabled:
                     with self._reshard_lock:
-                        self._reshard_send_meta[req_id] = req_meta
-                    self._maybe_reshard_push(req_id)
+                        self._reshard_send_meta[int(
+                            req_meta.uuid)] = (req_id, req_meta)
+                    self._maybe_reshard_push(int(req_meta.uuid))
             if self._reshard_enabled:
                 self._reshard_gc(time.perf_counter())
             return
@@ -1233,8 +1236,8 @@ class TPURaidenConnectorWorker:
                     self.tp_rank, req_id, push_req["uuid"], push_req["dst_tp"],
                     len(push_req["decode_blocks"]))
                 with self._reshard_lock:
-                    self._reshard_push_reqs[req_id] = push_req
-                self._maybe_reshard_push(req_id)
+                    self._reshard_push_reqs[push_req["uuid"]] = push_req
+                self._maybe_reshard_push(push_req["uuid"])
             except Exception:
                 # The affected request surfaces on the consumer as a recv
                 # timeout -> failed_recving -> block recompute.
@@ -1242,18 +1245,20 @@ class TPURaidenConnectorWorker:
                     "TPURaidenConnectorWorker rank%d --> reshard push "
                     "request failed", self.tp_rank)
 
-    def _maybe_reshard_push(self, req_id: str) -> None:
+    def _maybe_reshard_push(self, uuid: int) -> None:
         """Stage and push one request's KV once both the send meta (from the
         scheduler) and the consumer's push request (from the ZMQ channel)
         are present. Runs on the listener thread or the worker thread,
-        whichever supplies the second half."""
+        whichever supplies the second half. Keyed by the transfer uuid: the
+        producer's and consumer's request ids differ for one completion."""
         with self._reshard_lock:
-            req_meta = self._reshard_send_meta.get(req_id)
-            push_req = self._reshard_push_reqs.get(req_id)
-            if (req_meta is None or push_req is None
-                    or req_id in self._reshard_pushed):
+            entry = self._reshard_send_meta.get(uuid)
+            push_req = self._reshard_push_reqs.get(uuid)
+            if (entry is None or push_req is None
+                    or uuid in self._reshard_pushed):
                 return
-            self._reshard_pushed.add(req_id)
+            self._reshard_pushed.add(uuid)
+        req_id, req_meta = entry
         if self.dp_rank != 0:
             raise NotImplementedError(
                 "Raiden resharding from a dp_rank>0 producer is not "
@@ -1261,7 +1266,6 @@ class TPURaidenConnectorWorker:
                 "global TP rank)")
         from tpu_raiden.rpc import raiden_service_pb2 as pb2
         engine = self._ensure_raiden_transfer_engine()
-        uuid = push_req["uuid"]
         peer = push_req["push_endpoint"]
         decode_blocks = push_req["decode_blocks"]
         n = len(decode_blocks)
@@ -1321,21 +1325,21 @@ class TPURaidenConnectorWorker:
         timeout = float(dist_utils.get_p2p_wait_pull_timeout())
         with self._reshard_lock:
             expired = [
-                r for r, m in self._reshard_send_meta.items()
+                u for u, (_, m) in self._reshard_send_meta.items()
                 if now > m.expiration_time
             ]
-            for req_id in expired:
-                del self._reshard_send_meta[req_id]
-                self._reshard_push_reqs.pop(req_id, None)
-                self._reshard_pushed.discard(req_id)
+            for uuid in expired:
+                del self._reshard_send_meta[uuid]
+                self._reshard_push_reqs.pop(uuid, None)
+                self._reshard_pushed.discard(uuid)
             stale = [
-                r for r, p in self._reshard_push_reqs.items()
-                if r not in self._reshard_send_meta and now -
+                u for u, p in self._reshard_push_reqs.items()
+                if u not in self._reshard_send_meta and now -
                 p["recv_time"] > timeout
             ]
-            for req_id in stale:
-                self._reshard_push_reqs.pop(req_id, None)
-                self._reshard_pushed.discard(req_id)
+            for uuid in stale:
+                self._reshard_push_reqs.pop(uuid, None)
+                self._reshard_pushed.discard(uuid)
         self._reported_sending = {
             r: t
             for r, t in self._reported_sending.items() if now - t < 2 * timeout
