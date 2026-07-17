@@ -430,7 +430,8 @@ def _process_fp8_moe_weights(
             w13_chunk[:, padded_intermediate + local_real:2 *
                       padded_intermediate, :] = 0
 
-        if requant_block_size is not None and w13_chunk.shape[-1] % requant_block_size != 0:
+        if requant_block_size is not None and w13_chunk.shape[
+                -1] % requant_block_size != 0:
             raise ValueError(
                 f"Re-quantization block size mismatch: contracting "
                 f"dimension {w13_chunk.shape[-1]} is not divisible by "
@@ -441,7 +442,10 @@ def _process_fp8_moe_weights(
                                        axis=-1,
                                        block_size=requant_block_size)
         del w13_chunk
-        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q, w13_s, activation, is_w13=True)
+        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q,
+                                                           w13_s,
+                                                           activation,
+                                                           is_w13=True)
         if w13_q.device.type == "tpu":
             sync.synchronize(w13_q, wait=True)
             if w13_s is not None:
@@ -450,7 +454,9 @@ def _process_fp8_moe_weights(
         w13_scale_list.append(w13_s)
 
     w13 = torch.cat(w13_list, dim=0) if len(w13_list) > 1 else w13_list[0]
-    w13_scale = torch.cat(w13_scale_list, dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
+    w13_scale = torch.cat(
+        w13_scale_list,
+        dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
     del w13_list, w13_scale_list
 
     w2_list, w2_scale_list = [], []
@@ -465,7 +471,8 @@ def _process_fp8_moe_weights(
         if need_masking and local_real < padded_intermediate:
             w2_chunk[:, :, local_real:padded_intermediate] = 0
 
-        if requant_block_size is not None and w2_chunk.shape[-1] % requant_block_size != 0:
+        if requant_block_size is not None and w2_chunk.shape[
+                -1] % requant_block_size != 0:
             raise ValueError(
                 f"Re-quantization block size mismatch: contracting "
                 f"dimension {w2_chunk.shape[-1]} is not divisible by "
@@ -476,7 +483,10 @@ def _process_fp8_moe_weights(
                                      axis=-1,
                                      block_size=requant_block_size)
         del w2_chunk
-        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q, w2_s, activation, is_w13=False)
+        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q,
+                                                         w2_s,
+                                                         activation,
+                                                         is_w13=False)
         if w2_q.device.type == "tpu":
             sync.synchronize(w2_q, wait=True)
             if w2_s is not None:
@@ -485,7 +495,9 @@ def _process_fp8_moe_weights(
         w2_scale_list.append(w2_s)
 
     w2 = torch.cat(w2_list, dim=0) if len(w2_list) > 1 else w2_list[0]
-    w2_scale = torch.cat(w2_scale_list, dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
+    w2_scale = torch.cat(
+        w2_scale_list,
+        dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
     del w2_list, w2_scale_list
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
@@ -517,7 +529,10 @@ def _quantize_bf16_moe_weights(
                                        axis=-1,
                                        block_size=requant_block_size)
         del w13_chunk
-        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q, w13_s, activation, is_w13=True)
+        w13_q, w13_s = _format_single_moe_weight_and_scale(w13_q,
+                                                           w13_s,
+                                                           activation,
+                                                           is_w13=True)
         if w13_q.device.type == "tpu":
             sync.synchronize(w13_q, wait=True)
             if w13_s is not None:
@@ -526,7 +541,9 @@ def _quantize_bf16_moe_weights(
         w13_scale_list.append(w13_s)
 
     w13 = torch.cat(w13_list, dim=0) if len(w13_list) > 1 else w13_list[0]
-    w13_scale = torch.cat(w13_scale_list, dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
+    w13_scale = torch.cat(
+        w13_scale_list,
+        dim=0) if w13_scale_list and w13_scale_list[0] is not None else None
     del w13_list, w13_scale_list
 
     w2_list, w2_scale_list = [], []
@@ -538,7 +555,10 @@ def _quantize_bf16_moe_weights(
                                      axis=-1,
                                      block_size=requant_block_size)
         del w2_chunk
-        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q, w2_s, activation, is_w13=False)
+        w2_q, w2_s = _format_single_moe_weight_and_scale(w2_q,
+                                                         w2_s,
+                                                         activation,
+                                                         is_w13=False)
         if w2_q.device.type == "tpu":
             sync.synchronize(w2_q, wait=True)
             if w2_s is not None:
@@ -547,7 +567,9 @@ def _quantize_bf16_moe_weights(
         w2_scale_list.append(w2_s)
 
     w2 = torch.cat(w2_list, dim=0) if len(w2_list) > 1 else w2_list[0]
-    w2_scale = torch.cat(w2_scale_list, dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
+    w2_scale = torch.cat(
+        w2_scale_list,
+        dim=0) if w2_scale_list and w2_scale_list[0] is not None else None
     del w2_list, w2_scale_list
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
@@ -1000,6 +1022,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+        # Derive weight_block_size explicitly from weight_scale layout when requant_block_size is unspecified.
+        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
+        # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
         if requant_block_size is None:
             if weight_scale.ndim == 1:
                 if weight_scale.shape[0] == weight.shape[0]:
