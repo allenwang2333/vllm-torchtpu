@@ -54,27 +54,37 @@ def _validate_pcp_rank(pcp_rank: int, pcp_size: int) -> None:
         raise RuntimeError(f"pcp_rank={pcp_rank} is outside [0, {pcp_size})")
 
 
-def _pcp_slice_dim_torch(tensor: torch.Tensor, pcp_rank: int, pcp_size: int, *,
-                         axis: int) -> torch.Tensor:
-    _validate_pcp_rank(pcp_rank, pcp_size)
+def _pcp_slice_dim_torch(tensor: torch.Tensor, pcp_rank: torch.Tensor,
+                         pcp_size: int, *, axis: int) -> torch.Tensor:
+    """Select this rank's shard with the rank supplied as a tensor.
+
+    The rank stays runtime data, so the traced program is identical on
+    every PCP rank.
+    """
     axis = _normalize_dim(axis, tensor.dim())
     if tensor.shape[axis] % pcp_size != 0:
         raise RuntimeError(
             "PCP shard axis is not divisible by pcp_size: "
             f"shape={tuple(tensor.shape)} axis={axis} pcp_size={pcp_size}")
     shard_size = tensor.shape[axis] // pcp_size
-    return tensor.narrow(axis, pcp_rank * shard_size, shard_size)
+    index = (pcp_rank * shard_size +
+             torch.arange(shard_size, device=tensor.device))
+    return tensor.index_select(axis, index)
 
 
 def _pcp_slice_reordered_concatenated_torch(
     tensor: torch.Tensor,
     split_sizes: list[int],
-    pcp_rank: int,
+    pcp_rank: torch.Tensor,
     pcp_size: int,
     *,
     axis: int,
 ) -> torch.Tensor:
-    _validate_pcp_rank(pcp_rank, pcp_size)
+    """Select this rank's shard of each split with the rank as a tensor.
+
+    The rank stays runtime data, so the traced program is identical on
+    every PCP rank.
+    """
     axis = _normalize_dim(axis, tensor.dim())
     if sum(split_sizes) != tensor.shape[axis]:
         raise RuntimeError(
@@ -88,8 +98,9 @@ def _pcp_slice_reordered_concatenated_torch(
             raise RuntimeError("PCP split is not divisible by pcp_size: "
                                f"split_size={split_size} pcp_size={pcp_size}")
         shard_size = split_size // pcp_size
-        parts.append(
-            tensor.narrow(axis, offset + pcp_rank * shard_size, shard_size))
+        index = (offset + pcp_rank * shard_size +
+                 torch.arange(shard_size, device=tensor.device))
+        parts.append(tensor.index_select(axis, index))
         offset += split_size
     return torch.cat(parts, dim=axis).contiguous()
 
@@ -400,6 +411,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gdn_op = self._build_gdn_op()
+        if self._pcp_streaming_enabled():
+            # The PCP rank must reach the compiled graph as runtime data.
+            # Read as a Python int inside the traced op, it is baked in as
+            # a compile-time constant, so every rank compiles a
+            # structurally different program around the in-graph PCP
+            # collectives and their collective schedules desynchronize.
+            _validate_pcp_rank(get_pcp_rank(), get_pcp_world_size())
+            self.register_buffer(
+                "_pcp_rank",
+                torch.tensor(get_pcp_rank(), dtype=torch.int64),
+                persistent=False)
         self.gdn_pcp_op = (self._build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
@@ -522,7 +544,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
         ) -> torch.Tensor:
             if pcp_streaming:
-                pcp_rank = get_pcp_rank()
+                pcp_rank = self._pcp_rank.to(mixed_qkv.device)
                 local_key_dim = local_num_kq_heads * self.head_k_dim
                 local_value_dim = local_num_v_heads * self.head_v_dim
                 split_sizes = [local_key_dim, local_key_dim, local_value_dim]
