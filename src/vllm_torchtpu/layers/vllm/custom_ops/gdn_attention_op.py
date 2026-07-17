@@ -148,6 +148,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gdn_op = self._build_gdn_op()
+        if self._pcp_streaming_enabled():
+            # The PCP rank must reach the compiled graph as runtime data.
+            # Read as a Python int inside the traced forward, it is baked
+            # in as a compile-time constant, so every rank compiles a
+            # structurally different program around the in-graph PCP
+            # collectives and their collective schedules desynchronize.
+            self.register_buffer(
+                "_pcp_rank",
+                torch.tensor(get_pcp_rank(), dtype=torch.int64),
+                persistent=False)
         self.gdn_pcp_op = (self._build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
@@ -401,8 +411,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if not use_pcp_streaming:
                     raise RuntimeError(
                         "GDN op returned an incompatible output shape.")
-                start = get_pcp_rank() * num_tokens
-                core_attn_out = core_attn_out[start:start + num_tokens]
+                index = (self._pcp_rank.to(core_attn_out.device) *
+                         num_tokens +
+                         torch.arange(num_tokens,
+                                      device=core_attn_out.device))
+                core_attn_out = core_attn_out.index_select(0, index)
             if use_pcp_streaming:
                 local_core_attn_out = torch.empty(
                     tuple(core_attn_out.shape),
