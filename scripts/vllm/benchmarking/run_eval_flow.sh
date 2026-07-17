@@ -204,8 +204,27 @@ fi
 # 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
-    run_lm_eval "mmlu_llama"
-    run_lm_eval "mmlu_pro"
+    if [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
+        TASKS="${LM_EVAL_TASKS:-mmlu_pro}"
+    else
+        TASKS="${LM_EVAL_TASKS:-mmlu_llama mmlu_pro}"
+    fi
+    for task in $TASKS; do
+        run_lm_eval "$task"
+    done
+fi
+
+# ========================================================
+# 4b. Run Standalone Multimodal (MMMU) Evaluation
+# ========================================================
+if [ "$RUN_LM_EVAL" = "1" ] && [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
+    echo "=== Running Standalone Multimodal (MMMU) Evaluation ==="
+    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
+      --host "$HOST" \
+      --port "$PORT" \
+      --model "$MODEL" \
+      --limit "${MMMU_LIMIT:-100}" \
+      --results-dir "$RESULTS_DIR" || { echo "::error::MMMU evaluation failed!"; fail=1; }
 fi
 
 # ========================================================

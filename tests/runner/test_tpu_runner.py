@@ -1477,3 +1477,76 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1])
         }
         assert slots == {1, 2, 3, 4}
+
+    def test_multimodal_is_mm_embed_padding(self):
+        """Verify is_mm_embed mask is padded to match input_ids length
+
+        and transferred to TPU device without index mismatch.
+        """
+        runner = MagicMock(spec=TPUModelRunner)
+        runner.device = torch.device('cpu')
+        runner.supports_mm_inputs = True
+        runner.model = MagicMock()
+        runner.model.embed_input_ids = MagicMock(
+            return_value=torch.randn(8, 64))
+
+        input_ids = torch.arange(8, dtype=torch.int32)
+        mm_embeds = [torch.randn(3, 64)]
+        is_mm_embed = torch.tensor([True, True, True], dtype=torch.bool)
+
+        _, inputs_embeds = TPUModelRunner._get_model_inputs(
+            runner, input_ids, (mm_embeds, is_mm_embed))
+
+        runner.model.embed_input_ids.assert_called_once()
+        call_args = runner.model.embed_input_ids.call_args
+        passed_is_mm = call_args.kwargs.get("is_multimodal")
+
+        assert passed_is_mm.shape[0] == 8
+        assert passed_is_mm.dtype == torch.bool
+        assert torch.equal(passed_is_mm[:3], torch.tensor([True, True, True]))
+        assert torch.equal(passed_is_mm[3:], torch.zeros(5, dtype=torch.bool))
+
+    def test_tpu_platform_synced_weight_loader(self):
+        """Verify TpuPlatform weight loader syncs TPU tensors after loading."""
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        original_loader = MagicMock(return_value="loaded")
+        synced_loader = TpuPlatform.make_synced_weight_loader(original_loader)
+
+        param = MagicMock()
+        param.device = torch.device("cpu")
+
+        res = synced_loader(param, "arg1", kw="kw1")
+        assert res == "loaded"
+        original_loader.assert_called_once_with(param, "arg1", kw="kw1")
+
+
+def test_flush_disjoint_async_results():
+    """Verify _flush_disjoint_async_results handles early exit, overlap, and disjoint flushing."""
+    runner = MagicMock(spec=TPUModelRunner)
+    runner._pre_async_results = None
+    runner._modify_prev_results = MagicMock()
+
+    # 1. Early exit when _pre_async_results is None
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_not_called()
+    assert runner._pre_async_results is None
+
+    # 2. Overlap case: current batch overlaps with previous step requests
+    runner._pre_async_results = MagicMock()
+    runner._pre_async_results.req_id_to_index_copy = {"req_A": 0, "req_B": 1}
+    runner.input_batch = MagicMock()
+    runner.input_batch.req_ids = ["req_B", "req_C"]
+    runner.input_batch.num_reqs = 2
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_not_called()
+    assert runner._pre_async_results is not None
+
+    # 3. Disjoint case: current batch has zero overlap with previous step requests
+    runner.input_batch.req_ids = ["req_X", "req_Y"]
+    runner.input_batch.num_reqs = 2
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_called_once()
+    assert runner._pre_async_results is None

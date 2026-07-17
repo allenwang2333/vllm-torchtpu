@@ -81,7 +81,16 @@ def _configure_torchtpu_eager_mode() -> None:
         logger.info("TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).",
                     previous_mode.name)
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+
+    mode_str = os.getenv("TORCH_TPU_EAGER_MODE", "DEFER_AND_FUSE")
+    try:
+        execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_str)
+    except AttributeError:
+        logger.warning(
+            "Invalid TORCH_TPU_EAGER_MODE '%s', falling back to DEFER_AND_FUSE",
+            mode_str)
+        execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+
     logger.info("TorchTPU eager mode configured: %s (previous=%s)",
                 execution_mode.eager_mode.name, previous_mode.name)
 
@@ -534,6 +543,12 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def mem_get_info(
+            cls,
+            device: Union[int, str, torch.device] = None) -> Tuple[int, int]:
+        return torch.accelerator.get_memory_info(device)
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return False
 
@@ -897,8 +912,19 @@ class TpuPlatform(Platform):
         """
         Returns if the current platform needs to sync weight loader.
         """
-        # TODO: Fix this
-        return False
+        return True
+
+    @classmethod
+    def make_synced_weight_loader(cls, original_weight_loader):
+
+        def _synced_weight_loader(param, *args, **kwargs):
+            out = original_weight_loader(param, *args, **kwargs)
+            if param.device.type == "tpu":
+                from torch_tpu._internal import sync
+                sync.synchronize(param)
+            return out
+
+        return _synced_weight_loader
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

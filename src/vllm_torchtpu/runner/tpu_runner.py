@@ -509,6 +509,25 @@ class TPUModelRunner(GPUModelRunner):
                                                      pin_memory=PIN_MEMORY)
         self.sample_from_logits_func = self.sample_from_logits
 
+        if self.enforce_eager:
+            global _substitute_placeholder_token
+            _substitute_placeholder_token = getattr(
+                _substitute_placeholder_token, "_torchdynamo_orig_callable",
+                getattr(_substitute_placeholder_token, "__wrapped__",
+                        _substitute_placeholder_token))
+            for meth_name in [
+                    "compute_selected_logits", "sample_from_logits",
+                    "gather_logprobs", "structured_decode"
+            ]:
+                bound_meth = getattr(self, meth_name)
+                uncompiled = getattr(
+                    bound_meth, "_torchdynamo_orig_callable",
+                    getattr(bound_meth, "__wrapped__", bound_meth))
+                if hasattr(uncompiled, "__get__"):
+                    setattr(self, meth_name,
+                            uncompiled.__get__(self, self.__class__))
+            self.sample_from_logits_func = self.sample_from_logits
+
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
         self.mm_embed_inputs: tuple[list[torch.Tensor],
@@ -1611,14 +1630,31 @@ class TPUModelRunner(GPUModelRunner):
             self._pre_async_results.next_tokens_tpu)
 
     def _flush_disjoint_async_results(self) -> None:
-        if self._pre_async_results is None:
+        """
+        Flushes and clears in-flight asynchronous results from a previous iteration
+        when the current step's scheduled request batch is disjoint (has zero overlap)
+        with the previous step's request batch.
+        """
+        # 1. Early exit: If there are no pending or cached D2H results, return immediately.
+        if self._pre_async_results is None or self.input_batch is None or not hasattr(
+                self.input_batch, "req_ids"):
             return
+
+        # 2. Extract current scheduled request IDs and previous step request IDs.
         current_req_ids = set(
             self.input_batch.req_ids[:self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
+
+        # 3. Overlap check: If any request from the previous step is still active
+        # in the current step, allow standard async D2H result flushing to handle it.
         if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
+
+        # 4. Disjoint batch detected (e.g. batch transition or 0-token idle step):
+        # Force an immediate flush of previous D2H token results.
         self._modify_prev_results()
+
+        # 5. Nullify pointer to allow memory reclamation and prevent duplicate flushing.
         self._pre_async_results = None
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
@@ -2334,7 +2370,9 @@ class TPUModelRunner(GPUModelRunner):
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs:
-            self._execute_mm_encoder(scheduler_output)
+            from vllm.distributed.parallel_state import get_pp_group
+            if get_pp_group().is_first_rank:
+                self._execute_mm_encoder(scheduler_output)
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
 
@@ -2471,10 +2509,9 @@ class TPUModelRunner(GPUModelRunner):
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
-            # For multimodal models _get_model_inputs returns input_ids=None
-            # and packs the tokens into inputs_embeds; use whichever exists.
-            num_tokens_padded = (input_ids if input_ids is not None else
-                                 inputs_embeds).shape[0]
+            num_tokens_padded = (
+                input_ids.shape[0] if input_ids is not None else
+                (inputs_embeds.shape[0] if inputs_embeds is not None else 0))
             with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
