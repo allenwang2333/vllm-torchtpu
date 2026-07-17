@@ -269,15 +269,19 @@ def load_and_select_states(
     prev_conv_state_list = []
     prev_recurrent_state_list = []
 
+    is_spec = cfg.mode == config.GDNMode.SPEC
     for idx in range(cfg.seq_tile_size):
         s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
         real_sizes = metadata_ref.p_id_to_r_size[p_id, idx]
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
+        # NOTE: In SPEC mode the VMEM window holds one state per window
+        # position; the initial state was DMA'd into position 0.
         # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
         if cfg.state_plan is None:
-            hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+            hbm_conv_state = (conv_state_slot_ref[idx, 0] if is_spec else
+                              conv_state_slot_ref[idx]).astype(jnp.float32)
         else:
             hbm_conv_state = load_state_region(
                 conv_state_slot_ref.at[idx], cfg.state_plan.conv,
@@ -290,7 +294,8 @@ def load_and_select_states(
                                         prev_tile_conv)
 
         if cfg.state_plan is None:
-            hbm_recurrent_state = recurrent_slot_ref[idx]
+            hbm_recurrent_state = (recurrent_slot_ref[idx, 0]
+                                   if is_spec else recurrent_slot_ref[idx])
         else:
             hbm_recurrent_state = load_state_region(
                 recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
