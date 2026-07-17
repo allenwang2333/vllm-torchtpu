@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # Define default image names to clean up
-TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm-local")
+TARGET_IMAGES=("vllm-torchtpu" "vllm-torchtpu-local" "torchtpu-vllm" "torchtpu-vllm-local")
 
 echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"
@@ -25,9 +25,8 @@ for IMG in "${TARGET_IMAGES[@]}"; do
   echo "----------------------------------------"
   echo "Cleaning up images matching: ${IMG}"
 
-  # Get image IDs matching either exact name or registry repository name
-  # e.g., "vllm-torchtpu" or ".../.../vllm-torchtpu"
-  OLD_IMAGES=$(docker images --format '{{.Repository}} {{.ID}}' | awk -v img="${IMG}" '$1 == img || $1 ~ "/"img"$" {print $2}' | sort -u)
+  # Get image IDs matching either exact name or registry repository name, including variant suffixes (-ci, -dev, -prod, etc.)
+  OLD_IMAGES=$(docker images --format '{{.Repository}} {{.ID}}' | awk -v img="${IMG}" '$1 == img || $1 ~ "/"img"$" || $1 ~ "/"img"-" || $1 ~ img"-" {print $2}' | sort -u)
 
   if [[ -n "$OLD_IMAGES" ]]; then
     echo "Found matching images. Checking for dependent containers..."

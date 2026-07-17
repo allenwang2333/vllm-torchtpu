@@ -31,7 +31,7 @@ cd "${REPO_ROOT}"
 TARGETS=("ci" "dev" "prod")
 
 for TARGET in "${TARGETS[@]}"; do
-  IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
+  IMAGE_NAME="${REGISTRY}/vllm-torchtpu-${TARGET}"
   DATE_IMAGE="${IMAGE_NAME}:${DATE_TAG}"
   LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 

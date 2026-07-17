@@ -21,19 +21,19 @@ You can pull the following pre-built nightly image targets using the `:latest` t
 * **CI Image** (`ci:latest` equivalent):
 
   ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-ci:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-ci:latest
   ```
 
 * **Developer Image** (`dev:latest` equivalent):
 
   ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest
   ```
 
 * **Production Image** (`prod:latest` equivalent):
 
   ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-prod:latest
   ```
 
 #### Date-Specific Tags
@@ -41,13 +41,13 @@ You can pull the following pre-built nightly image targets using the `:latest` t
 To pull an image for a specific build date, use the `nightly-YYYYMMDD` tag format:
 
 ```bash
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-<target>:nightly-YYYYMMDD
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-<target>:nightly-YYYYMMDD
 ```
 
 For example, to pull the Developer Image from May 23, 2026:
 
 ```bash
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20260523
+docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:nightly-20260523
 ```
 
 ## Image targets
