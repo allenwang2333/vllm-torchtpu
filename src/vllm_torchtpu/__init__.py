@@ -281,6 +281,79 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_deepseek_missing_metadata_keys() -> None:
+    try:
+        import vllm.model_executor.models.deepseek_v2 as ds2
+    except ImportError:
+        return
+
+    if getattr(ds2, "_tpu_missing_meta_key_patch", False):
+        return
+
+    _orig_is_missing = ds2.is_pp_missing_parameter
+
+    def _safe_is_missing(name: str, model) -> bool:
+        if _orig_is_missing(name, model):
+            return True
+        cached = getattr(model, "_tpu_cached_params_dict", None)
+        if cached is None:
+            cached = dict(model.named_parameters())
+            object.__setattr__(model, "_tpu_cached_params_dict", cached)
+        return name not in cached
+
+    ds2.is_pp_missing_parameter = _safe_is_missing
+    ds2._tpu_missing_meta_key_patch = True
+    logger.info(
+        "Applied TPU patch: ignore unmapped MoE checkpoint metadata keys.")
+
+
+def _patch_custom_op_def_pickling() -> None:
+    """Monkey-patch CustomOpDef to allow serializing/pickling guards in Dynamo.
+
+    PyTorch Dynamo traces custom ops and serializes them in guards. By default,
+    CustomOpDef (returned by pallas.jax_op) is not picklable because it contains
+    underlying C++ dispatcher bindings, which causes compilation crashes.
+    Adding a custom __reduce__ serialization protocol allows pickling to succeed.
+    """
+    try:
+        import torch
+        from torch._library.custom_ops import CustomOpDef
+
+        if getattr(CustomOpDef, "_tpu_pickling_patched", False):
+            return
+
+        def recreate_custom_op_def(name):
+            try:
+                ns, op = name.split("::")
+                return getattr(getattr(torch.ops, ns), op)
+            except Exception:
+                # Fallback to a dummy function that prevents crashes but should not be called
+                def dummy(*args, **kwargs):
+                    raise RuntimeError(f"Dummy custom op {name} called!")
+
+                return dummy
+
+        # Inject the helper into the global namespace of a known module so pickle can find it.
+        # Pickling requires the reduce callable to be globally importable!
+        # We can register it in torch._library.custom_ops or another core module.
+        import torch._library.custom_ops as co
+        co.recreate_custom_op_def = recreate_custom_op_def
+
+        def custom_op_def_reduce(self):
+            # Serialize the CustomOpDef using our globally visible helper
+            return (co.recreate_custom_op_def, (self._qualname, ))
+
+        CustomOpDef.__reduce__ = custom_op_def_reduce
+        CustomOpDef._tpu_pickling_patched = True
+        logger.info(
+            "Applied TPU patch: enabled CustomOpDef pickling for Dynamo guards."
+        )
+    except Exception as e:
+        logger.warning(f"Failed to apply CustomOpDef pickling patch: {e}")
+
+
+_patch_custom_op_def_pickling()
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations

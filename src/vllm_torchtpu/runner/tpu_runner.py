@@ -215,6 +215,83 @@ def _torch_tpu_wrapper():
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+def _clean_communicators_from_submodules(model: torch.nn.Module) -> None:
+    """Recursively delete process groups or GroupCoordinators from submodules.
+
+    Dynamo traces module state during torch.compile, and attempts to pickle guards
+    on all referenced attributes. Non-serializable distributed process groups or
+    native communicators trigger serialization type errors. Removing these dead
+    references after model initialization/loading completes prevents the compiler crash.
+    """
+    import torch
+
+    def is_problematic(val) -> bool:
+        if val is None:
+            return False
+        val_type = type(val)
+        val_type_name = f"{val_type.__module__}.{val_type.__name__}"
+
+        # Check type name strings directly to avoid triggering tensor/allocator serialization code
+        if any(term in val_type_name for term in [
+                "_DispatchModule", "ProcessGroup", "GroupCoordinator",
+                "StatelessGroupCoordinator"
+        ]):
+            return True
+        return False
+
+    count = 0
+    for name, module in model.named_modules():
+        for attr_name in list(module.__dict__.keys()):
+            val = module.__dict__[attr_name]
+
+            # Avoid cleaning basic submodules, parameters, or tensors
+            if isinstance(val,
+                          (torch.nn.Module, torch.nn.Parameter, torch.Tensor)):
+                continue
+
+            if is_problematic(val):
+                logger.debug(
+                    "[CLEAN_COMM] Deleting attribute '%s' of type %s in module '%s'",
+                    attr_name, type(val), name)
+                delattr(module, attr_name)
+                count += 1
+                continue
+
+            if isinstance(val, list):
+                new_list = []
+                modified = False
+                for item in val:
+                    if is_problematic(item):
+                        logger.debug(
+                            "[CLEAN_COMM] Removing item of type %s from list '%s' in module '%s'",
+                            type(item), attr_name, name)
+                        modified = True
+                    else:
+                        new_list.append(item)
+                if modified:
+                    module.__dict__[attr_name] = new_list
+                    count += 1
+
+            elif isinstance(val, dict):
+                new_dict = {}
+                modified = False
+                for k, item in val.items():
+                    if is_problematic(item):
+                        logger.debug(
+                            "[CLEAN_COMM] Removing key '%s' of type %s from dict '%s' in module '%s'",
+                            k, type(item), attr_name, name)
+                        modified = True
+                    else:
+                        new_dict[k] = item
+                if modified:
+                    module.__dict__[attr_name] = new_dict
+                    count += 1
+
+    logger.info(
+        "[CLEAN_COMM] Cleaned %d communicator references from model submodules.",
+        count)
+
+
 class TPUModelRunner(GPUModelRunner):
 
     def __init__(
@@ -2845,6 +2922,7 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        _clean_communicators_from_submodules(self.model)
 
         # If using eagle3/mtp speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).

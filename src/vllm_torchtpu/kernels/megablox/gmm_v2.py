@@ -836,9 +836,11 @@ def kernel_main(
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
-    # Pack along K (2nd minor dim) so that pltpu.bitcast can unpack inside the
-    # kernel.
-    # [G, K, N] -> [G, K//packing, N] uint32
+    # If the weights arrive as an unpacked sub-byte JAX dtype (e.g., native jnp.int4),
+    # pack them along the contracting dimension (K-axis) into 32-bit words (uint32).
+    # For pre-packed inputs (which already arrive as 32-bit tensors), this operation
+    # only performs a view reinterpretation to uint32 without changing the shape or layout.
+    # [G, K, N] -> [G, K // packing, N] uint32
     if cfgs.rhs_cfgs.should_bitcast:
         rhs_weight = rhs_ref.weight.bitcast(jnp.uint32)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
@@ -1013,16 +1015,20 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    packing_factor: int | None = None,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
+    # `assert rhs.shape == (size_group, size_k, size_n)` has been removed, as it was redundant.
     size_group, size_k, size_n = rhs.shape
     size_lhs_group = group_sizes.shape[0]
 
+    if packing_factor is not None:
+        size_k = size_k * packing_factor
+
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1096,6 +1102,32 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     )
 
 
+def _get_packing_factor(
+    rhs: jax.Array,
+    rhs_logical_dtype: jnp.dtype | None,
+) -> int | None:
+    """Validate the logical/storage dtype combination and return the packing factor."""
+    if rhs_logical_dtype is None:
+        return None
+
+    # Guard: Fail fast for untested packed logical/container combinations
+    # Currently only INT4 packed as INT32 is tested
+    # TODO(rsinghc): Test support for other packing types
+    if rhs_logical_dtype != jnp.int4 or rhs.dtype not in (jnp.int32,
+                                                          jnp.uint32):
+        raise NotImplementedError(
+            f"TPU GMM kernel dynamic unpacking is only supported for jnp.int4 logical dtype "
+            f"packed in jnp.int32/uint32 carrier containers. Got logical={rhs_logical_dtype}, "
+            f"carrier={rhs.dtype}.")
+
+    if jax.dtypes.itemsize_bits(
+            rhs.dtype) != jax.dtypes.itemsize_bits(rhs_logical_dtype):
+        return jax.dtypes.itemsize_bits(
+            rhs.dtype) // jax.dtypes.itemsize_bits(rhs_logical_dtype)
+
+    return None
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1111,15 +1143,18 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    rhs_logical_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
+    packing_factor = _get_packing_factor(rhs, rhs_logical_dtype)
+
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
-                           group_offset, fuse_act)
+                           group_offset, fuse_act, packing_factor)
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        rhs_quant_dtype = rhs_logical_dtype or rhs.dtype
         num_blocks = rhs_scale.shape[1]
         block_size = dims.size_k // num_blocks
     else:
@@ -1130,7 +1165,7 @@ def make_gmm_configs(
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
-        dtype=rhs.dtype,
+        dtype=rhs_logical_dtype or rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
     )
@@ -1211,6 +1246,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "maybe_quantize_lhs",
     "zero_initialize",
     "fuse_act",
+    "rhs_logical_dtype",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1229,12 +1265,19 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    rhs_logical_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
     Dynamically calculate offset lhs/out tiles to reduce redundant computations.
     Additionally, it adjusts dma size based on number of valid rows and utilize
     triple buffering on weights to better utilize memory.
+
+    When packing is enabled, weights must be packed along the contracting dimension (K-axis)
+    in LSB-first order. Currently, only INT4 logical weights packed inside INT32 or UINT32
+    carrier containers are supported. Any padding must be applied as zeros along the logical
+    K-axis before packing to align with the packing factor and tile K-size.
+
 
     Args:
         lhs: lhs with shape [size_m, size_k].
@@ -1251,6 +1294,8 @@ def gmm_v2(
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
+        rhs_logical_dtype: Optional logical dtype (e.g., `jnp.int4`) of packed `rhs` weights.
+
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1281,6 +1326,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        rhs_logical_dtype=rhs_logical_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
