@@ -805,7 +805,7 @@ class TPURaidenConnectorWorker:
             for req_id, req_meta in metadata.reqs_to_send.items():
                 engine.register_read(req_id, req_meta.uuid,
                                      req_meta.local_block_ids)
-                logger.debug(
+                logger.info(
                     "TPURaidenConnectorWorker rank%d --> registered send "
                     "req_id=%s uuid=%s blocks=%d", self.tp_rank, req_id,
                     req_meta.uuid, len(req_meta.local_block_ids))
@@ -846,7 +846,7 @@ class TPURaidenConnectorWorker:
                     endpoints = [self._resolve_remote_endpoint(req_meta)]
                 for endpoint in endpoints:
                     engine.start_read(req_id, req_meta.uuid, endpoint, [], [])
-                    logger.debug(
+                    logger.info(
                         "TPURaidenConnectorWorker rank%d --> released remote "
                         "send req_id=%s uuid=%s endpoint=%s", self.tp_rank,
                         req_id, req_meta.uuid, endpoint)
@@ -868,7 +868,7 @@ class TPURaidenConnectorWorker:
             local_blocks = req_meta.local_block_ids
             engine.start_read(req_id, req_meta.uuid, endpoint, remote_blocks,
                               local_blocks)
-            logger.debug(
+            logger.info(
                 "TPURaidenConnectorWorker rank%d --> submitted load "
                 "req_id=%s uuid=%s endpoint=%s remote_blocks=%d "
                 "local_blocks=%d", self.tp_rank, req_id, req_meta.uuid,
@@ -911,7 +911,7 @@ class TPURaidenConnectorWorker:
         self._suppress_done_recving.difference_update(recv_finished)
         self._reported_recving.update(done_recving)
         if done_recving:
-            logger.debug(
+            logger.info(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
                 self.tp_rank, done_recving)
         # Bound the bookkeeping: once a request has finished generating it can no
@@ -1169,10 +1169,15 @@ class TPURaidenConnectorWorker:
                 req_meta.remote_side_channel_port, p)
             self._reshard_push_sock(f"tcp://{host}:{port}").send_multipart(
                 payload)
-        logger.debug(
+        logger.info(
             "TPURaidenConnectorWorker rank%d --> reshard receive registered "
-            "req_id=%s uuid=%s src_tp=%d sources=%s blocks=%d", self.tp_rank,
-            req_id, req_meta.uuid, src_tp, source_ranks, len(local_blocks))
+            "req_id=%s uuid=%s src_tp=%d sources=%s blocks=%d channels=%s",
+            self.tp_rank, req_id, req_meta.uuid, src_tp, source_ranks,
+            len(local_blocks), [
+                f"{self._reshard_source_host_port(req_meta, src_tp, p)[0]}:"
+                f"{self._reshard_channel_port(req_meta.remote_side_channel_port, p)}"
+                for p in source_ranks
+            ])
 
     def _reshard_push_sock(self, endpoint: str) -> zmq.Socket:
         sock = self._reshard_push_socks.get(endpoint)
@@ -1222,6 +1227,11 @@ class TPURaidenConnectorWorker:
                                                 dtype=np.int64).tolist(),
                     recv_time=time.perf_counter(),
                 )
+                logger.info(
+                    "TPURaidenConnectorWorker rank%d --> reshard push "
+                    "request received req_id=%s uuid=%s dst_tp=%d blocks=%d",
+                    self.tp_rank, req_id, push_req["uuid"], push_req["dst_tp"],
+                    len(push_req["decode_blocks"]))
                 with self._reshard_lock:
                     self._reshard_push_reqs[req_id] = push_req
                 self._maybe_reshard_push(req_id)
@@ -1300,7 +1310,7 @@ class TPURaidenConnectorWorker:
                                         layer_idx)
         with self._reshard_lock:
             self._reshard_done_sending.add(req_id)
-        logger.debug(
+        logger.info(
             "TPURaidenConnectorWorker rank%d --> reshard push done "
             "req_id=%s uuid=%s peer=%s dst_tp=%d blocks=%d", self.tp_rank,
             req_id, uuid, peer, push_req["dst_tp"], n)
