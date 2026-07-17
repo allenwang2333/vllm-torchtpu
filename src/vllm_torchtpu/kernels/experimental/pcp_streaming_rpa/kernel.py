@@ -528,6 +528,29 @@ def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
         for axis_name in mesh_axis_names)
 
 
+def _ring_entry_barrier(pcp_size, mesh_axis_names, pcp_axis_name):
+    """Synchronize all PCP ring devices before any ring communication.
+
+    Consecutive kernel launches share this collective id's semaphores and
+    VMEM scratch addresses. Without an entry rendezvous, a rank that finishes
+    one launch early can start the next launch's ring transfer into a
+    neighbor whose previous launch is still consuming that VMEM slot.
+    """
+    if pcp_size <= 1:
+        return
+    barrier_sem = pltpu.get_barrier_semaphore()
+    my_id = lax.axis_index(pcp_axis_name)
+    for offset in range(1, pcp_size):
+        peer = lax.rem(my_id + offset, pcp_size)
+        pl.semaphore_signal(
+            barrier_sem,
+            1,
+            device_id=_mesh_device_id(mesh_axis_names, pcp_axis_name, peer),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(barrier_sem, pcp_size - 1)
+
+
 def _pcp_streaming_attention_page_groups_kernel(
     active_page_groups_ref,
     q_ref,
@@ -560,6 +583,7 @@ def _pcp_streaming_attention_page_groups_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    use_entry_barrier,
 ):
     """Single-head Pallas body for ring-streaming PCP attention.
 
@@ -567,6 +591,8 @@ def _pcp_streaming_attention_page_groups_kernel(
     output for its local compact Q rows and streams local KV pages to the next
     PCP rank while receiving pages from the previous rank.
     """
+    if use_entry_barrier:
+        _ring_entry_barrier(pcp_size, mesh_axis_names, pcp_axis_name)
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
@@ -792,6 +818,7 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    use_entry_barrier,
 ):
     """Multi-head Pallas body for packed-KV ring-streaming PCP attention.
 
@@ -799,6 +826,8 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
     the packed batched-RPA KV-cache layout and computes all local KV heads from
     each streamed KV transfer.
     """
+    if use_entry_barrier:
+        _ring_entry_barrier(pcp_size, mesh_axis_names, pcp_axis_name)
     my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
@@ -1232,6 +1261,7 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            use_entry_barrier=collective_id is not None,
         ),
         out_shape=jax.ShapeDtypeStruct(
             (q_single_head.shape[0], head_dim),
@@ -1267,7 +1297,7 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
-            allow_collective_id_without_custom_barrier=True,
+            allow_collective_id_without_custom_barrier=collective_id is None,
         ),
         name="pcp_streaming_attention_page_groups",
     )(active_page_groups, q_single_head, kv_cache_single_head, packed_schedule)
@@ -1347,6 +1377,7 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            use_entry_barrier=collective_id is not None,
         ),
         out_shape=jax.ShapeDtypeStruct(
             q_multi_head.shape,
@@ -1383,7 +1414,7 @@ def _pcp_streaming_attention_page_groups_multi_head_pallas_call(
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
-            allow_collective_id_without_custom_barrier=True,
+            allow_collective_id_without_custom_barrier=collective_id is None,
         ),
         name="pcp_streaming_attention_page_groups_multi_head",
     )(active_page_groups, q_multi_head, kv_cache_local, packed_schedule)
