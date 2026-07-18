@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+import os
+
+yaml_content = """apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: lq-patemotter-google-com
+  name: dsv4-verify-v7x-8
+spec:
+  replicatedJobs:
+  - name: vllm-server
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        template:
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                      - gke-tpu-d716ab26-gf4c
+            containers:
+            - args:
+              - |
+                mkdir -p /mnt/local-cache/torch_tpu_cache
+                rm -rf /dev/shm/torch_tpu_cache
+                ln -sfn /mnt/local-cache/torch_tpu_cache /dev/shm/torch_tpu_cache
+
+                # Define trap-based cleanup to guarantee disk recovery on exit (even if python fails)
+                cleanup() {
+                  echo "=== [DISK CLEANUP] Removing large checkpoints from local SSD ==="
+                  rm -rf /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1
+                  rm -rf /mnt/local-cache/dsv4-flash-fp4
+                }
+                trap cleanup EXIT
+
+                # Pull weights from GCS to local SSD hostPath
+                mkdir -p /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1
+                if [ ! -d "/mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1" ] || [ ! "$(ls -A /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1 2>/dev/null)" ]; then
+                  echo "=== [GCS PULL] Pulling model checkpoints from GCS to local SSD ==="
+                  gcloud storage cp -r gs://cloud-tpu-inference-test-patemotter-archive/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1/* /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1/
+                fi
+
+                echo "=== Starting DeepSeek-V4-Flash Verification on GKE ==="
+                DSV4_MODEL_PATH=/mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1 python3 -u /root/cloud-devkit/torchtpu-vllm/examples/verify_dsv4.py
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: MALLOC_ARENA_MAX
+                value: '4'
+              - name: OMP_NUM_THREADS
+                value: '8'
+              - name: TPU_TOPOLOGY
+                value: 2x2x1
+              - name: TPU_LIBRARY_PATH
+                value: /mnt/workspace/libtpu.so
+              - name: PYTHONPATH
+                value: /root/cloud-devkit/torchtpu-vllm/src:/root/cloud-devkit/sglang/python
+              - name: HF_HOME
+                value: /mnt/local-cache/hf_cache
+              - name: JAX_COMPILER_CACHE_DIR
+                value: /mnt/local-cache/jax_cache
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/local-cache/vllm_cache
+              - name: TORCHINDUCTOR_CACHE_DIR
+                value: /mnt/local-cache/inductor_cache
+              - name: TRITON_CACHE_DIR
+                value: /mnt/local-cache/triton_cache
+              - name: TMPDIR
+                value: /mnt/local-cache/tmp
+              - name: ENABLE_QUANTIZED_MATMUL_KERNEL
+                value: '1'
+              - name: REQUANTIZE_BLOCK_SIZE
+                value: '128'
+              - name: MOE_REQUANTIZE_BLOCK_SIZE
+                value: '512'
+              - name: MOE_REQUANTIZE_WEIGHT_DTYPE
+                value: fp4
+              - name: NEW_MODEL_DESIGN
+                value: '1'
+              - name: MODEL_IMPL_TYPE
+                value: vllm
+              - name: GPU_MEM_UTIL
+                value: '0.40'
+              - name: TPU_VMODULE
+                value: tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1
+              - name: TPU_STDERR_LOG_LEVEL
+                value: '0'
+              image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest
+              imagePullPolicy: Always
+              name: vllm-server
+              resources:
+                limits:
+                  cpu: '180'
+                  google.com/tpu: 4
+                  memory: 400Gi
+                requests:
+                  cpu: '180'
+                  google.com/tpu: 4
+                  memory: 256Gi
+              volumeMounts:
+              - mountPath: /mnt/workspace
+                name: nfs-root-volume
+              - mountPath: /root/cloud-devkit/torchtpu-vllm
+                name: nfs-root-volume
+                subPath: torchtpu-vllm
+              - mountPath: /mnt/local-cache
+                name: local-ssd-volume
+              - mountPath: /dev/shm
+                name: dshm
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
+            volumes:
+            - name: nfs-root-volume
+              nfs:
+                path: /workspace
+                server: 172.30.171.18
+            - name: local-ssd-volume
+              hostPath:
+                path: /mnt/stateful_partition/torchtpu-cache
+                type: DirectoryOrCreate
+            - name: dshm
+              emptyDir:
+                medium: Memory
+        ttlSecondsAfterFinished: 900
+"""
+
+target_path = os.path.expanduser("~/cloud-devkit/recipes/experimental/torchtpu-vllm/dsv4-verify-v7x-8-patemotter.yml")
+with open(target_path, "w") as f:
+    f.write(yaml_content)
+
+print(f"Verify JobSet recipe successfully updated with cleanup at {target_path}")

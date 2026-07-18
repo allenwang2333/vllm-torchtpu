@@ -1,0 +1,28 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: lq-patemotter-google-com
+  name: dsv4-inference-v7x-8
+spec:
+  replicatedJobs:
+  - name: vllm-server
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        template:
+          spec:
+            containers:
+            - args:
+              - "mkdir -p /mnt/local-cache/torch_tpu_cache\nrm -rf /dev/shm/torch_tpu_cache\n\
+                ln -sfn /mnt/local-cache/torch_tpu_cache /dev/shm/torch_tpu_cache\n\
+                # Recover JAX cache from GCS
+                mkdir -p /mnt/local-cache/jax_cache
+                gcloud storage cp -r gs://cloud-tpu-inference-test-patemotter-archive/workspace/jax_cache/* /mnt/local-cache/jax_cache/ || true
+
+                mkdir -p /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1
+                if [ ! -d "/mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1" ] || [ ! "$(ls -A /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1 2>/dev/null)" ]; then
+                  echo "=== [GCS PULL] Syncing model snapshots directly from GCS to local SSD ==="
+                  gcloud storage cp -r gs://cloud-tpu-inference-test-patemotter-archive/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1/* /mnt/local-cache/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1/
+                fi
