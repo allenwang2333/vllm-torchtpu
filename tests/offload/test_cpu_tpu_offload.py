@@ -453,5 +453,226 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
         self.assertEqual(handler._pending[8], (fut, 2 * 64))
 
 
+class TestRaidenBatchWorker(unittest.TestCase):
+    """Unit tests for background batching/coalescing worker thread."""
+
+    def test_worker_coalescing(self):
+        import time
+
+        import numpy as np
+
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenBatchWorker
+
+        mgr = MagicMock()
+        mock_future = MagicMock()
+        mock_future.is_ready.return_value = False
+        mgr.h2d.return_value = mock_future
+
+        worker = _RaidenBatchWorker(mgr, tpu_to_cpu=False)
+        try:
+            worker.submit(job_id=1,
+                          src_ids=np.array([10, 11]),
+                          dst_ids=np.array([20, 21]),
+                          num_bytes=100)
+            worker.submit(job_id=2,
+                          src_ids=np.array([12, 13]),
+                          dst_ids=np.array([22, 23]),
+                          num_bytes=100)
+
+            self.assertEqual(mgr.h2d.call_count, 0)
+            worker.flush()
+
+            deadline = time.perf_counter() + 2.0
+            item = None
+            while time.perf_counter() < deadline:
+                if not worker.result_queue.empty():
+                    item = worker.result_queue.get()
+                    break
+                time.sleep(0.01)
+
+            self.assertIsNotNone(
+                item, "Worker timed out without returning a result")
+
+            mgr.h2d.assert_called_once()
+            call_args = mgr.h2d.call_args[0]
+            self.assertEqual(call_args[0], [10, 11, 12, 13])
+            self.assertEqual(call_args[1], [20, 21, 22, 23])
+            self.assertEqual(call_args[2], [1, 1, 1, 1])
+
+            fut, job_infos = item
+            self.assertEqual(fut, mock_future)
+            self.assertEqual(job_infos, [(1, 100), (2, 100)])
+        finally:
+            worker.shutdown()
+
+    def test_worker_empty_flush(self):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenBatchWorker
+
+        mgr = MagicMock()
+        worker = _RaidenBatchWorker(mgr, tpu_to_cpu=False)
+        try:
+            worker.flush()
+            import time
+            time.sleep(0.05)
+            self.assertEqual(mgr.h2d.call_count, 0)
+            self.assertEqual(mgr.d2h.call_count, 0)
+            self.assertTrue(worker.result_queue.empty())
+        finally:
+            worker.shutdown()
+
+    def test_worker_dma_failure(self):
+        import time
+
+        import numpy as np
+
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenBatchWorker
+
+        mgr = MagicMock()
+        mgr.h2d.side_effect = RuntimeError("DMA hardware failure")
+
+        worker = _RaidenBatchWorker(mgr, tpu_to_cpu=False)
+        try:
+            worker.submit(job_id=42,
+                          src_ids=np.array([1]),
+                          dst_ids=np.array([2]),
+                          num_bytes=64)
+            worker.flush()
+
+            deadline = time.perf_counter() + 2.0
+            item = None
+            while time.perf_counter() < deadline:
+                if not worker.result_queue.empty():
+                    item = worker.result_queue.get()
+                    break
+                time.sleep(0.01)
+
+            self.assertIsNotNone(item,
+                                 "Worker timed out without returning result")
+            err, job_infos = item
+            self.assertIsInstance(err, RuntimeError)
+            self.assertEqual(str(err), "DMA hardware failure")
+            self.assertEqual(job_infos, [(42, 64)])
+        finally:
+            worker.shutdown()
+
+
+class TestRaidenBatchedOffloadingHandler(unittest.TestCase):
+    """Unit tests for the batched offload handler lifecycle and flow control."""
+
+    def test_batched_handler_lifecycle(self):
+        import time
+
+        import numpy as np
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        from vllm_torchtpu.offload.cpu_tpu import \
+            _RaidenBatchedOffloadingHandler
+
+        mgr = MagicMock()
+        mock_future = MagicMock()
+        mock_future.is_ready.return_value = False
+        mock_future.ok.return_value = True
+        mgr.h2d.return_value = mock_future
+
+        with patch(
+                'vllm_torchtpu.offload.cpu_tpu._RaidenOffloadingHandler._expand_kernel_ids'
+        ) as mock_expand:
+            mock_expand.side_effect = lambda spec: (np.array(spec[
+                0].block_ids), np.array(spec[1].block_ids))
+
+            handler = _RaidenBatchedOffloadingHandler(
+                mgr,
+                tpu_to_cpu=False,
+                src_block_size_factor=1,
+                dst_block_size_factor=1,
+                bytes_per_kernel_block=64)
+            try:
+                spec1 = (CPULoadStoreSpec([10, 11]),
+                         GPULoadStoreSpec([20, 21],
+                                          group_sizes=[2],
+                                          block_indices=[0]))
+                spec2 = (CPULoadStoreSpec([12, 13]),
+                         GPULoadStoreSpec([22, 23],
+                                          group_sizes=[2],
+                                          block_indices=[0]))
+
+                handler.transfer_async(1, spec1)
+                handler.transfer_async(2, spec2)
+
+                self.assertEqual(len(handler.get_finished()), 0)
+                handler.flush()
+
+                deadline = time.perf_counter() + 2.0
+                while time.perf_counter() < deadline:
+                    if len(handler._active_batches
+                           ) > 0 or not handler._worker.result_queue.empty():
+                        break
+                    time.sleep(0.01)
+
+                mock_future.is_ready.return_value = False
+                results = handler.get_finished()
+                self.assertEqual(len(results), 0)
+
+                mock_future.is_ready.return_value = True
+                results = handler.get_finished()
+
+                self.assertEqual(len(results), 2)
+                self.assertTrue(results[0].success)
+                self.assertEqual(results[0].job_id, 1)
+                self.assertTrue(results[1].success)
+                self.assertEqual(results[1].job_id, 2)
+            finally:
+                handler.shutdown()
+
+    def test_batched_handler_dma_failure(self):
+        import time
+
+        import numpy as np
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+        from vllm_torchtpu.offload.cpu_tpu import \
+            _RaidenBatchedOffloadingHandler
+
+        mgr = MagicMock()
+        mgr.h2d.side_effect = RuntimeError("DMA submission failed")
+
+        with patch(
+                'vllm_torchtpu.offload.cpu_tpu._RaidenOffloadingHandler._expand_kernel_ids'
+        ) as mock_expand:
+            mock_expand.side_effect = lambda spec: (np.array(spec[
+                0].block_ids), np.array(spec[1].block_ids))
+
+            handler = _RaidenBatchedOffloadingHandler(
+                mgr,
+                tpu_to_cpu=False,
+                src_block_size_factor=1,
+                dst_block_size_factor=1,
+                bytes_per_kernel_block=64)
+            try:
+                spec = (CPULoadStoreSpec([10]),
+                        GPULoadStoreSpec([20],
+                                         group_sizes=[1],
+                                         block_indices=[0]))
+                handler.transfer_async(42, spec)
+                handler.flush()
+
+                # Wait for batch processing
+                deadline = time.perf_counter() + 2.0
+                while time.perf_counter() < deadline:
+                    if len(handler._active_batches
+                           ) > 0 or not handler._worker.result_queue.empty():
+                        break
+                    time.sleep(0.01)
+
+                results = handler.get_finished()
+                self.assertEqual(len(results), 1)
+                self.assertFalse(results[0].success)
+                self.assertEqual(results[0].job_id, 42)
+            finally:
+                handler.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

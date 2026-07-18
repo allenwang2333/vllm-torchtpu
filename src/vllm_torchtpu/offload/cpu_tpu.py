@@ -215,6 +215,21 @@ def _install_flush_pending_scatters_hook() -> None:
 if os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") != "1":
     _install_scheduler_scatter_now_hook()
     _install_flush_pending_scatters_hook()
+else:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
+        OffloadingConnectorWorker
+    _orig_start_kv_transfers = OffloadingConnectorWorker.start_kv_transfers
+
+    def _start_kv_transfers_raiden(
+            self, metadata) -> None:  # type: ignore[no-untyped-def]
+        _orig_start_kv_transfers(self, metadata)
+        if hasattr(self, "worker") and hasattr(self.worker,
+                                               "transfer_type_to_handler"):
+            for handler in self.worker.transfer_type_to_handler.values():
+                if hasattr(handler, "flush"):
+                    handler.flush()
+
+    OffloadingConnectorWorker.start_kv_transfers = _start_kv_transfers_raiden
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -917,6 +932,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 # buffer, no cpu_pool tensor, no scatter-now gate (the DMA writes kv_cache
 # directly; there is no scatter HLO to dispatch in lockstep).
 _USE_RAIDEN_OFFLOAD = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") == "1"
+_USE_RAIDEN_BATCHED = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN_BATCHED",
+                                     "0") == "1"
 # Upper bound on the raiden offload flush wait (seconds). Dedicated to the
 # offload path -- intentionally NOT the disagg p2p-pull timeout -- so it can be
 # tuned independently.
@@ -1054,6 +1071,205 @@ class _RaidenOffloadingHandler(OffloadingHandler):
 
 
 # ---------------------------------------------------------------------------
+# Background Raiden Coalesced Worker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RaidenOffloadJob:
+    """Represents a single D2H or H2D transfer request to be coalesced."""
+    job_id: int
+    src_ids: np.ndarray
+    dst_ids: np.ndarray
+    num_bytes: int
+
+
+# Sentinel object to signal a flush of the queue.
+# Using a singleton object() is a standard Python pattern for queue sentinels.
+_FLUSH_SENTINEL = "FLUSH"
+
+
+class _RaidenBatchWorker:
+    """Background worker that aggressively coalesces concurrent transfer jobs
+    into a single massive D2H/H2D physical array dispatch to minimize
+    host-side MapDmaBuffer overhead.
+    """
+
+    def __init__(self, mgr, tpu_to_cpu: bool):
+        self.mgr = mgr
+        self.tpu_to_cpu = tpu_to_cpu
+        self.job_queue = _queue.SimpleQueue()
+        self.result_queue = _queue.SimpleQueue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, job_id: int, src_ids: np.ndarray, dst_ids: np.ndarray,
+               num_bytes: int):
+        self.job_queue.put(
+            _RaidenOffloadJob(job_id, src_ids, dst_ids, num_bytes))
+
+    def flush(self):
+        self.job_queue.put(_FLUSH_SENTINEL)
+
+    def _run(self):
+        batch: list[_RaidenOffloadJob] = []
+        while True:
+            item = self.job_queue.get()
+
+            # None is the standard sentinel for thread shutdown
+            if item is None:
+                break
+
+            if item == _FLUSH_SENTINEL:
+                if not batch:
+                    continue
+
+                # Coalesce all accumulated jobs in the batch
+                job_infos = [(j.job_id, j.num_bytes) for j in batch]
+                src_ids = np.concatenate([j.src_ids for j in batch])
+                dst_ids = np.concatenate([j.dst_ids for j in batch])
+                sizes = [1] * len(dst_ids)
+
+                try:
+                    if self.tpu_to_cpu:
+                        fut = self.mgr.d2h(src_ids.tolist(), dst_ids.tolist(),
+                                           sizes)
+                    else:
+                        fut = self.mgr.h2d(src_ids.tolist(), dst_ids.tolist(),
+                                           sizes)
+                    self.result_queue.put((fut, job_infos))
+                except Exception as e:
+                    logger.exception("[kv-offload] Raiden batch worker failed")
+                    self.result_queue.put((e, job_infos))
+                batch.clear()
+            else:
+                batch.append(item)
+
+    def shutdown(self):
+        self.job_queue.put(None)
+
+
+class _RaidenBatchedOffloadingHandler(_RaidenOffloadingHandler):
+    """One-direction (D2H or H2D) KV offload via raiden's direct DMA with auto-batching.
+
+    `transfer_async` issues jobs to a background worker queue. The worker coalesces
+    multiple jobs into a single massive `mgr.D2h`/`mgr.H2d` call and returns a
+    single `RaidenFuture`; `get_finished` polls it.
+    """
+
+    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
+                 dst_block_size_factor: int, bytes_per_kernel_block: int):
+        super().__init__(mgr, tpu_to_cpu, src_block_size_factor,
+                         dst_block_size_factor, bytes_per_kernel_block)
+        self._worker = _RaidenBatchWorker(mgr, tpu_to_cpu)
+        self._active_batches: list[tuple] = []
+        self._pending_jobs: set[int] = set()
+
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        src_ids, dst_ids = self._expand_kernel_ids(transfer_spec)
+        n = len(dst_ids)
+        num_bytes = n * self._bytes_per_kernel_block
+
+        self._pending_jobs.add(job_id)
+        self._worker.submit(job_id, src_ids, dst_ids, num_bytes)
+        return True
+
+    def flush(self):
+        if self.tpu_to_cpu:
+            _tpu_sync(wait=True)
+        self._worker.flush()
+
+    def get_finished(self) -> list[TransferResult]:
+        while True:
+            try:
+                self._active_batches.append(
+                    self._worker.result_queue.get_nowait())
+            except _queue.Empty:
+                break
+
+        results: list[TransferResult] = []
+        incomplete_batches = []
+
+        for item in self._active_batches:
+            if isinstance(item[0], Exception):
+                err_obj, job_infos = item
+                for jid, n_bytes in job_infos:
+                    logger.error(
+                        "[kv-offload] Raiden batch transfer job=%s failed: %s",
+                        jid, err_obj)
+                    results.append(
+                        TransferResult(
+                            job_id=jid,
+                            success=False,
+                            transfer_size=n_bytes,
+                            transfer_time=1e-9,
+                            transfer_type=self.transfer_type,
+                        ))
+                    self._pending_jobs.discard(jid)
+                continue
+
+            fut, job_infos = item
+            if not fut.is_ready():
+                incomplete_batches.append(item)
+                continue
+
+            ok = fut.ok() if hasattr(fut, "ok") else True
+            if not ok:
+                err = (fut.error_message()
+                       if hasattr(fut, "error_message") else "")
+                logger.error("[kv-offload] Raiden batch transfer failed: %s",
+                             err)
+
+            for jid, n_bytes in job_infos:
+                results.append(
+                    TransferResult(
+                        job_id=jid,
+                        success=ok,
+                        transfer_size=n_bytes,
+                        transfer_time=1e-9,
+                        transfer_type=self.transfer_type,
+                    ))
+                self._pending_jobs.discard(jid)
+
+        self._active_batches = incomplete_batches
+        return results
+
+    def wait(self, job_ids: set[int]) -> None:
+        remaining = {jid for jid in job_ids if jid in self._pending_jobs}
+        deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
+
+        while remaining:
+            while not self._worker.result_queue.empty():
+                try:
+                    self._active_batches.append(
+                        self._worker.result_queue.get_nowait())
+                except _queue.Empty:
+                    break
+
+            for item in self._active_batches:
+                if isinstance(item[0], Exception):
+                    remaining -= {j[0] for j in item[1]}
+                else:
+                    fut, job_infos = item
+                    if fut.is_ready():
+                        remaining -= {j[0] for j in job_infos}
+
+            if not remaining:
+                break
+
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    "[kv-offload] Raiden wait timed out after %.1fs for jobs=%s",
+                    _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
+                    list(remaining)[:10])
+                return
+            time.sleep(0.0005)
+
+    def shutdown(self) -> None:
+        self._worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Factory: allocates CPU pinned tensors, creates bidirectional handlers
 # ---------------------------------------------------------------------------
 
@@ -1162,14 +1378,15 @@ class CpuTpuOffloadingHandlers:
             bytes_per_kernel_block = (
                 int(np.prod(per_block_shape)) *
                 torch.empty(0, dtype=kv_dtype).element_size())
-            self.gpu_to_cpu_handler = _RaidenOffloadingHandler(
+            handler_cls = _RaidenBatchedOffloadingHandler if _USE_RAIDEN_BATCHED else _RaidenOffloadingHandler
+            self.gpu_to_cpu_handler = handler_cls(
                 self._raiden_mgr,
                 tpu_to_cpu=True,
                 src_block_size_factor=gpu_block_size_factor,
                 dst_block_size_factor=cpu_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
             )
-            self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
+            self.cpu_to_gpu_handler = handler_cls(
                 self._raiden_mgr,
                 tpu_to_cpu=False,
                 src_block_size_factor=cpu_block_size_factor,
