@@ -96,6 +96,7 @@ class TestEstimateHbmReserveBytes(unittest.TestCase):
         cfg.model_config.get_num_kv_heads.return_value = num_kv_heads
         cfg.model_config.get_head_size.return_value = head_size
         cfg.model_config.dtype = "bfloat16"
+        cfg.model_config.is_hybrid = False
         cfg.cache_config.block_size = block_size
         cfg.cache_config.cache_dtype = "auto"  # resolved via model_dtype
         return cfg
@@ -179,21 +180,20 @@ class TestTransferDataclass(unittest.TestCase):
 
     def test_defaults(self):
         from vllm_torchtpu.offload.cpu_tpu import Transfer
-        t = Transfer(job_id=1, num_bytes=100, n=10, dma_done=None)
-        self.assertIsNone(t.host_buffer)
+        t = Transfer(job_id=1, num_bytes=100, dma_done=None)
         self.assertIsNone(t.device_buffer)
-        self.assertIsNone(t.dst_ids)
-        self.assertIsNone(t.src_ids)
+        self.assertIsNone(t.chunk_descs)
+        self.assertIsNone(t.current_scatters)
+        self.assertFalse(t.buffer_acquired)
         self.assertEqual(t.chunks_total, 0)
         self.assertEqual(t.chunks_done, 0)
-        self.assertIsNone(t.dst_ids_i32)
         self.assertIsNone(t.error)
 
     def test_error_capture_pattern(self):
         """The wrapper pattern in _h2d_task / _d2h_task sets t.error
         before re-raising so get_finished can report success=False."""
         from vllm_torchtpu.offload.cpu_tpu import Transfer
-        t = Transfer(job_id=1, num_bytes=100, n=10, dma_done=None)
+        t = Transfer(job_id=1, num_bytes=100, dma_done=None)
         try:
             try:
                 raise RuntimeError("simulated DMA failure")
@@ -208,17 +208,17 @@ class TestTransferDataclass(unittest.TestCase):
 
 
 class TestChunkingMath(unittest.TestCase):
-    """transfer_async H2D branch computes
-    `chunks_total = max(1, ceil(len(src_ids) / chunk_size))`. Exercise
-    boundary cases at the arithmetic level without spinning up a real
-    handler (which would need a TPU device for the staging buffer)."""
+    """transfer_async H2D branch emits `ceil(group_len / chunk_cap)`
+    chunks per non-empty KV-cache group. Exercise boundary cases at the
+    arithmetic level without spinning up a real handler (which would need
+    a TPU device for the staging buffer)."""
 
     @staticmethod
-    def _chunks(n_ids: int, chunk_size: int) -> int:
-        return max(1, (n_ids + chunk_size - 1) // chunk_size)
+    def _chunks(n_ids: int, chunk_cap: int) -> int:
+        return len(range(0, n_ids, chunk_cap)) if n_ids else 0
 
     def test_single_chunk_when_fits(self):
-        for n in (0, 1, 100, 2047, 2048):
+        for n in (1, 100, 2047, 2048):
             self.assertEqual(self._chunks(n, 2048), 1, f"n={n}")
 
     def test_multi_chunk_when_oversized(self):
@@ -257,14 +257,19 @@ class TestMultiChunkH2D(unittest.TestCase):
         import threading
         from collections import deque
 
+        import vllm_torchtpu.offload.cpu_tpu as cpu_tpu
         from vllm_torchtpu.offload.cpu_tpu import \
             SingleDirectionOffloadingHandler
+
+        sync_patch = patch.object(cpu_tpu, "_tpu_sync", lambda *a, **k: None)
+        sync_patch.start()
+        self.addCleanup(sync_patch.stop)
 
         h = SingleDirectionOffloadingHandler.__new__(
             SingleDirectionOffloadingHandler)
         h.tpu_to_cpu = False
-        h.src_tensors = []
-        h.dst_tensors = []
+        h.src_tensors = [MagicMock()]
+        h.dst_tensors = [MagicMock()]
         h._transfer_map = {}
         h._transfers = deque()
         h._req_id_by_job_id = {}
@@ -273,7 +278,6 @@ class TestMultiChunkH2D(unittest.TestCase):
         h._pending_scatters = []
         h._dma_worker = MagicMock()
         h.transfer_type = ("CPU", "GPU")
-        h.total_block_size_in_bytes = 1
         # Record chunks the handler dispatches.
         h._dispatched_chunks: list[int] = []
 
@@ -282,9 +286,10 @@ class TestMultiChunkH2D(unittest.TestCase):
             ev = threading.Event()
             ev.set()
             t.dma_done = ev
-            t.device_buffer = [MagicMock()]
-            t.dst_ids_i32 = MagicMock()
-            t.dst_ids_i32.to = lambda dtype: MagicMock()
+            dst_ids = MagicMock()
+            dst_ids.to = lambda dtype: MagicMock()
+            t.current_scatters = [(part.tensor_idxs, dst_ids, [MagicMock()])
+                                  for part in t.chunk_descs[t.chunks_done]]
 
         h._start_h2d_dma = fake_start
         return h
@@ -292,15 +297,20 @@ class TestMultiChunkH2D(unittest.TestCase):
     def _build_chunked_transfer(self, n_ids: int, req_id: str = "req-A"):
         import numpy as np
 
-        from vllm_torchtpu.offload.cpu_tpu import Transfer
+        from vllm_torchtpu.offload.cpu_tpu import Transfer, _H2DPart
+        chunk_descs = [[
+            _H2DPart(
+                tensor_idxs=[0],
+                src_ids=np.arange(s, min(s + 2, n_ids), dtype=np.int64),
+                dst_ids=np.arange(s, min(s + 2, n_ids), dtype=np.int64),
+            )
+        ] for s in range(0, n_ids, 2)]
         return Transfer(
             job_id=1,
             num_bytes=0,
-            n=n_ids,
             dma_done=None,
-            src_ids=np.arange(n_ids, dtype=np.int64),
-            dst_ids=np.arange(n_ids, dtype=np.int64),
-            chunks_total=4,  # 4 chunks of 2 ids each
+            chunk_descs=chunk_descs,
+            chunks_total=len(chunk_descs),
             chunks_done=0,
             req_id=req_id,
         )
@@ -339,6 +349,282 @@ class TestMultiChunkH2D(unittest.TestCase):
             "Intermediate chunks were not eligible for flush despite the "
             "owning req_id correctly being absent from `scatter_now_req_ids` "
             "(the request is still in WAITING_FOR_REMOTE_KVS).")
+
+
+class TestBuildTpuCanonicalKvCaches(unittest.TestCase):
+    """build_tpu_canonical_kv_caches turns per-layer private arrays
+    (attention: one tensor; mamba: one tensor per state) into int8
+    (num_blocks, row_bytes) canonical tensors with per-group refs."""
+
+    @staticmethod
+    def _make_kv_cache_config(num_blocks, groups):
+        cfg = MagicMock()
+        cfg.num_blocks = num_blocks
+        group_mocks = []
+        for layer_names in groups:
+            g = MagicMock()
+            g.layer_names = layer_names
+            group_mocks.append(g)
+        cfg.kv_cache_groups = group_mocks
+        return cfg
+
+    def test_hybrid_grouping_and_row_bytes(self):
+        from vllm_torchtpu.offload.cpu_tpu import build_tpu_canonical_kv_caches
+        num_blocks = 4
+        # 1 attention group (2 layers) + 1 mamba group (2 layers x 2 states).
+        kv_caches = {
+            "attn.0":
+            torch.zeros((num_blocks, 8, 2, 4), dtype=torch.bfloat16),
+            "attn.1":
+            torch.zeros((num_blocks, 8, 2, 4), dtype=torch.bfloat16),
+            "mamba.0": [
+                torch.zeros((num_blocks, 16, 3), dtype=torch.bfloat16),
+                torch.zeros((num_blocks, 2, 8, 8), dtype=torch.float32),
+            ],
+            "mamba.1": [
+                torch.zeros((num_blocks, 16, 3), dtype=torch.bfloat16),
+                torch.zeros((num_blocks, 2, 8, 8), dtype=torch.float32),
+            ],
+        }
+        cfg = self._make_kv_cache_config(
+            num_blocks, [["attn.0", "attn.1"], ["mamba.0", "mamba.1"]])
+        canonical = build_tpu_canonical_kv_caches(cfg, kv_caches)
+
+        self.assertEqual(len(canonical.tensors), 6)  # 2 attn + 2x2 states
+        self.assertEqual(len(canonical.group_data_refs), 2)
+        attn_row = 8 * 2 * 4 * 2  # bf16
+        conv_row = 16 * 3 * 2  # bf16
+        ssm_row = 2 * 8 * 8 * 4  # fp32
+        self.assertEqual(
+            [t.page_size_bytes for t in canonical.tensors],
+            [attn_row, attn_row, conv_row, ssm_row, conv_row, ssm_row])
+        for t in canonical.tensors:
+            self.assertEqual(t.tensor.dtype, torch.int8)
+            self.assertEqual(tuple(t.tensor.shape),
+                             (num_blocks, t.page_size_bytes))
+        self.assertEqual([r.tensor_idx for r in canonical.group_data_refs[0]],
+                         [0, 1])
+        self.assertEqual([r.tensor_idx for r in canonical.group_data_refs[1]],
+                         [2, 3, 4, 5])
+
+    def test_rejects_shared_storage_view(self):
+        from vllm_torchtpu.offload.cpu_tpu import build_tpu_canonical_kv_caches
+        raw = torch.zeros(1024, dtype=torch.int8)
+        view = raw.view(torch.bfloat16)[16:].view(4, -1)
+        cfg = self._make_kv_cache_config(4, [["attn.0"]])
+        with self.assertRaisesRegex(NotImplementedError, "shared storage"):
+            build_tpu_canonical_kv_caches(cfg, {"attn.0": view})
+
+    def test_rejects_compact_mamba_layout(self):
+        from vllm_torchtpu.offload.cpu_tpu import build_tpu_canonical_kv_caches
+        cfg = self._make_kv_cache_config(4, [["mamba.0"]])
+        # 3 slots against num_blocks=4: nbytes not divisible by num_blocks.
+        state = torch.zeros((3, 5), dtype=torch.int8)
+        with self.assertRaisesRegex(NotImplementedError, "Compact-mamba"):
+            build_tpu_canonical_kv_caches(cfg, {"mamba.0": [state]})
+
+
+class TestGroupAwareRoundtrip(unittest.TestCase):
+    """CPU-only store→clobber→reload roundtrip through both handlers with
+    two KV-cache groups, driving the real transfer_async / get_finished /
+    flush_pending_scatters machinery (device tensors simulated on CPU,
+    `_tpu_sync` stubbed)."""
+
+    NUM_BLOCKS = 16
+    NUM_CPU_BLOCKS = 8
+
+    def _make_handlers(self):
+        import vllm_torchtpu.offload.cpu_tpu as cpu_tpu
+
+        # Group 0: two "attention" tensors; group 1: one "state" tensor.
+        torch.manual_seed(0)
+        device_tensors = [
+            torch.randint(-128, 127, (self.NUM_BLOCKS, 32), dtype=torch.int8)
+            for _ in range(2)
+        ] + [
+            torch.randint(-128, 127, (self.NUM_BLOCKS, 48), dtype=torch.int8)
+        ]
+        cpu_tensors = [
+            torch.zeros((self.NUM_CPU_BLOCKS, t.shape[1]), dtype=torch.int8)
+            for t in device_tensors
+        ]
+        group_tensor_idxs = [[0, 1], [2]]
+
+        sync_patch = patch.object(cpu_tpu, "_tpu_sync", lambda *a, **k: None)
+        sync_patch.start()
+        self.addCleanup(sync_patch.stop)
+
+        d2h = cpu_tpu.SingleDirectionOffloadingHandler(
+            src_tensors=device_tensors,
+            dst_tensors=cpu_tensors,
+            group_tensor_idxs=group_tensor_idxs,
+            tpu_to_cpu=True,
+        )
+        h2d = cpu_tpu.SingleDirectionOffloadingHandler(
+            src_tensors=cpu_tensors,
+            dst_tensors=device_tensors,
+            group_tensor_idxs=group_tensor_idxs,
+            tpu_to_cpu=False,
+        )
+        self.addCleanup(d2h.shutdown)
+        self.addCleanup(h2d.shutdown)
+        return device_tensors, cpu_tensors, d2h, h2d
+
+    @staticmethod
+    def _specs(gpu_ids, cpu_ids, group_sizes, block_indices):
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+        gpu_spec = GPULoadStoreSpec(gpu_ids,
+                                    group_sizes=group_sizes,
+                                    block_indices=block_indices)
+        cpu_spec = CPULoadStoreSpec(cpu_ids)
+        return gpu_spec, cpu_spec
+
+    def _drain(self, handler, job_id, max_iters=20, flush_req_ids=None):
+        """Run the get_finished / flush cycle until job_id completes."""
+        if flush_req_ids is None:
+            flush_req_ids = {"req-A"}
+        for _ in range(max_iters):
+            results = handler.get_finished()
+            if not handler.tpu_to_cpu:
+                handler.flush_pending_scatters(flush_req_ids)
+            for r in results:
+                if r.job_id == job_id:
+                    return r
+            import time
+            time.sleep(0.01)
+        self.fail(f"job {job_id} did not complete")
+
+    def test_two_group_store_reload_preserves_rows(self):
+        device_tensors, cpu_tensors, d2h, h2d = self._make_handlers()
+
+        # Store: group 0 gpu blocks [3, 7] -> cpu [0, 1];
+        #        group 1 gpu block [5]     -> cpu [2].
+        gpu_ids = [3, 7, 5]
+        cpu_ids = [0, 1, 2]
+        gpu_spec, cpu_spec = self._specs(gpu_ids,
+                                         cpu_ids,
+                                         group_sizes=[2, 1],
+                                         block_indices=[0, 0])
+        originals = [t.clone() for t in device_tensors]
+        self.assertTrue(d2h.transfer_async(1, (gpu_spec, cpu_spec)))
+        r = self._drain(d2h, 1)
+        self.assertTrue(r.success)
+
+        # Group-0 rows land in tensors 0/1 only; group-1 row in tensor 2.
+        for i in (0, 1):
+            torch.testing.assert_close(cpu_tensors[i][0], originals[i][3])
+            torch.testing.assert_close(cpu_tensors[i][1], originals[i][7])
+        torch.testing.assert_close(cpu_tensors[2][2], originals[2][5])
+
+        # Clobber the stored device rows, then reload into fresh slots:
+        # group 0 cpu [0, 1] -> gpu [10, 12]; group 1 cpu [2] -> gpu [9].
+        for i in (0, 1):
+            device_tensors[i][3] = -1
+            device_tensors[i][7] = -1
+        device_tensors[2][5] = -1
+
+        h2d._req_id_by_job_id[2] = "req-A"
+        gpu_spec, cpu_spec = self._specs([10, 12, 9], [0, 1, 2],
+                                         group_sizes=[2, 1],
+                                         block_indices=[0, 0])
+        self.assertTrue(h2d.transfer_async(2, (cpu_spec, gpu_spec)))
+        r = self._drain(h2d, 2)
+        self.assertTrue(r.success)
+
+        for i in (0, 1):
+            torch.testing.assert_close(device_tensors[i][10], originals[i][3])
+            torch.testing.assert_close(device_tensors[i][12], originals[i][7])
+        torch.testing.assert_close(device_tensors[2][9], originals[2][5])
+        # Untouched rows keep their original contents.
+        torch.testing.assert_close(device_tensors[2][10], originals[2][10])
+
+    def test_concurrent_multichunk_loads_complete(self):
+        """Two multi-chunk loads in flight at once must both complete:
+        the depth-1 staging buffer interleaves their chunks, so
+        get_finished must register completed chunks anywhere in the
+        queue, not just at its head."""
+        with patch.dict(os.environ, {"KV_H2D_POOL_MAX_BLOCKS": "2"}):
+            device_tensors, cpu_tensors, d2h, h2d = self._make_handlers()
+
+        # Seed the cpu pool: group-0 rows 0-4 and group-1 row 5.
+        originals = [t.clone() for t in device_tensors]
+        gpu_spec, cpu_spec = self._specs([0, 1, 2, 3, 4, 5],
+                                         [0, 1, 2, 3, 4, 5],
+                                         group_sizes=[5, 1],
+                                         block_indices=[0, 0])
+        self.assertTrue(d2h.transfer_async(1, (gpu_spec, cpu_spec)))
+        self._drain(d2h, 1)
+
+        # Two loads, each 5 group-0 blocks (3 chunks at cap 2) + 1
+        # group-1 block, into disjoint fresh slots.
+        h2d._req_id_by_job_id[2] = "req-A"
+        spec_a = self._specs([8, 9, 10, 11, 12, 13], [0, 1, 2, 3, 4, 5],
+                             group_sizes=[5, 1],
+                             block_indices=[0, 0])
+        h2d._req_id_by_job_id[3] = "req-B"
+        spec_b = self._specs([14, 15, 8, 9, 10, 11], [0, 1, 2, 3, 4, 5],
+                             group_sizes=[5, 1],
+                             block_indices=[0, 0])
+        self.assertTrue(h2d.transfer_async(2, (spec_a[1], spec_a[0])))
+        self.assertTrue(h2d.transfer_async(3, (spec_b[1], spec_b[0])))
+
+        import time
+        done: set[int] = set()
+        for _ in range(100):
+            for r in h2d.get_finished():
+                self.assertTrue(r.success)
+                done.add(r.job_id)
+            h2d.flush_pending_scatters({"req-A", "req-B"})
+            if done == {2, 3}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(
+            done, {2, 3}, f"stuck: {len(h2d._transfers)} transfers queued, "
+            f"{len(h2d._pending_scatters)} pending scatters")
+        # Job 3 wrote group-1 cpu row 5 into device slot 11 last.
+        torch.testing.assert_close(device_tensors[2][11], originals[2][5])
+        torch.testing.assert_close(device_tensors[0][14], originals[0][0])
+
+    def test_aborted_request_releases_staging_buffer(self):
+        """A gated last-chunk scatter of an aborted request must be
+        dropped and the staging buffer released, or every later load
+        wedges on buffer_free.wait()."""
+        device_tensors, cpu_tensors, d2h, h2d = self._make_handlers()
+        gpu_spec, cpu_spec = self._specs([4], [3],
+                                         group_sizes=[1, 0],
+                                         block_indices=[0, 0])
+        self.assertTrue(d2h.transfer_async(1, (gpu_spec, cpu_spec)))
+        self._drain(d2h, 1)
+
+        h2d._req_id_by_job_id[2] = "req-dead"
+        gpu_spec, cpu_spec = self._specs([10], [3],
+                                         group_sizes=[1, 0],
+                                         block_indices=[0, 0])
+        self.assertTrue(h2d.transfer_async(2, (cpu_spec, gpu_spec)))
+        r = self._drain(h2d, 2, flush_req_ids=set())
+        self.assertTrue(r.success)
+        # DMA done, scatter still gated; the buffer is held.
+        self.assertEqual(len(h2d._pending_scatters), 1)
+        self.assertFalse(h2d._h2d_buffer_free.is_set())
+
+        h2d.drop_pending_scatters_for({"req-dead"})
+        self.assertEqual(h2d._pending_scatters, [])
+        self.assertTrue(h2d._h2d_buffer_free.is_set())
+
+    def test_empty_group_is_skipped(self):
+        device_tensors, cpu_tensors, d2h, _ = self._make_handlers()
+        originals = [t.clone() for t in device_tensors]
+        gpu_spec, cpu_spec = self._specs([4], [3],
+                                         group_sizes=[1, 0],
+                                         block_indices=[0, 0])
+        self.assertTrue(d2h.transfer_async(3, (gpu_spec, cpu_spec)))
+        r = self._drain(d2h, 3)
+        self.assertTrue(r.success)
+        torch.testing.assert_close(cpu_tensors[0][3], originals[0][4])
+        torch.testing.assert_close(cpu_tensors[1][3], originals[1][4])
+        # Group 1's tensor never written.
+        self.assertTrue(bool((cpu_tensors[2] == 0).all()))
 
 
 class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
@@ -391,66 +677,99 @@ class TestEstimateKvConnectorHbmReserve(unittest.TestCase):
         self.assertEqual(worker._estimate_kv_connector_hbm_reserve(), 0)
 
 
-class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
-    """`_RaidenOffloadingHandler.transfer_async` must call the raiden
-    wheel's public KVCacheManager wrapper methods, which are lowercase
-    `d2h`/`h2d` — the capitalized `D2h`/`H2d` spellings only exist on the
-    private `_impl` object and die with AttributeError on the wrapper."""
+class TestPadMambaStateForDma(unittest.TestCase):
+    """TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA padding of 2-D mamba states."""
 
-    def _make_handler(self, tpu_to_cpu: bool):
-        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+    def _pad(self, shape, enabled=True):
+        from vllm_torchtpu.kv_cache_materializer import \
+            _maybe_pad_mamba_state_shape
+        env = {
+            "TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA": "1" if enabled else "0",
+            "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK": "1",
+        }
+        with patch.dict(os.environ, env):
+            return _maybe_pad_mamba_state_shape(shape)
 
-        # spec-limited: any call other than d2h/h2d (e.g. the legacy D2h)
-        # raises AttributeError, pinning the public wrapper API.
-        mgr = MagicMock(spec=["d2h", "h2d"])
-        handler = _RaidenOffloadingHandler(mgr,
-                                           tpu_to_cpu=tpu_to_cpu,
-                                           src_block_size_factor=1,
-                                           dst_block_size_factor=1,
-                                           bytes_per_kernel_block=64)
-        return handler, mgr
+    def test_conv_state_rounds_to_multiple_of_4(self):
+        self.assertEqual(self._pad((3, 2048)), (4, 2048))
+        self.assertEqual(self._pad((5, 2048)), (8, 2048))
+
+    def test_aligned_and_non_2d_shapes_unchanged(self):
+        self.assertEqual(self._pad((4, 2048)), (4, 2048))
+        self.assertEqual(self._pad((8, 128, 128)), (8, 128, 128))
+
+    def test_disabled_returns_original(self):
+        self.assertEqual(self._pad((3, 2048), enabled=False), (3, 2048))
 
     @staticmethod
-    def _spec(block_ids):
-        from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
+    def _bare_handler(tpu_to_cpu):
+        import threading
 
-        class _TestSpec(BlockIDsLoadStoreSpec):
+        from vllm_torchtpu.offload.cpu_tpu import _RaidenOffloadingHandler
+        h = _RaidenOffloadingHandler.__new__(_RaidenOffloadingHandler)
+        h.tpu_to_cpu = tpu_to_cpu
+        h._queued_transfers = []
+        h._queue_lock = threading.Lock()
+        h._sidecar = None
+        h._pending = {}
+        return h
 
-            @staticmethod
-            def medium() -> str:
-                return "TEST"
+    def test_deferred_store_dispatch_gates_on_completed_step(self):
+        h = self._bare_handler(tpu_to_cpu=True)
+        mgr = MagicMock()
+        mgr.d2h.return_value = "fut"
+        futures: list = []
+        entry = [futures, 0, False, False]
+        h._queued_transfers.append(
+            (5, 1, None, [(mgr, [0], [0], [1])], futures, entry, False))
 
-        return _TestSpec(block_ids)
-
-    def test_d2h_store_uses_lowercase_wrapper_method(self):
-        handler, mgr = self._make_handler(tpu_to_cpu=True)
-        fut = MagicMock()
-        mgr.d2h.return_value = fut
-
-        with patch("vllm_torchtpu.offload.cpu_tpu._tpu_sync") as sync:
-            self.assertTrue(
-                handler.transfer_async(
-                    7, (self._spec([3, 5]), self._spec([1, 2]))))
-
-        # The store must barrier on the forward step's in-place KV write
-        # before raiden reads the device blocks.
-        sync.assert_called_once_with(wait=True)
-        mgr.d2h.assert_called_once_with([3, 5], [1, 2], [1, 1])
-        mgr.h2d.assert_not_called()
-        self.assertEqual(handler._pending[7], (fut, 2 * 64))
-
-    def test_h2d_load_uses_lowercase_wrapper_method(self):
-        handler, mgr = self._make_handler(tpu_to_cpu=False)
-        fut = MagicMock()
-        mgr.h2d.return_value = fut
-
-        self.assertTrue(
-            handler.transfer_async(8,
-                                   (self._spec([1, 2]), self._spec([3, 5]))))
-
-        mgr.h2d.assert_called_once_with([1, 2], [3, 5], [1, 1])
+        h.dispatch_queued_stores(4)
+        self.assertFalse(entry[3])
         mgr.d2h.assert_not_called()
-        self.assertEqual(handler._pending[8], (fut, 2 * 64))
+
+        h.dispatch_queued_stores(5)
+        self.assertTrue(entry[3])
+        mgr.d2h.assert_called_once_with([0], [0], [1])
+        self.assertEqual(futures, ["fut"])
+        self.assertEqual(h._queued_transfers, [])
+
+    def test_deferred_restore_dispatch_gates_and_uses_h2d(self):
+        h = self._bare_handler(tpu_to_cpu=False)
+        mgr = MagicMock()
+        mgr.h2d.return_value = "fut"
+        futures: list = []
+        entry = [futures, 0, False, False]
+        h._queued_transfers.append(
+            (3, 7, None, [(mgr, [8], [2], [1])], futures, entry, False))
+
+        h.dispatch_queued_stores(2)
+        self.assertFalse(entry[3])
+        mgr.h2d.assert_not_called()
+        mgr.d2h.assert_not_called()
+
+        h.dispatch_queued_stores(3)
+        self.assertTrue(entry[3])
+        mgr.h2d.assert_called_once_with([2], [8], [1])
+        mgr.d2h.assert_not_called()
+        self.assertEqual(futures, ["fut"])
+
+    def test_jax_split_and_repad_roundtrip(self):
+        import jax.numpy as jnp
+
+        from vllm_torchtpu.layers.common.gdn_attention import (
+            _repad_conv_state, _split_conv_state_pad)
+        kernel_size = 4
+        padded = jnp.arange(2 * 4 * 8, dtype=jnp.float32).reshape(2, 4, 8)
+        real, pad = _split_conv_state_pad(padded, kernel_size)
+        self.assertEqual(pad, 1)
+        self.assertEqual(real.shape, (2, 3, 8))
+        out = _repad_conv_state(real, pad)
+        self.assertEqual(out.shape, (2, 4, 8))
+        self.assertTrue(bool((out[:, 3, :] == 0).all()))
+        # Unpadded storage passes through untouched.
+        real2, pad2 = _split_conv_state_pad(real, kernel_size)
+        self.assertEqual(pad2, 0)
+        self.assertIs(_repad_conv_state(real2, pad2), real2)
 
 
 if __name__ == "__main__":

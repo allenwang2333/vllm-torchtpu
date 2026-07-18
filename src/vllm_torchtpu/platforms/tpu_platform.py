@@ -949,7 +949,15 @@ class TpuPlatform(Platform):
                     and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
-            if kv_transfer_config.kv_connector == "TPUConnectorV2":
+            if (kv_transfer_config.kv_connector == "TPUConnectorV2" or
+                (kv_transfer_config.kv_connector == "OffloadingConnector"
+                 and is_hybrid)):
+                # Both connectors report external computed tokens with
+                # load_kv_async, which vLLM's mamba-align scheduler path
+                # otherwise rejects (OffloadingConnector loads are always
+                # async: offloading/scheduler.py get_num_new_matched_tokens
+                # returns (N, bool(N))). Attention-only models never take
+                # the mamba-align path, so they keep the stock scheduler.
                 _patch_scheduler_mamba_external_kv()
 
     @classmethod

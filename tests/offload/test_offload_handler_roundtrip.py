@@ -55,8 +55,12 @@ def test_offload_store_reload_roundtrip_preserves_block_data():
     host_slots = [0, 1]  # destination host-pool slots
     reload_dst_blocks = [10, 12]  # fresh GPU slots to reload into
 
-    d2h = SingleDirectionOffloadingHandler([kv], [cpu_pool], 1, 1)
-    h2d = SingleDirectionOffloadingHandler([cpu_pool], [kv], 1, 1)
+    d2h = SingleDirectionOffloadingHandler([kv], [cpu_pool],
+                                           group_tensor_idxs=[[0]],
+                                           tpu_to_cpu=True)
+    h2d = SingleDirectionOffloadingHandler([cpu_pool], [kv],
+                                           group_tensor_idxs=[[0]],
+                                           tpu_to_cpu=False)
     try:
         # --- STORE: gather GPU blocks -> host pool (D2H) ---
         assert d2h.transfer_async(1, (GPULoadStoreSpec(

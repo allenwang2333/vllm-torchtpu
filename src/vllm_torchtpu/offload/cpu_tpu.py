@@ -21,6 +21,18 @@ in-place indexing.
 
 Architecture
 ------------
+- TPU allocates one private dense array per attention layer and one per
+  mamba/GDN state tensor (see `kv_cache_materializer`, alias fallback), so
+  a module-level hook replaces `OffloadingConnectorWorker.
+  register_kv_caches` with a TPU canonicalization: every array becomes its
+  own int8 `(num_blocks, row_bytes)` `CanonicalKVCacheTensor`, and each
+  KV-cache group's `CanonicalKVCacheRef`s point at that group's arrays.
+- Transfers are KV-cache-group aware: block ids arrive ordered by group
+  (`GPULoadStoreSpec.group_sizes`), and each group's rows are copied
+  between only that group's device arrays and cpu-pool tensors. For hybrid
+  models (e.g. Qwen3.5) this moves both attention KV and mamba/GDN state
+  pages, matching the scheduler-side `OffloadingConnectorScheduler`
+  contract that treats mamba groups as window-1 sliding-window groups.
 - `TPUCPUOffloadingSpec` subclasses `vllm.v1.kv_offload.cpu.spec.
   CPUOffloadingSpec`; it overrides `get_handlers()` and exposes
   `estimate_hbm_reserve_bytes(vllm_config) -> int` so the worker can
@@ -82,10 +94,13 @@ Environment knobs (all optional)
 """
 from __future__ import annotations
 
+import functools
+import math
 import os
 import queue as _queue
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -95,8 +110,10 @@ import torch
 from torch_tpu._internal.sync import synchronize as _tpu_sync
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec, CanonicalKVCaches,
-                                     GPULoadStoreSpec, LoadStoreSpec)
+from vllm.v1.kv_offload.base import (BlockIDsLoadStoreSpec,
+                                     CanonicalKVCacheRef, CanonicalKVCaches,
+                                     CanonicalKVCacheTensor, GPULoadStoreSpec,
+                                     LoadStoreSpec)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.worker.worker import (OffloadingHandler,
@@ -139,21 +156,48 @@ def _install_scheduler_scatter_now_hook() -> None:
     orig = OffloadingConnectorScheduler.build_connector_meta
     if getattr(orig, "_tpu_scatter_now_patched", False):
         return
+    orig_update = OffloadingConnectorScheduler.update_connector_output
+
+    def update_connector_output_with_recving(
+            self, connector_output):  # type: ignore[no-untyped-def]
+        # finished_recving reaches the scheduler only after the
+        # KVOutputAggregator merged it from ALL ranks, so it is an
+        # all-ranks-synced signal in its own right. Remember the req_ids
+        # so the next step's metadata releases their deferred scatters.
+        finished_recving = getattr(connector_output, "finished_recving", None)
+        if finished_recving:
+            pending = getattr(self, "_tpu_scatter_now_pending", None)
+            if pending is None:
+                pending = set()
+                self._tpu_scatter_now_pending = pending
+            pending.update(finished_recving)
+        return orig_update(self, connector_output)
 
     def build_connector_meta_with_scatter_now(
             self, scheduler_output):  # type: ignore[no-untyped-def]
         meta = orig(self, scheduler_output)
-        # Active-batch req_ids: a req enters the batch only after the
-        # aggregator released finished_recving from ALL ranks (or it
-        # didn't need a KV load at all). Either way, a req_id in this
-        # set is safe to scatter on every rank in lockstep.
-        meta.scatter_now_req_ids = set(
-            scheduler_output.num_scheduled_tokens.keys())
+        # Release scatters for req_ids in this step's scheduled batch,
+        # plus req_ids whose finished_recving the scheduler has consumed.
+        # The latter matters under block starvation: a restored request
+        # may not win scheduling capacity for many steps (or ever, if
+        # every block is held by other requests stuck behind the same
+        # staging buffer) — gating its scatter on being scheduled
+        # deadlocks the whole H2D pipeline. Both signals are aggregator-
+        # synced, so every rank dispatches the same scatters at the same
+        # step boundary.
+        scatter_now = set(scheduler_output.num_scheduled_tokens.keys())
+        pending = getattr(self, "_tpu_scatter_now_pending", None)
+        if pending:
+            scatter_now |= pending
+            pending.clear()
+        meta.scatter_now_req_ids = scatter_now
         return meta
 
     build_connector_meta_with_scatter_now._tpu_scatter_now_patched = True  # type: ignore[attr-defined]
     OffloadingConnectorScheduler.build_connector_meta = (
         build_connector_meta_with_scatter_now)
+    OffloadingConnectorScheduler.update_connector_output = (
+        update_connector_output_with_recving)
 
 
 def _install_flush_pending_scatters_hook() -> None:
@@ -166,6 +210,14 @@ def _install_flush_pending_scatters_hook() -> None:
 
     def start_kv_transfers_with_flush(
             self, metadata):  # type: ignore[no-untyped-def]
+        # Step 0: block until stores whose source blocks the scheduler is
+        # about to hand to new writers have finished reading them. Upstream
+        # runs this fence in handle_preemptions, which the TPU runner never
+        # calls; it matters here because raiden stores read the live KV
+        # arrays asynchronously after dispatch.
+        if getattr(metadata, "jobs_to_flush", None):
+            self.worker.wait(metadata.jobs_to_flush)
+
         # Step 1: drain deferred scatter, filtered by scheduler signal.
         # All ranks reach this point from the same `execute_model`
         # broadcast, so the scatter HLOs land on libtpu in lockstep.
@@ -205,6 +257,334 @@ def _install_flush_pending_scatters_hook() -> None:
         start_kv_transfers_with_flush)
 
 
+def _install_drop_aborted_scatters_hook() -> None:
+    """Wrap `OffloadingConnectorWorker.get_finished` so handlers discard
+    deferred scatters of finished/aborted requests.
+
+    A request aborted while WAITING_FOR_REMOTE_KVS never enters the
+    scheduled batch, so its gated scatter would hold the depth-1 staging
+    buffer forever and wedge every later H2D load.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
+        OffloadingConnectorWorker
+
+    orig = OffloadingConnectorWorker.get_finished
+    if getattr(orig, "_tpu_drop_aborted_patched", False):
+        return
+
+    def get_finished_with_drop(
+            self, finished_req_ids):  # type: ignore[no-untyped-def]
+        if finished_req_ids:
+            for handler in self.worker.handlers:
+                if hasattr(handler, "drop_pending_scatters_for"):
+                    handler.drop_pending_scatters_for(finished_req_ids)
+        return orig(self, finished_req_ids)
+
+    get_finished_with_drop._tpu_drop_aborted_patched = True  # type: ignore[attr-defined]
+    OffloadingConnectorWorker.get_finished = get_finished_with_drop
+
+
+def tpu_per_rank_block_row_bytes(kv_cache_config: KVCacheConfig) -> int:
+    """Bytes one block row occupies across all TPU per-layer arrays.
+
+    TPU materializes hybrid KV as private per-layer (per-state) arrays, so
+    a block costs every attention layer's physical page plus every
+    mamba/GDN layer's unpadded state page — more than vLLM's KVCacheTensor
+    accounting, which assumes layers share pages.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+    from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+
+    total = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        num_layers = len(group.layer_names)
+        if isinstance(spec, AttentionSpec):
+            page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype)
+        elif isinstance(spec, MambaSpec):
+            from vllm.utils.torch_utils import get_dtype_size
+
+            from vllm_torchtpu.kv_cache_materializer import \
+                _maybe_pad_mamba_state_shape
+
+            # Physical per-block state bytes: the materializer may pad a
+            # state's leading dim for DMA row addressability, so size from
+            # the padded shapes rather than the spec's logical page.
+            page = sum(
+                math.prod(_maybe_pad_mamba_state_shape(shape)) *
+                get_dtype_size(dtype)
+                for shape, dtype in zip(spec.shapes, spec.dtypes))
+        else:
+            raise NotImplementedError(
+                f"Unsupported KV cache spec for TPU offloading: {spec!r}")
+        total += num_layers * page
+    return total
+
+
+# Leading (major) dim of each source KV array, keyed by storage data_ptr.
+# Attention arrays are materialized at kernel-block granularity (shape[0] =
+# num_blocks x scheduler_block/kernel_block); the raiden path needs that
+# granularity to register buffers, while the canonical views stay at
+# scheduler-block granularity. Populated during canonicalization.
+_SOURCE_MAJOR_DIM_BY_STORAGE: dict[int, int] = {}
+
+
+def build_tpu_canonical_kv_caches(
+    kv_cache_config: KVCacheConfig,
+    kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+) -> CanonicalKVCaches:
+    """Canonicalize TPU per-layer KV-cache arrays for the offload handlers.
+
+    TPU cannot overlay differently-typed layers on shared bytes, so each
+    attention layer owns a private dense array and each mamba/GDN layer owns
+    one private dense array per state tensor (`kv_cache_materializer`, alias
+    fallback). Each array is viewed as int8 `(num_blocks, row_bytes)` and
+    becomes its own `CanonicalKVCacheTensor`; rows are copied whole, so
+    `page_size_bytes` equals the physical row size (no padding).
+    """
+    num_blocks = kv_cache_config.num_blocks
+    tensors: list[CanonicalKVCacheTensor] = []
+    tensor_idx_by_storage: dict[int, int] = {}
+    _SOURCE_MAJOR_DIM_BY_STORAGE.clear()
+    group_data_refs: list[list[CanonicalKVCacheRef]] = []
+    for group in kv_cache_config.kv_cache_groups:
+        group_refs: list[CanonicalKVCacheRef] = []
+        for layer_name in group.layer_names:
+            layer_cache = kv_caches[layer_name]
+            is_mamba_states = not isinstance(layer_cache, torch.Tensor)
+            arrays = list(layer_cache) if is_mamba_states else [layer_cache]
+            for arr in arrays:
+                storage = arr.untyped_storage()
+                if arr.storage_offset() != 0 or storage.size() != arr.nbytes:
+                    raise NotImplementedError(
+                        f"KV cache for layer {layer_name} is a view into "
+                        "shared storage; TPU offloading requires private "
+                        "per-layer arrays "
+                        "(TPU_VLLM_KV_CACHE_ALIAS_FALLBACK=1).")
+                # Mamba state arrays must have exactly one slot per block;
+                # attention arrays may be at kernel-block granularity (a
+                # whole number of rows per scheduler block).
+                if ((is_mamba_states and arr.shape[0] != num_blocks)
+                        or arr.shape[0] % num_blocks != 0
+                        or arr.nbytes % num_blocks != 0):
+                    raise NotImplementedError(
+                        f"KV cache for layer {layer_name} has "
+                        f"{arr.shape[0]} slots / {arr.nbytes} bytes, "
+                        f"incompatible with num_blocks={num_blocks}. "
+                        "Compact-mamba sizing shrinks mamba arrays below "
+                        "num_blocks slots; TPU offloading requires the "
+                        "uniform layout (pin --num-gpu-blocks-override).")
+                # KV-sharing layers alias another layer's storage; reuse
+                # its canonical tensor so shared bytes move exactly once.
+                existing = tensor_idx_by_storage.get(storage.data_ptr())
+                if existing is not None:
+                    group_refs.append(
+                        CanonicalKVCacheRef(
+                            tensor_idx=existing,
+                            page_size_bytes=tensors[existing].page_size_bytes))
+                    continue
+                row_bytes = arr.nbytes // num_blocks
+                int8_view = (torch.tensor(
+                    [], dtype=torch.int8,
+                    device=arr.device).set_(storage).view(
+                        num_blocks, row_bytes))
+                tensors.append(
+                    CanonicalKVCacheTensor(tensor=int8_view,
+                                           page_size_bytes=row_bytes))
+                tensor_idx_by_storage[storage.data_ptr()] = len(tensors) - 1
+                _SOURCE_MAJOR_DIM_BY_STORAGE[storage.data_ptr()] = int(
+                    arr.shape[0])
+                group_refs.append(
+                    CanonicalKVCacheRef(tensor_idx=len(tensors) - 1,
+                                        page_size_bytes=row_bytes))
+        group_data_refs.append(group_refs)
+    return CanonicalKVCaches(tensors=tensors, group_data_refs=group_data_refs)
+
+
+def _install_register_kv_caches_hook() -> None:
+    """Replace upstream `register_kv_caches` with TPU canonicalization.
+
+    The upstream implementation views each layer's storage as
+    `(num_blocks, page_size_padded)` and asserts that layers sharing a
+    `KVCacheTensor` share one physical allocation. Neither holds on TPU:
+    layers get private per-layer (per-state) arrays whose rows are the
+    unpadded physical page, so the padded view overflows the storage and
+    the shared-storage asserts fail.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import \
+        OffloadingConnectorWorker
+
+    orig = OffloadingConnectorWorker.register_kv_caches
+    if getattr(orig, "_tpu_register_patched", False):
+        return
+
+    def register_kv_caches_tpu(self,
+                               kv_caches):  # type: ignore[no-untyped-def]
+        if not isinstance(self.spec, TPUCPUOffloadingSpec):
+            return orig(self, kv_caches)
+        canonical = build_tpu_canonical_kv_caches(self.spec.kv_cache_config,
+                                                  kv_caches)
+        self._register_handlers(canonical)
+
+    register_kv_caches_tpu._tpu_register_patched = True  # type: ignore[attr-defined]
+    OffloadingConnectorWorker.register_kv_caches = register_kv_caches_tpu
+
+
+# Raiden D2H store handlers whose queued dispatches the completion hook
+# below drains as engine steps complete on device.
+_deferred_store_handlers: weakref.WeakSet = weakref.WeakSet()
+
+# monotonic timestamp of the last engine step seen by the dispatch hook;
+# read by the hang-dump watchdog.
+_last_step_ts = [0.0]
+_hang_dump_started = False
+
+# Engine-step bookkeeping for store dispatch. `_current_step` stamps store
+# jobs as they are queued (a job's source rows were written by strictly
+# earlier steps); `_last_completed_step` is the newest step whose
+# sampled-token copy has resolved on the host — TensorCore programs
+# execute serially, so at that moment every device write through that
+# step has finished. Written by the runner main thread and the async
+# output-resolution thread; reads/writes are single-value and guarded by
+# _dispatch_lock where ordering matters.
+_current_step = [0]
+_last_completed_step = [-1]
+_dispatch_lock = threading.Lock()
+
+
+def _dispatch_deferred_stores() -> None:
+    """Dispatch eligible queued transfers. Runner main thread only —
+    raiden managers are also driven from get_finished/wait on that
+    thread, and concurrent calls into one manager are not known to be
+    safe."""
+    _last_step_ts[0] = time.monotonic()
+    for handler in list(_deferred_store_handlers):
+        handler.dispatch_queued_stores(_last_completed_step[0])
+
+
+def _record_step_completed(step: int) -> None:
+    with _dispatch_lock:
+        if step > _last_completed_step[0]:
+            _last_completed_step[0] = step
+
+
+def _start_hang_dump_watchdog() -> None:
+    """Dump all thread stacks to stderr when the engine stops stepping.
+
+    Gated by KV_OFFLOAD_HANG_DUMP_S (seconds of step silence before a
+    dump; 0 disables). A worker wedged inside a step is otherwise
+    invisible: the engine's RPC timeout kills the server minutes later
+    with no worker-side stack trace.
+    """
+    global _hang_dump_started
+    interval_s = float(os.environ.get("KV_OFFLOAD_HANG_DUMP_S", "0"))
+    if interval_s <= 0 or _hang_dump_started:
+        return
+    _hang_dump_started = True
+    import faulthandler
+
+    def _watch() -> None:
+        while True:
+            time.sleep(interval_s / 2)
+            last = _last_step_ts[0]
+            if last and time.monotonic() - last > interval_s:
+                logger.warning(
+                    "[kv-offload] no engine step for %.0fs; dumping all "
+                    "thread stacks",
+                    time.monotonic() - last)
+                faulthandler.dump_traceback(all_threads=True)
+                _last_step_ts[0] = time.monotonic()
+
+    threading.Thread(target=_watch, name="kv-offload-hang-dump",
+                     daemon=True).start()
+
+
+def _install_store_dispatch_hook() -> None:
+    """Dispatch queued raiden D2H stores as their source writes complete.
+
+    Raiden's d2h reads device HBM directly, outside the lazy graph, so a
+    store must not start until every enqueued program that writes the
+    source rows has finished. There is no ordering primitive that can
+    express this without referencing the KV arrays themselves — and any
+    program materialized against a KV array races the per-step buffer
+    donation swap (`Buffer has been deleted or donated`). Instead, each
+    queued transfer is stamped with an engine step and becomes eligible
+    once that step's sampled-token copy resolves on the host
+    (`AsyncTPUCopyState.wait`): TensorCore programs execute serially, so
+    the resolved copy means every device program through that step has
+    finished. The copy may resolve on the worker's async-output thread;
+    that hook only RECORDS the completed step — dispatch itself always
+    runs on the runner main thread (end of `sample_tokens`,
+    `kv_connector_no_forward` steps, and the jobs_to_flush wait loop),
+    because raiden managers are also driven from get_finished/wait there
+    and concurrent calls into one manager are not known to be safe.
+
+    The stored rows stay pinned by the offloading scheduler until the
+    job's futures complete, so later steps cannot overwrite them while
+    the DMA reads.
+    """
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+    if getattr(TPUModelRunner.sample_tokens, "_tpu_store_dispatch_patched",
+               False):
+        return
+
+    orig_sample_tokens = TPUModelRunner.sample_tokens
+    orig_no_forward = TPUModelRunner.kv_connector_no_forward
+    orig_from_chunks = AsyncTPUCopyState.from_device_chunks.__func__
+    orig_wait = AsyncTPUCopyState.wait
+
+    @functools.wraps(orig_sample_tokens)
+    def sample_tokens_with_step_counter(self, *args, **kwargs):
+        try:
+            return orig_sample_tokens(self, *args, **kwargs)
+        finally:
+            _current_step[0] += 1
+            # Non-async scheduling resolved THIS step's copy inline;
+            # async resolved the previous step's (in _modify_prev_results
+            # or on the output thread, which only records). Either way
+            # the newest recorded completion is dispatchable now, on the
+            # main thread.
+            _dispatch_deferred_stores()
+
+    @functools.wraps(orig_no_forward)
+    def no_forward_with_store_dispatch(self, *args, **kwargs):
+        _dispatch_deferred_stores()
+        output = orig_no_forward(self, *args, **kwargs)
+        # A no-forward step can itself queue stores (its connector
+        # metadata carries store jobs); dispatch any whose stamped step
+        # has already completed. Later-stamped jobs drain when the
+        # in-flight step's copy resolves.
+        _dispatch_deferred_stores()
+        return output
+
+    @classmethod
+    @functools.wraps(orig_from_chunks)
+    def from_chunks_with_step(cls, *args, **kwargs):
+        state = orig_from_chunks(cls, *args, **kwargs)
+        state._kv_offload_step = _current_step[0]  # noqa: SLF001
+        return state
+
+    @functools.wraps(orig_wait)
+    def wait_with_store_dispatch(self):
+        was_completed = self.completed
+        orig_wait(self)
+        step = getattr(self, "_kv_offload_step", None)
+        if not was_completed and step is not None:
+            # Record only: this may run on the worker's async-output
+            # thread, and raiden calls must stay on the runner main
+            # thread (the next step's dispatch picks it up).
+            _record_step_completed(step)
+
+    sample_tokens_with_step_counter._tpu_store_dispatch_patched = True  # type: ignore[attr-defined]
+    TPUModelRunner.sample_tokens = sample_tokens_with_step_counter
+    TPUModelRunner.kv_connector_no_forward = no_forward_with_store_dispatch
+    AsyncTPUCopyState.from_device_chunks = from_chunks_with_step
+    AsyncTPUCopyState.wait = wait_with_store_dispatch
+
+
 # These hooks reshape the OffloadingConnector's store/load dispatch into the
 # torch handler's deferred-scatter + lockstep flow (flush_pending_scatters,
 # _unsubmitted_store_jobs). The raiden handler does direct D2h/H2d + poll-based
@@ -212,12 +592,24 @@ def _install_flush_pending_scatters_hook() -> None:
 # installing these would replace start_kv_transfers with a flow it doesn't
 # participate in -- leaving the scheduler's store-completion/block-free gate
 # unsatisfied and the engine busy-spinning. Only install for the torch path.
-if os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") != "1":
-    _install_scheduler_scatter_now_hook()
-    _install_flush_pending_scatters_hook()
+# The raiden path needs these hooks too: non-row-addressable tensors (GDN
+# conv state) ride the host-staged sidecar, whose deferred scatters use the
+# scatter-now gate. The patched start_kv_transfers is a superset of the
+# stock dispatch, so pure-raiden transfers behave identically under it.
+_install_scheduler_scatter_now_hook()
+_install_flush_pending_scatters_hook()
+_install_drop_aborted_scatters_hook()
+# The registration hook only canonicalizes tensor views; it applies to both
+# the torch and raiden paths.
+_install_register_kv_caches_hook()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Maximum D2H stores whose gather buffers may be in flight (queued or
+# draining) at once; transfer_async blocks when saturated. Each in-flight
+# store holds one gathered copy of its blocks in HBM.
+_D2H_MAX_INFLIGHT = int(os.environ.get("KV_D2H_MAX_INFLIGHT", "4"))
 
 
 def _pad_to_power_of_2(ids: np.ndarray) -> tuple[np.ndarray, int]:
@@ -239,39 +631,6 @@ def _pad_to_power_of_2(ids: np.ndarray) -> tuple[np.ndarray, int]:
     padded[:n] = ids
     padded[n:] = ids[n - 1]
     return padded, n
-
-
-def expand_block_ids(
-    block_ids: np.ndarray,
-    block_size_factor: int,
-    output: np.ndarray,
-    skip_count: int = 0,
-):
-    """
-    Convert a list of block IDs to a list of matching block ids,
-    assuming each block is composed of actual block_size_factor blocks.
-    Outputs to output tensor.
-    The first skip_count blocks will be skipped.
-    Note that skip_count must be less than block_size_factor.
-
-    For example, if block_ids = [0, 1, 3] and block_size_factor =  4,
-    then it yields [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]
-    since 0 maps to [0, 1, 2, 3]
-    1 maps to [4, 5, 6, 7]
-    and 3 maps to [12, 13, 14, 15]
-    """
-    assert skip_count < block_size_factor
-
-    first_range = np.arange(skip_count, block_size_factor)
-    full_range = np.arange(0, block_size_factor)
-
-    output_idx = 0
-    for i, block_id in enumerate(block_ids):
-        base_block_id = block_id * block_size_factor
-        indices = first_range if i == 0 else full_range
-        output_end_idx = output_idx + len(indices)
-        output[output_idx:output_end_idx] = base_block_id + indices
-        output_idx = output_end_idx
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +672,11 @@ class _DmaWorker:
                 logger.exception("[kv-offload] DMA worker task failed")
             finally:
                 done.set()
+                # Unbind the task's closure and buffers before blocking on
+                # the next get(); otherwise the completed task's staging
+                # buffers stay reachable through these locals for as long
+                # as the queue is idle.
+                del item, fn, args, done
 
     def shutdown(self) -> None:
         self._queue.put(None)
@@ -327,7 +691,6 @@ class _DmaWorker:
 class Transfer:
     job_id: int
     num_bytes: int
-    n: int
     # threading.Event set by _DmaWorker when the DMA task returns. Because
     # the task ends with `_tpu_sync(wait=True)` (D2H) or a blocking
     # `d.copy_(h)` (H2D), dma_done.is_set() implies the DMA is physically
@@ -337,36 +700,30 @@ class Transfer:
     # never overwritten while the previous transfer's scatter is still
     # reading it.
     dma_done: threading.Event | None
-    # Pinned CPU staging used as the DMA endpoint in BOTH directions.
-    # D2H: filled by the worker's blocking copy_; main-thread scatter into
-    #      cpu_pool happens after dma_done.is_set() flips True.
-    # H2D: filled by main-thread index_select(cpu_pool, padded_src_ids);
-    #      consumed by the worker's H2D copy_ into device_buffer.
-    host_buffer: list | None = None
-    # H2D: device staging (slice of the single _h2d_device_buffer) that
-    # holds the freshly DMA'd blocks until the Pallas scatter copies them
-    # into kv_cache. D2H: holds the Pallas gather output until the worker's
-    # D2H copy_ drains it; kept alive so XLA's gather IR isn't dropped early.
-    # For H2D, set lazily by `_start_h2d_dma` (None at register time).
+    # D2H: the device gather output, kept alive until the worker's D2H
+    # copy_ drains it so XLA's gather IR isn't dropped early. Unused by
+    # H2D (staging views live in `current_scatters`).
     device_buffer: list | None = None
-    # D2H: numpy int64 cpu_pool scatter indices, length n.
-    # H2D: numpy int64 KV-cache scatter indices (full, unpadded). Sliced
-    # per-chunk by `_start_h2d_dma`.
-    dst_ids: np.ndarray | None = None
-    # H2D: numpy int64 host pool gather indices (full, unpadded). Sliced
-    # per-chunk by `_start_h2d_dma`.
-    src_ids: np.ndarray | None = None
-    # H2D: total number of chunks the transfer is split into. = 1 for
-    # transfers that fit the single device buffer; > 1 for oversized loads
-    # that are streamed through the buffer one chunk per get_finished()
-    # round-trip. Set at transfer_async time, never mutated thereafter.
+    # H2D: per-chunk work units; each chunk is a list of `_H2DPart` (at
+    # most one per KV-cache group, each capped at the staging buffer's
+    # max_padded rows) whose parts share one buffer acquisition and one
+    # deferred scatter. Chunks stream through the depth-1 device buffer
+    # one per get_finished() round-trip.
+    chunk_descs: list | None = None
+    # H2D: total number of chunks the transfer is split into. Set at
+    # transfer_async time, never mutated thereafter.
     chunks_total: int = 0
     # H2D: number of chunks already dispatched-and-scattered. Incremented
-    # in get_finished() after each chunk's Pallas scatter syncs.
+    # in get_finished() after each chunk's DMA completes.
     chunks_done: int = 0
-    # H2D: current chunk's padded dst_ids on device, used by get_finished()
-    # for the Pallas scatter. Rebuilt for each chunk in `_start_h2d_dma`.
-    dst_ids_i32: object | None = None
+    # H2D: current chunk's scatter list — per part (tensor_idxs,
+    # dst_ids_i32 device tensor, staging views). Rebuilt for each chunk
+    # in `_start_h2d_dma`.
+    current_scatters: list | None = None
+    # H2D: set by the worker task once it has taken `_h2d_buffer_free`;
+    # the error path in get_finished() releases the buffer only when the
+    # failed task actually held it.
+    buffer_acquired: bool = False
     # Set by the DMA worker task if it raises. get_finished() reads this to
     # report success=False.
     error: BaseException | None = None
@@ -383,14 +740,24 @@ class _PendingScatter:
     """A chunk whose H2D completed; scatter HLO awaits the next
     broadcast-synchronized `start_kv_transfers` for dispatch.
 
-    Snapshotting device_buffer + dst_ids_i32 here lets the underlying
-    Transfer be re-submitted for its next chunk (which overwrites
-    Transfer.device_buffer) before this snapshot is consumed.
+    Snapshotting the chunk's scatter list here lets the underlying
+    Transfer be re-submitted for its next chunk (which overwrites the
+    Transfer's per-chunk fields) before this snapshot is consumed.
     """
     transfer: Transfer
-    device_buffer: list
-    dst_ids_i32: object  # torch.Tensor (lazy import)
+    # Per part: (tensor_idxs, dst_ids_i32 device tensor, staging views).
+    scatters: list[tuple[list[int], object, list]]
     is_last_chunk: bool
+
+
+@dataclass
+class _H2DPart:
+    """One KV-cache group's share of an H2D chunk: rows gathered at
+    `src_ids` in the cpu pool and scattered to `dst_ids` in the device KV
+    cache, touching only `tensor_idxs`."""
+    tensor_idxs: list[int]
+    src_ids: np.ndarray
+    dst_ids: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -399,32 +766,46 @@ class _PendingScatter:
 
 
 class SingleDirectionOffloadingHandler(OffloadingHandler):
-    """Handles KV-cache transfers for one direction (D2H or H2D) on TPU."""
+    """Handles KV-cache transfers for one direction (D2H or H2D) on TPU.
+
+    Operates on canonical int8 `(num_blocks, row_bytes)` views — one per
+    physical KV-cache array (attention KV or mamba/GDN state). Block ids
+    arrive ordered by KV-cache group (`GPULoadStoreSpec.group_sizes`);
+    each group's rows are gathered from / scattered to only that group's
+    tensors, so hybrid models transfer every group's bytes.
+    """
 
     def __init__(
         self,
         src_tensors: list[torch.Tensor],
         dst_tensors: list[torch.Tensor],
-        src_block_size_factor: int,
-        dst_block_size_factor: int,
+        group_tensor_idxs: list[list[int]],
+        tpu_to_cpu: bool,
     ):
+        """
+        Args:
+          src_tensors / dst_tensors: per-canonical-tensor int8 2D views,
+              index-aligned across the two lists. One side is the device
+              KV cache, the other the CPU pool; rows correspond 1:1
+              (offloaded block size == gpu block size).
+          group_tensor_idxs: per KV-cache group, the canonical tensor
+              indices holding that group's layers' data.
+          tpu_to_cpu: True for the D2H (store) direction, False for H2D
+              (load).
+        """
         assert len(src_tensors) == len(dst_tensors)
+        for s, d in zip(src_tensors, dst_tensors):
+            assert s.ndim == 2 and d.ndim == 2
+            assert s.shape[1] == d.shape[1]
 
         self.src_tensors = src_tensors
         self.dst_tensors = dst_tensors
-
-        min_factor = min(src_block_size_factor, dst_block_size_factor)
-        assert src_block_size_factor % min_factor == 0
-        assert dst_block_size_factor % min_factor == 0
-        self.src_block_size_factor = src_block_size_factor // min_factor
-        self.dst_block_size_factor = dst_block_size_factor // min_factor
-
-        self.block_size_in_bytes = [
-            t.element_size() * t.stride(0) * min_factor for t in src_tensors
+        self.group_tensor_idxs = group_tensor_idxs
+        self.row_bytes = [
+            int(t.shape[1] * t.element_size()) for t in src_tensors
         ]
-        self.total_block_size_in_bytes = sum(self.block_size_in_bytes)
 
-        self.tpu_to_cpu: bool = src_tensors[0].device.type != "cpu"
+        self.tpu_to_cpu: bool = tpu_to_cpu
         self.transfer_type = ("GPU", "CPU") if self.tpu_to_cpu else ("CPU",
                                                                      "GPU")
         self._device: torch.device = (src_tensors[0].device if self.tpu_to_cpu
@@ -451,6 +832,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         worker_name = ("kv-offload-d2h-worker"
                        if self.tpu_to_cpu else "kv-offload-h2d-worker")
         self._dma_worker = _DmaWorker(name=worker_name)
+
+        # D2H store flow control (see transfer_async). H2D loads are
+        # already bounded by the depth-1 staging buffer.
+        if self.tpu_to_cpu:
+            self._d2h_inflight = threading.Semaphore(_D2H_MAX_INFLIGHT)
 
         # H2D device-staging buffer. Single pre-allocated buffer at the max
         # padded shape; each H2D transfer takes a view [:n_padded].
@@ -511,7 +897,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         device buffer being free, and DMA the chunk into device_buffer.
 
         Submission is eager (called from transfer_async and from
-        get_finished for the next chunk of an oversized transfer). The
+        get_finished for the next chunk of a multi-chunk transfer). The
         worker queue serializes execution; the `_h2d_buffer_free` Event
         gates the actual DMA enqueue so libtpu sees:
             scatter(prev) → H2D(this)
@@ -519,64 +905,69 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         `device_buffer` then serializes them on-device — no host-side
         `_tpu_sync` is needed and the main thread never blocks.
 
-        For oversized transfers (chunks_total > 1), dispatches just the
-        chunk indexed by `t.chunks_done`. get_finished() re-submits so
-        the worker picks up the next chunk.
+        Dispatches just the chunk indexed by `t.chunks_done` — one part
+        per KV-cache group, all sharing a single buffer acquisition and a
+        single deferred scatter. get_finished() re-submits so the worker
+        picks up the next chunk.
         """
-        chunk_size = self._h2d_max_padded
-        start = t.chunks_done * chunk_size
-        end = min(start + chunk_size, len(t.src_ids))
-        src_chunk = t.src_ids[start:end]
-        dst_chunk = t.dst_ids[start:end]
+        chunk: list[_H2DPart] = t.chunk_descs[t.chunks_done]
 
-        # Per-chunk padding: non-last chunks already match a power-of-2
-        # (chunk_size is rounded to one); only the last chunk of an
-        # oversized transfer may need padding.
-        src_chunk_padded, _ = _pad_to_power_of_2(src_chunk)
-        dst_chunk_padded, _ = _pad_to_power_of_2(dst_chunk)
-        n_chunk_padded = len(src_chunk_padded)
+        scatters: list[tuple[list[int], object, list]] = []
+        gather_specs: list[tuple[list, list, np.ndarray]] = []
+        for part in chunk:
+            src_padded, _ = _pad_to_power_of_2(part.src_ids)
+            dst_padded, _ = _pad_to_power_of_2(part.dst_ids)
+            n_padded = len(src_padded)
+            dst_ids_i32 = (torch.from_numpy(dst_padded.astype(np.int32)).to(
+                torch.int32).to(self._device))
+            views = [
+                self._h2d_device_buffer[i][:n_padded] for i in part.tensor_idxs
+            ]
+            pools = [self.src_tensors[i] for i in part.tensor_idxs]
+            scatters.append((part.tensor_idxs, dst_ids_i32, views))
+            gather_specs.append((pools, views, src_padded))
 
-        t.dst_ids_i32 = (torch.from_numpy(dst_chunk_padded.astype(
-            np.int32)).to(torch.int32).to(self._device))
-
-        device_buffer = [
-            full[:n_chunk_padded] for full in self._h2d_device_buffer
-        ]
-        src_tensors = self.src_tensors  # cpu_pool, captured for the closure
+        t.current_scatters = scatters
+        t.buffer_acquired = False
         buffer_free = self._h2d_buffer_free  # captured for the closure
 
-        def _h2d_task(devs: list, src_tensors: list, src_ids_padded):
+        def _h2d_task(specs: list):
             try:
-                src_ids_torch = torch.from_numpy(src_ids_padded).to(
-                    torch.int64)
-                n_padded = len(src_ids_padded)
-                # Host-side gather first. Safe at any time — it touches only
-                # cpu_pool (read-only here) and a freshly allocated host
-                # buffer; no shared TPU state.
-                hosts = []
-                for cpu_pool in src_tensors:
-                    h = torch.empty(
-                        (n_padded, ) + cpu_pool.shape[1:],
-                        dtype=cpu_pool.dtype,
-                    )
-                    torch.index_select(cpu_pool, 0, src_ids_torch, out=h)
-                    hosts.append(h)
+                # Host-side gathers first. Safe at any time — they touch
+                # only cpu_pool (read-only here) and freshly allocated host
+                # buffers; no shared TPU state.
+                staged = []
+                for pools, views, src_ids_padded in specs:
+                    src_ids_torch = torch.from_numpy(
+                        src_ids_padded.astype(np.int64))
+                    n_padded = len(src_ids_padded)
+                    hosts = []
+                    for cpu_pool in pools:
+                        h = torch.empty(
+                            (n_padded, ) + cpu_pool.shape[1:],
+                            dtype=cpu_pool.dtype,
+                        )
+                        torch.index_select(cpu_pool, 0, src_ids_torch, out=h)
+                        hosts.append(h)
+                    staged.append((views, hosts))
                 # Gate on the device buffer being free. Blocks the WORKER
                 # thread, never the main thread. Main `set()`s after
                 # enqueuing the scatter HLO for the prior transfer, which
                 # guarantees: prev scatter is on libtpu's command stream
-                # before this H2D's copy_ enqueue lands on it.
+                # before this H2D's copy_ enqueue lands on it. Parts touch
+                # disjoint staging tensors, so one acquisition covers the
+                # whole chunk.
                 buffer_free.wait()
                 buffer_free.clear()
-                for d, h in zip(devs, hosts):
-                    d.copy_(h)
+                t.buffer_acquired = True
+                for views, hosts in staged:
+                    for d, h in zip(views, hosts):
+                        d.copy_(h)
             except BaseException as e:
                 t.error = e
                 raise
 
-        t.device_buffer = device_buffer
-        t.dma_done = self._dma_worker.submit(_h2d_task, device_buffer,
-                                             src_tensors, src_chunk_padded)
+        t.dma_done = self._dma_worker.submit(_h2d_task, gather_specs)
 
     @property
     def prewarm_shapes(self) -> list[int]:
@@ -587,119 +978,172 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     # -- OffloadingHandler interface -----------------------------------------
 
+    def _split_by_group(
+        self,
+        gpu_spec: GPULoadStoreSpec,
+        cpu_spec: BlockIDsLoadStoreSpec,
+    ) -> list[tuple[list[int], np.ndarray, np.ndarray]]:
+        """Split a transfer's flat id lists into per-group segments.
+
+        Both id lists are ordered by KV-cache group; `group_sizes` gives
+        each group's length. With offloaded block size == gpu block size,
+        the cpu ids map 1:1 onto the gpu ids, so both lists share the
+        group boundaries. Returns (tensor_idxs, gpu_ids, cpu_ids) per
+        non-empty group.
+        """
+        gpu_ids = gpu_spec.block_ids
+        cpu_ids = cpu_spec.block_ids
+        assert gpu_ids.ndim == 1 and cpu_ids.ndim == 1
+        group_sizes = gpu_spec.group_sizes
+        assert len(group_sizes) == len(self.group_tensor_idxs)
+        assert sum(group_sizes) == len(gpu_ids)
+        assert len(cpu_ids) == len(gpu_ids)
+
+        segments = []
+        offset = 0
+        for tensor_idxs, size in zip(self.group_tensor_idxs, group_sizes):
+            # A group with no tensors in this handler's subset still
+            # advances the id offset — its blocks are carried by another
+            # handler (composite raiden + host-staged sidecar split).
+            if size and tensor_idxs:
+                segments.append((tensor_idxs, gpu_ids[offset:offset + size],
+                                 cpu_ids[offset:offset + size]))
+            offset += size
+        return segments
+
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+        gpu_spec = src_spec if self.tpu_to_cpu else dst_spec
+        cpu_spec = dst_spec if self.tpu_to_cpu else src_spec
+        assert isinstance(gpu_spec, GPULoadStoreSpec)
+        segments = self._split_by_group(gpu_spec, cpu_spec)
+        assert segments, "transfer with no blocks in any KV-cache group"
 
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        src_sub_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-        src_skip = -dst_blocks.size % self.src_block_size_factor
-        assert dst_sub_count == src_sub_count - src_skip
-
-        src_expanded = np.empty(src_sub_count, dtype=np.int64)
-        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-        expand_block_ids(
-            src_blocks,
-            self.src_block_size_factor,
-            src_expanded,
-            skip_count=src_skip,
-        )
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
-        src_ids = src_expanded[src_skip:]
-        dst_ids = dst_expanded
-        n = len(dst_ids)
+        n = sum(len(seg[1]) for seg in segments)
+        num_bytes = sum(
+            len(gpu_ids) * sum(self.row_bytes[i] for i in tensor_idxs)
+            for tensor_idxs, gpu_ids, _ in segments)
 
         if self.tpu_to_cpu:
-            # ── D2H: Pallas gather (main) → lazy copy_ + sync (worker thread)
-            #         → main-thread scatter into cpu_pool in get_finished()
-            #         once dma_done.is_set(). ──
-            padded_src_ids, _ = _pad_to_power_of_2(src_ids)
-            src_ids_i32 = (torch.from_numpy(padded_src_ids.astype(
-                np.int32)).to(torch.int32).to(self._device))
+            # ── D2H: per-group device row-gather (main) → lazy copy_ + sync
+            #         (worker thread) → host scatter into that group's
+            #         cpu_pool tensors, all inside the worker task. ──
+            #
+            # Backpressure: each queued store holds its gather output in
+            # HBM until the worker drains it. Under eviction storms the
+            # store rate outruns the DMA engine, so cap the number of
+            # in-flight stores; when saturated, block here until one
+            # drains. All ranks execute the same store schedule, so the
+            # stall is symmetric across ranks — local flow control, not a
+            # cross-rank rendezvous.
+            if not self._d2h_inflight.acquire(blocking=False):
+                logger.info_once(
+                    "[kv-offload] D2H store backpressure engaged "
+                    "(KV_D2H_MAX_INFLIGHT=%d); generation throttles to the "
+                    "D2H drain rate under eviction bursts.", _D2H_MAX_INFLIGHT)
+                self._d2h_inflight.acquire()
 
-            # (1) Compute stream (main thread): Pallas gather + flush IR.
-            # Stays on the main thread because moving it would force XLA
-            # to coordinate kv_l (live KV cache) reads across threads.
-            src_ids_i64 = src_ids_i32.to(torch.int64)
-            device_buffer = [kv_l[src_ids_i64] for kv_l in self.src_tensors]
-            _tpu_sync(device_buffer, wait=False)
+            seg_work = []
+            all_device_buffers = []
+            for tensor_idxs, gpu_ids, cpu_ids in segments:
+                padded_ids, _ = _pad_to_power_of_2(gpu_ids)
+                ids_i32 = (torch.from_numpy(padded_ids.astype(np.int32)).to(
+                    torch.int32).to(self._device))
 
-            # (2) Unpinned host staging matching the gathered device shape.
-            # The lazy D2H copy_ below stages through libtpu's premap pool
-            # (TPU_PREMAPPED_BUFFER_SIZE), so the dst doesn't need to be
-            # pinned ourselves — saves the per-call pin-allocation cost.
-            host_buffer = [
-                torch.empty(db.shape, dtype=db.dtype) for db in device_buffer
-            ]
+                # Compute stream (main thread): device gather. Stays on
+                # the main thread because moving it would force XLA to
+                # coordinate kv_l (live KV cache) reads across threads.
+                ids_i64 = ids_i32.to(torch.int64)
+                device_buffer = [
+                    self.src_tensors[i][ids_i64] for i in tensor_idxs
+                ]
+                all_device_buffers.extend(device_buffer)
+                # Per-group IR flush: each gather program is keyed by
+                # (group tensors, padded n) — a population bounded by
+                # num_groups x the power-of-2 ladder. One flush across all
+                # groups would key one program per COMBINATION of
+                # per-group sizes, and that unbounded program-cache churn
+                # exhausts the on-device program arena under store bursts.
+                _tpu_sync(device_buffer, wait=False)
 
-            # (3) Submit the actual DMA work to the per-direction worker.
-            # The task does device -> host copy AND the cpu_pool host
-            # scatter. dma_done is signaled only after both are complete.
-            cpu_pool_tensors = self.dst_tensors
-            dst_ids_for_scatter = dst_ids[:n]
-            n_for_scatter = n
+                # Unpinned host staging matching the gathered device
+                # shape. The lazy D2H copy_ below stages through libtpu's
+                # premap pool (TPU_PREMAPPED_BUFFER_SIZE), so the dst
+                # doesn't need to be pinned ourselves — saves the per-call
+                # pin-allocation cost.
+                host_buffer = [
+                    torch.empty(db.shape, dtype=db.dtype)
+                    for db in device_buffer
+                ]
+                seg_work.append(
+                    (tensor_idxs, device_buffer, host_buffer, cpu_ids,
+                     len(gpu_ids)))
 
             # Build the Transfer first so the worker task closure can stash
             # any exception on it; success=False is then reported from
             # get_finished() instead of silently masking a failed DMA.
             t = Transfer(
                 job_id=job_id,
-                num_bytes=n * self.total_block_size_in_bytes,
-                n=n,
+                num_bytes=num_bytes,
                 dma_done=None,
-                host_buffer=host_buffer,
-                device_buffer=device_buffer,
-                dst_ids=dst_ids[:n],
+                device_buffer=all_device_buffers,
             )
+            cpu_pool_tensors = self.dst_tensors
+            inflight = self._d2h_inflight
 
-            def _d2h_task(devs: list, hosts: list):
+            # Submit the actual DMA work to the per-direction worker.
+            # The task does device -> host copies AND the cpu_pool host
+            # scatters. dma_done is signaled only after all are complete.
+            def _d2h_task():
                 try:
-                    for d, h in zip(devs, hosts):
-                        h.copy_(d)
-                    for h, dst in zip(hosts, cpu_pool_tensors):
-                        dst[dst_ids_for_scatter] = h[:n_for_scatter]
+                    for tensor_idxs, devs, hosts, cpu_ids, n_g in seg_work:
+                        for d, h in zip(devs, hosts):
+                            h.copy_(d)
+                        for i, h in zip(tensor_idxs, hosts):
+                            cpu_pool_tensors[i][cpu_ids] = h[:n_g]
                 except BaseException as e:
                     t.error = e
                     raise
+                finally:
+                    seg_work.clear()
+                    inflight.release()
 
-            t.dma_done = self._dma_worker.submit(_d2h_task, device_buffer,
-                                                 host_buffer)
+            t.dma_done = self._dma_worker.submit(_d2h_task)
 
         else:
             # H2D: host index_select (main) → lazy copy_ + sync (worker)
-            #      → Pallas scatter (main) in get_finished().
-            # Split into max_padded-sized chunks so the depth=1 device
-            # buffer is never overflowed. Oversized transfers stream one
-            # chunk per get_finished() round-trip; chunk splitting +
-            # padding happens lazily in `_start_h2d_dma`. Each chunk's
-            # Pallas scatter completes before the next chunk's DMA starts,
-            # preserving the depth=1 buffer-reuse invariant.
-            chunk_size = self._h2d_max_padded
-            chunks_total = max(1,
-                               (len(src_ids) + chunk_size - 1) // chunk_size)
-            if chunks_total > 1:
+            #      → deferred scatter in flush_pending_scatters.
+            # Chunk k carries the k-th max_padded-sized id range of every
+            # group, so a typical load (every group within the staging
+            # cap) is a single chunk with one DMA and one deferred
+            # scatter. Multi-chunk transfers stream one chunk per
+            # get_finished() round-trip.
+            chunk_cap = self._h2d_max_padded
+            chunks: list[list[_H2DPart]] = []
+            for tensor_idxs, gpu_ids, cpu_ids in segments:
+                for k, s in enumerate(range(0, len(gpu_ids), chunk_cap)):
+                    if k == len(chunks):
+                        chunks.append([])
+                    chunks[k].append(
+                        _H2DPart(
+                            tensor_idxs=tensor_idxs,
+                            src_ids=cpu_ids[s:s + chunk_cap],
+                            dst_ids=gpu_ids[s:s + chunk_cap],
+                        ))
+            if len(chunks) > 1:
                 logger.info_once(
                     "[kv-offload] H2D transfer of %d blocks exceeds device "
                     "buffer (%d); will be loaded as %d chunks across that "
-                    "many engine steps.", len(src_ids), chunk_size,
-                    chunks_total)
+                    "many engine steps.", n, chunk_cap, len(chunks))
 
             t = Transfer(
                 job_id=job_id,
-                num_bytes=n * self.total_block_size_in_bytes,
-                n=n,
+                num_bytes=num_bytes,
                 dma_done=None,
-                host_buffer=None,  # populated by _h2d_task
-                device_buffer=None,
-                src_ids=src_ids,
-                dst_ids=dst_ids,
-                chunks_total=chunks_total,
+                chunk_descs=chunks,
+                chunks_total=len(chunks),
                 chunks_done=0,
             )
 
@@ -769,10 +1213,19 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             for ps in to_flush:
                 if ps.transfer.error is not None:
                     continue
-                dst_ids_i64 = ps.dst_ids_i32.to(torch.int64)
-                for kv_cache_l, dev_buf in zip(self.dst_tensors,
-                                               ps.device_buffer):
-                    kv_cache_l[dst_ids_i64] = dev_buf
+                for tensor_idxs, dst_ids_i32, views in ps.scatters:
+                    dst_ids_i64 = dst_ids_i32.to(torch.int64)
+                    for i, dev_buf in zip(tensor_idxs, views):
+                        self.dst_tensors[i][dst_ids_i64] = dev_buf
+                        # Flush per tensor: each scatter program then
+                        # in-place-aliases a single KV array. Left in one
+                        # lazy region, the chunk's scatters fuse into one
+                        # program whose aliased I/O spans every array it
+                        # touches (tens of GB), and loading it demands a
+                        # same-sized contiguous reservation that a busy
+                        # HBM cannot provide (RuntimeProgramAllocation-
+                        # Failure on 'tt_jit_index_put_').
+                        _tpu_sync([self.dst_tensors[i]], wait=False)
         finally:
             # Scatter HLOs are now enqueued on libtpu's command stream;
             # the worker may proceed with the next H2D (XLA serializes
@@ -787,11 +1240,36 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 self._start_h2d_dma(ps.transfer)
         self._pending_scatters = to_keep
 
+    def drop_pending_scatters_for(self, req_ids: set[str]) -> None:
+        """Discard deferred scatters owned by requests that finished or
+        were aborted before their scatter was dispatched.
+
+        An aborted request is freed without ever entering the scheduled
+        batch, so its gated last-chunk scatter would otherwise sit in
+        `_pending_scatters` forever with the staging buffer held. Its
+        destination blocks are already freed (and possibly reallocated),
+        so the scatter must not run; dropping it and releasing the buffer
+        is the correct teardown.
+        """
+        if self.tpu_to_cpu or not self._pending_scatters or not req_ids:
+            return
+        keep = [
+            ps for ps in self._pending_scatters
+            if ps.transfer.req_id not in req_ids
+        ]
+        if len(keep) != len(self._pending_scatters):
+            self._pending_scatters = keep
+            self._h2d_buffer_free.set()
+
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers:
-            t = self._transfers[0]
-
+        # Scan the whole queue, not just the head: with the depth-1
+        # staging buffer, a later transfer's chunk can complete while an
+        # earlier transfer's next chunk is still blocked on
+        # `buffer_free.wait()` — its scatter must be registered (and later
+        # flushed, releasing the buffer) regardless of queue position, or
+        # the pipeline wedges.
+        for t in list(self._transfers):
             # dma_done is set by _DmaWorker when the task returns.
             #  - D2H: the task's blocking h.copy_(d) waits for the DMA to
             #    drain into host, then runs the cpu_pool host scatter, so
@@ -805,14 +1283,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             # next chunk's re-submission (from flush_pending_scatters) will
             # set it to a fresh Event.
             if t.dma_done is None or not t.dma_done.is_set():
-                break
+                continue
 
             if self.tpu_to_cpu:
                 # D2H: the worker task ran both the device→host copy AND
                 # the cpu_pool host scatter. The main thread only has to
                 # drop buffer refs.
-                self._transfers.popleft()
-                t.host_buffer = None
+                self._transfers.remove(t)
                 t.device_buffer = None
             else:
                 # H2D: defer the scatter HLO dispatch to
@@ -832,27 +1309,28 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     self._pending_scatters.append(
                         _PendingScatter(
                             transfer=t,
-                            device_buffer=t.device_buffer,
-                            dst_ids_i32=t.dst_ids_i32,
+                            scatters=t.current_scatters,
                             is_last_chunk=is_last,
                         ))
-                else:
-                    # Error path: no scatter needed; release the buffer so
-                    # the worker isn't stuck on `buffer_free.wait()`.
+                elif t.buffer_acquired:
+                    # Error path: no scatter will run for this chunk, so
+                    # release the buffer the failed task acquired. A task
+                    # that failed before acquisition never held it — the
+                    # buffer still belongs to another chunk's pending
+                    # scatter and must stay held.
                     self._h2d_buffer_free.set()
                 # Detach so the next chunk's `_start_h2d_dma` (called from
                 # flush_pending_scatters) can replace these fields without
                 # clobbering this chunk's snapshot in `_pending_scatters`.
-                t.device_buffer = None
-                t.host_buffer = None
+                t.current_scatters = None
                 t.dma_done = None  # re-entry marker for chunked transfers
                 if not is_last:
-                    # Non-last chunk: keep Transfer at head; do NOT report
-                    # finished_recving yet. flush_pending_scatters will
-                    # re-submit the next chunk after enqueuing this chunk's
-                    # scatter.
-                    break
-                self._transfers.popleft()
+                    # Non-last chunk: keep the Transfer queued; do NOT
+                    # report finished_recving yet. flush_pending_scatters
+                    # will re-submit the next chunk after enqueuing this
+                    # chunk's scatter.
+                    continue
+                self._transfers.remove(t)
 
             results.append(
                 TransferResult(
@@ -927,90 +1405,209 @@ _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S = float(
 class _RaidenOffloadingHandler(OffloadingHandler):
     """One-direction (D2H or H2D) KV offload via raiden's direct DMA.
 
-    `transfer_async` issues `mgr.D2h`/`mgr.H2d` (kernel-block granular) and
-    tracks the returned `RaidenFuture`; `get_finished` polls it. The host pool
-    lives inside raiden (DmaMapped), so there is no `cpu_pool` tensor here.
+    Each KV-cache group carries a list of `(KVCacheManager, factor)`
+    sub-managers, one per row class — a raiden manager sizes and
+    addresses every registered layer with layer 0's slice, so all
+    tensors it holds must share one slice size and one kernel-row
+    factor (a d2h/h2d call copies the addressed rows of every tensor
+    its manager registered, so ids must also be group-scoped).
+    `transfer_async` splits the flat id lists by
+    `GPULoadStoreSpec.group_sizes` into one segment per sub-manager of
+    each non-empty group; H2D loads issue immediately, D2H stores queue
+    until the runner's next device-quiescent point (see
+    `_install_store_dispatch_hook`). `get_finished` polls the returned
+    `RaidenFuture`s. The host pool lives inside raiden (DmaMapped), so
+    there is no `cpu_pool` tensor here.
+
+    Tensors whose on-device layout is not row-addressable (raiden's
+    per-row slice differs from nbytes/num_blocks — e.g. GDN conv state
+    without TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA, whose block dim lands
+    inside the tile) are carried by a host-staged
+    `SingleDirectionOffloadingHandler` sidecar instead; a job completes
+    when its raiden futures are ready AND the sidecar reported its part.
     """
 
-    def __init__(self, mgr, tpu_to_cpu: bool, src_block_size_factor: int,
-                 dst_block_size_factor: int, bytes_per_kernel_block: int):
-        self._mgr = mgr
+    def __init__(self,
+                 group_mgrs: list[list[tuple]],
+                 tpu_to_cpu: bool,
+                 group_row_bytes: list[int],
+                 sidecar: SingleDirectionOffloadingHandler | None = None,
+                 sidecar_group_has_work: list[bool] | None = None):
+        assert len(group_mgrs) == len(group_row_bytes)
+        self._group_mgrs = group_mgrs
         self.tpu_to_cpu = tpu_to_cpu
-        self.src_block_size_factor = src_block_size_factor
-        self.dst_block_size_factor = dst_block_size_factor
-        self._bytes_per_kernel_block = bytes_per_kernel_block
+        self._group_row_bytes = group_row_bytes
+        self._sidecar = sidecar
+        self._sidecar_group_has_work = sidecar_group_has_work or []
         self.transfer_type = ("GPU", "CPU") if tpu_to_cpu else ("CPU", "GPU")
-        self._pending: dict[int, tuple] = {}
+        # job_id -> [list[RaidenFuture], num_bytes, sidecar_pending,
+        #            dispatched]
+        self._pending: dict[int, list] = {}
+        # Transfers queue here at transfer_async time, stamped with an
+        # engine step, and dispatch once that step's device programs have
+        # completed (see _install_store_dispatch_hook). Appended by the
+        # runner main thread, drained by whichever thread resolves a
+        # step's sampled-token copy.
+        self._queued_transfers: list[tuple] = []
+        self._queue_lock = threading.Lock()
+        _install_store_dispatch_hook()
+        _deferred_store_handlers.add(self)
+        if tpu_to_cpu:
+            _start_hang_dump_watchdog()
 
-    def _expand_kernel_ids(
-            self,
-            transfer_spec: TransferSpec) -> tuple[np.ndarray, np.ndarray]:
-        """Expand (src, dst) scheduler block IDs to kernel-block IDs.
+    # -- sidecar delegation (H2D deferred-scatter machinery) ----------------
 
-        Mirrors SingleDirectionOffloadingHandler.transfer_async so D2H/H2D
-        granularity matches the torch path exactly.
-        """
+    def _stash_req_id_for_job(self, job_id: int, req_id: str) -> None:
+        if self._sidecar is not None:
+            self._sidecar._stash_req_id_for_job(job_id, req_id)
+
+    def flush_pending_scatters(self, scatter_now_req_ids: set[str]) -> None:
+        if self._sidecar is not None:
+            self._sidecar.flush_pending_scatters(scatter_now_req_ids)
+
+    def drop_pending_scatters_for(self, req_ids: set[str]) -> None:
+        if self._sidecar is not None:
+            self._sidecar.drop_pending_scatters_for(req_ids)
+
+    def _sidecar_involved(self, group_sizes) -> bool:
+        if self._sidecar is None:
+            return False
+        return any(size and has_work for size, has_work in zip(
+            group_sizes, self._sidecar_group_has_work))
+
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1 and dst_blocks.ndim == 1
+        gpu_spec = src_spec if self.tpu_to_cpu else dst_spec
+        cpu_spec = dst_spec if self.tpu_to_cpu else src_spec
+        assert isinstance(gpu_spec, GPULoadStoreSpec)
+        group_sizes = gpu_spec.group_sizes
+        assert len(group_sizes) == len(self._group_mgrs)
+        assert sum(group_sizes) == len(gpu_spec.block_ids)
+        assert len(cpu_spec.block_ids) == len(gpu_spec.block_ids)
 
-        src_sub_count = src_blocks.size * self.src_block_size_factor
-        dst_sub_count = dst_blocks.size * self.dst_block_size_factor
-        src_skip = -dst_blocks.size % self.src_block_size_factor
-        assert dst_sub_count == src_sub_count - src_skip
+        segments: list[tuple[object, list[int], list[int], list[int]]] = []
+        num_bytes = 0
+        offset = 0
+        for group, size in enumerate(group_sizes):
+            if size and self._group_mgrs[group]:
+                # Buffers are registered at the source arrays' kernel-block
+                # granularity; a scheduler block spans `factor` contiguous
+                # rows there, expressed via copy_sizes per segment.
+                for mgr, factor in self._group_mgrs[group]:
+                    gpu_ids = [
+                        int(b) * factor
+                        for b in gpu_spec.block_ids[offset:offset + size]
+                    ]
+                    cpu_ids = [
+                        int(b) * factor
+                        for b in cpu_spec.block_ids[offset:offset + size]
+                    ]
+                    segments.append((mgr, gpu_ids, cpu_ids, [factor] * size))
+                num_bytes += size * self._group_row_bytes[group]
+            offset += size
 
-        src_expanded = np.empty(src_sub_count, dtype=np.int64)
-        dst_expanded = np.empty(dst_sub_count, dtype=np.int64)
-        expand_block_ids(src_blocks,
-                         self.src_block_size_factor,
-                         src_expanded,
-                         skip_count=src_skip)
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_expanded)
-        return src_expanded[src_skip:], dst_expanded
+        sidecar_pending = self._sidecar_involved(group_sizes)
+        assert segments or sidecar_pending, (
+            "transfer with no blocks in any KV-cache group")
 
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        # src/dst are kernel-block IDs. D2H: src=device blocks, dst=host slots;
-        # H2D: src=host slots, dst=device blocks — matching D2h/H2d's
-        # (src_offsets_major_dim, dst_offsets_major_dim) contract.
-        src_ids, dst_ids = self._expand_kernel_ids(transfer_spec)
-        n = len(dst_ids)
-        sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
+        futures: list = []
+        entry = [futures, num_bytes, sidecar_pending, False]
+        self._pending[job_id] = entry
+
         if self.tpu_to_cpu:
-            # Barrier so the D2h store reads these blocks only after the
-            # forward step's in-place KV write to them has completed.
-            _tpu_sync(wait=True)
-            fut = self._mgr.d2h(src_ids.tolist(), dst_ids.tolist(), sizes)
+            # A store must read (raiden d2h) or gather (sidecar) its
+            # source rows only after every program that writes them has
+            # finished; the job is stamped with the current engine step
+            # and dispatched once that step completes on device (see
+            # _install_store_dispatch_hook).
+            with self._queue_lock:
+                self._queued_transfers.append(
+                    (_current_step[0], job_id, transfer_spec, segments,
+                     futures, entry, sidecar_pending))
         else:
-            fut = self._mgr.h2d(src_ids.tolist(), dst_ids.tolist(), sizes)
-        self._pending[job_id] = (fut, n * self._bytes_per_kernel_block)
+            # A restore's target blocks may have been freed by the
+            # previous step's optimistic (async-scheduling) bookkeeping
+            # while that step still executes and writes them; the DMA has
+            # no ordering against TensorCore programs, so defer the h2d
+            # until the step in flight at queue time has completed. Steps
+            # scheduled after the blocks were reserved never touch them.
+            with self._queue_lock:
+                self._queued_transfers.append(
+                    (_current_step[0] - 1, job_id, transfer_spec, segments,
+                     futures, entry, sidecar_pending))
         return True
 
+    def dispatch_queued_stores(self, completed_step: int) -> None:
+        """Issue queued transfers whose stamped step has completed on
+        device: the sidecar's part, raiden d2h store DMAs, and raiden h2d
+        restore DMAs.
+
+        The DMA starts immediately and moves bytes unsynchronized against
+        device programs, so a job may only dispatch once every program
+        through its stamped step has finished (d2h: the writes it reads;
+        h2d: writes into blocks its targets may have been recycled from).
+        """
+        with self._queue_lock:
+            ready = [
+                job for job in self._queued_transfers
+                if job[0] <= completed_step
+            ]
+            if not ready:
+                return
+            self._queued_transfers = [
+                job for job in self._queued_transfers
+                if job[0] > completed_step
+            ]
+        for (_, job_id, transfer_spec, segments, futures, entry,
+             sidecar_pending) in ready:
+            if sidecar_pending:
+                assert self._sidecar.transfer_async(job_id, transfer_spec)
+            for mgr, gpu_ids, cpu_ids, sizes in segments:
+                if self.tpu_to_cpu:
+                    futures.append(mgr.d2h(gpu_ids, cpu_ids, sizes))
+                else:
+                    futures.append(mgr.h2d(cpu_ids, gpu_ids, sizes))
+            entry[3] = True
+
     def get_finished(self) -> list[TransferResult]:
+        # Drain the sidecar first; its per-job results gate composite
+        # completion.
+        if self._sidecar is not None:
+            for r in self._sidecar.get_finished():
+                entry = self._pending.get(r.job_id)
+                if entry is None:
+                    continue
+                entry[2] = False
+                entry[1] += r.transfer_size or 0
+                if not r.success:
+                    logger.error(
+                        "[kv-offload] sidecar transfer failed for job=%s",
+                        r.job_id)
+
         results: list[TransferResult] = []
         for job_id in list(self._pending.keys()):
-            fut, num_bytes = self._pending[job_id]
-            if not fut.is_ready():
+            futures, num_bytes, sidecar_pending, dispatched = (
+                self._pending[job_id])
+            if sidecar_pending or not dispatched:
                 continue
-            # Poll-only completion: is_ready() True means the DMA finished. Do
-            # NOT call fut.wait()/Await here -- PJRT_Event_Await (and the
-            # xla::Future BlockUntilReady it also drains) can deadlock against
-            # the concurrently-executing model. The disagg connector likewise
-            # reports completion by polling (complete_read) and never blocks.
-            #
+            # Poll-only completion: is_ready() True means the DMA finished.
+            # Do NOT call fut.wait()/Await here -- PJRT_Event_Await (and the
+            # xla::Future BlockUntilReady it also drains) can deadlock
+            # against the concurrently-executing model. The disagg connector
+            # likewise reports completion by polling (complete_read) and
+            # never blocks.
+            if not all(fut.is_ready() for fut in futures):
+                continue
             # ok() is a non-blocking error probe (no Await), valid once
-            # is_ready() is True; it tells a successful transfer from one that
-            # completed with an error. hasattr-guarded so this still works
-            # against a raiden build that predates the accessor (falls back to
-            # the previous always-success behaviour).
-            ok = fut.ok() if hasattr(fut, "ok") else True
+            # is_ready() is True; it tells a successful transfer from one
+            # that completed with an error.
+            ok = all(fut.ok() for fut in futures)
             if not ok:
-                err = (fut.error_message()
-                       if hasattr(fut, "error_message") else "")
+                errs = [fut.error_message() for fut in futures if not fut.ok()]
                 logger.error("[kv-offload] Raiden transfer job=%s failed: %s",
-                             job_id, err)
+                             job_id, errs)
             results.append(
                 TransferResult(
                     job_id=job_id,
@@ -1019,7 +1616,8 @@ class _RaidenOffloadingHandler(OffloadingHandler):
                     transfer_time=1e-9,
                     transfer_type=self.transfer_type,
                 ))
-            # Completed: drop the future (its keep-alives release the buffers).
+            # Completed: drop the futures (their keep-alives release the
+            # buffers).
             del self._pending[job_id]
         return results
 
@@ -1030,6 +1628,14 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         `_pending`, emitting TransferResults) is left to the next
         `get_finished()`, which the scheduler relies on to mark jobs done.
         """
+        # Dispatch whatever has become eligible before polling (before
+        # sidecar.wait, which polls only already-submitted sidecar
+        # transfers). Jobs stamped with a still-in-flight step become
+        # eligible inside the poll loop below, as the step's copy
+        # resolves concurrently.
+        self.dispatch_queued_stores(_last_completed_step[0])
+        if self._sidecar is not None:
+            self._sidecar.wait(job_ids)
         # Flush by POLLING is_ready (never the blocking Await, which can
         # deadlock against the live model -- see get_finished). Bound the wait
         # with a dedicated offload timeout so a stalled raiden DMA can't
@@ -1038,9 +1644,11 @@ class _RaidenOffloadingHandler(OffloadingHandler):
         remaining = {jid for jid in job_ids if jid in self._pending}
         deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
         while remaining:
+            self.dispatch_queued_stores(_last_completed_step[0])
             for jid in list(remaining):
                 entry = self._pending.get(jid)
-                if entry is None or entry[0].is_ready():
+                if entry is None or (entry[3] and all(f.is_ready()
+                                                      for f in entry[0])):
                     remaining.discard(jid)
             if not remaining:
                 break
@@ -1052,6 +1660,11 @@ class _RaidenOffloadingHandler(OffloadingHandler):
                 return
             time.sleep(0.0005)
 
+    def shutdown(self) -> None:
+        _deferred_store_handlers.discard(self)
+        if self._sidecar is not None:
+            self._sidecar.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # Factory: allocates CPU pinned tensors, creates bidirectional handlers
@@ -1061,143 +1674,256 @@ class _RaidenOffloadingHandler(OffloadingHandler):
 class CpuTpuOffloadingHandlers:
     """Mirrors CpuGpuOffloadingHandlers for TPU.
 
-    TPU KV-cache tensors always have block dimension at index 0:
-        shape = (num_kernel_blocks, block_size, num_kv_heads, head_size)
-    There is no split_k_and_v variant as in the GPU paged-attention backend.
+    Every canonical KV-cache tensor — an attention KV array or a mamba/GDN
+    state array, viewed as int8 `(num_blocks, row_bytes)` — gets a matching
+    CPU pool tensor; per-group tensor indices route each KV-cache group's
+    block ids to only that group's arrays.
     """
 
     def __init__(
         self,
-        gpu_block_size: int,
-        cpu_block_size: int,
-        num_cpu_blocks: int,
+        *,
         kv_caches: CanonicalKVCaches,
-        kernel_block_size: int,
-        kv_dtype: torch.dtype,
-        per_block_shape: tuple[int, ...],
+        num_cpu_blocks: int,
     ):
         """
         Args:
-          gpu_block_size: scheduler block size (vllm config block_size).
-          cpu_block_size: offloaded block size (gpu_block_size * factor).
-          num_cpu_blocks: number of CPU-side scheduler blocks.
-          kv_caches: vllm 0.19 CanonicalKVCaches — each .tensor is a 2D int8
-              view (num_blocks, page_size_bytes) sharing storage with the
+          kv_caches: TPU-canonicalized caches (see
+              `build_tpu_canonical_kv_caches`) — each .tensor is a 2D int8
+              view (num_blocks, row_bytes) sharing storage with the
               model's kv_cache.
-          kernel_block_size: physical block_size in the original 5D Pallas
-              layout (typically 16). gpu_block_size must be a multiple of it.
-          kv_dtype: original dtype of the kv_cache (bf16, fp8, ...).
-          per_block_shape: per-block trailing dims in the 5D Pallas layout
-              (e.g. (block_size, num_kv_heads_x2 // kv_packing, kv_packing,
-              padded_head_size)) — everything after the leading num_blocks
-              dim.
+          num_cpu_blocks: number of CPU-side blocks; CPU block ids share
+              one id space across KV-cache groups, mirroring the device
+              block pool.
         """
         assert kv_caches.tensors
-        assert cpu_block_size % gpu_block_size == 0
-        assert gpu_block_size % kernel_block_size == 0
-
-        cpu_block_size_factor = cpu_block_size // kernel_block_size
-        gpu_block_size_factor = gpu_block_size // kernel_block_size
-        num_cpu_kernel_blocks = num_cpu_blocks * cpu_block_size_factor
 
         tpu_tensors: list[torch.Tensor] = []
-        cpu_tensors: list[torch.Tensor] = []
-
-        logger.debug(
-            "[kv-offload] Allocating %d unpinned CPU pool tensors "
-            "(num_cpu_blocks=%d, gpu_factor=%d, cpu_factor=%d)",
-            len(kv_caches.tensors),
-            num_cpu_blocks,
-            gpu_block_size_factor,
-            cpu_block_size_factor,
-        )
-        total_bytes = 0
         for kv_cache_tensor in kv_caches.tensors:
             int8_view = kv_cache_tensor.tensor
-            num_blocks = int8_view.shape[0]
-            # Rebuild the original 5D Pallas view from the same storage.
-            # vllm canonicalized to (num_blocks, page_size_bytes) int8 via
-            # .set_(storage).view(num_blocks, page_size_bytes); we round-trip
-            # to the kv_dtype-typed 5D shape so Pallas gather/scatter can
-            # operate on it directly.
-            tpu_tensor = (torch.empty(
-                0, dtype=kv_dtype, device=int8_view.device).set_(
-                    int8_view.untyped_storage()).view((num_blocks, ) +
-                                                      tuple(per_block_shape)))
-            cpu_shape = (num_cpu_kernel_blocks, ) + tuple(per_block_shape)
-            # cpu_pool is intentionally NOT pinned. The DMA-capable host
-            # staging buffer is allocated per-transfer (pinned) in
-            # register_store/register_load, and the host
-            # gather/scatter step copies between cpu_pool and that pinned
-            # staging buffer. Pinning the full cpu_pool would lock hundreds
-            # of GB and starve the libtpu premap region.
-            tpu_tensors.append(tpu_tensor)
-            if not _USE_RAIDEN_OFFLOAD:
-                cpu_tensor = torch.zeros(
-                    cpu_shape,
-                    dtype=kv_dtype,
-                    device="cpu",
-                )
-                total_bytes += cpu_tensor.element_size() * cpu_tensor.numel()
-                cpu_tensors.append(cpu_tensor)
+            assert int8_view.dtype == torch.int8 and int8_view.ndim == 2
+            tpu_tensors.append(int8_view)
+
+        group_tensor_idxs: list[list[int]] = []
+        for refs in kv_caches.group_data_refs:
+            idxs: list[int] = []
+            for ref in refs:
+                if ref.tensor_idx not in idxs:
+                    idxs.append(ref.tensor_idx)
+            group_tensor_idxs.append(idxs)
 
         if _USE_RAIDEN_OFFLOAD:
-            # raiden owns a DmaMapped host pool (no cpu_pool tensor). Build one
-            # KVCacheManager over the device KV-cache views; two direct-DMA
-            # handlers share it. host_blocks_to_allocate matches the scheduler's
-            # CPU pool sized in kernel blocks, so CPU block IDs map 1:1 to
-            # raiden host slots after expand_block_ids.
+            # raiden owns a DmaMapped host pool (no cpu_pool tensor). A
+            # d2h/h2d call copies the addressed rows of every tensor its
+            # manager registered, so build one KVCacheManager per KV-cache
+            # group over that group's device views; the two direct-DMA
+            # handlers share the manager list. host_blocks_to_allocate
+            # matches the scheduler's CPU pool in every group, so CPU
+            # block IDs map 1:1 to raiden host slots (one id space,
+            # mirroring the device block pool).
+            #
+            # raiden addresses rows by a per-buffer major-dim slice
+            # computed from the on-device layout; when a tensor's block
+            # dim lands inside the tile (GDN conv state), that slice
+            # degenerates to the whole buffer and both host sizing and
+            # transfers are wrong. Classify each distinct (shape, dtype)
+            # class by probing a one-block manager and comparing raiden's
+            # reported slice with nbytes/num_blocks; misfit tensors ride a
+            # host-staged sidecar instead.
             from tpu_raiden.api.torch import kv_cache_manager as _kcm
-            device_tensors = [[t] for t in tpu_tensors]
-            # raiden holds raw pointers / PJRT aliases to these device buffers
-            # for its lifetime. Keep the tensors (and thus the underlying
-            # buffers) alive on the factory, or they get GC'd after __init__
-            # and raiden's D2h/H2d dereferences freed buffers (segfault).
-            self._raiden_device_tensors = device_tensors
-            self._raiden_mgr = _kcm.KVCacheManager(
-                kv_caches=device_tensors,
-                local_control_port=0,
-                host_blocks_to_allocate=num_cpu_kernel_blocks,
-            )
-            bytes_per_kernel_block = (
-                int(np.prod(per_block_shape)) *
-                torch.empty(0, dtype=kv_dtype).element_size())
+
+            def _source_major_view(tensor: torch.Tensor) -> torch.Tensor:
+                """Reshape the canonical view to the source array's major
+                (kernel-block) granularity — raiden validates the leading
+                dim against the underlying buffer."""
+                major = _SOURCE_MAJOR_DIM_BY_STORAGE.get(
+                    tensor.untyped_storage().data_ptr(), tensor.shape[0])
+                return tensor.view(major, -1)
+
+            def _rows_per_block(tensor: torch.Tensor) -> int:
+                major = _SOURCE_MAJOR_DIM_BY_STORAGE.get(
+                    tensor.untyped_storage().data_ptr(), tensor.shape[0])
+                assert major % tensor.shape[0] == 0
+                return major // tensor.shape[0]
+
+            def _row_addressable(tensor: torch.Tensor) -> bool:
+                view = _source_major_view(tensor)
+                try:
+                    probe = _kcm.KVCacheManager(
+                        [[view]],
+                        local_control_port=0,
+                        host_blocks_to_allocate=1,
+                        unsafe_skip_buffer_lock=True,
+                        parallelism=1,
+                    )
+                except ValueError as e:
+                    # raiden rejects layouts its raw row transfer cannot
+                    # address; those tensors ride the sidecar.
+                    logger.info(
+                        "[kv-offload] raiden rejected tensor registration "
+                        "(%s); routing via host-staged sidecar.", e)
+                    return False
+                slice_bytes = int(probe._impl.slice_byte_size)
+                del probe
+                return slice_bytes == view.nbytes // view.shape[0]
+
+            addressable_by_class: dict[tuple, bool] = {}
+            raiden_side: list[bool] = []
+            for t in tpu_tensors:
+                key = (tuple(t.shape), t.dtype, _rows_per_block(t))
+                if key not in addressable_by_class:
+                    addressable_by_class[key] = _row_addressable(t)
+                    if not addressable_by_class[key]:
+                        logger.info(
+                            "[kv-offload] tensor class %s not raiden "
+                            "row-addressable; routing via host-staged "
+                            "sidecar.", key)
+                raiden_side.append(addressable_by_class[key])
+
+            # raiden holds raw pointers / PJRT aliases to these device
+            # buffers for its lifetime. Keep the tensors (and thus the
+            # underlying buffers) alive on the factory, or they get GC'd
+            # after __init__ and raiden's d2h/h2d dereferences freed
+            # buffers (segfault).
+            self._raiden_device_tensors = []
+            self._raiden_group_mgrs = []
+            group_row_bytes: list[int] = []
+            host_bytes = 0
+            sidecar_tensor_ids: list[int] = []
+            sidecar_group_idxs: list[list[int]] = []
+            sidecar_group_has_work: list[bool] = []
+            for tensor_idxs in group_tensor_idxs:
+                raiden_idxs = [i for i in tensor_idxs if raiden_side[i]]
+                torch_idxs = [i for i in tensor_idxs if not raiden_side[i]]
+                remapped: list[int] = []
+                for i in torch_idxs:
+                    if i not in sidecar_tensor_ids:
+                        sidecar_tensor_ids.append(i)
+                    remapped.append(sidecar_tensor_ids.index(i))
+                sidecar_group_idxs.append(remapped)
+                sidecar_group_has_work.append(bool(remapped))
+
+                # A manager sizes and addresses every registered layer
+                # with layer 0's slice, so partition this group's tensors
+                # into row classes of identical (kernel-row factor,
+                # per-row slice bytes) — one manager per class.
+                row_classes: dict[tuple[int, int], list[int]] = {}
+                for i in raiden_idxs:
+                    view = _source_major_view(tpu_tensors[i])
+                    key = (_rows_per_block(tpu_tensors[i]),
+                           int(view.nbytes // view.shape[0]))
+                    row_classes.setdefault(key, []).append(i)
+                submgrs: list[tuple] = []
+                for (factor, slice_bytes), idxs in sorted(row_classes.items()):
+                    device_tensors = [[_source_major_view(tpu_tensors[i])]
+                                      for i in idxs]
+                    self._raiden_device_tensors.append(device_tensors)
+                    submgrs.append((
+                        _kcm.KVCacheManager(
+                            device_tensors,
+                            local_control_port=0,
+                            host_blocks_to_allocate=num_cpu_blocks * factor,
+                            unsafe_skip_buffer_lock=True,
+                            # Local offload copies through the DmaMapped
+                            # pool; the wrapper's parallelism default of 4
+                            # multiplies per-layer host buffering for
+                            # parallel network streams that local D2h/H2d
+                            # never uses.
+                            parallelism=1,
+                        ),
+                        factor))
+                    host_bytes += (num_cpu_blocks * factor * slice_bytes *
+                                   len(idxs))
+                self._raiden_group_mgrs.append(submgrs)
+                row_bytes = sum(
+                    int(tpu_tensors[i].shape[1] *
+                        tpu_tensors[i].element_size()) for i in raiden_idxs)
+                group_row_bytes.append(row_bytes)
+
+            d2h_sidecar = h2d_sidecar = None
+            if sidecar_tensor_ids:
+                sidecar_device = [tpu_tensors[i] for i in sidecar_tensor_ids]
+                sidecar_cpu = [
+                    torch.zeros((num_cpu_blocks, t.shape[1]),
+                                dtype=torch.int8,
+                                device="cpu") for t in sidecar_device
+                ]
+                sidecar_bytes = sum(c.numel() for c in sidecar_cpu)
+                logger.info(
+                    "[kv-offload] sidecar host pool: %d tensors x %d "
+                    "blocks (%.2f GiB unpinned)", len(sidecar_cpu),
+                    num_cpu_blocks, sidecar_bytes / (1 << 30))
+                d2h_sidecar = SingleDirectionOffloadingHandler(
+                    src_tensors=sidecar_device,
+                    dst_tensors=sidecar_cpu,
+                    group_tensor_idxs=sidecar_group_idxs,
+                    tpu_to_cpu=True,
+                )
+                h2d_sidecar = SingleDirectionOffloadingHandler(
+                    src_tensors=sidecar_cpu,
+                    dst_tensors=sidecar_device,
+                    group_tensor_idxs=sidecar_group_idxs,
+                    tpu_to_cpu=False,
+                )
+
             self.gpu_to_cpu_handler = _RaidenOffloadingHandler(
-                self._raiden_mgr,
+                self._raiden_group_mgrs,
                 tpu_to_cpu=True,
-                src_block_size_factor=gpu_block_size_factor,
-                dst_block_size_factor=cpu_block_size_factor,
-                bytes_per_kernel_block=bytes_per_kernel_block,
+                group_row_bytes=group_row_bytes,
+                sidecar=d2h_sidecar,
+                sidecar_group_has_work=sidecar_group_has_work,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
-                self._raiden_mgr,
+                self._raiden_group_mgrs,
                 tpu_to_cpu=False,
-                src_block_size_factor=cpu_block_size_factor,
-                dst_block_size_factor=gpu_block_size_factor,
-                bytes_per_kernel_block=bytes_per_kernel_block,
+                group_row_bytes=group_row_bytes,
+                sidecar=h2d_sidecar,
+                sidecar_group_has_work=sidecar_group_has_work,
             )
             logger.info(
-                "[kv-offload] RAIDEN direct-DMA offload: %d host kernel blocks",
-                num_cpu_kernel_blocks,
+                "[kv-offload] RAIDEN direct-DMA offload: %d host blocks x "
+                "%d KV-cache groups (%.2f GiB DmaMapped host pool, %d "
+                "sidecar tensors)",
+                num_cpu_blocks,
+                len(group_tensor_idxs),
+                host_bytes / (1 << 30),
+                len(sidecar_tensor_ids),
             )
             return
 
-        logger.debug(
-            "[kv-offload] Allocated %.2f GiB unpinned CPU pool",
+        # cpu_pool is intentionally NOT pinned. The lazy copy_ in the DMA
+        # worker stages through libtpu's premap pool
+        # (TPU_PREMAPPED_BUFFER_SIZE); pinning the full cpu_pool would lock
+        # hundreds of GB and starve the libtpu premap region.
+        cpu_tensors: list[torch.Tensor] = []
+        total_bytes = 0
+        for t in tpu_tensors:
+            cpu_tensor = torch.zeros((num_cpu_blocks, t.shape[1]),
+                                     dtype=torch.int8,
+                                     device="cpu")
+            total_bytes += cpu_tensor.numel()
+            cpu_tensors.append(cpu_tensor)
+
+        logger.info(
+            "[kv-offload] Allocated %.2f GiB unpinned CPU pool "
+            "(%d tensors x %d blocks, %d KV-cache groups)",
             total_bytes / (1 << 30),
+            len(cpu_tensors),
+            num_cpu_blocks,
+            len(group_tensor_idxs),
         )
 
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=tpu_tensors,
             dst_tensors=cpu_tensors,
-            src_block_size_factor=gpu_block_size_factor,
-            dst_block_size_factor=cpu_block_size_factor,
+            group_tensor_idxs=group_tensor_idxs,
+            tpu_to_cpu=True,
         )
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=cpu_tensors,
             dst_tensors=tpu_tensors,
-            src_block_size_factor=cpu_block_size_factor,
-            dst_block_size_factor=gpu_block_size_factor,
+            group_tensor_idxs=group_tensor_idxs,
+            tpu_to_cpu=False,
         )
 
 
@@ -1219,6 +1945,29 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         super().__init__(vllm_config, kv_cache_config)
         self._tpu_handlers: CpuTpuOffloadingHandlers | None = None
 
+        # CPUOffloadingSpec sizes num_blocks from vLLM's KVCacheTensor
+        # byte accounting, which assumes layers sharing a tensor share its
+        # pages. TPU materializes hybrid KV as private per-layer
+        # (per-state) arrays whose combined per-block footprint is larger
+        # (Qwen3.5: 4x), so that formula over-allocates host RAM by the
+        # same factor. Recompute from the bytes the TPU pools actually
+        # hold per block row, times the world size (tensor x pipeline,
+        # stable across scheduler and worker processes).
+        parallel_config = vllm_config.parallel_config
+        world_size = (parallel_config.tensor_parallel_size *
+                      parallel_config.pipeline_parallel_size)
+        row_bytes = tpu_per_rank_block_row_bytes(kv_cache_config)
+        cpu_bytes_to_use = int(self.extra_config.get("cpu_bytes_to_use", 0))
+        if row_bytes > 0 and cpu_bytes_to_use > 0:
+            self.num_blocks = cpu_bytes_to_use // (
+                row_bytes * self.block_size_factor * world_size)
+            logger.info(
+                "[kv-offload] CPU pool: %d blocks "
+                "(%.2f MiB/block-row/rank, world_size=%d, %.2f GiB/rank).",
+                self.num_blocks, row_bytes / (1 << 20), world_size,
+                self.num_blocks * row_bytes * self.block_size_factor /
+                (1 << 30))
+
     @property
     def prewarm_shapes(self) -> list[int]:
         """H2D Pallas-scatter shapes the runner should pre-compile.
@@ -1230,14 +1979,17 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         """
         if self._tpu_handlers is None:
             return []
-        return self._tpu_handlers.cpu_to_gpu_handler.prewarm_shapes
+        return getattr(self._tpu_handlers.cpu_to_gpu_handler, "prewarm_shapes",
+                       [])
 
     def prewarm_shape(self, p: int) -> None:
         """Pre-compile H2D Pallas scatter for block-count `p`. Delegates
         to the H2D handler; no-op before get_handlers() has run."""
         if self._tpu_handlers is None:
             return
-        self._tpu_handlers.cpu_to_gpu_handler.prewarm_shape(p)
+        handler = self._tpu_handlers.cpu_to_gpu_handler
+        if hasattr(handler, "prewarm_shape"):
+            handler.prewarm_shape(p)
 
     @classmethod
     def estimate_hbm_reserve_bytes(cls, vllm_config: VllmConfig) -> int:
@@ -1254,6 +2006,8 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         spec class makes the gating explicit at the call site.
         """
         if _USE_RAIDEN_OFFLOAD:
+            # raiden DMAs between the KV cache and its host pool directly;
+            # there is no HBM staging buffer to reserve for.
             return 0
         max_pool_blocks = int(os.environ.get("KV_H2D_POOL_MAX_BLOCKS", "2048"))
         max_padded = 1
@@ -1282,11 +2036,23 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
             model_config.get_head_size(),
             kv_dtype,
         )
-        # Upper bound: vLLM may group multiple layers into one canonical
-        # tensor, in which case the actual H2D buffer is smaller. Safe
-        # direction (overestimate leaves a few GiB unused).
+        # The H2D staging buffer holds `max_padded` rows for every
+        # canonical tensor: one per attention layer, plus (on hybrid
+        # models) the per-layer mamba/GDN state arrays. Budget attention
+        # layers at the attention page and the remaining layers at the
+        # per-layer mamba state footprint (config-derived, per rank).
         num_layers = model_config.get_num_layers(parallel_config)
-        return num_layers * max_padded * per_block_bytes
+        num_attn_layers = num_layers
+        mamba_bytes = 0
+        if getattr(model_config, "is_hybrid", False):
+            from vllm_torchtpu.platforms.tpu_block_size_utils import \
+                _hybrid_mamba_page_size_bytes
+            mamba_page = _hybrid_mamba_page_size_bytes(vllm_config)
+            if mamba_page is not None:
+                num_attn_layers = model_config.get_num_layers_by_block_type(
+                    parallel_config, "attention")
+                mamba_bytes = (num_layers - num_attn_layers) * mamba_page
+        return max_padded * (num_attn_layers * per_block_bytes + mamba_bytes)
 
     def get_handlers(
         self,
@@ -1294,49 +2060,19 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec],
                         OffloadingHandler]]:
         if self._tpu_handlers is None:
-            from vllm.v1.kv_cache_interface import AttentionSpec
-
-            from vllm_torchtpu.layers.vllm.attention import \
-                PallasAttentionBackend
-
-            assert len(self.gpu_block_size) == 1
-            gpu_block_size = self.gpu_block_size[0]
-            offloaded_block_size = gpu_block_size * self.block_size_factor
-
-            # All kv_cache_groups must share the same attention spec so the
-            # rebuilt 5D view is consistent across canonical tensors.
-            kv_specs = [
-                g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
-                if isinstance(g.kv_cache_spec, AttentionSpec)
-            ]
-            assert kv_specs, "TPU offloading requires at least one AttentionSpec group"
-            spec0 = kv_specs[0]
-            for s in kv_specs[1:]:
-                assert (
-                    s.block_size == spec0.block_size
-                    and s.num_kv_heads == spec0.num_kv_heads
-                    and s.head_size == spec0.head_size
-                    and s.dtype == spec0.dtype
-                ), ("TPU offloading assumes a single attention spec across "
-                    "all KV cache groups")
-
-            full_5d_shape = PallasAttentionBackend.get_kv_cache_shape(
-                num_blocks=1,
-                block_size=spec0.block_size,
-                num_kv_heads=spec0.num_kv_heads,
-                head_size=spec0.head_size,
-                cache_dtype_str=spec0.dtype,
-            )
-            per_block_shape = tuple(full_5d_shape[1:])
+            gpu_block_sizes = set(self.gpu_block_size)
+            assert len(gpu_block_sizes) == 1, (
+                "TPU offloading requires a uniform block_size across KV "
+                f"cache groups, got {self.gpu_block_size}")
+            assert self.block_size_factor == 1, (
+                "TPU offloading requires offloaded_block_size == gpu block "
+                "size; do not set 'block_size' in kv_connector_extra_config")
+            assert len(kv_caches.group_data_refs) == len(
+                self.kv_cache_config.kv_cache_groups)
 
             self._tpu_handlers = CpuTpuOffloadingHandlers(
-                gpu_block_size=gpu_block_size,
-                cpu_block_size=offloaded_block_size,
-                num_cpu_blocks=self.num_blocks,
                 kv_caches=kv_caches,
-                kernel_block_size=spec0.block_size,
-                kv_dtype=spec0.dtype,
-                per_block_shape=per_block_shape,
+                num_cpu_blocks=self.num_blocks,
             )
 
         yield (
