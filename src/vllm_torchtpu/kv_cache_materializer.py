@@ -280,6 +280,25 @@ def make_attention_cache_tensor(
     return torch.zeros(shape, dtype=spec.dtype, device=device)
 
 
+def _maybe_pad_mamba_state_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Round a 2-D mamba state's leading dim up to a multiple of 4.
+
+    Applies only on the alias-fallback (private dense array) path when
+    TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA is set. A state like the GDN conv
+    state (kernel_size-1=3, dim) gets a device layout that interleaves
+    the block dim inside the tile pair, which no per-block DMA can
+    address; a multiple-of-4 leading dim keeps block rows contiguous.
+    The GDN kernels take the tap count from `kernel_size`, not the
+    storage shape, and ignore the extra taps (see
+    `_split_conv_state_pad` in layers/common/gdn_attention.py).
+    """
+    if (not tpu_envs.TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA
+            or not _kv_cache_alias_fallback_enabled() or len(shape) != 2
+            or shape[0] % 4 == 0):
+        return shape
+    return (-(-shape[0] // 4) * 4, shape[1])
+
+
 def make_mamba_cache_views(
     *,
     raw: torch.Tensor,
@@ -289,6 +308,7 @@ def make_mamba_cache_views(
     states: list[torch.Tensor] = []
     storage_offset_bytes = 0
     for shape, dtype in zip(spec.shapes, spec.dtypes):
+        shape = _maybe_pad_mamba_state_shape(shape)
         dtype_size = get_dtype_size(dtype)
         num_element_per_page = spec.page_size_bytes // dtype_size
         target_shape = (num_blocks, *shape)

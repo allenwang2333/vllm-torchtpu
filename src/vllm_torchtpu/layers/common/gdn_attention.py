@@ -45,6 +45,33 @@ class GdnAttentionConfig:
         RaggedGatedDeltaRuleImpl.REF)
 
 
+def _split_conv_state_pad(conv_state: jnp.ndarray,
+                          kernel_size: int) -> Tuple[jnp.ndarray, int]:
+    """Strip storage-only trailing taps from the conv state.
+
+    The conv-state array may be allocated with extra trailing taps beyond
+    the kernel's `kernel_size - 1` so that its on-device layout is
+    DMA-addressable per block row. Compute uses only the real taps;
+    `_repad_conv_state` restores the storage width on the way out.
+    """
+    state_pad = conv_state.shape[1] - (kernel_size - 1)
+    if state_pad:
+        conv_state = conv_state[:, :kernel_size - 1, :]
+    return conv_state, state_pad
+
+
+def _repad_conv_state(new_conv_state: jnp.ndarray,
+                      state_pad: int) -> jnp.ndarray:
+    """Extend the new conv state back to the storage tap width (pad taps
+    are always written as zeros)."""
+    if not state_pad:
+        return new_conv_state
+    pad = jnp.zeros(
+        (new_conv_state.shape[0], state_pad, new_conv_state.shape[2]),
+        new_conv_state.dtype)
+    return jnp.concatenate([new_conv_state, pad], axis=1)
+
+
 def run_jax_gdn_attention_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -118,27 +145,32 @@ def run_jax_gdn_attention_local(
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
 
+    conv_state, state_pad = _split_conv_state_pad(conv_state, kernel_size)
+
     if config.ragged_gated_delta_rule_impl == RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_V3_PD:
-        return gdn_v3_wrapper.fused_conv1d_gdn(
-            mixed_qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            A_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
+        (new_conv_state,
+         new_recurrent_state), output = (gdn_v3_wrapper.fused_conv1d_gdn(
+             mixed_qkv,
+             b,
+             a,
+             conv_state,
+             recurrent_state,
+             conv_weight,
+             conv_bias,
+             A_log,
+             dt_bias,
+             query_start_loc,
+             state_indices,
+             distribution,
+             seq_lens,
+             n_kq=n_kq,
+             n_v=n_v,
+             d_k=d_k,
+             d_v=d_v,
+             kernel_size=kernel_size,
+         ))
+        return (_repad_conv_state(new_conv_state,
+                                  state_pad), new_recurrent_state), output
 
     out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
         mixed_qkv,
@@ -196,7 +228,8 @@ def run_jax_gdn_attention_local(
             has_initial_state=has_initial_state,
         )
 
-    return (new_conv_state, new_recurrent_state), output
+    return (_repad_conv_state(new_conv_state,
+                              state_pad), new_recurrent_state), output
 
 
 def run_jax_gdn_attention(
@@ -522,6 +555,8 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         raise ValueError(
             f"n_v={n_v} must be divisible by pcp_size={pcp_size}.")
 
+    conv_state, state_pad = _split_conv_state_pad(conv_state, kernel_size)
+
     local_n_kq = n_kq // pcp_size
     local_n_v = n_v // pcp_size
     local_key_dim = n_kq * d_k
@@ -702,7 +737,8 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         distribution,
         seq_lens,
     )
-    return (new_conv_state, new_recurrent_state), output
+    return (_repad_conv_state(new_conv_state,
+                              state_pad), new_recurrent_state), output
 
 
 # ---------------------------------------------------------------

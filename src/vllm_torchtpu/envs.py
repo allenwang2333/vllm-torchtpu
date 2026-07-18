@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
     TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
+    TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA: bool = False
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_kernel_v3_pd"
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
@@ -185,6 +186,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reinterpret-cast + in-place update path needed for aliased TPU writes.
     "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK":
     env_bool("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", default=True),
+    "TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA":
+    env_bool("TPU_VLLM_PAD_MAMBA_STATE_FOR_DMA"),
     # Gated Delta Rule implementation. Default is the fused Conv1D+GDN v3
     # kernel; the older `chunked_kernel_pd` (v1) path is intentionally not a
     # valid choice — v1's ConcatBitcast conv-state assembly corrupts persistent
