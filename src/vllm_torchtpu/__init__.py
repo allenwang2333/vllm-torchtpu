@@ -475,11 +475,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
 
 
 def _patch_mla_prefill_backend() -> None:
-    """Disable FlashAttnPrefillBackend for MLA on TPU.
-
-    On TPU, MLA prefill is handled entirely by the custom Pallas MLA kernel.
-    Provide a dummy prefill backend so vLLM doesn't crash trying to initialize FlashAttention.
-    """
+    """Disable FlashAttnPrefillBackend for MLA on TPU."""
     from vllm.v1.attention.backends.mla.prefill import selector
 
     if getattr(selector, "_tpu_mla_prefill_patch", False):

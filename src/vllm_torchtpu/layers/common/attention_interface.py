@@ -512,13 +512,6 @@ def mla_attention(
 
     Returns:
         Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence layout `(T, N, D)`.
-
-    Note on Sharding Axis Names (`ATTN_DATA` / `ATTN_HEAD`):
-        `ATTN_DATA` denotes batch/data parallelism along the sequence length axis (`T` and `S`),
-        while `ATTN_HEAD` denotes tensor parallelism across individual head partitions (`N`).
-        Keeping the interface token-major `(T, N, A)` (`P(ATTN_DATA, ATTN_HEAD, None)`) guarantees
-        strict partition equivalence across sequence slices between query activations, `seq_lens`,
-        and block metadata during multi-device sharded execution.
     """
     in_specs = (
         query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
