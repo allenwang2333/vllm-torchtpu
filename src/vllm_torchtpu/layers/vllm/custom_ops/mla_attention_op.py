@@ -11,14 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA).
-
-Note on File Location (`vllm-torchtpu` convention):
-    Per repository practice, out-of-tree structural wrappers (`_oot`) and custom operations strictly reside
-    within `layers/vllm/custom_ops/*_op.py` (parallel to `gdn_attention_op.py`). This establishes clear boundary
-    segregation between standard vLLM execution backends (`layers/vllm/attention.py`) and out-of-tree
-    platform wrappers.
-"""
+"""Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
 from typing import Any
 
@@ -298,14 +291,7 @@ VllmMultiHeadLatentAttentionWrapper = VllmTPUMultiHeadLatentAttentionWrapper
 
 @DeepseekScalingRotaryEmbedding.register_oot
 class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
-    """TPU-compatible DeepSeek Scaling RoPE implementation.
-
-    Why this replacement is mandatory on TPU:
-        Upstream `DeepseekScalingRotaryEmbedding` relies on CUDA-specific ops or fragmented,
-        un-coalesced slice sequences that degrade JAX graph capture and lead to dynamic compilation
-        stalls. This class utilizes pure-PyTorch tensor transformations (`index_select`, `chunk(2)`,
-        and repeated interleaves) with eager device synchronization for zero-overhead static compilation.
-    """
+    """TPU-compatible DeepSeek Scaling RoPE implementation."""
 
     def forward_native(
         self,

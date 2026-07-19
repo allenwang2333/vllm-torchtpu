@@ -39,6 +39,9 @@ the blockwise Pallas kernel path instead.
 
 from typing import Optional
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
@@ -62,8 +65,7 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
-from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
-                                                      quantize_tensor)
+from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
@@ -344,6 +346,129 @@ def _quantize_and_format_moe_weights(
     return w13, w13_scale, w2, w2_scale
 
 
+def _jax_cpu_moe_repack_kernel(
+    w_raw: jnp.ndarray,
+    scale_raw: jnp.ndarray | None,
+    *,
+    weight_block_size: tuple[int, int] | None,
+    requant_block_size: int | None,
+    activation: str,
+    is_w13: bool,
+    mask_range: tuple[int, int] | None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Multi-core JAX CPU JIT compiled MoE dequantization and requantization kernel."""
+    if weight_block_size is not None:
+        assert scale_raw is not None
+        w_fp8 = w_raw.view(jnp.float8_e4m3fn)
+        block_h, block_w = weight_block_size
+        E_d, O_d, I_d = w_fp8.shape
+        num_b_o = O_d // block_h
+        num_b_i = I_d // block_w
+        w_blocked = w_fp8.reshape(E_d, num_b_o, block_h, num_b_i,
+                                  block_w).astype(jnp.float32)
+        s_expanded = scale_raw[:, :, None, :, None].astype(jnp.float32)
+        w_f32 = (w_blocked * s_expanded).reshape(E_d, O_d, I_d)
+    else:
+        w_f32 = w_raw.astype(jnp.float32)
+        E_d, O_d, I_d = w_f32.shape
+
+    if mask_range is not None:
+        local_real, padded_intermediate = mask_range
+        if is_w13:
+            w_f32 = w_f32.at[:, local_real:padded_intermediate, :].set(0.0)
+            w_f32 = w_f32.at[:, padded_intermediate + local_real:2 *
+                             padded_intermediate, :].set(0.0)
+        else:
+            w_f32 = w_f32.at[:, :, local_real:padded_intermediate].set(0.0)
+
+    if requant_block_size is not None:
+        block_size_q = requant_block_size
+    else:
+        block_size_q = I_d
+
+    num_blocks_q = I_d // block_size_q
+    w_req_blocked = w_f32.reshape(E_d, O_d, num_blocks_q, block_size_q)
+    abs_max = jnp.max(jnp.abs(w_req_blocked), axis=-1, keepdims=True)
+    scale_out = abs_max / 448.0
+    scale_inv_out = jnp.where(scale_out == 0.0, 0.0, 1.0 / scale_out)
+    w_q = jnp.clip(w_req_blocked * scale_inv_out, -448.0,
+                   448.0).astype(jnp.float8_e4m3fn)
+    w_q = w_q.reshape(E_d, O_d, I_d)
+    scale_out = scale_out.squeeze(-1)
+
+    if is_w13 and activation == "swigluoai":
+        w1 = w_q[:, ::2, :]
+        w3 = w_q[:, 1::2, :]
+        w_q = jnp.concatenate([w1, w3], axis=1)
+        s1 = scale_out[:, ::2, :]
+        s3 = scale_out[:, 1::2, :]
+        scale_out = jnp.concatenate([s1, s3], axis=1)
+
+    w_q = w_q.transpose((0, 2, 1))
+    scale_out = scale_out.astype(jnp.float32).transpose((0, 2, 1))
+    scale_out = jnp.expand_dims(scale_out, axis=2)
+
+    return w_q.view(jnp.uint8), scale_out
+
+
+_jax_cpu_moe_repack_kernel = jax.jit(
+    _jax_cpu_moe_repack_kernel,
+    static_argnames=(
+        "weight_block_size",
+        "requant_block_size",
+        "activation",
+        "is_w13",
+        "mask_range",
+    ),
+)
+
+
+def _execute_jax_cpu_repack(
+    weight_torch: torch.Tensor,
+    scale_torch: torch.Tensor | None,
+    *,
+    weight_block_size: tuple[int, int] | None,
+    requant_block_size: int | None,
+    activation: str,
+    is_w13: bool,
+    mask_range: tuple[int, int] | None,
+    target_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cpu_dev = jax.devices("cpu")[0]
+
+    w_cpu = weight_torch.data.to("cpu", copy=False)
+    if w_cpu.dtype == torch.float8_e4m3fn:
+        w_np = w_cpu.view(torch.uint8).numpy()
+    else:
+        w_np = w_cpu.float().numpy()
+
+    s_np = (scale_torch.data.to("cpu", copy=False).float().numpy()
+            if scale_torch is not None else None)
+
+    w_jax = jax.device_put(w_np, device=cpu_dev)
+    s_jax = jax.device_put(s_np, device=cpu_dev) if s_np is not None else None
+
+    out_w_jax, out_s_jax = _jax_cpu_moe_repack_kernel(
+        w_jax,
+        s_jax,
+        weight_block_size=weight_block_size,
+        requant_block_size=requant_block_size,
+        activation=activation,
+        is_w13=is_w13,
+        mask_range=mask_range,
+    )
+    out_w_jax.block_until_ready()
+
+    w_uint8 = np.asarray(out_w_jax).copy()
+    s_f32 = np.asarray(out_s_jax).copy()
+    del out_w_jax, out_s_jax, w_jax, s_jax
+
+    w_final = (torch.from_numpy(w_uint8).view(
+        torch.float8_e4m3fn).to(target_device))
+    s_final = torch.from_numpy(s_f32).to(target_device)
+    return w_final, s_final
+
+
 def _process_fp8_moe_weights(
     layer: FusedMoE,
     *,
@@ -351,14 +476,15 @@ def _process_fp8_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Dequantize and requantize FP8 MoE weights for the TPU GMM kernel.
+    """Dequantize and requantize FP8 MoE weights via multi-core JAX CPU JIT compilation.
 
     Returns (w13_weight, w13_scale, w2_weight, w2_scale,
              requant_dtype_name, requant_block_size).
     """
     desired_quant_dtype, requant_dtype, requant_block_size = (
         _get_moe_quant_config(
-            "[MoE requantization]: re-quantizing MoE weights"))
+            "[MoE requantization]: re-quantizing MoE weights via multi-core JAX CPU JIT"
+        ))
 
     # Validate block alignment
     block_h, block_w = weight_block_size
@@ -371,39 +497,38 @@ def _process_fp8_moe_weights(
                 f"block size, got {name}.shape={tuple(weight.shape)} and "
                 f"block_size={weight_block_size}.")
 
-    # Dequantize from checkpoint FP8 to float32
-    w13 = dequantize_tensor(
-        layer.w13_weight.data,
-        layer.w13_weight_scale_inv.data,
-        axis=(1, 2),
-        out_dtype=torch.float32,
-    )
-    w2 = dequantize_tensor(
-        layer.w2_weight.data,
-        layer.w2_weight_scale_inv.data,
-        axis=(1, 2),
-        out_dtype=torch.float32,
-    )
+    target_device = layer.w13_weight.data.device
     padded_intermediate = layer.moe_config.intermediate_size_per_partition
     unpadded_intermediate = (
         layer.moe_config.intermediate_size_per_partition_unpadded)
+    mask_range = None
     if padded_intermediate != unpadded_intermediate:
         full_intermediate = unpadded_intermediate * layer.tp_size
         local_start = padded_intermediate * layer.tp_rank
         local_real = max(
             0, min(padded_intermediate, full_intermediate - local_start))
         if local_real < padded_intermediate:
-            w13[:, local_real:padded_intermediate, :] = 0
-            w13[:, padded_intermediate + local_real:2 *
-                padded_intermediate, :] = 0
-            w2[:, :, local_real:padded_intermediate] = 0
+            mask_range = (local_real, padded_intermediate)
 
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
-        quant_dtype=requant_dtype,
-        block_size=requant_block_size,
+    w13, w13_scale = _execute_jax_cpu_repack(
+        layer.w13_weight.data,
+        layer.w13_weight_scale_inv.data,
+        weight_block_size=weight_block_size,
+        requant_block_size=requant_block_size,
         activation=activation,
+        is_w13=True,
+        mask_range=mask_range,
+        target_device=target_device,
+    )
+    w2, w2_scale = _execute_jax_cpu_repack(
+        layer.w2_weight.data,
+        layer.w2_weight_scale_inv.data,
+        weight_block_size=weight_block_size,
+        requant_block_size=requant_block_size,
+        activation=activation,
+        is_w13=False,
+        mask_range=mask_range,
+        target_device=target_device,
     )
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
@@ -415,23 +540,36 @@ def _quantize_bf16_moe_weights(
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
            | None]:
-    """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
+    """Quantize BF16 MoE weights to FP8 via multi-core JAX CPU JIT compilation.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
     weights instead of dequantizing from FP8 first.
     """
     desired_quant_dtype, requant_dtype, requant_block_size = (
-        _get_moe_quant_config("[MoE online FP8]: quantizing BF16 MoE weights"))
+        _get_moe_quant_config(
+            "[MoE online FP8]: quantizing BF16 MoE weights via multi-core JAX CPU JIT"
+        ))
 
-    w13 = layer.w13_weight.data.to(torch.float32)
-    w2 = layer.w2_weight.data.to(torch.float32)
-
-    w13, w13_scale, w2, w2_scale = _quantize_and_format_moe_weights(
-        w13,
-        w2,
-        quant_dtype=requant_dtype,
-        block_size=requant_block_size,
+    target_device = layer.w13_weight.data.device
+    w13, w13_scale = _execute_jax_cpu_repack(
+        layer.w13_weight.data,
+        None,
+        weight_block_size=None,
+        requant_block_size=requant_block_size,
         activation=activation,
+        is_w13=True,
+        mask_range=None,
+        target_device=target_device,
+    )
+    w2, w2_scale = _execute_jax_cpu_repack(
+        layer.w2_weight.data,
+        None,
+        weight_block_size=None,
+        requant_block_size=requant_block_size,
+        activation=activation,
+        is_w13=False,
+        mask_range=None,
+        target_device=target_device,
     )
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size

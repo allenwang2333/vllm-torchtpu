@@ -1082,11 +1082,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Executes complete TPU multi-head latent attention evaluation.
-
-        Relocating execution inside the backend implementation decouples out-of-tree PyTorch
-        wrappers from custom call building right while eliminating dynamic FP32 casting overhead.
-        """
+        """Executes complete TPU multi-head latent attention evaluation."""
         assert isinstance(
             q, tuple) and len(q) == 2, "q must be a tuple of (q_nope, q_pe)"
         q_nope, q_pe = q
