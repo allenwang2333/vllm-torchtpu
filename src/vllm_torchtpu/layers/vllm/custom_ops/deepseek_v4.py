@@ -1029,9 +1029,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         rank = get_tensor_model_parallel_rank()
         n_local_heads = self.mla_attn.n_local_heads
         local_sink = self.attn_sink[rank * n_local_heads : (rank + 1) * n_local_heads].clone()
-        # Deleted debug prints to prevent OOM on item() syncs
-        print(f"[DEBUG_SHAPES] rank={rank} swa_block_tables shape={swa_attn_metadata.block_tables.shape} main_page_indices shape={main_page_indices.shape} extra shape={extra.shape}", flush=True)
         output, new_sw_cache = self.attn_op(
+
             q,
             kv,
             sw_cache,
