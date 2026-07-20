@@ -90,7 +90,8 @@ def quantized_matmul_kernel(
     batch_block_size = tuned_value.batch_block_size
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
-    n_lane_multiplier = tuned_value.n_lane_multiplier
+    n_lane_multiplier = min(tuned_value.n_lane_multiplier, max(1, out_block_size // MXU_SIZE))
+
     # The num_blocks should become 1 in case of channelwise.
     channelwise_weight_scale = block_size == orig_n_in
     if channelwise_weight_scale and in_block_size != orig_n_in:
