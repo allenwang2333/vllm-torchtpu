@@ -223,9 +223,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         rank = dist.get_rank() if dist.is_initialized() else 0
         cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
         cache_path = None
+        w13_shape_str = f"{layer.w13_weight.shape[1]}x{layer.w13_weight.shape[2]}" if hasattr(layer, "w13_weight") and layer.w13_weight.ndim >= 3 else "default"
         if cache_dir and layer_idx is not None:
             os.makedirs(cache_dir, exist_ok=True)
-            cache_path = os.path.join(cache_dir, f"rank_{rank}_layer_{layer_idx}.pt")
+            cache_path = os.path.join(cache_dir, f"rank_{rank}_layer_{layer_idx}_{w13_shape_str}.pt")
+
 
         loaded_from_cache = False
         if cache_path and os.path.exists(cache_path):
