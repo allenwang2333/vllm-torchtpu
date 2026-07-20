@@ -42,6 +42,16 @@ try:
   # protect against this, see @requires_jax in PT/XLA repo.
   import jax
   import jax.export
+  try:
+    from jax.experimental.pallas import tpu as pltpu
+    _orig_compiler_params_init = pltpu.CompilerParams.__init__
+    def _patched_compiler_params_init(self, *args, **kwargs):
+      kwargs.pop("needs_layout_passes", None)
+      _orig_compiler_params_init(self, *args, **kwargs)
+    pltpu.CompilerParams.__init__ = _patched_compiler_params_init
+  except Exception:
+    pass
+
 except ImportError as ex:
   raise ImportError(
       "JAX/Pallas is not available. Please install JAX to use this API."
