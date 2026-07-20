@@ -23,8 +23,12 @@ def _apply_scoring_fn(scoring_fn: str,
         return scores.softmax(dim=-1)
     if scoring_fn == "sigmoid":
         return scores.sigmoid()
+    if scoring_fn == "sqrtsoftplus":
+        import torch.nn.functional as F
+        return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
+
 
 
 def select_experts(
