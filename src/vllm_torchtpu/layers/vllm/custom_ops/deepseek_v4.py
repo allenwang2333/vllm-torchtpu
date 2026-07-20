@@ -55,6 +55,8 @@ _indexer_op_cache = {}
 _attn_op_cache = {}
 
 from vllm_torchtpu.layers.common.sharding import ShardingAxisName
+BATCH_AXIS = getattr(ShardingAxisName, "BATCH", ShardingAxisName.ATTN_DATA)
+
 from vllm_torchtpu.kernels.deepseek_v4.compressor import (
     compressor_forward, compressor_forward_indexer)
 from vllm_torchtpu.kernels.deepseek_v4.mla import \
@@ -207,7 +209,7 @@ def _deepseek_v4_compressor_jax(
         return out + dummy_sum.astype(out.dtype)
 
     data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
-    cache_spec = get_valid_spec(mesh, ShardingAxisName.BATCH)
+    cache_spec = get_valid_spec(mesh, BATCH_AXIS)
     in_specs = (
         data_spec,  # kv_score
         P(),  # ape
@@ -472,7 +474,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             
         from jax.sharding import PartitionSpec as P
         attn_data_axis = ShardingAxisName.ATTN_DATA
-        batch_axis = ShardingAxisName.BATCH
+        batch_axis = BATCH_AXIS
         compressor_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
@@ -584,7 +586,7 @@ def _deepseek_v4_indexer_jax(
         )
 
     data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
-    cache_spec = get_valid_spec(mesh, ShardingAxisName.BATCH)
+    cache_spec = get_valid_spec(mesh, BATCH_AXIS)
     in_specs = (
         get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # q_rope
         get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # indexer_weights
@@ -661,7 +663,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         from jax.sharding import PartitionSpec as P
         attn_data_axis = ShardingAxisName.ATTN_DATA
         attn_head_axis = ShardingAxisName.ATTN_HEAD
-        batch_axis = ShardingAxisName.BATCH
+        batch_axis = BATCH_AXIS
         indexer_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
@@ -856,7 +858,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         from jax.sharding import PartitionSpec as P
         attn_data_axis = ShardingAxisName.ATTN_DATA
         attn_head_axis = ShardingAxisName.ATTN_HEAD
-        batch_axis = ShardingAxisName.BATCH
+        batch_axis = BATCH_AXIS
         extra_spec = P(batch_axis) if not is_csa else P(batch_axis, None)
         attn_jax_op = pallas.jax_op(
             op_name,
