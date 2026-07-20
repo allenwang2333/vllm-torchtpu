@@ -50,8 +50,17 @@ try:
       kwargs.pop("needs_layout_passes", None)
       _orig_compiler_params_init(self, *args, **kwargs)
     pltpu.CompilerParams.__init__ = _patched_compiler_params_init
-    if not hasattr(pl, "Indirect") and hasattr(pltpu, "Indirect"):
-      setattr(pl, "Indirect", pltpu.Indirect)
+    if not hasattr(pl, "Indirect"):
+      if hasattr(pltpu, "Indirect"):
+        setattr(pl, "Indirect", pltpu.Indirect)
+      else:
+        class Indirect:
+          def __init__(self, size=None):
+            self.size = size
+          def __repr__(self):
+            return f"Indirect({self.size})"
+        setattr(pl, "Indirect", Indirect)
+
   except Exception:
     pass
 
