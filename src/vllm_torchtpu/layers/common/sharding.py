@@ -184,9 +184,12 @@ class ShardingConfigManager:
             cache_dtype = vllm_config.cache_config.cache_dtype
             if cache_dtype == 'auto':
                 cache_dtype = vllm_config.model_config.dtype
-            kv_dtype = utils.get_jax_dtype_from_str_dtype(
-                cache_dtype) or jnp.bfloat16
-            packing = 4 // jnp.dtype(kv_dtype).itemsize
+            if isinstance(cache_dtype, str):
+                itemsize = 1 if ("fp8" in cache_dtype or "float8" in cache_dtype) else (2 if ("16" in cache_dtype or "bf16" in cache_dtype) else 4)
+            else:
+                itemsize = getattr(cache_dtype, "itemsize", 2)
+            packing = 4 // itemsize
+
             # When num_kv_heads * 2 / packing < TP, tensor parallelism would
             # duplicate KV heads across devices, wasting kv cache memory.
             # Use attention DP instead to reduce per-device num_kv_heads and
