@@ -33,6 +33,73 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import \
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
+from vllm.model_executor.models.deepseek_v2 import Indexer
+
+
+def _per_token_group_quant_fp8_tpu(
+    x: torch.Tensor, group_size: int = 128, eps: float = 1e-10, use_ue8m0: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_shape = x.shape
+    x_grouped = x.reshape(-1, group_size)
+    amax = torch.clamp(x_grouped.abs().max(dim=-1, keepdim=True).values, min=eps)
+    fp8_max = 448.0  # float8_e4m3fn max value
+    scale = amax / fp8_max
+    if use_ue8m0:
+        scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+    x_q = (x_grouped / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    scale = scale.reshape(orig_shape[:-1] + (orig_shape[-1] // group_size,))
+    return x_q.reshape(orig_shape), scale
+
+
+class VllmTPUIndexer(Indexer):
+    """TPU-optimized out-of-tree wrapper for Indexer."""
+
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        # Fused wk + weights_proj: one GEMM, then split
+        kw, _ = self.wk_weights_proj(hidden_states)
+        k = kw[:, : self.head_dim]
+        weights = kw[:, self.head_dim :]
+
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+
+        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        # Note: RoPE (NeoX) can introduce extra leading dimensions during
+        # compilation so we need to reshape back to token-flattened shapes
+        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+
+        # `rotary_emb` is shape-preserving; `q_pe` is already
+        # [num_tokens, n_head, rope_dim].
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+
+        # we only quant q here since k quant is fused with cache insertion
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = _per_token_group_quant_fp8_tpu(
+            q,
+            self.quant_block_size,
+            use_ue8m0=self.scale_fmt is not None,
+        )
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_head, 1)
+
+        weights = (
+            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
+        )
+        weights = weights.squeeze(-1)
+
+        return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
 class VllmTPUMLAAttention(MLAAttention):
