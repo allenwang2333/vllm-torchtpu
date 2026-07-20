@@ -45,6 +45,11 @@ scaling.
    - Returns output tensor
 """
 
+import os
+import sys
+# Disable JAX preallocation so it doesn't preallocate TPU HBM during weight loading.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 from typing import Optional
 
 import torch
@@ -67,14 +72,23 @@ from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Config,
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
+from enum import Enum
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
-from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
+from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed, quantize_tensor_to_fp4, pack_fp4_indices
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_vllm_model_wrapper_context
 from vllm_torchtpu.logger import init_logger
+
+class MoEBackend(Enum):
+    FUSED_MOE = "fused_moe"
+    GMM_TP = "gmm_tp"
+    GMM_EP = "gmm_ep"
 
 logger = init_logger(__name__)
 
@@ -146,6 +160,13 @@ def _get_activation_str(activation) -> str:
                                        'value') else str(activation)
 
 
+REQUANTIZED_BLOCK_SIZE = (
+    int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
+    if envs.MOE_REQUANTIZE_BLOCK_SIZE
+    else 32
+)
+
+
 class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
@@ -165,81 +186,284 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
-        self.mxfp4_backend = Mxfp4Backend.TRITON
-        self.apply_monolithic = self._select_monolithic()
-
-    def _select_monolithic(self):
-        return self._forward_monolithic_tpu
+        self.mxfp4_backend = Mxfp4Backend.NONE
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, FusedMoE)
-        assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
+        has_bias = layer.moe_config.has_bias
+        device = layer.w13_weight.device
+
+        # 1. Force use_ep = True if EP is enabled on the platform
+        if layer.ep_size > 1:
+            layer.moe_config.moe_parallel_config.use_ep = True
 
         activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
 
-        w13_weight = dequantize_mxfp4_packed(
-            layer.w13_weight.data.to("cpu"),
-            layer.w13_weight_scale.data.to("cpu"),
-            axis=-1,
-            out_dtype=torch.bfloat16,
-        ).to(layer.w13_weight.device)
-        w2_weight = dequantize_mxfp4_packed(
-            layer.w2_weight.data.to("cpu"),
-            layer.w2_weight_scale.data.to("cpu"),
-            axis=-1,
-            out_dtype=torch.bfloat16,
-        ).to(layer.w2_weight.device)
+        # Determine the MoE backend and slice ranges
+        if layer.moe_config.moe_parallel_config.use_ep:
+            moe_backend = MoEBackend.GMM_EP
+            ep_size = layer.ep_size
+            ep_rank = layer.ep_rank
+            base = layer.global_num_experts // ep_size
+            remainder = layer.global_num_experts % ep_size
+            start_idx = ep_rank * base + min(ep_rank, remainder)
+            end_idx = start_idx + base + (1 if ep_rank < remainder else 0)
+        else:
+            moe_backend = MoEBackend.GMM_TP
+            start_idx = 0
+            end_idx = layer.global_num_experts
 
-        w13_interleave = activation_str == "swigluoai"
-        if w13_interleave:
-            w1_weight = w13_weight[:, ::2, :]
-            w3_weight = w13_weight[:, 1::2, :]
-            w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
+        # Get TP size for reordering
+        tp_size = get_tensor_model_parallel_world_size()
 
-        w13_weight = w13_weight.transpose(1, 2).contiguous()
-        w2_weight = w2_weight.transpose(1, 2).contiguous()
+        import os
+        import torch.distributed as dist
+        layer_idx = getattr(layer, "layer_idx", None)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
+        cache_path = None
+        if cache_dir and layer_idx is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"rank_{rank}_layer_{layer_idx}.pt")
 
-        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        loaded_from_cache = False
+        if cache_path and os.path.exists(cache_path):
+            try:
+                print(f"[PATCH] Loading pre-quantized parameters from cache: {cache_path}", file=sys.stderr, flush=True)
+                logger.warning("Loading pre-quantized parameters from cache: %s", cache_path)
+                checkpoint = torch.load(cache_path, map_location="cpu")
+                w13_weight_packed = checkpoint["w13_weight_packed"]
+                w2_weight_packed = checkpoint["w2_weight_packed"]
+                w13_weight_scale = checkpoint["w13_weight_scale"]
+                w2_weight_scale = checkpoint["w2_weight_scale"]
+                w13_bias_padded = checkpoint.get("w13_bias_padded", None)
+                w2_bias_padded = checkpoint.get("w2_bias_padded", None)
+                loaded_from_cache = True
+                
+                # Delete original TPU parameters immediately to free up HBM
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale
+                del layer.w2_weight_scale
+                if has_bias:
+                    del layer.w13_bias
+                    del layer.w2_bias
+                import gc
+                gc.collect()
+            except Exception as e:
+                logger.warning("Failed to load cached parameters from %s: %s", cache_path, e)
 
-        layer.w13_weight_scale = None
-        layer.w2_weight_scale = None
+        if not loaded_from_cache:
+            # The weights are already sharded along the expert dimension by the vLLM loader.
+            # We execute dequantization and re-quantization on the host CPU layer by layer
+            # to prevent PyTorch-XLA from compiling massive lazy graphs of intermediate float32
+            # tensors on the TPU device, which would cause compiler memory exhaustion.
+            w13_weight_packed = layer.w13_weight.data.to("cpu")
+            w13_weight_scale = layer.w13_weight_scale.data.to("cpu")
+            w13_bias = layer.w13_bias.data.to("cpu") if has_bias and layer.w13_bias is not None else None
 
-        if layer.w13_bias is not None:
-            w13_bias = layer.w13_bias.data
+            w2_weight_packed = layer.w2_weight.data.to("cpu")
+            w2_weight_scale = layer.w2_weight_scale.data.to("cpu")
+            w2_bias = layer.w2_bias.data.to("cpu") if has_bias and layer.w2_bias is not None else None
+
+            # Now that we have fetched them to host CPU memory, delete the original TPU parameters to free HBM
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            if has_bias:
+                del layer.w13_bias
+                del layer.w2_bias
+            import gc
+            gc.collect()
+
+            if layer_idx == 0:
+                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w13_weight_packed: Mean={w13_weight_packed.float().mean():.6f} Max={w13_weight_packed.max()} Min={w13_weight_packed.min()}", flush=True)
+                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w13_weight_scale: Mean={w13_weight_scale.float().mean():.6f} Max={w13_weight_scale.max()} Min={w13_weight_scale.min()}", flush=True)
+                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w2_weight_packed: Mean={w2_weight_packed.float().mean():.6f} Max={w2_weight_packed.max()} Min={w2_weight_packed.min()}", flush=True)
+                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w2_weight_scale: Mean={w2_weight_scale.float().mean():.6f} Max={w2_weight_scale.max()} Min={w2_weight_scale.min()}", flush=True)
+
+            # 2. Dequantize checkpoint weights (block-32 MXFP4) to FP32
+            # Quantization axis is hidden_size (axis 2)
+            w13_weight = dequantize_mxfp4_packed(
+                w13_weight_packed, w13_weight_scale, axis=2, out_dtype=torch.float32)
+
+            # Quantization axis is intermediate_size (axis 2)
+            w2_weight = dequantize_mxfp4_packed(
+                w2_weight_packed, w2_weight_scale, axis=2, out_dtype=torch.float32)
+
+            if layer_idx == 0:
+                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w13_weight: Mean={w13_weight.mean():.6f} Max={w13_weight.max()} Min={w13_weight.min()} HasNaN={torch.isnan(w13_weight).any()}", flush=True)
+                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w2_weight: Mean={w2_weight.mean():.6f} Max={w2_weight.max()} Min={w2_weight.min()} HasNaN={torch.isnan(w2_weight).any()}", flush=True)
+
+            w13_interleave = activation_str == "swigluoai"
+
+            # 2. Uninterleave w13 if needed (swigluoai checkpoint layout has interleaved w1/w3)
             if w13_interleave:
-                w1_bias = w13_bias[:, ::2]
-                w3_bias = w13_bias[:, 1::2]
-                w13_bias = torch.cat([w1_bias, w3_bias], dim=1)
+                w1 = w13_weight[:, ::2, :]
+                w3 = w13_weight[:, 1::2, :]
+                w13_weight = torch.cat([w1, w3], dim=1)
+                if w13_bias is not None:
+                    b1 = w13_bias[:, ::2]
+                    b3 = w13_bias[:, 1::2]
+                    w13_bias = torch.cat([b1, b3], dim=1)
 
-            layer.w13_bias = torch.nn.Parameter(
-                w13_bias.unsqueeze(1).to(torch.float32),
-                requires_grad=False,
-            )
-        if layer.w2_bias is not None:
-            layer.w2_bias = torch.nn.Parameter(
-                layer.w2_bias.data.unsqueeze(1).to(torch.float32),
-                requires_grad=False,
-            )
+            # 3. Calculate padded dimensions for block-512 and GMM alignment
+            # Note: weights are already sharded by vLLM, so these are local dimensions.
+            orig_hidden_size = w2_weight.shape[1]
+            orig_local_intermediate_size = w2_weight.shape[2]
 
-        if layer.w13_weight.device.type == "tpu":
+            w13_block_size = REQUANTIZED_BLOCK_SIZE
+            w2_block_size = REQUANTIZED_BLOCK_SIZE
+            w2_block_size = min(w2_block_size, orig_local_intermediate_size)
+
+            # Align local intermediate dimension to 128 for GMM kernel
+            local_intermediate_size_padded = (orig_local_intermediate_size + 128 - 1) // 128 * 128
+            hidden_size_padded = (orig_hidden_size + w13_block_size - 1) // w13_block_size * w13_block_size
+
+            # 4. Pad local tensors
+            # w13_weight has shape [num_experts, 2 * orig_local_intermediate_size, orig_hidden_size]
+            # We split it into w1 and w3 to pad the intermediate dimension individually
+            w1_weight = w13_weight[:, :orig_local_intermediate_size, :]
+            w3_weight = w13_weight[:, orig_local_intermediate_size:, :]
+            
+            pad_w13_intermediate = local_intermediate_size_padded - orig_local_intermediate_size
+            pad_w13_hidden = hidden_size_padded - orig_hidden_size
+            
+            pad_spec_w13 = (0, pad_w13_hidden, 0, pad_w13_intermediate)
+            w1_weight_padded = torch.nn.functional.pad(w1_weight, pad_spec_w13)
+            w3_weight_padded = torch.nn.functional.pad(w3_weight, pad_spec_w13)
+            w13_weight_padded = torch.cat([w1_weight_padded, w3_weight_padded], dim=1)
+            
+            if w13_bias is not None:
+                b1_bias = w13_bias[:, :orig_local_intermediate_size]
+                b3_bias = w13_bias[:, orig_local_intermediate_size:]
+                b1_bias_padded = torch.nn.functional.pad(b1_bias, (0, pad_w13_intermediate))
+                b3_bias_padded = torch.nn.functional.pad(b3_bias, (0, pad_w13_intermediate))
+                w13_bias_padded = torch.cat([b1_bias_padded, b3_bias_padded], dim=1)
+            else:
+                w13_bias_padded = None
+
+            # w2_weight has shape [num_experts, orig_hidden_size, orig_local_intermediate_size]
+            pad_spec_w2 = (0, local_intermediate_size_padded - orig_local_intermediate_size, 0, hidden_size_padded - orig_hidden_size)
+            w2_weight_padded = torch.nn.functional.pad(w2_weight, pad_spec_w2)
+            if w2_bias is not None:
+                w2_bias_padded = torch.nn.functional.pad(w2_bias, (0, hidden_size_padded - orig_hidden_size))
+            else:
+                w2_bias_padded = None
+
+            # 5. Quantize to FP8 (block-32) on TPU v6e, or FP4 (block-512) on other devices
+            is_tpu_v6e = False
+            try:
+                from vllm_torchtpu.tpu_info import get_tpu_type
+                tpu_type = get_tpu_type()
+                if tpu_type and tpu_type.startswith(("v5lite", "v6e")):
+                    is_tpu_v6e = True
+            except Exception as e:
+                logger.warning("Failed to detect TPU type, defaulting to native FP4 path: %s", e)
+
+            if is_tpu_v6e:
+                logger.info("TPU v6e detected. Re-quantizing expert weights to FP8 float8_e4m3fn (block_size=32)")
+                from vllm_torchtpu.layers.common.quantization import quantize_tensor
+                w13_weight_fp8, w13_weight_scale = quantize_tensor(
+                    w13_weight_padded, quant_dtype=torch.float8_e4m3fn, axis=2, block_size=32)
+                w2_weight_fp8, w2_weight_scale = quantize_tensor(
+                    w2_weight_padded, quant_dtype=torch.float8_e4m3fn, axis=2, block_size=32)
+
+                w13_weight_processed = w13_weight_fp8.transpose(1, 2).contiguous()
+                w2_weight_processed = w2_weight_fp8.transpose(1, 2).contiguous()
+
+                s13 = w13_weight_scale.transpose(1, 2).contiguous().to(torch.float32)
+                w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
+                s2 = w2_weight_scale.transpose(1, 2).contiguous().to(torch.float32)
+                w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
+            else:
+                w13_indices, w13_weight_scale = quantize_tensor_to_fp4(w13_weight_padded, axis=2, block_size=w13_block_size)
+                w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=2, block_size=w2_block_size)
+
+                w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2)).contiguous()
+                w2_weight_processed = pack_fp4_indices(w2_indices.transpose(1, 2)).contiguous()
+
+                s13 = w13_weight_scale.transpose(1, 2).contiguous()
+                w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
+                s2 = w2_weight_scale.transpose(1, 2).contiguous()
+                w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
+
+            if w13_bias_padded is not None:
+                w13_bias_padded = w13_bias_padded.unsqueeze(1)
+            if w2_bias_padded is not None:
+                w2_bias_padded = w2_bias_padded.unsqueeze(1)
+
+            if cache_path:
+                try:
+                    logger.warning("Saving pre-quantized parameters to cache: %s", cache_path)
+                    checkpoint_dict = {
+                        "w13_weight_packed": w13_weight_processed.to("cpu"),
+                        "w2_weight_packed": w2_weight_processed.to("cpu"),
+                        "w13_weight_scale": w13_weight_scale.to("cpu"),
+                        "w2_weight_scale": w2_weight_scale.to("cpu"),
+                    }
+                    if w13_bias_padded is not None:
+                        checkpoint_dict["w13_bias_padded"] = w13_bias_padded.to("cpu")
+                    if w2_bias_padded is not None:
+                        checkpoint_dict["w2_bias_padded"] = w2_bias_padded.to("cpu")
+                    torch.save(checkpoint_dict, cache_path)
+                except Exception as e:
+                    logger.warning("Failed to save cached parameters to %s: %s", cache_path, e)
+        else:
+            w13_weight_processed = w13_weight_packed
+            w2_weight_processed = w2_weight_packed
+
+        # Convert back to PyTorch-XLA parameters (retaining float/uint8 dtypes)
+        from torch.nn.parameter import Parameter
+
+        def to_xla_parameter(tensor: torch.Tensor) -> Parameter:
+            if tensor is None:
+                return None
+            xla_tensor = tensor.to(device=device)
+            return Parameter(xla_tensor, requires_grad=False)
+
+        layer.w13_weight = to_xla_parameter(w13_weight_processed)
+        layer.w2_weight = to_xla_parameter(w2_weight_processed)
+
+        layer.w13_weight_scale = to_xla_parameter(w13_weight_scale)
+        layer.w2_weight_scale = to_xla_parameter(w2_weight_scale)
+
+        if has_bias:
+            layer.w13_bias = to_xla_parameter(w13_bias_padded)
+            layer.w2_bias = to_xla_parameter(w2_bias_padded)
+
+        if device.type == "tpu":
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
-            if layer.w13_bias is not None:
+            if has_bias:
                 sync.synchronize(layer.w13_bias, wait=True)
-            if layer.w2_bias is not None:
                 sync.synchronize(layer.w2_bias, wait=True)
 
-        logger.info_once(
-            "MXFP4 weights dequantized to bfloat16 and transposed for GMM kernel."
+        del w13_weight_packed, w2_weight_packed, w13_weight_scale, w2_weight_scale
+        if "w13_weight" in locals():
+            del w13_weight, w2_weight
+        if "w13_weight_padded" in locals():
+            del w13_weight_padded, w2_weight_padded, w1_weight, w3_weight
+            del w1_weight_padded, w3_weight_padded
+        if "w13_indices" in locals():
+            del w13_indices, w2_indices
+        import gc
+        gc.collect()
+
+        print("[PATCH] MXFP4 weights processed and stored as native FP4 for GMM kernel.", file=sys.stderr, flush=True)
+        logger.warning(
+            "MXFP4 weights processed and stored as native FP4 for GMM kernel."
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             experts_start=moe_routing.get_experts_start(layer),
+            has_bias=has_bias,
         )
 
     def get_fused_moe_quant_config(
@@ -249,15 +473,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
 
-    def _forward_monolithic_tpu(
+    def apply_monolithic(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
@@ -281,19 +506,20 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 layer=layer,
             )
 
-        # Step 2: EP global->local remap happens inside fused_moe_gmm via an
-        # elementwise subtract from `experts_start` (scalar).
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
+
+
+
