@@ -504,8 +504,9 @@ class TpuPlatform(Platform):
     simple_compile_backend: str = "tpu"
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4", "deepseek_v4_fp8"
     ]
+
 
     additional_env_vars: list[str] = [
         "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
