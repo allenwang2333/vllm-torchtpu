@@ -516,8 +516,20 @@ class VllmDeepseekCompressor(DeepseekCompressor):
     ) -> None:
         kv_score = kv_score.to(torch.float32)
         
-        attn_metadata = get_forward_context().attn_metadata
-        state_metadata = attn_metadata[self.state_cache.prefix]
+        attn_ctx = get_forward_context().attn_metadata
+        if isinstance(attn_ctx, dict):
+            prefix_key = getattr(getattr(self, "state_cache", None), "prefix", None)
+            state_metadata = attn_ctx.get(prefix_key, next(iter(attn_ctx.values()), None))
+        else:
+            state_metadata = attn_ctx
+
+        if state_metadata is not None:
+            state_req_dist = state_metadata.request_distribution
+            state_q_start_loc = state_metadata.query_start_loc
+            state_seq_lens = state_metadata.seq_lens
+            state_block_tables = state_metadata.block_tables.flatten()
+        else:
+            state_req_dist = state_q_start_loc = state_seq_lens = state_block_tables = None
         
         orig_cache = self.k_cache.kv_cache
         updated_cache = self.compressor_op(
@@ -526,12 +538,13 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             self.norm.weight.clone(),
             rotary_emb.cos_sin_cache,
             positions,
-            state_metadata.request_distribution,
-            state_metadata.query_start_loc,
-            state_metadata.seq_lens,
-            state_metadata.block_tables.flatten(),
+            state_req_dist,
+            state_q_start_loc,
+            state_seq_lens,
+            state_block_tables,
             orig_cache,
         )
+
         
         orig_cache.copy_(updated_cache)
 
