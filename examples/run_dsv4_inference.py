@@ -17,7 +17,9 @@ try:
         # 2. Load our patched module as a temporary standalone module
         spec = importlib.util.spec_from_file_location("patched_pallas_temp", patch_path)
         patched_module = importlib.util.module_from_spec(spec)
+        sys.modules["patched_pallas_temp"] = patched_module
         spec.loader.exec_module(patched_module)
+
         
         # 3. Patch both package and submodule namespaces
         for target in [original_pallas, original_pallas_submodule]:

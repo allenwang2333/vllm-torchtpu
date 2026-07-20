@@ -32,7 +32,6 @@ import torch.library
 from torch_tpu._internal.pallas import _compat
 from torch_tpu._internal.pallas import tpu_torch_pallas
 
-sys.modules["patched_pallas_temp"] = sys.modules[__name__]
 
 
 
