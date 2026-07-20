@@ -275,7 +275,7 @@ class TPUModelRunner(GPUModelRunner):
 
             InputBatch.get_pooling_metadata = get_pooling_metadata
 
-        # Parent already set: vllm_config, *_config, device, pin_memory, dtype,
+        # Parent already set: vllm_config, *_config, device, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
         # inputs_embeds_size, mm_registry, uses_mrope, supports_mm_inputs,
         # kv_caches, encoder_cache, shared_kv_cache_layers, requests,

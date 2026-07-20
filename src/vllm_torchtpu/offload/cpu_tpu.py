@@ -491,7 +491,7 @@ class SingleDirectionOffloadingHandler:
 
     def _stash_req_id_for_job(self, job_id: int, req_id: str) -> None:
         """Called from monkey-patched `OffloadingConnectorWorker.
-        start_kv_transfers` immediately before `worker.transfer_async`,
+        start_kv_transfers_with_flush` immediately before `worker.submit_load`,
         so the downstream `self.transfer_async` can tag the Transfer
         with its owning req_id without a framework signature change.
         """
