@@ -997,6 +997,17 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
 
+        if swa_attn_metadata is not None:
+            swa_seq_lens = swa_attn_metadata.seq_lens
+            swa_block_tables = swa_attn_metadata.block_tables
+            swa_query_start_loc = swa_attn_metadata.query_start_loc
+            swa_request_distribution = swa_attn_metadata.request_distribution
+        else:
+            swa_seq_lens = None
+            swa_block_tables = None
+            swa_query_start_loc = None
+            swa_request_distribution = None
+
         if not swa_only and main_attn_metadata is not None:
             main_cache_kv = getattr(getattr(self.mla_attn, "mla_attn", None), "kv_cache", sw_cache)
             main_kv_lens = main_attn_metadata.seq_lens // self.compress_ratio
@@ -1005,10 +1016,10 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             main_distribution = main_attn_metadata.request_distribution
         elif swa_attn_metadata is not None:
             main_cache_kv = sw_cache
-            main_kv_lens = swa_attn_metadata.seq_lens
-            main_page_indices = swa_attn_metadata.block_tables
-            main_cu_q_lens = swa_attn_metadata.query_start_loc
-            main_distribution = swa_attn_metadata.request_distribution
+            main_kv_lens = swa_seq_lens
+            main_page_indices = swa_block_tables
+            main_cu_q_lens = swa_query_start_loc
+            main_distribution = swa_request_distribution
         else:
             main_cache_kv = sw_cache
             main_kv_lens = None
@@ -1016,9 +1027,6 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             main_cu_q_lens = None
             main_distribution = None
 
-
-
-            
         if is_csa:
             assert topk_indices is not None
             extra = topk_indices
@@ -1030,14 +1038,13 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         n_local_heads = self.mla_attn.n_local_heads
         local_sink = self.attn_sink[rank * n_local_heads : (rank + 1) * n_local_heads].clone()
         output, new_sw_cache = self.attn_op(
-
             q,
             kv,
             sw_cache,
-            swa_attn_metadata.seq_lens,
-            swa_attn_metadata.block_tables,
-            swa_attn_metadata.query_start_loc,
-            swa_attn_metadata.request_distribution,
+            swa_seq_lens,
+            swa_block_tables,
+            swa_query_start_loc,
+            swa_request_distribution,
             main_cache_kv,
             main_kv_lens,
             extra,
@@ -1046,6 +1053,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             main_distribution,
             local_sink,
         )
+
         orig_sw_cache.copy_(new_sw_cache)
         return output
 
