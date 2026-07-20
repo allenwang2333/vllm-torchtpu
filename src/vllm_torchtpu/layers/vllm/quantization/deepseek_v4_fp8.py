@@ -38,8 +38,10 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+@register_quantization_config(DEEPSEEK_V4_FP8)
 @register_quantization_config(get_tpu_quant_method(DEEPSEEK_V4_FP8))
 class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
+
     """TPU quantization config for "deepseek_v4_fp8" format.
 
     Registered under "tpu-deepseek_v4_fp8".
