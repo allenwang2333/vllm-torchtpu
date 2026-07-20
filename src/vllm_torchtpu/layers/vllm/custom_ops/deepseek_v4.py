@@ -987,8 +987,12 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             swa_attn_metadata = attn_ctx
             main_attn_metadata = attn_ctx
 
-        orig_sw_cache = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "kv_cache", None) or getattr(self.mla_attn, "kv_cache", None)
+        if getattr(self.mla_attn, "swa_cache_layer", None) is not None:
+            orig_sw_cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache", None)
+        else:
+            orig_sw_cache = getattr(self.mla_attn, "kv_cache", None)
         sw_cache = orig_sw_cache
+
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
