@@ -979,9 +979,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
         
-        swa_layer_name = self.mla_attn.swa_cache_layer.prefix
-        swa_attn_metadata = attn_metadata[swa_layer_name]
-        orig_sw_cache = self.mla_attn.swa_cache_layer.kv_cache
+        swa_layer_name = self.mla_attn.swa_cache_layer.prefix if getattr(self.mla_attn, "swa_cache_layer", None) is not None else self.mla_attn.prefix
+        swa_attn_metadata = attn_metadata.get(swa_layer_name) if swa_layer_name in attn_metadata else attn_metadata.get(self.mla_attn.prefix)
+        orig_sw_cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache", None) if getattr(self.mla_attn, "swa_cache_layer", None) is not None else getattr(self.mla_attn, "kv_cache", None)
         sw_cache = orig_sw_cache
         
         swa_only = self.compress_ratio <= 1
@@ -989,8 +989,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         
         if not swa_only:
             main_layer_name = self.mla_attn.prefix
-            main_attn_metadata = attn_metadata[main_layer_name]
-            main_cache_kv = self.mla_attn.mla_attn.kv_cache
+            main_attn_metadata = attn_metadata.get(main_layer_name, swa_attn_metadata)
+            main_cache_kv = getattr(self.mla_attn.mla_attn, "kv_cache", sw_cache) if hasattr(self.mla_attn, "mla_attn") else sw_cache
+
             
             main_kv_lens = main_attn_metadata.seq_lens // self.compress_ratio
             main_page_indices = main_attn_metadata.block_tables
