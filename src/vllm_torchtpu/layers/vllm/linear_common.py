@@ -84,12 +84,15 @@ def _build_quantized_matmul_op() -> Callable:
     return op
 
 
-# Pre-warmed at import time to prevent PyTorch Dynamo graph breaks during model forward passes.
-_quantized_matmul_kernel_op: Callable = _build_quantized_matmul_op()
+_quantized_matmul_kernel_op: Optional[Callable] = None
 
 
 def _get_quantized_matmul_op() -> Callable:
+    global _quantized_matmul_kernel_op
+    if _quantized_matmul_kernel_op is None:
+        _quantized_matmul_kernel_op = _build_quantized_matmul_op()
     return _quantized_matmul_kernel_op
+
 
 
 
