@@ -315,6 +315,20 @@ def _patch_mla_prefill_backend() -> None:
     logger.info("Applied TPU patch: dummy MLA prefill backend.")
 
 
+def _patch_deepseek_v2_indexer() -> None:
+    """Replace vLLM Indexer with VllmTPUIndexer for TPU execution."""
+    from vllm.model_executor.models import deepseek_v2
+    from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
+        VllmTPUIndexer
+
+    if getattr(deepseek_v2, "_tpu_indexer_patch", False):
+        return
+
+    deepseek_v2.Indexer = VllmTPUIndexer
+    deepseek_v2._tpu_indexer_patch = True
+    logger.info("Applied TPU patch: Indexer replaced with VllmTPUIndexer.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations

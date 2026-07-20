@@ -262,9 +262,11 @@ def apply_tpu_patches() -> None:
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
+                               _patch_deepseek_v2_indexer,
                                _patch_mla_prefill_backend,
                                _patch_multiproc_worker_global_rank_env)
     _patch_mla_prefill_backend()
+    _patch_deepseek_v2_indexer()
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
