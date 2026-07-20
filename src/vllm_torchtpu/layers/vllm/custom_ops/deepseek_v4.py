@@ -721,19 +721,31 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         
         kv_cache = self.k_cache.kv_cache
         
-        attn_metadata_dict = get_forward_context().attn_metadata
-        attn_metadata = attn_metadata_dict[self.k_cache.prefix]
-        
-        print(f"[DEBUG_INDEXER_SHAPES] block_tables shape={attn_metadata.block_tables.shape} seq_lens shape={attn_metadata.seq_lens.shape}", flush=True)
+        attn_ctx = get_forward_context().attn_metadata
+        if isinstance(attn_ctx, dict):
+            prefix_key = getattr(getattr(self, "k_cache", None), "prefix", None)
+            attn_metadata = attn_ctx.get(prefix_key, next(iter(attn_ctx.values()), None))
+        else:
+            attn_metadata = attn_ctx
+
+        if attn_metadata is not None:
+            idx_seq_lens = attn_metadata.seq_lens
+            idx_block_tables = attn_metadata.block_tables
+            idx_q_start_loc = attn_metadata.query_start_loc
+            idx_req_dist = attn_metadata.request_distribution
+        else:
+            idx_seq_lens = idx_block_tables = idx_q_start_loc = idx_req_dist = None
+
         topk_indices = self.indexer_op(
             q_rope,
             indexer_weights,
             kv_cache,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
+            idx_seq_lens,
+            idx_block_tables,
+            idx_q_start_loc,
+            idx_req_dist,
         )
+
         
         return topk_indices
 
