@@ -18,7 +18,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, ragged_paged_attention, ragged_paged_attention_batched)
+    attention, attention_bundled, ragged_paged_attention,
+    ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
                                                       quantize_kv)
@@ -173,6 +174,90 @@ def _pallas_rpa_kernel_default(
         rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
+    )
+
+
+def _pallas_rpa_kernel_bundled_impl(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    metadata = AttentionMetadata(
+        input_positions=None,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        request_distribution=request_distribution,
+    )
+    new_bundle, outputs = attention_bundled(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        metadata,
+        mesh,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sinks=sinks,
+        attention_chunk_size=sliding_window,
+    )
+    return new_bundle, outputs
+
+
+def _pallas_rpa_kernel_default_bundled(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+) -> tuple[jax.Array, jax.Array]:
+    """Block-major (bundled) Pallas RPA kernel entry -- used by
+    `PallasAttentionBackendImpl` when `VllmModelWrapperContext.kv_cache_bundle`
+    is set. Same signature as the default entry, except the first arg is
+    the whole bundle and the second is a dynamic int32 scalar layer_idx.
+    """
+    return _pallas_rpa_kernel_bundled_impl(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
     )
 
 
@@ -447,6 +532,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
 
+    # Bundled (block-major) RPA kernel entry; same signature as the
+    # default but takes the whole KV cache bundle plus a dynamic
+    # layer_idx scalar. Registered under a separate op prefix so it
+    # doesn't collide with the layer-major op in the shared registry.
+    _kernel_entry_bundled: ClassVar = staticmethod(
+        _pallas_rpa_kernel_default_bundled)
+    _kernel_op_prefix_bundled: ClassVar[str] = "pallas::rpa_kernel_bundled"
+
+    # Class-level registry of declared bundled CustomOpDefs, keyed by
+    # the same fields as `_kernel_registry` for the layer-major path.
+    # Sharing across layers is load-bearing: the FX donation chain that
+    # threads the bundle through N sequential attention forwards only
+    # closes when every layer's forward calls the SAME `CustomOpDef`.
+    # Distinct ops break the chain even when the underlying JAX code is
+    # byte-identical.
+    _bundled_kernel_registry: ClassVar[dict] = {}
+
     def __init__(
         self,
         num_heads: int,
@@ -496,6 +598,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
+
+        # Bundled (block-major) RPA kernel; populated by `setup_bundled` once
+        # the runner has allocated the KV cache bundle. Stays None (dormant)
+        # until then; the forward branch that would use it gates on
+        # `ctx.kv_cache_bundle is not None`, which is only true once
+        # `setup_bundled` has been called on every layer AND the runner has
+        # populated the wrapper-context bundle sentinel.
+        self.rpa_kernel_bundled = None
+        # Pre-allocated int32 layer_idx tensor on the bundle device; avoids
+        # H2D-copying a Python scalar on every forward call. Set by
+        # `setup_bundled`.
+        self._bundle_layer_idx_tensor: torch.Tensor | None = None
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -645,6 +759,89 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_registry[registry_key] = rpa_kernel_impl
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def setup_bundled(self, layer_idx: int, bundle_device: torch.device,
+                      layer: "AttentionLayer") -> None:
+        """Build the shared bundled RPA custom op and pre-allocate the
+        per-layer layer_idx tensor. Called by the runner right after the
+        KV cache bundle is allocated, BEFORE torch.compile traces
+        capture_model. Mesh + sliding_window + scales are baked into
+        `wrapped_fn`; after this call the op is callable both eagerly
+        and under torch.compile.
+
+        Load-bearing invariant: layers with the same
+        ``(prefix, sliding_window, sm_scale, soft_cap, mesh_id, q_scale,
+        k_scale, v_scale)`` share a single ``CustomOpDef`` via
+        ``_bundled_kernel_registry`` — the second and later layers to
+        call ``setup_bundled`` find the op already built and reuse it.
+        This is what keeps the FX donation chain closed across
+        sequential attention layers; N distinct ops break the chain
+        even when the underlying JAX code is byte-identical.
+
+        Historical note: OLD (torchtpu-vllm pre-migration) split this
+        into ``_declare_bundled_op`` at attention __init__ +
+        ``bind_jax_kernel`` here, using torch_tpu's
+        ``pallas.declare_jax_op`` / ``pallas.bind_jax_kernel`` lazy-bind
+        APIs. The pinned torch_tpu here (2026-07 build) only ships
+        ``pallas.jax_op``, so declare+bind are consolidated at
+        setup_bundled time. Runner still calls this BEFORE compile trace
+        so the op's ``OpOverload`` and its
+        ``_pallas_inplace_donate_argnums`` attribute exist in the
+        torch.library schema when torch_tpu's ``inplace_donate_ssa_rename``
+        FX pass runs. Bundle allocation and setup_bundled wiring land in
+        the runner-side follow-up (block-major-kv reconciliation step 4).
+        """
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value != 0.0 and v_scale_value != 0.0:
+                k_scale = k_scale_value
+                v_scale = v_scale_value
+        # Pre-allocate so we don't H2D-copy a scalar on every forward call.
+        self._bundle_layer_idx_tensor = torch.tensor(int(layer_idx),
+                                                     dtype=torch.int32,
+                                                     device=bundle_device)
+
+        ctx = get_vllm_model_wrapper_context()
+        mesh = ctx.mesh
+        registry_key = (self._kernel_op_prefix_bundled, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale)
+        existing = self._bundled_kernel_registry.get(registry_key)
+        if existing is not None:
+            self.rpa_kernel_bundled = existing
+            return
+
+        wrapped_fn = functools.partial(
+            self._kernel_entry_bundled,
+            mesh=mesh,
+            sliding_window=self.sliding_window,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"{self._kernel_op_prefix_bundled}_{kernel_instance_id}"
+        # Donate arg 0 (kv_cache_bundle) so JAX aliases the new bundle
+        # over the old one; the inner kernel reshape is a no-copy view,
+        # so this donation flows through to the per-layer HBM update
+        # without a materialization.
+        rpa_donate_argnums = (None if envs.TPU_KERNEL_ITER_MODE else (0, ))
+        rpa_kernel_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=rpa_donate_argnums,
+        )
+
+        def _fake_bundled_op(kv_cache_bundle: torch.Tensor,
+                             layer_idx: torch.Tensor, query: torch.Tensor,
+                             *args, **kwargs):
+            return torch.empty_like(kv_cache_bundle), torch.empty_like(query)
+
+        rpa_kernel_op.register_fake(_fake_bundled_op)
+        self._bundled_kernel_registry[registry_key] = rpa_kernel_op
+        self.rpa_kernel_bundled = rpa_kernel_op
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
@@ -818,6 +1015,42 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # This line will only influence performance, not functionality
         # # Mark kv_cache avaliable for donation
         # pallas.set_buffer_donor_(kv_cache, True)
+
+        # Block-major (bundled) fast path: when the runner has allocated
+        # a bundle and pre-built our bundled kernel via `setup_bundled`,
+        # route through it. The per-layer `kv_cache` view vLLM passes us
+        # is intentionally unused on this path — the kernel operates on
+        # the full bundle and the bundle's storage is what gets updated
+        # in place. Dormant until block-major-kv reconciliation step 4
+        # wires the runner-side allocation + setup_bundled call.
+        if ctx.kv_cache_bundle is not None:
+            if self.rpa_kernel_bundled is None or self._bundle_layer_idx_tensor is None:
+                raise RuntimeError(
+                    "VllmModelWrapperContext.kv_cache_bundle is set but "
+                    "setup_bundled() was not called on this layer. The "
+                    "runner must invoke setup_bundled(layer_idx, "
+                    "bundle_device, layer) for every attention layer "
+                    "before setting the wrapper-context bundle sentinel.")
+            _, outputs = self.rpa_kernel_bundled(
+                ctx.kv_cache_bundle,
+                self._bundle_layer_idx_tensor,
+                query,
+                key,
+                value,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                sink,
+            )
+            if not torch.compiler.is_compiling():
+                sync.synchronize(ctx.kv_cache_bundle)
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len,
+                                          self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
 
         # Call the operator
         outputs = rpa_kernel(

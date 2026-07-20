@@ -28,6 +28,15 @@ class VllmModelWrapperContext:
     kv_caches: Optional[List[torch.Tensor]] = None
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None
     vllm_config: Optional[object] = None
+    # Block-major KV cache: when present, every Attention layer routes
+    # its forward through the bundled RPA kernel that takes the full
+    # bundle plus a dynamic layer_idx. The per-layer kv_cache that
+    # bind_kv_cache hands to each layer is ignored on this path.
+    # Populated by the runner-side bundle-allocation path (see the
+    # block-major-kv reconciliation plan step 1); until wired up, both
+    # remain None and the bundled forward branch is dormant.
+    kv_cache_bundle: Optional[torch.Tensor] = None
+    kv_cache_bundle_layer_index: Optional[Dict[str, int]] = None
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -48,6 +57,8 @@ def set_vllm_model_wrapper_context(
     mesh: Mesh,
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None,
     vllm_config: Optional[object] = None,
+    kv_cache_bundle: Optional[torch.Tensor] = None,
+    kv_cache_bundle_layer_index: Optional[Dict[str, int]] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -56,6 +67,8 @@ def set_vllm_model_wrapper_context(
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
+        kv_cache_bundle=kv_cache_bundle,
+        kv_cache_bundle_layer_index=kv_cache_bundle_layer_index,
     )
 
     try:
