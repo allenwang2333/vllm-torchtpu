@@ -977,33 +977,43 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         *,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        attn_metadata = get_forward_context().attn_metadata
-        
-        swa_layer_name = self.mla_attn.swa_cache_layer.prefix if getattr(self.mla_attn, "swa_cache_layer", None) is not None else self.mla_attn.prefix
-        swa_attn_metadata = attn_metadata.get(swa_layer_name) if swa_layer_name in attn_metadata else attn_metadata.get(self.mla_attn.prefix)
-        orig_sw_cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache", None) if getattr(self.mla_attn, "swa_cache_layer", None) is not None else getattr(self.mla_attn, "kv_cache", None)
+        attn_ctx = get_forward_context().attn_metadata
+        if isinstance(attn_ctx, dict):
+            swa_layer_name = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "prefix", self.mla_attn.prefix)
+            swa_attn_metadata = attn_ctx.get(swa_layer_name, attn_ctx.get(self.mla_attn.prefix, next(iter(attn_ctx.values()), None)))
+            main_layer_name = self.mla_attn.prefix
+            main_attn_metadata = attn_ctx.get(main_layer_name, swa_attn_metadata)
+        else:
+            swa_attn_metadata = attn_ctx
+            main_attn_metadata = attn_ctx
+
+        orig_sw_cache = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "kv_cache", None) or getattr(self.mla_attn, "kv_cache", None)
         sw_cache = orig_sw_cache
-        
+
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
-        
-        if not swa_only:
-            main_layer_name = self.mla_attn.prefix
-            main_attn_metadata = attn_metadata.get(main_layer_name, swa_attn_metadata)
-            main_cache_kv = getattr(self.mla_attn.mla_attn, "kv_cache", sw_cache) if hasattr(self.mla_attn, "mla_attn") else sw_cache
 
+        if not swa_only and main_attn_metadata is not None:
+            main_cache_kv = getattr(getattr(self.mla_attn, "mla_attn", None), "kv_cache", sw_cache)
             seq_lens_val = getattr(main_attn_metadata, "seq_lens", None)
             main_kv_lens = (seq_lens_val // self.compress_ratio) if seq_lens_val is not None else None
             main_page_indices = getattr(main_attn_metadata, "block_tables", None)
             main_cu_q_lens = getattr(main_attn_metadata, "query_start_loc", None)
             main_distribution = getattr(main_attn_metadata, "request_distribution", None)
-        else:
+        elif swa_attn_metadata is not None:
             main_cache_kv = sw_cache
             seq_lens_val = getattr(swa_attn_metadata, "seq_lens", None)
             main_kv_lens = seq_lens_val
             main_page_indices = getattr(swa_attn_metadata, "block_tables", None)
             main_cu_q_lens = getattr(swa_attn_metadata, "query_start_loc", None)
             main_distribution = getattr(swa_attn_metadata, "request_distribution", None)
+        else:
+            main_cache_kv = sw_cache
+            main_kv_lens = None
+            main_page_indices = None
+            main_cu_q_lens = None
+            main_distribution = None
+
 
             
         if is_csa:
