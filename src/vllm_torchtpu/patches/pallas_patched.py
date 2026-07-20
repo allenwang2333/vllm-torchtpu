@@ -20,6 +20,7 @@ of these APIs requires that your environment also has JAX/Pallas installed.
 
 import inspect
 import pathlib
+import sys
 import types
 import typing
 from typing import Any, Callable, Sequence, Union, overload
@@ -30,6 +31,10 @@ from torch._library.custom_ops import CustomOpDef
 import torch.library
 from torch_tpu._internal.pallas import _compat
 from torch_tpu._internal.pallas import tpu_torch_pallas
+
+sys.modules["patched_pallas_temp"] = sys.modules[__name__]
+
+
 
 try:
   # TODO: TorchXLA hit issues when workin with both JAX and PT in the same
