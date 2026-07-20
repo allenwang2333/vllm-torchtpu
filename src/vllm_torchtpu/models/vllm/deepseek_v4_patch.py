@@ -262,12 +262,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             *args,
             **kwargs
         ):
-            if not hasattr(patched_amd_forward, "printed_shapes"):
-                patched_amd_forward.printed_shapes = True
-                print("[DEBUG_LOADED_PARAM_SHAPE] Printing compressor.fused_wkv_wgate parameter shapes...", flush=True)
-                for name, param in self.named_parameters():
-                    if "compressor.fused_wkv_wgate" in name:
-                        print(f"[DEBUG_LOADED_PARAM_SHAPE]   {name}: shape={list(param.shape)} dtype={param.dtype}", flush=True)
             return _orig_amd_forward(
                 self,
                 input_ids,
@@ -277,6 +271,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 *args,
                 **kwargs
             )
+
 
         _AmdDeepseekV4ForCausalLM.forward = patched_amd_forward
 
