@@ -101,10 +101,15 @@ JAX_TO_TORCH_DTYPE_MAP = {v: k for k, v in TORCH_TO_JAX_DTYPE_MAP.items()}
 def _convert_shape(shape, mesh, partition_spec, op):
   """Converts a shape based on a mesh and partition specification."""
   def _get_axis_size(name):
+    if name is None:
+      return 1
     if isinstance(name, tuple):
       import math
-      return math.prod(mesh.devices.shape[mesh.axis_names.index(n)] for n in name)
-    return mesh.devices.shape[mesh.axis_names.index(name)]
+      return math.prod(mesh.devices.shape[mesh.axis_names.index(n)] if n in mesh.axis_names else 1 for n in name)
+    if name in mesh.axis_names:
+      return mesh.devices.shape[mesh.axis_names.index(name)]
+    return 1
+
 
   if mesh is not None and partition_spec is not None:
     ans = tuple(
