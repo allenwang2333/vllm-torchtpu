@@ -62,18 +62,11 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
 
 
 _quantized_matmul_kernel_op: Callable | None = None
-_quantized_matmul_kernel_op_lock = Lock()
 
 
 def _get_quantized_matmul_op() -> Callable:
     global _quantized_matmul_kernel_op
-    if _quantized_matmul_kernel_op is not None:
-        return _quantized_matmul_kernel_op
-
-    with _quantized_matmul_kernel_op_lock:
-        if _quantized_matmul_kernel_op is not None:
-            return _quantized_matmul_kernel_op
-
+    if _quantized_matmul_kernel_op is None:
         op = pallas.jax_op("pallas::quantized_matmul_kernel",
                            _quantized_matmul_jax)
 
@@ -87,7 +80,9 @@ def _get_quantized_matmul_op() -> Callable:
 
         op.register_fake(_fake_quantized_matmul)
         _quantized_matmul_kernel_op = op
-        return op
+
+    return _quantized_matmul_kernel_op
+
 
 
 def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
