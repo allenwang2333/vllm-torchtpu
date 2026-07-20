@@ -240,12 +240,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
-    env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
+    env_with_choices("RAGGED_GATHER_VERSION", "v1", ["v1", "v2"]),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
     # ragged_gather_reduce.
     "RAGGED_GATHER_REDUCE_VERSION":
-    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v1", ["v1", "v2"]),
+
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
