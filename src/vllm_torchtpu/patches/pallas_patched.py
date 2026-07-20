@@ -43,14 +43,18 @@ try:
   import jax
   import jax.export
   try:
+    from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     _orig_compiler_params_init = pltpu.CompilerParams.__init__
     def _patched_compiler_params_init(self, *args, **kwargs):
       kwargs.pop("needs_layout_passes", None)
       _orig_compiler_params_init(self, *args, **kwargs)
     pltpu.CompilerParams.__init__ = _patched_compiler_params_init
+    if not hasattr(pl, "Indirect") and hasattr(pltpu, "Indirect"):
+      setattr(pl, "Indirect", pltpu.Indirect)
   except Exception:
     pass
+
 
 except ImportError as ex:
   raise ImportError(
