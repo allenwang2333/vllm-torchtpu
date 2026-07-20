@@ -883,32 +883,33 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         attn_data_axis = ShardingAxisName.ATTN_DATA
         attn_head_axis = ShardingAxisName.ATTN_HEAD
         batch_axis = BATCH_AXIS
-        extra_spec = P(batch_axis) if not is_csa else P(batch_axis, None)
+        extra_spec = get_valid_spec(mesh, batch_axis) if not is_csa else get_valid_spec(mesh, batch_axis, None)
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
+                get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # q
                 P(),  # new_kv
                 P(),  # sw_cache
-                P(batch_axis),  # swa_kv_lens
-                P(batch_axis),  # swa_page_indices
+                get_valid_spec(mesh, batch_axis),  # swa_kv_lens
+                get_valid_spec(mesh, batch_axis),  # swa_page_indices
                 P(),  # swa_cu_q_lens
                 P(),  # swa_distribution
                 P(),  # main_cache_kv
-                P(batch_axis),  # main_kv_lens
+                get_valid_spec(mesh, batch_axis),  # main_kv_lens
                 extra_spec,  # extra
-                P(batch_axis),  # main_page_indices
+                get_valid_spec(mesh, batch_axis),  # main_page_indices
                 P(),  # main_cu_q_lens
                 P(),  # main_distribution
                 P(),  # attention_sinks
             ),
             output_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # out (sharded along attention heads)
+                get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # out (sharded along attention heads)
                 P(),                      # new_sw_cache
             ),
         )
+
         
         def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
             num_tokens = q.shape[0]
