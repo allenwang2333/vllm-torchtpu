@@ -746,7 +746,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_req_dist,
         )
 
-        
         return topk_indices
 
 
@@ -1091,16 +1090,25 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         o_ref_flat = o_ref.view(t, -1).contiguous() # [t, 4096]
         check_nan("o_ref_flat", o_ref_flat, self.custom_prefix)
         
-        # Dequantize wo_a.weight of shape [1024, 4096]
+        # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
         s = self.wo_a.weight_scale
-        if s.ndim == 3: # block-quantized [n_blocks, 1, n_out]
-            s_t = s.transpose(0, 2)
-            s_flat = torch.repeat_interleave(s_t, 128, dim=2).squeeze(1)
+        if s.ndim == 2:
+            block_n = w.shape[0] // s.shape[0]
+            block_k = w.shape[1] // s.shape[1]
+            s_flat = s.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
+        elif s.ndim == 3:
+            s_2d = s.squeeze(1) if s.shape[1] == 1 else s.squeeze()
+            if s_2d.shape[0] != w.shape[0] // 128 and s_2d.shape[1] == w.shape[0] // 128:
+                s_2d = s_2d.transpose(0, 1)
+            block_n = w.shape[0] // s_2d.shape[0]
+            block_k = w.shape[1] // s_2d.shape[1]
+            s_flat = s_2d.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
         else:
-            s_flat = s.view(-1, 1) # per-channel
+            s_flat = s.view(w.shape[0], 1)
             
         wo_a_dequant = w.to(o_ref.dtype) * s_flat.to(o_ref.dtype)
+
         check_nan("wo_a_dequant", wo_a_dequant, self.custom_prefix)
         
         # Local matmul: [t, 4096] @ [1024, 4096]^T -> [t, 1024]
