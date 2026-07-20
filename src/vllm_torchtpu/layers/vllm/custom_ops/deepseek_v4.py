@@ -992,17 +992,19 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             main_attn_metadata = attn_metadata.get(main_layer_name, swa_attn_metadata)
             main_cache_kv = getattr(self.mla_attn.mla_attn, "kv_cache", sw_cache) if hasattr(self.mla_attn, "mla_attn") else sw_cache
 
-            
-            main_kv_lens = main_attn_metadata.seq_lens // self.compress_ratio
-            main_page_indices = main_attn_metadata.block_tables
-            main_cu_q_lens = main_attn_metadata.query_start_loc
-            main_distribution = main_attn_metadata.request_distribution
+            seq_lens_val = getattr(main_attn_metadata, "seq_lens", None)
+            main_kv_lens = (seq_lens_val // self.compress_ratio) if seq_lens_val is not None else None
+            main_page_indices = getattr(main_attn_metadata, "block_tables", None)
+            main_cu_q_lens = getattr(main_attn_metadata, "query_start_loc", None)
+            main_distribution = getattr(main_attn_metadata, "request_distribution", None)
         else:
             main_cache_kv = sw_cache
-            main_kv_lens = swa_attn_metadata.seq_lens
-            main_page_indices = swa_attn_metadata.block_tables
-            main_cu_q_lens = swa_attn_metadata.query_start_loc
-            main_distribution = swa_attn_metadata.request_distribution
+            seq_lens_val = getattr(swa_attn_metadata, "seq_lens", None)
+            main_kv_lens = seq_lens_val
+            main_page_indices = getattr(swa_attn_metadata, "block_tables", None)
+            main_cu_q_lens = getattr(swa_attn_metadata, "query_start_loc", None)
+            main_distribution = getattr(swa_attn_metadata, "request_distribution", None)
+
             
         if is_csa:
             assert topk_indices is not None
