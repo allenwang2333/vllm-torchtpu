@@ -42,8 +42,7 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.linear import (
     LinearBase, UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method)
@@ -476,6 +475,26 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
     reuse its dequant/requant runtime path.
     """
 
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        ignored_layers: list[str] | None = None,
+        weight_block_size: list[int] | None = None,
+        store_dtype: str | None = None,
+    ) -> None:
+        if store_dtype is not None:
+            raise NotImplementedError(
+                "FP8 store_dtype is not supported by the TPU quantization "
+                "path")
+        super().__init__(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
+        )
+
     @classmethod
     def get_name(cls) -> str:
         return FP8
@@ -485,6 +504,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         weight_block_size = config.get("weight_block_size")
         activation_scheme = config.get("activation_scheme", "dynamic")
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], None)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config,
                                                   ["modules_to_not_convert"],
@@ -494,6 +514,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
             ignored_layers=ignored_layers,
+            store_dtype=store_dtype,
         )
 
     def get_quant_method(

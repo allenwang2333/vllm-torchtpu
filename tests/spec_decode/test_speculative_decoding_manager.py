@@ -201,6 +201,7 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     mock_runner = MagicMock()
     mock_runner.input_batch.num_reqs = 2
     mock_runner.speculative_config.method = "ngram"
+    mock_runner.speculative_config.num_speculative_tokens = 4
     mock_drafter = MagicMock(spec=NgramProposer)
     mock_drafter.propose.return_value = [[5], [6]]
     mock_runner.drafter = mock_drafter
@@ -212,4 +213,4 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
 
     assert result is None
     assert manager._draft_token_ids == [[5], [6]]
-    mock_drafter.propose.assert_called_once_with([[1], [2]], "NTS", "TIDS")
+    mock_drafter.propose.assert_called_once_with(4, [[1], [2]], "NTS", "TIDS")

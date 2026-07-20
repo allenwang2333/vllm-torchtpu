@@ -39,9 +39,9 @@ from typing import Any, Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (FusedMoE,
+                                                  UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \

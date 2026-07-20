@@ -40,8 +40,7 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \

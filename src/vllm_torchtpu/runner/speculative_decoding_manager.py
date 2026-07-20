@@ -117,6 +117,7 @@ class SpeculativeDecodingManager:
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
             self._draft_token_ids = self.runner.drafter.propose(
+                self.runner.speculative_config.num_speculative_tokens,
                 sampled_token_ids[:num_reqs],
                 self.runner.input_batch.num_tokens_no_spec,
                 self.runner.input_batch.token_ids_cpu,
