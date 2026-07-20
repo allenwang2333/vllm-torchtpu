@@ -1026,10 +1026,16 @@ def validate_inputs(
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
+        if rhs_scale.ndim == 3:
+            rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n), (
+            f"rhs_scale shape {rhs_scale.shape} does not match expected "
+            f"{(size_group, num_quant_blocks, 1, size_n)}"
+        )
         assert (size_k % num_quant_blocks == 0
                 ), f"{size_k=} should be divisible by {num_quant_blocks=}"
+
 
     assert group_offset.shape == (1, )
 
@@ -1288,8 +1294,11 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
+        if rhs_scale.ndim == 3:
+            rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
         rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)
         rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
