@@ -135,6 +135,7 @@ def prebuild_fused_moe_kernel(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    has_bias: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
