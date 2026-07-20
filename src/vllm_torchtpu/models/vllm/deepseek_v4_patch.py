@@ -49,8 +49,9 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 
     sharding_config = ShardingConfigManager.get(vllm_config)
-    tp_size = sharding_config.tp_size
-    ep_size = sharding_config.expert_size
+    tp_size = max(1, sharding_config.tp_size)
+    ep_size = max(1, sharding_config.expert_size)
+
     _orig_get_tp_world_size = ps.get_tensor_model_parallel_world_size
     _orig_get_tp_rank = ps.get_tensor_model_parallel_rank
     _orig_make = fmc.FusedMoEParallelConfig.make
