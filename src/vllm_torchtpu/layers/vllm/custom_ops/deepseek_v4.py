@@ -1068,7 +1068,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
         n_local_heads = self.mla_attn.n_local_heads
+        print(f"[DEBUG_SINK] rank={rank} n_local_heads={n_local_heads} attn_sink_shape={list(self.attn_sink.shape)}", flush=True)
         local_sink = self.attn_sink[rank * n_local_heads : (rank + 1) * n_local_heads].clone()
+        print(f"[DEBUG_SINK] local_sink_shape={list(local_sink.shape)}", flush=True)
         output, new_sw_cache = self.attn_op(
             q,
             kv,
