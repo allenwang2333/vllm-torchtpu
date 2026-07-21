@@ -781,3 +781,17 @@ This document serves as a persistent, timestamped log tracking all architectural
 (Worker_TP1_EP1 pid=538)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 217, in _report_usage_once
   ```
 
+
+---
+
+### [2026-07-21 03:04:56 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 2 processed and cached
+
+
+---
+
+### [2026-07-21 03:15:11 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 11 processed and cached
+
