@@ -795,3 +795,10 @@ This document serves as a persistent, timestamped log tracking all architectural
 - **Container Status:** Running (Up)
 - **Progress State:** MoE weight pre-processing: layer 11 processed and cached
 
+
+---
+
+### [2026-07-21 03:30:04 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 25 processed and cached
+
