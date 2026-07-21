@@ -52,7 +52,12 @@ class TestMxfp4MoETPU:
             kernel_config=SimpleNamespace(moe_backend="auto"),
             lora_config=None,
             device_config=SimpleNamespace(device=device),
-            parallel_config=SimpleNamespace(enable_dbo=False),
+            parallel_config=SimpleNamespace(
+                enable_dbo=False,
+                enable_expert_parallel=False,
+                all2all_backend="allgather_reducescatter",
+                enable_eplb=False,
+            ),
         )
         
         # Instantiate inside the thread-local config context to satisfy CustomOp/layer registration checks
