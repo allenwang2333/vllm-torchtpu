@@ -199,9 +199,15 @@ if vllm_xla_cache_path:
 
 # Force-load torch_tpu to register the privateuse1 'tpu' backend renaming
 # process-wide. This handles cases where PYTHONPATH or import paths shadow
-# or skip sitecustomize.py execution.
+# or skip sitecustomize.py execution. We call _init_device("tpu") directly
+# from the loader to bypass get_tpu_device_count() checks inside Docker containers
+# that don't mount /dev/vfio or /sys.
 try:
-    import torch_tpu
-    torch_tpu.load()
-except ImportError:
-    pass
+    from torch_tpu._loader import _init_device
+    _init_device("tpu")
+except Exception:
+    try:
+        import torch_tpu
+        torch_tpu.load()
+    except ImportError:
+        pass
