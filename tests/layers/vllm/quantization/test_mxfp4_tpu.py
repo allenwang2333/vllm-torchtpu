@@ -63,6 +63,9 @@ class TestMxfp4MoETPU:
                 static_forward_context={},
                 static_all_moe_layers=[],
             ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048,
+            ),
         )
         
         # Instantiate inside the thread-local config context to satisfy CustomOp/layer registration checks
