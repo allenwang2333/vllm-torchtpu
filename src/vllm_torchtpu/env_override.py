@@ -195,3 +195,13 @@ if vllm_xla_cache_path:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
+
+
+# Force-load torch_tpu to register the privateuse1 'tpu' backend renaming
+# process-wide. This handles cases where PYTHONPATH or import paths shadow
+# or skip sitecustomize.py execution.
+try:
+    import torch_tpu
+    torch_tpu.load()
+except ImportError:
+    pass
