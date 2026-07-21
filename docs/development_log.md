@@ -559,3 +559,91 @@ This document serves as a persistent, timestamped log tracking all architectural
 - **Container Status:** Running (Up)
 - **Progress State:** MoE weight pre-processing: layer 18 processed and cached
 
+
+---
+
+### [2026-07-21 01:10:18 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 27 processed and cached
+
+
+---
+
+### [2026-07-21 01:20:16 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 35 processed and cached
+
+
+---
+
+### [2026-07-21 01:30:06 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 42 processed and cached
+
+
+---
+
+### [2026-07-21 01:30:19 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 42 processed and cached
+
+
+---
+
+### [2026-07-21 01:40:09 UTC] Full Model Offline Inference Failed
+- **Container Status:** Exited (1) - Failure
+- **Traceback:**
+  ```
+  (Worker_TP0_EP0 pid=822) Traceback (most recent call last):
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP0_EP0 pid=822)     self.run()
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP0_EP0 pid=822)     self._target(*self._args, **self._kwargs)
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 173, in _report_usage_worker
+(Worker_TP0_EP0 pid=822)     self._report_usage_once(model_architecture, usage_context, extra_kvs)
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 217, in _report_usage_once
+(Worker_TP0_EP0 pid=822)     info = cpuinfo.get_cpu_info()
+(Worker_TP0_EP0 pid=822)            ^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/site-packages/cpuinfo/cpuinfo.py", line 2762, in get_cpu_info
+(Worker_TP0_EP0 pid=822)     output = json.loads(output, object_hook = _utf_to_str)
+(Worker_TP0_EP0 pid=822)              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/json/__init__.py", line 359, in loads
+(Worker_TP0_EP0 pid=822)     return cls(**kw).decode(s)
+(Worker_TP0_EP0 pid=822)            ^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/json/decoder.py", line 338, in decode
+(Worker_TP0_EP0 pid=822)     obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+(Worker_TP0_EP0 pid=822)                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=822)   File "/usr/local/lib/python3.12/json/decoder.py", line 356, in raw_decode
+(Worker_TP0_EP0 pid=822)     raise JSONDecodeError("Expecting value", s, err.value) from None
+(Worker_TP0_EP0 pid=822) json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+(Worker_TP6_EP6 pid=828) Exception in thread Thread-2 (_report_usage_worker):
+(Worker_TP6_EP6 pid=828) Traceback (most recent call last):
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP6_EP6 pid=828)     self.run()
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP6_EP6 pid=828)     self._target(*self._args, **self._kwargs)
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 173, in _report_usage_worker
+(Worker_TP6_EP6 pid=828)     self._report_usage_once(model_architecture, usage_context, extra_kvs)
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 217, in _report_usage_once
+(Worker_TP6_EP6 pid=828)     info = cpuinfo.get_cpu_info()
+(Worker_TP6_EP6 pid=828)            ^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/site-packages/cpuinfo/cpuinfo.py", line 2762, in get_cpu_info
+(Worker_TP6_EP6 pid=828)     output = json.loads(output, object_hook = _utf_to_str)
+(Worker_TP6_EP6 pid=828)              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/json/__init__.py", line 359, in loads
+(Worker_TP6_EP6 pid=828)     return cls(**kw).decode(s)
+(Worker_TP6_EP6 pid=828)            ^^^^^^^^^^^^^^^^^^^
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/json/decoder.py", line 338, in decode
+(Worker_TP6_EP6 pid=828)     obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+(Worker_TP6_EP6 pid=828)                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP6_EP6 pid=828)   File "/usr/local/lib/python3.12/json/decoder.py", line 356, in raw_decode
+(Worker_TP6_EP6 pid=828)     raise JSONDecodeError("Expecting value", s, err.value) from None
+(Worker_TP6_EP6 pid=828) json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+(Worker_TP3_EP3 pid=825) Exception in thread Thread-2 (_report_usage_worker):
+(Worker_TP3_EP3 pid=825) Traceback (most recent call last):
+(Worker_TP3_EP3 pid=825)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP3_EP3 pid=825)     self.run()
+(Worker_TP3_EP3 pid=825)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP3_EP3 pid=825)     self._target(*self._args, **self._kwargs)
+  ```
+
