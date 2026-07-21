@@ -180,6 +180,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
 
+    name = "vllm_mxfp4_moe_method"
+
     @property
     def is_monolithic(self) -> bool:
         return True
