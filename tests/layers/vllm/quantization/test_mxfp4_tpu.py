@@ -62,7 +62,7 @@ class TestMxfp4MoETPU:
             compilation_config=SimpleNamespace(
                 static_forward_context={},
                 static_all_moe_layers=[],
-                custom_ops=[],
+                custom_ops=["all"],
             ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
