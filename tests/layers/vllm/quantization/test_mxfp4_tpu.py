@@ -4,7 +4,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig
 from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
 
 class TestMxfp4MoETPU:
-    def test_mxfp4_moe_forward_tpu(self, device):
+    def test_mxfp4_moe_forward_tpu(self, device, default_vllm_config):
         # 1. Config
         num_experts = 8
         top_k = 2
