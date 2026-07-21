@@ -44,7 +44,19 @@ class TestMxfp4MoETPU:
             in_dtype=torch.bfloat16,
         )
         
-        layer = FusedMoE(moe_config)
+        layer = FusedMoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            params_dtype=torch.bfloat16,
+            renormalize=True,
+            tp_size=1,
+            ep_size=1,
+            dp_size=1,
+            pcp_size=1,
+            activation="silu",
+        )
         layer.layer_idx = 3
         layer._tpu_activation_str = "silu"
         layer.renormalize = True
