@@ -59,6 +59,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import \
     Mxfp4MoeBackend as Mxfp4Backend
 from vllm.model_executor.layers.linear import (LinearBase,
@@ -167,7 +168,7 @@ REQUANTIZED_BLOCK_SIZE = (
 )
 
 
-class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
+class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
     """
     TPU-specific implementation of MXFP4 MoE quantization.
 
