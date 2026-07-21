@@ -63,6 +63,8 @@ class TestMxfp4MoETPU:
                 static_forward_context={},
                 static_all_moe_layers=[],
                 custom_ops=["all"],
+                enabled_custom_ops=set(),
+                disabled_custom_ops=set(),
             ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,
