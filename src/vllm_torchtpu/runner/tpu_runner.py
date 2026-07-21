@@ -3026,6 +3026,17 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self._attention_kernels_initialized:
             return
+
+        # Shard all attn_sink parameters on the PyTorch/XLA side before any compilation/warmup starts
+        try:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            for name, module in self.model.named_modules():
+                if module.__class__.__name__ in ("DeepseekV4Attention", "VllmDeepseekV4MLAAttention"):
+                    if hasattr(module, "attn_sink"):
+                        module.attn_sink.data.sharding = NamedSharding(self.mesh, P("model"))
+            logger.info("Successfully sharded attn_sink parameters on the TPU mesh")
+        except Exception as e:
+            logger.warning("Failed to shard attn_sink parameters in runner: %s", e)
         from vllm_torchtpu.layers.vllm.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
             _pallas_rpa_kernel_local)

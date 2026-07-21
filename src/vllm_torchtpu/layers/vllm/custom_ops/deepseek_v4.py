@@ -1068,14 +1068,6 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         rank = get_tensor_model_parallel_rank()
         n_local_heads = self.mla_attn.n_local_heads
-        # Dynamically mark PyTorch/XLA sharding on the fly if not initialized (mesh is not ready at load_weights time)
-        if getattr(self.attn_sink.data, "sharding", None) is None:
-            from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_vllm_model_wrapper_context
-            vllm_context = get_vllm_model_wrapper_context()
-            if vllm_context is not None and vllm_context.mesh is not None:
-                from jax.sharding import NamedSharding, PartitionSpec as P
-                self.attn_sink.data.sharding = NamedSharding(vllm_context.mesh, P("model"))
-
         # Pass the sharded attn_sink parameter directly. XLA's SPMD partitioner will map the sharded heads natively.
         local_sink = self.attn_sink
         output, new_sw_cache = self.attn_op(
