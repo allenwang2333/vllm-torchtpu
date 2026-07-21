@@ -270,18 +270,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                 print(f"[PATCH] Manually invoking process_weights_after_loading on layer {idx} FusedMoE", flush=True)
                                 moe_layer._quant_method.process_weights_after_loading(moe_layer)
                 
-                try:
-                    from jax.sharding import NamedSharding, PartitionSpec as P
-                    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_vllm_model_wrapper_context
-                    vllm_context = get_vllm_model_wrapper_context()
-                    if vllm_context is not None and vllm_context.mesh is not None:
-                        mesh = vllm_context.mesh
-                        for name, module in self.named_modules():
-                            if module.__class__.__name__ in ("DeepseekV4Attention", "VllmDeepseekV4MLAAttention"):
-                                if hasattr(module, "attn_sink"):
-                                    module.attn_sink.data.sharding = NamedSharding(mesh, P("model"))
-                except Exception as e:
-                    print(f"WARNING: failed to shard attn_sink parameters: {e}")
+
 
                 import torch.distributed as dist
                 if dist.is_initialized():
