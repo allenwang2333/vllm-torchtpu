@@ -48,6 +48,7 @@ class TestMxfp4MoETPU:
         
         # Define a minimal offline mock for VllmConfig
         dummy_vllm_config = SimpleNamespace(
+            model_config=None,
             kernel_config=SimpleNamespace(moe_backend="auto"),
             lora_config=None,
             device_config=SimpleNamespace(device=device),
