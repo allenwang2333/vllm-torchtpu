@@ -47,7 +47,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--use-tpu",
         action="store_true",
-        default=True,
+        default=False,
         help="Run tests on TPU device instead of CPU",
     )
 
