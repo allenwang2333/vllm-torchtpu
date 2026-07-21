@@ -302,6 +302,9 @@ def _deepseek_v4_attention_jax(
         sw_cache_was_5d = (sw_cache.ndim == 5)
         if sw_cache_was_5d:
             sw_cache = jnp.squeeze(sw_cache, axis=2)
+        import jax.debug
+        jax.debug.print("[EXEC_SINK] attention_sinks sum={s} values={v}", s=jnp.sum(attention_sinks), v=attention_sinks[:16])
+
         if main_cache_kv.ndim == 5:
             main_cache_kv = jnp.squeeze(main_cache_kv, axis=2)
 
