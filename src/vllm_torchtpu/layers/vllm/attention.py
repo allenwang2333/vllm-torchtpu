@@ -1101,7 +1101,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
         # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
         q_nope_t = q_nope.transpose(0, 1)
-        ql_nope = torch.bmm(q_nope_t, layer.W_UK_T)
+        ql_nope = torch.bmm(q_nope_t, layer.W_UK_T.to(q_nope_t.dtype))
         if hasattr(layer, "W_UK_T_scale"):
             ql_nope = ql_nope * layer.W_UK_T_scale
         ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
@@ -1154,7 +1154,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                     layer.kv_lora_rank).transpose(0, 1)
         out_proj = torch.bmm(outputs_t, layer.W_UV)
         if hasattr(layer, "W_UV_scale"):
-            out_proj = out_proj * layer.W_UV_scale
+            out_proj = out_proj * layer.W_UV_scale.to(out_proj.dtype)
         outputs = out_proj.transpose(0, 1).to(input_dtype).reshape(
             -1, layer.num_heads * layer.v_head_dim)
 
