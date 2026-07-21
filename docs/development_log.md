@@ -714,3 +714,70 @@ This document serves as a persistent, timestamped log tracking all architectural
 (Worker_TP0_EP0 pid=537)     self._target(*self._args, **self._kwargs)
   ```
 
+
+---
+
+### [2026-07-21 02:27:31 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Initializing...
+
+
+---
+
+### [2026-07-21 02:47:40 UTC] Full Model Offline Inference Failed
+- **Container Status:** Exited (1) - Failure
+- **Traceback:**
+  ```
+  (Worker_TP0_EP0 pid=537) Traceback (most recent call last):
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP0_EP0 pid=537)     self.run()
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP0_EP0 pid=537)     self._target(*self._args, **self._kwargs)
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 173, in _report_usage_worker
+(Worker_TP0_EP0 pid=537)     self._report_usage_once(model_architecture, usage_context, extra_kvs)
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 217, in _report_usage_once
+(Worker_TP0_EP0 pid=537)     info = cpuinfo.get_cpu_info()
+(Worker_TP0_EP0 pid=537)            ^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/site-packages/cpuinfo/cpuinfo.py", line 2762, in get_cpu_info
+(Worker_TP0_EP0 pid=537)     output = json.loads(output, object_hook = _utf_to_str)
+(Worker_TP0_EP0 pid=537)              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/json/__init__.py", line 359, in loads
+(Worker_TP0_EP0 pid=537)     return cls(**kw).decode(s)
+(Worker_TP0_EP0 pid=537)            ^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/json/decoder.py", line 338, in decode
+(Worker_TP0_EP0 pid=537)     obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+(Worker_TP0_EP0 pid=537)                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0_EP0 pid=537)   File "/usr/local/lib/python3.12/json/decoder.py", line 356, in raw_decode
+(Worker_TP0_EP0 pid=537)     raise JSONDecodeError("Expecting value", s, err.value) from None
+(Worker_TP0_EP0 pid=537) json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+(Worker_TP5_EP5 pid=542) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_compressor_128_4_1: None
+(Worker_TP2_EP2 pid=539) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_compressor_128_4_1: None
+(Worker_TP5_EP5 pid=542) (Worker_TP2_EP2 pid=539) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_indexer: NoneDEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_indexer: None
+
+(Worker_TP5_EP5 pid=542) Exception in thread Thread-2 (_report_usage_worker):
+(Worker_TP5_EP5 pid=542) (Worker_TP2_EP2 pid=539) Exception in thread Thread-2 (_report_usage_worker)Traceback (most recent call last):
+(Worker_TP5_EP5 pid=542)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+:
+(Worker_TP2_EP2 pid=539) Traceback (most recent call last):
+(Worker_TP2_EP2 pid=539)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP5_EP5 pid=542)     self.run()
+(Worker_TP2_EP2 pid=539)     self.run()(Worker_TP5_EP5 pid=542)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP2_EP2 pid=539) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_compressor_512_4_1: None
+(Worker_TP5_EP5 pid=542) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_compressor_512_4_1: None
+(Worker_TP2_EP2 pid=539) [DEBUG_SWA] Layer model.layers.2.attn compress_ratio=4 class=VllmDeepseekV4SWACache is_unused=True
+(Worker_TP5_EP5 pid=542) [DEBUG_SWA] Layer model.layers.2.attn compress_ratio=4 class=VllmDeepseekV4SWACache is_unused=True
+(Worker_TP1_EP1 pid=538) Exception in thread Thread-2 (_report_usage_worker):
+(Worker_TP1_EP1 pid=538) Traceback (most recent call last):
+(Worker_TP1_EP1 pid=538)   File "/usr/local/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+(Worker_TP1_EP1 pid=538)     self.run()
+(Worker_TP1_EP1 pid=538)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+(Worker_TP2_EP2 pid=539) (Worker_TP5_EP5 pid=542) DEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_attention_csa: NoneDEBUG_PALLAS: registering fake_fn for pallas::deepseek_v4_attention_csa: None
+(Worker_TP1_EP1 pid=538)     self._target(*self._args, **self._kwargs)
+
+(Worker_TP1_EP1 pid=538)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 173, in _report_usage_worker
+(Worker_TP2_EP2 pid=539)   File "/usr/local/lib/python3.12/threading.py", line 1012, in run
+
+(Worker_TP1_EP1 pid=538)     self._report_usage_once(model_architecture, usage_context, extra_kvs)
+(Worker_TP1_EP1 pid=538)   File "/usr/local/lib/python3.12/site-packages/vllm/usage/usage_lib.py", line 217, in _report_usage_once
+  ```
+
