@@ -1041,3 +1041,76 @@ INFO 07-21 11:03:08 [tpu_platform.py:676] Initialized sharding configuration: Sh
 - **Container Status:** Running (Up)
 - **Progress State:** MoE weight pre-processing: layer 40 processed and cached
 
+
+---
+
+### [2026-07-21 07:15:03 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Sampler compilation: substitute_placeholder_token in progress
+
+
+---
+
+### [2026-07-21 07:45:05 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Safetensors shard loading: 100% Completed | 46/46
+
+
+---
+
+### [2026-07-21 08:00:05 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Sampler compilation: substitute_placeholder_token in progress
+
+
+---
+
+### [2026-07-21 08:15:04 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Safetensors shard loading: 100% Completed | 46/46
+
+
+---
+
+### [2026-07-21 08:30:03 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Sampler compilation: gather_logprobs in progress
+
+
+---
+
+### [2026-07-21 10:46:21 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Initializing...
+
+
+---
+
+### [2026-07-21 10:47:06 UTC] Full Model Offline Inference Failed
+- **Container Status:** Exited (1) - Failure
+- **Traceback:**
+  ```
+  Traceback (most recent call last):
+  File "/root/cloud-devkit/torchtpu-vllm/examples/run_dsv4_inference.py", line 134, in <module>
+INFO 07-21 17:46:45 [utils.py:278] non-default args: {'trust_remote_code': True, 'kv_cache_dtype': 'fp8', 'max_model_len': 16, 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.32, 'max_num_batched_tokens': 16, 'disable_log_stats': True, 'quantization': 'deepseek_v4_fp8', 'additional_config': {'compilation_config': {'compile_sizes': [16]}, 'sharding': {'sharding_strategy': {'enable_dp_attention': True, 'expert_parallelism': 8}}}, 'model': '/home/patemotter_google_com/workspace/dsv4-flash-4layer-fp8'}
+    main()
+  File "/root/cloud-devkit/torchtpu-vllm/examples/run_dsv4_inference.py", line 43, in main
+    llm = LLM(
+          ^^^^
+  File "/usr/local/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 349, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 162, in from_engine_args
+    vllm_config = engine_args.create_engine_config(usage_context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/vllm/engine/arg_utils.py", line 1709, in create_engine_config
+    device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+  File "/usr/local/lib/python3.12/site-packages/vllm/config/device.py", line 78, in __post_init__
+    self.device = torch.device(self.device_type)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, fpga, maia, xla, lazy, vulkan, mps, meta, hpu, mtia, privateuseone device type at start of device string: tpu
+  ```
+
