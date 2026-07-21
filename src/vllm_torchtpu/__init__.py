@@ -51,14 +51,22 @@ def _patch_default_moe_runner_select_forward() -> None:
     _orig_moe_forward = _dmr._moe_forward
     def patched_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
         if "layers.3." in layer_name or "layers.4." in layer_name:
-            print(f"[DEBUG_FORWARD_HOOK] layer_name: {layer_name} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+            print(f"[DEBUG_FORWARD_HOOK] (Standard) layer_name: {layer_name} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
         return _orig_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
 
     _dmr._moe_forward = patched_moe_forward
 
+    _orig_moe_forward_shared = _dmr._moe_forward_shared
+    def patched_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
+        if "layers.3." in layer_name or "layers.4." in layer_name:
+            print(f"[DEBUG_FORWARD_HOOK] (Shared Experts) layer_name: {layer_name} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+        return _orig_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
+
+    _dmr._moe_forward_shared = patched_moe_forward_shared
+
     def patched_select(self):
         return (patched_moe_forward
-                if self.shared_experts is None else _dmr._moe_forward_shared)
+                if self.shared_experts is None else patched_moe_forward_shared)
 
     _dmr.MoERunner._select_forward = patched_select
     _dmr.MoERunner._tpu_select_forward_patch = True
