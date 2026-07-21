@@ -1068,13 +1068,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         rank = get_tensor_model_parallel_rank()
         n_local_heads = self.mla_attn.n_local_heads
-        # Safely extract local segment of attn_sink. If NamedSharding is set, the parameter
-        # is already split by the TPU compiler, so indexing during tracing would produce shape mismatch.
-        # Otherwise (replicated parameters), we slice based on parallel rank.
-        if getattr(self.attn_sink.data, "sharding", None) is not None:
-            local_sink = self.attn_sink.clone()
-        else:
-            local_sink = self.attn_sink[rank * n_local_heads : (rank + 1) * n_local_heads].clone()
+        # Pass the sharded attn_sink parameter directly. XLA's SPMD partitioner will map the sharded heads natively.
+        local_sink = self.attn_sink
         output, new_sw_cache = self.attn_op(
             q,
             kv,
