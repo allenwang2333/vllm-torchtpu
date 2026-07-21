@@ -1,10 +1,11 @@
 import torch
 import pytest
+from types import SimpleNamespace
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEConfig
 from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
 
 class TestMxfp4MoETPU:
-    def test_mxfp4_moe_forward_tpu(self, device, default_vllm_config):
+    def test_mxfp4_moe_forward_tpu(self, device):
         # 1. Config
         num_experts = 8
         top_k = 2
@@ -12,7 +13,7 @@ class TestMxfp4MoETPU:
         intermediate_size = 256
         num_tokens = 16
         
-        # 2. Instantiate FusedMoE layer
+        # 2. Instantiate FusedMoE Parallel Config
         from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
         moe_parallel_config = FusedMoEParallelConfig(
             tp_size=1,
@@ -28,6 +29,7 @@ class TestMxfp4MoETPU:
             pcp_size=1,
             pcp_rank=0,
         )
+        
         from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
         from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         moe_config = FusedMoEConfig(
@@ -44,19 +46,31 @@ class TestMxfp4MoETPU:
             in_dtype=torch.bfloat16,
         )
         
-        layer = FusedMoE(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            params_dtype=torch.bfloat16,
-            renormalize=True,
-            tp_size=1,
-            ep_size=1,
-            dp_size=1,
-            pcp_size=1,
-            activation="silu",
+        # Define a minimal offline mock for VllmConfig
+        dummy_vllm_config = SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="auto"),
+            lora_config=None,
+            device_config=SimpleNamespace(device=device),
+            parallel_config=SimpleNamespace(enable_dbo=False),
         )
+        
+        # Instantiate inside the thread-local config context to satisfy CustomOp/layer registration checks
+        from vllm.config.vllm import set_current_vllm_config
+        with set_current_vllm_config(dummy_vllm_config):
+            layer = FusedMoE(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                params_dtype=torch.bfloat16,
+                renormalize=True,
+                tp_size=1,
+                ep_size=1,
+                dp_size=1,
+                pcp_size=1,
+                activation="silu",
+            )
+            
         layer.layer_idx = 3
         layer._tpu_activation_str = "silu"
         layer.renormalize = True
