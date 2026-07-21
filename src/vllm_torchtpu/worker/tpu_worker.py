@@ -32,6 +32,8 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
+from cdk.trace import trace_func, trace_me, trace_start, trace_end
+
 logger = init_logger(__name__)
 DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
@@ -128,6 +130,7 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    @trace_func("tpu_worker.init_device")
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -350,6 +353,7 @@ class TPUWorker(WorkerBase):
             return 0
         return estimator(self.vllm_config)
 
+    @trace_func("tpu_worker.determine_available_memory")
     def determine_available_memory(self) -> int:
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -392,6 +396,7 @@ class TPUWorker(WorkerBase):
                              "headroom requirement.")
         return available
 
+    @trace_func("tpu_worker.execute_model")
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
 
@@ -449,12 +454,14 @@ class TPUWorker(WorkerBase):
                 logger.warning(
                     "Profiler context is not set. Cannot stop profiler.")
 
+    @trace_func("tpu_worker.load_model")
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu.platforms.tpu_platform import \
             _apply_model_specific_patches
         _apply_model_specific_patches(self.model_config)
         self.model_runner.load_model()
 
+    @trace_func("tpu_worker.compile_or_warm_up_model")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
@@ -505,6 +512,7 @@ class TPUWorker(WorkerBase):
     def prewarm_kv_offload_shape(self, p: int) -> None:
         self.model_runner.prewarm_kv_offload_shape(p)
 
+    @trace_func("tpu_worker.initialize_from_config")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)

@@ -22,8 +22,7 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.logger import init_logger
+from cdk.trace import trace_func, trace_me, trace_start, trace_end
 
 logger = init_logger(__name__)
 
@@ -224,6 +223,7 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         return hash_obj.hexdigest()[:10]
 
+    @trace_func("tpu_compiler.compile")
     def compile(
         self,
         graph: fx.GraphModule,

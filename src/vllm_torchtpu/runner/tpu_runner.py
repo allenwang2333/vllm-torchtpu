@@ -85,6 +85,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput)
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs, Eagle3Proposer
 
+from cdk.trace import trace_func, trace_me, trace_start, trace_end
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
@@ -1731,6 +1733,7 @@ class TPUModelRunner(GPUModelRunner):
         return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                 num_draft_per_req)
 
+    @trace_func("tpu_runner._prepare_inputs")
     def _prepare_inputs(self, scheduler_output: "SchedulerOutput",
                         start_index: int, num_decode_reqs: int):
         assert scheduler_output.total_num_scheduled_tokens > 0
@@ -2212,6 +2215,7 @@ class TPUModelRunner(GPUModelRunner):
                           device="cpu")
 
     @torch.no_grad()
+    @trace_func("tpu_runner.execute_model")
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2480,6 +2484,7 @@ class TPUModelRunner(GPUModelRunner):
         return self._sampling_generator
 
     @torch.no_grad()
+    @trace_func("tpu_runner.sample_tokens")
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -2963,6 +2968,7 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    @trace_func("tpu_runner.load_model")
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
@@ -3040,6 +3046,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    @trace_func("tpu_runner._dummy_run")
     def _dummy_run(self,
                    num_tokens: int,
                    num_reqs: int,
@@ -3419,6 +3426,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
+    @trace_func("tpu_runner.capture_model")
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
