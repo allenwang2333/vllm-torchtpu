@@ -57,8 +57,8 @@ def ref_moe_implementation(
         # SwiGLU / Gated SiLU activation
         act = (gate / (1.0 + np.exp(-gate))) * up
         
-        # Out projection (w2 is transposed to match [intermediate_size, hidden_size] multiplication)
-        out = act @ w2[e].T
+        # Out projection
+        out = act @ w2[e]
         output += out * expert_weights[:, None]
         
     return output
@@ -87,7 +87,7 @@ class MoERoutingCorrectnessTest(parameterized.TestCase):
         # Generate inputs
         hidden_states = gen_random(rng, (num_tokens, hidden_size))
         w1_global = gen_random(rng, (global_num_experts, hidden_size, intermediate_size * 2))
-        w2_global = gen_random(rng, (global_num_experts, hidden_size, intermediate_size))
+        w2_global = gen_random(rng, (global_num_experts, intermediate_size, hidden_size))
 
         # Generate top-K routing assignments
         topk_ids_list = []
