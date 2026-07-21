@@ -381,19 +381,19 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 w13_weight_fp8, w13_weight_scale = quantize_tensor(
                     w13_weight_padded, quant_dtype=torch.float8_e4m3fn, axis=2, block_size=32)
                 w2_weight_fp8, w2_weight_scale = quantize_tensor(
-                    w2_weight_padded, quant_dtype=torch.float8_e4m3fn, axis=2, block_size=32)
+                    w2_weight_padded, quant_dtype=torch.float8_e4m3fn, axis=1, block_size=32)
 
                 w13_weight_processed = w13_weight_fp8.transpose(1, 2).contiguous()
                 w2_weight_processed = w2_weight_fp8.transpose(1, 2).contiguous()
 
                 s13 = w13_weight_scale.transpose(1, 2).contiguous().to(torch.float32)
                 w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
-                s2 = w2_weight_scale.transpose(1, 2).contiguous().to(torch.float32)
+                s2 = w2_weight_scale.contiguous().to(torch.float32)
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
             else:
-                # Quantization is along axis 2 (the contracting dimension for both padded tensors)
+                # Quantization is along contracting dimensions: axis 2 for w13, axis 1 for w2
                 w13_indices, w13_weight_scale = quantize_tensor_to_fp4(w13_weight_padded, axis=2, block_size=w13_block_size)
-                w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=2, block_size=w2_block_size)
+                w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=1, block_size=w2_block_size)
 
                 w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2))
                 w2_weight_processed = pack_fp4_indices(w2_indices.transpose(1, 2))
@@ -403,7 +403,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
                 s13 = w13_weight_scale.transpose(1, 2).contiguous()
                 w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
-                s2 = w2_weight_scale.transpose(1, 2).contiguous()
+                s2 = w2_weight_scale.contiguous()
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
 
 

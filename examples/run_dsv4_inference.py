@@ -48,7 +48,7 @@ def main():
         max_model_len=64,
         max_num_batched_tokens=64,
         kv_cache_dtype="fp8",
-        gpu_memory_utilization=0.32,
+        gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.20")),
         enable_expert_parallel=True,
         additional_config={
             "compilation_config": {
