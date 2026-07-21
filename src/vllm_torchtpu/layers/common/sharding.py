@@ -3,11 +3,8 @@ import math
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
-
-from vllm_torchtpu import envs, utils
 
 if TYPE_CHECKING:
     from vllm.v1.configs.vllm_config import VllmConfig
@@ -16,8 +13,8 @@ MESH_AXIS_NAMES = ("attn_dp", "expert", "model")
 MESH_AXIS_NAMES_2D = ('model', )
 
 
-class ShardingAxisNameBase:
-    """Base class for sharding axis names."""
+class ShardingAxisName:
+    """Class for sharding axis names."""
     SEQUENCE = 'attn_dp'
     ATTN_DATA = 'attn_dp'
     MLP_DATA = None
@@ -27,33 +24,6 @@ class ShardingAxisNameBase:
     MOE_TENSOR = ('attn_dp', 'model')
     EXPERT = ('attn_dp', 'expert', 'model')
     VOCAB = ('expert', 'model')
-
-
-class ShardingAxisName2D:
-    """Sharding axis names for 2D data parallelism scenarios.
-    NOTE(wenxindongwork): The new MoE kernel expects a 2D mesh for now.
-    We should use ShardingAxisNameBase once the new MoE kernel supports
-    more general mesh shapes. For now, this is the default sharding axes.
-    """
-    SEQUENCE = None
-    ATTN_DATA = None
-    MLP_DATA = None
-    ATTN_HEAD = 'model'
-    ATTN_TENSOR = None
-    MLP_TENSOR = 'model'
-    MOE_TENSOR = 'model'
-    EXPERT = 'model'
-    VOCAB = 'model'
-
-
-try:
-    _use_base_sharding = envs.NEW_MODEL_DESIGN
-    if _use_base_sharding:
-        ShardingAxisName = ShardingAxisNameBase
-    else:
-        ShardingAxisName = ShardingAxisName2D
-except Exception:
-    ShardingAxisName = ShardingAxisName2D
 
 
 @dataclass
@@ -175,36 +145,12 @@ class ShardingConfigManager:
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
         device_indexes = sharding_strategy.get("device_indexes", None)
 
-        enable_dp_attention = sharding_strategy.get("enable_dp_attention",
-                                                    False)
-        if enable_dp_attention:
-            # Replicate attention layer when num_kv_heads < TP
-            num_kv_heads = 1 if vllm_config.model_config.use_mla else vllm_config.model_config.get_total_num_kv_heads(
-            )
-            cache_dtype = vllm_config.cache_config.cache_dtype
-            if cache_dtype == 'auto':
-                cache_dtype = vllm_config.model_config.dtype
-            kv_dtype = utils.get_jax_dtype_from_str_dtype(
-                cache_dtype) or jnp.bfloat16
-            packing = 4 // jnp.dtype(kv_dtype).itemsize
-            # When num_kv_heads * 2 / packing < TP, tensor parallelism would
-            # duplicate KV heads across devices, wasting kv cache memory.
-            # Use attention DP instead to reduce per-device num_kv_heads and
-            # eliminate this waste.
-            num_kv_heads_per_device_in_kv_cache = (num_kv_heads * 2) / packing
-            attn_dp = max(
-                int(tensor_parallelism // num_kv_heads_per_device_in_kv_cache),
-                1)
-            tensor_parallelism = tensor_parallelism // attn_dp
-        else:
-            attn_dp = 1
-
         sharding_strategy = ShardingStrategy(
             tensor_parallelism=tensor_parallelism,
             data_parallelism=data_parallelism,
             expert_parallelism=expert_parallelism,
             sequence_parallelism=sequence_parallelism,
-            attention_data_parallelism=attn_dp)
+            attention_data_parallelism=1)
 
         cls.validate(vllm_config, sharding_strategy)
         return cls(sharding_strategy, device_indexes)
@@ -223,11 +169,6 @@ class ShardingConfigManager:
                     f"LoRA is not supported with data parallelism "
                     f"(DP size: {total_dp_size}). Please disable LoRA or "
                     f"set data parallelism to 1.")
-        if sharding_strategy.attention_data_parallelism > 1:
-            if not envs.NEW_MODEL_DESIGN:
-                raise ValueError(
-                    "Must run Attention DP with NEW_MODEL_DESIGN enabled. Please set the "
-                    "NEW_MODEL_DESIGN=True.")
 
     @property
     def total_dp_size(self) -> int:

@@ -303,18 +303,20 @@ def sharded_ragged_paged_attention(
 ):
     """Shards along KV heads."""
 
-    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD, None, None)
+    attn_data_axis = ShardingAxisName.ATTN_DATA if "attn_dp" in mesh.axis_names else None
+    attn_head_axis = ShardingAxisName.ATTN_HEAD if ShardingAxisName.ATTN_HEAD in mesh.axis_names else None
+
+    qkv_spec = P(attn_data_axis, attn_head_axis, None)
+    kv_cache_spec = P(attn_data_axis, None, attn_head_axis, None, None)
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
         qkv_spec,  # v
         kv_cache_spec,  # kv cache
-        P(ShardingAxisName.ATTN_DATA),  # kv_lens
-        P(ShardingAxisName.ATTN_DATA),  # page_indices
-        P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
-        P(ShardingAxisName.ATTN_DATA),  # distribution
+        P(attn_data_axis),  # kv_lens
+        P(attn_data_axis),  # page_indices
+        P(attn_data_axis),  # cu_q_lens
+        P(attn_data_axis),  # distribution
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
