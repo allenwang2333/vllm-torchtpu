@@ -1069,7 +1069,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         rank = get_tensor_model_parallel_rank()
         n_local_heads = self.mla_attn.n_local_heads
         # Pass the sharded attn_sink parameter directly. XLA's SPMD partitioner will map the sharded heads natively.
-        local_sink = self.attn_sink
+        local_sink = self.attn_sink[:n_local_heads]
         output, new_sw_cache = self.attn_op(
             q,
             kv,
