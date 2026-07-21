@@ -368,19 +368,19 @@ def _deepseek_v4_attention_jax(
 
     data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD)
     batch_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
-    extra_spec = batch_spec if not is_csa else P(ShardingAxisName.ATTN_DATA, None)
+    extra_spec = batch_spec if not is_csa else get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, None)
     in_specs = (
         data_spec,  # q
         P(),  # new_kv
         P(),  # sw_cache
         batch_spec,  # swa_kv_lens
-        P(ShardingAxisName.ATTN_DATA),  # swa_page_indices
+        batch_spec,  # swa_page_indices
         P(),  # swa_cu_q_lens
         P(),  # swa_distribution
         P(),  # main_cache_kv
         batch_spec,  # main_kv_lens
         extra_spec,  # extra
-        P(ShardingAxisName.ATTN_DATA),  # main_page_indices
+        batch_spec,  # main_page_indices
         P(),  # main_cu_q_lens
         P(),  # main_distribution
         P(),  # attention_sinks
@@ -480,19 +480,19 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, None),  # kv_score
+                get_valid_spec(mesh, attn_data_axis, None),  # kv_score
                 P(),  # ape
                 P(),  # norm_weight
                 P(),  # cos_sin_cache
-                P(attn_data_axis),  # positions
+                get_valid_spec(mesh, attn_data_axis),  # positions
                 P(),  # request_distribution
                 P(),  # query_start_loc
-                P(batch_axis),  # seq_lens
-                P(batch_axis),  # state_block_tables
+                get_valid_spec(mesh, batch_axis),  # seq_lens
+                get_valid_spec(mesh, batch_axis),  # state_block_tables
                 P(),  # cache
             ),
             output_partition_specs=(
-                P(),  # updated_cache
+                get_valid_spec(mesh),  # updated_cache
             ),
         )
         
@@ -609,7 +609,7 @@ def _deepseek_v4_indexer_jax(
         P(),  # cu_q_lens
         P(),  # distribution
     )
-    out_specs = P(ShardingAxisName.ATTN_DATA, None)  # topk_indices
+    out_specs = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, None)  # topk_indices
 
     if cache_kv.ndim == 5:
         cache_kv = jnp.squeeze(cache_kv, axis=2)
@@ -682,16 +682,16 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q_rope
-                P(attn_data_axis, attn_head_axis),  # indexer_weights
+                get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # q_rope
+                get_valid_spec(mesh, attn_data_axis, attn_head_axis),  # indexer_weights
                 P(),  # cache_kv
-                P(batch_axis),  # seq_lens
-                P(batch_axis),  # page_indices
+                get_valid_spec(mesh, batch_axis),  # seq_lens
+                get_valid_spec(mesh, batch_axis),  # page_indices
                 P(),  # cu_q_lens
                 P(),  # distribution
             ),
             output_partition_specs=(
-                P(batch_axis, None),  # indices
+                get_valid_spec(mesh, batch_axis, None),  # indices
             ),
         )
         
@@ -765,7 +765,9 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         self.block_size = min(compressed_kv_cache_bz // csa_compression_ratio,
                               window_size)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        if getattr(self, "is_unused", False):
+            return None
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -818,6 +820,11 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
                 object.__setattr__(self.mla_attn.compressor, "k_cache", self.mla_attn.swa_cache_layer)
             else:
                 object.__setattr__(self.mla_attn.compressor, "k_cache", self.mla_attn.mla_attn)
+        if self.compress_ratio > 1:
+            if hasattr(self.mla_attn, "swa_cache_layer"):
+                object.__setattr__(self.mla_attn.swa_cache_layer, "is_unused", True)
+        if hasattr(self.mla_attn, "swa_cache_layer"):
+            print(f"[DEBUG_SWA] Layer {prefix} compress_ratio={self.compress_ratio} class={self.mla_attn.swa_cache_layer.__class__.__name__} is_unused={getattr(self.mla_attn.swa_cache_layer, 'is_unused', False)}", flush=True)
         hf_config = vllm_config.model_config.hf_config
         object.__setattr__(self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim)
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -1109,11 +1116,12 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             s_flat = s.view(w.shape[0], 1)
             
         wo_a_dequant = w.to(o_ref.dtype) * s_flat.to(o_ref.dtype)
-
         check_nan("wo_a_dequant", wo_a_dequant, self.custom_prefix)
         
+        wo_a_local_weight = wo_a_dequant
+
         # Local matmul: [t, 4096] @ [1024, 4096]^T -> [t, 1024]
-        z_local = torch.matmul(o_ref_flat.to(wo_a_dequant.dtype), wo_a_dequant.T)
+        z_local = torch.matmul(o_ref_flat.to(wo_a_local_weight.dtype), wo_a_local_weight.T)
         check_nan("z_local", z_local, self.custom_prefix)
 
         # --- wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).

@@ -324,3 +324,141 @@ else:
         logger.error(
             f"Error occurred while logging TPU info: {e}. Are you running on CPU?"
         )
+
+
+import sys
+from importlib.abc import MetaPathFinder
+
+
+class PatchedLoader:
+    def __init__(self, orig_loader, patch_func):
+        self.orig_loader = orig_loader
+        self.patch_func = patch_func
+
+    def create_module(self, spec):
+        return self.orig_loader.create_module(spec)
+
+    def exec_module(self, module):
+        self.orig_loader.exec_module(module)
+        try:
+            self.patch_func(module)
+        except Exception as e:
+            print(f"Error applying patch to module {module.__name__}: {e}", file=sys.stderr, flush=True)
+
+
+class LazyPatcher(MetaPathFinder):
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname not in (
+            "vllm.v1.worker.gpu_model_runner",
+            "vllm.v1.worker.gpu.model_runner",
+            "vllm.v1.core.kv_cache_utils",
+            "vllm.v1.kv_cache_interface",
+            "vllm.v1.engine.utils"
+        ):
+            return None
+
+        # Direct trace print to see all imports handled by the hook
+        print(f"[LAZY_PATCHER_FIND] {fullname}", file=sys.stderr, flush=True)
+
+        sys.meta_path.remove(self)
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec(fullname, path)
+            if spec is None or spec.loader is None:
+                return None
+
+            if fullname in ("vllm.v1.worker.gpu_model_runner", "vllm.v1.worker.gpu.model_runner"):
+                def patch_func(module):
+                    _orig_runner_get_kv_cache_spec = module.GPUModelRunner.get_kv_cache_spec
+                    def patched_runner_get_kv_cache_spec(self):
+                        res = _orig_runner_get_kv_cache_spec(self)
+                        print(f"[DEBUG_RUNNER_SPECS] {fullname} get_kv_cache_spec returned keys: {list(res.keys())}", file=sys.stderr, flush=True)
+                        for k, v in res.items():
+                            print(f"  {k}: {v.__class__.__name__}", file=sys.stderr, flush=True)
+                        return res
+                    module.GPUModelRunner.get_kv_cache_spec = patched_runner_get_kv_cache_spec
+                    print(f"Successfully lazy-patched {fullname}.GPUModelRunner.get_kv_cache_spec.", file=sys.stderr, flush=True)
+            elif fullname == "vllm.v1.core.kv_cache_utils":
+                def patch_func(module):
+                    _orig_unify = module.unify_hybrid_kv_cache_specs
+                    def patched_unify(kv_cache_spec):
+                        _orig_unify(kv_cache_spec)
+                        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+                        for name, spec in kv_cache_spec.items():
+                            if isinstance(spec, MLAAttentionSpec):
+                                storage_block_size = spec.block_size // spec.compress_ratio
+                                if spec.cache_dtype_str == "fp8_ds_mla":
+                                    if spec.model_version == "deepseek_v4":
+                                        real_page_size = storage_block_size * 584
+                                    else:
+                                        real_page_size = spec.block_size * 656
+                                else:
+                                    real_page_size = storage_block_size * spec.num_kv_heads * spec.head_size * 1
+                                
+                                if spec.kv_quant_mode.is_per_token_head:
+                                    real_page_size += 2 * spec.block_size * spec.num_kv_heads * 4
+                                
+                                padded_size = ((real_page_size + 127) // 128) * 128
+                                if spec.page_size_padded is None or spec.page_size_padded < padded_size:
+                                    print(f"[PATCH_UNIFY_HYBRID] Correcting {name} page_size_padded from {spec.page_size_padded} to {padded_size} (real={real_page_size})", file=sys.stderr, flush=True)
+                                    object.__setattr__(spec, "page_size_padded", padded_size)
+                    module.unify_hybrid_kv_cache_specs = patched_unify
+
+                    _orig_get_kv_cache_groups = module.get_kv_cache_groups
+                    def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
+                        print(f"[DEBUG_GLOBAL_GROUPS_INPUT] kv_cache_spec keys: {list(kv_cache_spec.keys())}", file=sys.stderr, flush=True)
+                        for k, v in kv_cache_spec.items():
+                            print(f"  {k}: {v.__class__.__name__} window={getattr(v, 'sliding_window', None)} compress={getattr(v, 'compress_ratio', None)} page_size={v.page_size_bytes}", file=sys.stderr, flush=True)
+                        res = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+                        print(f"[DEBUG_GLOBAL_GROUPS_OUTPUT] returned {len(res)} groups:", file=sys.stderr, flush=True)
+                        for idx, g in enumerate(res):
+                            print(f"  Group {idx}: {g.kv_cache_spec.__class__.__name__} layers={g.layer_names}", file=sys.stderr, flush=True)
+                            print(f"    Spec details: block_size={g.kv_cache_spec.block_size} page_size={g.kv_cache_spec.page_size_bytes}", file=sys.stderr, flush=True)
+                        return res
+                    module.get_kv_cache_groups = patched_get_kv_cache_groups
+                    print("Successfully lazy-patched get_kv_cache_groups and unify_hybrid_kv_cache_specs.", file=sys.stderr, flush=True)
+            elif fullname == "vllm.v1.kv_cache_interface":
+                def patch_func(module):
+                    orig_getter = module.AttentionSpec.page_size_bytes.fget
+                    def patched_getter(self):
+                        print(f"[DEBUG_GETTER_CALL] {self.__class__.__name__} page_size_padded={self.page_size_padded}", file=sys.stderr, flush=True)
+                        try:
+                            return orig_getter(self)
+                        except BaseException as e:
+                            real_page_size = self.real_page_size_bytes
+                            if self.kv_quant_mode.is_per_token_head:
+                                real_page_size += 2 * self.block_size * self.num_kv_heads * 4
+                            msg = f"[FATAL_ASSERT_FAIL] {self.__class__.__name__} page_size_padded={self.page_size_padded} vs real_page_size={real_page_size} (block_size={self.block_size} num_heads={self.num_kv_heads} head_size={self.head_size})"
+                            print(msg, file=sys.stderr, flush=True)
+                            try:
+                                with open("/tmp/assertion_fail.txt", "a") as f:
+                                    f.write(msg + "\n")
+                            except Exception:
+                                pass
+                            raise e
+                    module.AttentionSpec.page_size_bytes = property(patched_getter)
+                    print("Successfully lazy-patched AttentionSpec.page_size_bytes property.", file=sys.stderr, flush=True)
+            elif fullname == "vllm.v1.engine.utils":
+                def patch_func(module):
+                    _orig_init = module.CoreEngineProcManager.__init__
+                    def patched_init(self, *args, **kwargs):
+                        from vllm.v1.kv_cache_interface import AttentionSpec
+                        print(f"[DEBUG_FORK_CHECK] AttentionSpec.page_size_bytes getter is: {AttentionSpec.page_size_bytes.fget}", file=sys.stderr, flush=True)
+                        return _orig_init(self, *args, **kwargs)
+                    module.CoreEngineProcManager.__init__ = patched_init
+                    print("Successfully lazy-patched CoreEngineProcManager.__init__.", file=sys.stderr, flush=True)
+
+            spec.loader = PatchedLoader(spec.loader, patch_func)
+            return spec
+        finally:
+            sys.meta_path.insert(0, self)
+        return None
+
+
+sys.meta_path.insert(0, LazyPatcher())
+logger.info("Registered LazyPatcher import hook for vLLM V1 debugging.")
+
+
+def general_plugin_init() -> None:
+    logger.info("Executing general plugin init...")

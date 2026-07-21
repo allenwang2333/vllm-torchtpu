@@ -94,8 +94,11 @@ def gmm_wrapper(lhs,
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    is_fp4_weight = (rhs.dtype == jnp.uint8) or (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+    rhs_quant_dtype = jnp.float4_e2m1fn if is_fp4_weight else None
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -107,6 +110,7 @@ def gmm_wrapper(lhs,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
 

@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
 import functools
+import os
 from enum import Enum
 
 import jax
@@ -167,7 +168,14 @@ def _mla_ragged_paged_attention_kernel(
         head_l_ref = l_ref.at[:q.shape[0]]
         head_m_ref = m_ref.at[:q.shape[0]]
         head_acc_ref = acc_ref.at[:q.shape[0]]
-
+        if os.environ.get("TPU_INTERPRET") == "1":
+            @pl.when(jnp.logical_and(seq_idx == 7, bq_idx == 2))
+            def _():
+                any_q_nan = jnp.any(jnp.isnan(q))
+                # Slice nope (448 channels) and rope (64 channels) from kv (512 channels)
+                any_nope_nan = jnp.any(jnp.isnan(kv[:, :448]))
+                any_rope_nan = jnp.any(jnp.isnan(kv[:, 448:]))
+                pl.debug_print("NaN check: any_q_nan={}, nope_nan={}, rope_nan={}", any_q_nan, any_nope_nan, any_rope_nan)
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
@@ -234,6 +242,12 @@ def _mla_ragged_paged_attention_kernel(
         dma_bkv_sz = jnp.minimum(kv_left_per_kv_packing, bkv_sz_per_kv_packing)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
+        if os.environ.get("TPU_INTERPRET") == "1":
+            @pl.when(jnp.logical_and(seq_idx == 7, bkv_idx == 0))
+            def _():
+                pl.debug_print("DMA debug seq_idx={} page_indices_offset={} page_indices_ref[offset]={}", 
+                               seq_idx, page_indices_offset, page_indices_ref[page_indices_offset])
+            
         if not wait:
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
@@ -417,19 +431,14 @@ def _mla_ragged_paged_attention_kernel(
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     def load_bq(bq_sem_idx):
-        q_ref = (bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx].reshape(
-            bq_sz * num_q_heads_per_q_packing, head_dim))
-        q = pltpu.bitcast(
-            q_ref[:bq_sz * num_q_heads_per_q_packing],
-            q_dtype,
-        ).reshape(bq_sz * num_q_heads, head_dim)
-        return q
+        return bq_x2_ref.at[bq_sem_idx].reshape(bq_sz * num_q_heads, head_dim)[...]
+
+
 
     def load_bkv(bkv_sem_idx, bkv_idx):
-        bkv_ref = (bkv_x2_ref.bitcast(
-            jnp.uint32).at[bkv_sem_idx, :bkv_sz_per_kv_packing].reshape(
-                bkv_sz_per_kv_packing, lkv_dim))
-        bkv = pltpu.bitcast(bkv_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
+        bkv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
+            bkv_sz_per_kv_packing, lkv_dim)
+        bkv = pltpu.bitcast(bkv_ref[...], jnp.uint8).reshape(bkv_sz, lkv_dim)
 
         # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
         # compressor state cache write data in bfloat16 / float32 format, certain
@@ -451,16 +460,16 @@ def _mla_ragged_paged_attention_kernel(
         nope_scales = nope_scales.reshape(bkv_sz, 7, 1)
         dequant_nope = (nope_fp8 * nope_scales).reshape(bkv_sz, 448)
         
-        # Force evaluation and combine bytes to uint32 to prevent register sub-slice compiler bugs.
-        rope_bytes = bkv[:, 448:576] + 0
-        rope_bytes_reshaped = rope_bytes.reshape(bkv_sz, 64, 2)
-        byte0 = rope_bytes_reshaped[:, :, 0].astype(jnp.uint32)
-        byte1 = rope_bytes_reshaped[:, :, 1].astype(jnp.uint32)
-        rope_uint32 = byte0 | (byte1 << 8)
-        rope = pltpu.bitcast(rope_uint32, jnp.bfloat16).reshape(bkv_sz, 2, 64)[:, 0]
+        # Padded bitcast avoids transpose layout mismatch/scrambling in VMEM registers.
+        dummy_zeros = jnp.zeros((bkv_sz, 128), dtype=jnp.uint8)
+        padded = jnp.concat([bkv[:, 448:576], dummy_zeros], axis=-1)
+        rope_temp = padded.T
+        rope_padded = pltpu.bitcast(rope_temp, jnp.bfloat16).T
+        rope = rope_padded[:, :64]
         
         bkv = jnp.concatenate([dequant_nope, rope], axis=-1)
         return bkv
+
 
     def broadcast_minor(src, shape):
         if src.shape == shape:
@@ -483,6 +492,8 @@ def _mla_ragged_paged_attention_kernel(
             num_bq = jnp.maximum(1, cdiv(q_len, bq_sz))
         else:
             num_bq = jnp.maximum(1, cdiv(static_q_len, bq_sz))
+
+        pl.debug_print("PROGRAM_BLOCK seq_idx={}: q_len={}, kv_len={}, num_bq={}, num_bkv={}", seq_idx, q_len, kv_len, num_bq, num_bkv)
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -520,7 +531,7 @@ def _mla_ragged_paged_attention_kernel(
                 kv_lens_to_attend_segment = None
 
             # Prefetch next bq
-            @pl.when(next_seq_idx < end_seq_idx)
+            @pl.when(next_seq_idx == seq_idx)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
@@ -537,7 +548,7 @@ def _mla_ragged_paged_attention_kernel(
                     seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
 
                 # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
+                @pl.when(next_seq_idx == seq_idx)
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx,
@@ -551,6 +562,19 @@ def _mla_ragged_paged_attention_kernel(
                 # flash attention, so that the invalid kv entries
                 # (as long as they are not NaN or inf) won't affect to the output.
                 bkv = load_bkv(bkv_sem_idx, bkv_idx)
+                if os.environ.get("TPU_INTERPRET") == "1":
+                    @pl.when(
+                        jnp.logical_and(
+                            jnp.logical_and(seq_idx == 7, bq_idx == 2),
+                            bkv_idx == 0,
+                        )
+                    )
+                    def _():
+                        pl.debug_print("bkv raw bytes: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}", 
+                                       bkv[0, 0], bkv[0, 1], bkv[0, 2], bkv[0, 3],
+                                       bkv[0, 4], bkv[0, 5], bkv[0, 6], bkv[0, 7],
+                                       bkv[0, 8], bkv[0, 9], bkv[0, 10], bkv[0, 11],
+                                       bkv[0, 12], bkv[0, 13], bkv[0, 14], bkv[0, 15])
 
                 bq = load_bq(bq_sem_idx)
 
@@ -568,12 +592,22 @@ def _mla_ragged_paged_attention_kernel(
                     kv_lens_to_attend_segment=kv_lens_to_attend_segment,
                     bq_topk_indices=bq_topk_indices,
                 )
+                if os.environ.get("TPU_INTERPRET") == "1":
+                    @pl.when(jnp.logical_and(seq_idx == 7, bq_idx == 2))
+                    def _():
+                        pl.debug_print("LOOP seq_idx={} bq_idx={} bkv_idx={}: acc_ref[49, 83]={}, l_ref[49, 83]={}, m_ref[49, 83]={}", 
+                                       seq_idx, bq_idx, bkv_idx, 
+                                       acc_ref[49, 83], l_ref[49, 83], m_ref[49, 83])
                 return (kv_lens_to_attend_segment, )
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
             wait_fetch_swa(seq_idx, bq_idx, bq_sem_idx)
             wait_fetch_topk_indices(seq_idx, bq_idx, bq_sem_idx)
+            if os.environ.get("TPU_INTERPRET") == "1":
+                @pl.when(jnp.logical_and(seq_idx == 7, bq_idx == 2))
+                def _():
+                    pl.debug_print("INITIAL: acc_ref[49, 83]={}, l_ref[49, 83]={}, m_ref[49, 83]={}", acc_ref[49, 83], l_ref[49, 83], m_ref[49, 83])
             jax.lax.fori_loop(
                 0,
                 num_bkv,
@@ -581,16 +615,30 @@ def _mla_ragged_paged_attention_kernel(
                 (kv_lens_to_attend_segment, ),
                 unroll=False,
             )
+            if os.environ.get("TPU_INTERPRET") == "1":
+                @pl.when(jnp.logical_and(seq_idx == 7, bq_idx == 2))
+                def _():
+                    pl.debug_print("POST_LOOP: acc_ref[49, 83]={}, l_ref[49, 83]={}, m_ref[49, 83]={}", acc_ref[49, 83], l_ref[49, 83], m_ref[49, 83])
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
             attention_sinks = jnp.concat(
                 [attention_sinks_ref[:num_q_heads] for _ in range(bq_sz)])[..., None]
-            exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
+            # Avoid -inf - (-inf) = NaN subtraction when sinks are disabled.
+            is_sink_inf = (attention_sinks < -10000.0)
+            safe_diff = jnp.where(is_sink_inf, -10000.0, attention_sinks - m_ref[...])
+            exp_attention_sinks = jnp.where(is_sink_inf, 0.0, jnp.exp(safe_diff))
             L = l_ref[...] + exp_attention_sinks
             L = broadcast_minor(L, acc.shape)
             out = (lax.div(acc, L) if q_dtype == jnp.float32 else
-                   (acc * pl.reciprocal(L, approx=True)).astype(q_dtype))
+                   (acc * pl.reciprocal(L, approx=False)).astype(q_dtype))
+            if os.environ.get("TPU_INTERPRET") == "1":
+                @pl.when(jnp.logical_and(seq_idx == 0, bq_idx == 0))
+                def _():
+                    pl.debug_print("DEBUG_L: l_ref[0]={:.6f} exp_sinks[0]={:.6f} L[0]={:.6f} m_ref[0]={:.6f} acc[0,0]={:.6f}", 
+                                   l_ref[0, 0], exp_attention_sinks[0, 0], L[0, 0], m_ref[0, 0], acc[0, 0])
+                    pl.debug_print("DEBUG_L_ALL: l_ref_slice={} exp_sinks_slice={} m_ref_slice={}", 
+                                   l_ref[:8, 0], exp_attention_sinks[:8, 0], m_ref[:8, 0])
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -598,10 +646,8 @@ def _mla_ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                bq_sz * num_q_heads_per_q_packing,
-                head_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
+
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -610,19 +656,28 @@ def _mla_ragged_paged_attention_kernel(
 
     ### ------- Kernel start ------- ###
 
-    @pl.when(seq_idx == start_seq_idx)
-    def prologue():
-        start_fetch_bq(start_seq_idx, 0, 0)
-        start_fetch_swa(start_seq_idx, 0, 0)
-        start_fetch_topk_indices(start_seq_idx, 0, 0)
-        start_fetch_bkv(start_seq_idx, 0, 0)
+    sem_ids_ref[0] = 0
+    sem_ids_ref[1] = 0
+    sem_ids_ref[2] = 0
+    bo_ids_ref[0] = -1
+    bo_ids_ref[1] = -1
+    bo_ids_ref[2] = -1
+    bo_ids_ref[3] = -1
 
+    def prologue():
+        start_fetch_bq(seq_idx, 0, 0)
+        start_fetch_swa(seq_idx, 0, 0)
+        start_fetch_topk_indices(seq_idx, 0, 0)
+        start_fetch_bkv(seq_idx, 0, 0)
+
+    prologue()
     process()
 
-    @pl.when(seq_idx == end_seq_idx - 1)
     def epilogue():
         for i in range(2):
             wait_send_bo(i)
+
+    epilogue()
 
     ### ------- Kernel end ------- ###
 
@@ -872,14 +927,20 @@ def mla_ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_bufq
+        bo_double_buf = pltpu.VMEM(
+            (2, bq_sz, num_q_heads, head_dim),
+            q.dtype,
+        )
 
         num_l_heads = align_to(num_q_heads, 128)
         bl_double_buf = pltpu.VMEM(
             (2, bq_sz, num_l_heads),
             jnp.float32,
         )
-        bm_double_buf = bl_double_buf
+        bm_double_buf = pltpu.VMEM(
+            (2, bq_sz, num_l_heads),
+            jnp.float32,
+        )
 
         swa_acc_double_buf = pltpu.VMEM(
             (2, bq_sz, num_q_heads, head_dim),
@@ -898,13 +959,15 @@ def mla_ragged_paged_attention(
             (bq_sz * num_q_heads, 128),
             jnp.float32,
         )
-        m_scratch = l_scratch
+        m_scratch = pltpu.VMEM(
+            (bq_sz * num_q_heads, 128),
+            jnp.float32,
+        )
 
         acc_scratch = pltpu.VMEM(
             (bq_sz * num_q_heads, head_dim),
             jnp.float32,
         )
-
         scratch_shapes = [
             bkv_double_buf,
             bq_double_bufq,
@@ -933,6 +996,9 @@ def mla_ragged_paged_attention(
             jnp.full((4, ), -1, jnp.int32),
         )
 
+        import os
+        interpret_params = pltpu.InterpretParams() if os.environ.get("TPU_INTERPRET") == "1" else None
+        
         scope_name = f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -944,6 +1010,7 @@ def mla_ragged_paged_attention(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                 ),
+                interpret=interpret_params,
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
                     in_specs=in_specs,

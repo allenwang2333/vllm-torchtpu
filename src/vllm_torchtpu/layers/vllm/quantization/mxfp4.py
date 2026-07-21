@@ -224,9 +224,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
         cache_path = None
         w13_shape_str = f"{layer.w13_weight.shape[1]}x{layer.w13_weight.shape[2]}" if hasattr(layer, "w13_weight") and layer.w13_weight.ndim >= 3 else "default"
+        w2_shape_str = f"{layer.w2_weight.shape[1]}x{layer.w2_weight.shape[2]}" if hasattr(layer, "w2_weight") and layer.w2_weight.ndim >= 3 else "default"
         if cache_dir and layer_idx is not None:
             os.makedirs(cache_dir, exist_ok=True)
-            cache_path = os.path.join(cache_dir, f"rank_{rank}_layer_{layer_idx}_{w13_shape_str}.pt")
+            cache_path = os.path.join(cache_dir, f"rank_{rank}_layer_{layer_idx}_w13_{w13_shape_str}_w2_{w2_shape_str}.pt")
 
 
         loaded_from_cache = False
@@ -313,30 +314,38 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
             # 3. Calculate padded dimensions for block-512 and GMM alignment
             # Note: weights are already sharded by vLLM, so these are local dimensions.
-            orig_hidden_size = w2_weight.shape[1]
-            orig_local_intermediate_size = w2_weight.shape[2]
+            # Transpose non-contracting dim to right-most dim:
+            # w13_weight: (num_experts, 2 * intermediate_size, hidden_size) -> (num_experts, hidden_size, 2 * intermediate_size)
+            # w2_weight: (num_experts, hidden_size, intermediate_size) -> (num_experts, intermediate_size, hidden_size)
+            w13_weight = w13_weight.transpose(1, 2).contiguous()
+            w2_weight = w2_weight.transpose(1, 2).contiguous()
+
+            orig_hidden_size = w2_weight.shape[2]
+            orig_local_intermediate_size = w2_weight.shape[1]
+            logger.info(f"[DEBUG_INPUT_WEIGHT_SHAPES] layer_{layer_idx} w13: {w13_weight.shape}, w2: {w2_weight.shape}")
 
             w13_block_size = REQUANTIZED_BLOCK_SIZE
             w2_block_size = REQUANTIZED_BLOCK_SIZE
             w2_block_size = min(w2_block_size, orig_local_intermediate_size)
 
-            # Align local intermediate dimension to 128 for GMM kernel
+            # Align local intermediate dimension to 128 for GMM alignment
             local_intermediate_size_padded = (orig_local_intermediate_size + 128 - 1) // 128 * 128
             hidden_size_padded = (orig_hidden_size + w13_block_size - 1) // w13_block_size * w13_block_size
 
             # 4. Pad local tensors
-            # w13_weight has shape [num_experts, 2 * orig_local_intermediate_size, orig_hidden_size]
+            # w13_weight has shape [num_experts, orig_hidden_size, 2 * orig_local_intermediate_size]
             # We split it into w1 and w3 to pad the intermediate dimension individually
-            w1_weight = w13_weight[:, :orig_local_intermediate_size, :]
-            w3_weight = w13_weight[:, orig_local_intermediate_size:, :]
+            w1_weight = w13_weight[:, :, :orig_local_intermediate_size]
+            w3_weight = w13_weight[:, :, orig_local_intermediate_size:]
             
             pad_w13_intermediate = local_intermediate_size_padded - orig_local_intermediate_size
             pad_w13_hidden = hidden_size_padded - orig_hidden_size
             
-            pad_spec_w13 = (0, pad_w13_hidden, 0, pad_w13_intermediate)
+            # PyTorch pad spec starts from the last dimension: (pad_last, pad_second_last, ...)
+            pad_spec_w13 = (0, pad_w13_intermediate, 0, pad_w13_hidden)
             w1_weight_padded = torch.nn.functional.pad(w1_weight, pad_spec_w13)
             w3_weight_padded = torch.nn.functional.pad(w3_weight, pad_spec_w13)
-            w13_weight_padded = torch.cat([w1_weight_padded, w3_weight_padded], dim=1)
+            w13_weight_padded = torch.cat([w1_weight_padded, w3_weight_padded], dim=2)
             
             if w13_bias is not None:
                 b1_bias = w13_bias[:, :orig_local_intermediate_size]
@@ -347,11 +356,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             else:
                 w13_bias_padded = None
 
-            # w2_weight has shape [num_experts, orig_hidden_size, orig_local_intermediate_size]
-            pad_spec_w2 = (0, local_intermediate_size_padded - orig_local_intermediate_size, 0, hidden_size_padded - orig_hidden_size)
+            # w2_weight has shape [num_experts, orig_local_intermediate_size, orig_hidden_size]
+            pad_spec_w2 = (0, pad_w13_hidden, 0, pad_w13_intermediate)
             w2_weight_padded = torch.nn.functional.pad(w2_weight, pad_spec_w2)
+
             if w2_bias is not None:
-                w2_bias_padded = torch.nn.functional.pad(w2_bias, (0, hidden_size_padded - orig_hidden_size))
+                w2_bias_padded = torch.nn.functional.pad(w2_bias, (0, pad_w13_hidden))
             else:
                 w2_bias_padded = None
 
@@ -381,16 +391,21 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 s2 = w2_weight_scale.transpose(1, 2).contiguous().to(torch.float32)
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
             else:
+                # Quantization is along axis 2 (the contracting dimension for both padded tensors)
                 w13_indices, w13_weight_scale = quantize_tensor_to_fp4(w13_weight_padded, axis=2, block_size=w13_block_size)
                 w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=2, block_size=w2_block_size)
 
-                w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2)).contiguous()
-                w2_weight_processed = pack_fp4_indices(w2_indices.transpose(1, 2)).contiguous()
+                w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2))
+                w2_weight_processed = pack_fp4_indices(w2_indices.transpose(1, 2))
+                logger.info(f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}")
+                w13_weight_processed = w13_weight_processed.contiguous()
+                w2_weight_processed = w2_weight_processed.contiguous()
 
                 s13 = w13_weight_scale.transpose(1, 2).contiguous()
                 w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
                 s2 = w2_weight_scale.transpose(1, 2).contiguous()
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
+
 
             if w13_bias_padded is not None:
                 w13_bias_padded = w13_bias_padded.unsqueeze(1)
@@ -425,6 +440,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 return None
             xla_tensor = tensor.to(device=device)
             return Parameter(xla_tensor, requires_grad=False)
+
+        if loaded_from_cache:
+            w13_weight_processed = w13_weight_packed
+            w2_weight_processed = w2_weight_packed
 
         layer.w13_weight = to_xla_parameter(w13_weight_processed)
         layer.w2_weight = to_xla_parameter(w2_weight_processed)

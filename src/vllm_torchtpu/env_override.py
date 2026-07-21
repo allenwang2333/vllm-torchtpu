@@ -8,6 +8,10 @@ import os
 # The issue was introduced by vllm-project/vllm#26440
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+# Default GMM max tile size limits to avoid compiler register pressure and VMEM spilling
+os.environ.setdefault("GMM_MAX_TILE_K", "256")
+os.environ.setdefault("GMM_MAX_TILE_N", "256")
+
 # Disable forced graph breaks for functional collectives by default.
 # torch_tpu commit 477f611f made the collective-ops graph-break guardrail
 # active by default on module import in non-absl environments, causing a
@@ -105,11 +109,8 @@ def _user_has_flag(flag_name: str) -> bool:
 
 _libtpu_extra_args: list[str] = []
 
-# --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
-# batched RPA attention kernel's scheduling metadata (default budget is too
-# small on --attention-backend CUSTOM).
-if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
-    _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
+
+
 
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so

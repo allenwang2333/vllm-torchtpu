@@ -328,9 +328,6 @@ class PallasAttentionBackend(AttentionBackend):
             return (num_blocks, block_size, num_kv_heads_x2, 1,
                     padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
 
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2

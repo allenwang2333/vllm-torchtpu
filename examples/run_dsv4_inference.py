@@ -45,14 +45,14 @@ def main():
         quantization="deepseek_v4_fp8",
         tensor_parallel_size=8,
         trust_remote_code=True,
-        max_model_len=16,
-        max_num_batched_tokens=16,
+        max_model_len=64,
+        max_num_batched_tokens=64,
         kv_cache_dtype="fp8",
         gpu_memory_utilization=0.32,
         enable_expert_parallel=True,
         additional_config={
             "compilation_config": {
-                "compile_sizes": [16],
+                "compile_sizes": [64],
             },
             "sharding": {
                 "sharding_strategy": {

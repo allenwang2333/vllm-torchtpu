@@ -21,7 +21,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 import sys
+import os
 print("[PATCH] Top-level import of deepseek_v4_patch.py", file=sys.stderr, flush=True)
+
 
 
 @contextmanager
@@ -90,8 +92,9 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             params_keys = sorted(list(dict(self.named_parameters()).keys()))
             print(f"[PATCH] Model parameters count: {len(params_keys)}", file=sys.stderr, flush=True)
             for k in params_keys:
-                if "layers.0.attn.fused_wqa_wkv" in k or "layers.0.attn.wq_a" in k:
-                    print(f"[PATCH]   Param: {k}", file=sys.stderr, flush=True)
+                if "layers.0.attn.wo_b" in k:
+                    param = dict(self.named_parameters())[k]
+                    print(f"[PATCH]   Param: {k} | Shape: {list(param.shape)} | Type: {param.__class__.__name__}", file=sys.stderr, flush=True)
             for idx, l in enumerate(self.model.layers):
                 if hasattr(l, "ffn"):
                     l.ffn.layer_idx = idx
@@ -196,6 +199,41 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
                         yield name, loaded_weight
                         
+            # Check if all expert layers have been pre-quantized and cached on disk.
+            # If so, we can skip loading the heavy expert weights from safetensors to save CPU memory and time.
+            has_all_cached = False
+            cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
+            if cache_dir and os.path.exists(cache_dir):
+                import re
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                cached_files = os.listdir(cache_dir)
+                # Find cached files for this rank
+                pattern = re.compile(rf"rank_{rank}_layer_(\d+).*\.pt")
+                layers_found = set()
+                for f in cached_files:
+                    m = pattern.match(f)
+                    if m:
+                        layers_found.add(int(m.group(1)))
+                # Check layers 0 to num_layers-1
+                has_all_cached = True
+                for i in range(self.config.num_hidden_layers):
+                    if hasattr(self.model.layers[i], "ffn") and hasattr(self.model.layers[i].ffn, "experts"):
+                        if i not in layers_found:
+                            has_all_cached = False
+                            break
+                            
+            if has_all_cached:
+                logger.warning("[PATCH] All expert weights are cached. Skipping loading expert weights from safetensors checkpoint!")
+                def filter_expert_weights(weights_iter):
+                    for name, loaded_weight in weights_iter:
+                        if ".experts." in name:
+                            continue
+                        yield name, loaded_weight
+                weights = filter_expert_weights(weights)
+            else:
+                logger.warning("[PATCH] Cached expert weights not found or incomplete. Loading expert weights from safetensors checkpoint to generate cache.")
+
             self.hf_to_vllm_mapper = WrappedMapper()
             try:
                 def debug_weights_generator(weights_iter):
@@ -204,6 +242,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             print(f"[PATCH] Passing to load_weights: {name} shape={list(loaded_weight.shape)} dtype={loaded_weight.dtype}", file=sys.stderr, flush=True)
                         yield name, loaded_weight
                 res = _orig_load_weights(self, debug_weights_generator(weights))
+                print(f"[PATCH] POST_LOAD: layers.0.attn.wo_b.weight Shape: {list(self.model.layers[0].attn.wo_b.weight.shape)} | Type: {self.model.layers[0].attn.wo_b.weight.__class__.__name__}", file=sys.stderr, flush=True)
+
                 
                 # Manually invoke process_weights_after_loading on all FusedMoE layers
                 # because the standard vLLM loader checks hasattr(module, "quant_method")
@@ -213,7 +253,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         moe_layer = l.ffn.experts
                         if hasattr(moe_layer, "_quant_method"):
                             if hasattr(moe_layer._quant_method, "process_weights_after_loading"):
-                                print(f"[PATCH] Manually invoking process_weights_after_loading on layer {idx} FusedMoE", file=sys.stderr, flush=True)
+                                print(f"[PATCH] Manually invoking process_weights_after_loading on layer {idx} FusedMoE", flush=True)
                                 moe_layer._quant_method.process_weights_after_loading(moe_layer)
                 
                 try:
@@ -228,6 +268,18 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                     module.attn_sink.data.sharding = NamedSharding(mesh, P("model"))
                 except Exception as e:
                     print(f"WARNING: failed to shard attn_sink parameters: {e}")
+
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    logger.info("Aligning workers at barrier after _orig_load_weights")
+                    dist.barrier()
+
+                from torch_tpu._internal import sync
+                print("[DEBUG_LOAD] Calling sync.synchronize(wait=True) and gc.collect() to finalize parameter materialization and free HBM...", flush=True)
+                sync.synchronize(wait=True)
+                import gc
+                gc.collect()
+
                 return res
             finally:
                 self.hf_to_vllm_mapper = orig_mapper
@@ -428,9 +480,20 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     worker_utils.bind_kv_cache = patched_bind_kv_cache
     tpu_runner.bind_kv_cache = patched_bind_kv_cache
+    import vllm.v1.core.kv_cache_utils as kv_utils
+    _orig_get_kv_cache_groups = kv_utils.get_kv_cache_groups
+    def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
+        print(f"[DEBUG_GROUPS_INPUT] kv_cache_spec keys: {list(kv_cache_spec.keys())}", flush=True)
+        for k, v in kv_cache_spec.items():
+            print(f"  {k}: {v.__class__.__name__} window={getattr(v, 'sliding_window', None)} compress={getattr(v, 'compress_ratio', None)}", flush=True)
+        res = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+        print(f"[DEBUG_GROUPS_OUTPUT] returned {len(res)} groups:", flush=True)
+        for idx, g in enumerate(res):
+            print(f"  Group {idx}: {g.kv_cache_spec.__class__.__name__} layers={g.layer_names}", flush=True)
+        return res
+    kv_utils.get_kv_cache_groups = patched_get_kv_cache_groups
 
     try:
         yield
     finally:
         logger.info("DeepSeek V4 TPU model patches kept active for compilation and worker execution.")
-

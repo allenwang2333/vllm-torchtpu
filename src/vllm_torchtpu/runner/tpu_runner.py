@@ -692,6 +692,11 @@ class TPUModelRunner(GPUModelRunner):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+            # Custom get_kv_cache_spec override (e.g. MLA / SWACache)
+            elif not isinstance(attn_module, Attention) and hasattr(attn_module, "get_kv_cache_spec"):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
@@ -790,15 +795,15 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 continue
 
-        # Note: that each shared layer's target actually owns a KV cache (and
-        # that the shared layer was not itself allocated one) is enforced later
-        # against the concrete KVCacheConfig in
-        # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        res = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_block_pool=self._unified_kv_layout,
         )
+        logger.info(f"[DEBUG_RUNNER_SPECS] get_kv_cache_spec returned keys: {list(res.keys())}")
+        for k, v in res.items():
+            logger.info(f"  {k}: {v.__class__.__name__} block_size={v.block_size} page_size={v.page_size_bytes} page_size_padded={getattr(v, 'page_size_padded', None)}")
+        return res
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
