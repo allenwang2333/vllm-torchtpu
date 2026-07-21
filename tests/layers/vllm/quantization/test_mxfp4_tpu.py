@@ -57,6 +57,11 @@ class TestMxfp4MoETPU:
                 enable_expert_parallel=False,
                 all2all_backend="allgather_reducescatter",
                 enable_eplb=False,
+                expert_placement_strategy="linear",
+            ),
+            compilation_config=SimpleNamespace(
+                static_forward_context={},
+                static_all_moe_layers=[],
             ),
         )
         
