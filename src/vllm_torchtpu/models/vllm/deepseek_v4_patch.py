@@ -279,8 +279,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         for name, module in self.named_modules():
                             if module.__class__.__name__ in ("DeepseekV4Attention", "VllmDeepseekV4MLAAttention"):
                                 if hasattr(module, "attn_sink"):
-                                    # module.attn_sink.data.sharding = NamedSharding(mesh, P("model"))
-                                    pass
+                                    module.attn_sink.data.sharding = NamedSharding(mesh, P("model"))
                 except Exception as e:
                     print(f"WARNING: failed to shard attn_sink parameters: {e}")
 
