@@ -71,7 +71,7 @@ class TestMxfp4MoETPU:
             ),
         )
         
-        # Instantiate inside the thread-local config context to satisfy CustomOp/layer registration checks
+        # Execute the entire setup and run inside the config context block
         from vllm.config.vllm import set_current_vllm_config
         with set_current_vllm_config(dummy_vllm_config):
             layer = FusedMoE(
@@ -88,45 +88,45 @@ class TestMxfp4MoETPU:
                 activation="silu",
             )
             
-        layer.layer_idx = 3
-        layer._tpu_activation_str = "silu"
-        layer.renormalize = True
-        
-        # Assign mock weights to w13 and w2 (simulating BF16 model weights on TPU)
-        layer.w13_weight = torch.nn.Parameter(
-            torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16, device=device)
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device)
-        )
-        
-        # 3. Instantiate MXFP4 quant method
-        method = VllmMxfp4MoEMethod(moe_config)
-        layer.quant_method = method
-        
-        # 4. Run weight processing (simulating weight loader)
-        method.process_weights_after_loading(layer)
-        
-        # Verify weight attributes are populated as native FP4 packed tensors
-        assert hasattr(layer, "w13_packed")
-        assert hasattr(layer, "w2_packed")
-        assert layer.w13_packed.dtype == torch.uint8
-        assert layer.w2_packed.dtype == torch.uint8
-        
-        # 5. Execute forward pass (apply_monolithic) on TPU
-        x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-        router_logits = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device=device)
-        
-        # Trigger the monolithic forward pass
-        out = method.apply_monolithic(layer, x, router_logits)
-        
-        # 6. Verify outputs
-        assert out.shape == (num_tokens, hidden_size)
-        assert out.dtype == torch.bfloat16
-        # Assert no NaNs or Infs
-        assert not torch.isnan(out).any().item(), "Output contains NaNs!"
-        assert not torch.isinf(out).any().item(), "Output contains Infs!"
-        
-        print("TPU Forward Output Mean:", out.mean().item())
-        print("TPU Forward Output Max:", out.max().item())
-        print("TPU Forward Output Min:", out.min().item())
+            layer.layer_idx = 3
+            layer._tpu_activation_str = "silu"
+            layer.renormalize = True
+            
+            # Assign mock weights to w13 and w2 (simulating BF16 model weights on TPU)
+            layer.w13_weight = torch.nn.Parameter(
+                torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16, device=device)
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device)
+            )
+            
+            # 3. Instantiate MXFP4 quant method
+            method = VllmMxfp4MoEMethod(moe_config)
+            layer.quant_method = method
+            
+            # 4. Run weight processing (simulating weight loader)
+            method.process_weights_after_loading(layer)
+            
+            # Verify weight attributes are populated as native FP4 packed tensors
+            assert hasattr(layer, "w13_packed")
+            assert hasattr(layer, "w2_packed")
+            assert layer.w13_packed.dtype == torch.uint8
+            assert layer.w2_packed.dtype == torch.uint8
+            
+            # 5. Execute forward pass (apply_monolithic) on TPU
+            x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+            router_logits = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device=device)
+            
+            # Trigger the monolithic forward pass
+            out = method.apply_monolithic(layer, x, router_logits)
+            
+            # 6. Verify outputs
+            assert out.shape == (num_tokens, hidden_size)
+            assert out.dtype == torch.bfloat16
+            # Assert no NaNs or Infs
+            assert not torch.isnan(out).any().item(), "Output contains NaNs!"
+            assert not torch.isinf(out).any().item(), "Output contains Infs!"
+            
+            print("TPU Forward Output Mean:", out.mean().item())
+            print("TPU Forward Output Max:", out.max().item())
+            print("TPU Forward Output Min:", out.min().item())
