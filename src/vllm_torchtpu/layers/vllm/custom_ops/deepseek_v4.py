@@ -383,7 +383,7 @@ def _deepseek_v4_attention_jax(
         batch_spec,  # main_page_indices
         P(),  # main_cu_q_lens
         P(),  # main_distribution
-        get_valid_spec(mesh, ShardingAxisName.ATTN_HEAD),  # attention_sinks
+        P(),  # attention_sinks
     )
     out_specs = (
         data_spec,  # output
@@ -909,7 +909,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
                 get_valid_spec(mesh, batch_axis),  # main_page_indices
                 P(),  # main_cu_q_lens
                 P(),  # main_distribution
-                get_valid_spec(mesh, attn_head_axis),  # attention_sinks
+                P(),  # attention_sinks
             ),
             output_partition_specs=(
                 get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # out (sharded along attention heads)
