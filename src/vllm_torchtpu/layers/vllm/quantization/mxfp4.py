@@ -391,17 +391,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 s2 = w2_weight_scale.contiguous().to(torch.float32)
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
             else:
-                # Quantization is along contracting dimensions: axis 2 for w13, axis 1 for w2
-                w13_indices, w13_weight_scale = quantize_tensor_to_fp4(w13_weight_padded, axis=2, block_size=w13_block_size)
+                # Quantization is along contracting dimensions: axis 1 (hidden_size) for w13, axis 1 (intermediate_size) for w2
+                w13_indices, w13_weight_scale = quantize_tensor_to_fp4(w13_weight_padded, axis=1, block_size=w13_block_size)
                 w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=1, block_size=w2_block_size)
 
-                w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2))
+                # Keep Case B layout (unpacked contracting dim, packed non-contracting dim) by calling pack on raw indices
+                w13_weight_processed = pack_fp4_indices(w13_indices)
                 w2_weight_processed = pack_fp4_indices(w2_indices)
                 logger.info(f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}")
                 w13_weight_processed = w13_weight_processed.contiguous()
                 w2_weight_processed = w2_weight_processed.contiguous()
 
-                s13 = w13_weight_scale.transpose(1, 2).contiguous()
+                s13 = w13_weight_scale.contiguous()
                 w13_weight_scale = torch.empty(s13.shape[0], s13.shape[1], 1, s13.shape[2], dtype=s13.dtype, device=s13.device).copy_(s13.unsqueeze(2))
                 s2 = w2_weight_scale.contiguous()
                 w2_weight_scale = torch.empty(s2.shape[0], s2.shape[1], 1, s2.shape[2], dtype=s2.dtype, device=s2.device).copy_(s2.unsqueeze(2))
