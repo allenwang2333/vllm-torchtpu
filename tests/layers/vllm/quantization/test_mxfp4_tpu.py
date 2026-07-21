@@ -73,7 +73,9 @@ class TestMxfp4MoETPU:
         
         # Execute the entire setup and run inside the config context block
         from vllm.config.vllm import set_current_vllm_config
-        with set_current_vllm_config(dummy_vllm_config):
+        from unittest.mock import patch
+        with set_current_vllm_config(dummy_vllm_config), \
+             patch("vllm_torchtpu.layers.vllm.quantization.mxfp4.get_tensor_model_parallel_world_size", return_value=1):
             layer = FusedMoE(
                 num_experts=num_experts,
                 top_k=top_k,
