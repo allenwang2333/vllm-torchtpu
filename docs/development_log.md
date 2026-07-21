@@ -876,3 +876,24 @@ INFO 07-21 09:49:36 [tpu_platform.py:676] Initialized sharding configuration: Sh
 - **Container Status:** Running (Up)
 - **Progress State:** Initializing...
 
+
+---
+
+### [2026-07-21 04:15:02 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** Safetensors shard loading: 100% Completed | 46/46
+
+
+---
+
+### [2026-07-21 04:30:05 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 11 processed and cached
+
+
+---
+
+### [2026-07-21 04:45:04 UTC] Full Model Offline Inference Progress Run
+- **Container Status:** Running (Up)
+- **Progress State:** MoE weight pre-processing: layer 27 processed and cached
+
