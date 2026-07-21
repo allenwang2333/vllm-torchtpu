@@ -542,10 +542,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
-        if getattr(layer, "layer_idx", -1) == 0:
-            print(f"[DEBUG_FORWARD] layer_0 input x: Mean={x.mean().item():.6f} Max={x.max().item():.6f} Min={x.min().item():.6f}", flush=True)
-            print(f"[DEBUG_FORWARD] layer_0 topk_ids: Mean={topk_ids.float().mean().item():.6f} Max={topk_ids.max().item()} Min={topk_ids.min().item()}", flush=True)
-            print(f"[DEBUG_FORWARD] layer_0 output res: Mean={res.mean().item():.6f} Max={res.max().item():.6f} Min={res.min().item():.6f} HasNaN={torch.isnan(res).any().item()}", flush=True)
+        layer_idx = getattr(layer, "layer_idx", -1)
+        if layer_idx in (3, 4):
+            print(f"[DEBUG_FORWARD] layer_{layer_idx} input x: Mean={x.mean().item():.6f} Max={x.max().item():.6f} Min={x.min().item():.6f}", flush=True)
+            print(f"[DEBUG_FORWARD] layer_{layer_idx} topk_ids: Mean={topk_ids.float().mean().item():.6f} Max={topk_ids.max().item()} Min={topk_ids.min().item()}", flush=True)
+            print(f"[DEBUG_FORWARD] layer_{layer_idx} output res: Mean={res.mean().item():.6f} Max={res.max().item():.6f} Min={res.min().item():.6f} HasNaN={torch.isnan(res).any().item()}", flush=True)
         return res
 
 
