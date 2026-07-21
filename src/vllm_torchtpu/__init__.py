@@ -50,16 +50,28 @@ def _patch_default_moe_runner_select_forward() -> None:
 
     _orig_moe_forward = _dmr._moe_forward
     def patched_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
-        if "layers.3." in layer_name or "layers.4." in layer_name:
-            print(f"[DEBUG_FORWARD_HOOK] (Standard) layer_name: {layer_name} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+        try:
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import get_layer_from_name, _resolve_layer_name
+            layer = get_layer_from_name(_resolve_layer_name(layer_name))
+            layer_idx = getattr(layer, "layer_idx", -1)
+            if layer_idx in (3, 4):
+                print(f"[DEBUG_FORWARD_HOOK] (Standard) layer_idx: {layer_idx} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG_FORWARD_HOOK_ERROR] Standard failed to get layer info: {e}", flush=True)
         return _orig_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
 
     _dmr._moe_forward = patched_moe_forward
 
     _orig_moe_forward_shared = _dmr._moe_forward_shared
     def patched_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
-        if "layers.3." in layer_name or "layers.4." in layer_name:
-            print(f"[DEBUG_FORWARD_HOOK] (Shared Experts) layer_name: {layer_name} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+        try:
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import get_layer_from_name, _resolve_layer_name
+            layer = get_layer_from_name(_resolve_layer_name(layer_name))
+            layer_idx = getattr(layer, "layer_idx", -1)
+            if layer_idx in (3, 4):
+                print(f"[DEBUG_FORWARD_HOOK] (Shared Experts) layer_idx: {layer_idx} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG_FORWARD_HOOK_ERROR] Shared failed to get layer info: {e}", flush=True)
         return _orig_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
 
     _dmr._moe_forward_shared = patched_moe_forward_shared
