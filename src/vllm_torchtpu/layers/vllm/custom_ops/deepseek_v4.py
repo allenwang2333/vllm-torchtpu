@@ -1065,8 +1065,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         else:
             extra = (positions + 1).to(torch.int32) // self.compress_ratio
             
-        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
-        rank = get_tensor_model_parallel_rank()
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
         n_local_heads = self.mla_attn.n_local_heads
         local_sink = self.attn_sink[rank * n_local_heads : (rank + 1) * n_local_heads].clone()
         output, new_sw_cache = self.attn_op(
