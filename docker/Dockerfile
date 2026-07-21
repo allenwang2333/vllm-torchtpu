@@ -17,6 +17,10 @@ WORKDIR /root/torchtpu-vllm
 # Copy pyproject.toml to extract dependencies and read settings
 COPY pyproject.toml .
 
+# Workaround: Pre-install xgrammar from PyPI to bypass private registry 404 error
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system xgrammar==0.2.3 --index-url https://pypi.org/simple
+
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
 RUN --mount=type=cache,target=/root/.cache/uv \
