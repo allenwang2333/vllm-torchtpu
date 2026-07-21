@@ -94,12 +94,22 @@ class TestMxfp4MoETPU:
             layer._tpu_activation_str = "silu"
             layer.renormalize = True
             
-            # Assign mock weights to w13 and w2 (simulating BF16 model weights on TPU)
+            # Assign mock packed weights and scales (simulating MXFP4 model weights on TPU)
             layer.w13_weight = torch.nn.Parameter(
-                torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16, device=device)
+                torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 2), dtype=torch.uint8, device=device),
+                requires_grad=False
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8, device=device),
+                requires_grad=False
             )
             layer.w2_weight = torch.nn.Parameter(
-                torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device)
+                torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 2), dtype=torch.uint8, device=device),
+                requires_grad=False
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8, device=device),
+                requires_grad=False
             )
             
             # 3. Instantiate MXFP4 quant method
