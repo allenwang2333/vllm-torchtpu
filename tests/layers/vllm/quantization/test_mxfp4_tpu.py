@@ -100,7 +100,7 @@ class TestMxfp4MoETPU:
                 requires_grad=False
             )
             layer.w13_weight_scale = torch.nn.Parameter(
-                torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8, device=device),
+                torch.randint(120, 135, (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8, device=device),
                 requires_grad=False
             )
             layer.w2_weight = torch.nn.Parameter(
@@ -108,7 +108,7 @@ class TestMxfp4MoETPU:
                 requires_grad=False
             )
             layer.w2_weight_scale = torch.nn.Parameter(
-                torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8, device=device),
+                torch.randint(120, 135, (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8, device=device),
                 requires_grad=False
             )
             
