@@ -28,11 +28,20 @@ class TestMxfp4MoETPU:
             pcp_size=1,
             pcp_rank=0,
         )
+        from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         moe_config = FusedMoEConfig(
             num_experts=num_experts,
             experts_per_token=top_k,
-            intermediate_size=intermediate_size,
-            moe_parallel_config=moe_parallel_config
+            hidden_dim=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            num_local_experts=num_experts,
+            num_logical_experts=num_experts,
+            activation=MoEActivation.SILU,
+            device=device,
+            routing_method=RoutingMethodType.DeepseekV4,
+            moe_parallel_config=moe_parallel_config,
+            in_dtype=torch.bfloat16,
         )
         
         layer = FusedMoE(moe_config)
