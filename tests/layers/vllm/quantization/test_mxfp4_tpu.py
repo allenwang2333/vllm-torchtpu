@@ -25,6 +25,8 @@ class TestMxfp4MoETPU:
             use_ep=False,
             all2all_backend="allgather_reducescatter",
             enable_eplb=False,
+            pcp_size=1,
+            pcp_rank=0,
         )
         moe_config = FusedMoEConfig(
             num_experts=num_experts,
