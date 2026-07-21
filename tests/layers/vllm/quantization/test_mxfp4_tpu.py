@@ -120,10 +120,12 @@ class TestMxfp4MoETPU:
             method.process_weights_after_loading(layer)
             
             # Verify weight attributes are populated as native FP4 packed tensors
-            assert hasattr(layer, "w13_packed")
-            assert hasattr(layer, "w2_packed")
-            assert layer.w13_packed.dtype == torch.uint8
-            assert layer.w2_packed.dtype == torch.uint8
+            assert hasattr(layer, "w13_weight")
+            assert hasattr(layer, "w2_weight")
+            assert layer.w13_weight.dtype == torch.uint8
+            assert layer.w2_weight.dtype == torch.uint8
+            assert hasattr(layer, "w13_weight_scale")
+            assert hasattr(layer, "w2_weight_scale")
             
             # 5. Execute forward pass (apply_monolithic) on TPU
             x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
