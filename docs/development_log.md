@@ -904,3 +904,63 @@ INFO 07-21 09:49:36 [tpu_platform.py:676] Initialized sharding configuration: Sh
 - **Container Status:** Running (Up)
 - **Progress State:** MoE weight pre-processing: layer 41 processed and cached
 
+
+---
+
+### [2026-07-21 05:15:04 UTC] Full Model Offline Inference Failed
+- **Container Status:** Exited (1) - Failure
+- **Traceback:**
+  ```
+  ERROR 07-21 11:02:53 [__init__.py:64] Traceback (most recent call last):
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/vllm/plugins/__init__.py", line 61, in load_plugins_by_group
+ERROR 07-21 11:02:53 [__init__.py:64]     func = plugin.load()
+ERROR 07-21 11:02:53 [__init__.py:64]            ^^^^^^^^^^^^^
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/importlib/metadata/__init__.py", line 205, in load
+ERROR 07-21 11:02:53 [__init__.py:64]     module = import_module(match.group('module'))
+ERROR 07-21 11:02:53 [__init__.py:64]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module
+ERROR 07-21 11:02:53 [__init__.py:64]     return _bootstrap._gcd_import(name[level:], package, level)
+ERROR 07-21 11:02:53 [__init__.py:64]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap_external>", line 999, in exec_module
+ERROR 07-21 11:02:53 [__init__.py:64]   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/tpu_inference/layers/vllm/__init__.py", line 14, in <module>
+ERROR 07-21 11:02:53 [__init__.py:64]     from tpu_inference.layers.vllm import backends as backends
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/tpu_inference/layers/vllm/backends/__init__.py", line 14, in <module>
+ERROR 07-21 11:02:53 [__init__.py:64]     from tpu_inference.layers.vllm.backends import flash_attn as flash_attn
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/tpu_inference/layers/vllm/backends/flash_attn.py", line 9, in <module>
+ERROR 07-21 11:02:53 [__init__.py:64]     from torchax.interop import jax_view, torch_view
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/torchax/__init__.py", line 107, in <module>
+ERROR 07-21 11:02:53 [__init__.py:64]     torch.utils.rename_privateuse1_backend("jax")
+ERROR 07-21 11:02:53 [__init__.py:64]   File "/usr/local/lib/python3.12/site-packages/torch/utils/backend_registration.py", line 79, in rename_privateuse1_backend
+ERROR 07-21 11:02:53 [__init__.py:64]     _rename_privateuse1_backend(backend_name)
+ERROR 07-21 11:02:53 [__init__.py:64] RuntimeError: torch.register_privateuse1_backend() has already been set! Current backend: tpu
+INFO 07-21 11:02:53 [utils.py:278] non-default args: {'trust_remote_code': True, 'kv_cache_dtype': 'fp8', 'max_model_len': 64, 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.2, 'max_num_batched_tokens': 64, 'disable_log_stats': True, 'quantization': 'deepseek_v4_fp8', 'additional_config': {'compilation_config': {'compile_sizes': [64]}, 'sharding': {'sharding_strategy': {'enable_dp_attention': True, 'expert_parallelism': 8}}}, 'model': '/mnt/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1'}
+WARNING 07-21 11:02:53 [envs.py:2057] Unknown vLLM environment variable detected: VLLM_FP4_CACHE_DIR
+INFO 07-21 11:02:53 [config.py:803] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+WARNING 07-21 11:03:06 [interface.py:247] Failed to import from vllm._C: ImportError('libcudart.so.13: cannot open shared object file: No such file or directory')
+WARNING 07-21 11:03:06 [interface.py:247] Failed to import from vllm._C: ImportError('libcudart.so.13: cannot open shared object file: No such file or directory')
+WARNING 07-21 11:03:06 [interface.py:247] Failed to import from vllm._C: ImportError('libcudart.so.13: cannot open shared object file: No such file or directory')
+WARNING 07-21 11:03:06 [interface.py:247] Failed to import from vllm._C: ImportError('libcudart.so.13: cannot open shared object file: No such file or directory')
+INFO 07-21 11:03:07 [model.py:617] Resolved architecture: DeepseekV4ForCausalLM
+INFO 07-21 11:03:07 [model.py:635] Defaulting to tokenizer_mode='deepseek_v4' for DeepseekV4ForCausalLM
+INFO 07-21 11:03:07 [model.py:1752] Using max model len 64
+INFO 07-21 11:03:07 [cache.py:261] Using fp8 data type to store kv cache. It reduces the GPU memory footprint and boosts the performance. Meanwhile, it may cause accuracy drop without a proper scaling factor
+INFO 07-21 11:03:07 [scheduler.py:239] Chunked prefill is enabled with max_num_batched_tokens=64.
+INFO 07-21 11:03:07 [vllm.py:977] Asynchronous scheduling is enabled.
+INFO 07-21 11:03:07 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 07-21 11:03:08 [__init__.py:36] Applied TPU patch: disable vLLM custom collective ops.
+INFO 07-21 11:03:08 [__init__.py:57] Applied TPU patch: DefaultMoERunner uses direct _moe_forward.
+INFO 07-21 11:03:08 [__init__.py:84] Applied TPU patch: disable dynamic compile_ranges (static compile_sizes only).
+INFO 07-21 11:03:08 [__init__.py:158] Applied TPU patch: disable sequence-parallel MoE.
+INFO 07-21 11:03:08 [__init__.py:228] Applied TPU patch: scope non-EP MoE TP inside each DP engine.
+INFO 07-21 11:03:08 [__init__.py:141] Applied TPU patch: defer RowParallelLinear bias past TP all_reduce.
+INFO 07-21 11:03:08 [__init__.py:174] Applied TPU patch: disable DP microbatching.
+INFO 07-21 11:03:08 [__init__.py:281] Applied TPU patch: MultiprocExecutor worker binding env.
+INFO 07-21 11:03:08 [tpu_platform.py:87] TorchTPU eager mode configured: DEFER_AND_FUSE (previous=DEFER_NEVER)
+INFO 07-21 11:03:08 [tpu_platform.py:676] Initialized sharding configuration: ShardingConfigManager(total_devices=0, sharding_strategy=ShardingStrategy(tensor_parallelism=0, expert_parallelism=8, sequence_parallelism=1, data_parallelism=1, attention_data_parallelism=16), device_indexes=None)
+  ```
+
