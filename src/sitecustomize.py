@@ -10,6 +10,12 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         torch._dynamo.config.disable = True
         print(f"[SITECUSTOMIZE_PATCH] Disabled PyTorch Dynamo globally in pid={os.getpid()}", file=sys.stderr, flush=True)
         try:
+            import vllm.models.deepseek_v4.attention as att_mod
+            if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+                att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+        except ImportError:
+            pass
+        try:
             from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
             def patched_wrapper_call(self, *args, **kwargs):
                 return self._call_with_optional_nvtx_range(self.forward, *args, **kwargs)
@@ -44,13 +50,6 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
             print(f"[SITECUSTOMIZE_PATCH] Added AttentionLayerBase to VllmDeepseekV4MLAAttention bases globally in pid={os.getpid()}", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"[SITECUSTOMIZE_PATCH] Failed to add AttentionLayerBase base class: {e}", file=sys.stderr, flush=True)
-        try:
-            import vllm.models.deepseek_v4.attention as att_mod
-            if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
-                att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
-        except ImportError:
-            pass
-
         from tpu_inference.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
