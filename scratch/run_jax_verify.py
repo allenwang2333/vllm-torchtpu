@@ -286,10 +286,6 @@ def patched_amd_load_weights(self, weights):
     class WrappedMapper:
         def apply(self, w):
             for name, loaded_weight in orig_mapper.apply(w):
-                if ".experts." in name and name.endswith(".weight"):
-                    if loaded_weight.ndim == 2:
-                        loaded_weight = loaded_weight.t()
-
                 if "hc_head.hc_" in name:
                     name = name.replace("hc_head.hc_", "hc_head_")
                     
