@@ -73,6 +73,32 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
 
         ColumnParallelLinear.weight_loader_v2 = patched_column_parallel_weight_loader_v2
         print("[SITECUSTOMIZE_PATCH] Successfully patched ColumnParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
+
+        # Patch MergedColumnParallelLinear weight_loader_v2
+        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+        _orig_merged_column_parallel_weight_loader_v2 = MergedColumnParallelLinear.weight_loader_v2
+
+        def patched_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+            cls_name = param.__class__.__name__
+            if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+                loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+            return _orig_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+
+        MergedColumnParallelLinear.weight_loader_v2 = patched_merged_column_parallel_weight_loader_v2
+        print("[SITECUSTOMIZE_PATCH] Successfully patched MergedColumnParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
+
+        # Patch QKVParallelLinear weight_loader_v2
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+        _orig_qkv_parallel_weight_loader_v2 = QKVParallelLinear.weight_loader_v2
+
+        def patched_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+            cls_name = param.__class__.__name__
+            if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+                loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+            return _orig_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+
+        QKVParallelLinear.weight_loader_v2 = patched_qkv_parallel_weight_loader_v2
+        print("[SITECUSTOMIZE_PATCH] Successfully patched QKVParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[SITECUSTOMIZE_PATCH] Failed to patch: {e}", file=sys.stderr, flush=True)
 else:
