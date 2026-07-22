@@ -343,12 +343,16 @@ def quantize_tensor_to_fp4(
     tensor_scaled = tensor_blocked * scale_inv
     tensor_clipped = tensor_scaled.clamp(FP4_MIN, FP4_MAX)
 
-    # Find nearest FP4 value (quantize by finding closest in LUT)
-    tensor_for_compare = tensor_clipped.unsqueeze(-1)
-    fp4_for_compare = FP4_VALUES.view([1] * tensor_clipped.ndim + [16])
-
-    distances = (tensor_for_compare - fp4_for_compare).abs()
-    indices = distances.argmin(dim=-1).to(torch.int8)
+    # Find nearest FP4 value using bucketize (extremely fast and memory efficient)
+    thresholds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                              dtype=torch.float32,
+                              device=tensor.device)
+    abs_val = tensor_clipped.abs()
+    bucket_indices = torch.bucketize(abs_val, thresholds).to(torch.int8)
+    
+    # Map to negative FP4 indices (add 8) if original value is negative
+    is_negative = tensor_clipped < 0
+    indices = torch.where(is_negative, bucket_indices + 8, bucket_indices)
 
     # Reshape back to original shape
     indices = indices.reshape(orig_shape)
@@ -359,7 +363,7 @@ def quantize_tensor_to_fp4(
     return indices, scale
 
 
-def pack_fp4_indices(indices: torch.Tensor) -> torch.Tensor:
+def pack_fp4_indices(indices: torch.Tensor, axis: int = -1) -> torch.Tensor:
     """Pack FP4 indices (0-15) into uint8 (two per byte).
 
     Packing format: even indices in low nibble (bits 0-3),
@@ -367,18 +371,27 @@ def pack_fp4_indices(indices: torch.Tensor) -> torch.Tensor:
 
     Args:
         indices: int8 tensor with shape [..., N] where N is even.
+        axis: The axis along which to pack indices (dimension must be even).
 
     Returns:
-        uint8 tensor with shape [..., N/2].
+        uint8 tensor with shape where the target axis dimension is halved.
     """
-    if indices.shape[-1] % 2 != 0:
+    axis = axis % indices.ndim
+    if indices.shape[axis] % 2 != 0:
         raise ValueError(
-            f"Last dimension must be even for packing, got {indices.shape[-1]}"
+            f"Dimension {axis} of size {indices.shape[axis]} must be even for packing"
         )
 
     indices = indices.to(torch.uint8)
-    low = indices[..., 0::2]  # Even indices -> low nibble
-    high = indices[..., 1::2]  # Odd indices -> high nibble
+    
+    # Slices for even/odd elements along the specified axis
+    slices_low = [slice(None)] * indices.ndim
+    slices_low[axis] = slice(0, None, 2)
+    low = indices[tuple(slices_low)]
+    
+    slices_high = [slice(None)] * indices.ndim
+    slices_high[axis] = slice(1, None, 2)
+    high = indices[tuple(slices_high)]
 
     # Pack: low in bits 0-3, high in bits 4-7
     packed = low | (high << 4)
