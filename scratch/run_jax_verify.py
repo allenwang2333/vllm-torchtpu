@@ -40,8 +40,11 @@ except ImportError:
 
 try:
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    if not hasattr(ds_v4_amd_model, "DeepseekV4Attention") and hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
-        ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
+    if not hasattr(ds_v4_amd_model, "DeepseekV4Attention"):
+        if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention
+        elif hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
 except ImportError:
     pass
 
