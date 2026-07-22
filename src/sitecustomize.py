@@ -37,6 +37,14 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         except Exception as e:
             print(f"[SITECUSTOMIZE_PATCH] Failed to patch HybridKVCacheCoordinator: {e}", file=sys.stderr, flush=True)
         try:
+            from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
+            from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+            if AttentionLayerBase not in VllmDeepseekV4MLAAttention.__bases__:
+                VllmDeepseekV4MLAAttention.__bases__ = VllmDeepseekV4MLAAttention.__bases__ + (AttentionLayerBase,)
+            print(f"[SITECUSTOMIZE_PATCH] Added AttentionLayerBase to VllmDeepseekV4MLAAttention bases globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[SITECUSTOMIZE_PATCH] Failed to add AttentionLayerBase base class: {e}", file=sys.stderr, flush=True)
+        try:
             import vllm.models.deepseek_v4.attention as att_mod
             if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
                 att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
