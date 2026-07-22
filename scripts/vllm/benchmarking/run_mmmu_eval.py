@@ -58,6 +58,12 @@ def parse_args():
         help=
         "Allow synthetic sample fallback if HuggingFace dataset fails to load",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=
+        "Run offline direct vLLM LLM engine generation instead of HTTP server",
+    )
     return parser.parse_args()
 
 
@@ -314,7 +320,10 @@ def main():
 
     print("====================================================")
     print("  MMMU / MMMU-Pro Generative Vision Evaluation")
-    print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
+    if args.offline:
+        print("  Target: Offline vLLM LLM Engine (Direct TPU)")
+    else:
+        print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
     print(f"  Model: {args.model} | Limit: {args.limit}")
     print("====================================================")
 
@@ -329,23 +338,92 @@ def main():
     results = []
 
     t0 = time.time()
-    for idx, sample in enumerate(samples, 1):
-        is_correct, pred, target = evaluate_sample(sample, args.host,
-                                                   args.port, args.model)
-        if is_correct:
-            correct_count += 1
 
-        results.append({
-            "id": sample["id"],
-            "predicted": pred,
-            "ground_truth": target,
-            "is_correct": is_correct,
-        })
+    if args.offline:
+        os.environ["VLLM_USE_V1"] = "0"
+        from transformers import AutoProcessor
+        from vllm import LLM, SamplingParams
 
-        if idx % 10 == 0 or idx == total_count:
-            acc = correct_count / idx * 100.0
-            print(f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}%"
-                  f" ({correct_count}/{idx})")
+        print("Initializing offline vLLM LLM engine on TPU (TP=8)...")
+        processor = AutoProcessor.from_pretrained(args.model,
+                                                  trust_remote_code=True)
+        llm = LLM(
+            model=args.model,
+            tensor_parallel_size=8,
+            gpu_memory_utilization=0.8,
+            enforce_eager=True,
+            trust_remote_code=True,
+        )
+        sampling_params = SamplingParams(max_tokens=2048, temperature=0.0)
+
+        inputs = []
+        for sample in samples:
+            prompt_text = (
+                f"{sample['prompt']}\n\n"
+                "Please select the correct option by responding with ONLY the single letter corresponding to your choice (e.g. A, B, C, or D).\n"
+                "Answer:")
+            messages = [{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "image"
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt_text
+                    },
+                ],
+            }]
+            formatted_prompt = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs.append({
+                "prompt": formatted_prompt,
+                "multi_modal_data": {
+                    "image": sample["image"]
+                },
+            })
+
+        print(
+            f"Running offline multimodal inference for {total_count} samples..."
+        )
+        outputs = llm.generate(inputs, sampling_params=sampling_params)
+
+        for idx, (sample, output) in enumerate(zip(samples, outputs), 1):
+            generated_text = output.outputs[0].text
+            pred = extract_answer(generated_text)
+            target = sample["answer"]
+            is_correct = pred == target
+            if is_correct:
+                correct_count += 1
+            results.append({
+                "id": sample["id"],
+                "predicted": pred,
+                "ground_truth": target,
+                "is_correct": is_correct,
+            })
+            if idx % 10 == 0 or idx == total_count:
+                acc = correct_count / idx * 100.0
+                print(f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}%"
+                      f" ({correct_count}/{idx})")
+    else:
+        for idx, sample in enumerate(samples, 1):
+            is_correct, pred, target = evaluate_sample(sample, args.host,
+                                                       args.port, args.model)
+            if is_correct:
+                correct_count += 1
+
+            results.append({
+                "id": sample["id"],
+                "predicted": pred,
+                "ground_truth": target,
+                "is_correct": is_correct,
+            })
+
+            if idx % 10 == 0 or idx == total_count:
+                acc = correct_count / idx * 100.0
+                print(f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}%"
+                      f" ({correct_count}/{idx})")
 
     t1 = time.time()
     accuracy = (correct_count /
