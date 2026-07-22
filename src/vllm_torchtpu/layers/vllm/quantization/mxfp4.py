@@ -113,6 +113,7 @@ def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, sha
                 loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
                 if expert_data.shape[shard_dim] > loaded_weight.shape[shard_dim]:
                     expert_data = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+                print(f"[DEBUG_LOAD] shard_id={shard_id} expert_id={expert_id} | expert_shape={list(expert_data.shape)} loaded_shape={list(loaded_weight.shape)} shard_dim={shard_dim}", flush=True)
                 expert_data.copy_(loaded_weight)
         return True if return_success else None
 
