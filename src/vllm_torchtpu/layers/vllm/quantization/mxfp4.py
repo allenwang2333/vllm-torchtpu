@@ -399,8 +399,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 w2_indices, w2_weight_scale = quantize_tensor_to_fp4(w2_weight_padded, axis=1, block_size=w2_block_size)
 
                 # Keep Case B layout (unpacked contracting dim, packed non-contracting dim) by calling pack on raw indices
-                w13_weight_processed = pack_fp4_indices(w13_indices)
-                w2_weight_processed = pack_fp4_indices(w2_indices)
+                w13_weight_processed = pack_fp4_indices(w13_indices, axis=1)
+                w2_weight_processed = pack_fp4_indices(w2_indices, axis=1)
                 logger.info(f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}")
                 w13_weight_processed = w13_weight_processed.contiguous()
                 w2_weight_processed = w2_weight_processed.contiguous()
