@@ -213,7 +213,7 @@ def moe_gmm(
         group_sizes,
         group_offset,
         zero_initialize=False,
-        fuse_act=activation,
+    )
     w2_k = w2.shape[1]
     if w2.dtype == jnp.uint8:
         w2_k = w2_k * 2
