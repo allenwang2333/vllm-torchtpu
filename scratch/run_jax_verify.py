@@ -13,6 +13,23 @@ os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 import torch
 torch._dynamo.config.disable = True
 
+# Patch DeviceConfig to fallback to cpu if tpu device is not registered in PyTorch
+try:
+    from vllm.config.device import DeviceConfig
+    _orig_device_config_post_init = DeviceConfig.__post_init__
+    def patched_device_config_post_init(self):
+        try:
+            _orig_device_config_post_init(self)
+        except RuntimeError as e:
+            if "device string: tpu" in str(e):
+                print("[JAX_VERIFY_PATCH] Caught device tpu RuntimeError, falling back to cpu device object", flush=True)
+                self.device = torch.device("cpu")
+            else:
+                raise
+    DeviceConfig.__post_init__ = patched_device_config_post_init
+except ImportError:
+    pass
+
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
     import vllm.models.deepseek_v4.attention as att_mod
