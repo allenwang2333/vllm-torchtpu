@@ -36,6 +36,7 @@ try:
     _orig_register_oot = CustomOp.register_oot
     @classmethod
     def patched_register_oot(cls, reg_name):
+        print(f"[JAX_VERIFY_PATCH] register_oot called for: {reg_name} (current registry: {list(op_registry_oot.keys())})", flush=True)
         if reg_name in op_registry_oot:
             print(f"[JAX_VERIFY_PATCH] Ignoring duplicate custom op registration for: {reg_name}", flush=True)
             return lambda subclass: subclass
