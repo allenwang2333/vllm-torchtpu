@@ -50,13 +50,16 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
             raise ValueError(
                 f"Input hidden dim {k_dim} must be divisible by block scale "
                 f"count {sharded_num_blocks}.")
-        block_size = k_dim // sharded_num_blocks
-        return blockwise_quantized_matmul_kernel(
-            x,
-            w_q,
-            w_s,
-            x_q_dtype=x_q_dtype,
-            block_size=block_size,
+        return gmm_v2(
+            lhs=x,
+            rhs=jnp.expand_dims(w_q, 0),
+            group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+            rhs_scale=jnp.expand_dims(w_s, 0),
+            rhs_bias=None,
+            group_offset=jnp.array([0], dtype=jnp.int32),
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            maybe_quantize_lhs=True,
         )
     return xla_quantized_matmul(x, w_q, w_s)
 
