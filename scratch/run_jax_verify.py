@@ -69,6 +69,21 @@ import torch
 torch.cuda.Stream = lambda *args, **kwargs: None
 torch.cuda.Event = DummyCudaEvent
 
+import types
+mock_tpu = types.ModuleType("torch.tpu")
+mock_tpu.Stream = DummyCudaEvent
+mock_tpu.Event = DummyCudaEvent
+mock_tpu.current_stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.default_stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.set_stream = lambda *args, **kwargs: None
+mock_tpu.synchronize = lambda *args, **kwargs: None
+mock_tpu.set_device = lambda *args, **kwargs: None
+mock_tpu.current_device = lambda *args, **kwargs: 0
+mock_tpu.device_count = lambda *args, **kwargs: 1
+mock_tpu.is_available = lambda *args, **kwargs: True
+torch.tpu = mock_tpu
+
 # Manually define weight name loader patch for the AMD model class
 from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeepseekV4ForCausalLM
 _amd_orig_load_weights = _AmdDeepseekV4ForCausalLM.load_weights
