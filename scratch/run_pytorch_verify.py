@@ -15,7 +15,7 @@ def main():
         trust_remote_code=True,
         max_model_len=1024,
         kv_cache_dtype="fp8",
-        gpu_memory_utilization=0.05,
+        gpu_memory_utilization=0.30,
         enable_expert_parallel=False,
         enforce_eager=True,
         additional_config={
