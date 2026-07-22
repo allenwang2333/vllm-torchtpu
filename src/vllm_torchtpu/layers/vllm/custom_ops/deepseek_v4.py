@@ -30,7 +30,14 @@ from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 
 def check_nan(name: str, tensor: torch.Tensor, prefix: str):
-    pass
+    if tensor is None:
+        return
+    is_fake = (tensor.device.type == "meta" or
+               type(tensor).__name__ == "FakeTensor" or
+               (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
+    if not is_fake and torch.isnan(tensor).any().item():
+        print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} device={tensor.device}", flush=True)
+
 
 import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
 from vllm.models.deepseek_v4.attention import (
