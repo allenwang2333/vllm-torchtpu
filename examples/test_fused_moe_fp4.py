@@ -127,7 +127,7 @@ def test_fused_moe_fp4_parity():
         [15, 13, 11, 9, 7, 5, 3, 1],
         [14, 12, 10, 8, 6, 4, 2, 0],
     ], dtype=jnp.int32)
-    
+    topk = topk_ids.shape[1]
     print("Running TPU JAX fused_moe_func kernel...")
     actual = fused_moe_func(
         hidden_states=hidden_states,
@@ -167,6 +167,7 @@ def test_fused_moe_fp4_parity():
     print(f"FP4 Fused MoE Matmul Mean Absolute Error:     {mean_abs_err:.6f}")
     print(f"FP4 Fused MoE Matmul Max Relative Difference: {max_rel_diff:.6f}")
     
+
     # Assert correctness using typical BF16 tolerance limits (0.15 atol, 0.1 rtol)
     np.testing.assert_allclose(actual_np, expected_np, atol=0.15, rtol=1e-1)
     print("SUCCESS: Parity verified!")
