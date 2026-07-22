@@ -18,6 +18,22 @@ sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
+# Monkey patch JAX MoE apply_jax to log inputs
+from tpu_inference.layers.jax.quantization.fp8 import Fp8FusedMoEMethod
+_orig_apply_jax = Fp8FusedMoEMethod.apply_jax
+
+def patched_apply_jax(self, layer, x, *, router_logits):
+    prefix = getattr(layer, "prefix", "")
+    if "layers.0." in prefix or "layers.3." in prefix:
+        import jax
+        def print_stats(prefix, x, r):
+            print(f"[DEBUG_JAX] {prefix} input x: shape={list(x.shape)} dtype={str(x.dtype)} | mean={float(x.mean()):.6f} std={float(x.std()):.6f} min={float(x.min()):.6f} max={float(x.max()):.6f}", flush=True)
+            print(f"[DEBUG_JAX] {prefix} input router_logits: shape={list(r.shape)} dtype={str(r.dtype)} | mean={float(r.mean()):.6f} std={float(r.std()):.6f} min={float(r.min()):.6f} max={float(r.max()):.6f}", flush=True)
+        jax.debug.callback(print_stats, prefix, x, router_logits)
+    return _orig_apply_jax(self, layer, x, router_logits=router_logits)
+
+Fp8FusedMoEMethod.apply_jax = patched_apply_jax
+
 def custom_main(args: dict):
     # Pop arguments not used by LLM
     max_tokens = args.pop("max_tokens")
