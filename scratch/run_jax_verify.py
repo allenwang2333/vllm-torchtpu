@@ -25,6 +25,24 @@ def patched_device(device_type, *args, **kwargs):
     return _orig_device(device_type, *args, **kwargs)
 torch.device = patched_device
 
+def redirect_tpu_device(func):
+    import functools
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if "device" in kwargs:
+            dev = kwargs["device"]
+            if dev == "tpu" or (isinstance(dev, str) and dev.startswith("tpu:")):
+                kwargs["device"] = "cpu"
+            elif isinstance(dev, torch.device) and dev.type == "tpu":
+                kwargs["device"] = torch.device("cpu")
+        return func(*args, **kwargs)
+    return wrapper
+
+# Patch core PyTorch tensor factory functions
+for name in ["empty", "zeros", "ones", "tensor", "arange", "full", "randn", "rand", "empty_like", "zeros_like", "ones_like"]:
+    if hasattr(torch, name):
+        setattr(torch, name, redirect_tpu_device(getattr(torch, name)))
+
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
     import vllm.models.deepseek_v4.attention as att_mod
