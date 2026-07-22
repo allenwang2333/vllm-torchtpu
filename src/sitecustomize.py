@@ -22,7 +22,39 @@ sys.meta_path.insert(0, ModuleAliasRedirector())
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
     print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
     
-    pass
+    # Patch pallas.jax_op and torchax to support JAX-compilation of custom Pallas operators
+    try:
+        import torch
+        import torchax.tensor as ta_tensor
+        import torchax.ops.ops_registry as ta_registry
+        import torch_tpu._internal.pallas.pallas as pallas_mod
+
+        # 1. Patch pallas.jax_op to register custom JAX ops in torchax registry
+        _orig_jax_op = pallas_mod.jax_op
+        def patched_jax_op(name, fn=None, /, *args, **kwargs):
+            result = _orig_jax_op(name, fn, *args, **kwargs)
+            try:
+                namespace, op_name = name.split("::")
+                custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
+                custom_op = custom_op_packet.default
+                ta_registry.register_torch_dispatch_op(custom_op, result)
+                print(f"[PATCH_JAX_OP] Registered custom op {name} with torchax registry", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", file=sys.stderr, flush=True)
+            return result
+        pallas_mod.jax_op = patched_jax_op
+
+        # 2. Patch XLADispatchMode to intercept "pallas" namespace
+        _orig_xla_dispatch = ta_tensor.XLADispatchMode.__torch_dispatch__
+        def patched_xla_dispatch(self, func, types, args=(), kwargs=None):
+            if func.namespace == "pallas":
+                return self.env.dispatch(func, types, args, kwargs)
+            return _orig_xla_dispatch(self, func, types, args, kwargs)
+        ta_tensor.XLADispatchMode.__torch_dispatch__ = patched_xla_dispatch
+        
+        print("[SITECUSTOMIZE] Successfully patched pallas.jax_op and torchax dispatcher", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[SITECUSTOMIZE] Failed to patch pallas/torchax: {e}", file=sys.stderr, flush=True)
 
 # Apply monkey-patches to prevent device registration conflicts process-wide
 try:
