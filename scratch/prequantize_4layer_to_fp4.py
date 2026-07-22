@@ -55,10 +55,9 @@ def process_layer_for_all_ranks(model_path, cache_dir, layer_idx, index_data):
                 for expert_idx, key_type, full_key in keys:
                     loaded_tensors[(expert_idx, key_type)] = f.get_tensor(full_key).clone().to(torch.float32)
 
-        # 3. Process all 8 ranks
         for rank in range(8):
-            start_expert = 0
-            end_expert = 256
+            start_expert = rank * 32
+            end_expert = (rank + 1) * 32
 
             local_w1_weights = []
             local_w3_weights = []
