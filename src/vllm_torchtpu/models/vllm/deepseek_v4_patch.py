@@ -326,6 +326,18 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         ):
             if input_ids is not None:
                 print(f"[DEBUG_FORWARD_INPUT] pid={os.getpid()} input_ids shape={list(input_ids.shape)} values={input_ids.tolist()}", flush=True)
+            if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
+                import torchax
+                with torchax.default_env():
+                    return _orig_amd_forward(
+                        self,
+                        input_ids,
+                        positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        *args,
+                        **kwargs
+                    )
             return _orig_amd_forward(
                 self,
                 input_ids,
