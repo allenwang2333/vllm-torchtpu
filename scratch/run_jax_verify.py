@@ -30,16 +30,17 @@ try:
 except ImportError:
     pass
 
-# Patch custom_op.register_oot to ignore duplicate registrations
+# Patch custom_op.CustomOp.register_oot to ignore duplicate registrations
 try:
-    import vllm.model_executor.custom_op as custom_op
-    _orig_register_oot = custom_op.register_oot
-    def patched_register_oot(reg_name):
-        if reg_name in custom_op.op_registry_oot:
+    from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+    _orig_register_oot = CustomOp.register_oot
+    @classmethod
+    def patched_register_oot(cls, reg_name):
+        if reg_name in op_registry_oot:
             print(f"[JAX_VERIFY_PATCH] Ignoring duplicate custom op registration for: {reg_name}", flush=True)
-            return lambda cls: cls
-        return _orig_register_oot(reg_name)
-    custom_op.register_oot = patched_register_oot
+            return lambda subclass: subclass
+        return _orig_register_oot.__func__(cls, reg_name)
+    CustomOp.register_oot = patched_register_oot
 except Exception as e:
     print(f"[JAX_VERIFY_PATCH] Failed to patch register_oot: {e}", flush=True)
 
