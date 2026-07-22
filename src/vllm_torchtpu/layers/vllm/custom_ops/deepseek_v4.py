@@ -1103,12 +1103,10 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         t = o.shape[0]
         o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
-        o_ref_flat = o_ref.view(t, -1).contiguous() # [t, 4096]
-        check_nan("o_ref_flat", o_ref_flat, self.custom_prefix)
+        o_ref = o_ref.to(torch.bfloat16)
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
-        print(f"[DEBUG_O_PROJ] tp_size={getattr(self, 'tp_size', None)} | w shape: {w.shape} | o_ref_flat shape: {o_ref_flat.shape}", flush=True)
         s = self.wo_a.weight_scale
         if s.ndim == 2:
             block_n = w.shape[0] // s.shape[0]
@@ -1127,14 +1125,19 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         wo_a_dequant = w.to(o_ref.dtype) * s_flat.to(o_ref.dtype)
         check_nan("wo_a_dequant", wo_a_dequant, self.custom_prefix)
         
-        wo_a_local_weight = wo_a_dequant
-
-        # Local matmul: [t, 4096] @ [1024, 4096]^T -> [t, 1024]
-        z_local = torch.matmul(o_ref_flat.to(wo_a_local_weight.dtype), wo_a_local_weight.T)
-        check_nan("z_local", z_local, self.custom_prefix)
+        # Grouped einsum projection matching reference ROCm implementation
+        n_local_groups = self.n_local_groups
+        o_lora_rank = self.o_lora_rank
+        
+        o_ref_grouped = o_ref.view(t, n_local_groups, -1)
+        wo_a_grouped = wo_a_dequant.view(n_local_groups, o_lora_rank, -1)
+        
+        z = torch.einsum("tgd,grd->tgr", o_ref_grouped, wo_a_grouped)
+        z_flat = z.flatten(1)
+        check_nan("z_flat", z_flat, self.custom_prefix)
 
         # --- wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).
-        out = self.wo_b(z_local)
+        out = self.wo_b(z_flat)
         if isinstance(out, tuple):
             out = out[0]
         check_nan("out_o_proj", out, self.custom_prefix)
