@@ -548,8 +548,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         self.quant_config = quant_config
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
-        self.weight_scale_name = "weight_scale_inv"
+        self.weight_scale_name = ("weight_scale_inv"
+                                  if self.block_quant else "weight_scale")
         self.fp8_backend = None
+
 
 
     def maybe_roundup_sizes(
