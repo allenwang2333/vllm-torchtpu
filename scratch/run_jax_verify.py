@@ -29,11 +29,9 @@ patch_deepseek_v4_mla_cls()
 
 # Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
 from vllm.platforms import current_platform
-class DummyDeviceCapability:
-    major = 9
-    minor = 0
+from vllm.platforms.interface import DeviceCapability
 
-current_platform.get_device_capability = lambda *args, **kwargs: DummyDeviceCapability()
+current_platform.get_device_capability = lambda *args, **kwargs: DeviceCapability(9, 0)
 
 class DummyCudaEvent:
     def __init__(self, *args, **kwargs):
