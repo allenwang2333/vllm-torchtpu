@@ -290,6 +290,11 @@ sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
 # Monkey-patch JAX quantization mapping for deepseek_v4_fp8
 import vllm_torchtpu.layers.common.quant_methods as qm
 qm.FP8 = "deepseek_v4_fp8"
+try:
+    import tpu_inference.layers.common.quant_methods as tpu_qm
+    tpu_qm.FP8 = "deepseek_v4_fp8"
+except ImportError:
+    pass
 
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
