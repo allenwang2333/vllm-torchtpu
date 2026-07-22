@@ -487,7 +487,7 @@ def inner_kernel(
         # axis. This expands the K dimension back to tile_k.
         if cfgs.rhs_cfgs.should_bitcast:
             tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.dtype)
-        elif cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn:
+        elif cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn and cfgs.rhs_cfgs.dtype != jnp.float4_e2m1fn:
             if cfgs.rhs_cfgs.k_is_packed:
                 tiled_rhs = unpack_uint8_to_bf16(tiled_rhs, tiled_lut_ref)
             else:
