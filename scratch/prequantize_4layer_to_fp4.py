@@ -57,8 +57,8 @@ def process_layer_for_all_ranks(model_path, cache_dir, layer_idx, index_data):
 
         # 3. Process all 8 ranks
         for rank in range(8):
-            start_expert = rank * 32
-            end_expert = (rank + 1) * 32
+            start_expert = 0
+            end_expert = 256
 
             local_w1_weights = []
             local_w3_weights = []
