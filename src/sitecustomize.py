@@ -2,13 +2,6 @@
 
 import os
 
-# Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
-try:
-    import vllm.models.deepseek_v4.attention as att_mod
-    if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
-        att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
-except ImportError:
-    pass
 
 import torch
 import torch.utils
@@ -49,3 +42,11 @@ print(f"[SITECUSTOMIZE_SYS_MODULES] pid={os.getpid()} argv={sys.argv} vllm modul
 
 # Register LazyPatcher process-wide at Python startup.
 import vllm_torchtpu
+
+# Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
+try:
+    import vllm.models.deepseek_v4.attention as att_mod
+    if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+        att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+except ImportError:
+    pass
