@@ -78,6 +78,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 COPY . .
+RUN pip uninstall -y tpu_inference || true
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system -e ".[test,benchmarking]"
@@ -92,6 +93,7 @@ CMD ["/bin/bash"]
 FROM base AS prod
 WORKDIR /root/torchtpu-vllm
 COPY . .
+RUN pip uninstall -y tpu_inference || true
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system .
