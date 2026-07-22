@@ -434,6 +434,8 @@ _amd_orig_inner_load_weights = DeepseekV4Model.load_weights
 def patched_amd_inner_load_weights(self, weights):
     def wrap_weights(w_iter):
         for name, loaded_weight in w_iter:
+            if "experts" in name and ("w1" in name or "gate_proj" in name) and "scale" not in name:
+                print(f"[DEBUG_WRAP_WEIGHTS] name={name} shape={list(loaded_weight.shape)}", flush=True)
             if ".attn." in name or ".self_attn." in name:
                 continue
             if "hc_head.hc_" in name:
