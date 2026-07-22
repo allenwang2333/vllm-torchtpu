@@ -78,6 +78,7 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
             print(f"[SITECUSTOMIZE_PATCH] get_quant_method called for: {layer.__class__.__name__} | {prefix}", file=sys.stderr, flush=True)
             if isinstance(layer, FusedMoE):
                 print(f"[SITECUSTOMIZE_PATCH] Redirecting FusedMoE to VllmMxfp4MoEMethod!", file=sys.stderr, flush=True)
+                layer.prefix = prefix
                 moe_config = self.get_moe_config(layer)
                 if self.expert_dtype == "fp4":
                     return VllmMxfp4MoEMethod(moe_config, self.mesh)
