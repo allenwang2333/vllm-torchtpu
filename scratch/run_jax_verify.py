@@ -7,14 +7,8 @@ import sys
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.32"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["VLLM_ENFORCE_EAGER"] = "1"
-os.environ["VLLM_BYPASS_TPU_INIT"] = "0"
+os.environ["VLLM_BYPASS_TPU_INIT"] = "1"
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-
-# Monkey-patch rename_privateuse1_backend to be a no-op before torchax/tpu_inference is imported.
-# JAX runner runs under VLLM_PLUGINS="torchtpu", which registers the 'tpu' backend.
-# When torchax is imported by JAX, it attempts to rename the backend to 'jax', throwing a duplicate backend error.
-import torch.utils
-torch.utils.rename_privateuse1_backend = lambda name: print(f"[MOCK] rename_privateuse1_backend called with: {name}", flush=True)
 
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
@@ -26,7 +20,46 @@ except ImportError:
 
 # Add torchtpu-vllm/src to path so we can import env_override
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
-import vllm_torchtpu.env_override
+
+# Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
+from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
+patch_deepseek_v4_mla_cls()
+
+# Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+
+current_platform.get_device_capability = lambda *args, **kwargs: DeviceCapability(9, 0)
+
+class DummyCudaEvent:
+    def __init__(self, *args, **kwargs):
+        pass
+    def record(self, *args, **kwargs):
+        pass
+    def wait(self, *args, **kwargs):
+        pass
+    def query(self):
+        return True
+    def synchronize(self):
+        pass
+
+import torch
+torch.cuda.Stream = lambda *args, **kwargs: None
+torch.cuda.Event = DummyCudaEvent
+
+# Import and apply weight name mapper patch
+from vllm_torchtpu.models.vllm.deepseek_v4_patch import patch_load_weights_for_class
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM as _CudaDeepseekV4ForCausalLM
+from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeepseekV4ForCausalLM
+
+patch_load_weights_for_class(_CudaDeepseekV4ForCausalLM)
+patch_load_weights_for_class(_AmdDeepseekV4ForCausalLM)
+
+# Set global vllm_config in the patch module's namespace to satisfy the nested function closure
+import vllm_torchtpu.models.vllm.deepseek_v4_patch as patch_mod
+class DummyVllmConfig:
+    quant_config = None
+patch_mod.vllm_config = DummyVllmConfig()
 
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
