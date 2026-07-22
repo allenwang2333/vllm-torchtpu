@@ -743,6 +743,9 @@ class TpuPlatform(Platform):
         compilation_config.pass_config.fuse_act_quant = False
         compilation_config.pass_config.fuse_attn_quant = False
         compilation_config.pass_config.eliminate_noops = False
+        if getattr(vllm_envs, "VLLM_TPU_USING_PATHWAYS", False):
+            compilation_config.backend = "eager"
+            return
 
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
@@ -752,7 +755,7 @@ class TpuPlatform(Platform):
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
                 max_token_size=scheduler_config.max_num_batched_tokens,
-                padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP,
+                padding_gap=getattr(vllm_envs, "VLLM_TPU_BUCKET_PADDING_GAP", 1),
             )
         else:
             compilation_config.compile_sizes = sorted(
