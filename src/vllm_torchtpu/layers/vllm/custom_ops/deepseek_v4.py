@@ -984,9 +984,13 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
             out: torch.Tensor,
     ) -> torch.Tensor:
+        import os
+        print(f"[DEBUG_SHAPES] pid={os.getpid()} qr shape={list(qr.shape)} | n_local_heads={self.mla_attn.n_local_heads} head_dim={self.mla_attn.head_dim}", flush=True)
         q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
+        print(f"[DEBUG_SHAPES] pid={os.getpid()} projected q shape={list(q.shape)} | input kv shape={list(kv.shape)}", flush=True)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
+        print(f"[DEBUG_SHAPES] pid={os.getpid()} after rope q shape={list(q.shape)} kv shape={list(kv.shape)}", flush=True)
 
         topk_indices = None
         if self.indexer is not None:
