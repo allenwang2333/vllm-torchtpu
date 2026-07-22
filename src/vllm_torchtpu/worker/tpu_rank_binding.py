@@ -36,6 +36,12 @@ try:
     import torch_tpu  # noqa: F401
     from torch_tpu._internal.distributed import tpu_distributed
 
+    # Touch TPU before initializing distributed process group to guarantee PjRtClient is initialized
+    try:
+        torch.empty((1,), device="tpu")
+    except Exception:
+        pass
+
     init_method = (
         f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}")
     if not dist.is_initialized():

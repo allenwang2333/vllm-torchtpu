@@ -183,7 +183,7 @@ def _patch_moe_no_ep_tp_scope() -> None:
     model-internal DP.
     """
     from vllm.distributed import parallel_state
-    from vllm.model_executor.layers.fused_moe.layer import \
+    from vllm.model_executor.layers.fused_moe import \
         FusedMoEParallelConfig
 
     if getattr(FusedMoEParallelConfig, "_tpu_no_ep_tp_scope_patch", False):

@@ -43,12 +43,12 @@ import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 try:
-    from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
+    from vllm.model_executor.layers.fused_moe import (FusedMoE,
                                                             FusedMoEMethodBase)
 except ImportError:
     from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
         FusedMoEMethodBase)
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
@@ -426,6 +426,13 @@ def _quantize_bf16_moe_weights(
     )
 
     return w13, w13_scale, w2, w2_scale, desired_quant_dtype, requant_block_size
+
+
+def _is_fused_moe(layer) -> bool:
+    if isinstance(FusedMoE, type):
+        return isinstance(layer, FusedMoE)
+    return getattr(layer, "__class__", type(layer)).__name__ in (
+        "FusedMoE", "FusedMoEBase") or hasattr(layer, "make_expert_params_mapping")
 
 
 @register_quantization_config(get_tpu_quant_method(FP8))

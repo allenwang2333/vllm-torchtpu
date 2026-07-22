@@ -40,8 +40,16 @@ import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+try:
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod)
+except ImportError:
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import (
+            UnquantizedFusedMoEMethod)
+    except ImportError:
+        UnquantizedFusedMoEMethod = object
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -58,6 +66,13 @@ from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _is_fused_moe(layer) -> bool:
+    if isinstance(FusedMoE, type):
+        return isinstance(layer, FusedMoE)
+    return getattr(layer, "__class__", type(layer)).__name__ in (
+        "FusedMoE", "FusedMoEBase") or hasattr(layer, "make_expert_params_mapping")
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
@@ -113,7 +128,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             )
             return UnquantizedLinearMethod()
 
-        if isinstance(layer, FusedMoE):
+        if _is_fused_moe(layer):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
             return VllmUnquantizedFusedMoEMethod(moe_config)

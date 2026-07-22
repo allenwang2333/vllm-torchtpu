@@ -286,6 +286,7 @@ class TPUModelRunner(GPUModelRunner):
         # TPU-only custom kwarg + alias kept for backwards-compat with worker.
         self.original_parallel_config = original_parallel_config
         self.device_config = vllm_config.device_config
+        self.pin_memory = False
 
         # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
         # models so vLLM sees a uniform page size across groups.
@@ -343,9 +344,12 @@ class TPUModelRunner(GPUModelRunner):
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
         self.num_xla_graphs = 0
-        self._update_num_xla_graphs("init")
-        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limit.
-        torch._dynamo.config.cache_size_limit = 1024
+        # torchTPU doesn't support SymInt yet, so widen Dynamo cache and recompile limits.
+        torch._dynamo.config.cache_size_limit = 8192
+        if hasattr(torch._dynamo.config, "accumulated_recompile_limit"):
+            torch._dynamo.config.accumulated_recompile_limit = 8192
+        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
+            torch._dynamo.config.accumulated_cache_size_limit = 8192
 
         # Override parent's kv_cache_dtype with the TPU mapping (handles
         # auto -> bfloat16 for our supported dtype set).
@@ -361,7 +365,7 @@ class TPUModelRunner(GPUModelRunner):
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        self.most_model_len = getattr(envs, "VLLM_TPU_MOST_MODEL_LEN", None)
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req

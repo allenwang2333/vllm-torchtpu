@@ -41,12 +41,12 @@ import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 try:
-    from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
+    from vllm.model_executor.layers.fused_moe import (FusedMoE,
                                                             FusedMoEMethodBase)
 except ImportError:
     from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
         FusedMoEMethodBase)
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \

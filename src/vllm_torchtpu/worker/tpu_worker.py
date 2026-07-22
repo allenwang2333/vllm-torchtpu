@@ -281,6 +281,12 @@ class TPUWorker(WorkerBase):
         if not self.devices:
             self.devices = [torch.device("tpu")]
 
+        # Touch TPU to ensure PjRtClient is initialized before process group creation
+        try:
+            torch.empty((1,), device="tpu")
+        except Exception:
+            pass
+
         from vllm.platforms import current_platform
         dist_backend = current_platform.get_worker_distributed_backend(
             dist_world_size)

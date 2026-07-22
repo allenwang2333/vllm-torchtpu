@@ -3,7 +3,14 @@ import itertools
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+def get_total_cp_world_size() -> int:
+    try:
+        from vllm.distributed import get_pcp_group, get_dcp_group
+        pcp = get_pcp_group().world_size if get_pcp_group() is not None else 1
+        dcp = get_dcp_group().world_size if get_dcp_group() is not None else 1
+        return pcp * dcp
+    except Exception:
+        return 1
 
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import (
     ensure_op_built, mamba_state_copy)
