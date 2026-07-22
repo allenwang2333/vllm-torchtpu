@@ -30,10 +30,11 @@ try:
 except ImportError:
     pass
 
-# Patch custom_op.CustomOp.register_oot to ignore duplicate registrations
+# Patch custom_op.CustomOp.register_oot and PluggableLayer.register_oot to ignore duplicate registrations
 try:
-    from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+    from vllm.model_executor.custom_op import CustomOp, PluggableLayer, op_registry_oot
     _orig_register_oot = CustomOp.register_oot
+    _orig_pluggable_register_oot = PluggableLayer.register_oot
     @classmethod
     def patched_register_oot(cls, _decorated_op_cls=None, name: str | None = None):
         reg_name = name if name is not None else cls.__name__
@@ -45,8 +46,20 @@ try:
             return lambda subclass: subclass
         return _orig_register_oot.__func__(cls, _decorated_op_cls, name)
     CustomOp.register_oot = patched_register_oot
+    
+    @classmethod
+    def patched_pluggable_register_oot(cls, _decorated_op_cls=None, name: str | None = None):
+        reg_name = name if name is not None else cls.__name__
+        print(f"[JAX_VERIFY_PATCH] PluggableLayer.register_oot called for: {reg_name} (current registry: {list(op_registry_oot.keys())})", flush=True)
+        if reg_name in op_registry_oot:
+            print(f"[JAX_VERIFY_PATCH] Ignoring duplicate pluggable custom op registration for: {reg_name}", flush=True)
+            if _decorated_op_cls is not None and isinstance(_decorated_op_cls, type):
+                return _decorated_op_cls
+            return lambda subclass: subclass
+        return _orig_pluggable_register_oot.__func__(cls, _decorated_op_cls, name)
+    PluggableLayer.register_oot = patched_pluggable_register_oot
 except Exception as e:
-    print(f"[JAX_VERIFY_PATCH] Failed to patch register_oot: {e}", flush=True)
+    print(f"[JAX_VERIFY_PATCH] Failed to patch custom_op: {e}", flush=True)
 
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
