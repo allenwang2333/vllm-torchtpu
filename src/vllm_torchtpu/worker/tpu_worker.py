@@ -452,19 +452,19 @@ class TPUWorker(WorkerBase):
                     "Profiler context is not set. Cannot stop profiler.")
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        from vllm_torchtpu.platforms.tpu_platform import \
+            _apply_model_specific_patches
+        _apply_model_specific_patches(self.model_config)
+        self.model_runner.load_model()
+
         import os
         if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
             try:
                 import torchax
                 torchax.enable_globally()
-                logger.info("Enabled torchax globally inside TPUWorker.load_model for JAX bypass mode")
+                logger.info("Enabled torchax globally inside TPUWorker.load_model AFTER model load complete")
             except Exception as e:
                 logger.error(f"Failed to enable torchax in TPUWorker: {e}")
-
-        from vllm_torchtpu.platforms.tpu_platform import \
-            _apply_model_specific_patches
-        _apply_model_specific_patches(self.model_config)
-        self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
