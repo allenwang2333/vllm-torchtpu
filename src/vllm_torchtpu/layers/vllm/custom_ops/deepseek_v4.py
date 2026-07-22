@@ -959,19 +959,23 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = q.dtype
-        # Swap q_pe (128:192) to the front (0:64) to align with rotary_emb expectation
-        q_swapped = q.clone()
-        q_swapped[..., :64] = q[..., 128:192]
-        q_swapped[..., 128:192] = q[..., :64]
+        # Swap q_pe (nope_head_dim:head_dim) to the front (0:rope_head_dim)
+        nope_dim = self.nope_head_dim
+        rope_dim = self.rope_head_dim
+        head_dim = self.head_dim
         
-        # Apply rotary embedding (rotates the first 64 channels, i.e. q_pe)
+        q_swapped = q.clone()
+        q_swapped[..., :rope_dim] = q[..., nope_dim:head_dim]
+        q_swapped[..., nope_dim:head_dim] = q[..., :rope_dim]
+        
+        # Apply rotary embedding (rotates the first rope_dim channels, i.e. q_pe)
         q_rotated, _ = self.mla_attn.rotary_emb(positions, q_swapped.to(torch.float32))
         q_rotated = q_rotated.to(orig_dtype)
         
         # Swap back to original position
         q_out = q_rotated.clone()
-        q_out[..., 128:192] = q_rotated[..., :64]
-        q_out[..., :64] = q_rotated[..., 128:192]
+        q_out[..., nope_dim:head_dim] = q_rotated[..., :rope_dim]
+        q_out[..., :rope_dim] = q_rotated[..., nope_dim:head_dim]
         return q_out
 
     def kv_rope(
@@ -980,19 +984,23 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = kv.dtype
-        # Swap k_pe (448:512) to the front (0:64) to align with rotary_emb expectation
-        kv_swapped = kv.clone()
-        kv_swapped[..., :64] = kv[..., 448:512]
-        kv_swapped[..., 448:512] = kv[..., :64]
+        # Swap k_pe (nope_head_dim:head_dim) to the front (0:rope_head_dim)
+        nope_dim = self.nope_head_dim
+        rope_dim = self.rope_head_dim
+        head_dim = self.head_dim
         
-        # Apply rotary embedding (rotates the first 64 channels)
+        kv_swapped = kv.clone()
+        kv_swapped[..., :rope_dim] = kv[..., nope_dim:head_dim]
+        kv_swapped[..., nope_dim:head_dim] = kv[..., :rope_dim]
+        
+        # Apply rotary embedding (rotates the first rope_dim channels)
         kv_rotated, _ = self.mla_attn.rotary_emb(positions, kv_swapped.unsqueeze(1).to(torch.float32))
         kv_rotated = kv_rotated.squeeze(1).to(orig_dtype)
         
         # Swap back to original position
         kv_out = kv_rotated.clone()
-        kv_out[..., 448:512] = kv_rotated[..., :64]
-        kv_out[..., :64] = kv_rotated[..., 448:512]
+        kv_out[..., nope_dim:head_dim] = kv_rotated[..., :rope_dim]
+        kv_out[..., :rope_dim] = kv_rotated[..., nope_dim:head_dim]
         return kv_out
 
     def attention_impl(
