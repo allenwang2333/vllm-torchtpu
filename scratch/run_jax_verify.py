@@ -12,8 +12,8 @@ os.environ["VLLM_ENFORCE_EAGER"] = "1"
 sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu/src")
 import vllm_torchtpu.env_override
 
-# Now add tpu-inference to path and import offline_inference
-sys.path.insert(0, "/root/tpu-inference")
+# Now add our repo to path and import offline_inference
+sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
