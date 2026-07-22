@@ -41,7 +41,7 @@ except ImportError:
 # sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
-from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
+from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
 patch_deepseek_v4_mla_cls()
 
 # Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
@@ -252,14 +252,14 @@ _AmdDeepseekV4ForCausalLM.forward = patched_forward
 sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
 
 # Monkey-patch JAX quantization mapping for deepseek_v4_fp8
-import tpu_inference.layers.common.quant_methods as qm
+import vllm_torchtpu.layers.common.quant_methods as qm
 qm.FP8 = "deepseek_v4_fp8"
 
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
 # Monkey patch JAX MoE apply_monolithic to log inputs
-from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
 _orig_apply_monolithic = VllmMxfp4MoEMethod.apply_monolithic
 
 def patched_apply_monolithic(self, layer, x, router_logits, input_ids=None):
@@ -289,7 +289,7 @@ VllmMxfp4MoEMethod.apply_monolithic = patched_apply_monolithic
 def custom_main(args: dict):
     # Patch DeepseekV4Attention to VllmDeepseekV4MLAAttention
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
     print("[RUN_JAX_VERIFY_PATCH] Patched ds_v4_amd_model.DeepseekV4Attention -> VllmDeepseekV4MLAAttention", flush=True)
 
