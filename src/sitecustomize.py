@@ -35,23 +35,44 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
         print("[SITECUSTOMIZE_PATCH] Successfully patched VllmDeepseekV4Fp8Config.get_quant_method for JAX.", file=sys.stderr, flush=True)
 
-        # Patch RowParallelLinear weight_loader_v2 to bypass sharding/narrowing for weight scales
+        # Helper to pre-expand 1D checkpoint scales to match 2D blockwise class parameters
+        def pre_expand_scale_tensor(param, loaded_weight):
+            if len(loaded_weight.shape) == 0:
+                loaded_weight = loaded_weight.reshape(1)
+            param_shape = param.data.shape
+            if len(param_shape) == 2 and len(loaded_weight.shape) == 1:
+                # Expand 1D scale to match the 2D parameter shape along the correct dimension
+                if param_shape[0] == loaded_weight.shape[0]:
+                    loaded_weight = loaded_weight.unsqueeze(1).expand(param_shape)
+                elif param_shape[1] == loaded_weight.shape[0]:
+                    loaded_weight = loaded_weight.unsqueeze(0).expand(param_shape)
+            return loaded_weight
+
+        # Patch RowParallelLinear weight_loader_v2
         from vllm.model_executor.layers.linear import RowParallelLinear
         _orig_row_parallel_weight_loader_v2 = RowParallelLinear.weight_loader_v2
 
         def patched_row_parallel_weight_loader_v2(self, param, loaded_weight):
             cls_name = param.__class__.__name__
             if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
-                print(f"[DEBUG_SCALE_SHAPES] param_shape: {param.data.shape} | loaded_shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
-                print(f"[SITECUSTOMIZE_PATCH] RowParallelLinear: loading scale parameter directly without sharding: {cls_name}", file=sys.stderr, flush=True)
-                if len(loaded_weight.shape) == 0:
-                    loaded_weight = loaded_weight.reshape(1)
-                param.data.copy_(loaded_weight)
-                return
+                loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
             return _orig_row_parallel_weight_loader_v2(self, param, loaded_weight)
 
         RowParallelLinear.weight_loader_v2 = patched_row_parallel_weight_loader_v2
         print("[SITECUSTOMIZE_PATCH] Successfully patched RowParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
+
+        # Patch ColumnParallelLinear weight_loader_v2
+        from vllm.model_executor.layers.linear import ColumnParallelLinear
+        _orig_column_parallel_weight_loader_v2 = ColumnParallelLinear.weight_loader_v2
+
+        def patched_column_parallel_weight_loader_v2(self, param, loaded_weight):
+            cls_name = param.__class__.__name__
+            if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+                loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+            return _orig_column_parallel_weight_loader_v2(self, param, loaded_weight)
+
+        ColumnParallelLinear.weight_loader_v2 = patched_column_parallel_weight_loader_v2
+        print("[SITECUSTOMIZE_PATCH] Successfully patched ColumnParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[SITECUSTOMIZE_PATCH] Failed to patch: {e}", file=sys.stderr, flush=True)
 else:
