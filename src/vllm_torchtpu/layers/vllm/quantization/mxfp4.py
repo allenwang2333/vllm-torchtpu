@@ -544,6 +544,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
+        layer_idx = getattr(layer, "layer_idx", -1)
         if layer_idx in (0, 3):
             x_cpu = x.to("cpu")
             router_logits_cpu = router_logits.to("cpu")
