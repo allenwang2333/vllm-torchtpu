@@ -337,6 +337,15 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             return ta_tensor.Tensor(jax_arr, env)
                         return t
 
+                    # Convert all model parameters and buffers to torchax.Tensor
+                    for name, param in self.named_parameters():
+                        if param is not None and not hasattr(param.data, "_elem"):
+                            param.data = to_torchax(param.data)
+
+                    for name, buf in self.named_buffers():
+                        if buf is not None and not hasattr(buf.data, "_elem"):
+                            buf.data = to_torchax(buf.data)
+
                     input_ids_ta = to_torchax(input_ids)
                     positions_ta = to_torchax(positions)
                     inputs_embeds_ta = to_torchax(inputs_embeds)
