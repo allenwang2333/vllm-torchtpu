@@ -19,7 +19,7 @@ quantized-matmul kernels in **W4A16** mode (bf16 activations, fp4 weights
 dequantized per block inside the kernel).
 
 Design:
-  - Reuse upstream `ModelOptNvFp4{LinearMethod,FusedMoE}.create_weights` for
+  - Reuse upstream `ModelOptNvFp4{LinearMethod,RoutedExperts}.create_weights` for
     parameter registration (packed uint8 weight, E4M3 `weight_scale`, FP32
     `weight_scale_2` global, `input_scale`).
   - `process_weights_after_loading` (pure PyTorch, no JAX): fuse the E4M3 block
@@ -40,7 +40,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -157,7 +158,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
             if self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return VllmNvfp4LinearMethod(self, self.get_linear_config(layer))
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             if self.is_layer_excluded(prefix):
                 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
                     VllmUnquantizedFusedMoEMethod
@@ -218,7 +219,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value})
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
@@ -332,7 +333,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,

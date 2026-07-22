@@ -42,7 +42,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.linear import (
     LinearBase, UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method)
@@ -344,7 +345,7 @@ def _quantize_and_format_moe_weights(
 
 
 def _process_fp8_moe_weights(
-    layer: FusedMoE,
+    layer: RoutedExperts,
     *,
     weight_block_size: Optional[tuple[int, int]] = None,
     activation: str,
@@ -438,7 +439,7 @@ def _process_fp8_moe_weights(
 
 
 def _quantize_bf16_moe_weights(
-    layer: FusedMoE,
+    layer: RoutedExperts,
     *,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int
@@ -522,7 +523,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                     prefix=prefix,
                     ignored_layers=self.ignored_layers,
@@ -670,7 +671,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         For BF16 checkpoints (online quantization): quantize BF16 → FP8
         directly using the same requantization path.
         """
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         activation_str = _get_activation_str(layer.activation)
@@ -731,7 +732,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
