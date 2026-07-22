@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 def test_linear_weight_loading_quant_config_resolving():
     # Setup global dummy config
     dummy_quant_config = Fp8Config(
-        quant_method="fp8",
+        is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=[1, 32],
     )
