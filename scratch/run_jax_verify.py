@@ -29,46 +29,6 @@ try:
     DeviceConfig.__post_init__ = patched_device_config_post_init
 except ImportError:
     pass
-# Patch VllmDeepseekV4Fp8Config to expose mesh attribute for old custom ops compatibility
-try:
-    from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
-    @property
-    def get_mesh_prop(self):
-        from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
-        return get_or_create_pcp_mesh()
-    VllmDeepseekV4Fp8Config.mesh = get_mesh_prop
-except ImportError:
-    pass
-# Patch custom_op.CustomOp.register_oot and PluggableLayer.register_oot to ignore duplicate registrations
-try:
-    from vllm.model_executor.custom_op import CustomOp, PluggableLayer, op_registry_oot
-    _orig_register_oot = CustomOp.register_oot
-    _orig_pluggable_register_oot = PluggableLayer.register_oot
-    @classmethod
-    def patched_register_oot(cls, _decorated_op_cls=None, name: str | None = None):
-        reg_name = name if name is not None else cls.__name__
-        print(f"[JAX_VERIFY_PATCH] register_oot called for: {reg_name} (current registry: {list(op_registry_oot.keys())})", flush=True)
-        if reg_name in op_registry_oot:
-            print(f"[JAX_VERIFY_PATCH] Ignoring duplicate custom op registration for: {reg_name}", flush=True)
-            if _decorated_op_cls is not None and isinstance(_decorated_op_cls, type):
-                return _decorated_op_cls
-            return lambda subclass: subclass
-        return _orig_register_oot.__func__(cls, _decorated_op_cls, name)
-    CustomOp.register_oot = patched_register_oot
-    
-    @classmethod
-    def patched_pluggable_register_oot(cls, _decorated_op_cls=None, name: str | None = None):
-        reg_name = name if name is not None else cls.__name__
-        print(f"[JAX_VERIFY_PATCH] PluggableLayer.register_oot called for: {reg_name} (current registry: {list(op_registry_oot.keys())})", flush=True)
-        if reg_name in op_registry_oot:
-            print(f"[JAX_VERIFY_PATCH] Ignoring duplicate pluggable custom op registration for: {reg_name}", flush=True)
-            if _decorated_op_cls is not None and isinstance(_decorated_op_cls, type):
-                return _decorated_op_cls
-            return lambda subclass: subclass
-        return _orig_pluggable_register_oot.__func__(cls, _decorated_op_cls, name)
-    PluggableLayer.register_oot = patched_pluggable_register_oot
-except Exception as e:
-    print(f"[JAX_VERIFY_PATCH] Failed to patch custom_op: {e}", flush=True)
 
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
@@ -77,13 +37,6 @@ try:
         att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
 except ImportError:
     pass
-
-# sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
-
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
-print(f"[DEBUG_METACLASS_CHECK] CustomOp.register_oot: {CustomOp.register_oot}", flush=True)
-print(f"[DEBUG_METACLASS_CHECK] QwenGatedDeltaNetAttention.register_oot: {QwenGatedDeltaNetAttention.register_oot}", flush=True)
 
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import patch_deepseek_v4_mla_cls
@@ -299,24 +252,7 @@ sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
 # Monkey-patch JAX quantization mapping for deepseek_v4_fp8
 import vllm_torchtpu.layers.common.quant_methods as qm
 qm.FP8 = "deepseek_v4_fp8"
-try:
-    import tpu_inference.layers.common.quant_methods as tpu_qm
-    tpu_qm.FP8 = "deepseek_v4_fp8"
-except ImportError:
-    pass
-# Monkey-patch get_vllm_model to establish VllmModelWrapperContext
-try:
-    import tpu_inference.models.common.model_loader as ml
-    _orig_get_vllm_model = ml.get_vllm_model
-    def patched_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs):
-        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import set_vllm_model_wrapper_context
-        from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
-        VllmDeepseekV4Fp8Config.set_configs(vllm_config)
-        with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_config):
-            return _orig_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs)
-    ml.get_vllm_model = patched_get_vllm_model
-except ImportError:
-    pass
+
 
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
