@@ -43,6 +43,22 @@ for name in ["empty", "zeros", "ones", "tensor", "arange", "full", "randn", "ran
     if hasattr(torch, name):
         setattr(torch, name, redirect_tpu_device(getattr(torch, name)))
 
+# Automatically propagate VllmConfig on initialization to quantization configs
+try:
+    from vllm.config import VllmConfig
+    _orig_vllm_config_init = VllmConfig.__init__
+    def patched_vllm_config_init(self, *args, **kwargs):
+        _orig_vllm_config_init(self, *args, **kwargs)
+        try:
+            from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+            VllmDeepseekV4Fp8Config.set_configs(self)
+            print("[JAX_VERIFY_PATCH] Automatically set VllmDeepseekV4Fp8Config configs from VllmConfig init!", flush=True)
+        except Exception as e:
+            print(f"[JAX_VERIFY_PATCH] Failed to set configs on init: {e}", flush=True)
+    VllmConfig.__init__ = patched_vllm_config_init
+except ImportError:
+    pass
+
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
     import vllm.models.deepseek_v4.attention as att_mod
