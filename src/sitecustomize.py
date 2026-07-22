@@ -38,16 +38,13 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         # Helper to pre-expand 1D checkpoint scales to match 2D blockwise class parameters
         def pre_expand_scale_tensor(param, loaded_weight):
             cls_name = param.__class__.__name__
-            print(f"[DEBUG_PRE_EXPAND] param_type: {cls_name} | param_shape: {param.data.shape} | loaded_shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.reshape(1)
             param_shape = param.data.shape
             if len(param_shape) == 2 and len(loaded_weight.shape) == 1:
-                # Expand 1D scale to match the 2D parameter shape along the correct dimension
-                if param_shape[0] == loaded_weight.shape[0]:
-                    loaded_weight = loaded_weight.unsqueeze(1).expand(param_shape)
-                elif param_shape[1] == loaded_weight.shape[0]:
-                    loaded_weight = loaded_weight.unsqueeze(0).expand(param_shape)
+                # Expand 1D scale to match the block size dimension of the parameter [partition_out_features, num_blocks]
+                loaded_weight = loaded_weight.unsqueeze(1).expand(loaded_weight.shape[0], param_shape[1])
+            print(f"[DEBUG_PRE_EXPAND] param_type: {cls_name} | param_shape: {param_shape} | expanded_shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
             return loaded_weight
 
         # Patch RowParallelLinear weight_loader_v2
