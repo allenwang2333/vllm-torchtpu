@@ -232,7 +232,7 @@ def patched_forward(self, *args, **kwargs):
 _AmdDeepseekV4ForCausalLM.forward = patched_forward
 
 # Now add our repo to path and import offline_inference
-sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
+sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
 
 # Monkey-patch JAX quantization mapping for deepseek_v4_fp8
 import tpu_inference.layers.common.quant_methods as qm
