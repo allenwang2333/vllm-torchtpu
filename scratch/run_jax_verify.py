@@ -8,6 +8,15 @@ os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.32"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["VLLM_ENFORCE_EAGER"] = "1"
 os.environ["VLLM_BYPASS_TPU_INIT"] = "1"
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+# Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
+try:
+    import vllm.models.deepseek_v4.attention as att_mod
+    if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+        att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+except ImportError:
+    pass
 
 
 
