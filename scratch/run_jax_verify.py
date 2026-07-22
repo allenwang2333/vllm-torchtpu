@@ -52,9 +52,6 @@ from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeeps
 _amd_orig_load_weights = _AmdDeepseekV4ForCausalLM.load_weights
 
 def patched_amd_load_weights(self, weights):
-    import torchax
-    torchax.enable_globally()
-    print("[RUN_JAX_VERIFY_PATCH] Enabled torchax globally inside patched_amd_load_weights", flush=True)
     try:
         if hasattr(self, "model") and hasattr(self.model, "layers") and len(self.model.layers) > 0:
             l = self.model.layers[0]
@@ -194,6 +191,10 @@ def patched_amd_load_weights(self, weights):
                     return spec
                 return wrapped_spec_fn
             module.get_kv_cache_spec = make_wrapped_fn(orig_spec_fn, name)
+
+    import torchax
+    torchax.enable_globally()
+    print("[RUN_JAX_VERIFY_PATCH] Enabled torchax globally after loading weights", flush=True)
 
     return res
 
