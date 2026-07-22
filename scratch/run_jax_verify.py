@@ -160,26 +160,6 @@ sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
 import tpu_inference.layers.common.quant_methods as qm
 qm.FP8 = "deepseek_v4_fp8"
 
-# Patch JAX quantization config to support FusedMoE class (which was renamed from RoutedExperts)
-from tpu_inference.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
-
-_orig_get_quant_method = VllmDeepseekV4Fp8Config.get_quant_method
-
-def patched_get_quant_method(self, layer, prefix):
-    if isinstance(layer, FusedMoE):
-        moe_config = self.get_moe_config(layer)
-        if self.expert_dtype == "fp4":
-            return VllmMxfp4MoEMethod(moe_config, self.mesh)
-        else:
-            from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8MoEMethod
-            layer.moe_config = moe_config
-            return VllmFp8MoEMethod(self, layer, self.mesh)
-    return _orig_get_quant_method(self, layer, prefix)
-
-VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
-
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
