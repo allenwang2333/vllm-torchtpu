@@ -2,6 +2,32 @@
 
 import os
 
+import torch
+import torch.utils
+_orig_rename = getattr(torch.utils, "rename_privateuse1_backend", None)
+if _orig_rename is not None:
+    def patched_rename(name):
+        try:
+            _orig_rename(name)
+        except RuntimeError as e:
+            if "already been set" in str(e):
+                pass
+            else:
+                raise e
+    torch.utils.rename_privateuse1_backend = patched_rename
+
+_orig_register = getattr(torch, "_register_device_module", None)
+if _orig_register is not None:
+    def patched_register(device_type, module):
+        try:
+            _orig_register(device_type, module)
+        except RuntimeError as e:
+            if "already be" in str(e) or "Expected one of" in str(e) or "already registered" in str(e):
+                pass
+            else:
+                raise e
+    torch._register_device_module = patched_register
+
 # torch_tpu reads this during import. If unset, it marks c10d functional
 # collectives as Dynamo graph breaks, which prevents vLLM TP graphs from
 # compiling. This file is imported by Python before vLLM imports torch.
