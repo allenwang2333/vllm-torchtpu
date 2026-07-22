@@ -47,19 +47,38 @@ import torch
 torch.cuda.Stream = lambda *args, **kwargs: None
 torch.cuda.Event = DummyCudaEvent
 
-# Import and apply weight name mapper patch
-from vllm_torchtpu.models.vllm.deepseek_v4_patch import patch_load_weights_for_class
-from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM as _CudaDeepseekV4ForCausalLM
+# Manually define weight name loader patch for the AMD model class
 from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeepseekV4ForCausalLM
+_amd_orig_load_weights = _AmdDeepseekV4ForCausalLM.load_weights
 
-patch_load_weights_for_class(_CudaDeepseekV4ForCausalLM)
-patch_load_weights_for_class(_AmdDeepseekV4ForCausalLM)
+def patched_amd_load_weights(self, weights):
+    self.model.has_tilelang = False
+    for idx, l in enumerate(self.model.layers):
+        l.layer_idx = idx
+        l.has_tilelang = False
+        if hasattr(l, "ffn"):
+            l.ffn.layer_idx = idx
+            if hasattr(l.ffn, "experts"):
+                l.ffn.experts.layer_idx = idx
 
-# Set global vllm_config in the patch module's namespace to satisfy the nested function closure
-import vllm_torchtpu.models.vllm.deepseek_v4_patch as patch_mod
-class DummyVllmConfig:
-    quant_config = None
-patch_mod.vllm_config = DummyVllmConfig()
+    orig_mapper = self.hf_to_vllm_mapper
+    class WrappedMapper:
+        def apply(self, w):
+            for name, loaded_weight in orig_mapper.apply(w):
+                if ".experts." in name and name.endswith("weight_scale"):
+                    name = name + "_inv"
+                if "hc_head.hc_" in name:
+                    name = name.replace("hc_head.hc_", "hc_head_")
+                if ".shared_experts.gate_proj" in name:
+                    name = name.replace(".shared_experts.gate_proj", ".shared_experts.w1")
+                elif ".shared_experts.up_proj" in name:
+                    name = name.replace(".shared_experts.up_proj", ".shared_experts.w3")
+                yield name, loaded_weight
+
+    self.hf_to_vllm_mapper = WrappedMapper()
+    return _amd_orig_load_weights(self, weights)
+
+_AmdDeepseekV4ForCausalLM.load_weights = patched_amd_load_weights
 
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
