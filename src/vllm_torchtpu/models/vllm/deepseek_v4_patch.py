@@ -111,6 +111,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     print(f"[PATCH]   Param: {k} | Shape: {list(param.shape)} | Type: {param.__class__.__name__}", file=sys.stderr, flush=True)
             for idx, l in enumerate(self.model.layers):
                 l.layer_idx = idx
+                l.has_tilelang = False
                 if hasattr(l, "ffn"):
                     l.ffn.layer_idx = idx
                     if hasattr(l.ffn, "experts"):
