@@ -103,9 +103,9 @@ def test_moe_weight_loading_and_quantization():
         w2_float = dequantize_mxfp4_packed(w2_packed, w2_scale_u8, axis=2, out_dtype=torch.bfloat16)
 
         # Load raw floats into temp CPU buffers (mimicking FusedMoE weight loader)
-        layer.w1_temp.copy_(w1_float)
-        layer.w3_temp.copy_(w3_float)
-        layer.w2_temp.copy_(w2_float)
+        layer.w1_temp[:num_experts_local].copy_(w1_float)
+        layer.w3_temp[:num_experts_local].copy_(w3_float)
+        layer.w2_temp[:num_experts_local].copy_(w2_float)
         
         # Run the weight processing (performing on-the-fly quantization and packing)
         moe_method.process_weights_after_loading(layer)
