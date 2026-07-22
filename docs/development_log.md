@@ -1239,5 +1239,8 @@ RuntimeError: Expected one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep
   - **GMM MXFP4 Contracting Axis Packing**: Updated `VllmMxfp4MoEMethod` to pack FP4 weight indices along `axis=1` (contracting dimension K) matching the offline pre-quantization script shape outputs.
   - **FP8 Scale Routing Prefix Helper**: Configured prefix-based linear layer routing in `VllmFp8LinearMethodTPU` to enforce per-channel FP8 scaling on dense layers (attention, shared experts) while routing routed experts to block-wise configuration.
   - **Activation Logs Patcher**: Hooked `DeepseekV4DecoderLayer.forward` to print activation statistics (mean, std, min, max, NaNs) layer-by-layer to help locate numerical divergence during execution.
+  - **MoE Weight Loading Correctness Test**: Created `test_dsv4_moe_weight_loading.py` unit test to verify that the FusedMoE weight loader correctly uninterleaves `w1`/`w3` from the checkpoint, pads, re-quantizes to FP4, and packs along axis 1.
 - **Result:**
   - `pytest` correctness tests for MLA attention, SWA attention, KV compressor, MoE routing (EP=8), and StreamIndex TopK all completed successfully on TPU.
+  - MoE weight loading test passed successfully with exact dequantized parity (MAE = 0.0) compared to raw checkpoint reference.
+
