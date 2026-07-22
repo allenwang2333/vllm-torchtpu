@@ -1212,8 +1212,32 @@ RuntimeError: Expected one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep
              ^^^^^^^^^^^
   File "/usr/local/lib/python3.12/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
-pydantic_core._pydantic_core.ValidationError: 1 validation error for VllmConfig
   Value error, No TPU devices found. [type=value_error, input_value=ArgsKwargs((), {'model_co... 'shutdown_timeout': 0}), input_type=ArgsKwargs]
     For further information visit https://errors.pydantic.dev/2.13/v/value_error
   ```
 
+---
+
+### [2026-07-22 14:10:00 UTC] DeepSeek-V4 Correctness Debugging & Synthetic Parity Verification
+- **Context:** Resolved compiler shape mismatches, Pallas sharding bounds, compiler VMEM spills, CustomOp negative constraints, and verified FP4 MoE numerical correctness.
+- **Key Changes:**
+  - **Attention Sinks Sharding Fix**: Synced query attention sinks layout partition spec dynamically under TP=8 to avoid multi-device python indexing gather crashes.
+  - **PyTorch-XLA CustomOp Sentinel Fix**: Masked negative expert IDs (-1) to 0 at the PyTorch CustomOp boundary, and recovered the sentinels back to -1 inside the JAX kernel graph.
+  - **Weight Scale Parameter Shapes**: Enabled `is_channel_quant = True` on the FP8 quantization config, resolving shape mismatch assertions.
+  - **MoE GMM Contracting Axis Shape Bug**: Corrected packed weight contracting axis detection logic (`padded_hidden_size = w1.shape[1] * 2` for `uint8`) in `fused_moe_gmm.py`, resolving negative padding crashes.
+  - **Synthetic Correctness Verification**: Created `test_fused_moe_fp4.py` unit test comparing custom Pallas GMM MoE kernel outputs with CPU dequantization reference matrix multiplication.
+- **Result:**
+  - Parity successfully verified: Max Absolute Difference = 0.125, Mean Absolute Error = 0.014 (within bfloat16 hardware accumulator rounding bounds).
+  - Cleaned up local workspace backups and reclaimed 80 GB of disk space on the laptop.
+
+---
+
+### [2026-07-22 14:45:00 UTC] DeepSeek-V4 Kernel Correctness Verification & SWA Softmax Invariant Fix
+- **Context:** Verified correctness of core DeepSeek-V4 attention and routing kernels, and resolved sliding window attention (SWA) verification test failure.
+- **Key Changes:**
+  - **SWA Softmax Denominator Assertion Fix**: Corrected verification test in `test_dsv4_mla_swa.py` to compare the mathematically invariant `logsumexp = log(L) + m` rather than `L` and `m` individually. This bypasses the scaling offset caused by different max-value tracking in block-wise kernel execution versus monolithic CPU reference.
+  - **GMM MXFP4 Contracting Axis Packing**: Updated `VllmMxfp4MoEMethod` to pack FP4 weight indices along `axis=1` (contracting dimension K) matching the offline pre-quantization script shape outputs.
+  - **FP8 Scale Routing Prefix Helper**: Configured prefix-based linear layer routing in `VllmFp8LinearMethodTPU` to enforce per-channel FP8 scaling on dense layers (attention, shared experts) while routing routed experts to block-wise configuration.
+  - **Activation Logs Patcher**: Hooked `DeepseekV4DecoderLayer.forward` to print activation statistics (mean, std, min, max, NaNs) layer-by-layer to help locate numerical divergence during execution.
+- **Result:**
+  - `pytest` correctness tests for MLA attention, SWA attention, KV compressor, MoE routing (EP=8), and StreamIndex TopK all completed successfully on TPU.
