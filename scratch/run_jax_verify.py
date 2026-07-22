@@ -157,8 +157,8 @@ def patched_amd_load_weights(self, weights):
                 elif ".self_attn.sinks" in name:
                     name = name.replace(".self_attn.sinks", ".attn.attn_sink")
 
-                if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale_inv"):
-                    name = name.replace("weight_scale_inv", "weight_scale")
+                if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale"):
+                    name = name.replace("weight_scale", "weight_scale_inv")
 
                 yield name, loaded_weight
 
