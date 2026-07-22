@@ -10,6 +10,9 @@ os.environ["VLLM_ENFORCE_EAGER"] = "1"
 os.environ["VLLM_BYPASS_TPU_INIT"] = "1"
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
+import torch
+torch._dynamo.config.disable = True
+
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
     import vllm.models.deepseek_v4.attention as att_mod
