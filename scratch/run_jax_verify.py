@@ -17,6 +17,15 @@ os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 import torch
 torch._dynamo.config.disable = True
 
+# Mock distributed barrier and TPU synchronization for JAX-only execution
+import torch.distributed as dist
+dist.barrier = lambda *args, **kwargs: None
+try:
+    import torch_tpu._internal.sync as tpu_sync
+    tpu_sync.synchronize = lambda *args, **kwargs: None
+except ImportError:
+    pass
+
 # Globally patch torch.device to redirect tpu allocation to cpu under JAX verification
 _orig_device = torch.device
 
