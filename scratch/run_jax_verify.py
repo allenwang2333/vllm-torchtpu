@@ -22,6 +22,15 @@ if _orig_rename is not None:
                 raise e
     torch.utils.rename_privateuse1_backend = patched_rename
 
+import torch
+_orig_register = getattr(torch, "_register_device_module", None)
+if _orig_register is not None:
+    def patched_register(device_type, module):
+        if device_type == "jax":
+            device_type = "tpu"
+        _orig_register(device_type, module)
+    torch._register_device_module = patched_register
+
 # Add torchtpu-vllm/src to path so we can import env_override
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 import vllm_torchtpu.env_override
