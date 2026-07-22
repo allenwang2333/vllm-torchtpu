@@ -164,6 +164,7 @@ def patched_amd_load_weights(self, weights):
 
                 yield name, loaded_weight
 
+    self.hf_to_vllm_mapper = WrappedMapper()
     res = _amd_orig_load_weights(self, weights)
 
     # Wrap get_kv_cache_spec to return dummy specs instead of None to bypass JAX KV cache manager assertions
@@ -194,6 +195,29 @@ def patched_amd_load_weights(self, weights):
     return res
 
 _AmdDeepseekV4ForCausalLM.load_weights = patched_amd_load_weights
+
+# Also patch inner DeepseekV4Model.load_weights
+from vllm.models.deepseek_v4.amd.model import DeepseekV4Model
+_amd_orig_inner_load_weights = DeepseekV4Model.load_weights
+
+def patched_amd_inner_load_weights(self, weights):
+    orig_mapper = self.hf_to_vllm_mapper
+    class WrappedMapper:
+        def apply(self, w):
+            for name, loaded_weight in orig_mapper.apply(w):
+                if ".experts." in name and name.endswith(".weight"):
+                    if loaded_weight.ndim == 2:
+                        loaded_weight = loaded_weight.t()
+                if "hc_head.hc_" in name:
+                    name = name.replace("hc_head.hc_", "hc_head_")
+                if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale"):
+                    name = name.replace("weight_scale", "weight_scale_inv")
+                yield name, loaded_weight
+
+    self.hf_to_vllm_mapper = WrappedMapper()
+    return _amd_orig_inner_load_weights(self, weights)
+
+DeepseekV4Model.load_weights = patched_amd_inner_load_weights
 
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
