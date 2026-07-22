@@ -175,43 +175,4 @@ else:
     except ImportError:
         pass
 
-try:
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    _orig_weight_loader = FusedMoE.weight_loader
 
-    def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
-        if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2") and "weight" in weight_name and "scale" not in weight_name:
-            if shard_id == "w1":
-                temp_param = self.w1_temp
-                shard_dim = 0
-            elif shard_id == "w3":
-                temp_param = self.w3_temp
-                shard_dim = 0
-            else:
-                temp_param = self.w2_temp
-                shard_dim = 1
-
-            expert_data = temp_param.data[expert_id]
-
-            if loaded_weight.ndim > 0:
-                shard_size = expert_data.shape[shard_dim]
-                start_offset = shard_size * self.tp_rank
-                available = loaded_weight.shape[shard_dim] - start_offset
-                if available <= 0:
-                    return True if return_success else None
-                narrow_size = min(shard_size, available)
-                loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
-
-                if expert_data.shape[shard_dim] > loaded_weight.shape[shard_dim]:
-                    expert_data = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
-
-            expert_data.copy_(loaded_weight)
-            return True if return_success else None
-
-        return _orig_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
-
-    FusedMoE.weight_loader = patched_fused_moe_weight_loader
-    import sys
-    print(f"[SITECUSTOMIZE_PATCH] Patched FusedMoE.weight_loader process-wide in pid={os.getpid()}", file=sys.stderr, flush=True)
-except Exception as e:
-    pass

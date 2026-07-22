@@ -86,12 +86,45 @@ from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_vllm_model_wrapper_context
 from vllm_torchtpu.logger import init_logger
 
+logger = init_logger(__name__)
+
+# Apply local patch to FusedMoE.weight_loader for MXFP4 redirection to CPU
+_orig_weight_loader = FusedMoE.weight_loader
+
+def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
+    if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2") and "weight" in weight_name and "scale" not in weight_name:
+        if shard_id == "w1":
+            temp_param = self.w1_temp
+            shard_dim = 0
+        elif shard_id == "w3":
+            temp_param = self.w3_temp
+            shard_dim = 0
+        else:
+            temp_param = self.w2_temp
+            shard_dim = 1
+
+        expert_data = temp_param.data[expert_id]
+
+        if loaded_weight.ndim > 0:
+            shard_size = expert_data.shape[shard_dim]
+            start_offset = shard_size * self.tp_rank
+            narrow_size = min(shard_size, loaded_weight.shape[shard_dim] - start_offset)
+            if narrow_size > 0:
+                loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+                if expert_data.shape[shard_dim] > loaded_weight.shape[shard_dim]:
+                    expert_data = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+                expert_data.copy_(loaded_weight)
+        return True if return_success else None
+
+    return _orig_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
+
+FusedMoE.weight_loader = patched_fused_moe_weight_loader
+logger.info("FusedMoE.weight_loader patched locally in VllmMxfp4MoEMethod.")
+
 class MoEBackend(Enum):
     FUSED_MOE = "fused_moe"
     GMM_TP = "gmm_tp"
     GMM_EP = "gmm_ep"
-
-logger = init_logger(__name__)
 
 
 @register_quantization_config(get_tpu_quant_method(MXFP4))
