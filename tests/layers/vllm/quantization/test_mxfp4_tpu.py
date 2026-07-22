@@ -97,29 +97,35 @@ class TestMxfp4MoETPU:
             layer._tpu_activation_str = "silu"
             layer.renormalize = True
             
-            # Assign mock packed weights and scales (simulating MXFP4 model weights on TPU)
-            layer.w13_weight = torch.nn.Parameter(
-                torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 2), dtype=torch.uint8, device=device),
-                requires_grad=False
-            )
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.randint(120, 135, (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8, device=device),
-                requires_grad=False
-            )
-            layer.w2_weight = torch.nn.Parameter(
-                torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 2), dtype=torch.uint8, device=device),
-                requires_grad=False
-            )
-            layer.w2_weight_scale = torch.nn.Parameter(
-                torch.randint(120, 135, (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8, device=device),
-                requires_grad=False
-            )
+            # Create mock packed weights and scales (simulating MXFP4 model weights on TPU)
+            w13_packed = torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 2), dtype=torch.uint8, device="cpu")
+            w13_scale = torch.randint(120, 135, (num_experts, 2 * intermediate_size, hidden_size // 32, 1), dtype=torch.uint8, device="cpu")
+            w2_packed = torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 2), dtype=torch.uint8, device="cpu")
+            w2_scale = torch.randint(120, 135, (num_experts, hidden_size, intermediate_size // 32, 1), dtype=torch.uint8, device="cpu")
+
+            # Setup temporary cache directory and save the pre-quantized weights
+            import tempfile
+            import os
+            temp_dir = tempfile.TemporaryDirectory()
+            os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir.name
+            
+            # Form dummy parameters on the layer so that process_weights knows the shapes for filename construction
+            layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
+
+            cache_path = os.path.join(temp_dir.name, "rank_0_layer_3_w13_512x64_w2_128x128.pt")
+            torch.save({
+                "w13_weight_packed": w13_packed,
+                "w2_weight_packed": w2_packed,
+                "w13_weight_scale": w13_scale,
+                "w2_weight_scale": w2_scale,
+            }, cache_path)
             
             # 3. Instantiate MXFP4 quant method
             method = VllmMxfp4MoEMethod(moe_config)
             layer.quant_method = method
             
-            # 4. Run weight processing (simulating weight loader)
+            # 4. Run weight processing (simulating weight loader reading from cache)
             method.process_weights_after_loading(layer)
             
             # Verify weight attributes are populated as native FP4 packed tensors
