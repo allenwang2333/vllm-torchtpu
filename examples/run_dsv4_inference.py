@@ -50,7 +50,7 @@ def main():
         kv_cache_dtype="fp8",
         gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.20")),
         enable_expert_parallel=True,
-        enforce_eager=False,
+        enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
         additional_config={
 
             "compilation_config": {
