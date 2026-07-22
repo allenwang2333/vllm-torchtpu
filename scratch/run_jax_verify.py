@@ -242,21 +242,33 @@ qm.FP8 = "deepseek_v4_fp8"
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
-# Monkey patch JAX MoE apply_jax to log inputs
-from tpu_inference.layers.jax.quantization.fp8 import Fp8FusedMoEMethod
-_orig_apply_jax = Fp8FusedMoEMethod.apply_jax
+# Monkey patch JAX MoE apply_monolithic to log inputs
+from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+_orig_apply_monolithic = VllmMxfp4MoEMethod.apply_monolithic
 
-def patched_apply_jax(self, layer, x, *, router_logits):
+def patched_apply_monolithic(self, layer, x, router_logits, input_ids=None):
     prefix = getattr(layer, "prefix", "")
     if "layers.0." in prefix or "layers.3." in prefix:
         import jax
-        def print_stats(prefix, x, r):
-            print(f"[DEBUG_JAX] {prefix} input x: shape={list(x.shape)} dtype={str(x.dtype)} | mean={float(x.mean()):.6f} std={float(x.std()):.6f} min={float(x.min()):.6f} max={float(x.max()):.6f}", flush=True)
-            print(f"[DEBUG_JAX] {prefix} input router_logits: shape={list(r.shape)} dtype={str(r.dtype)} | mean={float(r.mean()):.6f} std={float(r.std()):.6f} min={float(r.min()):.6f} max={float(r.max()):.6f}", flush=True)
-        jax.debug.callback(print_stats, prefix, x, router_logits)
-    return _orig_apply_jax(self, layer, x, router_logits=router_logits)
+        def print_stats(prefix, x_arr, r_arr):
+            print(f"[DEBUG_JAX] {prefix} input x: shape={list(x_arr.shape)} dtype={str(x_arr.dtype)} | mean={float(x_arr.mean()):.6f} std={float(x_arr.std()):.6f} min={float(x_arr.min()):.6f} max={float(x_arr.max()):.6f}", flush=True)
+            print(f"[DEBUG_JAX] {prefix} input router_logits: shape={list(r_arr.shape)} dtype={str(r_arr.dtype)} | mean={float(r_arr.mean()):.6f} std={float(r_arr.std()):.6f} min={float(r_arr.min()):.6f} max={float(r_arr.max()):.6f}", flush=True)
+        x_elem = getattr(x, "_elem", x)
+        r_elem = getattr(router_logits, "_elem", router_logits)
+        jax.debug.callback(print_stats, prefix, x_elem, r_elem)
 
-Fp8FusedMoEMethod.apply_jax = patched_apply_jax
+    res = _orig_apply_monolithic(self, layer, x, router_logits, input_ids)
+
+    if "layers.0." in prefix or "layers.3." in prefix:
+        import jax
+        def print_output_stats(prefix, res_arr):
+            print(f"[DEBUG_JAX] {prefix} output: shape={list(res_arr.shape)} dtype={str(res_arr.dtype)} | mean={float(res_arr.mean()):.6f} std={float(res_arr.std()):.6f} min={float(res_arr.min()):.6f} max={float(res_arr.max()):.6f}", flush=True)
+        res_elem = getattr(res, "_elem", res)
+        jax.debug.callback(print_output_stats, prefix, res_elem)
+
+    return res
+
+VllmMxfp4MoEMethod.apply_monolithic = patched_apply_monolithic
 
 def custom_main(args: dict):
     # Patch DeepseekV4Attention to VllmDeepseekV4MLAAttention
