@@ -96,6 +96,7 @@ class TestMxfp4MoETPU:
             layer.layer_idx = 3
             layer._tpu_activation_str = "silu"
             layer.renormalize = True
+            layer.device = device
             
             # Create mock packed weights and scales (simulating MXFP4 model weights on TPU)
             w13_packed = torch.randint(0, 256, (num_experts, 64, 1024), dtype=torch.uint8, device="cpu")
