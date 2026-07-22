@@ -338,13 +338,25 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         return t
 
                     # Convert all model parameters and buffers to torchax.Tensor
-                    for name, param in self.named_parameters():
-                        if param is not None and not hasattr(param.data, "_elem"):
-                            param.data = to_torchax(param.data)
+                    def convert_module_params(module):
+                        for name in list(module._parameters.keys()):
+                            param = module._parameters[name]
+                            if param is not None and not hasattr(param, "_elem"):
+                                wrapper = to_torchax(param)
+                                del module._parameters[name]
+                                setattr(module, name, wrapper)
 
-                    for name, buf in self.named_buffers():
-                        if buf is not None and not hasattr(buf.data, "_elem"):
-                            buf.data = to_torchax(buf.data)
+                        for name in list(module._buffers.keys()):
+                            buf = module._buffers[name]
+                            if buf is not None and not hasattr(buf, "_elem"):
+                                wrapper = to_torchax(buf)
+                                del module._buffers[name]
+                                setattr(module, name, wrapper)
+
+                        for child in module.children():
+                            convert_module_params(child)
+
+                    convert_module_params(self)
 
                     input_ids_ta = to_torchax(input_ids)
                     positions_ta = to_torchax(positions)
