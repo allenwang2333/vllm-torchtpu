@@ -37,7 +37,7 @@ if _orig_register is not None:
 
 # Add torchtpu-vllm/src to path so we can import env_override
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
-import vllm_torchtpu.env_override
+# import vllm_torchtpu.env_override
 
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
