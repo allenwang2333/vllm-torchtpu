@@ -37,6 +37,8 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
 
         # Helper to pre-expand 1D checkpoint scales to match 2D blockwise class parameters
         def pre_expand_scale_tensor(param, loaded_weight):
+            cls_name = param.__class__.__name__
+            print(f"[DEBUG_PRE_EXPAND] param_type: {cls_name} | param_shape: {param.data.shape} | loaded_shape: {loaded_weight.shape}", file=sys.stderr, flush=True)
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.reshape(1)
             param_shape = param.data.shape
