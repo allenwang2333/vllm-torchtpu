@@ -215,7 +215,7 @@ if [ "$RUN_LM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 4b. Run Standalone Multimodal (MMMU) Evaluation
+# 4b. Run Standalone Multimodal (MMMU & MMMU-Pro) Evaluation
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ] && [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
     echo "=== Running Standalone Multimodal (MMMU) Evaluation ==="
@@ -223,8 +223,18 @@ if [ "$RUN_LM_EVAL" = "1" ] && [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
       --host "$HOST" \
       --port "$PORT" \
       --model "$MODEL" \
+      --dataset "MMMU/MMMU" \
       --limit "${MMMU_LIMIT:-100}" \
       --results-dir "$RESULTS_DIR" || { echo "::error::MMMU evaluation failed!"; fail=1; }
+
+    echo "=== Running Standalone Multimodal (MMMU-Pro) Evaluation ==="
+    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
+      --host "$HOST" \
+      --port "$PORT" \
+      --model "$MODEL" \
+      --dataset "MMMU/MMMU_Pro" \
+      --limit "${MMMU_LIMIT:-100}" \
+      --results-dir "$RESULTS_DIR" || { echo "::error::MMMU-Pro evaluation failed!"; fail=1; }
 fi
 
 # ========================================================
