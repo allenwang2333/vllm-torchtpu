@@ -210,23 +210,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             **extra_weight_attrs,
         )
 
-        # 2. Allocate temporary UNPACKED bfloat16 parameters for w1, w3, w2 to receive checkpoint weights
-        from vllm.model_executor.utils import set_weight_attrs
-        layer.w1_temp = torch.nn.Parameter(
-            torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu"),
-            requires_grad=False,
-        )
-        layer.w3_temp = torch.nn.Parameter(
-            torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu"),
-            requires_grad=False,
-        )
-        layer.w2_temp = torch.nn.Parameter(
-            torch.zeros(num_experts, hidden_size, intermediate_size_per_partition, dtype=torch.bfloat16, device="cpu"),
-            requires_grad=False,
-        )
-        set_weight_attrs(layer.w1_temp, extra_weight_attrs)
-        set_weight_attrs(layer.w3_temp, extra_weight_attrs)
-        set_weight_attrs(layer.w2_temp, extra_weight_attrs)
+        # 2. Allocate temporary UNPACKED bfloat16 tensors for w1, w3, w2 to receive checkpoint weights
+        layer.w1_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu")
+        layer.w3_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu")
+        layer.w2_temp = torch.zeros(num_experts, hidden_size, intermediate_size_per_partition, dtype=torch.bfloat16, device="cpu")
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, FusedMoE)
