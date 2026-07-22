@@ -111,8 +111,8 @@ class TestMxfp4MoETPU:
             os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir.name
             
             # Form dummy parameters on the layer so that process_weights knows the shapes for filename construction
-            layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
+            layer.w13_weight = torch.nn.Parameter(w13_packed.to(device), requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2_packed.to(device), requires_grad=False)
 
             cache_path = os.path.join(temp_dir.name, "rank_0_layer_3_w13_64x1024_w2_128x128.pt")
             torch.save({
