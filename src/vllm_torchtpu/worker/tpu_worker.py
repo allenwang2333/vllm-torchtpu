@@ -416,11 +416,13 @@ class TPUWorker(WorkerBase):
                 f"Starting TorchTPU profiler trace at {profile_dir}...")
             handler = torch.profiler.tensorboard_trace_handler(
                 profile_dir, worker_name=f"rank{self.rank}")
+            config = f"rank:{self.rank}"
             self.profile_context = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.PrivateUse1,
                 ],
+                experimental_config=config,
                 record_shapes=True,
                 on_trace_ready=handler,
             )
