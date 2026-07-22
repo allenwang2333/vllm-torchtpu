@@ -86,16 +86,28 @@ def test_moe_weight_loading_and_quantization():
         # w2_weight_scale has shape [32, hidden_size, intermediate_size // 32] = [32, 2048, 64]
         w2_scale_u8 = torch.ones(num_experts_local, hidden_size, intermediate_size // 32, dtype=torch.uint8) * 130 # exponent = 130 -> scale = 8.0
         
-        # Bind parameters to the dummy layer (overriding the empty parameters)
-        layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_u8, requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_u8, requires_grad=False)
-        
-        # Instantiate MoE method
+        # Bind parameters via create_weights to allocate final parameters and temp CPU buffers
         moe_method = VllmMxfp4MoEMethod(layer.moe_config)
+        moe_method.create_weights(
+            layer=layer,
+            num_experts=num_experts_global,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            params_dtype=torch.bfloat16,
+        )
+
+        # Dequantize packed inputs to get raw floats for temp CPU weight loading
+        w13_float = dequantize_mxfp4_packed(w13_packed, w13_scale_u8, axis=2, out_dtype=torch.bfloat16)
+        w1_float = w13_float[:, ::2, :]
+        w3_float = w13_float[:, 1::2, :]
+        w2_float = dequantize_mxfp4_packed(w2_packed, w2_scale_u8, axis=2, out_dtype=torch.bfloat16)
+
+        # Load raw floats into temp CPU buffers (mimicking FusedMoE weight loader)
+        layer.w1_temp.copy_(w1_float)
+        layer.w3_temp.copy_(w3_float)
+        layer.w2_temp.copy_(w2_float)
         
-        # Run the weight processing
+        # Run the weight processing (performing on-the-fly quantization and packing)
         moe_method.process_weights_after_loading(layer)
         
     # --- Verify Outputs ---
