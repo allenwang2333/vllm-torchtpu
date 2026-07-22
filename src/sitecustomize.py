@@ -49,6 +49,8 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         def patched_xla_dispatch(self, func, types, args=(), kwargs=None):
             if func.namespace == "pallas":
                 print(f"[DEBUG_PALLAS_DISPATCH] func={func} types={types} args={[(type(a), getattr(a, '_elem', None) is not None) for a in args]}", file=sys.stderr, flush=True)
+                print(f"[DEBUG_PALLAS_KEYS] ops={[str(k) for k in self.env._ops.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", file=sys.stderr, flush=True)
+                print(f"[DEBUG_PALLAS_KEYS] decomps={[str(k) for k in self.env._decomps.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", file=sys.stderr, flush=True)
                 return self.env.dispatch(func, types, args, kwargs)
             return _orig_xla_dispatch(self, func, types, args, kwargs)
         ta_tensor.XLADispatchMode.__torch_dispatch__ = patched_xla_dispatch
