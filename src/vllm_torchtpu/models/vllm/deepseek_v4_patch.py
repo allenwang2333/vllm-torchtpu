@@ -87,10 +87,9 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     def patched_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids=None):
         layer_idx = getattr(layer, "layer_idx", -1)
-        if layer_idx in (3, 4):
-            print(f"[DEBUG_PATCH] layer_{layer_idx} _quant_method: {self._quant_method.__class__.__name__} | is_monolithic: {getattr(self._quant_method, 'is_monolithic', None)}", flush=True)
-            print(f"[DEBUG_PATCH] layer_{layer_idx} input hidden_states: shape={list(hidden_states.shape)} dtype={hidden_states.dtype}", flush=True)
-            print(f"[DEBUG_PATCH] layer_{layer_idx} input router_logits: shape={list(router_logits.shape)} dtype={router_logits.dtype}", flush=True)
+        if layer_idx in (0, 3, 4):
+            print(f"[DEBUG_PATCH] layer_{layer_idx} input hidden_states: shape={list(hidden_states.shape)} dtype={hidden_states.dtype} | mean={hidden_states.float().mean().item():.6f} std={hidden_states.float().std().item():.6f} min={hidden_states.float().min().item():.6f} max={hidden_states.float().max().item():.6f}", flush=True)
+            print(f"[DEBUG_PATCH] layer_{layer_idx} input router_logits: shape={list(router_logits.shape)} dtype={router_logits.dtype} | mean={router_logits.float().mean().item():.6f} std={router_logits.float().std().item():.6f} min={router_logits.float().min().item():.6f} max={router_logits.float().max().item():.6f}", flush=True)
         return _orig_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids)
 
     MoERunner._apply_quant_method = patched_apply_quant_method
