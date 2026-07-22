@@ -6,12 +6,68 @@ import torch
 from safetensors import safe_open
 from concurrent.futures import ProcessPoolExecutor
 
-# Add layers/common to python path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/vllm_torchtpu/layers/common")))
-from quantization import (
-    quantize_tensor_to_fp4,
-    pack_fp4_indices
-)
+def quantize_tensor_to_fp4(tensor: torch.Tensor, axis: int = -1, block_size: int = 512):
+    if isinstance(axis, int):
+        axis = [axis]
+
+    FP4_MAX = 6.0
+    FP4_MIN = -6.0
+
+    orig_shape = tensor.shape
+    blocked_shape = []
+    for i, dim in enumerate(orig_shape):
+        if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
+            if dim % block_size != 0:
+                raise ValueError(f"Dimension {i} of size {dim} is not divisible by block_size={block_size}")
+            num_blocks = dim // block_size
+            blocked_shape.extend([num_blocks, block_size])
+        else:
+            blocked_shape.append(dim)
+
+    axis_normalized = sorted([a % tensor.ndim for a in axis])
+    expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
+
+    tensor_blocked = tensor.reshape(blocked_shape)
+
+    abs_max = tensor_blocked.abs().amax(dim=expanded_axis, keepdim=True)
+    scale = abs_max / FP4_MAX
+
+    scale_inv = torch.where(scale == 0, 0.0, 1.0 / scale)
+
+    tensor_scaled = tensor_blocked * scale_inv
+    tensor_clipped = tensor_scaled.clamp(FP4_MIN, FP4_MAX)
+
+    thresholds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                              dtype=torch.float32,
+                              device=tensor.device)
+    abs_val = tensor_clipped.abs()
+    bucket_indices = torch.bucketize(abs_val, thresholds).to(torch.int8)
+    
+    is_negative = tensor_clipped < 0
+    indices = torch.where(is_negative, bucket_indices + 8, bucket_indices)
+
+    indices = indices.reshape(orig_shape)
+    scale = scale.squeeze(tuple(expanded_axis)).to(torch.float32)
+
+    return indices, scale
+
+def pack_fp4_indices(indices: torch.Tensor, axis: int = -1) -> torch.Tensor:
+    axis = axis % indices.ndim
+    if indices.shape[axis] % 2 != 0:
+        raise ValueError(f"Dimension {axis} of size {indices.shape[axis]} must be even for packing")
+
+    indices = indices.to(torch.uint8)
+    
+    slices_low = [slice(None)] * indices.ndim
+    slices_low[axis] = slice(0, None, 2)
+    low = indices[tuple(slices_low)]
+    
+    slices_high = [slice(None)] * indices.ndim
+    slices_high[axis] = slice(1, None, 2)
+    high = indices[tuple(slices_high)]
+
+    packed = low | (high << 4)
+    return packed
 
 REQUANTIZED_BLOCK_SIZE = 512
 
