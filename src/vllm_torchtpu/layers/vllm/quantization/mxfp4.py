@@ -545,11 +545,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
-        # layer_idx = getattr(layer, "layer_idx", -1)
-        # if layer_idx in (3, 4):
-        #     print(f"[DEBUG_FORWARD] layer_{layer_idx} input x: Mean={x.mean().item():.6f} Max={x.max().item():.6f} Min={x.min().item():.6f}", flush=True)
-        #     print(f"[DEBUG_FORWARD] layer_{layer_idx} topk_ids: Mean={topk_ids.float().mean().item():.6f} Max={topk_ids.max().item()} Min={topk_ids.min().item()}", flush=True)
-        #     print(f"[DEBUG_FORWARD] layer_{layer_idx} output res: Mean={res.mean().item():.6f} Max={res.max().item():.6f} Min={res.min().item():.6f} HasNaN={torch.isnan(res).any().item()}", flush=True)
+        layer_idx = getattr(layer, "layer_idx", -1)
+        if layer_idx in (0, 3):
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input x: shape={list(x.shape)} dtype={x.dtype} | mean={x.mean().item():.6f} std={x.std().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}", flush=True)
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input router_logits: shape={list(router_logits.shape)} dtype={router_logits.dtype} | mean={router_logits.mean().item():.6f} std={router_logits.std().item():.6f} min={router_logits.min().item():.6f} max={router_logits.max().item():.6f}", flush=True)
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts output: shape={list(res.shape)} dtype={res.dtype} | mean={res.mean().item():.6f} std={res.std().item():.6f} min={res.min().item():.6f} max={res.max().item():.6f}", flush=True)
         return res
 
 
