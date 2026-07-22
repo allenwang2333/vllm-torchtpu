@@ -42,6 +42,13 @@ else:
     ragged_gather_reduce = ragged_gather_reduce_v2
 
 
+def unpack_packed_u8_to_fp4_axis(w_packed: jax.Array, axis: int) -> jax.Array:
+    w_t = jnp.swapaxes(w_packed, axis, -1)
+    w_fp4 = jax.lax.bitcast_convert_type(w_t, jnp.float4_e2m1fn)
+    w_flat = jnp.reshape(w_fp4, w_fp4.shape[:-2] + (-1, ))
+    return jnp.swapaxes(w_flat, axis, -1)
+
+
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     """Unpack a uint8-packed E2M1 weight (2 fp4 per byte along the last axis)
     into ``float4_e2m1fn`` and move the contracting axis into GMM layout. Input
@@ -298,13 +305,14 @@ def fused_moe_func(
     """
     num_tokens, hidden_size = hidden_states.shape
 
-    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
-    # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
-    # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
+    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout.
+    # If they are packed uint8, unpack them to float4_e2m1fn here in JAX.
     if w1.dtype in (jnp.uint8, jnp.int8):
-        padded_hidden_size = w1.shape[1] * 2
-    else:
-        _, padded_hidden_size, _ = w1.shape
+        w1 = unpack_packed_u8_to_fp4_axis(w1, axis=1)
+    if w2.dtype in (jnp.uint8, jnp.int8):
+        w2 = unpack_packed_u8_to_fp4_axis(w2, axis=1)
+
+    _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
