@@ -69,10 +69,83 @@ def patched_amd_load_weights(self, weights):
                     name = name + "_inv"
                 if "hc_head.hc_" in name:
                     name = name.replace("hc_head.hc_", "hc_head_")
+                    
+                # Map MHC layer parameters from HF (nested) to vLLM (flat)
+                if ".attn_hc.base" in name:
+                    name = name.replace(".attn_hc.base", ".hc_attn_base")
+                elif ".attn_hc.fn" in name:
+                    name = name.replace(".attn_hc.fn", ".hc_attn_fn")
+                elif ".attn_hc.weight_scale_inv" in name:
+                    name = name.replace(".attn_hc.weight_scale_inv", ".hc_attn_scale")
+                elif ".ffn_hc.base" in name:
+                    name = name.replace(".ffn_hc.base", ".hc_ffn_base")
+                elif ".ffn_hc.fn" in name:
+                    name = name.replace(".ffn_hc.fn", ".hc_ffn_fn")
+                elif ".ffn_hc.weight_scale_inv" in name:
+                    name = name.replace(".ffn_hc.weight_scale_inv", ".hc_ffn_scale")
+                    
+                # Map shared experts from HF (gate_proj/up_proj/down_proj) to vLLM (w1/w3/w2)
                 if ".shared_experts.gate_proj" in name:
                     name = name.replace(".shared_experts.gate_proj", ".shared_experts.w1")
                 elif ".shared_experts.up_proj" in name:
                     name = name.replace(".shared_experts.up_proj", ".shared_experts.w3")
+                    
+                # Map layernorms
+                if ".input_layernorm" in name:
+                    name = name.replace(".input_layernorm", ".attn_norm")
+                elif ".post_attention_layernorm" in name:
+                    name = name.replace(".post_attention_layernorm", ".ffn_norm")
+                
+                # Map mlp to ffn
+                if ".mlp." in name:
+                    name = name.replace(".mlp.", ".ffn.")
+                
+                # Map attention parameters
+                # 1. Indexer Compressor mappings (HF -> vLLM)
+                if ".self_attn.compressor.indexer.gate_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.gate_proj", ".attn.indexer.compressor.wgate")
+                elif ".self_attn.compressor.indexer.kv_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.kv_proj", ".attn.indexer.compressor.wkv")
+                elif ".self_attn.compressor.indexer.kv_norm" in name:
+                    name = name.replace(".self_attn.compressor.indexer.kv_norm", ".attn.indexer.compressor.norm")
+                elif ".self_attn.compressor.indexer.position_bias" in name:
+                    name = name.replace(".self_attn.compressor.indexer.position_bias", ".attn.indexer.compressor.ape")
+                    
+                # 2. Indexer main mappings (HF -> vLLM)
+                elif ".self_attn.compressor.indexer.q_b_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.q_b_proj", ".attn.indexer.wq_b")
+                elif ".self_attn.compressor.indexer.scorer.weights_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.scorer.weights_proj", ".attn.indexer.weights_proj")
+                    
+                # 3. Attention Compressor mappings (HF -> vLLM)
+                elif ".self_attn.compressor.gate_proj" in name:
+                    name = name.replace(".self_attn.compressor.gate_proj", ".attn.mla_attn.compressor.wgate")
+                elif ".self_attn.compressor.kv_proj" in name:
+                    name = name.replace(".self_attn.compressor.kv_proj", ".attn.mla_attn.compressor.wkv")
+                elif ".self_attn.compressor.kv_norm" in name:
+                    name = name.replace(".self_attn.compressor.kv_norm", ".attn.mla_attn.compressor.norm")
+                elif ".self_attn.compressor.position_bias" in name:
+                    name = name.replace(".self_attn.compressor.position_bias", ".attn.mla_attn.compressor.ape")
+                elif ".self_attn.q_a_proj" in name:
+                    name = name.replace(".self_attn.q_a_proj", ".attn.wq_a")
+                elif ".self_attn.q_a_norm" in name:
+                    name = name.replace(".self_attn.q_a_norm", ".attn.q_norm")
+                elif ".self_attn.q_b_proj" in name:
+                    name = name.replace(".self_attn.q_b_proj", ".attn.wq_b")
+                elif ".self_attn.kv_proj" in name:
+                    name = name.replace(".self_attn.kv_proj", ".attn.wkv")
+                elif ".self_attn.kv_norm" in name:
+                    name = name.replace(".self_attn.kv_norm", ".attn.kv_norm")
+                elif ".self_attn.o_a_proj" in name:
+                    name = name.replace(".self_attn.o_a_proj", ".attn.wo_a")
+                elif ".self_attn.o_b_proj" in name:
+                    name = name.replace(".self_attn.o_b_proj", ".attn.wo_b")
+                elif ".self_attn.sinks" in name:
+                    name = name.replace(".self_attn.sinks", ".attn.attn_sink")
+
+                if ".experts." not in name and name.endswith("weight_scale_inv"):
+                    name = name.replace("weight_scale_inv", "weight_scale")
+
                 yield name, loaded_weight
 
     self.hf_to_vllm_mapper = WrappedMapper()
