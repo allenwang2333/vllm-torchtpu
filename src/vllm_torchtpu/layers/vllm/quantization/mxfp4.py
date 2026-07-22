@@ -304,14 +304,20 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 w2_bias_padded = checkpoint.get("w2_bias_padded", None)
                 loaded_from_cache = True
                 
-                # Delete original TPU parameters immediately to free up HBM
-                del layer.w13_weight
-                del layer.w2_weight
-                del layer.w13_weight_scale
-                del layer.w2_weight_scale
+                # Delete original TPU parameters safely if they exist to free up HBM
+                if hasattr(layer, "w13_weight"):
+                    del layer.w13_weight
+                if hasattr(layer, "w2_weight"):
+                    del layer.w2_weight
+                if hasattr(layer, "w13_weight_scale"):
+                    del layer.w13_weight_scale
+                if hasattr(layer, "w2_weight_scale"):
+                    del layer.w2_weight_scale
                 if has_bias:
-                    del layer.w13_bias
-                    del layer.w2_bias
+                    if hasattr(layer, "w13_bias"):
+                        del layer.w13_bias
+                    if hasattr(layer, "w2_bias"):
+                        del layer.w2_bias
                 import gc
                 gc.collect()
             except Exception as e:
