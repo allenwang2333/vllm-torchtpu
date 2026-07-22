@@ -832,6 +832,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         logger.warning(f"[DEBUG_PREFIX] prefix={prefix!r} is_routed_expert={is_routed_expert}")
         if not is_routed_expert:
             # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
+            self.weight_block_size = None
+            self.block_quant = False
             self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None, False)
         else:
             self._linear_quant_config = _get_linear_quant_config(
