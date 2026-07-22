@@ -50,13 +50,18 @@ def main():
         kv_cache_dtype="fp8",
         gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.20")),
         enable_expert_parallel=True,
+        enforce_eager=False,
         additional_config={
+
             "compilation_config": {
                 "compile_sizes": [64],
             },
+            "cache_config": {
+                "num_gpu_blocks_override": 512,
+            },
             "sharding": {
                 "sharding_strategy": {
-                    "enable_dp_attention": True,
+                    "enable_dp_attention": False,
                     "expert_parallelism": 8,
                 }
             }
@@ -67,7 +72,7 @@ def main():
         "Hello, my name is",
     ]
 
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=8, ignore_eos=True)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=64, ignore_eos=False)
 
     print("=== Testing raw and manually formatted prompts with llm.generate (ignore_eos=True) ===")
     outputs = llm.generate(prompts, sampling_params)
