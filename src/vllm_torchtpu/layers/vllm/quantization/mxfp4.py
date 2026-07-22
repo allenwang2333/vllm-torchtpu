@@ -464,7 +464,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 sync.synchronize(layer.w13_bias, wait=True)
                 sync.synchronize(layer.w2_bias, wait=True)
 
-        del w13_weight_packed, w2_weight_packed, w13_weight_scale, w2_weight_scale
+        if "w13_weight_packed" in locals():
+            del w13_weight_packed, w2_weight_packed, w13_weight_scale, w2_weight_scale
         if "w13_weight" in locals():
             del w13_weight, w2_weight
         if "w13_weight_padded" in locals():
