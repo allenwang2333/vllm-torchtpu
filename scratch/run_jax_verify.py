@@ -259,7 +259,7 @@ Fp8FusedMoEMethod.apply_jax = patched_apply_jax
 def custom_main(args: dict):
     # Patch DeepseekV4Attention to VllmDeepseekV4MLAAttention
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
+    from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
     print("[RUN_JAX_VERIFY_PATCH] Patched ds_v4_amd_model.DeepseekV4Attention -> VllmDeepseekV4MLAAttention", flush=True)
 
