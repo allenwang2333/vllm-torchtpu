@@ -76,14 +76,11 @@ def main():
 
     print("=== Testing raw and manually formatted prompts with llm.generate (ignore_eos=True) ===")
     outputs = llm.generate(prompts, sampling_params)
-
     for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        generated_tokens = output.outputs[0].token_ids
-        print(f"Prompt: {prompt!r}")
-        print(f"Generated token IDs: {generated_tokens}")
-        print(f"Generated text: {generated_text!r}")
+        print(f"Prompt: {output.prompt!r}")
+        print(f"Prompt token IDs: {output.prompt_token_ids}")
+        print(f"Generated token IDs: {output.outputs[0].token_ids}")
+        print(f"Generated text: {output.outputs[0].text!r}")
         print("-" * 80)
 
     print("=== Testing chat API with llm.chat (ignore_eos=True) ===")
