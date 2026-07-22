@@ -1108,6 +1108,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
+        print(f"[DEBUG_O_PROJ] tp_size={getattr(self, 'tp_size', None)} | w shape: {w.shape} | o_ref_flat shape: {o_ref_flat.shape}", flush=True)
         s = self.wo_a.weight_scale
         if s.ndim == 2:
             block_n = w.shape[0] // s.shape[0]
