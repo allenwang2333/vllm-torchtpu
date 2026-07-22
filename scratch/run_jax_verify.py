@@ -150,11 +150,11 @@ try:
             layer.prefix = prefix
             moe_config = self.get_moe_config(layer)
             if self.expert_dtype == "fp4":
-                return VllmMxfp4MoEMethod(moe_config, self.mesh)
+                return VllmMxfp4MoEMethod(moe_config)
             else:
                 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethod
                 layer.moe_config = moe_config
-                return VllmFp8MoEMethod(self, layer, self.mesh)
+                return VllmFp8MoEMethod(self, moe_config)
         return _orig_get_quant_method(self, layer, prefix)
 
     VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
