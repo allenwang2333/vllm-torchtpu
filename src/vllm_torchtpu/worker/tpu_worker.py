@@ -116,23 +116,20 @@ class TPUWorker(WorkerBase):
             self.kv_cache_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 self.cache_config.cache_dtype]
 
-        # TPU profiler: only on rank 0 single-host, or every PP worker.
+        # TPU profiler: Enable multi-rank profiling across all worker processes.
         self.profile_dir: str | None = None
         self.profile_context = None
-        torch_profiler_dir = self.vllm_config.profiler_config.torch_profiler_dir
-        pp_size = self.parallel_config.pipeline_parallel_size
-        if torch_profiler_dir and pp_size == 1 and self.rank < 1 and (
-                not self.devices or 0 in self.device_ranks):
-            # Only 1 active profiler session per server is allowed.
-            self.profile_dir = torch_profiler_dir
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        self.profile_dir)
-        elif pp_size > 1 and torch_profiler_dir:
-            # PP uses MPMD: profile every worker.
-            self.profile_dir = os.path.join(
-                torch_profiler_dir,
-                f"pprank_{self.rank}_ppworldsize_{pp_size}")
+        torch_profiler_dir = (
+            getattr(self.vllm_config.profiler_config, "torch_profiler_dir", None)
+            if hasattr(self, "vllm_config") and hasattr(self.vllm_config, "profiler_config")
+            else None
+        ) or os.getenv("VLLM_TORCH_PROFILER_DIR")
+
+        if torch_profiler_dir:
+            self.profile_dir = os.path.join(torch_profiler_dir, f"rank{self.rank}")
             os.makedirs(self.profile_dir, exist_ok=True)
+            logger.info("Profiling enabled for rank %d. Traces will be saved to: %s",
+                        self.rank, self.profile_dir)
 
         # step_counter is used to calc uuid for intermediate tensor transfer.
         self.step_counter = 0
@@ -417,12 +414,16 @@ class TPUWorker(WorkerBase):
         if is_start:
             logger.info(
                 f"Starting TorchTPU profiler trace at {profile_dir}...")
-            handler = profiler_api.xprof_trace_handler(dir_name=profile_dir)
-            self.profile_context = profiler_api.profile(activities=[
-                profiler_api.ProfilerActivity.CPU,
-                profiler_api.ProfilerActivity.TPU
-            ],
-                                                        on_trace_ready=handler)
+            handler = torch.profiler.tensorboard_trace_handler(
+                profile_dir, worker_name=f"rank{self.rank}")
+            self.profile_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
+                ],
+                record_shapes=True,
+                on_trace_ready=handler,
+            )
             self.profile_context.__enter__()
         else:
             if self.profile_context is not None:
