@@ -34,6 +34,23 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
 
         VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
         print("[SITECUSTOMIZE_PATCH] Successfully patched VllmDeepseekV4Fp8Config.get_quant_method for JAX.", file=sys.stderr, flush=True)
+
+        # Patch RowParallelLinear weight_loader_v2 to bypass sharding/narrowing for weight scales
+        from vllm.model_executor.layers.linear import RowParallelLinear
+        _orig_row_parallel_weight_loader_v2 = RowParallelLinear.weight_loader_v2
+
+        def patched_row_parallel_weight_loader_v2(self, param, loaded_weight):
+            param_name = getattr(param, "name", "") or ""
+            if "scale" in param_name:
+                print(f"[SITECUSTOMIZE_PATCH] RowParallelLinear: loading scale parameter directly without sharding: {param_name}", file=sys.stderr, flush=True)
+                if len(loaded_weight.shape) == 0:
+                    loaded_weight = loaded_weight.reshape(1)
+                param.data.copy_(loaded_weight)
+                return
+            return _orig_row_parallel_weight_loader_v2(self, param, loaded_weight)
+
+        RowParallelLinear.weight_loader_v2 = patched_row_parallel_weight_loader_v2
+        print("[SITECUSTOMIZE_PATCH] Successfully patched RowParallelLinear.weight_loader_v2 for JAX.", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[SITECUSTOMIZE_PATCH] Failed to patch: {e}", file=sys.stderr, flush=True)
 else:
