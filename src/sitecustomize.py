@@ -45,10 +45,16 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         try:
             from tpu_inference.models.vllm.vllm_model_wrapper import VllmModelWrapper
             _orig_wrapper_load_weights = VllmModelWrapper.load_weights
+            class DummyZeroLenDict(dict):
+                def __len__(self):
+                    return 0
+                def __bool__(self):
+                    return False
             def patched_wrapper_load_weights(self, *args, **kwargs):
                 res = _orig_wrapper_load_weights(self, *args, **kwargs)
-                self.vllm_config.compilation_config.static_forward_context.clear()
-                print(f"[SITECUSTOMIZE_PATCH] Cleared static_forward_context on vllm_config globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+                dummy_dict = DummyZeroLenDict(self.vllm_config.compilation_config.static_forward_context)
+                self.vllm_config.compilation_config.static_forward_context = dummy_dict
+                print(f"[SITECUSTOMIZE_PATCH] Replaced static_forward_context with DummyZeroLenDict on vllm_config globally in pid={os.getpid()}", file=sys.stderr, flush=True)
                 return res
             VllmModelWrapper.load_weights = patched_wrapper_load_weights
             print(f"[SITECUSTOMIZE_PATCH] Patched VllmModelWrapper.load_weights globally in pid={os.getpid()}", file=sys.stderr, flush=True)
