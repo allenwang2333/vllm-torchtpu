@@ -3,7 +3,7 @@
 import os
 import sys
 
-# Apply monkey-patches to prevent device registration conflicts process-wide
+# 1. Apply monkey-patches to prevent device registration conflicts process-wide
 try:
     import torch
     import torch.utils
@@ -33,8 +33,16 @@ try:
 except ImportError:
     pass
 
+# 2. Check JAX fallback mode vs PyTorch mode
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
-    print(f"[SITECUSTOMIZE_JAX_BYPASS] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
+    print(f"[SITECUSTOMIZE_JAX_MODE] Applying JAX compatibility alias in pid={os.getpid()}", file=sys.stderr, flush=True)
+    # Apply compatibility alias for renamed DeepseekV4Attention class
+    try:
+        import vllm.models.deepseek_v4.attention as att_mod
+        if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+            att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+    except ImportError:
+        pass
 else:
     # PyTorch-specific initialization
     os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
@@ -46,7 +54,7 @@ else:
     # Register LazyPatcher process-wide at Python startup.
     import vllm_torchtpu
 
-    # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
+    # Compatibility alias for renamed DeepseekV4Attention class
     try:
         import vllm.models.deepseek_v4.attention as att_mod
         if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
