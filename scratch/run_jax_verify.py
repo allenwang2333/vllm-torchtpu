@@ -29,7 +29,16 @@ try:
     DeviceConfig.__post_init__ = patched_device_config_post_init
 except ImportError:
     pass
-
+# Patch VllmDeepseekV4Fp8Config to expose mesh attribute for old custom ops compatibility
+try:
+    from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+    @property
+    def get_mesh_prop(self):
+        from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+        return get_or_create_pcp_mesh()
+    VllmDeepseekV4Fp8Config.mesh = get_mesh_prop
+except ImportError:
+    pass
 # Patch custom_op.CustomOp.register_oot and PluggableLayer.register_oot to ignore duplicate registrations
 try:
     from vllm.model_executor.custom_op import CustomOp, PluggableLayer, op_registry_oot
