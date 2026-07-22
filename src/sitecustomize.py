@@ -180,7 +180,7 @@ try:
     _orig_weight_loader = FusedMoE.weight_loader
 
     def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
-        if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2"):
+        if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2") and "weight" in weight_name and "scale" not in weight_name:
             if shard_id == "w1":
                 temp_param = self.w1_temp
                 shard_dim = 0
