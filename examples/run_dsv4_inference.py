@@ -40,16 +40,18 @@ from vllm import LLM, SamplingParams
 def main():
     # Instantiate the LLM. It will automatically use our TPU platform and patches.
     # We use TP=8 to utilize all 8 TPU chips on the v7x-8 node.
+    tp_size = int(os.getenv("VLLM_TP_SIZE", "8"))
+    ep_size = int(os.getenv("VLLM_EP_SIZE", "8"))
     llm = LLM(
         model=os.getenv("DSV4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash"),
         quantization="deepseek_v4_fp8",
-        tensor_parallel_size=8,
+        tensor_parallel_size=tp_size,
         trust_remote_code=True,
         max_model_len=64,
         max_num_batched_tokens=64,
         kv_cache_dtype="fp8",
         gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.20")),
-        enable_expert_parallel=True,
+        enable_expert_parallel=ep_size > 1,
         enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
         additional_config={
 
@@ -62,7 +64,7 @@ def main():
             "sharding": {
                 "sharding_strategy": {
                     "enable_dp_attention": False,
-                    "expert_parallelism": 8,
+                    "expert_parallelism": ep_size,
                 }
             }
         },
