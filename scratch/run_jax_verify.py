@@ -52,6 +52,18 @@ from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeeps
 _amd_orig_load_weights = _AmdDeepseekV4ForCausalLM.load_weights
 
 def patched_amd_load_weights(self, weights):
+    try:
+        if hasattr(self, "model") and hasattr(self.model, "layers") and len(self.model.layers) > 0:
+            l = self.model.layers[0]
+            if hasattr(l, "ffn") and hasattr(l.ffn, "shared_experts") and hasattr(l.ffn.shared_experts, "down_proj"):
+                proj = l.ffn.shared_experts.down_proj
+                print(f"[DEBUG_SHARED_EXPERTS_PARAMS] down_proj state_dict keys: {list(proj.state_dict().keys())}", flush=True)
+                # Print class details of down_proj's linear method
+                if hasattr(proj, "quant_method"):
+                    print(f"[DEBUG_SHARED_EXPERTS_PARAMS] down_proj quant_method: {proj.quant_method.__class__.__name__}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG_SHARED_EXPERTS_PARAMS] Failed to print: {e}", flush=True)
+
     self.model.has_tilelang = False
     for idx, l in enumerate(self.model.layers):
         l.layer_idx = idx
