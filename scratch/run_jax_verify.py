@@ -310,6 +310,8 @@ try:
     _orig_get_vllm_model = ml.get_vllm_model
     def patched_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs):
         from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import set_vllm_model_wrapper_context
+        from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+        VllmDeepseekV4Fp8Config.set_configs(vllm_config)
         with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_config):
             return _orig_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs)
     ml.get_vllm_model = patched_get_vllm_model
