@@ -40,10 +40,9 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         _orig_row_parallel_weight_loader_v2 = RowParallelLinear.weight_loader_v2
 
         def patched_row_parallel_weight_loader_v2(self, param, loaded_weight):
-            param_name = getattr(param, "name", None) or getattr(param, "param_name", None) or ""
-            print(f"[DEBUG_RP_LOAD] param: {param} | type={param.__class__.__name__} | resolved_name={param_name} | dir={list(param.__dict__.keys()) if hasattr(param, '__dict__') else []}", file=sys.stderr, flush=True)
-            if "scale" in param_name or "scale" in str(param_name):
-                print(f"[SITECUSTOMIZE_PATCH] RowParallelLinear: loading scale parameter directly without sharding: {param_name}", file=sys.stderr, flush=True)
+            cls_name = param.__class__.__name__
+            if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+                print(f"[SITECUSTOMIZE_PATCH] RowParallelLinear: loading scale parameter directly without sharding: {cls_name}", file=sys.stderr, flush=True)
                 if len(loaded_weight.shape) == 0:
                     loaded_weight = loaded_weight.reshape(1)
                 param.data.copy_(loaded_weight)
