@@ -160,15 +160,9 @@ def main():
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}. Defaulting to 4 layers.", flush=True)
 
-    import multiprocessing
-    ctx = multiprocessing.get_context("spawn")
-    print(f"Launching parallel layer pre-quantizer for {num_hidden_layers} layers in FP4 format...", flush=True)
-    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        futures = []
-        for l in range(num_hidden_layers):
-            futures.append(executor.submit(process_layer_for_all_ranks, model_path, cache_dir, l, index_data))
-        for f in futures:
-            f.result()
+    print(f"Launching sequential layer pre-quantizer for {num_hidden_layers} layers in FP4 format...", flush=True)
+    for l in range(num_hidden_layers):
+        process_layer_for_all_ranks(model_path, cache_dir, l, index_data)
 
     print("Offline pre-quantization completed successfully for all layers across 8 ranks!", flush=True)
 
