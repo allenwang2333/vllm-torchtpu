@@ -399,7 +399,7 @@ def generate_block_specs(
     if cfgs.rhs_cfgs.should_bitcast:
         packing = pl.cdiv(32, jax.dtypes.itemsize_bits(cfgs.rhs_cfgs.dtype))
         tile_k_rhs //= packing
-    elif cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn:
+    elif cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn and cfgs.rhs_cfgs.dtype != jnp.float4_e2m1fn:
         if cfgs.rhs_cfgs.k_is_packed:
             tile_k_rhs //= 2
         else:
