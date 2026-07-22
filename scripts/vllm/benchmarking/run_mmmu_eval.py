@@ -20,7 +20,10 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+os.environ["VLLM_USE_V1"] = "0"
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import requests
 
@@ -58,6 +61,17 @@ def parse_args():
         help=
         "Allow synthetic sample fallback if HuggingFace dataset fails to load",
     )
+    parser.add_argument(
+        "--config",
+        default="standard (4 options)",
+        help="Dataset config/subset name (default: 'standard (4 options)')",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=
+        "Run offline direct vLLM engine evaluation on TPU without requiring HTTP server",
+    )
     return parser.parse_args()
 
 
@@ -68,11 +82,14 @@ def encode_image_base64(image) -> str:
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
-def extract_answer(response_text: str) -> str:
-    """Extract choice letter (A, B, C, D) from generated text."""
-    # 1. Match explicit keyword patterns like "Answer: (A)", "Option A", "choice is D"
+def extract_answer(response_text: str,
+                   options: Optional[List[str]] = None) -> str:
+    """Extract choice letter (A-J) from generated text using VLMEvalKit two-pass matching."""
+    if not response_text:
+        return "UNKNOWN"
+    # 1. Match explicit keyword patterns like "Answer: (A)", "Option B", "choice is (D)", "A."
     match = re.search(
-        r"\b(?:answer|option|choice)\b.*?\(?([A-D])\)?\b",
+        r"\b(?:answer|option|choice|is|result)\b[^\w\n]*\(?([A-J])\)?\b",
         response_text,
         re.IGNORECASE,
     )
@@ -80,12 +97,28 @@ def extract_answer(response_text: str) -> str:
         return match.group(1).upper()
 
     # 2. Match enclosed letter like "(B)", "A)", "[C]"
-    match = re.search(r"(?:\(|\[|^)([A-D])(?:\)|\]|\b)", response_text)
+    match = re.search(r"(?:\(|\[|^|\s)([A-J])(?:\)|\]|\.|\b)", response_text)
     if match:
         return match.group(1).upper()
 
-    # 3. Fallback: check for isolated uppercase single letter
-    match = re.search(r"\b([A-D])\b", response_text)
+    # 3. Fallback to candidate option text matching (VLMEvalKit style)
+    if options and isinstance(options, list):
+        clean_resp = response_text.strip().lower()
+        best_match_idx = -1
+        best_match_len = 0
+        for idx, opt in enumerate(options):
+            if not opt or not isinstance(opt, str):
+                continue
+            opt_clean = opt.strip().lower()
+            if opt_clean and opt_clean in clean_resp:
+                if len(opt_clean) > best_match_len:
+                    best_match_len = len(opt_clean)
+                    best_match_idx = idx
+        if best_match_idx >= 0:
+            return chr(65 + best_match_idx)
+
+    # 4. Fallback: check for isolated uppercase single letter
+    match = re.search(r"\b([A-J])\b", response_text)
     if match:
         return match.group(1).upper()
 
@@ -95,21 +128,28 @@ def extract_answer(response_text: str) -> str:
 def load_mmmu_samples(
         dataset_name: str = "MMMU/MMMU",
         limit: int = 100,
-        allow_synthetic: bool = False) -> Tuple[List[Dict], str, bool]:
+        allow_synthetic: bool = False,
+        config_name: str = "standard (4 options)"
+) -> Tuple[List[Dict], str, bool]:
     """Load MMMU or MMMU-Pro validation samples from HuggingFace datasets or fallback dataset."""
     try:
         from datasets import load_dataset
 
         print(
-            f"Loading {dataset_name} dataset from HuggingFace (limit={limit})..."
+            f"Loading {dataset_name} ({config_name}) dataset from HuggingFace (limit={limit})..."
         )
         samples = []
         if "MMMU_Pro" in dataset_name or "mmmu_pro" in dataset_name.lower():
             # MMMU-Pro dataset loading
             target_ds = "MMMU/MMMU_Pro"
-            configs = ["standard", "vision"]
+            if config_name and config_name != "all":
+                configs = [config_name]
+            else:
+                configs = [
+                    "standard (4 options)", "standard (10 options)", "vision"
+                ]
             for config in configs:
-                if len(samples) >= limit:
+                if limit > 0 and len(samples) >= limit:
                     break
                 try:
                     ds = load_dataset(target_ds, config, split="test")
@@ -121,11 +161,16 @@ def load_mmmu_samples(
                     except Exception:
                         continue
                 for item in ds:
-                    if len(samples) >= limit:
+                    if limit > 0 and len(samples) >= limit:
                         break
-                    image = item.get("image_1") or item.get(
-                        "image") or item.get("img")
-                    if image is None:
+                    from PIL import Image
+                    images = []
+                    for k in sorted(item.keys()):
+                        val = item[k]
+                        if val is not None and (isinstance(val, Image.Image)
+                                                or hasattr(val, "convert")):
+                            images.append(val)
+                    if not images:
                         continue
                     question = item.get("question", "")
                     options_raw = item.get("options", [])
@@ -151,8 +196,10 @@ def load_mmmu_samples(
                         options,
                         "answer":
                         answer,
+                        "images":
+                        images,
                         "image":
-                        image,
+                        images[0],
                     })
         else:
             # Standard MMMU multi-domain dataset loading
@@ -314,12 +361,13 @@ def main():
 
     print("====================================================")
     print("  MMMU / MMMU-Pro Generative Vision Evaluation")
-    print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
+    target_mode = "Offline Direct TPU Engine" if args.offline else f"http://{args.host}:{args.port}/v1/chat/completions"
+    print(f"  Target: {target_mode}")
     print(f"  Model: {args.model} | Limit: {args.limit}")
     print("====================================================")
 
     samples, dataset_source, is_synthetic = load_mmmu_samples(
-        args.dataset, args.limit, args.allow_synthetic)
+        args.dataset, args.limit, args.allow_synthetic, args.config)
     if not samples:
         print("ERROR: No samples loaded for MMMU evaluation.")
         sys.exit(1)
@@ -329,23 +377,150 @@ def main():
     results = []
 
     t0 = time.time()
-    for idx, sample in enumerate(samples, 1):
-        is_correct, pred, target = evaluate_sample(sample, args.host,
-                                                   args.port, args.model)
-        if is_correct:
-            correct_count += 1
+    if args.offline:
+        from transformers import AutoProcessor
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.engine.llm_engine import LLMEngine
+        from vllm.sampling_params import SamplingParams
 
-        results.append({
-            "id": sample["id"],
-            "predicted": pred,
-            "ground_truth": target,
-            "is_correct": is_correct,
-        })
+        tp_size = int(os.environ.get("TP_SIZE", "8"))
+        print(f"Initializing offline vLLM engine on TPU (TP={tp_size})...")
+        engine_args = EngineArgs(
+            model=args.model,
+            tensor_parallel_size=tp_size,
+            enforce_eager=True,
+            trust_remote_code=True,
+            dtype="bfloat16",
+            max_model_len=2048,
+            gpu_memory_utilization=0.9,
+            limit_mm_per_prompt={"image": 8},
+        )
+        engine = LLMEngine.from_engine_args(engine_args)
+        processor = AutoProcessor.from_pretrained(args.model,
+                                                  trust_remote_code=True)
+        sampling_params = SamplingParams(temperature=0.0, max_tokens=64)
 
-        if idx % 10 == 0 or idx == total_count:
-            acc = correct_count / idx * 100.0
-            print(f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}%"
-                  f" ({correct_count}/{idx})")
+        inputs = []
+        for sample in samples:
+            question_clean = re.sub(r"<image \d+>", "",
+                                    sample["question"]).strip()
+            prompt_text = question_clean
+            options = sample.get("options", [])
+            if isinstance(options, list) and len(options) > 0:
+                if "(A)" not in prompt_text and "A." not in prompt_text:
+                    prompt_text += "\n\nOptions:\n" + "\n".join(
+                        f"({chr(65+idx)}) {opt}"
+                        for idx, opt in enumerate(options))
+            prompt_text += "\n\nRespond with only the final option letter in format (A), (B), (C), or (D)."
+            img = sample["image"]
+            messages = [{
+                "role":
+                "user",
+                "content": [{
+                    "type": "image"
+                }, {
+                    "type": "text",
+                    "text": prompt_text
+                }]
+            }]
+            prompt_str = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs.append({
+                "prompt": prompt_str,
+                "multi_modal_data": {
+                    "image": img
+                }
+            })
+
+        print(
+            f"Running generative evaluation on {len(inputs)} samples in batches of 20..."
+        )
+        batch_size = 20
+        for i in range(0, len(inputs), batch_size):
+            chunk_inputs = inputs[i:i + batch_size]
+            chunk_samples = samples[i:i + batch_size]
+            for req_idx, inp in enumerate(chunk_inputs):
+                engine.add_request(f"req_{i}_{req_idx}", inp, sampling_params)
+            chunk_outputs_dict = {}
+            while engine.has_unfinished_requests():
+                step_outputs = engine.step()
+                for req_out in step_outputs:
+                    if req_out.finished:
+                        chunk_outputs_dict[
+                            req_out.request_id] = req_out.outputs[0].text
+            for req_idx, sample in enumerate(chunk_samples):
+                idx = len(results) + 1
+                gen_text = chunk_outputs_dict.get(f"req_{i}_{req_idx}", "")
+                pred = extract_answer(gen_text, sample.get("options"))
+                target = sample["answer"]
+                is_correct = pred == target
+                if is_correct:
+                    correct_count += 1
+                results.append({
+                    "id": sample["id"],
+                    "predicted": pred,
+                    "ground_truth": target,
+                    "is_correct": is_correct,
+                    "generated_text": gen_text,
+                })
+                if idx % 10 == 0 or idx == total_count:
+                    acc = correct_count / idx * 100.0
+                    print(
+                        f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
+                    )
+                    out_path = os.path.join(args.results_dir,
+                                            "mmmu_eval_results.json")
+                    with open(out_path, "w") as f:
+                        json.dump(
+                            {
+                                "model": args.model,
+                                "dataset_source": dataset_source,
+                                "is_synthetic": is_synthetic,
+                                "samples": idx,
+                                "accuracy": acc,
+                                "correct": correct_count,
+                                "details": results,
+                            },
+                            f,
+                            indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+    else:
+        for idx, sample in enumerate(samples, 1):
+            is_correct, pred, target = evaluate_sample(sample, args.host,
+                                                       args.port, args.model)
+            if is_correct:
+                correct_count += 1
+
+            results.append({
+                "id": sample["id"],
+                "predicted": pred,
+                "ground_truth": target,
+                "is_correct": is_correct,
+            })
+
+            if idx % 10 == 0 or idx == total_count:
+                acc = correct_count / idx * 100.0
+                print(
+                    f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
+                )
+                out_path = os.path.join(args.results_dir,
+                                        "mmmu_eval_results.json")
+                with open(out_path, "w") as f:
+                    json.dump(
+                        {
+                            "model": args.model,
+                            "dataset_source": dataset_source,
+                            "is_synthetic": is_synthetic,
+                            "samples": idx,
+                            "accuracy": acc,
+                            "correct": correct_count,
+                            "details": results,
+                        },
+                        f,
+                        indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
 
     t1 = time.time()
     accuracy = (correct_count /
@@ -376,6 +551,8 @@ def main():
             f,
             indent=2,
         )
+        f.flush()
+        os.fsync(f.fileno())
     print(f"Results saved to: {output_file}")
 
 
