@@ -112,26 +112,26 @@ def test_moe_weight_loading_and_quantization():
         
     # --- Verify Outputs ---
     # 1. Output shapes
-    # w13_weight should be padded/processed shape: [32, hidden_size // 2, 2 * intermediate_size] = [32, 1024, 4096]
-    assert layer.w13_weight.shape == (num_experts_local, hidden_size // 2, 2 * intermediate_size)
-    assert layer.w2_weight.shape == (num_experts_local, intermediate_size // 2, hidden_size)
+    # w13_weight should be padded/processed shape: [256, hidden_size // 2, 2 * intermediate_size] = [256, 1024, 4096]
+    assert layer.w13_weight.shape == (num_experts_global, hidden_size // 2, 2 * intermediate_size)
+    assert layer.w2_weight.shape == (num_experts_global, intermediate_size // 2, hidden_size)
     
     # 2. Output scale shapes
-    # w13_weight_scale should be: [32, K // 512, 1, N] = [32, 2048 // 512, 1, 4096] = [32, 4, 1, 4096]
-    assert layer.w13_weight_scale.shape == (num_experts_local, 4, 1, 4096)
-    assert layer.w2_weight_scale.shape == (num_experts_local, 4, 1, 2048)
+    # w13_weight_scale should be: [256, K // 512, 1, N] = [256, 2048 // 512, 1, 4096] = [256, 4, 1, 4096]
+    assert layer.w13_weight_scale.shape == (num_experts_global, 4, 1, 4096)
+    assert layer.w2_weight_scale.shape == (num_experts_global, 4, 1, 2048)
 
-
-    
     # 4. Values checks:
     # Transpose axis 1 to last axis, unpack, and transpose back
-    w13_temp = layer.w13_weight.cpu().transpose(1, 2).contiguous() # [32, 4096, 1024]
-    w13_output_unpacked = unpack_uint8_to_fp4(w13_temp).transpose(1, 2).contiguous() # [32, 2048, 4096]
-    scales_expanded = layer.w13_weight_scale.cpu().squeeze(2).repeat_interleave(512, dim=1) # [32, 2048, 4096]
+    w13_temp = layer.w13_weight.cpu().transpose(1, 2).contiguous() # [256, 4096, 1024]
+    w13_output_unpacked = unpack_uint8_to_fp4(w13_temp).transpose(1, 2).contiguous() # [256, 2048, 4096]
+    scales_expanded = layer.w13_weight_scale.cpu().squeeze(2).repeat_interleave(512, dim=1) # [256, 2048, 4096]
 
     print("w13_output_unpacked shape:", w13_output_unpacked.shape)
     print("scales_expanded shape:", scales_expanded.shape)
     w13_output_dequant = (w13_output_unpacked * scales_expanded).to(torch.float32)
+    # Slice to local expert rank slice to compare against reference
+    w13_output_dequant = w13_output_dequant[:num_experts_local]
 
 
     
