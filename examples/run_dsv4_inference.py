@@ -70,7 +70,6 @@ def main():
 
     prompts = [
         "Explain the difference between JAX and PyTorch in one sentence.",
-        "Hello, my name is",
     ]
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False)
