@@ -10,6 +10,12 @@ def quantize_tensor_to_fp4(tensor: torch.Tensor, axis: int = -1, block_size: int
     if isinstance(axis, int):
         axis = [axis]
 
+    FP4_VALUES = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0,
+        -3.0, -4.0, -6.0
+    ],
+                              dtype=torch.float32,
+                              device=tensor.device)
     FP4_MAX = 6.0
     FP4_MIN = -6.0
 
@@ -37,16 +43,18 @@ def quantize_tensor_to_fp4(tensor: torch.Tensor, axis: int = -1, block_size: int
     tensor_scaled = tensor_blocked * scale_inv
     tensor_clipped = tensor_scaled.clamp(FP4_MIN, FP4_MAX)
 
-    thresholds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                              dtype=torch.float32,
-                              device=tensor.device)
-    abs_val = tensor_clipped.abs()
-    bucket_indices = torch.bucketize(abs_val, thresholds).to(torch.int8)
-    
-    is_negative = tensor_clipped < 0
-    indices = torch.where(is_negative, bucket_indices + 8, bucket_indices)
+    flat_clipped = tensor_clipped.flatten()
+    flat_indices = torch.empty(flat_clipped.shape, dtype=torch.int8, device=tensor.device)
+    fp4_for_compare = FP4_VALUES.view(1, 16)
 
-    indices = indices.reshape(orig_shape)
+    chunk_size = 4000000
+    for i in range(0, flat_clipped.numel(), chunk_size):
+        chunk = flat_clipped[i : i + chunk_size]
+        chunk_for_compare = chunk.unsqueeze(-1)
+        distances = (chunk_for_compare - fp4_for_compare).abs()
+        flat_indices[i : i + chunk_size] = distances.argmin(dim=-1).to(torch.int8)
+
+    indices = flat_indices.reshape(orig_shape)
     scale = scale.squeeze(tuple(expanded_axis)).to(torch.float32)
 
     return indices, scale
