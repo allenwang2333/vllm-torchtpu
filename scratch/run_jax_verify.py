@@ -9,11 +9,11 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["VLLM_ENFORCE_EAGER"] = "1"
 
 # Add torchtpu-vllm/src to path so we can import env_override
-sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu/src")
+sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 import vllm_torchtpu.env_override
 
 # Now add our repo to path and import offline_inference
-sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
+sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
