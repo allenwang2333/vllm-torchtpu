@@ -58,6 +58,11 @@ except ImportError:
 
 # sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
+print(f"[DEBUG_METACLASS_CHECK] CustomOp.register_oot: {CustomOp.register_oot}", flush=True)
+print(f"[DEBUG_METACLASS_CHECK] QwenGatedDeltaNetAttention.register_oot: {QwenGatedDeltaNetAttention.register_oot}", flush=True)
+
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
 patch_deepseek_v4_mla_cls()
