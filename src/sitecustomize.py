@@ -18,6 +18,25 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         except Exception as e:
             print(f"[SITECUSTOMIZE_PATCH] Failed to patch TorchCompileWithNoGuardsWrapper: {e}", file=sys.stderr, flush=True)
         try:
+            from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+            def patched_verify_and_split_kv_cache_groups(self):
+                attention_groups = []
+                for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+                    manager_cls = self.single_type_managers[i].__class__
+                    spec = g.kv_cache_spec
+                    for existing_spec, group_ids, existing_cls in attention_groups:
+                        if existing_spec == spec:
+                            assert manager_cls is existing_cls
+                            group_ids.append(i)
+                            break
+                    else:
+                        attention_groups.append((spec, [i], manager_cls))
+                self.attention_groups = attention_groups
+            HybridKVCacheCoordinator.verify_and_split_kv_cache_groups = patched_verify_and_split_kv_cache_groups
+            print(f"[SITECUSTOMIZE_PATCH] Patched HybridKVCacheCoordinator globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[SITECUSTOMIZE_PATCH] Failed to patch HybridKVCacheCoordinator: {e}", file=sys.stderr, flush=True)
+        try:
             import vllm.models.deepseek_v4.attention as att_mod
             if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
                 att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
