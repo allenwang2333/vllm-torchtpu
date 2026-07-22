@@ -328,16 +328,36 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 print(f"[DEBUG_FORWARD_INPUT] pid={os.getpid()} input_ids shape={list(input_ids.shape)} values={input_ids.tolist()}", flush=True)
             if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
                 import torchax
-                with torchax.default_env():
-                    return _orig_amd_forward(
+                import torchax.tensor as ta_tensor
+                import jax
+                with torchax.default_env() as env:
+                    def to_torchax(t):
+                        if isinstance(t, torch.Tensor) and not hasattr(t, "_elem"):
+                            jax_arr = jax.device_put(t.detach().cpu().numpy())
+                            return ta_tensor.Tensor(jax_arr, env)
+                        return t
+
+                    input_ids_ta = to_torchax(input_ids)
+                    positions_ta = to_torchax(positions)
+                    inputs_embeds_ta = to_torchax(inputs_embeds)
+                    args_ta = tuple(to_torchax(a) for a in args)
+                    kwargs_ta = {k: to_torchax(v) for k, v in kwargs.items()}
+
+                    res = _orig_amd_forward(
                         self,
-                        input_ids,
-                        positions,
+                        input_ids_ta,
+                        positions_ta,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        *args,
-                        **kwargs
+                        inputs_embeds=inputs_embeds_ta,
+                        *args_ta,
+                        **kwargs_ta
                     )
+
+                    def to_torch(t):
+                        if hasattr(t, "torch"):
+                            return t.torch()
+                        return t
+                    return jax.tree_util.tree_map(to_torch, res)
             return _orig_amd_forward(
                 self,
                 input_ids,
