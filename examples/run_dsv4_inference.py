@@ -74,7 +74,7 @@ def main():
         "Explain the difference between JAX and PyTorch in one sentence.",
     ]
 
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False, logprobs=5)
 
     print("=== Testing raw and manually formatted prompts with llm.generate (ignore_eos=True) ===")
     outputs = llm.generate(prompts, sampling_params)
@@ -83,6 +83,8 @@ def main():
         print(f"Prompt token IDs: {output.prompt_token_ids}")
         print(f"Generated token IDs: {output.outputs[0].token_ids}")
         print(f"Generated text: {output.outputs[0].text!r}")
+        if output.outputs[0].logprobs is not None and len(output.outputs[0].logprobs) > 0:
+            print(f"Generated logprobs (step 1): {output.outputs[0].logprobs[0]}")
         print("-" * 80)
 
     print("=== Testing chat API with llm.chat (ignore_eos=True) ===")
