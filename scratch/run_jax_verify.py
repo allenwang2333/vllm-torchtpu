@@ -304,6 +304,17 @@ try:
     tpu_qm.FP8 = "deepseek_v4_fp8"
 except ImportError:
     pass
+# Monkey-patch get_vllm_model to establish VllmModelWrapperContext
+try:
+    import tpu_inference.models.common.model_loader as ml
+    _orig_get_vllm_model = ml.get_vllm_model
+    def patched_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs):
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import set_vllm_model_wrapper_context
+        with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_config):
+            return _orig_get_vllm_model(vllm_config, rng, mesh, *args, **kwargs)
+    ml.get_vllm_model = patched_get_vllm_model
+except ImportError:
+    pass
 
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
