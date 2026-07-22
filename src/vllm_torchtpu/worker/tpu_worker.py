@@ -128,8 +128,13 @@ class TPUWorker(WorkerBase):
         if torch_profiler_dir:
             self.profile_dir = os.path.join(torch_profiler_dir, f"rank{self.rank}")
             os.makedirs(self.profile_dir, exist_ok=True)
-            logger.info("Profiling enabled for rank %d. Traces will be saved to: %s",
-                        self.rank, self.profile_dir)
+            logger.info(
+                "[TPU_WORKER_PROFILER_INIT] rank=%d local_rank=%d base_dir=%s rank_profile_dir=%s",
+                self.rank, self.local_rank, torch_profiler_dir, self.profile_dir)
+        else:
+            logger.info(
+                "[TPU_WORKER_PROFILER_INIT] Profiling disabled for rank=%d (no torch_profiler_dir configured)",
+                self.rank)
 
         # step_counter is used to calc uuid for intermediate tensor transfer.
         self.step_counter = 0
@@ -403,7 +408,9 @@ class TPUWorker(WorkerBase):
                 is_start: bool = True,
                 profile_prefix: str | None = None):
         if self.profile_dir is None:
-            logger.warning("Profile directory is not set. Skipping profiling.")
+            logger.warning(
+                "[TPU_WORKER_PROFILE] rank=%d profile_dir is None. Skipping profiling.",
+                self.rank)
             return
 
         profile_dir = self.profile_dir
@@ -411,12 +418,15 @@ class TPUWorker(WorkerBase):
             profile_dir = os.path.join(profile_dir, profile_prefix)
             os.makedirs(profile_dir, exist_ok=True)
 
+        worker_name = f"rank{self.rank}"
+        config = f"rank:{self.rank}"
+
         if is_start:
             logger.info(
-                f"Starting TorchTPU profiler trace at {profile_dir}...")
+                "[TPU_WORKER_PROFILE_START] rank=%d worker_name=%s config=%s target_profile_dir=%s",
+                self.rank, worker_name, config, profile_dir)
             handler = torch.profiler.tensorboard_trace_handler(
-                profile_dir, worker_name=f"rank{self.rank}")
-            config = f"rank:{self.rank}"
+                profile_dir, worker_name=worker_name)
             self.profile_context = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -427,14 +437,22 @@ class TPUWorker(WorkerBase):
                 on_trace_ready=handler,
             )
             self.profile_context.__enter__()
+            logger.info(
+                "[TPU_WORKER_PROFILE_START_ACTIVE] rank=%d Profiler context entered successfully.",
+                self.rank)
         else:
             if self.profile_context is not None:
-                logger.info("Stopping TorchTPU profiler trace...")
+                logger.info(
+                    "[TPU_WORKER_PROFILE_STOP] rank=%d Exiting profiler context and flushing trace to %s...",
+                    self.rank, profile_dir)
                 self.profile_context.__exit__(None, None, None)
-                logger.info(f"Profiler trace saved to {profile_dir}")
+                logger.info(
+                    "[TPU_WORKER_PROFILE_STOP_DONE] rank=%d Profiler trace saved to %s",
+                    self.rank, profile_dir)
             else:
                 logger.warning(
-                    "Profiler context is not set. Cannot stop profiler.")
+                    "[TPU_WORKER_PROFILE_STOP_FAILED] rank=%d Profiler context is not set. Cannot stop profiler.",
+                    self.rank)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu.platforms.tpu_platform import \
