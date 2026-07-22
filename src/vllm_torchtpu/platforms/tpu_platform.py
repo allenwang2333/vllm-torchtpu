@@ -21,8 +21,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_block_pool_enabled, unified_kv_layout_enabled,
-    update_tpu_block_size_and_slot_config)
+    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -630,7 +629,7 @@ class TpuPlatform(Platform):
         # KV cache. Set before workers spawn — torch_tpu reads this env once
         # per process at first compile. Respect an explicit user setting of
         # the same key.
-        if unified_block_pool_enabled(vllm_config):
+        if unified_kv_layout_enabled(vllm_config):
             sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
             xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
             if sc_ar not in xla_opts:
@@ -821,10 +820,7 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            # TODO(ranlihao): Use the vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND to determine which executor to use.
-            # use_ray_v2 = vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-            use_ray_v2 = False
-            if use_ray_v2:
+            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
                     RayDistributedExecutorV2
                 parallel_config.distributed_executor_backend = RayDistributedExecutorV2
