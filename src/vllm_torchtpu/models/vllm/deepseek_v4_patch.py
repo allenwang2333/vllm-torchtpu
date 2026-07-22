@@ -324,6 +324,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             *args,
             **kwargs
         ):
+            if input_ids is not None:
+                print(f"[DEBUG_FORWARD_INPUT] pid={os.getpid()} input_ids shape={list(input_ids.shape)} values={input_ids.tolist()}", flush=True)
             return _orig_amd_forward(
                 self,
                 input_ids,
