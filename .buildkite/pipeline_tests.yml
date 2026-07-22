@@ -22,6 +22,7 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   test-runner: pytest
   install-client: false
   oidc-lifetime: 7200
+  suite-slug: vllm-torchtpu-ci
 
 steps:
   - group: "Unit Tests on TPU"
