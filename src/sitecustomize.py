@@ -27,6 +27,7 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         import torch
         import torchax.tensor as ta_tensor
         import torchax.ops.ops_registry as ta_registry
+        import torch_tpu._internal.pallas as pallas_pkg
         import torch_tpu._internal.pallas.pallas as pallas_mod
 
         # 1. Patch pallas.jax_op to register custom JAX ops in torchax registry
@@ -43,6 +44,7 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
                 print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", file=sys.stderr, flush=True)
             return result
         pallas_mod.jax_op = patched_jax_op
+        pallas_pkg.jax_op = patched_jax_op
 
         # 2. Patch XLADispatchMode to intercept "pallas" namespace
         _orig_xla_dispatch = ta_tensor.XLADispatchMode.__torch_dispatch__
