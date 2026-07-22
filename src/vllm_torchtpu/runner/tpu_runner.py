@@ -85,6 +85,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs, Eagle3Proposer
 
 if TYPE_CHECKING:
@@ -143,43 +144,6 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
-
-_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
-    "invalid_block_group_index" in getattr(KVConnectorOutput,
-                                           "__dataclass_fields__", {}))
-
-
-def _build_kv_connector_output(
-    *,
-    finished_sending: set[str] | None,
-    finished_recving: set[str] | None,
-    kv_connector_worker_meta: Any | None,
-    invalid_block_ids: set[int],
-    invalid_block_group_index: int | None,
-) -> KVConnectorOutput:
-    """Build a connector output across the vLLM 0.23 API boundary.
-
-    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
-    does not expose ``invalid_block_group_index``. Newer vLLM versions support
-    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
-    0.23, but fail closed if a hybrid load actually fails: silently dropping
-    the group would make overlapping block IDs ambiguous to its scheduler.
-    """
-    kwargs: dict[str, Any] = {
-        "finished_sending": finished_sending,
-        "finished_recving": finished_recving,
-        "kv_connector_worker_meta": kv_connector_worker_meta,
-        "invalid_block_ids": invalid_block_ids,
-    }
-    if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-        kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
-    return KVConnectorOutput(**kwargs)
-
 
 # Smallest output size
 MIN_NUM_SEQS = 8
@@ -254,6 +218,13 @@ def _torch_tpu_wrapper():
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+
+    @property
+    def _is_async_drafter(self) -> bool:
+        if not self.speculative_config:
+            return False
+        return (self.speculative_config.use_eagle()
+                or self.speculative_config.method == "dflash")
 
     def __init__(
         self,
@@ -585,12 +556,6 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
-        # Upstream parity (gpu_model_runner calls this before every forward;
-        # base-class default is a no-op): lets connectors with async saves
-        # fence in-flight stores whose source blocks the scheduler is about
-        # to reuse (OffloadingConnector jobs_to_flush) before the forward
-        # overwrites them.
-        kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
@@ -607,14 +572,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None, set(), None
+            return None, None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
-        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
-        invalid_block_group_index = (
-            kv_connector.get_block_ids_with_load_errors_group_index()
-            if invalid_block_ids else None)
         # vLLM >=0.21 job model: store completions (and load completions) are
         # reported to the scheduler via the worker meta's `completed_jobs`,
         # NOT via finished_sending. Without plumbing this, the
@@ -626,8 +587,7 @@ class TPUModelRunner(GPUModelRunner):
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
-        return (finished_sending, finished_recving, worker_meta,
-                invalid_block_ids, invalid_block_group_index)
+        return finished_sending, finished_recving, worker_meta
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -637,15 +597,12 @@ class TPUModelRunner(GPUModelRunner):
         self.maybe_setup_kv_connector(
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
-        (finished_sending, finished_recving, worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
-        kv_connector_output = _build_kv_connector_output(
+        finished_sending, finished_recving, worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
+        kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
-            invalid_block_ids=invalid_block_ids,
-            invalid_block_group_index=invalid_block_group_index,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -660,6 +617,8 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler()
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "dflash":
+                self.drafter = DFlashProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:
@@ -1163,7 +1122,6 @@ class TPUModelRunner(GPUModelRunner):
             [self.device], self.cache_config.gpu_memory_utilization)
         return budget.available - utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config)
-
     def _maybe_set_compact_mamba_num_blocks_override(
             self, attn_page_size_bytes: int,
             unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
@@ -1225,7 +1183,12 @@ class TPUModelRunner(GPUModelRunner):
         if group_size <= 0:
             return
 
-        avail = self._available_kv_cache_hbm()
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block counts
+        # match the KV-cache budget vLLM is given (incl. the headroom knob).
+        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
+        avail = budget.available
         if avail <= 0:
             return
 
@@ -1476,9 +1439,12 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        `avail` comes from `_available_kv_cache_hbm`, so the block count
-        pinned here matches the KV-cache budget
-        `TPUWorker.determine_available_memory()` hands vLLM.
+        `avail` comes from `utils.compute_hbm_budget`, the same helper
+        `TPUWorker.determine_available_memory()` uses, so it reserves both the
+        `gpu_memory_utilization` cap and the `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom, and the block count pinned here matches the KV-cache budget
+        the worker hands vLLM. No safety margin is applied beyond those two
+        knobs.
 
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
@@ -1500,7 +1466,11 @@ class TPUModelRunner(GPUModelRunner):
         if cache_config.num_gpu_blocks_override is not None:
             return
 
-        avail = self._available_kv_cache_hbm()
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block count
+        # matches the KV-cache budget vLLM is given.
+        avail = utils.compute_hbm_budget([self.device], gpu_mem_util).available
         if avail <= 0:
             return
 
@@ -2398,8 +2368,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         draft_chunks: list[DraftChunkInputs] = []
-        is_draft_model = (self.speculative_config is not None
-                          and self.speculative_config.use_eagle())
+        is_draft_model = (self._is_async_drafter)
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -2532,7 +2501,7 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
-            if is_draft_model:
+            if is_draft_model and aux_hidden_states is not None:
                 # Capture this chunk's draft inputs while they are valid.
                 draft_chunks.append(
                     DraftChunkInputs(
@@ -2549,6 +2518,7 @@ class TPUModelRunner(GPUModelRunner):
                         draft_lengths=(spec_decode_metadata.draft_lengths
                                        if spec_decode_metadata is not None else
                                        None),
+                        attn_metadata=attn_metadata,
                     ))
 
             start_index = end_index
@@ -2565,7 +2535,6 @@ class TPUModelRunner(GPUModelRunner):
 
         if self.is_pooling_model:
             return self.sample_tokens(None)
-
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2606,8 +2575,8 @@ class TPUModelRunner(GPUModelRunner):
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
 
-        # Hand the per-chunk draft inputs to the proposer.
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # Hand the per-chunk draft inputs to the drafter.
+        if self._is_async_drafter:
             self.drafter.draft_chunks = state.draft_chunks
 
         # Prepare inputs, the requests might be split into multiple
@@ -2841,9 +2810,8 @@ class TPUModelRunner(GPUModelRunner):
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
-        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+        finished_sending, finished_recving, kv_worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2891,14 +2859,11 @@ class TPUModelRunner(GPUModelRunner):
 
         kv_connector_output = (
             None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None and not invalid_block_ids) else
-            _build_kv_connector_output(
-                finished_sending=finished_sending,
-                finished_recving=finished_recving,
-                kv_connector_worker_meta=kv_worker_meta,
-                invalid_block_ids=invalid_block_ids,
-                invalid_block_group_index=invalid_block_group_index,
-            ))
+                     and kv_worker_meta is None) else KVConnectorOutput(
+                         finished_sending=finished_sending,
+                         finished_recving=finished_recving,
+                         kv_connector_worker_meta=kv_worker_meta,
+                     ))
 
         next_tokens_tpu = None
         copy_state = None
@@ -2922,8 +2887,7 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = self.scheduler_config.async_scheduling
         eagle3_drafts = None
-        if (self.speculative_config and self.speculative_config.use_eagle()
-                and combined_selected_tokens):
+        if (self._is_async_drafter and combined_selected_tokens and is_async):
             if is_spec_step:
                 eagle3_drafts = (
                     self.spec_decode_manager.propose_draft_token_ids(
@@ -2963,9 +2927,7 @@ class TPUModelRunner(GPUModelRunner):
                 (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                  num_draft_per_req) = (self._assemble_async_spec_substitution(
                      eagle3_drafts, next_tokens_per_chunk, state))
-            elif (self.speculative_config
-                  and self.speculative_config.use_eagle()
-                  and next_tokens_tpu_chunks):
+            elif (self._is_async_drafter and next_tokens_tpu_chunks):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
@@ -3063,17 +3025,16 @@ class TPUModelRunner(GPUModelRunner):
 
                     req_state.output_token_ids.extend(valid_tokens)
 
-            if (self.speculative_config
-                    and self.speculative_config.method == "ngram"):
-                # ngram drafts on the host from the committed token ids, so it
-                # must run after materialization; eagle3 was already proposed
-                # from device state by the unified call above.
-                self.spec_decode_manager.propose_draft_token_ids(
-                    final_output.sampled_token_ids,
-                    discard_sampled_tokens_req_indices=
-                    discard_sampled_tokens_req_indices,
-                    scheduler_output=scheduler_output,
-                )
+            if self.speculative_config:
+                if (self.speculative_config.method == "ngram" or self._is_async_drafter):
+                    # For sync mode, propose drafts on the host from the committed
+                    # token ids, so it must run after materialization.
+                    self.spec_decode_manager.propose_draft_token_ids(
+                        sampled_token_ids=final_output.sampled_token_ids,
+                        discard_sampled_tokens_req_indices=
+                        discard_sampled_tokens_req_indices,
+                        num_rejected_tokens_np=num_rejected_tokens_np,
+                        scheduler_output=scheduler_output)
 
             return final_output
 
@@ -3104,9 +3065,9 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         self.model = model
 
-        # If using eagle3/mtp speculative decoding, load the draft model and
+        # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
-        if self.speculative_config and self.speculative_config.use_eagle():
+        if self._is_async_drafter:
             self.drafter.load_model(self.model)
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_attention_kernels()
@@ -3377,8 +3338,7 @@ class TPUModelRunner(GPUModelRunner):
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
-        if (self.speculative_config is not None
-                and self.speculative_config.use_eagle()):
+        if (self._is_async_drafter):
             next_lens.append(
                 self.max_num_reqs *
                 (1 + self.speculative_config.num_speculative_tokens))
@@ -3400,9 +3360,11 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens = torch.zeros(nlen,
                                               dtype=torch.int64,
                                               device=self.device)
-                    out = _substitute_placeholder_token(
-                        input_ids, cur_input_indices, pre_next_tokens_indices,
-                        next_tokens)
+                    with set_vllm_model_wrapper_context(
+                            mesh=self.mesh, vllm_config=self.vllm_config):
+                        out = _substitute_placeholder_token(
+                            input_ids, cur_input_indices,
+                            pre_next_tokens_indices, next_tokens)
                     sync.synchronize(out, wait=True)
                     logger.info("  -- num_tokens: %d, next_len: %d",
                                 num_tokens, nlen)
@@ -3430,8 +3392,7 @@ class TPUModelRunner(GPUModelRunner):
         step by ``input_batch.all_greedy``, so both are reachable and must be
         pre-compiled here.
         """
-        if not (self.speculative_config is not None
-                and self.speculative_config.use_eagle()):
+        if not (self._is_async_drafter):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
@@ -3556,8 +3517,7 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if (self.speculative_config
-                    and self.speculative_config.use_eagle()):
+            if (self._is_async_drafter):
                 self.drafter.precompile()
                 self._precompile_rejection_sampler()
                 # The isolated precompile above emits standalone fused programs;
@@ -3597,8 +3557,7 @@ class TPUModelRunner(GPUModelRunner):
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
-        if not (self.speculative_config
-                and self.speculative_config.use_eagle()):
+        if not (self._is_async_drafter):
             return
         if self.input_batch.num_reqs != 0:
             logger.warning("skip spec-decode warmup: input_batch not empty")
