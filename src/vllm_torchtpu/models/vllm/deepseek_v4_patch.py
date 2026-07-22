@@ -109,6 +109,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 if "layers.0.attn.wo_b" in k:
                     param = dict(self.named_parameters())[k]
                     print(f"[PATCH]   Param: {k} | Shape: {list(param.shape)} | Type: {param.__class__.__name__}", file=sys.stderr, flush=True)
+            self.model.has_tilelang = False
             for idx, l in enumerate(self.model.layers):
                 l.layer_idx = idx
                 l.has_tilelang = False
