@@ -14,6 +14,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.sparse.kernel as mla_sparse_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
@@ -42,6 +43,7 @@ ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
 mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
+sparse_mla_ragged_paged_attention = mla_sparse_kernel.sparse_ragged_paged_attention
 
 
 def sharded_flash_attention(
@@ -595,3 +597,156 @@ def mla_attention(
                                               md.query_start_loc,
                                               md.request_distribution)
     return kv_cache, output_TNA
+
+
+def _update_kv_cache_slots(cache, kv_c, k_pe, seq_lens, block_tables,
+                           query_start_loc):
+    """Scatter the current step's latents into the paged FP8 MLA cache.
+
+    Mirrors the dense MLA kernel's fused insert: sequence s's new tokens
+    land at positions kv_len - q_len .. kv_len - 1; values stored
+    verbatim in FP8.
+    """
+    page_size = cache.shape[1] * cache.shape[2]
+    num_tokens = kv_c.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
+                              side="right").astype(jnp.int32)
+    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
+    local = tok - query_start_loc[seq_id]
+    pos = seq_lens[seq_id] - q_len + local
+    valid = tok < query_start_loc[-1]
+    bt = block_tables.reshape(seq_lens.shape[0], -1)
+    page = jnp.where(valid, bt[seq_id, pos // page_size], jnp.int32(2**30))
+    slot = pos % page_size
+    kv_new = jnp.concatenate([kv_c, k_pe], axis=-1)  # (T, 576) fp8
+    return cache.at[page, slot // 4, slot % 4, :kv_new.shape[-1]].set(kv_new)
+
+
+def sparse_mla_attention(
+        q_TNA: jax.Array,
+        q_rope_TNH: jax.Array,
+        k_SA: jax.Array,
+        k_rope_SH: jax.Array,
+        kv_cache: jax.Array,
+        topk_indices: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        mesh: Mesh,
+        query_tnh_sharding: Any | None = None,
+        keyvalue_skh_sharding: Any | None = None,
+        attn_o_tnh_sharding: Any | None = None,
+        sm_scale: float | None = None,
+        k_scale: float | None = None) -> tuple[jax.Array, jax.Array]:
+    """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
+
+    Contract notes:
+      * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
+        token-major order -- no separate rope argument, and no head-major
+        transpose (the v2 kernel wants (N, T, L); this one does not).
+      * `q` must be bf16 (pre-quantization): the kernel dequantizes the
+        gathered KV to bf16 and has no q-scale plumbing.
+      * Fused KV-cache insert: writes current step's `k_SA` and `k_rope_SH`
+        into `kv_cache` before SparseCore gather execution.
+      * Per-token kv_lens derive from the "-1" tail padding in
+        `topk_indices`; every token must have at least one valid entry.
+    """
+    in_specs = (
+        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
+                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
+        query_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
+        keyvalue_skh_sharding
+        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
+        P(ShardingAxisName.ATTN_DATA),  # kv_cache
+        P(ShardingAxisName.ATTN_DATA),  # topk_indices
+        P(ShardingAxisName.ATTN_DATA),  # seq_lens
+        P(ShardingAxisName.ATTN_DATA),  # block_tables
+        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
+        P(ShardingAxisName.ATTN_DATA),  # request_distribution
+    )
+    out_specs = (
+        attn_o_tnh_sharding
+        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+             None),  # attn output (T, N, D)
+        P(ShardingAxisName.ATTN_DATA),  # updated kv cache
+    )
+
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+
+    def _sparse_mla_ragged_paged_attention(q, q_rope, k, k_rope, cache,
+                                           topk_idx, seq_lens_, block_tables_,
+                                           query_start_loc_,
+                                           request_distribution_):
+        lkv_dim = q.shape[-1]  # kv_lora_rank (512 for GLM-5.2)
+        rope_dim = q_rope.shape[-1]  # 64
+        # (T, N, L) + (T, N, H) -> (T, N, L + H); token-major, no transpose.
+        q = jnp.concatenate([q, q_rope], axis=-1)
+
+        # ---- Fused Cache Write -------------------------------------------
+        cache = _update_kv_cache_slots(cache, k, k_rope, seq_lens_,
+                                       block_tables_, query_start_loc_)
+        # ------------------------------------------------------------------
+
+        # ---- Stage-A cache shim ------------------------------------------
+        # Convert the resident fp8 float cache (written by fused insert above;
+        # layout (pages, ps//4, 4, 640) float8) into packed uint8 pair for csa_gather:
+        #   nope: (pages, page_size, 4, 128) u8
+        #   rope: (pages, page_size//4, 4, 128) u8
+        assert cache.dtype == jnp.float8_e4m3fn, (
+            "Stage-A sparse shim requires --kv-cache-dtype fp8 (got "
+            f"{cache.dtype}); the nope conversion is a pure bitcast.")
+        assert lkv_dim == 512 and rope_dim == 64, (
+            "Packed sparse cache layout assumes a 512+64 latent, got "
+            f"{lkv_dim}+{rope_dim}")
+        pages = cache.shape[0]
+        page_size = cache.shape[1] * cache.shape[2]
+        flat = cache.reshape(pages, page_size, cache.shape[-1])
+
+        nope_u8 = jax.lax.bitcast_convert_type(
+            flat[..., :lkv_dim], jnp.uint8).reshape(pages, page_size, 4, 128)
+
+        rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
+        if dequant_scale != 1.0:
+            rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
+        rope_u16 = jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
+        rope_u8 = jnp.concatenate(
+            [(rope_u16 >> 8).astype(jnp.uint8),
+             (rope_u16 & 0xFF).astype(jnp.uint8)],
+            axis=-1).reshape(pages, page_size // 4, 4, 128)
+        # ------------------------------------------------------------------
+
+        out = sparse_mla_ragged_paged_attention(
+            q,
+            nope_u8,
+            rope_u8,
+            topk_idx,
+            block_tables_,  # page_indices
+            query_start_loc_,  # cu_q_lens
+            request_distribution_,  # distribution
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+        )
+        # The kernel attends over concatenated (nope + rope) keys, so its
+        # per-head output is lkv_dim + rope_dim (576) wide: [..., :512] is
+        # P @ latent -- the MLA value output -- while [..., 512:] is
+        # attention-weighted ROPE keys, which are not part of the value.
+        # Slice to the latent so the shape matches the registered fake
+        # (T, N, kv_lora_rank) and the downstream W_UV projection.
+        return out[..., :lkv_dim], cache
+
+    output_TNA, updated_cache = jax.jit(
+        shard_map.shard_map(_sparse_mla_ragged_paged_attention,
+                             mesh=mesh,
+                             in_specs=in_specs,
+                             out_specs=out_specs,
+                             check_rep=False))(q_TNA, q_rope_TNH, k_SA,
+                                               k_rope_SH, kv_cache,
+                                               topk_indices, seq_lens,
+                                               block_tables, query_start_loc,
+                                               request_distribution)
+    return updated_cache, output_TNA

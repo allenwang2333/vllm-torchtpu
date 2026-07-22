@@ -464,6 +464,7 @@ class VllmTPUMLAAttention(MLAAttention):
                                               q_scale=q_scale,
                                               k_scale=k_scale,
                                               v_scale=v_scale)
+        self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
@@ -485,6 +486,7 @@ class VllmTPUMLAAttention(MLAAttention):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
             output=output,
+            topk_indices=kwargs.get("topk_indices"),
         )
 
 
@@ -535,7 +537,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
 
-        if self.indexer is not None and not self.skip_topk:
+        # skip_topk layers (GLM-5.2 index sharing) still need topk_tokens and
+        # the shared buffer: they don't run their indexer but consume the
+        # indices a previous layer wrote into the model-wide buffer.
+        if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
             self.topk_indices_buffer = mla_modules.topk_indices_buffer
@@ -613,9 +618,23 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        topk_indices = None
         if self.indexer and self.is_sparse:
-            _topk_indices = self.indexer(hidden_states, q_c, positions,
-                                         self.indexer_rope_emb)
+            # Non-skip layers run the indexer, which writes into the
+            # model-wide topk_indices_buffer; skip_topk layers (GLM-5.2
+            # index sharing) reuse whatever the previous non-skip layer
+            # wrote there in this pass. Either way the sparse path consumes
+            # the shared buffer, sliced to this batch (a copy-free view).
+            # Rows are valid-first with a -1 tail, as the sparse MLA kernel
+            # requires.
+            if not self.skip_topk:
+                self.indexer(hidden_states, q_c, positions,
+                             self.indexer_rope_emb)
+            assert self.topk_indices_buffer is not None, (
+                "sparse MLA layers require the model-wide topk_indices_buffer"
+            )
+            topk_indices = self.topk_indices_buffer[
+                : hidden_states.shape[0], : self.topk_tokens]
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
@@ -627,6 +646,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             k_pe,
             output_shape=(hidden_states.shape[0],
                           self.num_heads * self.v_head_dim),
+            topk_indices=topk_indices,
         )
 
         return self.o_proj(attn_out)[0]
