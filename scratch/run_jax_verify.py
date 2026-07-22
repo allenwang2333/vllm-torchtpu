@@ -162,8 +162,34 @@ def patched_amd_load_weights(self, weights):
 
                 yield name, loaded_weight
 
-    self.hf_to_vllm_mapper = WrappedMapper()
-    return _amd_orig_load_weights(self, weights)
+    res = _amd_orig_load_weights(self, weights)
+
+    # Wrap get_kv_cache_spec to return dummy specs instead of None to bypass JAX KV cache manager assertions
+    from vllm.v1.attention.backends.mla.sparse_swa import SlidingWindowMLASpec
+    import torch
+
+    for name, module in self.model.named_modules():
+        if hasattr(module, "get_kv_cache_spec"):
+            orig_spec_fn = module.get_kv_cache_spec
+            def make_wrapped_fn(orig_fn, mod_name):
+                def wrapped_spec_fn(*args, **kwargs):
+                    spec = orig_fn(*args, **kwargs)
+                    if spec is None:
+                        print(f"[JAX_VERIFY_PATCH] Returning dummy KVCacheSpec for unused module: {mod_name}", flush=True)
+                        return SlidingWindowMLASpec(
+                            block_size=1,
+                            num_kv_heads=1,
+                            head_size=128,
+                            dtype=torch.uint8,
+                            sliding_window=1,
+                            cache_dtype_str="fp8",
+                            model_version="deepseek_v4",
+                        )
+                    return spec
+                return wrapped_spec_fn
+            module.get_kv_cache_spec = make_wrapped_fn(orig_spec_fn, name)
+
+    return res
 
 _AmdDeepseekV4ForCausalLM.load_weights = patched_amd_load_weights
 
