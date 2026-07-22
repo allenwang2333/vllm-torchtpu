@@ -61,6 +61,8 @@ def patched_amd_load_weights(self, weights):
                 # Print class details of down_proj's linear method
                 if hasattr(proj, "quant_method"):
                     print(f"[DEBUG_SHARED_EXPERTS_PARAMS] down_proj quant_method: {proj.quant_method.__class__.__name__}", flush=True)
+        if hasattr(self, "model") and hasattr(self.model, "hc_head"):
+            print(f"[DEBUG_HC_HEAD_PARAMS] hc_head state_dict keys: {list(self.model.hc_head.state_dict().keys())}", flush=True)
     except Exception as e:
         print(f"[DEBUG_SHARED_EXPERTS_PARAMS] Failed to print: {e}", flush=True)
 
