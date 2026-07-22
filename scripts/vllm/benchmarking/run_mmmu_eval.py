@@ -84,24 +84,30 @@ def encode_image_base64(image) -> str:
 
 def extract_answer(response_text: str,
                    options: Optional[List[str]] = None) -> str:
-    """Extract choice letter (A-J) from generated text using VLMEvalKit two-pass matching."""
+    """Extract choice letter (A-J) from generated CoT text."""
     if not response_text:
         return "UNKNOWN"
-    # 1. Match explicit keyword patterns like "Answer: (A)", "Option B", "choice is (D)", "A."
-    match = re.search(
+
+    # 1. Match explicit CoT conclusion phrases anywhere in the text
+    cot_patterns = [
+        r"therefore,?\s*(?:the)?\s*(?:correct)?\s*answer\s*is\s*\(?([A-J])\)?",
+        r"the\s*correct\s*option\s*is\s*\(?([A-J])\)?",
+        r"answer\s*:\s*\(?([A-J])\)?",
+        r"\boption\s*\(?([A-J])\)?\s*is\s*correct",
         r"\b(?:answer|option|choice|is|result)\b[^\w\n]*\(?([A-J])\)?\b",
-        response_text,
-        re.IGNORECASE,
-    )
+    ]
+    for pattern in cot_patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+
+    # 2. Inspect the final 300 characters for enclosed or standalone option letters
+    tail_text = response_text[-300:]
+    match = re.search(r"(?:\(|\[|^|\s)([A-J])(?:\)|\]|\.|\b)", tail_text)
     if match:
         return match.group(1).upper()
 
-    # 2. Match enclosed letter like "(B)", "A)", "[C]"
-    match = re.search(r"(?:\(|\[|^|\s)([A-J])(?:\)|\]|\.|\b)", response_text)
-    if match:
-        return match.group(1).upper()
-
-    # 3. Fallback to candidate option text matching (VLMEvalKit style)
+    # 3. VLMEvalKit Fallback: Substring match against candidate option texts
     if options and isinstance(options, list):
         clean_resp = response_text.strip().lower()
         best_match_idx = -1
@@ -117,8 +123,8 @@ def extract_answer(response_text: str,
         if best_match_idx >= 0:
             return chr(65 + best_match_idx)
 
-    # 4. Fallback: check for isolated uppercase single letter
-    match = re.search(r"\b([A-J])\b", response_text)
+    # 4. Fallback: isolated uppercase single letter
+    match = re.search(r"\b([A-J])\b", tail_text)
     if match:
         return match.group(1).upper()
 
@@ -391,14 +397,14 @@ def main():
             enforce_eager=True,
             trust_remote_code=True,
             dtype="bfloat16",
-            max_model_len=2048,
+            max_model_len=4096,
             gpu_memory_utilization=0.9,
             limit_mm_per_prompt={"image": 8},
         )
         engine = LLMEngine.from_engine_args(engine_args)
         processor = AutoProcessor.from_pretrained(args.model,
                                                   trust_remote_code=True)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=64)
+        sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
 
         inputs = []
         for sample in samples:
@@ -411,7 +417,10 @@ def main():
                     prompt_text += "\n\nOptions:\n" + "\n".join(
                         f"({chr(65+idx)}) {opt}"
                         for idx, opt in enumerate(options))
-            prompt_text += "\n\nRespond with only the final option letter in format (A), (B), (C), or (D)."
+            prompt_text += (
+                "\n\nPlease think step-by-step and provide a detailed explanation. "
+                "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
+            )
             img = sample["image"]
             messages = [{
                 "role":
@@ -433,9 +442,9 @@ def main():
             })
 
         print(
-            f"Running generative evaluation on {len(inputs)} samples in batches of 20..."
+            f"Running CoT generative evaluation on {len(inputs)} samples in batches of 10..."
         )
-        batch_size = 20
+        batch_size = 10
         for i in range(0, len(inputs), batch_size):
             chunk_inputs = inputs[i:i + batch_size]
             chunk_samples = samples[i:i + batch_size]
