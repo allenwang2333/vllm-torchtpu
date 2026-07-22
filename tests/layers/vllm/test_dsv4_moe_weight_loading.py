@@ -117,15 +117,15 @@ def test_moe_weight_loading_and_quantization():
     assert layer.w2_weight.shape == (num_experts_global, intermediate_size // 2, hidden_size)
     
     # 2. Output scale shapes
-    # w13_weight_scale should be: [256, K // 512, 1, N] = [256, 2048 // 512, 1, 4096] = [256, 4, 1, 4096]
-    assert layer.w13_weight_scale.shape == (num_experts_global, 4, 1, 4096)
-    assert layer.w2_weight_scale.shape == (num_experts_global, 4, 1, 2048)
+    # w13_weight_scale should be: [256, K // 32, 1, N] = [256, 2048 // 32, 1, 4096] = [256, 64, 1, 4096]
+    assert layer.w13_weight_scale.shape == (num_experts_global, 64, 1, 4096)
+    assert layer.w2_weight_scale.shape == (num_experts_global, 64, 1, 2048)
 
     # 4. Values checks:
     # Transpose axis 1 to last axis, unpack, and transpose back
     w13_temp = layer.w13_weight.cpu().transpose(1, 2).contiguous() # [256, 4096, 1024]
     w13_output_unpacked = unpack_uint8_to_fp4(w13_temp).transpose(1, 2).contiguous() # [256, 2048, 4096]
-    scales_expanded = layer.w13_weight_scale.cpu().squeeze(2).repeat_interleave(512, dim=1) # [256, 2048, 4096]
+    scales_expanded = layer.w13_weight_scale.cpu().squeeze(2).repeat_interleave(32, dim=1) # [256, 2048, 4096]
 
     print("w13_output_unpacked shape:", w13_output_unpacked.shape)
     print("scales_expanded shape:", scales_expanded.shape)
