@@ -27,6 +27,30 @@ sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
 patch_deepseek_v4_mla_cls()
 
+# Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
+from vllm.platforms import current_platform
+class DummyDeviceCapability:
+    major = 9
+    minor = 0
+
+current_platform.get_device_capability = lambda *args, **kwargs: DummyDeviceCapability()
+
+class DummyCudaEvent:
+    def __init__(self, *args, **kwargs):
+        pass
+    def record(self, *args, **kwargs):
+        pass
+    def wait(self, *args, **kwargs):
+        pass
+    def query(self):
+        return True
+    def synchronize(self):
+        pass
+
+import torch
+torch.cuda.Stream = lambda *args, **kwargs: None
+torch.cuda.Event = DummyCudaEvent
+
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
 
