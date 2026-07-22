@@ -362,9 +362,6 @@ def patched_amd_load_weights(self, weights):
                 elif ".self_attn.sinks" in name:
                     name = name.replace(".self_attn.sinks", ".attn.attn_sink")
 
-                if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale"):
-                    name = name.replace("weight_scale", "weight_scale_inv")
-
                 yield name, loaded_weight
 
     self.hf_to_vllm_mapper = WrappedMapper()
@@ -436,8 +433,6 @@ def patched_amd_inner_load_weights(self, weights):
                 continue
             if "hc_head.hc_" in name:
                 name = name.replace("hc_head.hc_", "hc_head_")
-            if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale"):
-                name = name.replace("weight_scale", "weight_scale_inv")
             yield name, loaded_weight
 
     return _amd_orig_inner_load_weights(self, wrap_weights(weights))
