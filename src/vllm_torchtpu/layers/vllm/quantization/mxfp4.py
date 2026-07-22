@@ -544,11 +544,13 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
-        layer_idx = getattr(layer, "layer_idx", -1)
         if layer_idx in (0, 3):
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input x: shape={list(x.shape)} dtype={x.dtype} | mean={x.mean().item():.6f} std={x.std().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}", flush=True)
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input router_logits: shape={list(router_logits.shape)} dtype={router_logits.dtype} | mean={router_logits.mean().item():.6f} std={router_logits.std().item():.6f} min={router_logits.min().item():.6f} max={router_logits.max().item():.6f}", flush=True)
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts output: shape={list(res.shape)} dtype={res.dtype} | mean={res.mean().item():.6f} std={res.std().item():.6f} min={res.min().item():.6f} max={res.max().item():.6f}", flush=True)
+            x_cpu = x.to("cpu")
+            router_logits_cpu = router_logits.to("cpu")
+            res_cpu = res.to("cpu")
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input x: shape={list(x_cpu.shape)} dtype={x_cpu.dtype} | mean={x_cpu.mean().item():.6f} std={x_cpu.std().item():.6f} min={x_cpu.min().item():.6f} max={x_cpu.max().item():.6f}", flush=True)
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input router_logits: shape={list(router_logits_cpu.shape)} dtype={router_logits_cpu.dtype} | mean={router_logits_cpu.mean().item():.6f} std={router_logits_cpu.std().item():.6f} min={router_logits_cpu.min().item():.6f} max={router_logits_cpu.max().item():.6f}", flush=True)
+            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts output: shape={list(res_cpu.shape)} dtype={res_cpu.dtype} | mean={res_cpu.mean().item():.6f} std={res_cpu.std().item():.6f} min={res_cpu.min().item():.6f} max={res_cpu.max().item():.6f}", flush=True)
         return res
 
 
