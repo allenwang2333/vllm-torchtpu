@@ -77,7 +77,7 @@ print(f"[DEBUG_METACLASS_CHECK] CustomOp.register_oot: {CustomOp.register_oot}",
 print(f"[DEBUG_METACLASS_CHECK] QwenGatedDeltaNetAttention.register_oot: {QwenGatedDeltaNetAttention.register_oot}", flush=True)
 
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
+from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import patch_deepseek_v4_mla_cls
 patch_deepseek_v4_mla_cls()
 
 # Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
@@ -325,7 +325,7 @@ VllmMxfp4MoEMethod.apply_monolithic = patched_apply_monolithic
 def custom_main(args: dict):
     # Patch DeepseekV4Attention to VllmDeepseekV4MLAAttention
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
     print("[RUN_JAX_VERIFY_PATCH] Patched ds_v4_amd_model.DeepseekV4Attention -> VllmDeepseekV4MLAAttention", flush=True)
 
