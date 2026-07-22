@@ -38,6 +38,13 @@ try:
 except ImportError:
     pass
 
+try:
+    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
+    if not hasattr(ds_v4_amd_model, "DeepseekV4Attention") and hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
+        ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
+except ImportError:
+    pass
+
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import patch_deepseek_v4_mla_cls
 patch_deepseek_v4_mla_cls()
