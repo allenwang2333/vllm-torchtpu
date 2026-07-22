@@ -3,6 +3,21 @@
 import os
 import sys
 
+# Dynamically alias tpu_inference imports to vllm_torchtpu for backward compatibility
+class ModuleAliasRedirector:
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "tpu_inference" or fullname.startswith("tpu_inference."):
+            alias_name = fullname.replace("tpu_inference", "vllm_torchtpu", 1)
+            try:
+                __import__(alias_name)
+                sys.modules[fullname] = sys.modules[alias_name]
+                return sys.modules[alias_name].__spec__
+            except ImportError:
+                pass
+        return None
+
+sys.meta_path.insert(0, ModuleAliasRedirector())
+
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
     print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
     try:
