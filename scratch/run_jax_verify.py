@@ -4,6 +4,10 @@
 import os
 import sys
 
+# Ensure local directories are in PYTHONPATH programmatically
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.32"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["VLLM_ENFORCE_EAGER"] = "1"
@@ -53,6 +57,12 @@ try:
             from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
             VllmDeepseekV4Fp8Config.set_configs(self)
             print("[JAX_VERIFY_PATCH] Automatically set VllmDeepseekV4Fp8Config configs from VllmConfig init!", flush=True)
+            @property
+            def get_mesh_prop(config_self):
+                from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+                return get_or_create_pcp_mesh()
+            VllmDeepseekV4Fp8Config.mesh = get_mesh_prop
+            print("[JAX_VERIFY_PATCH] Attached mesh property getter to VllmDeepseekV4Fp8Config class", flush=True)
         except Exception as e:
             print(f"[JAX_VERIFY_PATCH] Failed to set configs on init: {e}", flush=True)
     VllmConfig.__init__ = patched_vllm_config_init
@@ -76,6 +86,122 @@ try:
             ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
 except ImportError:
     pass
+
+# Bypasses and monkey-patches for JAX verification
+try:
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+    def patched_wrapper_call(self, *args, **kwargs):
+        return self._call_with_optional_nvtx_range(self.forward, *args, **kwargs)
+    TorchCompileWithNoGuardsWrapper.__call__ = patched_wrapper_call
+    print("[JAX_VERIFY_PATCH] Bypassed TorchCompileWithNoGuardsWrapper globally", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch TorchCompileWithNoGuardsWrapper: {e}", flush=True)
+
+try:
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+    def patched_verify_and_split_kv_cache_groups(self):
+        attention_groups = []
+        for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            manager_cls = self.single_type_managers[i].__class__
+            spec = g.kv_cache_spec
+            for existing_spec, group_ids, existing_cls in attention_groups:
+                if existing_spec == spec:
+                    assert manager_cls is existing_cls
+                    group_ids.append(i)
+                    break
+            else:
+                attention_groups.append((spec, [i], manager_cls))
+        self.attention_groups = attention_groups
+    HybridKVCacheCoordinator.verify_and_split_kv_cache_groups = patched_verify_and_split_kv_cache_groups
+    print("[JAX_VERIFY_PATCH] Patched HybridKVCacheCoordinator globally", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch HybridKVCacheCoordinator: {e}", flush=True)
+
+try:
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    if AttentionLayerBase not in VllmDeepseekV4MLAAttention.__bases__:
+        VllmDeepseekV4MLAAttention.__bases__ = VllmDeepseekV4MLAAttention.__bases__ + (AttentionLayerBase,)
+    print("[JAX_VERIFY_PATCH] Added AttentionLayerBase to VllmDeepseekV4MLAAttention bases", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to add AttentionLayerBase base class: {e}", flush=True)
+
+try:
+    from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+
+    _orig_get_quant_method = VllmDeepseekV4Fp8Config.get_quant_method
+
+    def patched_get_quant_method(self, layer, prefix):
+        print(f"[JAX_VERIFY_PATCH] get_quant_method called for: {layer.__class__.__name__} | {prefix}", flush=True)
+        if isinstance(layer, FusedMoE):
+            print(f"[JAX_VERIFY_PATCH] Redirecting FusedMoE to VllmMxfp4MoEMethod!", flush=True)
+            layer.prefix = prefix
+            moe_config = self.get_moe_config(layer)
+            if self.expert_dtype == "fp4":
+                return VllmMxfp4MoEMethod(moe_config, self.mesh)
+            else:
+                from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethod
+                layer.moe_config = moe_config
+                return VllmFp8MoEMethod(self, layer, self.mesh)
+        return _orig_get_quant_method(self, layer, prefix)
+
+    VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
+    print("[JAX_VERIFY_PATCH] Successfully patched VllmDeepseekV4Fp8Config.get_quant_method for JAX.", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch VllmDeepseekV4Fp8Config: {e}", flush=True)
+
+# Patch linear layer weight loaders to expand 1D checkpoint scales to match 2D parameters
+try:
+    def pre_expand_scale_tensor(param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        param_shape = param.data.shape
+        if len(param_shape) == 2 and len(loaded_weight.shape) == 1:
+            loaded_weight = loaded_weight.unsqueeze(1).expand(loaded_weight.shape[0], param_shape[1])
+        print(f"[DEBUG_PRE_EXPAND] param_type: {cls_name} | param_shape: {param_shape} | expanded_shape: {loaded_weight.shape}", flush=True)
+        return loaded_weight
+
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    _orig_row_parallel_weight_loader_v2 = RowParallelLinear.weight_loader_v2
+    def patched_row_parallel_weight_loader_v2(self, param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_row_parallel_weight_loader_v2(self, param, loaded_weight)
+    RowParallelLinear.weight_loader_v2 = patched_row_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+    _orig_column_parallel_weight_loader_v2 = ColumnParallelLinear.weight_loader_v2
+    def patched_column_parallel_weight_loader_v2(self, param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_column_parallel_weight_loader_v2(self, param, loaded_weight)
+    ColumnParallelLinear.weight_loader_v2 = patched_column_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    _orig_merged_column_parallel_weight_loader_v2 = MergedColumnParallelLinear.weight_loader_v2
+    def patched_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+    MergedColumnParallelLinear.weight_loader_v2 = patched_merged_column_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+    _orig_qkv_parallel_weight_loader_v2 = QKVParallelLinear.weight_loader_v2
+    def patched_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+    QKVParallelLinear.weight_loader_v2 = patched_qkv_parallel_weight_loader_v2
+    print("[JAX_VERIFY_PATCH] Successfully patched weight loaders for JAX.", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch linear weight loaders: {e}", flush=True)
 
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import patch_deepseek_v4_mla_cls
@@ -266,6 +392,26 @@ def patched_amd_load_weights(self, weights):
     import torchax
     torchax.enable_globally()
     print("[RUN_JAX_VERIFY_PATCH] Enabled torchax globally after loading weights", flush=True)
+
+    # Clear/mock static_forward_context to force manual KV cache spec generation in JAX mode
+    class DummyZeroLenDict(dict):
+        def __len__(self):
+            return 0
+        def __bool__(self):
+            return False
+
+    if hasattr(self, "vllm_config") and hasattr(self.vllm_config, "compilation_config"):
+        if hasattr(self.vllm_config.compilation_config, "static_forward_context"):
+            self.vllm_config.compilation_config.static_forward_context = DummyZeroLenDict(
+                self.vllm_config.compilation_config.static_forward_context
+            )
+            print("[JAX_VERIFY_PATCH] Replaced static_forward_context on self.vllm_config with DummyZeroLenDict", flush=True)
+    if hasattr(self, "config") and hasattr(self.config, "compilation_config"):
+        if hasattr(self.config.compilation_config, "static_forward_context"):
+            self.config.compilation_config.static_forward_context = DummyZeroLenDict(
+                self.config.compilation_config.static_forward_context
+            )
+            print("[JAX_VERIFY_PATCH] Replaced static_forward_context on self.config with DummyZeroLenDict", flush=True)
 
     return res
 
