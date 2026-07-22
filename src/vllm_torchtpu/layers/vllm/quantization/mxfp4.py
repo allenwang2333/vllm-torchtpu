@@ -211,7 +211,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
         )
 
         # 2. Allocate temporary UNPACKED bfloat16 parameters for w1, w3, w2 to receive checkpoint weights
-        from vllm.model_executor.layers.quantization.utils.quant_utils import set_weight_attrs
+        from vllm.model_executor.utils import set_weight_attrs
         layer.w1_temp = torch.nn.Parameter(
             torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16),
             requires_grad=False,
