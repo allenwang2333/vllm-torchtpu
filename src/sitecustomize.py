@@ -6,9 +6,6 @@ import sys
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
     print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
     try:
-        import torchax
-        torchax.enable_globally()
-        print("[SITECUSTOMIZE_PATCH] Enabled torchax globally.", file=sys.stderr, flush=True)
         try:
             import vllm.models.deepseek_v4.attention as att_mod
             if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
