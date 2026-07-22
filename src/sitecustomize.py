@@ -43,6 +43,18 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         except Exception as e:
             print(f"[SITECUSTOMIZE_PATCH] Failed to patch HybridKVCacheCoordinator: {e}", file=sys.stderr, flush=True)
         try:
+            from tpu_inference.models.vllm.vllm_model_wrapper import VllmModelWrapper
+            _orig_wrapper_load_weights = VllmModelWrapper.load_weights
+            def patched_wrapper_load_weights(self, *args, **kwargs):
+                res = _orig_wrapper_load_weights(self, *args, **kwargs)
+                self.vllm_config.compilation_config.static_forward_context.clear()
+                print(f"[SITECUSTOMIZE_PATCH] Cleared static_forward_context on vllm_config globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+                return res
+            VllmModelWrapper.load_weights = patched_wrapper_load_weights
+            print(f"[SITECUSTOMIZE_PATCH] Patched VllmModelWrapper.load_weights globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[SITECUSTOMIZE_PATCH] Failed to patch VllmModelWrapper: {e}", file=sys.stderr, flush=True)
+        try:
             from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import VllmDeepseekV4MLAAttention
             from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
             if AttentionLayerBase not in VllmDeepseekV4MLAAttention.__bases__:
