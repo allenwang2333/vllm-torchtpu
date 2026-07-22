@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import torch
 import torch_tpu  # noqa: F401
 from torch_tpu._internal.profiler import profiler_api
+from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
                                           get_kv_transfer_group,
@@ -419,8 +420,13 @@ class TPUWorker(WorkerBase):
             os.makedirs(profile_dir, exist_ok=True)
 
         worker_name = f"rank{self.rank}"
-        config = f"rank:{self.rank}"
-
+        config = TpuProfilerConfig(
+            rank=f"rank:{self.rank}",
+            host_tracer_level=2,
+            device_tracer_level=1,
+            python_tracer_level=1,
+            experimental_options={},
+        )
         if is_start:
             logger.info(
                 "[TPU_WORKER_PROFILE_START] rank=%d worker_name=%s config=%s target_profile_dir=%s",
@@ -432,9 +438,9 @@ class TPUWorker(WorkerBase):
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.PrivateUse1,
                 ],
-                experimental_config=config,
                 record_shapes=True,
                 on_trace_ready=handler,
+                experimental_config=config,
             )
             self.profile_context.__enter__()
             logger.info(
