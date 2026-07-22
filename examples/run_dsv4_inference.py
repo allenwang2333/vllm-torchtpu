@@ -69,10 +69,11 @@ def main():
     )
 
     prompts = [
+        "Explain the difference between JAX and PyTorch in one sentence.",
         "Hello, my name is",
     ]
 
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=64, ignore_eos=False)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False)
 
     print("=== Testing raw and manually formatted prompts with llm.generate (ignore_eos=True) ===")
     outputs = llm.generate(prompts, sampling_params)
