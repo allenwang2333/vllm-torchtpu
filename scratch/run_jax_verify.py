@@ -217,6 +217,16 @@ def patched_amd_inner_load_weights(self, weights):
 
 DeepseekV4Model.load_weights = patched_amd_inner_load_weights
 
+# Patch forward method to execute within torchax.default_env()
+_orig_forward = _AmdDeepseekV4ForCausalLM.forward
+
+def patched_forward(self, *args, **kwargs):
+    import torchax
+    with torchax.default_env():
+        return _orig_forward(self, *args, **kwargs)
+
+_AmdDeepseekV4ForCausalLM.forward = patched_forward
+
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
 
