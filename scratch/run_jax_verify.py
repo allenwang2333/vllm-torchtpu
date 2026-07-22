@@ -21,8 +21,7 @@ try:
 except ImportError:
     pass
 
-# Add torchtpu-vllm/src to path so we can import env_override
-sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
+# sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 
 # Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
 from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import patch_deepseek_v4_mla_cls
