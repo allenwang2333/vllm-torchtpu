@@ -417,8 +417,10 @@ class CorrectnessTest(parameterized.TestCase):
         m_base.block_until_ready()
         assert L.shape == (total_tokens, self.num_heads)
         assert m.shape == (total_tokens, self.num_heads)
-        np.testing.assert_allclose(l_base, L, rtol=0.1, atol=0.1)
-        np.testing.assert_allclose(m_base, m, rtol=0.1, atol=0.1)
+        logsumexp_base = np.log(l_base) + m_base
+        logsumexp_kernel = np.log(L) + m
+        print(f"Max Diff LogSumExp: {np.max(np.abs(logsumexp_base - logsumexp_kernel))}")
+        np.testing.assert_allclose(logsumexp_base, logsumexp_kernel, rtol=0.1, atol=0.1)
 
         # Cache comparison
         self.compare_cache(kv_lens)
