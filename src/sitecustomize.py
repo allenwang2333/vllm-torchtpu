@@ -6,6 +6,13 @@ import sys
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
     print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
     try:
+        try:
+            import vllm.models.deepseek_v4.attention as att_mod
+            if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+                att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+        except ImportError:
+            pass
+
         from tpu_inference.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
