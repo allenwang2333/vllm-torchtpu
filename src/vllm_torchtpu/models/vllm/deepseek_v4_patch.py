@@ -130,6 +130,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             print(f"[PATCH] Mapping: {name} shape={list(loaded_weight.shape)} dtype={loaded_weight.dtype}", file=sys.stderr, flush=True)
                         if not is_fp4_experts and ".experts." in name and name.endswith("weight_scale"):
                             name = name + "_inv"
+                        if ".experts." not in name and name.endswith("weight_scale_inv"):
+                            name = name.replace("weight_scale_inv", "weight_scale")
                         if "hc_head.hc_" in name:
                             name = name.replace("hc_head.hc_", "hc_head_")
                             
