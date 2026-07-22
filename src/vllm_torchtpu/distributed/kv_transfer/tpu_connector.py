@@ -194,7 +194,7 @@ def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
     config = vllm_config.kv_transfer_config
     if config is None:
         return {}
-    return getattr(config, "kv_connector_extra_config", None) or {}
+    return config.kv_connector_extra_config or {}
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -249,8 +249,7 @@ def stage3_fa_raiden_id_fields(
 
 
 def _use_raiden_stage3_transport() -> bool:
-    return str(getattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT",
-                       "zmq")).strip().lower() == "raiden"
+    return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
 
 
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
@@ -1009,9 +1008,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         num_tokens = min(computed_tokens, prompt_tokens - 1)
         if num_tokens <= 0 or not block_ids:
             return False, {}
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        pcp_size = int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         scheduler_block_tokens = self.block_size * pcp_size
         expected_scheduler_blocks = (
             (num_tokens + scheduler_block_tokens - 1) //
@@ -1034,20 +1032,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"page_tokens={self.block_size}, pcp_size={pcp_size}")
 
         controller_address = str(
-            getattr(tpu_envs, "TPU_RAIDEN_CONTROLLER_ADDRESS", "")).strip()
+            tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
         if not controller_address:
             raise ValueError("Stage-3 producer metadata requires "
                              "TPU_RAIDEN_CONTROLLER_ADDRESS")
         normalized_ids = normalized_block_ids
-        src_job_name = str(getattr(tpu_envs, "TPU_RAIDEN_JOB_NAME",
-                                   "")).strip() or "prefill"
-        src_engine_id = str(getattr(tpu_envs, "TPU_RAIDEN_ENGINE_ID",
-                                    "0")).strip()
-        src_parallelism = int(
-            getattr(tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 8))
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        src_data_replica_idx = int(
-            getattr(parallel_config, "data_parallel_rank", 0) or 0)
+        src_job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or "prefill"
+        src_engine_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
+        src_parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+        parallel_config = self.vllm_config.parallel_config
+        src_data_replica_idx = int(parallel_config.data_parallel_rank or 0)
         if not src_engine_id:
             raise ValueError("TPU_RAIDEN_ENGINE_ID must not be empty")
         if src_parallelism <= 0:
@@ -1117,8 +1111,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         return True, params
 
     def update_connector_output(self, connector_output: Any) -> None:
-        for req_id in getattr(connector_output, "finished_sending",
-                              None) or ():
+        for req_id in connector_output.finished_sending or ():
             self._stage3_finished_sends.pop(req_id, None)
 
     def get_finished_count(self) -> int:
@@ -1128,9 +1121,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not self.is_producer:
             # DP8 routes one request to one decode engine.
             return 1
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        return int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        parallel_config = self.vllm_config.parallel_config
+        return int(parallel_config.prefill_context_parallel_size or 1)
 
 
 class TPURaidenConnectorWorker:
@@ -1231,9 +1223,8 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _raiden_qwen35_admission_enabled() -> bool:
-        return bool(
-            getattr(tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
-            and getattr(tpu_envs, "TPU_RAIDEN_QWEN35_ADMISSION", False))
+        return bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                    and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION)
 
     def _admit_raiden_qwen35_kv_cache(self, runner: TPUModelRunner) -> None:
         """Constructs the v1 Raiden engine over the explicit Qwen3.5 pools."""
@@ -1244,8 +1235,7 @@ class TPURaidenConnectorWorker:
         controller_address = ""
         if stage3_enabled:
             controller_address = str(
-                getattr(tpu_envs, "TPU_RAIDEN_CONTROLLER_ADDRESS",
-                        "")).strip()
+                tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
             if not controller_address:
                 raise ValueError(
                     "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
@@ -1260,10 +1250,8 @@ class TPURaidenConnectorWorker:
         if not named_kv_caches:
             raise ValueError("Raiden pool admission requires "
                              "register_kv_caches() before register_runner()")
-        kv_cache_groups = tuple(
-            getattr(getattr(runner, "kv_cache_config", None),
-                    "kv_cache_groups", ()) or ())
-        raw_tensors = tuple(getattr(runner, "kv_cache_raw_tensors", ()) or ())
+        kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
+        raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
 
         manifest = rpm.build_qwen35_pool_manifest(
             named_kv_caches=named_kv_caches,
@@ -1375,8 +1363,7 @@ class TPURaidenConnectorWorker:
         return KVCacheManager(**kwargs)
 
     def _raiden_transfer_parallelism(self) -> int:
-        parallelism = int(
-            getattr(tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 8))
+        parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
         if parallelism <= 0:
             raise ValueError(
                 "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
@@ -1406,9 +1393,9 @@ class TPURaidenConnectorWorker:
         # option remains present in its shared ParallelConfig.
         if not self.is_producer or transfer_parallelism == 1:
             return page_tokens
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        interleave_tokens = int(
-            getattr(parallel_config, "cp_kv_cache_interleave_size", 0) or 0)
+        parallel_config = self.vllm_config.parallel_config
+        interleave_tokens = int(parallel_config.cp_kv_cache_interleave_size
+                                or 0)
         if interleave_tokens <= 0:
             raise ValueError("Stage-3 PCP source requires a positive "
                              "cp_kv_cache_interleave_size")
@@ -1422,8 +1409,8 @@ class TPURaidenConnectorWorker:
 
     def _raiden_work_unit_fields(self, transfer_rank: int) -> dict[str, Any]:
         default_job = "prefill" if self.is_producer else "decode"
-        job_name = str(getattr(tpu_envs, "TPU_RAIDEN_JOB_NAME", "")).strip()
-        engine_id = str(getattr(tpu_envs, "TPU_RAIDEN_ENGINE_ID", "0")).strip()
+        job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip()
+        engine_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
         return stage3_fa_raiden_id_fields(
             job_name=job_name or default_job,
             engine_id=engine_id,
@@ -1461,8 +1448,8 @@ class TPURaidenConnectorWorker:
             page_tokens, transfer_parallelism)
         if self.is_producer:
             pcp_size = int(
-                getattr(self.vllm_config.parallel_config,
-                        "prefill_context_parallel_size", 1) or 1)
+                self.vllm_config.parallel_config.prefill_context_parallel_size
+                or 1)
             if transfer_parallelism != pcp_size:
                 raise ValueError(
                     "Producer transfer parallelism must equal the complete "
@@ -1525,13 +1512,10 @@ class TPURaidenConnectorWorker:
         return dict(self._raiden_admission_summary)
 
     def _raiden_qwen35_admission_topology(self) -> str:
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        pcp_size = int(
-            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
-        tp_size = int(
-            getattr(parallel_config, "tensor_parallel_size", self.tp_size)
-            or self.tp_size)
-        dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+        parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
+        dp_size = int(parallel_config.data_parallel_size or 1)
         if self.is_producer:
             if pcp_size != 8 or tp_size != 1 or dp_size != 1:
                 raise ValueError(
@@ -1553,8 +1537,8 @@ class TPURaidenConnectorWorker:
         return "dp8_decode"
 
     def _model_config_int(self, name: str, default: int) -> int:
-        model_config = getattr(self.vllm_config, "model_config", None)
-        hf_config = getattr(model_config, "hf_config", None)
+        model_config = self.vllm_config.model_config
+        hf_config = model_config.hf_config
         if hf_config is None:
             hf_config = model_config
         text_config = getattr(hf_config, "text_config", hf_config)
@@ -1565,10 +1549,8 @@ class TPURaidenConnectorWorker:
         total_heads = int(total_heads)
         if total_heads <= 0:
             return 0
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        tp_size = int(
-            getattr(parallel_config, "tensor_parallel_size", self.tp_size)
-            or self.tp_size)
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         if total_heads < tp_size:
             return 1
         if total_heads % tp_size:
@@ -1677,7 +1659,7 @@ class TPURaidenConnectorWorker:
 
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
-            num_tokens = int(getattr(req_meta, "num_tokens", 0) or 0)
+            num_tokens = int(req_meta.num_tokens or 0)
             expiration_time = float(req_meta.expiration_time)
             if num_tokens <= 0:
                 raise ValueError(
