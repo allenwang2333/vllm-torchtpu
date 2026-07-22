@@ -100,8 +100,8 @@ class TestMxfp4MoETPU:
             # Create mock packed weights and scales (simulating MXFP4 model weights on TPU)
             w13_packed = torch.randint(0, 256, (num_experts, 64, 1024), dtype=torch.uint8, device="cpu")
             w13_scale = torch.randint(120, 135, (num_experts, 4, 1, 1024), dtype=torch.uint8, device="cpu")
-            w2_packed = torch.randint(0, 256, (num_experts, 512, 128), dtype=torch.uint8, device="cpu")
-            w2_scale = torch.randint(120, 135, (num_experts, 32, 1, 128), dtype=torch.uint8, device="cpu")
+            w2_packed = torch.randint(0, 256, (num_experts, 128, 128), dtype=torch.uint8, device="cpu")
+            w2_scale = torch.randint(120, 135, (num_experts, 8, 1, 128), dtype=torch.uint8, device="cpu")
 
             # Setup temporary cache directory and save the pre-quantized weights
             import tempfile
@@ -113,7 +113,7 @@ class TestMxfp4MoETPU:
             layer.w13_weight = torch.nn.Parameter(w13_packed, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_packed, requires_grad=False)
 
-            cache_path = os.path.join(temp_dir.name, "rank_0_layer_3_w13_64x1024_w2_512x128.pt")
+            cache_path = os.path.join(temp_dir.name, "rank_0_layer_3_w13_64x1024_w2_128x128.pt")
             torch.save({
                 "w13_weight_packed": w13_packed,
                 "w2_weight_packed": w2_packed,
@@ -132,11 +132,11 @@ class TestMxfp4MoETPU:
             assert hasattr(layer, "w13_weight")
             assert hasattr(layer, "w2_weight")
             assert layer.w13_weight.shape == (num_experts, 64, 1024)
-            assert layer.w2_weight.shape == (num_experts, 512, 128)
+            assert layer.w2_weight.shape == (num_experts, 128, 128)
             assert layer.w13_weight.dtype == torch.uint8
             assert layer.w2_weight.dtype == torch.uint8
             assert layer.w13_weight_scale.shape == (num_experts, 4, 1, 1024)
-            assert layer.w2_weight_scale.shape == (num_experts, 32, 1, 128)
+            assert layer.w2_weight_scale.shape == (num_experts, 8, 1, 128)
             
             # 5. Execute forward pass (apply_monolithic) on TPU
             x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
