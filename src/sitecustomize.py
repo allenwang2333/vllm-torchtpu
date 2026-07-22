@@ -21,19 +21,8 @@ sys.meta_path.insert(0, ModuleAliasRedirector())
 
 if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
     print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
-    try:
-        import torchax
-        torchax.enable_globally()
-        print("[SITECUSTOMIZE_JAX_MODE] Successfully enabled torchax globally.", file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"[SITECUSTOMIZE_JAX_MODE] Failed to enable torchax: {e}", file=sys.stderr, flush=True)
     
-    # Still import vllm_torchtpu so process-wide hooks / aliases load
-    try:
-        import vllm_torchtpu
-    except Exception:
-        pass
-    sys.exit(0) if "run_jax_verify.py" not in "".join(sys.argv) and "EngineCore" not in "".join(sys.argv) else None
+    pass
 
 # Apply monkey-patches to prevent device registration conflicts process-wide
 try:
