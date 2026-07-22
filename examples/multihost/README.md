@@ -50,13 +50,13 @@ gcloud compute tpus tpu-vm ssh <VM_NAME> \
   --worker=0
 ```
 
-2. Log into the Docker container:
+1. Log into the Docker container:
 
 ```bash
 sudo docker exec -it node /bin/bash
 ```
 
-3. Start the vLLM server (example command given below, adjust parameters as needed):
+1. Start the vLLM server (example command given below, adjust parameters as needed):
 
 ```bash
 vllm serve "Qwen/Qwen3-8B" \
