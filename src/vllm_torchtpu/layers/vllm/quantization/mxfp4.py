@@ -191,6 +191,43 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
         FusedMoEMethodBase.__init__(self, moe)
         self.mxfp4_backend = Mxfp4Backend.NONE
 
+    def create_weights(
+        self,
+        layer: FusedMoE,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # 1. Call base Mxfp4MoEMethod.create_weights to allocate final packed parameters
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+        # 2. Allocate temporary UNPACKED bfloat16 parameters for w1, w3, w2 to receive checkpoint weights
+        from vllm.model_executor.layers.quantization.utils.quant_utils import set_weight_attrs
+        layer.w1_temp = torch.nn.Parameter(
+            torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.w3_temp = torch.nn.Parameter(
+            torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.w2_temp = torch.nn.Parameter(
+            torch.zeros(num_experts, hidden_size, intermediate_size_per_partition, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        set_weight_attrs(layer.w1_temp, extra_weight_attrs)
+        set_weight_attrs(layer.w3_temp, extra_weight_attrs)
+        set_weight_attrs(layer.w2_temp, extra_weight_attrs)
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, FusedMoE)
         has_bias = layer.moe_config.has_bias
@@ -261,19 +298,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 logger.warning("Failed to load cached parameters from %s: %s", cache_path, e)
 
         if not loaded_from_cache:
-            # The weights are already sharded along the expert dimension by the vLLM loader.
-            # We execute dequantization and re-quantization on the host CPU layer by layer
-            # to prevent PyTorch-XLA from compiling massive lazy graphs of intermediate float32
-            # tensors on the TPU device, which would cause compiler memory exhaustion.
-            w13_weight_packed = layer.w13_weight.data.to("cpu")
-            w13_weight_scale = layer.w13_weight_scale.data.to("cpu")
+            # We read from the temp parameters loaded from the checkpoint
+            w1 = layer.w1_temp.data.to("cpu")
+            w3 = layer.w3_temp.data.to("cpu")
+            w2 = layer.w2_temp.data.to("cpu")
             w13_bias = layer.w13_bias.data.to("cpu") if has_bias and layer.w13_bias is not None else None
-
-            w2_weight_packed = layer.w2_weight.data.to("cpu")
-            w2_weight_scale = layer.w2_weight_scale.data.to("cpu")
             w2_bias = layer.w2_bias.data.to("cpu") if has_bias and layer.w2_bias is not None else None
 
-            # Now that we have fetched them to host CPU memory, delete the original TPU parameters to free HBM
+            # Delete the temp parameters to free HBM/RAM immediately
+            del layer.w1_temp
+            del layer.w3_temp
+            del layer.w2_temp
+            # Also delete the empty packed parameters, as we will re-allocate them on TPU after quantization!
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
@@ -284,40 +320,15 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             import gc
             gc.collect()
 
-            if layer_idx == 0:
-                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w13_weight_packed: Mean={w13_weight_packed.float().mean():.6f} Max={w13_weight_packed.max()} Min={w13_weight_packed.min()}", flush=True)
-                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w13_weight_scale: Mean={w13_weight_scale.float().mean():.6f} Max={w13_weight_scale.max()} Min={w13_weight_scale.min()}", flush=True)
-                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w2_weight_packed: Mean={w2_weight_packed.float().mean():.6f} Max={w2_weight_packed.max()} Min={w2_weight_packed.min()}", flush=True)
-                print(f"[DEBUG_LOADED_WEIGHTS] layer_0 w2_weight_scale: Mean={w2_weight_scale.float().mean():.6f} Max={w2_weight_scale.max()} Min={w2_weight_scale.min()}", flush=True)
-
-            # 2. Dequantize checkpoint weights (block-32 MXFP4) to FP32
-            # Quantization axis is hidden_size (axis 2)
-            w13_weight = dequantize_mxfp4_packed(
-                w13_weight_packed, w13_weight_scale, axis=2, out_dtype=torch.float32)
-
-            # Quantization axis is intermediate_size (axis 2)
-            w2_weight = dequantize_mxfp4_packed(
-                w2_weight_packed, w2_weight_scale, axis=2, out_dtype=torch.float32)
+            # 2. Concatenate w1 and w3 to form w13
+            w13_weight = torch.cat([w1, w3], dim=1).to(torch.float32)
+            w2_weight = w2.to(torch.float32)
 
             if layer_idx == 0:
                 print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w13_weight: Mean={w13_weight.mean():.6f} Max={w13_weight.max()} Min={w13_weight.min()} HasNaN={torch.isnan(w13_weight).any()}", flush=True)
                 print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w2_weight: Mean={w2_weight.mean():.6f} Max={w2_weight.max()} Min={w2_weight.min()} HasNaN={torch.isnan(w2_weight).any()}", flush=True)
 
-            w13_interleave = activation_str == "swigluoai"
-
-            # 2. Uninterleave w13 if needed (swigluoai checkpoint layout has interleaved w1/w3)
-            if w13_interleave:
-                w1 = w13_weight[:, ::2, :]
-                w3 = w13_weight[:, 1::2, :]
-                w13_weight = torch.cat([w1, w3], dim=1)
-                if w13_bias is not None:
-                    b1 = w13_bias[:, ::2]
-                    b3 = w13_bias[:, 1::2]
-                    w13_bias = torch.cat([b1, b3], dim=1)
-
-            # 3. Calculate padded dimensions for block-512 and GMM alignment
-            # Note: weights are already sharded by vLLM, so these are local dimensions.
-            # Transpose non-contracting dim to right-most dim:
+            # 3. Transpose non-contracting dim to right-most dim:
             # w13_weight: (num_experts, 2 * intermediate_size, hidden_size) -> (num_experts, hidden_size, 2 * intermediate_size)
             # w2_weight: (num_experts, hidden_size, intermediate_size) -> (num_experts, intermediate_size, hidden_size)
             w13_weight = w13_weight.transpose(1, 2).contiguous()
