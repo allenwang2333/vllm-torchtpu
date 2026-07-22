@@ -10,6 +10,14 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
         torch._dynamo.config.disable = True
         print(f"[SITECUSTOMIZE_PATCH] Disabled PyTorch Dynamo globally in pid={os.getpid()}", file=sys.stderr, flush=True)
         try:
+            from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+            def patched_wrapper_call(self, *args, **kwargs):
+                return self._call_with_optional_nvtx_range(self.forward, *args, **kwargs)
+            TorchCompileWithNoGuardsWrapper.__call__ = patched_wrapper_call
+            print(f"[SITECUSTOMIZE_PATCH] Bypassed TorchCompileWithNoGuardsWrapper globally in pid={os.getpid()}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[SITECUSTOMIZE_PATCH] Failed to patch TorchCompileWithNoGuardsWrapper: {e}", file=sys.stderr, flush=True)
+        try:
             import vllm.models.deepseek_v4.attention as att_mod
             if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
                 att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
