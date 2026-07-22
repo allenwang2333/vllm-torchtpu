@@ -538,6 +538,10 @@ def inner_kernel(
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
                         tiled_rhs_scale = tiled_rhs_ref.get_scale()
+                        jax.debug.print("DEBUG_KERNEL_SCALE: start_k={start_k} b_id={b_id} scale={scale} acc_before={acc_before}", 
+                                        start_k=start_k, b_id=b_id, 
+                                        scale=tiled_rhs_scale[b_id, 0, 0], 
+                                        acc_before=block_acc[0, 0])
                         block_acc *= tiled_rhs_scale[b_id, :,
                                                      start_n:end_n].astype(
                                                          acc_ref.dtype)
