@@ -203,9 +203,12 @@ _amd_orig_inner_load_weights = DeepseekV4Model.load_weights
 def patched_amd_inner_load_weights(self, weights):
     def wrap_weights(w_iter):
         for name, loaded_weight in w_iter:
+            if ".experts." in name:
+                print(f"[DEBUG_INNER_EXPERTS] name: {name} | shape: {list(loaded_weight.shape)} | ndim: {loaded_weight.ndim}", flush=True)
             if ".experts." in name and name.endswith(".weight"):
                 if loaded_weight.ndim == 2:
                     loaded_weight = loaded_weight.t()
+                    print(f"[DEBUG_INNER_EXPERTS] Transposed: {name} -> new shape: {list(loaded_weight.shape)}", flush=True)
             if "hc_head.hc_" in name:
                 name = name.replace("hc_head.hc_", "hc_head_")
             if (".experts." not in name or ".shared_experts." in name) and name.endswith("weight_scale"):
