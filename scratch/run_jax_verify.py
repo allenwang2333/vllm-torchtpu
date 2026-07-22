@@ -26,6 +26,11 @@ sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
 
 # Now add our repo to path and import offline_inference
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu")
+
+# Monkey-patch JAX quantization mapping for deepseek_v4_fp8
+import tpu_inference.layers.common.quant_methods as qm
+qm.FP8 = "deepseek_v4_fp8"
+
 from examples.offline_inference import create_parser
 from vllm import LLM, SamplingParams
 
