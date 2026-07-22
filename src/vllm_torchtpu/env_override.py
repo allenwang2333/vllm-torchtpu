@@ -202,7 +202,8 @@ if vllm_xla_cache_path:
 # or skip sitecustomize.py execution. We call _init_device("tpu") directly
 # from the loader to bypass get_tpu_device_count() checks inside Docker containers
 # that don't mount /dev/vfio or /sys.
-try:
+if os.getenv("VLLM_BYPASS_TPU_INIT") != "1":
+    try:
     print("[DEBUG_ENV_OVERRIDE] Attempting direct _init_device('tpu')", flush=True)
     from torch_tpu._loader import _init_device
     _init_device("tpu")
