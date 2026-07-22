@@ -15,10 +15,13 @@
 
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
-from torch_tpu._internal import sync
-from vllm.config import CacheConfig
+from torch_tpu._internal import pallas, sync
+from transformers import DeepseekV2Config, DeepseekV3Config
+from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.attention.attention import \
     get_attention_context
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
@@ -33,8 +36,24 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import \
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
-from vllm.model_executor.models.deepseek_v2 import Indexer
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.models.deepseek_v2 import Indexer, DeepseekV32IndexerCache
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    SparseAttnIndexer,
+)
+from vllm.model_executor.layers.layernorm import LayerNorm
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
+from vllm_torchtpu.kernels.lightning_indexer.streamindex_topk import streamindex_topk
 
+# streamindex_topk block-tuning knobs; bkv pages/block must keep
+# page_size * bkv_p a multiple of 128 (TPU DMA constraint).
+STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
+STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
 
 def _per_token_group_quant_fp8_tpu(
     x: torch.Tensor, group_size: int = 128, eps: float = 1e-10, use_ue8m0: bool = True
@@ -43,16 +62,278 @@ def _per_token_group_quant_fp8_tpu(
     x_grouped = x.reshape(-1, group_size)
     amax = torch.clamp(x_grouped.abs().max(dim=-1, keepdim=True).values, min=eps)
     fp8_max = 448.0  # float8_e4m3fn max value
-    scale = amax / fp8_max
     if use_ue8m0:
-        scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+        # ue8m0: scale is a power of two, stored as its e8m0 bit pattern
+        # (biased exponent, 1 byte/group) so it can be packed next to the
+        # fp8 values and bitcast to float8_e8m0fnu inside the TPU kernel.
+        exp = torch.ceil(torch.log2(amax / fp8_max))
+        scale = torch.exp2(exp)
+        scale_bits = (exp + 127).clamp(0, 254).to(torch.uint8)
+    else:
+        scale = amax / fp8_max
+        scale_bits = None
     x_q = (x_grouped / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
-    scale = scale.reshape(orig_shape[:-1] + (orig_shape[-1] // group_size,))
-    return x_q.reshape(orig_shape), scale
+    out_scale = scale_bits if scale_bits is not None else scale
+    out_scale = out_scale.reshape(orig_shape[:-1] + (orig_shape[-1] // group_size,))
+    return x_q.reshape(orig_shape), out_scale
 
+
+@SparseAttnIndexer.register_oot
+class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
+    def _get_streamidx_op(self):
+        """Build (once) the torch-callable wrapper around streamindex_topk."""
+        op = getattr(self, "_streamidx_op", None)
+        if op is not None:
+            return op
+
+        topk = self.topk_tokens
+
+        def _streamidx_topk_jax(
+            q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
+            weights: jax.Array,  # [num_tokens, H]
+            cache_kv: jax.Array,  # uint8 [num_blocks, block_size, D + 1]
+            seq_lens: jax.Array,  # i32 [num_seqs]
+            page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
+            cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
+            distribution: jax.Array,  # i32 [3]
+        ) -> jax.Array:
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            num_blocks, block_size, entry_size = cache_kv.shape
+            kv_packing = 4  # uint8: 32 bits / 8
+            cache_kv = cache_kv.reshape(
+                num_blocks, block_size // kv_packing, kv_packing, entry_size
+            )
+            return streamindex_topk(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=1,
+                num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
+                num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
+            )
+
+        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
+        op = pallas.jax_op(op_name, _streamidx_topk_jax)
+
+        def _fake(q_bytes, weights, *args, **kwargs):
+            return torch.empty(
+                (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
+            )
+
+        op.register_fake(_fake)
+        self._streamidx_op = op
+        return op
+
+    def forward_oot(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        # FP8 path: single tensor (per-token scale is folded into `weights`).
+        # FP4 path: (values, scales) tuple with scales required by the kernel.
+        if isinstance(q_quant, tuple):
+            q_values, q_scale = q_quant
+        else:
+            q_values, q_scale = q_quant, None
+
+        k_quant, k_scale = _per_token_group_quant_fp8_tpu(
+            k, self.quant_block_size, use_ue8m0=True
+        )
+        # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
+        # layout the TPU kernel unpacks (head_dim value bytes + 1 scale byte).
+        # cat requires a single dtype, so view the fp8 values as raw bytes.
+        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+
+        attn_metadata = get_forward_context().attn_metadata
+        metadata = None
+        if isinstance(attn_metadata, dict):
+            metadata = attn_metadata.get(self.k_cache.prefix)
+        if not isinstance(metadata, DeepseekV32IndexerMetadata):
+            # Profiling / dummy run: no slot mapping to insert with.
+            return self.topk_indices_buffer
+
+        # Insert the packed rows into the paged cache. slot_mapping maps
+        # token i -> block_idx * block_size + block_offset; -1 slots (e.g.
+        # spec-decode padding) are skipped, and k may be padded beyond
+        # slot_mapping's length.
+        kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size, head_dim + 1]
+        if not self.skip_k_cache_insert:
+            block_size = kv_cache.shape[1]
+            slot_mapping = metadata.slot_mapping
+            valid = slot_mapping >= 0
+            slots = slot_mapping[valid].long()
+            kv_cache[slots // block_size, slots % block_size] = k_quant_packed[
+                : slot_mapping.shape[0]
+            ][valid]
+
+        # ---- streamindex_topk: assemble the unified per-sequence view ----
+        # The kernel wants one flat batch (decodes first, then prefills) with
+        # per-seq context lens, a flattened page table, cumulative query lens
+        # and a (decode_end, decode_end, num_seqs) distribution; prefills run
+        # through the kernel's MIXED case.
+        assert metadata.num_decode_tokens == metadata.num_decodes, (
+            "streamindex_topk path does not support speculative decode yet"
+        )
+        assert q_values.dtype == torch.float8_e4m3fn, (
+            f"streamindex_topk expects fp8 q, got {q_values.dtype}"
+        )
+        num_seqs = metadata.num_decodes + metadata.num_prefills
+        device = k.device
+        seq_lens = metadata.seq_lens[:num_seqs].to(torch.int32)
+
+        q_lens = []
+        tables = []
+        if metadata.num_decodes > 0:
+            decode_meta = metadata.decode
+            assert decode_meta is not None
+            q_lens.append(
+                decode_meta.decode_lens[: metadata.num_decodes].to(torch.int32)
+            )
+            tables.append(decode_meta.block_table[: metadata.num_decodes])
+        if metadata.num_prefills > 0:
+            assert metadata.prefill is not None
+            for chunk in metadata.prefill.chunks:
+                assert not chunk.skip_kv_gather, (
+                    "streamindex_topk path does not support KV-chunked prefill yet"
+                )
+                # Per-request query lens: each query token's cu_seqlen_ks is
+                # its request's start offset, i.e. an entry of cu_seq_lens.
+                req_of_token = (
+                    torch.searchsorted(
+                        chunk.cu_seq_lens, chunk.cu_seqlen_ks, right=True
+                    )
+                    - 1
+                )
+                q_lens.append(
+                    torch.bincount(req_of_token, minlength=chunk.num_reqs).to(
+                        torch.int32
+                    )
+                )
+                tables.append(chunk.block_table)
+
+        cu_q_lens = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
+        torch.cumsum(torch.cat(q_lens), dim=0, out=cu_q_lens[1:])
+
+        pages_per_seq = max(t.shape[1] for t in tables)
+        page_indices = torch.cat(
+            [
+                torch.nn.functional.pad(t, (0, pages_per_seq - t.shape[1]))
+                for t in tables
+            ]
+        ).to(torch.int32).flatten()
+
+        distribution = torch.tensor(
+            [metadata.num_decodes, metadata.num_decodes, num_seqs],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        topk_indices = self._get_streamidx_op()(
+            q_values.view(torch.uint8),
+            weights,
+            kv_cache,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+        )
+
+        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
+        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
+        self.topk_indices_buffer[:num_out, : self.topk_tokens] = topk_indices[
+            :num_out
+        ]
+        return self.topk_indices_buffer
+
+    # Reference path is also the native path (used when the custom op is
+    # disabled in CompilationConfig).
+    forward_native = forward_oot
 
 class VllmTPUIndexer(Indexer):
     """TPU-optimized out-of-tree wrapper for Indexer."""
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        config: DeepseekV2Config | DeepseekV3Config,
+        hidden_size: int,
+        q_lora_rank: int,
+        quant_config: QuantizationConfig | None,
+        cache_config: CacheConfig | None,
+        topk_indices_buffer: torch.Tensor | None,
+        prefix: str = "",
+        is_inplace_rope: bool = False,
+    ):
+        # Skip Indexer.__init__ (it builds the unfused projections); init nn.Module directly.
+        super(Indexer, self).__init__()
+        self.vllm_config = vllm_config
+        self.config = config
+        self.quant_config = quant_config
+        # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
+        self.topk_tokens = config.index_topk
+        self.n_head = config.index_n_heads  # 64
+        self.head_dim = config.index_head_dim  # 128
+        self.rope_dim = config.qk_rope_head_dim  # 64
+        self.q_lora_rank = q_lora_rank  # 1536
+        # no tensor parallel, just replicated
+        self.wq_b = ReplicatedLinear(
+            self.q_lora_rank,
+            self.head_dim * self.n_head,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+        )
+        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
+        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
+        self.wk_weights_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [self.head_dim, self.n_head],
+            bias=False,
+            quant_config=None,
+            disable_tp=True,
+            prefix=f"{prefix}.wk_weights_proj",
+        )
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.softmax_scale = self.head_dim**-0.5
+
+        self.scale_fmt = "ue8m0"
+
+        # streamindex_topk kernel limitaiton quant_block_size must be same with head_dim
+        self.quant_block_size = self.head_dim  # TODO: get from config
+        self.topk_indices_buffer = topk_indices_buffer
+
+        # NOTE: (zyongye) we use fp8 naive cache,
+        #       where we store value in fp8 and scale in fp8 since we use ue8m0 format, so we need to store 1 extra scale value
+        #       per self.quant_block_size element
+        self.k_cache = DeepseekV32IndexerCache(
+            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 1,
+            dtype=torch.uint8,
+            prefix=f"{prefix}.k_cache",
+            cache_config=cache_config,
+        )
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.prefix = prefix
+        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+
+        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        self.indexer_op = VllmTPUSparseAttnIndexer(
+            self.k_cache,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+        )
+
+        self.is_inplace_rope = is_inplace_rope
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -98,9 +379,7 @@ class VllmTPUIndexer(Indexer):
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
         weights = weights.squeeze(-1)
-
         return self.indexer_op(hidden_states, q_fp8, k, weights)
-
 
 class VllmTPUMLAAttention(MLAAttention):
     """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
