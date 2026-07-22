@@ -33,8 +33,8 @@ def redirect_tpu_device(func):
             dev = kwargs["device"]
             if dev == "tpu" or (isinstance(dev, str) and dev.startswith("tpu:")):
                 kwargs["device"] = "cpu"
-            elif isinstance(dev, torch.device) and dev.type == "tpu":
-                kwargs["device"] = torch.device("cpu")
+            elif isinstance(dev, _orig_device) and dev.type == "tpu":
+                kwargs["device"] = _orig_device("cpu")
         return func(*args, **kwargs)
     return wrapper
 
