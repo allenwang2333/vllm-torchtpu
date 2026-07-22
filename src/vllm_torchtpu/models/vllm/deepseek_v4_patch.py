@@ -333,7 +333,19 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 with torchax.default_env() as env:
                     def to_torchax(t):
                         if isinstance(t, torch.Tensor) and not hasattr(t, "_elem"):
-                            jax_arr = jax.device_put(t.detach().cpu().numpy())
+                            orig_dtype = t.dtype
+                            # Check if the dtype requires float32 casting for numpy compatibility
+                            if orig_dtype in (torch.bfloat16, getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+                                np_arr = t.detach().cpu().to(torch.float32).numpy()
+                                jax_arr = jax.device_put(np_arr)
+                                if orig_dtype == torch.bfloat16:
+                                    jax_arr = jax_arr.astype(jax.numpy.bfloat16)
+                                elif orig_dtype == getattr(torch, "float8_e4m3fn", None):
+                                    jax_arr = jax_arr.astype(jax.numpy.float8_e4m3fn)
+                                elif orig_dtype == getattr(torch, "float8_e5m2", None):
+                                    jax_arr = jax_arr.astype(jax.numpy.float8_e5m2)
+                            else:
+                                jax_arr = jax.device_put(t.detach().cpu().numpy())
                             return ta_tensor.Tensor(jax_arr, env)
                         return t
 
