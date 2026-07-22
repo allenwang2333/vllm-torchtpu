@@ -214,8 +214,10 @@ def moe_gmm(
         group_offset,
         zero_initialize=False,
         fuse_act=activation,
-    )
-    gmm1_res = gmm1_res[:, :w2.shape[1]]
+    w2_k = w2.shape[1]
+    if w2.dtype == jnp.uint8:
+        w2_k = w2_k * 2
+    gmm1_res = gmm1_res[:, :w2_k]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -299,7 +301,10 @@ def fused_moe_func(
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
     # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
-    _, padded_hidden_size, _ = w1.shape
+    if w1.dtype in (jnp.uint8, jnp.int8):
+        padded_hidden_size = w1.shape[1] * 2
+    else:
+        _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
@@ -309,12 +314,15 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
+    valid = topk_weights > 0
     if experts_start is not None:
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights,
-                                 jnp.zeros_like(topk_weights))
+        valid = valid & (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+    else:
+        topk_ids = jnp.where(valid, topk_ids, jnp.full_like(topk_ids, -1))
+    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(
