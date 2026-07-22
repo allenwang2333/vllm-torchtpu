@@ -99,9 +99,9 @@ class TestMxfp4MoETPU:
             
             # Create mock packed weights and scales (simulating MXFP4 model weights on TPU)
             w13_packed = torch.randint(0, 256, (num_experts, 2 * intermediate_size, hidden_size // 2), dtype=torch.uint8, device="cpu")
-            w13_scale = torch.randint(120, 135, (num_experts, 2 * intermediate_size, hidden_size // 32, 1), dtype=torch.uint8, device="cpu")
+            w13_scale = torch.randint(120, 135, (num_experts, hidden_size // 32, 1, 2 * intermediate_size), dtype=torch.uint8, device="cpu")
             w2_packed = torch.randint(0, 256, (num_experts, hidden_size, intermediate_size // 2), dtype=torch.uint8, device="cpu")
-            w2_scale = torch.randint(120, 135, (num_experts, hidden_size, intermediate_size // 32, 1), dtype=torch.uint8, device="cpu")
+            w2_scale = torch.randint(120, 135, (num_experts, intermediate_size // 32, 1, hidden_size), dtype=torch.uint8, device="cpu")
 
             # Setup temporary cache directory and save the pre-quantized weights
             import tempfile
