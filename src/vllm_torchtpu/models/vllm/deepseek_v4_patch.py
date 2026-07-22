@@ -353,19 +353,24 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     def patched_decoder_forward(self, x, positions, input_ids, *args, **kwargs):
         layer_idx = getattr(self, "layer_idx", -1)
-        if layer_idx in (0, 1, 2, 3, 10, 20, 30, 40, 43):
+        is_fake = (x.device.type == "meta" or
+                   type(x).__name__ == "FakeTensor" or
+                   (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
+        
+        if not is_fake and layer_idx in (0, 1, 2, 3, 10, 20, 30, 40, 43):
             # Print statistics of input x
             print(f"[DEBUG_LAYER_INPUT] Layer {layer_idx} input x: Shape={list(x.shape)} Mean={x.mean().item():.6f} Std={x.std().item():.6f} Max={x.max().item():.6f} Min={x.min().item():.6f} HasNaN={torch.isnan(x).any().item()}", flush=True)
 
         res_x, res_residual, res_post, res_comb = _orig_decoder_forward(self, x, positions, input_ids, *args, **kwargs)
 
-        if layer_idx in (0, 1, 2, 3, 10, 20, 30, 40, 43):
+        if not is_fake and layer_idx in (0, 1, 2, 3, 10, 20, 30, 40, 43):
             # Print statistics of output res_x
             print(f"[DEBUG_LAYER_OUTPUT] Layer {layer_idx} output x: Shape={list(res_x.shape)} Mean={res_x.mean().item():.6f} Std={res_x.std().item():.6f} Max={res_x.max().item():.6f} Min={res_x.min().item():.6f} HasNaN={torch.isnan(res_x).any().item()}", flush=True)
 
         return res_x, res_residual, res_post, res_comb
 
     DeepseekV4DecoderLayer.forward = patched_decoder_forward
+
 
     # 2. Clear cached resolved architectures so the AMD model is picked up.
     from vllm.model_executor.model_loader import utils as _ml_utils
