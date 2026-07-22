@@ -959,19 +959,41 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = q.dtype
-        qf = q.to(torch.float32)
-        rms = torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + self.mla_attn.eps)
-        qf = qf * rms
-        q_out, _ = self.mla_attn.rotary_emb(positions, qf)
-        return q_out.to(orig_dtype)
+        # Swap q_pe (128:192) to the front (0:64) to align with rotary_emb expectation
+        q_swapped = q.clone()
+        q_swapped[..., :64] = q[..., 128:192]
+        q_swapped[..., 128:192] = q[..., :64]
+        
+        # Apply rotary embedding (rotates the first 64 channels, i.e. q_pe)
+        q_rotated, _ = self.mla_attn.rotary_emb(positions, q_swapped.to(torch.float32))
+        q_rotated = q_rotated.to(orig_dtype)
+        
+        # Swap back to original position
+        q_out = q_rotated.clone()
+        q_out[..., 128:192] = q_rotated[..., :64]
+        q_out[..., :64] = q_rotated[..., 128:192]
+        return q_out
 
     def kv_rope(
             self,
             kv: torch.Tensor,
             positions: torch.Tensor,
     ) -> torch.Tensor:
-        kv, _ = self.mla_attn.rotary_emb(positions, kv.unsqueeze(1))
-        return kv.squeeze(1)
+        orig_dtype = kv.dtype
+        # Swap k_pe (448:512) to the front (0:64) to align with rotary_emb expectation
+        kv_swapped = kv.clone()
+        kv_swapped[..., :64] = kv[..., 448:512]
+        kv_swapped[..., 448:512] = kv[..., :64]
+        
+        # Apply rotary embedding (rotates the first 64 channels)
+        kv_rotated, _ = self.mla_attn.rotary_emb(positions, kv_swapped.unsqueeze(1).to(torch.float32))
+        kv_rotated = kv_rotated.squeeze(1).to(orig_dtype)
+        
+        # Swap back to original position
+        kv_out = kv_rotated.clone()
+        kv_out[..., 448:512] = kv_rotated[..., :64]
+        kv_out[..., :64] = kv_rotated[..., 448:512]
+        return kv_out
 
     def attention_impl(
             self,
