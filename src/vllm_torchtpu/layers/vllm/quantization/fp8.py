@@ -607,8 +607,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                                       requires_grad=False)
                 w2_weight_scale = torch.nn.Parameter(w2_scale_data,
                                                      requires_grad=False)
-                layer.register_parameter("w13_weight_scale", w13_weight_scale)
-                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.register_parameter(f"w13_{self.weight_scale_name}", w13_weight_scale)
+                layer.register_parameter(f"w2_{self.weight_scale_name}", w2_weight_scale)
+
                 from vllm.model_executor.layers.fused_moe import \
                     FusedMoeWeightScaleSupported
                 attrs = dict(extra_weight_attrs)
@@ -677,10 +678,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                  activation=activation_str,
              )
 
-        if hasattr(layer, "w13_weight_scale"):
-            del layer.w13_weight_scale
-        if hasattr(layer, "w2_weight_scale"):
-            del layer.w2_weight_scale
+        if hasattr(layer, f"w13_{self.weight_scale_name}"):
+            delattr(layer, f"w13_{self.weight_scale_name}")
+        if hasattr(layer, f"w2_{self.weight_scale_name}"):
+            delattr(layer, f"w2_{self.weight_scale_name}")
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
