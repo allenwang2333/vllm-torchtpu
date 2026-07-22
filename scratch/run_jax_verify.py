@@ -9,31 +9,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["VLLM_ENFORCE_EAGER"] = "1"
 os.environ["VLLM_BYPASS_TPU_INIT"] = "1"
 
-import torch.utils
-_orig_rename = getattr(torch.utils, "rename_privateuse1_backend", None)
-if _orig_rename is not None:
-    def patched_rename(name):
-        try:
-            _orig_rename(name)
-        except RuntimeError as e:
-            if "already been set" in str(e):
-                pass
-            else:
-                raise e
-    torch.utils.rename_privateuse1_backend = patched_rename
 
-import torch
-_orig_register = getattr(torch, "_register_device_module", None)
-if _orig_register is not None:
-    def patched_register(device_type, module):
-        try:
-            _orig_register(device_type, module)
-        except RuntimeError as e:
-            if "already be" in str(e) or "Expected one of" in str(e) or "already registered" in str(e):
-                pass
-            else:
-                raise e
-    torch._register_device_module = patched_register
 
 # Add torchtpu-vllm/src to path so we can import env_override
 sys.path.insert(0, "/mnt/workspace/vllm-torchtpu/src")
