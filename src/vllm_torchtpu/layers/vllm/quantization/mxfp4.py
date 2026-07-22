@@ -569,7 +569,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 layer=layer,
             )
 
-        print(f"[DEVICE_CHECK] x: {x.device}, w1: {layer.w13_weight.device}, w2: {layer.w2_weight.device}, scale1: {layer.w13_weight_scale.device}, scale2: {layer.w2_weight_scale.device}", flush=True)
         res = fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
