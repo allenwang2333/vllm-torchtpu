@@ -37,7 +37,7 @@ if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
                 namespace, op_name = name.split("::")
                 custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
                 custom_op = custom_op_packet.default
-                ta_registry.register_torch_dispatch_op(custom_op, result)
+                ta_registry.register_torch_dispatch_op(custom_op, result._backend_fns[None])
                 print(f"[PATCH_JAX_OP] Registered custom op {name} with torchax registry", file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", file=sys.stderr, flush=True)
