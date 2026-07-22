@@ -19,15 +19,25 @@ torch._dynamo.config.disable = True
 
 # Globally patch torch.device to redirect tpu allocation to cpu under JAX verification
 _orig_device = torch.device
-def patched_device(device_type, *args, **kwargs):
-    if device_type == "tpu":
-        print("[JAX_VERIFY_PATCH] Globally redirecting torch.device('tpu') -> torch.device('cpu')", flush=True)
-        return _orig_device("cpu")
-    if isinstance(device_type, str) and device_type.startswith("tpu:"):
-        print(f"[JAX_VERIFY_PATCH] Globally redirecting torch.device('{device_type}') -> torch.device('cpu')", flush=True)
-        return _orig_device("cpu")
-    return _orig_device(device_type, *args, **kwargs)
-torch.device = patched_device
+
+class DeviceMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _orig_device) or super().__instancecheck__(instance)
+    def __or__(cls, other):
+        import typing
+        return typing.Union[cls, other]
+    def __ror__(cls, other):
+        import typing
+        return typing.Union[other, cls]
+
+class PatchedDeviceClass(metaclass=DeviceMeta):
+    def __new__(cls, device_type, *args, **kwargs):
+        if device_type == "tpu" or (isinstance(device_type, str) and device_type.startswith("tpu:")):
+            print("[JAX_VERIFY_PATCH] Globally redirecting torch.device('tpu') -> torch.device('cpu')", flush=True)
+            return _orig_device("cpu")
+        return _orig_device(device_type, *args, **kwargs)
+
+torch.device = PatchedDeviceClass
 
 def redirect_tpu_device(func):
     import functools
