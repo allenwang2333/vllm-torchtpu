@@ -1,3 +1,4 @@
+import torch
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions and classes for TPU runners."""
 
@@ -294,7 +295,7 @@ class PhaseBasedProfiler:
             self.profile_context = profiler_api.profile(
                 activities=[
                     profiler_api.ProfilerActivity.CPU,
-                    profiler_api.ProfilerActivity.TPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
                 ],
                 on_trace_ready=handler,
             )

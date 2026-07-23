@@ -450,7 +450,7 @@ class TPUWorker(WorkerBase):
             handler = profiler_api.xprof_trace_handler(dir_name=profile_dir)
             self.profile_context = profiler_api.profile(activities=[
                 profiler_api.ProfilerActivity.CPU,
-                profiler_api.ProfilerActivity.TPU
+                torch.profiler.ProfilerActivity.PrivateUse1
             ],
                                                         on_trace_ready=handler)
             self.profile_context.__enter__()
