@@ -1178,7 +1178,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         t = o.shape[0]
         o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
-        o_ref = o_ref.to(torch.bfloat16)
+        o_ref = torch.nan_to_num(o_ref, nan=0.0).to(torch.bfloat16)
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
