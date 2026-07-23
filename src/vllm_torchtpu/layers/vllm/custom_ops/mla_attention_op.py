@@ -38,7 +38,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import Indexer, DeepseekV32IndexerCache
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
 )
@@ -80,6 +80,12 @@ def _per_token_group_quant_fp8_tpu(
 
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
+        # cannot trace if the op is first built inside a compiled forward.
+        self._get_streamidx_op()
+
     def _get_streamidx_op(self):
         """Build (once) the torch-callable wrapper around streamindex_topk."""
         op = getattr(self, "_streamidx_op", None)
@@ -92,21 +98,36 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
             weights: jax.Array,  # [num_tokens, H]
             cache_kv: jax.Array,  # uint8 [num_blocks, block_size, D + 1]
+            k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
             seq_lens: jax.Array,  # i32 [num_seqs]
             page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
-        ) -> jax.Array:
-            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+        ) -> tuple[jax.Array, jax.Array]:
             num_blocks, block_size, entry_size = cache_kv.shape
+
+            # Fused insert (TPU metadata has no slot_mapping): same position
+            # formula and OOB-drop contract as _update_kv_cache_slots.
+            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+            seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
+                                      side="right").astype(jnp.int32)
+            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+            page = jnp.where(tok < cu_q_lens[-1],
+                             page_indices.reshape(seq_lens.shape[0],
+                                                  -1)[seq_id, pos // block_size],
+                             jnp.int32(2**30))
+            cache_kv = cache_kv.at[page, pos % block_size].set(k_packed)
+
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_packing = 4  # uint8: 32 bits / 8
-            cache_kv = cache_kv.reshape(
+            cache_view = cache_kv.reshape(
                 num_blocks, block_size // kv_packing, kv_packing, entry_size
             )
-            return streamindex_topk(
+            topk_indices = streamindex_topk(
                 q,
                 weights,
-                cache_kv,
+                cache_view,
                 seq_lens,
                 page_indices,
                 cu_q_lens,
@@ -116,16 +137,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
                 num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
             )
+            return cache_kv, topk_indices
 
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        op = pallas.jax_op(op_name, _streamidx_topk_jax)
+        jax_op = pallas.jax_op(op_name, _streamidx_topk_jax,
+                               donate_argnums=(2, ))
 
-        def _fake(q_bytes, weights, *args, **kwargs):
-            return torch.empty(
+        def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
+            return torch.empty_like(cache_kv), torch.empty(
                 (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
             )
 
-        op.register_fake(_fake)
+        jax_op.register_fake(_fake)
+
+        def op(*args):
+            new_cache, topk_indices = jax_op(*args)
+            args[2].copy_(new_cache)
+            return topk_indices
+
         self._streamidx_op = op
         return op
 
@@ -155,90 +184,32 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         metadata = None
         if isinstance(attn_metadata, dict):
             metadata = attn_metadata.get(self.k_cache.prefix)
-        if not isinstance(metadata, DeepseekV32IndexerMetadata):
-            # Profiling / dummy run: no slot mapping to insert with.
+        if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
-        # Insert the packed rows into the paged cache. slot_mapping maps
-        # token i -> block_idx * block_size + block_offset; -1 slots (e.g.
-        # spec-decode padding) are skipped, and k may be padded beyond
-        # slot_mapping's length.
         kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size, head_dim + 1]
-        if not self.skip_k_cache_insert:
-            block_size = kv_cache.shape[1]
-            slot_mapping = metadata.slot_mapping
-            valid = slot_mapping >= 0
-            slots = slot_mapping[valid].long()
-            kv_cache[slots // block_size, slots % block_size] = k_quant_packed[
-                : slot_mapping.shape[0]
-            ][valid]
+        if kv_cache.numel() == 0:
+            # Profiling run: the runner has not bound the caches yet.
+            return self.topk_indices_buffer
 
-        # ---- streamindex_topk: assemble the unified per-sequence view ----
-        # The kernel wants one flat batch (decodes first, then prefills) with
-        # per-seq context lens, a flattened page table, cumulative query lens
-        # and a (decode_end, decode_end, num_seqs) distribution; prefills run
-        # through the kernel's MIXED case.
-        assert metadata.num_decode_tokens == metadata.num_decodes, (
-            "streamindex_topk path does not support speculative decode yet"
-        )
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
-        num_seqs = metadata.num_decodes + metadata.num_prefills
-        device = k.device
-        seq_lens = metadata.seq_lens[:num_seqs].to(torch.int32)
-
-        q_lens = []
-        tables = []
-        if metadata.num_decodes > 0:
-            decode_meta = metadata.decode
-            assert decode_meta is not None
-            q_lens.append(
-                decode_meta.decode_lens[: metadata.num_decodes].to(torch.int32)
-            )
-            tables.append(decode_meta.block_table[: metadata.num_decodes])
-        if metadata.num_prefills > 0:
-            assert metadata.prefill is not None
-            for chunk in metadata.prefill.chunks:
-                assert not chunk.skip_kv_gather, (
-                    "streamindex_topk path does not support KV-chunked prefill yet"
-                )
-                # Per-request query lens: each query token's cu_seqlen_ks is
-                # its request's start offset, i.e. an entry of cu_seq_lens.
-                req_of_token = (
-                    torch.searchsorted(
-                        chunk.cu_seq_lens, chunk.cu_seqlen_ks, right=True
-                    )
-                    - 1
-                )
-                q_lens.append(
-                    torch.bincount(req_of_token, minlength=chunk.num_reqs).to(
-                        torch.int32
-                    )
-                )
-                tables.append(chunk.block_table)
-
-        cu_q_lens = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
-        torch.cumsum(torch.cat(q_lens), dim=0, out=cu_q_lens[1:])
-
-        pages_per_seq = max(t.shape[1] for t in tables)
-        page_indices = torch.cat(
-            [
-                torch.nn.functional.pad(t, (0, pages_per_seq - t.shape[1]))
-                for t in tables
-            ]
-        ).to(torch.int32).flatten()
-
-        distribution = torch.tensor(
-            [metadata.num_decodes, metadata.num_decodes, num_seqs],
-            dtype=torch.int32,
-            device=device,
-        )
+        # TPU metadata already carries the kernel's flat per-sequence view.
+        seq_lens = metadata.seq_lens
+        page_indices = metadata.block_tables
+        cu_q_lens = metadata.query_start_loc
+        # TPU request_distribution is (decode_end, prefill_end, num_seqs); the
+        # kernel wants (decode_end, decode_end, num_seqs) so every non-decode
+        # sequence routes through its MIXED case.
+        rd = metadata.request_distribution
+        distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         topk_indices = self._get_streamidx_op()(
             q_values.view(torch.uint8),
             weights,
             kv_cache,
+            k_quant_packed,
             seq_lens,
             page_indices,
             cu_q_lens,
