@@ -48,6 +48,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
                                              if spec_k is None else object())),
         speculative_config=(None if spec_k is None else SimpleNamespace(
             num_speculative_tokens=spec_k)),
+        _last_sequence_layout_plan=None,
         input_batch=SimpleNamespace(req_ids=req_ids))
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
@@ -679,14 +680,14 @@ class TestTPURunner:
         attn.num_kv_heads = 2
         attn.head_size = 128
         attn.sliding_window = attn_window
-        attn.impl = None
+        attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         target = MagicMock(spec=Attention)
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
         target.sliding_window = target_window
-        target.impl = None
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
         return attn, target
 
     def test_validate_shared_layout_skips_sliding_window_when_hma_disabled(
