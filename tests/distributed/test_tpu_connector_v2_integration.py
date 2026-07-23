@@ -1271,7 +1271,8 @@ def test_zmq_prefill_decode_fa_4pcp_gdn_4tp_to_decode_tp(
                         kv_transfer_config=types.SimpleNamespace(
                             is_kv_producer=False),
                         parallel_config=types.SimpleNamespace(
-                            data_parallel_rank=0),
+                            data_parallel_rank=0,
+                            tensor_parallel_size=decode_tp_size),
                         cache_config=types.SimpleNamespace(block_size=1)))
                 worker.tp_rank = decode_tp_rank
                 worker.set_strided_transfer_bridge(
