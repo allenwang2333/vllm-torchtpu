@@ -582,7 +582,7 @@ def _mla_ragged_paged_attention_kernel(
             attention_sinks = jnp.concat(
                 [attention_sinks_ref[...] for _ in range(bq_sz)])[..., None]
             exp_attention_sinks = jnp.where(
-                m_ref[...] == float("-inf"),
+                (m_ref[...] <= -1e30) | (l_ref[...] <= 1e-10),
                 0.0,
                 jnp.exp(attention_sinks - m_ref[...]),
             )
