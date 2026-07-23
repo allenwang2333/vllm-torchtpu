@@ -442,7 +442,10 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
-        "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
+        "PHASED_PROFILING_DIR", "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR",
+        "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP",
+        "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
+        "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
         "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
@@ -620,20 +623,6 @@ class TpuPlatform(Platform):
         if pcp_config.enabled:
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
-
-        # libtpu never completes a pool-program execution whose TP all-reduce
-        # was offloaded to the SparseCore (the `auto` payload threshold
-        # selects the offload from ~1024-token buckets upward); keep the
-        # all-reduce on the TensorCore when the unified block pool serves the
-        # KV cache. Set before workers spawn — torch_tpu reads this env once
-        # per process at first compile. Respect an explicit user setting of
-        # the same key.
-        if unified_kv_layout_enabled(vllm_config):
-            sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-            xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
-            if sc_ar not in xla_opts:
-                os.environ["TORCH_TPU_INTERNAL_XLA_OPTIONS"] = (
-                    f"{xla_opts} {sc_ar}=false".strip())
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
