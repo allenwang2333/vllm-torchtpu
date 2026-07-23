@@ -417,8 +417,8 @@ def _process_fp8_moe_weights(
     unpadded_intermediate = (
         layer.moe_config.intermediate_size_per_partition_unpadded)
     if padded_intermediate != unpadded_intermediate:
-        full_intermediate = unpadded_intermediate * layer.tp_size
-        local_start = padded_intermediate * layer.tp_rank
+        full_intermediate = unpadded_intermediate * layer.moe_config.tp_size
+        local_start = padded_intermediate * layer.moe_config.tp_rank
         local_real = max(
             0, min(padded_intermediate, full_intermediate - local_start))
         if local_real < padded_intermediate:
