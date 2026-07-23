@@ -40,7 +40,8 @@ def check_nan(name: str, tensor: torch.Tensor, prefix: str):
     if not is_fake:
         has_nan = torch.isnan(tensor).any().item()
         if has_nan:
-            print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} device={tensor.device}", flush=True)
+            nan_token_0 = torch.isnan(tensor[0]).any().item() if tensor.shape[0] > 0 else False
+            print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} token0_has_nan={nan_token_0}", flush=True)
         elif os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
             t_flt = tensor.to(torch.float32)
             t_mean = t_flt.mean().item()
