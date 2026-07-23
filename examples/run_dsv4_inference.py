@@ -49,8 +49,8 @@ def main():
         trust_remote_code=True,
         max_model_len=64,
         max_num_batched_tokens=64,
-        kv_cache_dtype="fp8",
-        gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", "0.20")),
+        kv_cache_dtype="auto",
+        gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", os.getenv("GPU_MEM_UTIL", "0.40"))),
         enable_expert_parallel=ep_size > 1,
         enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
         additional_config={
