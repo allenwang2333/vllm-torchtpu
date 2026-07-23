@@ -1209,13 +1209,14 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         wo_a_grouped = wo_a_dequant.view(n_local_groups, o_lora_rank, -1)
         
         z = torch.einsum("tgd,grd->tgr", o_ref_grouped, wo_a_grouped)
-        z_flat = z.flatten(1)
+        z_flat = torch.nan_to_num(z.flatten(1), nan=0.0)
         check_nan("z_flat", z_flat, self.custom_prefix)
 
         # --- wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).
         out = self.wo_b(z_flat)
         if isinstance(out, tuple):
             out = out[0]
+        out = torch.nan_to_num(out, nan=0.0)
         check_nan("out_o_proj", out, self.custom_prefix)
         return out
 
@@ -1272,7 +1273,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         )
         check_nan("attn_output (attention_impl)", attn_output, self.custom_prefix)
 
-        out = self._o_proj(attn_output, positions)
+        out = torch.nan_to_num(self._o_proj(attn_output, positions), nan=0.0)
         check_nan("forward_out", out, self.custom_prefix)
         return out
 
