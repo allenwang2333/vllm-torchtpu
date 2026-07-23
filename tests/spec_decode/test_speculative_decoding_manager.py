@@ -201,15 +201,17 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     mock_runner = MagicMock()
     mock_runner.input_batch.num_reqs = 2
     mock_runner.speculative_config.method = "ngram"
-    mock_runner.speculative_config.num_speculative_tokens = 4
     mock_drafter = MagicMock(spec=NgramProposer)
     mock_drafter.propose.return_value = [[5], [6]]
     mock_runner.drafter = mock_drafter
     mock_runner.input_batch.num_tokens_no_spec = "NTS"
     mock_runner.input_batch.token_ids_cpu = "TIDS"
     manager = SpeculativeDecodingManager(mock_runner)
+    scheduler_output = MagicMock()
+    scheduler_output.num_spec_tokens_to_schedule = 4
 
-    result = manager.propose_draft_token_ids(sampled_token_ids=[[1], [2], [3]])
+    result = manager.propose_draft_token_ids(sampled_token_ids=[[1], [2], [3]],
+                                             scheduler_output=scheduler_output)
 
     assert result is None
     assert manager._draft_token_ids == [[5], [6]]
