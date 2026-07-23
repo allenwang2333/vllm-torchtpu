@@ -656,6 +656,7 @@ class TestTPURunner:
         owner.head_size = 128
         owner.kv_sharing_target_layer_name = None
         owner.sliding_window = None
+        owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         shared = MagicMock(spec=Attention)
         shared.attn_type = AttentionType.DECODER
@@ -663,6 +664,7 @@ class TestTPURunner:
         shared.head_size = 128
         shared.kv_sharing_target_layer_name = "layer.0"
         shared.sliding_window = None
+        shared.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
         mock_get_layers.return_value = {
             "layer.0": owner,
