@@ -956,10 +956,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
-            # Uniform mamba layout: the GDN op reads/writes the live
-            # recurrent state at the mamba table's FIRST block
-            # (block_tables[:, 0] fallback); later blocks hold APC boundary
-            # checkpoints, not the live state.
+            # Align-mode mamba layout: the live recurrent state follows the
+            # request's last token through the mamba table
+            # (_collect_mamba_state_seed_copies seeds from position
+            # (computed-1)//block_size on a prefix-cache resume), so the
+            # transferred boundary state must land at THAT table position —
+            # not slot 0, which only holds the first page's checkpoint.
+            # NOTE(investigation): the runner's align-mode seeding indexes
+            # the mamba table POSITIONALLY by (computed-1)//block_size, but
+            # remote-KV resumes allocate a single mamba block (len==1), so
+            # position 7 resolves to the padded null entry and the GDN op
+            # falls back to pool block 0. Delivering at the boundary
+            # position therefore cannot work without an allocation-side
+            # change; ship slot 0 (the allocated block) until the runner's
+            # remote-resume state addressing is settled.
             mamba_state_block_ids = []
             for mamba_gid in self._stage3_mamba_group_indices:
                 if mamba_gid >= len(grouped_block_ids):
@@ -1091,8 +1101,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if not mamba_block_ids:
                 raise ValueError("GDN state is present but the producer's "
                                  "mamba block tables were not provided")
-            # Live state is at the mamba table's first block (see the
-            # consumer-side note); the producer ships that slot.
+            # Producer state source: both runners gather the state slot
+            # positionally over the mamba group's own table
+            # (attention_metadata.py, unified-layout branch); with the
+            # single-entry tables of a 32k request that is group_ids[0] on
+            # each side, so the group tables name the written blocks
+            # directly.
             mamba_state_block_ids = []
             for ordinal, group_ids in enumerate(mamba_block_ids):
                 if not group_ids:
@@ -1100,6 +1114,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                         "GDN state reshard: producer mamba table is empty "
                         f"(ordinal {ordinal})")
                 mamba_state_block_ids.append(int(group_ids[0]))
+            logger.info(
+                "Stage-3 GDN state source req_id=%s group_tables=%s "
+                "chosen=%s", request.request_id,
+                [list(g)[:3] for g in mamba_block_ids],
+                mamba_state_block_ids)
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
@@ -1196,6 +1215,14 @@ class TPURaidenConnectorWorker:
         self._stage3_state_source_to_dest: dict[str, str] = {}
         self._stage3_state_pending: dict[str, set[str]] = {}
         self._stage3_fa_done_awaiting_state: set[str] = set()
+        # Deferred state-class load submissions, keyed by destination req id.
+        # The FA payload and the GDN state slots address the SAME unified
+        # arena pages (7 pools per storage, zero headroom), and the mamba
+        # state slot id can coincide with an FA destination page id, so the
+        # two H2Ds are last-writer-wins. Submitting the state classes only
+        # after the FA transfer's native receive completes makes the state
+        # bytes land last, deterministically.
+        self._stage3_deferred_state_loads: dict[str, tuple[Any, ...]] = {}
         # Producer-side sibling lifecycle. Native Raiden reports each GDN
         # state transfer under its connector-private derived request ID, but
         # vLLM knows only the base request. Keep those IDs entirely below the
@@ -1369,6 +1396,7 @@ class TPURaidenConnectorWorker:
             "geometry": summary_geometry,
         })
         self._raiden_admission_summary = dict(summary)
+
 
         logger.info(
             "Raiden pool admission complete topology=%s role=%s binding=%s "
@@ -1719,6 +1747,25 @@ class TPURaidenConnectorWorker:
         facade, _ = self._require_stage3_controller()
         if self._raiden_work_unit is None:
             raise RuntimeError("Stage-3 producer work unit is not registered")
+        # Fence the finishing step before any registration: under async
+        # scheduling the execution that wrote this request's final KV bytes
+        # (in particular the GDN recurrent-state block, materialized by the
+        # request's last chunk) can still be in flight when the scheduler
+        # retires the request. Raiden's D2H staging is a raw PJRT copy,
+        # unordered against in-flight executions, so an unfenced first-pool
+        # push snapshots pre-final (initial-fill) state bytes — wire-proven
+        # as rank-identical state corruption on the earliest-staged pool.
+        # The async copy_state wait is the same device-quiescence point the
+        # engine itself uses to read the step's sampled tokens (idempotent,
+        # engine-thread safe); torch-level tensor syncs must NOT be used
+        # here — they deadlock against Raiden's buffer wrap.
+        runner = self.runner
+        pre = getattr(runner, "_pre_async_results", None) \
+            if runner is not None else None
+        copy_state = getattr(pre, "copy_state", None) \
+            if pre is not None else None
+        if copy_state is not None:
+            copy_state.wait()
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
         if transfer_rank < 0 or transfer_rank >= parallelism:
@@ -2235,6 +2282,7 @@ class TPURaidenConnectorWorker:
         for derived_req_id in pending:
             self._stage3_state_source_to_dest.pop(derived_req_id, None)
         self._stage3_fa_done_awaiting_state.discard(destination_req_id)
+        self._stage3_deferred_state_loads.pop(destination_req_id, None)
 
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any,
@@ -2368,9 +2416,14 @@ class TPURaidenConnectorWorker:
                     raise RuntimeError(
                         "destination controller rejected Stage-3 transfer")
                 fa_accepted = True
-                self._submit_stage3_state_loads(
-                    facade, destination_req_id, source_req_id, uuid, src_units,
-                    src_controller_address, dst_controller_address,
+                # Deferred: the state-class siblings are submitted from
+                # _poll_finished once the FA transfer's native receive
+                # completes, so the state bytes are the last writer on the
+                # shared arena pages (see _stage3_deferred_state_loads).
+                self._stage3_deferred_state_loads[destination_req_id] = (
+                    facade, destination_req_id, source_req_id, uuid,
+                    src_units, src_controller_address,
+                    dst_controller_address,
                     getattr(req_meta, "mamba_state_block_ids", None))
             except Exception as exc:  # pylint: disable=broad-except
                 missing_d5 = "Missing producer block registration" in str(exc)
@@ -2591,6 +2644,27 @@ class TPURaidenConnectorWorker:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
                 for req_id in expired_uncertain:
                     self._stage3_pending_controller_failures.pop(req_id, None)
+            # FA native receive completed: now submit the deferred state
+            # classes so their bytes land after FA's on the shared arena
+            # pages. Populating _stage3_state_pending here keeps this pass's
+            # completion gate below holding the base request open until the
+            # states finish.
+            if self._stage3_deferred_state_loads:
+                for dest in list(done_recving):
+                    deferred = self._stage3_deferred_state_loads.pop(
+                        dest, None)
+                    if deferred is None:
+                        continue
+                    try:
+                        self._submit_stage3_state_loads(*deferred)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.error(
+                            "Deferred Stage-3 state load submission failed "
+                            "destination_req_id=%s: %s", dest, exc)
+                        if dest not in failed_recving:
+                            failed_recving = list(failed_recving) + [dest]
+                for dest in failed_recving:
+                    self._stage3_deferred_state_loads.pop(dest, None)
             # Gate FA completion on the sibling state classes: the request
             # is done only when every configured class has landed. Failures
             # already collapsed onto the base ID above.
