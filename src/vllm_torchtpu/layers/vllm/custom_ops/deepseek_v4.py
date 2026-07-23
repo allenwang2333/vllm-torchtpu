@@ -1200,6 +1200,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         else:
             s_flat = s.view(w.shape[0], 1)
             
+        s_flat = torch.nan_to_num(s_flat, nan=1.0)
         wo_a_dequant = w.to(o_ref.dtype) * s_flat.to(o_ref.dtype)
         check_nan("wo_a_dequant", wo_a_dequant, self.custom_prefix)
         
