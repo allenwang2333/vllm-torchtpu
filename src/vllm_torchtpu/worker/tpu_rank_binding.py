@@ -360,6 +360,9 @@ def get_tpu_worker_binding(
     local_rank = int(local_rank)
     if dp_size > 1:
         dp_rank = parallel_config.data_parallel_index
+        assert dp_rank is not None, (
+            "ParallelConfig.data_parallel_index must be resolved when "
+            "data_parallel_size > 1")
 
         native_local_rank = dp_rank * world_size + local_rank
         global_rank = dp_rank * world_size + rank

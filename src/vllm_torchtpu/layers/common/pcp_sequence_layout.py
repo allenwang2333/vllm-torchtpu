@@ -44,18 +44,6 @@ def _get_pcp_streaming_q_block_size() -> int:
     return PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
 
 
-def _as_int(value: Any, default: int) -> int:
-    return value if isinstance(value, int) else default
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return bool(value)
-    return default
-
-
 class PcpSequenceLayoutMode(Enum):
     DISABLED = "DISABLED"
     STREAMING = "STREAMING"
@@ -111,14 +99,13 @@ class PcpSequenceLayoutEligibility:
         speculative_enabled: bool = False,
         is_kv_producer: bool | None = None,
     ):
-        self.pcp_size = _as_int(pcp_size, 1)
-        self.interleave_size = _as_int(interleave_size, 1)
-        self.dcp_size = _as_int(dcp_size, 1)
-        self.pipeline_parallel_size = _as_int(pipeline_parallel_size, 1)
-        self.async_scheduling = _as_bool(async_scheduling)
+        self.pcp_size = pcp_size
+        self.interleave_size = interleave_size
+        self.dcp_size = dcp_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.async_scheduling = bool(async_scheduling)
         self.speculative_enabled = bool(speculative_enabled)
-        self.is_kv_producer = (is_kv_producer if isinstance(
-            is_kv_producer, bool) else None)
+        self.is_kv_producer = is_kv_producer
 
     @classmethod
     def from_vllm_config(cls,
