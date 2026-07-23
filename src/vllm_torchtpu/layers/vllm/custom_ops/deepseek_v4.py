@@ -1138,11 +1138,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         if is_csa:
             assert topk_indices is not None
             max_valid_kv = max(1, (positions.max().item() + 1) // self.compress_ratio)
-            extra = torch.where((topk_indices >= 0) & (topk_indices < max_valid_kv), topk_indices, torch.full_like(topk_indices, -1))
-            # Functional unmasking of ONLY position [i, 0] (Tile 0, Candidate 0) when all 512 candidates are masked (-1)
-            all_masked = (extra == -1).all(dim=-1, keepdim=True)
-            first_col = (torch.arange(extra.shape[1], device=extra.device) == 0).unsqueeze(0)
-            extra = torch.where(all_masked & first_col, torch.zeros_like(extra), extra)
+            extra = torch.clamp(topk_indices.to(torch.int32), min=0, max=max_valid_kv - 1)
         else:
             extra = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1)
             
