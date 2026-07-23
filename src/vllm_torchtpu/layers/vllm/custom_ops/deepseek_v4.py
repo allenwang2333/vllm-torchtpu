@@ -1124,7 +1124,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             if main_cache_kv is None:
                 main_cache_kv = sw_cache
             m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
-            main_kv_lens = m_seq_lens // self.compress_ratio if m_seq_lens is not None else None
+            ratio = self.compress_ratio if is_csa else 1
+            main_kv_lens = m_seq_lens // ratio if m_seq_lens is not None else None
             main_page_indices = _get_field(main_attn_metadata, "block_tables")
             main_cu_q_lens = _get_field(main_attn_metadata, "query_start_loc")
             main_distribution = _get_field(main_attn_metadata, "request_distribution")
