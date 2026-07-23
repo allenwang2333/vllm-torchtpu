@@ -4093,6 +4093,8 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        assert kv_cache_config.num_blocks is not None, (
+            "KVCacheConfig.num_blocks must be resolved by the scheduler")
         kv_cache_config = copy.deepcopy(kv_cache_config)
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.

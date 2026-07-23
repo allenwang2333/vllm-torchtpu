@@ -75,6 +75,13 @@ def test_validate_linear_ep_placement_accepts_linear():
         SimpleNamespace(expert_placement_strategy="linear"))
 
 
+def test_validate_linear_ep_placement_requires_declared_strategy():
+    # An object that never declares its placement must fail loudly, not be
+    # assumed linear.
+    with pytest.raises(AttributeError):
+        moe_routing.validate_linear_ep_placement(SimpleNamespace())
+
+
 def test_validate_linear_ep_placement_rejects_round_robin():
     with pytest.raises(NotImplementedError, match="linear EP placement"):
         moe_routing.validate_linear_ep_placement(

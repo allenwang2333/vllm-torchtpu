@@ -1092,6 +1092,28 @@ class TestTPURunner:
                                                    attn_spec.head_size,
                                                    attn_spec.dtype)
 
+    def test_initialize_kv_cache_rejects_unresolved_num_blocks(self):
+        # num_blocks is resolved by the scheduler before reaching the runner;
+        # an unresolved config must fail loudly instead of being recomputed.
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        kv_cache_config = KVCacheConfig(
+            num_blocks=None,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384 * 5, shared_by=["attn.0"]),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn.0"],
+                                 kv_cache_spec=attn_spec),
+            ],
+        )
+
+        with pytest.raises(AssertionError, match="num_blocks"):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
 
 class TestAttentionMetadataBuilder:
     """Direct tests for AttentionMetadataBuilder.build, exercising the
