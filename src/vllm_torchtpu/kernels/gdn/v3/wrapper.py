@@ -66,7 +66,6 @@ def inner_kernel(
     """
 
     p_id = pl.program_id(0)
-    is_spec = cfg.mode == config.GDNMode.SPEC
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -100,7 +99,6 @@ def inner_kernel(
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         cfg=cfg,
-        collect_windows=is_spec,
     )
 
     if cfg.state_plan is None:
@@ -113,7 +111,9 @@ def inner_kernel(
                                          cfg.state_plan.conv,
                                          new_conv_state[idx])
     if carry_conv_scratch_ref is not None:
-        carry_conv_scratch_ref[...] = new_conv_state
+        # The next tile resumes from the state after this tile's last token,
+        # which is the final checkpoint.
+        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -128,10 +128,7 @@ def inner_kernel(
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
-    # SPEC mode uses the token-recurrent path: windows are tiny
-    # (num_spec + 1 tokens) and the scan produces the per-token state
-    # checkpoints the rollback scheme stores.
-    if cfg.chunk_size == 1 or is_spec:
+    if cfg.use_recurrent:
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
@@ -152,7 +149,6 @@ def inner_kernel(
             dt_bias=dt_bias,
             cfg=cfg,
             real_sizes=real_sizes,
-            collect_states=is_spec,
         )
 
     else:
@@ -190,7 +186,7 @@ def inner_kernel(
                                          new_recurrent_state[idx])
 
     if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def outer_kernel(
@@ -352,11 +348,11 @@ def fused_conv1d_gdn(
             of per-request groups of `num_spec_tokens + 1` consecutive slots.
         distribution: Tensor of shape [3] int32 — [decode_end, prefill_end,
             mixed_end]. With `num_spec_tokens > 0`, the first segment holds
-            windowed sequences (decodes and speculative verify windows of up
-            to `num_spec_tokens + 1` tokens) processed in SPEC mode.
+            speculative verify windows of up to `num_spec_tokens + 1` tokens
+            rather than 1-token decodes.
         seq_lens: Sequence lengths for each sequence of shape [num_seqs].
         read_offsets: Optional [num_seqs] int32 — per-sequence state read
-            offset (num_accepted - 1 from the last verify step). SPEC-mode
+            offset (num_accepted - 1 from the last verify step). Windowed
             sequences read their initial state from
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
@@ -373,8 +369,8 @@ def fused_conv1d_gdn(
             returned in place of the dense states.
         state_plan: Static copy-plan describing the source's state regions.
             Must be set iff `state_source` is set.
-        num_spec_tokens: Number of speculative draft tokens (0 disables SPEC
-            mode and preserves the original BATCHED decode path).
+        num_spec_tokens: Number of speculative draft tokens (0 gives the
+            plain 1-token-per-sequence decode path).
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -431,7 +427,7 @@ def fused_conv1d_gdn(
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
-        # SPEC mode holds one state checkpoint per window position per
+        # A verify window holds one state checkpoint per window position per
         # sequence in VMEM, which multiplies the per-sequence footprint by
         # the window size. Shrink the tile so the double-buffered windows
         # fit in roughly half the scoped-VMEM budget (the rest goes to
@@ -446,7 +442,7 @@ def fused_conv1d_gdn(
             + (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
             + dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        vmem_budget = int(config.GDNConfig.SPEC_VMEM_FRACTION *
+        vmem_budget = int(config.GDNConfig.WINDOWED_VMEM_FRACTION *
                           pltpu.get_tpu_info().vmem_capacity_bytes)
         spec_tile_budget = (vmem_budget // 2) // num_buffers
         decode_tile_size = max(
@@ -494,15 +490,18 @@ def fused_conv1d_gdn(
         # recurrent-state input is absent.
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
+            # Prefill / mixed sequences keep a single state checkpoint.
+            window_size = 1
         else:
             tile_size = decode_tile_size
+            window_size = num_spec_tokens + 1
 
         cfg = config.GDNConfig(
             mode=mode,
             batch_size=padded_batch_size,
             kernel_size=kernel_size,
             tile_size=tile_size,
-            window_size=num_spec_tokens + 1,
+            window_size=window_size,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -522,16 +521,8 @@ def fused_conv1d_gdn(
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
-        if mode == config.GDNMode.BATCHED:
+        if mode != config.GDNMode.PER_SEQ:
             metadata_obj = metadata.compute_batched_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                end_seq=distribution[0],
-            )
-        elif mode == config.GDNMode.SPEC:
-            metadata_obj = metadata.compute_spec_seq_metadata(
                 cfg=cfg,
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
@@ -609,13 +600,10 @@ def fused_conv1d_gdn(
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
-    # With speculative decoding the first (windowed) segment holds verify
-    # windows of up to `num_spec_tokens + 1` tokens and runs in SPEC mode;
-    # otherwise it holds 1-token decodes and runs in BATCHED mode.
-    first_mode = (config.GDNMode.SPEC
-                  if num_spec_tokens > 0 else config.GDNMode.BATCHED)
+    # The first segment holds verify windows of up to `num_spec_tokens + 1`
+    # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, first_mode)
+        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
 
