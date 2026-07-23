@@ -343,18 +343,23 @@ def _mla_ragged_paged_attention_kernel(
             dst_m = bm_x2_ref.at[bq_sem_idx, pl.ds(0, sz)]
             _async_copy(src=dst_m, dst=dst_m, sem=sem_m, wait=True)
 
-            acc_ref[...] = (swa_acc_x2_ref[bq_sem_idx,
-                                           ...].astype(jnp.float32).reshape(
-                                               bq_sz * num_q_heads, head_dim))
-            bl = jnp.concat([
-                bl_x2_ref[bq_sem_idx, i, :num_q_heads] for i in range(bq_sz)
-            ])[..., None]
-            l_ref[...] = jnp.concat([bl for _ in range(128)], axis=-1)
+            if swa_accumution_hbm_ref.shape[0] == 0:
+                acc_ref[...] = 0.0
+                l_ref[...] = 0.0
+                m_ref[...] = float("-inf")
+            else:
+                acc_ref[...] = (swa_acc_x2_ref[bq_sem_idx,
+                                               ...].astype(jnp.float32).reshape(
+                                                   bq_sz * num_q_heads, head_dim))
+                bl = jnp.concat([
+                    bl_x2_ref[bq_sem_idx, i, :num_q_heads] for i in range(bq_sz)
+                ])[..., None]
+                l_ref[...] = jnp.concat([bl for _ in range(128)], axis=-1)
 
-            bm = jnp.concat([
-                bm_x2_ref[bq_sem_idx, i, :num_q_heads] for i in range(bq_sz)
-            ])[..., None]
-            m_ref[...] = jnp.concat([bm for _ in range(128)], axis=-1)
+                bm = jnp.concat([
+                    bm_x2_ref[bq_sem_idx, i, :num_q_heads] for i in range(bq_sz)
+                ])[..., None]
+                m_ref[...] = jnp.concat([bm for _ in range(128)], axis=-1)
 
     def _fetch_topk_indices(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         if topk_indices_ref is not None:
