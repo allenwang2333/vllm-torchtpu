@@ -37,6 +37,7 @@ from vllm.model_executor.layers.attention import (Attention,
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
@@ -788,12 +789,10 @@ class TPUModelRunner(GPUModelRunner):
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
                 )
-            elif type(attn_module).__name__ == "DeepseekV32IndexerCache":
+            elif isinstance(attn_module, DeepseekV32IndexerCache):
                 # DSA indexer K cache: the module declares its own uint8 spec
                 # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
-                spec = attn_module.get_kv_cache_spec(self.vllm_config)
-                if spec is not None:
-                    kv_cache_spec[layer_name] = spec
+                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(self.vllm_config)
             else:
                 continue
 
@@ -4213,16 +4212,6 @@ class TPUModelRunner(GPUModelRunner):
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
-                elif (isinstance(kv_cache_spec, MLAAttentionSpec)
-                      and not kv_cache_spec.dtype.is_floating_point):
-                    # DSA indexer K cache: flat uint8 rows. Must precede the
-                    # general MLA branch, whose get_kv_cache_shape rejects
-                    # integer dtypes and uses the MLA-latent layout.
-                    tpu_kv_cache = torch.zeros(
-                        (num_blocks, kv_cache_spec.block_size,
-                         kv_cache_spec.head_size),
-                        dtype=kv_cache_spec.dtype).to(self.device)
-                    kv_caches[layer_name] = tpu_kv_cache
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
                         num_blocks,

@@ -1,9 +1,9 @@
 from dataclasses import replace
 
 import torch
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec, MLAAttentionSpec
 
-from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend, PallasMLAttentionBackend
 
 
 def normalize_kv_cache_specs_for_tpu(
@@ -31,17 +31,27 @@ def _normalize_one_spec(
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
-    if not spec.dtype.is_floating_point:
-        # Byte-typed caches (DSA indexer K rows) keep their declared dtype
-        # and page size; the fp8/bf16 KV normalization does not apply.
-        return spec
 
-    page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-        spec.block_size,
-        spec.num_kv_heads,
-        spec.head_size,
-        kv_cache_dtype,
-    )
+    if not spec.dtype.is_floating_point:
+        # Byte-typed caches (DSA indexer K rows) keep their declared dtype;
+        # the fp8/bf16 KV normalization does not apply.
+        kv_cache_dtype = spec.dtype
+
+    if isinstance(spec, MLAAttentionSpec):
+        page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            spec.block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            kv_cache_dtype,
+        )
+    else:
+        page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            spec.block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            kv_cache_dtype,
+        )
+
     padded_page_size = spec.page_size_padded or 0
     page_size = max(page_size, spec.real_page_size_bytes, padded_page_size)
     if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:

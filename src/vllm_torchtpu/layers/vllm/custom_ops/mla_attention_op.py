@@ -97,14 +97,19 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
             weights: jax.Array,  # [num_tokens, H]
-            cache_kv: jax.Array,  # uint8 [num_blocks, block_size, D + 1]
+            cache_kv: jax.Array,  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim] where lkv_dim = D + 1 padded to a 128 multiple
             k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
             seq_lens: jax.Array,  # i32 [num_seqs]
             page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            num_blocks, block_size, entry_size = cache_kv.shape
+            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+            block_size = block_size_per_kv_packing * kv_packing
+            # Cache rows are padded to the 128-lane HBM width; pad the packed
+            # fp8+scale rows to match before scattering.
+            k_packed = jnp.pad(
+                k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
             # Fused insert (TPU metadata has no slot_mapping): same position
             # formula and OOB-drop contract as _update_kv_cache_slots.
@@ -117,17 +122,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                              page_indices.reshape(seq_lens.shape[0],
                                                   -1)[seq_id, pos // block_size],
                              jnp.int32(2**30))
-            cache_kv = cache_kv.at[page, pos % block_size].set(k_packed)
+            slot = pos % block_size
+            cache_kv = cache_kv.at[page, slot // kv_packing,
+                                   slot % kv_packing].set(k_packed)
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            kv_packing = 4  # uint8: 32 bits / 8
-            cache_view = cache_kv.reshape(
-                num_blocks, block_size // kv_packing, kv_packing, entry_size
-            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
-                cache_view,
+                cache_kv,
                 seq_lens,
                 page_indices,
                 cu_q_lens,
@@ -187,7 +190,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
-        kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size, head_dim + 1]
+        kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim], lkv_dim = head_dim + 1 padded to a 128 multiple
         if kv_cache.numel() == 0:
             # Profiling run: the runner has not bound the caches yet.
             return self.topk_indices_buffer

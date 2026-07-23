@@ -887,9 +887,6 @@ class PallasMLAttentionBackend(AttentionBackend):
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
         return (
             num_blocks,
