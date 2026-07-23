@@ -15,12 +15,21 @@ rank.
 """
 
 import torch
-from vllm.distributed.device_communicators.base_device_communicator import \
-    DeviceCommunicatorBase
+from vllm.distributed.device_communicators.base_device_communicator import (
+    All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
 
 class TpuDeviceCommunicator(DeviceCommunicatorBase):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # TPU performs EP dispatch/combine directly (see dispatch/combine
+        # below), not through an all2all manager. The base manager only
+        # satisfies vLLM's DP>1 + MoE fault-tolerance probe
+        # (support_fault_tolerance=False); it is never used for compute.
+        if self.use_all2all:
+            self.all2all_manager = All2AllManagerBase(self.cpu_group)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
