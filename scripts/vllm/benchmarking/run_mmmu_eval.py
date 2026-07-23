@@ -41,8 +41,8 @@ def parse_args():
     parser.add_argument(
         "--limit",
         type=int,
-        default=100,
-        help="Number of samples to evaluate (default: 100)",
+        default=0,
+        help="Number of samples to evaluate (0 for all dataset samples)",
     )
     parser.add_argument(
         "--results-dir",
@@ -442,9 +442,9 @@ def main():
             })
 
         print(
-            f"Running CoT generative evaluation on {len(inputs)} samples in batches of 10..."
+            f"Running CoT generative evaluation on {len(inputs)} samples in batches of 32..."
         )
-        batch_size = 10
+        batch_size = 32
         for i in range(0, len(inputs), batch_size):
             chunk_inputs = inputs[i:i + batch_size]
             chunk_samples = samples[i:i + batch_size]
