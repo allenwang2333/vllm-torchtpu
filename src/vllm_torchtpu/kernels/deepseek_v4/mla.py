@@ -581,8 +581,13 @@ def _mla_ragged_paged_attention_kernel(
             acc = acc_ref[...]
             attention_sinks = jnp.concat(
                 [attention_sinks_ref[...] for _ in range(bq_sz)])[..., None]
-            exp_attention_sinks = jnp.exp(attention_sinks - m_ref[...])
+            exp_attention_sinks = jnp.where(
+                m_ref[...] == float("-inf"),
+                0.0,
+                jnp.exp(attention_sinks - m_ref[...]),
+            )
             L = l_ref[...] + exp_attention_sinks
+            L = jnp.maximum(L, 1e-12)
             L = broadcast_minor(L, acc.shape)
             out = (lax.div(acc, L) if q_dtype == jnp.float32 else
                    (acc * pl.reciprocal(L, approx=True)).astype(q_dtype))
