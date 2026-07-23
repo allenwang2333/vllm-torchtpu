@@ -337,6 +337,7 @@ class TestFp8LinearRuntimeQuant:
         block_h, block_w = 128, 128
 
         layer = torch.nn.Module()
+        layer.logical_widths = None
         layer.weight = torch.nn.Parameter(torch.ones(out_dim,
                                                      in_dim,
                                                      device=device,

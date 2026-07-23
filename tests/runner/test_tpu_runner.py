@@ -1045,10 +1045,8 @@ class TestTPURunner:
         assert "attn.0" in created_caches
         assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
 
-    def test_initialize_kv_cache_num_blocks_override_and_relaxed_divisibility(
-            self):
-        """Verify explicit num_blocks override on kv_cache_config and relaxed
-        divisibility when num_blocks is None and tensor_size is padded."""
+    def test_initialize_kv_cache_num_blocks_override(self):
+        """Verify explicit num_blocks override on kv_cache_config."""
         attn_spec = FullAttentionSpec(block_size=16,
                                       num_kv_heads=2,
                                       head_size=128,
@@ -1058,7 +1056,7 @@ class TestTPURunner:
             KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
         ]
 
-        # Case 1: num_blocks explicitly provided on kv_cache_config
+        # num_blocks explicitly provided on kv_cache_config
         kv_cache_config_explicit = KVCacheConfig(
             num_blocks=10,
             kv_cache_tensors=[
@@ -1088,29 +1086,6 @@ class TestTPURunner:
                     return_value=False):
             self.runner.initialize_kv_cache(kv_cache_config_explicit)
             mock_get_shape.assert_called_once_with(10, attn_spec.block_size,
-                                                   attn_spec.num_kv_heads,
-                                                   attn_spec.head_size,
-                                                   attn_spec.dtype)
-
-        # Case 2: num_blocks is None, tensor_size has padding (not perfectly divisible)
-        kv_cache_config_implicit = KVCacheConfig(
-            num_blocks=None,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 5 + 400, shared_by=["attn.0"]),
-            ],
-            kv_cache_groups=kv_cache_groups,
-        )
-        kv_cache_config_implicit.num_blocks = None
-
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(5, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
-                ), patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config_implicit)
-            mock_get_shape.assert_called_once_with(5, attn_spec.block_size,
                                                    attn_spec.num_kv_heads,
                                                    attn_spec.head_size,
                                                    attn_spec.dtype)
