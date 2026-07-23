@@ -458,7 +458,7 @@ def _mla_ragged_paged_attention_kernel(
         nope_fp8 = nope_fp8.reshape(bkv_sz, 7, 64)
         nope_scales = nope_scales.reshape(bkv_sz, 7, 1)
         dequant_nope = (nope_fp8 * nope_scales).reshape(bkv_sz, 448)
-        rope = pltpu.bitcast(bkv[:, 448:576].reshape(bkv_sz, 64, 2), jnp.bfloat16).squeeze(-1)
+        rope = pltpu.bitcast(bkv[:, 448:576].reshape(bkv_sz, 64, 2), jnp.bfloat16).reshape(bkv_sz, 64)
         bkv = jnp.concatenate([dequant_nope, rope], axis=-1)
         return bkv
 
