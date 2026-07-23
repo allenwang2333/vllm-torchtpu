@@ -1271,6 +1271,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions,
             None,
         )
+        attn_output = torch.nan_to_num(attn_output, nan=0.0)
         check_nan("attn_output (attention_impl)", attn_output, self.custom_prefix)
 
         out = torch.nan_to_num(self._o_proj(attn_output, positions), nan=0.0)
