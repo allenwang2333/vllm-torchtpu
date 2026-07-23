@@ -92,7 +92,7 @@ def tpu_grouped_topk(
         )
 
     if renormalize:
-        topk_weights = torch.softmax(topk_weights.to(torch.float32), dim=-1)
+        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-6)
 
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
@@ -141,7 +141,7 @@ def select_experts(
                                         k=topk,
                                         dim=-1)
     if renormalize:
-        topk_weights = torch.softmax(topk_weights.to(torch.float32), dim=-1)
+        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-6)
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
