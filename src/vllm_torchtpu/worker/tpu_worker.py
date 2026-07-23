@@ -325,6 +325,9 @@ class TPUWorker(WorkerBase):
             is_last_rank = (
                 self.rank == self.parallel_config.pipeline_parallel_size - 1)
 
+        # Touch TPU device to ensure PJRT client is initialized.
+        torch.empty((1, ), device=self.devices[0])
+
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(self.vllm_config, self.devices[0])
         logger.info(f"Init worker | "
