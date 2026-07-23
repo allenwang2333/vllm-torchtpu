@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
 import functools
 from typing import Dict, Optional, Tuple
 
@@ -35,8 +37,16 @@ def check_nan(name: str, tensor: torch.Tensor, prefix: str):
     is_fake = (tensor.device.type == "meta" or
                type(tensor).__name__ == "FakeTensor" or
                (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
-    if not is_fake and torch.isnan(tensor).any().item():
-        print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} device={tensor.device}", flush=True)
+    if not is_fake:
+        has_nan = torch.isnan(tensor).any().item()
+        if has_nan:
+            print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} device={tensor.device}", flush=True)
+        elif os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
+            t_flt = tensor.to(torch.float32)
+            t_mean = t_flt.mean().item()
+            t_std = (t_flt - t_mean).pow(2).mean().sqrt().item()
+            print(f"[ACT_TRACE] [{prefix}] {name}: shape={list(tensor.shape)} mean={t_mean:.6f} std={t_std:.6f} min={t_flt.min().item():.6f} max={t_flt.max().item():.6f}", flush=True)
+
 
 
 import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
@@ -286,7 +296,8 @@ def _deepseek_v4_attention_jax(
     is_csa: bool,
     two_caches_same_buffer: bool,
 ) -> tuple[jax.Array, jax.Array]:
-    if sw_cache.shape[0] == 0 or main_cache_kv.shape[0] == 0:
+    if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
+        print(f"[DEBUG_ZERO_CACHE] main_cache_kv.shape={main_cache_kv.shape} sw_cache.shape={sw_cache.shape} swa_only={swa_only}", flush=True)
         t = q.shape[0]
         n_local_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -312,27 +323,35 @@ def _deepseek_v4_attention_jax(
         if main_cache_kv.ndim == 5:
             main_cache_kv = jnp.squeeze(main_cache_kv, axis=2)
 
-        swa_page_indices = swa_page_indices.flatten()
-        main_page_indices = main_page_indices.flatten()
+        if swa_page_indices is not None:
+            swa_page_indices = swa_page_indices.flatten()
+        if main_page_indices is not None:
+            main_page_indices = main_page_indices.flatten()
 
-        swa_output, updated_sw_cache, swa_l, swa_m = (
-            mla_sliding_window_ragged_paged_attention(
-                q=q,
-                new_kv=new_kv,
-                cache_kv=sw_cache,
-                kv_lens=swa_kv_lens,
-                page_indices=swa_page_indices,
-                cu_q_lens=swa_cu_q_lens,
-                distribution=swa_distribution,
-                attention_sinks=attention_sinks,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                logical_page_size=logical_page_size,
-                num_kv_pages_per_block=1,
-                num_queries_per_block=1,
-                unnormalized_output=False if swa_only else True,
+        if sw_cache.shape[0] == 0:
+            swa_output = jnp.zeros_like(q)
+            updated_sw_cache = sw_cache
+            swa_l = jnp.zeros((q.shape[0], q.shape[1], 1), dtype=jnp.float32)
+            swa_m = jnp.full((q.shape[0], q.shape[1], 1), -1e9, dtype=jnp.float32)
+        else:
+            swa_output, updated_sw_cache, swa_l, swa_m = (
+                mla_sliding_window_ragged_paged_attention(
+                    q=q,
+                    new_kv=new_kv,
+                    cache_kv=sw_cache,
+                    kv_lens=swa_kv_lens,
+                    page_indices=swa_page_indices,
+                    cu_q_lens=swa_cu_q_lens,
+                    distribution=swa_distribution,
+                    attention_sinks=attention_sinks,
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    logical_page_size=logical_page_size,
+                    num_kv_pages_per_block=1,
+                    num_queries_per_block=1,
+                    unnormalized_output=False if swa_only else True,
+                )
             )
-        )
 
         dummy_sum = 0.0
         for arg in (
@@ -342,15 +361,20 @@ def _deepseek_v4_attention_jax(
             main_distribution, attention_sinks
         ):
             if arg is not None:
-                dummy_sum = dummy_sum + jnp.sum(arg) * 0
+                dummy_sum = dummy_sum + jnp.sum(arg.astype(jnp.float32)) * 0
 
         if swa_only:
             if sw_cache_was_5d:
                 updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
             return swa_output + dummy_sum, updated_sw_cache
 
-        if two_caches_same_buffer:
+        if two_caches_same_buffer and not is_csa:
             main_cache_kv = updated_sw_cache
+
+        if swa_l is not None and swa_l.ndim == 3:
+            swa_l = jnp.squeeze(swa_l, axis=-1)
+        if swa_m is not None and swa_m.ndim == 3:
+            swa_m = jnp.squeeze(swa_m, axis=-1)
 
         output = mla_ragged_paged_attention(
             q=q,
@@ -789,7 +813,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         )
 
 
-class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionLayerBase):
+class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLayerBase):
 
     def __init__(
         self,
@@ -849,6 +873,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
                 compilation_config.static_forward_context[self.mla_attn.swa_cache_layer.prefix] = self.mla_attn.swa_cache_layer
             if hasattr(self.mla_attn, "indexer") and hasattr(self.mla_attn.indexer, "k_cache"):
                 compilation_config.static_forward_context[self.mla_attn.indexer.k_cache.prefix] = self.mla_attn.indexer.k_cache
+            if hasattr(self.mla_attn, "compressor") and hasattr(self.mla_attn.compressor, "state_cache"):
+                compilation_config.static_forward_context[self.mla_attn.compressor.state_cache.prefix] = self.mla_attn.compressor.state_cache
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -859,15 +885,14 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         return PallasAttentionBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        if self.compress_ratio <= 1:
-            return None
         block_size = vllm_config.cache_config.block_size
+        comp_ratio = max(1, self.compress_ratio)
         return MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=align_to(448 + 64 * 2 + 7, 128),
             dtype=torch.uint8,
-            compress_ratio=min(self.compress_ratio, block_size),
+            compress_ratio=min(comp_ratio, block_size),
             alignment=None,
         )
 
@@ -877,7 +902,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
-        two_caches_same_buffer = is_csa
+        two_caches_same_buffer = not swa_only
         logical_page_size = self.mla_attn.swa_cache_layer.block_size if self.mla_attn.swa_cache_layer is not None else 0
         
         wrapped_fn = functools.partial(
@@ -991,7 +1016,6 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         import os
         print(f"[DEBUG_SHAPES] pid={os.getpid()} qr shape={list(qr.shape)} | n_local_heads={self.mla_attn.n_local_heads} head_dim={self.mla_attn.head_dim}", flush=True)
         q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
-        print(f"[DEBUG_SHAPES] pid={os.getpid()} projected q shape={list(q.shape)} | input kv shape={list(kv.shape)}", flush=True)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
         print(f"[DEBUG_SHAPES] pid={os.getpid()} after rope q shape={list(q.shape)} kv shape={list(kv.shape)}", flush=True)
@@ -1017,6 +1041,32 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         )
         return res
 
+    def _get_active_sw_cache(self) -> torch.Tensor | None:
+        if hasattr(self.mla_attn, "swa_cache_layer") and getattr(self.mla_attn.swa_cache_layer, "kv_cache", None) is not None:
+            cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache")
+            if cache.dtype == torch.uint8:
+                return cache
+        if hasattr(self, "kv_cache") and getattr(self, "kv_cache", None) is not None:
+            cache = getattr(self, "kv_cache")
+            if cache.dtype == torch.uint8:
+                return cache
+        if hasattr(self.mla_attn, "kv_cache") and getattr(self.mla_attn, "kv_cache", None) is not None:
+            cache = getattr(self.mla_attn, "kv_cache")
+            if cache.dtype == torch.uint8:
+                return cache
+        return None
+
+    def _get_active_main_cache(self) -> torch.Tensor | None:
+        if hasattr(self, "kv_cache") and getattr(self, "kv_cache", None) is not None:
+            cache = getattr(self, "kv_cache")
+            if cache.dtype == torch.uint8 and cache.shape[-1] > 512:
+                return cache
+        if hasattr(self.mla_attn, "kv_cache") and getattr(self.mla_attn, "kv_cache", None) is not None:
+            cache = getattr(self.mla_attn, "kv_cache")
+            if cache.dtype == torch.uint8 and cache.shape[-1] > 512:
+                return cache
+        return self._get_active_sw_cache()
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -1026,31 +1076,43 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         *,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        rank = get_tensor_model_parallel_rank()
         attn_ctx = get_forward_context().attn_metadata
+        if rank == 0 and not hasattr(self, "_printed_ctx_keys"):
+            self._printed_ctx_keys = True
+            print(f"[DEBUG_ATTN_CTX_TYPE] prefix={self.mla_attn.prefix} type={type(attn_ctx)} val={attn_ctx}", flush=True)
+
+        def _get_field(meta, field_name):
+            if meta is None:
+                return None
+            if isinstance(meta, dict):
+                return meta.get(field_name)
+            return getattr(meta, field_name, None)
+
         if isinstance(attn_ctx, dict):
             swa_layer_name = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "prefix", self.mla_attn.prefix)
             swa_attn_metadata = attn_ctx.get(swa_layer_name, attn_ctx.get(self.mla_attn.prefix, next(iter(attn_ctx.values()), None)))
+            compressor_state_prefix = getattr(getattr(getattr(self.mla_attn, "compressor", None), "state_cache", None), "prefix", None)
             main_layer_name = self.mla_attn.prefix
-            main_attn_metadata = attn_ctx.get(main_layer_name, swa_attn_metadata)
+            main_attn_metadata = attn_ctx.get(compressor_state_prefix) or attn_ctx.get(main_layer_name) or swa_attn_metadata
         else:
             swa_attn_metadata = attn_ctx
             main_attn_metadata = attn_ctx
 
-        if getattr(self.mla_attn, "swa_cache_layer", None) is not None:
-            orig_sw_cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache", None)
-        else:
-            orig_sw_cache = getattr(self.mla_attn, "kv_cache", None)
+        orig_sw_cache = self._get_active_sw_cache()
         sw_cache = orig_sw_cache
-
+        if sw_cache is None:
+            sw_cache = torch.zeros((0, 16, 1, self.mla_attn.head_dim), dtype=q.dtype, device=q.device)
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
 
         if swa_attn_metadata is not None:
-            swa_seq_lens = swa_attn_metadata.seq_lens
-            swa_block_tables = swa_attn_metadata.block_tables
-            swa_query_start_loc = swa_attn_metadata.query_start_loc
-            swa_request_distribution = swa_attn_metadata.request_distribution
+            swa_seq_lens = _get_field(swa_attn_metadata, "seq_lens")
+            swa_block_tables = _get_field(swa_attn_metadata, "block_tables")
+            swa_query_start_loc = _get_field(swa_attn_metadata, "query_start_loc")
+            swa_request_distribution = _get_field(swa_attn_metadata, "request_distribution")
         else:
             swa_seq_lens = None
             swa_block_tables = None
@@ -1058,17 +1120,14 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             swa_request_distribution = None
 
         if not swa_only and main_attn_metadata is not None:
-            main_cache_kv = getattr(getattr(self.mla_attn, "mla_attn", None), "kv_cache", sw_cache)
-            main_kv_lens = main_attn_metadata.seq_lens // self.compress_ratio
-            main_page_indices = main_attn_metadata.block_tables
-            main_cu_q_lens = main_attn_metadata.query_start_loc
-            main_distribution = main_attn_metadata.request_distribution
-        elif swa_attn_metadata is not None:
-            main_cache_kv = sw_cache
-            main_kv_lens = swa_seq_lens
-            main_page_indices = swa_block_tables
-            main_cu_q_lens = swa_query_start_loc
-            main_distribution = swa_request_distribution
+            main_cache_kv = self._get_active_main_cache()
+            if main_cache_kv is None:
+                main_cache_kv = sw_cache
+            m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
+            main_kv_lens = m_seq_lens // self.compress_ratio if m_seq_lens is not None else None
+            main_page_indices = _get_field(main_attn_metadata, "block_tables")
+            main_cu_q_lens = _get_field(main_attn_metadata, "query_start_loc")
+            main_distribution = _get_field(main_attn_metadata, "request_distribution")
         else:
             main_cache_kv = sw_cache
             main_kv_lens = None
@@ -1078,15 +1137,19 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
 
         if is_csa:
             assert topk_indices is not None
-            extra = topk_indices
+            max_valid_kv = max(1, (positions.max().item() + 1) // self.compress_ratio)
+            extra = torch.where((topk_indices >= 0) & (topk_indices < max_valid_kv), topk_indices, torch.full_like(topk_indices, -1))
         else:
-            extra = (positions + 1).to(torch.int32) // self.compress_ratio
+            extra = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1)
             
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         rank = get_tensor_model_parallel_rank()
-        n_local_heads = self.mla_attn.n_local_heads
-        # Pass the sharded attn_sink parameter directly. XLA's SPMD partitioner will map the sharded heads natively.
-        local_sink = self.attn_sink[:n_local_heads]
+        if rank == 0:
+            kv_lens_str = main_kv_lens.tolist() if main_kv_lens is not None else "None"
+            print(f"[DEBUG_ATTN_INPUTS] prefix={self.custom_prefix} main_cache_kv.shape={list(main_cache_kv.shape)} mean={main_cache_kv.to(torch.float32).mean().item():.6f} is_csa={is_csa} extra.shape={list(extra.shape)} extra_min={extra.min().item()} extra_max={extra.max().item()} main_kv_lens={kv_lens_str}", flush=True)
+
+        if rank == 0:
+            print(f"[DEBUG_FORWARD_MQA_CACHES] prefix={self.mla_attn.prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}", flush=True)
         output, new_sw_cache = self.attn_op(
             q,
             kv,
@@ -1101,10 +1164,11 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             main_page_indices,
             main_cu_q_lens,
             main_distribution,
-            local_sink,
+            self.attn_sink,
         )
 
-        orig_sw_cache.copy_(new_sw_cache)
+        if orig_sw_cache is not None and new_sw_cache is not None and new_sw_cache.numel() > 0:
+            orig_sw_cache.copy_(new_sw_cache)
         return output
 
     def _o_proj(self, o: torch.Tensor,
@@ -1180,7 +1244,17 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
 
         qr, kv = qr_kv.split([self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1)
         qr = self.q_norm(qr)
-        kv = self.kv_norm(kv)
+        
+        # Split kv into nope and rope parts, RMSNorm only the nope part
+        nope_dim = self.mla_attn.nope_head_dim
+        kv_nope, kv_rope = kv.split([nope_dim, self.mla_attn.head_dim - nope_dim], dim=-1)
+        
+        variance = kv_nope.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        rrms = torch.rsqrt(variance + self.kv_norm.variance_epsilon)
+        kv_nope = (kv_nope.to(torch.float32) * rrms).to(kv_nope.dtype) * self.kv_norm.weight[:nope_dim]
+        
+        kv = torch.cat([kv_nope, kv_rope], dim=-1)
+        
         check_nan("qr (after norm)", qr, self.custom_prefix)
         check_nan("kv (after norm)", kv, self.custom_prefix)
 
