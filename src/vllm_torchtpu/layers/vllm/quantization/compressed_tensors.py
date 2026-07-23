@@ -98,7 +98,7 @@ def _get_moe_scheme_dict(
 ) -> Optional[dict]:
     """Resolve the compressed-tensors scheme for a fused MoE experts layer.
 
-    RoutedExperts/RoutedExperts fuses each expert's separate gate_proj/up_proj/
+    RoutedExperts fuses each expert's separate gate_proj/up_proj/
     down_proj Linears into one module, so config_groups targets (often just
     "Linear") don't match the fused layer's own prefix directly. Mirrors
     vLLM's CompressedTensorsMoEMethod.get_moe_method: populate
