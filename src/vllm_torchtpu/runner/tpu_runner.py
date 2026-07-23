@@ -2370,9 +2370,7 @@ class TPUModelRunner(GPUModelRunner):
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs:
-            from vllm.distributed.parallel_state import get_pp_group
-            if get_pp_group().is_first_rank:
-                self._execute_mm_encoder(scheduler_output)
+            self._execute_mm_encoder(scheduler_output)
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
 
