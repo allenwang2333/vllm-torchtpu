@@ -289,6 +289,8 @@ class StridedKVTransferEngine:
     ) -> RegisteredMemoryRegion:
         """Register one local raw tensor/buffer under an explicit descriptor."""
         metadata = _require_registered_region(region)
+        if _is_torch_tensor(buffer):
+            _validate_registered_tensor(buffer)
         buffer_size = _buffer_nbytes(buffer)
         if metadata.nbytes > buffer_size:
             raise ValueError("registered region nbytes exceeds buffer size: "
@@ -852,6 +854,20 @@ def _require_torch() -> Any:
     return torch
 
 
+def _validate_registered_tensor(tensor: Any) -> None:
+    torch = _require_torch()
+    supported_dtypes = {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.bfloat16,
+    }
+    if tensor.dtype not in supported_dtypes:
+        raise TypeError("ZMQ tensor regions support only FP8/BF16, got "
+                        f"{tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError("ZMQ tensor regions must be contiguous")
+
+
 def _tensor_to_bytes(tensor: Any) -> bytes:
     torch = _require_torch()
     if not tensor.is_contiguous():
@@ -884,10 +900,7 @@ def _copy_bytes_to_tensor(payload: bytearray, tensor: Any) -> None:
         raise ValueError("payload size mismatch for destination tensor: got "
                          f"{len(payload)}, expected {expected_size}")
     cpu_bytes = torch.frombuffer(payload, dtype=torch.uint8)
-    if tensor.dtype == torch.uint8:
-        cpu_tensor = cpu_bytes.reshape(tensor.shape)
-    else:
-        cpu_tensor = cpu_bytes.view(tensor.dtype).reshape(tensor.shape)
+    cpu_tensor = cpu_bytes.view(tensor.dtype).reshape(tensor.shape)
     tensor.copy_(cpu_tensor.to(device=tensor.device))
 
 

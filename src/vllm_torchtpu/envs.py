@@ -15,8 +15,10 @@ if TYPE_CHECKING:
     SKIP_JAX_PRECOMPILE: bool = False
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     MODEL_IMPL_TYPE: str = "vllm"
-    NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
+    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR: int = 15
+    PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP: int = 0
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD: int = -1
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     NUM_SLICES: int = 1
@@ -29,7 +31,6 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_KV_CACHE_HEADROOM_MIB: int = 5120
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
-    TPU_VLLM_KV_CACHE_ALIAS_FALLBACK: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -141,12 +142,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_IMPL_TYPE":
     env_with_choices("MODEL_IMPL_TYPE", "vllm",
                      ["vllm", "flax_nnx", "jetpack"]),
-    # Enable new experimental model design
-    "NEW_MODEL_DESIGN":
-    lambda: bool(int(os.getenv("NEW_MODEL_DESIGN") or "0")),
     # Directory to store phased profiling output
     "PHASED_PROFILING_DIR":
     lambda: os.getenv("PHASED_PROFILING_DIR", ""),
+    "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR":
+    lambda: int(os.getenv("PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR", "15")),
+    "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP":
+    lambda: int(os.getenv("PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP", "0")),
+    "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD":
+    lambda: int(os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD", "-1")
+                ),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
@@ -187,11 +192,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # preserve the compact-mamba allocation/indexing path.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":
     env_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
-    # Fallback defaults to ON: materialized KV caches use private typed tensors
-    # instead of aliasing into raw int8 storage. Keep it until XLA supports the
-    # reinterpret-cast + in-place update path needed for aliased TPU writes.
-    "TPU_VLLM_KV_CACHE_ALIAS_FALLBACK":
-    env_bool("TPU_VLLM_KV_CACHE_ALIAS_FALLBACK", default=True),
     # Raiden admission gates: construct a Raiden KVCacheManager and
     # register the pool manifest derived from the live typed KV caches.
     # This does not switch the V2 strided transfer transport.

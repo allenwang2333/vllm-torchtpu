@@ -18,12 +18,10 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.sharding import ShardingConfigManager
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_block_pool_enabled, unified_kv_layout_enabled,
-    update_tpu_block_size_and_slot_config)
+    unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
 from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
@@ -177,6 +175,7 @@ def apply_tpu_patches() -> None:
         return
     _tpu_patches_applied = True
 
+    import vllm_torchtpu as tpu_plugin
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_no_ep_tp_scope,
@@ -187,6 +186,7 @@ def apply_tpu_patches() -> None:
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     _register_custom_ops()
+    tpu_plugin._patch_vllm_aot_compile_cache_key()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_vllm_disable_compile_ranges()
@@ -441,11 +441,14 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
-        "PHASED_PROFILING_DIR", "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
+        "PHASED_PROFILING_DIR", "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR",
+        "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP",
+        "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
+        "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "NEW_MODEL_DESIGN", "ENABLE_QUANTIZED_MATMUL_KERNEL",
-        "REQUANTIZE_BLOCK_SIZE", "REQUANTIZE_WEIGHT_DTYPE",
-        "MOE_REQUANTIZE_BLOCK_SIZE", "MOE_REQUANTIZE_WEIGHT_DTYPE",
+        "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
+        "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
+        "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
@@ -599,15 +602,10 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
-    def _initialize_sharding_config(cls, vllm_config: VllmConfig) -> None:
-        # Store the parsed sharding config keyed by vllm_config (not as an
-        # attribute on it) so vLLM's replace()/compute_hash() machinery never
-        # sees it. Read it back via ShardingConfigManager.get(vllm_config).
-        sharding_config = ShardingConfigManager.initialize(vllm_config)
-        logger.info(f"Initialized sharding configuration: {sharding_config}")
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        assert "sharding" not in vllm_config.additional_config, (
+            "Legacy additional_config['sharding'] is no longer supported. "
+            "Use --data-parallel-size and --enable-expert-parallel instead.")
         apply_tpu_patches()
         _apply_model_specific_patches(
             getattr(vllm_config, "model_config", None))
@@ -616,7 +614,6 @@ class TpuPlatform(Platform):
             raise NotImplementedError(
                 "Pathways is not supported by torchtpu-vllm. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
-        cls._initialize_sharding_config(vllm_config)
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
@@ -627,20 +624,6 @@ class TpuPlatform(Platform):
         if pcp_config.enabled:
             logger.info("Using vLLM native multiprocess PCP world; PCP is not "
                         "represented as a JAX mesh axis.")
-
-        # libtpu never completes a pool-program execution whose TP all-reduce
-        # was offloaded to the SparseCore (the `auto` payload threshold
-        # selects the offload from ~1024-token buckets upward); keep the
-        # all-reduce on the TensorCore when the unified block pool serves the
-        # KV cache. Set before workers spawn — torch_tpu reads this env once
-        # per process at first compile. Respect an explicit user setting of
-        # the same key.
-        if unified_block_pool_enabled(vllm_config):
-            sc_ar = "xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-            xla_opts = os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", "")
-            if sc_ar not in xla_opts:
-                os.environ["TORCH_TPU_INTERNAL_XLA_OPTIONS"] = (
-                    f"{xla_opts} {sc_ar}=false".strip())
 
         from vllm.config import CompilationMode
         compilation_config = vllm_config.compilation_config
@@ -826,10 +809,7 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            # TODO(ranlihao): Use the vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND to determine which executor to use.
-            # use_ray_v2 = vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-            use_ray_v2 = False
-            if use_ray_v2:
+            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
                     RayDistributedExecutorV2
                 parallel_config.distributed_executor_backend = RayDistributedExecutorV2
