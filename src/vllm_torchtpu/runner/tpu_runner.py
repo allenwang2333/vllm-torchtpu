@@ -53,6 +53,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -75,8 +76,9 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
-from vllm_torchtpu.platforms.tpu_block_size_utils import (
-    unified_block_pool_enabled, unified_kv_layout_enabled)
+from vllm_torchtpu.platforms.tpu_block_size_utils import \
+    unified_kv_layout_enabled
+from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -353,15 +355,9 @@ class TPUModelRunner(GPUModelRunner):
         # for disagg serving.
         self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
                                             is not None)
-        # Unified layout family: attention KV and mamba state are fungible
-        # block-table blocks in one shared buffer per kv_cache_tensor. On
-        # top of it, the unified block pool serves that buffer as one
-        # attention-shaped pool (mamba state addressed through the pool
-        # adapters); without the pool the buffer is flat int8 with typed
-        # per-state views (the layout kv-transfer connectors address).
+        # Unified layout: attention KV and mamba state are fungible
+        # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(
-            self.vllm_config)
-        self._unified_block_pool: bool = unified_block_pool_enabled(
             self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
 
@@ -537,6 +533,27 @@ class TPUModelRunner(GPUModelRunner):
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
+        self.batch_counter = 0
+        self._init_phased_profiling()
+
+    def _init_phased_profiling(self) -> None:
+        """Initializes the phase-based profiler if the environment variable is set."""
+        self.phased_profiling_dir = tpu_envs.PHASED_PROFILING_DIR
+        self.phase_based_profiler = None
+        if self.phased_profiling_dir:
+            global_rank = getattr(self.parallel_config, "rank", 0) or 0
+            world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
+                self.phased_profiling_dir,
+                worker_rank=global_rank,
+                world_size=world_size,
+                num_steps_to_profile_for=tpu_envs.
+                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
+                num_decode_steps_to_skip=tpu_envs.
+                PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
+                decode_kv_len_threshold=tpu_envs.
+                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+            )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
 
@@ -848,7 +865,7 @@ class TPUModelRunner(GPUModelRunner):
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
-            enable_unified_block_pool=self._unified_kv_layout,
+            enable_unified_kv_layout=self._unified_kv_layout,
         )
 
     @staticmethod
@@ -2312,6 +2329,23 @@ class TPUModelRunner(GPUModelRunner):
             self._execute_mm_encoder(scheduler_output)
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
+
+        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
+        if self.phase_based_profiler:
+            self.batch_counter += 1
+            padded_total_tokens = _get_padded_token_len(
+                self.num_tokens_paddings,
+                scheduler_output.total_num_scheduled_tokens)
+            batch_composition_stats = runner_utils.get_batch_composition_stats(
+                batch_id=self.batch_counter,
+                input_batch=self.input_batch,
+                total_num_scheduled_tokens=scheduler_output.
+                total_num_scheduled_tokens,
+                num_reqs=self.input_batch.num_reqs,
+                padded_total_num_scheduled_tokens=padded_total_tokens,
+                scheduler_output=scheduler_output,
+            )
+            self.phase_based_profiler.step(batch_composition_stats)
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
@@ -4038,11 +4072,10 @@ class TPUModelRunner(GPUModelRunner):
             kernel_block_sizes=kernel_block_sizes,
             device=self.device,
             cache_dtype=self.kv_cache_dtype,
-            unified_block_pool=self._unified_block_pool,
         )
         kv_caches = materialized.kv_caches
         self.kv_cache_raw_tensors = materialized.raw_tensors
-        if self._unified_block_pool:
+        if self._unified_kv_layout:
             self._build_mamba_copy_plan(kv_cache_config,
                                         materialized.raw_tensors)
         if kv_cache_config.has_mamba_layers:
@@ -4055,7 +4088,7 @@ class TPUModelRunner(GPUModelRunner):
                          target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        if self._unified_block_pool:
+        if self._unified_kv_layout:
             # Flush the pool zero-fill before any compiled execution. PJRT
             # only donates quiescent buffers: a pending write at enqueue time
             # makes every donated pool parameter fall back to a fresh
@@ -4089,7 +4122,7 @@ class TPUModelRunner(GPUModelRunner):
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
 
-        if (not self._unified_block_pool and self._mamba_align_mode
+        if (not self._unified_kv_layout and self._mamba_align_mode
                 and kv_cache_config.has_mamba_layers):
             self._mamba_apc_copier = MambaApcStateCopier(self)
 
