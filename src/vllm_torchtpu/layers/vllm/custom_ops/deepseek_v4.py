@@ -1139,6 +1139,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             assert topk_indices is not None
             max_valid_kv = max(1, (positions.max().item() + 1) // self.compress_ratio)
             extra = torch.where((topk_indices >= 0) & (topk_indices < max_valid_kv), topk_indices, torch.full_like(topk_indices, -1))
+            if extra.ndim == 2 and extra.shape[1] % 128 == 0:
+                extra = extra.view(extra.shape[0], extra.shape[1] // 128, 128)
         else:
             extra = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1)
             
