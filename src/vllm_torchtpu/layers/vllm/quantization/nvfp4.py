@@ -371,6 +371,16 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+class _NullInputQuantKernel:
+    """Placeholder kernel so upstream create_weights' expose_input_quant_key
+    is a no-op. TPU NVFP4 is W4A16: activations are not pre-quantized, so the
+    layer advertises no input_quant_key."""
+
+    @staticmethod
+    def input_quant_key():
+        return None
+
+
 class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
@@ -382,10 +392,12 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
 
     def __init__(self, quant_config: 'VllmNvfp4Config',
                  linear_config: VllmQuantLinearConfig):
-        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel).
+        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
+        # unavailable on TPU). create_weights only needs kernel.input_quant_key.
         self.quant_config = quant_config
         self.linear_config = linear_config
         self.group_size = quant_config.group_size
+        self.kernel = _NullInputQuantKernel()
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
