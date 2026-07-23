@@ -92,7 +92,7 @@ def tpu_grouped_topk(
         )
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-12)
 
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
@@ -108,19 +108,31 @@ def select_experts(
     scoring_fn: str,
     layer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local routed ids/weights for the non-EP path."""
-    if layer is not None and getattr(layer, "use_grouped_topk", False):
+    gate = getattr(layer, "gate", None) if layer is not None else None
+    is_grouped = (
+        layer is not None and (
+            getattr(layer, "use_grouped_topk", False)
+            or (getattr(layer, "num_expert_group", 0) or 0) > 0
+            or (getattr(gate, "num_expert_group", 0) or 0) > 0
+        )
+    )
+    if is_grouped:
+        num_expert_group = getattr(layer, "num_expert_group", None) or getattr(gate, "num_expert_group", None) or 8
+        topk_group = getattr(layer, "topk_group", None) or getattr(gate, "topk_group", None) or 4
+        scoring_func = getattr(layer, "scoring_func", None) or getattr(gate, "scoring_func", None) or "sigmoid"
+        routed_scaling_factor = getattr(layer, "routed_scaling_factor", None) or getattr(gate, "routed_scaling_factor", None) or 2.5
+        e_score_correction_bias = getattr(layer, "e_score_correction_bias", None) or getattr(gate, "e_score_correction_bias", None)
+
         topk_weights, topk_ids = tpu_grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=topk,
             renormalize=renormalize,
-            num_expert_group=getattr(layer, "num_expert_group", 0),
-            topk_group=getattr(layer, "topk_group", 0),
-            scoring_func=scoring_fn,
-            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
-            e_score_correction_bias=getattr(layer, "e_score_correction_bias",
-                                            None),
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
@@ -129,7 +141,7 @@ def select_experts(
                                         k=topk,
                                         dim=-1)
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-12)
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
