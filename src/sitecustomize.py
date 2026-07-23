@@ -3,63 +3,53 @@
 import os
 import sys
 
-# Dynamically alias tpu_inference imports to vllm_torchtpu for backward compatibility
-class ModuleAliasRedirector:
-    def find_spec(self, fullname, path, target=None):
-        if fullname == "tpu_inference" or fullname.startswith("tpu_inference."):
-            alias_name = fullname.replace("tpu_inference", "vllm_torchtpu", 1)
-            try:
-                import importlib
-                mod = importlib.import_module(alias_name)
-                sys.modules[fullname] = mod
-                return mod.__spec__
-            except ImportError:
-                pass
-        return None
-
-sys.meta_path.insert(0, ModuleAliasRedirector())
-
-if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
-    print(f"[SITECUSTOMIZE_JAX_MODE] Short-circuiting sitecustomize for JAX run in pid={os.getpid()}", file=sys.stderr, flush=True)
-    
-    # Patch pallas.jax_op and torchax to support JAX-compilation of custom Pallas operators
+# Detect if we are running pytest unit tests on CPU, and configure JAX/Pallas env variables
+# BEFORE any package (including vllm_torchtpu) imports jax.
+if any("pytest" in arg for arg in sys.argv) and "--use-tpu" not in sys.argv:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["PALLAS_INTERPRET"] = "1"
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8").strip()
+    print("[SITECUSTOMIZE] CPU unit test run detected. Configured JAX/Pallas for CPU interpret mode with 8 virtual devices.", file=sys.stderr, flush=True)
     try:
-        import torch
-        import torchax.tensor as ta_tensor
-        import torchax.ops.ops_registry as ta_registry
-        import torch_tpu._internal.pallas as pallas_pkg
-        import torch_tpu._internal.pallas.pallas as pallas_mod
-
-        # 1. Patch pallas.jax_op to register custom JAX ops in torchax registry
-        _orig_jax_op = pallas_mod.jax_op
-        def patched_jax_op(name, fn=None, /, *args, **kwargs):
-            result = _orig_jax_op(name, fn, *args, **kwargs)
-            try:
-                namespace, op_name = name.split("::")
-                custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
-                custom_op = custom_op_packet.default
-                ta_registry.register_torch_dispatch_op(custom_op, result._backend_fns[None], is_jax_function=False)
-                print(f"[PATCH_JAX_OP] Registered custom op {name} with torchax registry", file=sys.stderr, flush=True)
-            except Exception as e:
-                print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", file=sys.stderr, flush=True)
-            return result
-        pallas_mod.jax_op = patched_jax_op
-        pallas_pkg.jax_op = patched_jax_op
-
-        # 2. Patch XLADispatchMode to intercept "pallas" namespace
-        _orig_xla_dispatch = ta_tensor.XLADispatchMode.__torch_dispatch__
-        def patched_xla_dispatch(self, func, types, args=(), kwargs=None):
-            if func.namespace == "pallas":
-                print(f"[DEBUG_PALLAS_DISPATCH] func={func} types={types} args={[(type(a), getattr(a, '_elem', None) is not None) for a in args]}", file=sys.stderr, flush=True)
-                print(f"[DEBUG_PALLAS_KEYS] ops={[str(k) for k in self.env._ops.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", file=sys.stderr, flush=True)
-                print(f"[DEBUG_PALLAS_KEYS] decomps={[str(k) for k in self.env._decomps.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", file=sys.stderr, flush=True)
-                return self.env.dispatch(func, types, args, kwargs)
-            return _orig_xla_dispatch(self, func, types, args, kwargs)
-        ta_tensor.XLADispatchMode.__torch_dispatch__ = patched_xla_dispatch
-        
-        print("[SITECUSTOMIZE] Successfully patched pallas.jax_op and torchax dispatcher", file=sys.stderr, flush=True)
+        import jax
+        from jax._src.config import pallas_tpu_interpret_mode_context_manager
+        from jax._src.pallas.mosaic.interpret.params import InterpretParams
+        pallas_tpu_interpret_mode_context_manager.set_global(InterpretParams())
+        print("[SITECUSTOMIZE] Successfully enabled Pallas CPU interpret mode globally.", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"[SITECUSTOMIZE] Failed to patch pallas/torchax: {e}", file=sys.stderr, flush=True)
+        print(f"[SITECUSTOMIZE] Failed to enable Pallas CPU interpret mode: {e}", file=sys.stderr, flush=True)
+
+if any("verify_dsv4_equivalence" in arg for arg in sys.argv):
+    try:
+        import vllm.distributed.parallel_state as ps
+        ps.get_tensor_model_parallel_world_size = lambda: 1
+        ps.get_tensor_model_parallel_rank = lambda: 0
+        import vllm.distributed as dist
+        dist.get_tensor_model_parallel_world_size = lambda: 1
+        dist.get_tensor_model_parallel_rank = lambda: 0
+        
+        # Mock CUDA Event and Stream for TPU VM compatibility
+        class DummyCudaEvent:
+            def __init__(self, *args, **kwargs):
+                pass
+            def record(self, *args, **kwargs):
+                pass
+            def wait(self, *args, **kwargs):
+                pass
+            def query(self):
+                return True
+            def synchronize(self):
+                pass
+        class DummyCudaStream:
+            def __init__(self, *args, **kwargs):
+                pass
+        import torch
+        torch.cuda.Event = DummyCudaEvent
+        torch.cuda.Stream = DummyCudaStream
+        
+        print("[SITECUSTOMIZE] Equivalence verification run detected. Monkey-patched vllm parallel state and cuda events globally.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[SITECUSTOMIZE] Failed to monkey-patch parallel state / cuda: {e}", file=sys.stderr, flush=True)
 
 # Apply monkey-patches to prevent device registration conflicts process-wide
 try:
@@ -106,5 +96,15 @@ try:
     import vllm.models.deepseek_v4.attention as att_mod
     if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
         att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+except ImportError:
+    pass
+
+try:
+    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
+    if not hasattr(ds_v4_amd_model, "DeepseekV4Attention"):
+        if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention
+        elif hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
 except ImportError:
     pass

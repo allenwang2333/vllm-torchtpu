@@ -28,6 +28,8 @@ def test_o_proj_dequantization_and_sharding_tp1():
     
     layer.tp_size = 1 # TP=1 (single rank)
     layer.custom_prefix = "model.layers.2.attn"
+    layer.n_local_groups = 8
+    layer.o_lora_rank = 1024
     
     # 1. Mock wo_a (Grouped Projection)
     # Shape of weight: [o_lora_rank, hidden_size] = [1024, 4096]
@@ -81,6 +83,8 @@ def test_o_proj_dequantization_and_sharding_tp8():
     
     layer.tp_size = 8 # TP=8 (sharded layout)
     layer.custom_prefix = "model.layers.2.attn"
+    layer.n_local_groups = 1
+    layer.o_lora_rank = 1024
     
     # 1. Mock wo_a (Grouped Projection)
     # Shape of weight: [o_lora_rank, hidden_size] = [1024, 4096]

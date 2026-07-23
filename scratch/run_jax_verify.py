@@ -88,6 +88,55 @@ try:
 except ImportError:
     pass
 
+# Patch pallas.jax_op and torchax to support JAX-compilation of custom Pallas operators
+try:
+    import torchax.tensor as ta_tensor
+    import torchax.ops.ops_registry as ta_registry
+    import torch_tpu._internal.pallas as pallas_pkg
+    import torch_tpu._internal.pallas.pallas as pallas_mod
+
+    # 1. Patch pallas.jax_op to register custom JAX ops in torchax registry
+    _orig_jax_op = pallas_mod.jax_op
+    def patched_jax_op(name, fn=None, /, *args, **kwargs):
+        result = _orig_jax_op(name, fn, *args, **kwargs)
+        try:
+            namespace, op_name = name.split("::")
+            custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
+            custom_op = custom_op_packet.default
+            ta_registry.register_torch_dispatch_op(custom_op, result._backend_fns[None], is_jax_function=False)
+            print(f"[PATCH_JAX_OP] Registered custom op {name} with torchax registry", flush=True)
+        except Exception as e:
+            print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", flush=True)
+        return result
+    pallas_mod.jax_op = patched_jax_op
+    pallas_pkg.jax_op = patched_jax_op
+
+    # Force register quantized_matmul_kernel if it was imported eagerly
+    try:
+        import vllm_torchtpu.layers.vllm.linear_common as lc
+        namespace, op_name = "pallas", "quantized_matmul_kernel"
+        custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
+        custom_op = custom_op_packet.default
+        ta_registry.register_torch_dispatch_op(custom_op, lc._quantized_matmul_kernel_op._backend_fns[None], is_jax_function=False)
+        print("[PATCH_JAX_OP] Manually registered quantized_matmul_kernel", flush=True)
+    except Exception as e:
+        print(f"[PATCH_JAX_OP] Failed to manually register quantized_matmul_kernel: {e}", flush=True)
+
+    # 2. Patch XLADispatchMode to intercept "pallas" namespace
+    _orig_xla_dispatch = ta_tensor.XLADispatchMode.__torch_dispatch__
+    def patched_xla_dispatch(self, func, types, args=(), kwargs=None):
+        if func.namespace == "pallas":
+            print(f"[DEBUG_PALLAS_DISPATCH] func={func} types={types} args={[(type(a), getattr(a, '_elem', None) is not None) for a in args]}", flush=True)
+            print(f"[DEBUG_PALLAS_KEYS] ops={[str(k) for k in self.env._ops.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", flush=True)
+            print(f"[DEBUG_PALLAS_KEYS] decomps={[str(k) for k in self.env._decomps.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", flush=True)
+            return self.env.dispatch(func, types, args, kwargs)
+        return _orig_xla_dispatch(self, func, types, args, kwargs)
+    ta_tensor.XLADispatchMode.__torch_dispatch__ = patched_xla_dispatch
+    
+    print("[JAX_VERIFY_PATCH] Successfully patched pallas.jax_op and torchax dispatcher", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch pallas/torchax: {e}", flush=True)
+
 # Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
 try:
     import vllm.models.deepseek_v4.attention as att_mod

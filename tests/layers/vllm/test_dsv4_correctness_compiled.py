@@ -1,4 +1,5 @@
 import torch
+import pytest
 import numpy as np
 import os
 import sys
@@ -101,7 +102,7 @@ def test_attn_sink_suite():
     # 1. Fetch TPU topology dynamically
     topology = hardware.get_tpu_topology(8)
     if topology is None:
-        raise ValueError("Could not query TPU topology. Are we on a TPU VM?")
+        pytest.skip("Could not query TPU topology. Skipping distributed TPU-only test.")
     print(f"Detected TPU topology: {topology}", flush=True)
     
     # 2. Allocate ports and set up env

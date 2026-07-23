@@ -105,7 +105,7 @@ def xla_quantized_matmul(
             dimension_numbers=(((1, ), (1, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
-    out *= jnp.expand_dims(w_scale, 0)
+    out *= jnp.expand_dims(w_scale.astype(jnp.float32), 0)
     return out.astype(x.dtype)
 
 
@@ -169,9 +169,7 @@ def xla_quantized_batched_matmul(
             preferred_element_type=jnp.float32,
         )
 
-    # Broadcast w_scale to match the output shape.
-    # dot_general output order: batch dims, lhs free dims, rhs free dims.
-    # w_scale is per-output-channel (rhs free dims), so expand leading dims.
+    w_scale = w_scale.astype(jnp.float32)
     n_leading = out.ndim - w_scale.ndim
     for _ in range(n_leading):
         w_scale = jnp.expand_dims(w_scale, 0)

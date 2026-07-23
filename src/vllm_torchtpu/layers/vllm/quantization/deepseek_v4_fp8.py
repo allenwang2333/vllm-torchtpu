@@ -80,7 +80,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                     fused_mapping=self.packed_modules_mapping,
             ):
                 return vllm_linear.UnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, linear_config)
+            return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
                     prefix=prefix,

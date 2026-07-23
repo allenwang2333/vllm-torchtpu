@@ -65,6 +65,7 @@ class TestMxfp4MoETPU:
                 custom_ops=["all"],
                 enabled_custom_ops=set(),
                 disabled_custom_ops=set(),
+                max_cudagraph_capture_size=0,
             ),
             scheduler_config=SimpleNamespace(
                 max_num_batched_tokens=2048,

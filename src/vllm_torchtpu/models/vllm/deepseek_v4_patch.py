@@ -24,6 +24,88 @@ import sys
 import os
 print("[PATCH] Top-level import of deepseek_v4_patch.py", file=sys.stderr, flush=True)
 
+# Register collectives in Dynamo allow_in_graph to bypass tracing errors
+try:
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "allow_in_graph"):
+        if hasattr(torch.ops, "_c10d_functional"):
+            registered_ops = []
+            for attr_name in dir(torch.ops._c10d_functional):
+                try:
+                    attr = getattr(torch.ops._c10d_functional, attr_name)
+                    if callable(attr):
+                        torch.compiler.allow_in_graph(attr)
+                        registered_ops.append(attr_name)
+                except Exception:
+                    pass
+            print(f"[PATCH] Registered functional collectives in Dynamo: {registered_ops}", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[PATCH] Failed to register collectives in Dynamo: {e}", file=sys.stderr, flush=True)
+
+
+def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
+    exponents = u8.to(torch.int32) - 127
+    ones = torch.ones_like(u8, dtype=torch.float32)
+    return torch.ldexp(ones, exponents)
+
+def re_quantize_attention_weight(weight_fp8: torch.Tensor, scale_block_fp8: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale_block_fp8.dtype == torch.float8_e8m0fnu:
+        scale_block_fp8 = scale_block_fp8.view(torch.uint8)
+    scale_block_fp32 = e8m0_to_fp32(scale_block_fp8)
+    scale_expanded = scale_block_fp32.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+    weight_fp32 = weight_fp8.to(torch.float32) * scale_expanded
+    
+    max_fp8_value = 448.0
+    row_max = torch.max(torch.abs(weight_fp32), dim=1, keepdim=True).values
+    scale_per_channel = torch.clamp(row_max / max_fp8_value, min=1e-12)
+    weight_quantized = torch.clamp(weight_fp32 / scale_per_channel, -max_fp8_value, max_fp8_value).to(torch.float8_e4m3fn)
+    return weight_quantized, scale_per_channel
+
+def attention_requantizer_generator(weights_iter):
+    buffered = {}
+    
+    def is_fp8_projection_to_requantize(name: str) -> bool:
+        if ".attn." in name:
+            for proj in ["wq_a", "wq_b", "wo_a", "wo_b", "wkv", "indexer.wq_b"]:
+                if f".attn.{proj}." in name:
+                    return True
+        if ".shared_experts." in name:
+            for proj in ["w1", "w2", "w3"]:
+                if f".shared_experts.{proj}." in name:
+                    return True
+        return False
+
+    for name, loaded_weight in weights_iter:
+        if is_fp8_projection_to_requantize(name):
+            if name.endswith(".weight"):
+                base_key = name[:-7]
+                target_type = "weight"
+            elif name.endswith(".scale"):
+                base_key = name[:-6]
+                target_type = "scale"
+            elif name.endswith(".weight_scale"):
+                base_key = name[:-13]
+                target_type = "scale"
+            elif name.endswith(".weight_scale_inv"):
+                base_key = name[:-17]
+                target_type = "scale"
+            else:
+                yield name, loaded_weight
+                continue
+                
+            entry = buffered.setdefault(base_key, {})
+            entry[target_type] = loaded_weight
+            
+            if "weight" in entry and "scale" in entry:
+                w_new, s_new = re_quantize_attention_weight(entry["weight"], entry["scale"])
+                yield f"{base_key}.weight", w_new
+                yield f"{base_key}.scale", s_new
+                del buffered[base_key]
+        else:
+            yield name, loaded_weight
+            
+    if buffered:
+        print(f"[PATCH ERROR] Remaining unmatched buffered layers in weight loader: {list(buffered.keys())}", file=sys.stderr, flush=True)
+
 
 
 @contextmanager
@@ -62,7 +144,13 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     ps.get_tensor_model_parallel_rank = lambda: torch.distributed.get_rank() % tp_size
 
     def patched_make(*args, **kwargs):
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         if ep_size > 1:
+            moe_tp_size = max(1, world_size // ep_size)
+            ret_rank = rank // moe_tp_size if rank >= 0 else 0
+            print(f"[DEBUG_MAKE] Rank {rank} (world_size={world_size}, dist_init={dist.is_initialized()}) | ep_size={ep_size} (moe_tp_size={moe_tp_size}) -> returning ep_rank={ret_rank}", flush=True)
             return fmc.FusedMoEParallelConfig(
                 tp_size=1,
                 tp_rank=0,
@@ -71,7 +159,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 dp_size=1,
                 dp_rank=0,
                 ep_size=ep_size,
-                ep_rank=torch.distributed.get_rank() // tp_size,
+                ep_rank=ret_rank,
                 sp_size=1,
                 use_ep=True,
                 all2all_backend="allgather_reducescatter",
@@ -257,13 +345,21 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
             self.hf_to_vllm_mapper = WrappedMapper()
             try:
+                print(f"[PATCH] Model state_dict keys related to layers.0.attn: {[k for k in self.model.state_dict().keys() if 'layers.0.attn.' in k]}", file=sys.stderr, flush=True)
+                # Update TP status of all parameters since new ones (like weight_scale)
+                # are registered during weight creation which runs AFTER linear layer __init__.
+                for name, module in self.model.named_modules():
+                    if hasattr(module, "update_param_tp_status"):
+                        module.update_param_tp_status()
+                weights = attention_requantizer_generator(weights)
                 def debug_weights_generator(weights_iter):
                     for name, loaded_weight in weights_iter:
                         if "layers.0.attn" in name:
                             print(f"[PATCH] Passing to load_weights: {name} shape={list(loaded_weight.shape)} dtype={loaded_weight.dtype}", file=sys.stderr, flush=True)
                         yield name, loaded_weight
                 res = _orig_load_weights(self, debug_weights_generator(weights))
-                print(f"[PATCH] POST_LOAD: layers.0.attn.wo_b.weight Shape: {list(self.model.layers[0].attn.wo_b.weight.shape)} | Type: {self.model.layers[0].attn.wo_b.weight.__class__.__name__}", file=sys.stderr, flush=True)
+                if hasattr(self.model, "layers") and len(self.model.layers) > 0 and hasattr(self.model.layers[0], "attn") and hasattr(self.model.layers[0].attn, "wo_b") and hasattr(self.model.layers[0].attn.wo_b, "weight"):
+                    print(f"[PATCH] POST_LOAD: layers.0.attn.wo_b.weight Shape: {list(self.model.layers[0].attn.wo_b.weight.shape)} | Type: {self.model.layers[0].attn.wo_b.weight.__class__.__name__}", file=sys.stderr, flush=True)
 
                 
                 # Manually invoke process_weights_after_loading on all FusedMoE layers
@@ -295,6 +391,91 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 self.hf_to_vllm_mapper = orig_mapper
 
         cls.load_weights = patched_load_weights
+
+    # Patch custom Triton operations with PyTorch equivalents on TPU
+    try:
+        import vllm.models.deepseek_v4.attention as ds_attn
+        import vllm.models.deepseek_v4.common.ops.fused_qk_rmsnorm as fused_qk_ops
+        import vllm.models.deepseek_v4.common.ops.fused_indexer_q as fused_indexer_ops
+        import vllm.models.deepseek_v4.common.ops as common_ops
+
+        def fused_q_kv_rmsnorm_pytorch(
+            qr: torch.Tensor,
+            kv: torch.Tensor,
+            q_weight: torch.Tensor,
+            kv_weight: torch.Tensor,
+            eps: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Standard PyTorch equivalent of GPU Triton RMSNorm kernel
+            qr_out = qr * torch.rsqrt(qr.pow(2).mean(-1, keepdim=True) + eps) * q_weight
+            kv_out = kv * torch.rsqrt(kv.pow(2).mean(-1, keepdim=True) + eps) * kv_weight
+            return qr_out, kv_out
+
+        def fused_indexer_q_rope_quant_pytorch(
+            positions: torch.Tensor,
+            index_q: torch.Tensor,
+            index_q_cos_sin_cache: torch.Tensor,
+            index_weights: torch.Tensor,
+            index_weights_softmax_scale: float,
+            index_weights_head_scale: float,
+            use_fp4: bool = False,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert not use_fp4, "FP4 path not supported on TPU"
+            num_tokens = positions.shape[0]
+            num_index_q_heads = index_q.shape[1]
+            index_q_head_dim = index_q.shape[2]
+
+            cos_sin = index_q_cos_sin_cache[positions]
+            rot_dim = cos_sin.shape[-1]
+            half_rot_dim = rot_dim // 2
+            cos = cos_sin[:, :half_rot_dim]
+            sin = cos_sin[:, half_rot_dim:]
+
+            nope_dim = index_q_head_dim - rot_dim
+            q_nope = index_q[..., :nope_dim]
+            q_rot = index_q[..., nope_dim:]
+
+            q_rot_reshaped = q_rot.view(num_tokens, num_index_q_heads, half_rot_dim, 2)
+            x_even = q_rot_reshaped[..., 0]
+            x_odd = q_rot_reshaped[..., 1]
+
+            cos_expanded = cos.unsqueeze(1)
+            sin_expanded = sin.unsqueeze(1)
+
+            r_even = x_even * cos_expanded - x_odd * sin_expanded
+            r_odd = x_odd * cos_expanded + x_even * sin_expanded
+
+            r_even = r_even.to(torch.bfloat16).to(torch.float32)
+            r_odd = r_odd.to(torch.bfloat16).to(torch.float32)
+
+            r_stacked = torch.stack([r_even, r_odd], dim=-1)
+            q_rot_out = r_stacked.view(num_tokens, num_index_q_heads, rot_dim)
+
+            q_rot_final = torch.cat([q_nope, q_rot_out], dim=-1)
+
+            amax = torch.max(torch.abs(q_rot_final), dim=-1).values
+            scale = torch.clamp(amax, min=1e-4) / 448.0
+            scale = torch.exp2(torch.ceil(torch.log2(scale))).unsqueeze(-1)
+
+            index_q_fp8 = torch.clamp(q_rot_final / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
+
+            scale_squeezed = scale.squeeze(-1)
+            index_weights_out = index_weights * scale_squeezed * index_weights_softmax_scale * index_weights_head_scale
+
+            return index_q_fp8, index_weights_out
+
+        # Overwrite all imports/locations of both functions
+        ds_attn.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
+        fused_qk_ops.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
+        common_ops.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
+
+        ds_attn.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
+        fused_indexer_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
+        common_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
+
+        print("[PATCH] Successfully monkey-patched fused_q_kv_rmsnorm and fused_indexer_q_rope_quant with PyTorch equivalents.", flush=True)
+    except Exception as e:
+        print(f"[PATCH] Failed to patch Triton custom ops: {e}", file=sys.stderr, flush=True)
 
     # Capture and patch the standard CUDA/CPU variant from ds_v4
     try:
@@ -579,3 +760,145 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         yield
     finally:
         logger.info("DeepSeek V4 TPU model patches kept active for compilation and worker execution.")
+
+
+from typing import Iterable
+
+def patched_decoder_load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    import typing
+    from typing import Iterable, Callable
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+    from vllm.model_executor.parameter import default_weight_loader
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("gate_up_proj", "w1", 0),
+        ("gate_up_proj", "w3", 1),
+        ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+        ("attn.fused_wqa_wkv", "attn.wkv", 1),
+        ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+        ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+    ]
+    params_dict = dict(self.named_parameters())
+    loaded_params: set[str] = set()
+
+    # TP for attention
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+    n_head = self.config.num_attention_heads
+    n_local_head = n_head // tp_size
+    head_rank_start = n_local_head * tp_rank
+    head_rank_end = n_local_head * (tp_rank + 1)
+
+    # Pre-compute expert mapping ONCE.
+    expert_mapping = self.get_expert_mapping()
+
+    for name, loaded_weight in weights:
+        # Bypass loading MTP draft keys in the target model.
+        if "mtp." in name:
+            continue
+
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            # Skip non-stacked layers and experts (experts handled below).
+            if ".experts." in name:
+                continue
+            if weight_name not in name:
+                continue
+            name = name.replace(weight_name, param_name)
+
+            if is_pp_missing_parameter(name, self):
+                break
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(name)
+            break
+        else:
+            if ".experts." in name:
+                if (
+                    "weight_scale" in name
+                    and loaded_weight.dtype == torch.float8_e8m0fnu
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
+                for mapping in expert_mapping:
+                    param_name, weight_name, expert_id, expert_shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+                    param = params_dict[name_mapped]
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=expert_shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        name = name_mapped
+                        break
+                loaded_params.add(name_mapped)
+                continue
+            elif "attn_sink" in name:
+                if is_pp_missing_parameter(name, self):
+                    continue
+                narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                n = narrow_weight.shape[0]
+                params_dict[name][:n].copy_(narrow_weight)
+                loaded_params.add(name)
+                continue
+            elif "attn.wq_b.weight" in name:  # Fixed check!
+                param = params_dict["attn.wq_b.weight"]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                shard_size = param.data.shape[0]
+                loaded_weight_shard = loaded_weight.narrow(
+                    0, tp_rank * shard_size, shard_size
+                )
+                weight_loader(param, loaded_weight_shard)
+                loaded_params.add("attn.wq_b.weight")
+                continue
+            elif "attn.wo_a.weight" in name:  # Fixed check!
+                param = params_dict["attn.wo_a.weight"]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                shard_size = param.data.shape[0]
+                loaded_weight_shard = loaded_weight.narrow(
+                    0, tp_rank * shard_size, shard_size
+                )
+                weight_loader(param, loaded_weight_shard)
+                loaded_params.add("attn.wo_a.weight")
+                continue
+            elif "attn.wo_b.weight" in name:  # Fixed check!
+                param = params_dict["attn.wo_b.weight"]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                shard_size = param.data.shape[1]
+                loaded_weight_shard = loaded_weight.narrow(
+                    1, tp_rank * shard_size, shard_size
+                )
+                weight_loader(param, loaded_weight_shard)
+                loaded_params.add("attn.wo_b.weight")
+                continue
+            else:
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
+
+    return loaded_params
+

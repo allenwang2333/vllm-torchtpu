@@ -773,6 +773,7 @@ class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
         if loaded_weight.ndim == 1:
             loaded_weight = loaded_weight.view(-1, 1)
+        print(f"[DEBUG_LOAD] load_merged_column_weight name={getattr(self, 'name', 'unknown')} self.data.shape={list(self.data.shape)} loaded_weight.shape={list(loaded_weight.shape)} tp_rank={self.tp_rank} tp_size={self.tp_size} kwargs={kwargs}", flush=True)
         super().load_merged_column_weight(loaded_weight, **kwargs)
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):

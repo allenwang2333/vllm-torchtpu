@@ -769,8 +769,11 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         super().__init__(head_dim, window_size, dtype, prefix, cache_config)
         compressed_kv_cache_bz = cache_config.block_size
         csa_compression_ratio = 4
-        self.block_size = min(compressed_kv_cache_bz // csa_compression_ratio,
-                              window_size)
+        if window_size is None:
+            self.block_size = compressed_kv_cache_bz // csa_compression_ratio
+        else:
+            self.block_size = min(compressed_kv_cache_bz // csa_compression_ratio,
+                                  window_size)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         if getattr(self, "is_unused", False):
@@ -812,6 +815,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
                 aux_stream_list=aux_stream_list,
             )
             self.custom_prefix = prefix
+            self.__dict__['mla_attn'] = self
             for module in self.modules():
                 if module is not self and hasattr(module, "get_kv_cache_spec"):
                     if module.__class__.__name__ in ("DeepseekV4MultiHeadLatentAttentionWrapper", "DeepseekV4MLAAttention"):
@@ -959,24 +963,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = q.dtype
-        # Swap q_pe (nope_head_dim:head_dim) to the front (0:rope_head_dim)
-        nope_dim = self.nope_head_dim
-        rope_dim = self.rope_head_dim
-        head_dim = self.head_dim
-        
-        q_swapped = q.clone()
-        q_swapped[..., :rope_dim] = q[..., nope_dim:head_dim]
-        q_swapped[..., nope_dim:head_dim] = q[..., :rope_dim]
-        
-        # Apply rotary embedding (rotates the first rope_dim channels, i.e. q_pe)
-        q_rotated, _ = self.mla_attn.rotary_emb(positions, q_swapped.to(torch.float32))
-        q_rotated = q_rotated.to(orig_dtype)
-        
-        # Swap back to original position
-        q_out = q_rotated.clone()
-        q_out[..., nope_dim:head_dim] = q_rotated[..., :rope_dim]
-        q_out[..., :rope_dim] = q_rotated[..., nope_dim:head_dim]
-        return q_out
+        # Apply rotary embedding directly (rotates the last rotary_dim channels internally)
+        q_rotated, _ = self.mla_attn.rotary_emb(positions, q.to(torch.float32))
+        return q_rotated.to(orig_dtype)
 
     def kv_rope(
             self,
@@ -984,24 +973,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = kv.dtype
-        # Swap k_pe (nope_head_dim:head_dim) to the front (0:rope_head_dim)
-        nope_dim = self.nope_head_dim
-        rope_dim = self.rope_head_dim
-        head_dim = self.head_dim
-        
-        kv_swapped = kv.clone()
-        kv_swapped[..., :rope_dim] = kv[..., nope_dim:head_dim]
-        kv_swapped[..., nope_dim:head_dim] = kv[..., :rope_dim]
-        
-        # Apply rotary embedding (rotates the first rope_dim channels)
-        kv_rotated, _ = self.mla_attn.rotary_emb(positions, kv_swapped.unsqueeze(1).to(torch.float32))
-        kv_rotated = kv_rotated.squeeze(1).to(orig_dtype)
-        
-        # Swap back to original position
-        kv_out = kv_rotated.clone()
-        kv_out[..., nope_dim:head_dim] = kv_rotated[..., :rope_dim]
-        kv_out[..., :rope_dim] = kv_rotated[..., nope_dim:head_dim]
-        return kv_out
+        # Apply rotary embedding directly (rotates the last rotary_dim channels internally)
+        kv_rotated, _ = self.mla_attn.rotary_emb(positions, kv.unsqueeze(1).to(torch.float32))
+        return kv_rotated.squeeze(1).to(orig_dtype)
 
     def attention_impl(
             self,
@@ -1021,6 +995,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
         print(f"[DEBUG_SHAPES] pid={os.getpid()} after rope q shape={list(q.shape)} kv shape={list(kv.shape)}", flush=True)
+        check_nan("q (after rope)", q, self.custom_prefix)
+        check_nan("kv (after rope)", kv, self.custom_prefix)
 
         topk_indices = None
         if self.indexer is not None:
@@ -1228,7 +1204,11 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention, AttentionL
 def patch_deepseek_v4_mla_cls() -> None:
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
+    if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
+        ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention
+    if hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
+        ds_v4_amd_model.DeepseekV4MLAAttention = VllmDeepseekV4MLAAttention
     dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
     logger.info(
-        "Patched DeepseekV4Attention and DeepseekV4SWACache for TPU."
+        "Patched DeepseekV4Attention, DeepseekV4ROCMAiterMLAAttention and DeepseekV4SWACache for TPU."
     )
