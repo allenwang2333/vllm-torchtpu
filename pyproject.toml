@@ -106,11 +106,6 @@ include = ["vllm_torchtpu*"]
 
 [tool.uv]
 keyring-provider = "subprocess"
-override-dependencies = [
-    # Keep this aligned with vLLM 0.25.1's common dependency constraint.
-    "fastapi<0.137",
-]
-
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"
