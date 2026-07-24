@@ -29,6 +29,7 @@ grid step moves only the region's bytes. Scatters alias the pool in place
 (`input_output_aliases`); the unwritten complement is preserved via the
 HBM alias, with no read-modify-write.
 """
+import dataclasses
 import math
 
 import jax
@@ -410,9 +411,13 @@ def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
     lane split; the conv region is ``conv_ntok`` token rows inside a
     single kernel block, viewed bf16 with the tail rows zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
-    caller; ``pool`` contributes only its shape and dtype.
+    caller; ``pool`` contributes only its shape and dtype. Regions address
+    flat ``(blocks, rows, lanes)`` source rows — the token cell's payload
+    rows per token — because the V3 kernel relabels the source ref to that
+    flat shape, letting its state windows tile pad-free.
     """
     block_size, payload, lanes = _pool_geometry(pool)
+    tok_rows = math.prod(payload) if payload else 1
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
 
     assert lanes % d_v == 0, (lanes, d_v)
@@ -461,6 +466,15 @@ def v3_state_source(pool, *, split: int, ssm_ntok: int, conv_tok0: int,
         lane_split=1,
         rows_used=conv_rows,
     )
+
+    if tok_rows > 1:
+        # Same byte extents, reinterpreted in flat source rows.
+        ssm = dataclasses.replace(ssm,
+                                  row0=ssm.row0 * tok_rows,
+                                  nrows=ssm.nrows * tok_rows)
+        conv = dataclasses.replace(conv,
+                                   row0=conv.row0 * tok_rows,
+                                   nrows=conv.nrows * tok_rows)
 
     return gdn_v3_config.StateSourcePlan(stride=split,
                                          conv=conv,

@@ -30,6 +30,7 @@ CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
 CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
 NUM_MGR = 5  # null block + 4 slots
 POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES, )
+TOK_ROWS = 1 * 2  # PAYLOAD rows per token: plan regions are in flat rows
 
 
 def _plan(pool=None, **overrides):
@@ -53,7 +54,7 @@ class TestV3StateSourcePlan:
 
     def test_ssm_region_one_contiguous_whole_block_window(self):
         r = _plan().recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 2, 0, KBS)
+        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 2, 0, KBS * TOK_ROWS)
         assert r.view_dtype == jnp.dtype(jnp.float32)
         assert r.lane_split == LANES // D_V
         assert r.rows_used == N_V * D_K
@@ -61,7 +62,8 @@ class TestV3StateSourcePlan:
     def test_conv_region_rows_of_last_kernel_block(self):
         plan = _plan()
         c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
+        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0,
+                                                       CONV_NTOK * TOK_ROWS)
         assert c.view_dtype == jnp.dtype(jnp.bfloat16)
         assert c.lane_split == 1
         assert c.rows_used == CONV_ROWS
@@ -76,10 +78,11 @@ class TestV3StateSourcePlan:
             (NUM_MGR, SPLIT * KBS) + PAYLOAD + (LANES, ), jnp.bfloat16)
         plan = _plan(pool, split=1)
         r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, SSM_NTOK)
+        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0,
+                                                       SSM_NTOK * TOK_ROWS)
         c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0,
-                                                       CONV_NTOK)
+        assert (c.kb0, c.nblocks, c.row0,
+                c.nrows) == (0, 1, CONV_TOK0 * TOK_ROWS, CONV_NTOK * TOK_ROWS)
         assert plan.stride == 1
 
     def test_one_byte_pool_keeps_regions_and_view_dtypes(self):
@@ -89,6 +92,10 @@ class TestV3StateSourcePlan:
         assert plan.recurrent.nblocks == 2
         assert plan.recurrent.view_dtype == jnp.dtype(jnp.float32)
         assert plan.conv.view_dtype == jnp.dtype(jnp.bfloat16)
+        # 4 payload rows per token on the 1-byte pool: flat-row regions.
+        assert plan.recurrent.nrows == KBS * 4
+        assert (plan.conv.row0, plan.conv.nrows) == (0, CONV_NTOK * 4)
+        assert plan.recurrent.rows_used == N_V * D_K
 
     def test_conv_region_straddling_kernel_blocks_rejected(self):
         with pytest.raises(NotImplementedError):

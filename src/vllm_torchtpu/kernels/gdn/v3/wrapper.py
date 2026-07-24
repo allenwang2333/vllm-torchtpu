@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -214,7 +215,12 @@ def outer_kernel(
 
     if cfg.state_plan is not None:
         # Both state regions stream from the single external source ref,
-        # which rides the conv-state input slot.
+        # which rides the conv-state input slot. The plan addresses flat
+        # (blocks, rows, lanes) source rows; relabeling the untiled ref is
+        # metadata-only and lets the state windows tile pad-free.
+        rows = math.prod(conv_state_ref.shape[1:-1])
+        conv_state_ref = conv_state_ref.reshape(conv_state_ref.shape[0], rows,
+                                                conv_state_ref.shape[-1])
         recurrent_state_ref = conv_state_ref
 
     qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
