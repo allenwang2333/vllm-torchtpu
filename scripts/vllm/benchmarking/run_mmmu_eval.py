@@ -66,6 +66,13 @@ def parse_args():
         default="standard (4 options)",
         help="Dataset config/subset name (default: 'standard (4 options)')",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=16,
+        help=
+        "Number of concurrent parallel HTTP requests to send (default: 16)",
+    )
     return parser.parse_args()
 
 
@@ -345,11 +352,20 @@ def evaluate_sample(sample: Dict, host: str, port: int,
         0.0,
     }
 
-    resp = requests.post(url, json=payload, timeout=300)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"HTTP Error {resp.status_code} for sample {sample['id']}: {resp.text[:500]}"
-        )
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=600)
+            if resp.status_code == 200:
+                break
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"HTTP Error {resp.status_code} for sample {sample['id']}: {resp.text[:500]}"
+                )
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(3 * attempt)
 
     res_json = resp.json()
     generated_text = res_json["choices"][0]["message"]["content"]
@@ -365,7 +381,10 @@ def main():
     print("====================================================")
     print("  MMMU / MMMU-Pro Generative Vision Evaluation")
     print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
-    print(f"  Model: {args.model} | Limit: {args.limit}")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print(f"  Concurrency: {args.concurrency} parallel workers")
     print("====================================================")
 
     samples, dataset_source, is_synthetic = load_mmmu_samples(
@@ -377,42 +396,58 @@ def main():
     correct_count = 0
     total_count = len(samples)
     results = []
+    completed_idx = 0
+    lock = threading.Lock()
 
     t0 = time.time()
-    for idx, sample in enumerate(samples, 1):
+
+    def eval_worker(sample_tuple):
+        seq_id, sample = sample_tuple
         is_correct, pred, target = evaluate_sample(sample, args.host,
                                                    args.port, args.model)
-        if is_correct:
-            correct_count += 1
+        return seq_id, sample["id"], is_correct, pred, target
 
-        results.append({
-            "id": sample["id"],
-            "predicted": pred,
-            "ground_truth": target,
-            "is_correct": is_correct,
-        })
+    indexed_samples = list(enumerate(samples, 1))
 
-        if idx % 10 == 0 or idx == total_count:
-            acc = correct_count / idx * 100.0
-            print(
-                f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
-            )
-            out_path = os.path.join(args.results_dir, "mmmu_eval_results.json")
-            with open(out_path, "w") as f:
-                json.dump(
-                    {
-                        "model": args.model,
-                        "dataset_source": dataset_source,
-                        "is_synthetic": is_synthetic,
-                        "samples": idx,
-                        "accuracy": acc,
-                        "correct": correct_count,
-                        "details": results,
-                    },
-                    f,
-                    indent=2)
-                f.flush()
-                os.fsync(f.fileno())
+    with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as executor:
+        futures = [
+            executor.submit(eval_worker, item) for item in indexed_samples
+        ]
+        for future in as_completed(futures):
+            seq_id, sample_id, is_correct, pred, target = future.result()
+            with lock:
+                completed_idx += 1
+                if is_correct:
+                    correct_count += 1
+                results.append({
+                    "id": sample_id,
+                    "predicted": pred,
+                    "ground_truth": target,
+                    "is_correct": is_correct,
+                })
+
+                if completed_idx % 10 == 0 or completed_idx == total_count:
+                    acc = correct_count / completed_idx * 100.0
+                    print(
+                        f"[{completed_idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{completed_idx})"
+                    )
+                    out_path = os.path.join(args.results_dir,
+                                            "mmmu_eval_results.json")
+                    with open(out_path, "w") as f:
+                        json.dump(
+                            {
+                                "model": args.model,
+                                "dataset_source": dataset_source,
+                                "is_synthetic": is_synthetic,
+                                "samples": completed_idx,
+                                "accuracy": acc,
+                                "correct": correct_count,
+                                "details": results,
+                            },
+                            f,
+                            indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
 
     t1 = time.time()
     accuracy = (correct_count /

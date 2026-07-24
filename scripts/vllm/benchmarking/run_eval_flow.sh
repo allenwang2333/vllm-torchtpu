@@ -230,6 +230,7 @@ if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NA
       --model "$MODEL" \
       --dataset "MMMU/MMMU_Pro" \
       --limit "${MMMU_LIMIT:-100}" \
+      --concurrency "${MMMU_CONCURRENCY:-16}" \
       --results-dir "$RESULTS_DIR" || { echo "::error::MMMU-Pro evaluation failed!"; fail=1; }
 fi
 
