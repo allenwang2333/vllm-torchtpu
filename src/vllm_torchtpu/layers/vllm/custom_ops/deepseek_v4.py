@@ -39,9 +39,12 @@ def check_nan(name: str, tensor: torch.Tensor, prefix: str):
                (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
     if not is_fake:
         has_nan = torch.isnan(tensor).any().item()
-        if has_nan:
-            nan_token_0 = torch.isnan(tensor[0]).any().item() if tensor.shape[0] > 0 else False
-            print(f"[NAN_DETECTION] NaN detected in {name} at layer {prefix}! shape={list(tensor.shape)} token0_has_nan={nan_token_0}", flush=True)
+        has_inf = torch.isinf(tensor).any().item()
+        if has_nan or has_inf:
+            nan_token_0 = (torch.isnan(tensor[0]).any().item() or torch.isinf(tensor[0]).any().item()) if tensor.shape[0] > 0 else False
+            print(f"[NAN_DETECTION] NaN/Inf detected in {name} at layer {prefix}! shape={list(tensor.shape)} has_nan={has_nan} has_inf={has_inf} token0_has_nan_inf={nan_token_0}", flush=True)
+            t_flt = tensor.to(torch.float32)
+            print(f"    min={t_flt.min().item():.6f} max={t_flt.max().item():.6f} mean={t_flt.mean().item():.6f}", flush=True)
         elif os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
             t_flt = tensor.to(torch.float32)
             t_mean = t_flt.mean().item()
