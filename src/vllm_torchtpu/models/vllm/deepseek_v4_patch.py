@@ -208,6 +208,28 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         
         def patched_load_weights(self, weights):
             print(f"[PATCH] Entering patched_load_weights on DeepseekV4ForCausalLM", file=sys.stderr, flush=True)
+            
+            # Check if all expert layers have been pre-quantized and cached on disk.
+            cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+                cached_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
+                # Total expected cache files = num_hidden_layers * 8 ranks
+                expected_files = self.config.num_hidden_layers * 8
+                has_all_cached = (len(cached_files) >= expected_files)
+            else:
+                has_all_cached = False
+
+            if has_all_cached:
+                import vllm.model_executor.model_loader.weight_utils as wu
+                print(f"[PATCH] All expert weights are cached on disk. Monkey-patching should_skip_weight to skip MoE experts from checkpoint files!", file=sys.stderr, flush=True)
+                _orig_should_skip_weight = wu.should_skip_weight
+                def patched_should_skip_weight(weight_name, local_expert_ids):
+                    if ".experts." in weight_name:
+                        return True
+                    return _orig_should_skip_weight(weight_name, local_expert_ids)
+                wu.should_skip_weight = patched_should_skip_weight
+
             print(f"[PATCH] Model parameters count: {len(list(self.parameters()))}", file=sys.stderr, flush=True)
             named_params = dict(self.named_parameters())
             for name in named_params.keys():
@@ -348,6 +370,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         if ".experts." in name:
                             continue
                         yield name, loaded_weight
+                weights = filter_expert_weights(weights)
             else:
                 logger.warning("[PATCH] Cached expert weights not found or incomplete. Loading expert weights from safetensors checkpoint to generate cache.")
 

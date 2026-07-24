@@ -77,8 +77,7 @@ _compressor_op_cache = {}
 _indexer_op_cache = {}
 _attn_op_cache = {}
 
-from vllm_torchtpu.layers.common.sharding import ShardingAxisName
-BATCH_AXIS = getattr(ShardingAxisName, "BATCH", ShardingAxisName.ATTN_DATA)
+BATCH_AXIS = None
 
 from vllm_torchtpu.kernels.deepseek_v4.compressor import (
     compressor_forward, compressor_forward_indexer)
@@ -231,7 +230,7 @@ def _deepseek_v4_compressor_jax(
 
         return out + dummy_sum.astype(out.dtype)
 
-    data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
+    data_spec = get_valid_spec(mesh, None)
     cache_spec = get_valid_spec(mesh, BATCH_AXIS)
     in_specs = (
         data_spec,  # kv_score
@@ -405,9 +404,9 @@ def _deepseek_v4_attention_jax(
             updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
         return output + dummy_sum, updated_sw_cache
 
-    data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD)
-    batch_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
-    extra_spec = batch_spec if not is_csa else get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, None)
+    data_spec = get_valid_spec(mesh, None, "model")
+    batch_spec = get_valid_spec(mesh, None)
+    extra_spec = batch_spec if not is_csa else get_valid_spec(mesh, None, None)
     in_specs = (
         data_spec,  # q
         P(),  # new_kv
@@ -512,7 +511,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             return _compressor_op_cache[op_name]
             
         from jax.sharding import PartitionSpec as P
-        attn_data_axis = ShardingAxisName.ATTN_DATA
+        attn_data_axis = None
         batch_axis = BATCH_AXIS
         compressor_jax_op = pallas.jax_op(
             op_name,
@@ -637,18 +636,18 @@ def _deepseek_v4_indexer_jax(
             num_queries_per_block=1,
         )
 
-    data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
+    data_spec = get_valid_spec(mesh, None)
     cache_spec = get_valid_spec(mesh, BATCH_AXIS)
     in_specs = (
-        get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # q_rope
-        get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # indexer_weights
+        get_valid_spec(mesh, None, "model"),  # q_rope
+        get_valid_spec(mesh, None, "model"),  # indexer_weights
         P(),  # cache_kv
         data_spec,  # seq_lens
         data_spec,  # page_indices
         P(),  # cu_q_lens
         P(),  # distribution
     )
-    out_specs = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, None)  # topk_indices
+    out_specs = get_valid_spec(mesh, None, None)  # topk_indices
 
     if cache_kv.ndim == 5:
         cache_kv = jnp.squeeze(cache_kv, axis=2)
@@ -713,8 +712,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             return _indexer_op_cache[op_name]
             
         from jax.sharding import PartitionSpec as P
-        attn_data_axis = ShardingAxisName.ATTN_DATA
-        attn_head_axis = ShardingAxisName.ATTN_HEAD
+        attn_data_axis = None
+        attn_head_axis = "model"
         batch_axis = BATCH_AXIS
         indexer_jax_op = pallas.jax_op(
             op_name,
@@ -931,8 +930,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             return _attn_op_cache[op_name]
             
         from jax.sharding import PartitionSpec as P
-        attn_data_axis = ShardingAxisName.ATTN_DATA
-        attn_head_axis = ShardingAxisName.ATTN_HEAD
+        attn_data_axis = None
+        attn_head_axis = "model"
         batch_axis = BATCH_AXIS
         extra_spec = get_valid_spec(mesh, batch_axis) if not is_csa else get_valid_spec(mesh, batch_axis, None)
         attn_jax_op = pallas.jax_op(
@@ -1002,9 +1001,18 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         rms = torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + self.mla_attn.eps)
         qf = qf * rms
         
-        # Apply rotary embedding directly (rotates the last rotary_dim channels internally)
-        q_rotated, _ = self.mla_attn.rotary_emb(positions, qf)
-        return q_rotated.to(orig_dtype)
+        # Apply rotary embedding to trailing channels.
+        rot_dim = self.mla_attn.rotary_emb.rotary_dim
+        nope_dim = qf.shape[-1] - rot_dim
+        
+        q_nope = qf[..., :nope_dim]
+        q_rot = qf[..., nope_dim:]
+        
+        q_padded = torch.cat([q_rot, torch.zeros_like(q_nope)], dim=-1)
+        q_padded_rotated, _ = self.mla_attn.rotary_emb(positions, q_padded)
+        q_rot_rotated = q_padded_rotated[..., :rot_dim]
+        
+        return torch.cat([q_nope, q_rot_rotated], dim=-1).to(orig_dtype)
 
     def kv_rope(
             self,
@@ -1012,8 +1020,19 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = kv.dtype
-        # Apply rotary embedding directly (rotates the last rotary_dim channels internally)
-        kv_rotated, _ = self.mla_attn.rotary_emb(positions, kv.unsqueeze(1).to(torch.float32))
+        kv_f = kv.unsqueeze(1).to(torch.float32)
+        
+        rot_dim = self.mla_attn.rotary_emb.rotary_dim
+        nope_dim = kv_f.shape[-1] - rot_dim
+        
+        kv_nope = kv_f[..., :nope_dim]
+        kv_rot = kv_f[..., nope_dim:]
+        
+        kv_padded = torch.cat([kv_rot, torch.zeros_like(kv_nope)], dim=-1)
+        kv_padded_rotated, _ = self.mla_attn.rotary_emb(positions, kv_padded)
+        kv_rot_rotated = kv_padded_rotated[..., :rot_dim]
+        
+        kv_rotated = torch.cat([kv_nope, kv_rot_rotated], dim=-1)
         return kv_rotated.squeeze(1).to(orig_dtype)
 
     def attention_impl(
@@ -1191,8 +1210,14 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         check_nan("o (input to o_proj)", o, self.custom_prefix)
         t = o.shape[0]
         o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
-        o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
-        o_ref = o_ref.to(torch.bfloat16)
+        rot_dim = self.mla_attn.rotary_emb.rotary_dim
+        nope_dim = o_f.shape[-1] - rot_dim
+        o_nope = o_f[..., :nope_dim]
+        o_rot = o_f[..., nope_dim:]
+        o_padded = torch.cat([o_rot, torch.zeros_like(o_nope)], dim=-1)
+        o_padded_rotated, _ = self.mla_attn.rotary_emb(positions, o_padded, inverse=True)
+        o_rot_rotated = o_padded_rotated[..., :rot_dim]
+        o_ref = torch.cat([o_nope, o_rot_rotated], dim=-1).to(torch.bfloat16)
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
