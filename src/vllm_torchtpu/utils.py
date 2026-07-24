@@ -249,7 +249,12 @@ def tpu_bind_kv_cache(
             runner_kv_caches.append(kv_caches[layer_name])
 
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        if layer_name in forward_context:
+            target_mod = forward_context[layer_name]
+            target_mod.kv_cache = kv_cache
+            print(f"[DEBUG_BIND_KV] bound kv_cache shape={kv_cache.shape} to layer_name={layer_name} mod_class={target_mod.__class__.__name__} mod_id={id(target_mod)}", flush=True)
+        else:
+            print(f"[DEBUG_BIND_KV_MISSING] layer_name={layer_name} NOT IN forward_context! keys={list(forward_context.keys())[:5]}", flush=True)
 
 
 _TORCH_TO_JAX_DTYPE = {

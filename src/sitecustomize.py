@@ -3,6 +3,12 @@
 import os
 import sys
 
+try:
+    import triton
+    triton.next_power_of_2 = lambda x: 1 << (int(x) - 1).bit_length()
+except Exception:
+    pass
+
 # Detect if we are running pytest unit tests on CPU, and configure JAX/Pallas env variables
 # BEFORE any package (including vllm_torchtpu) imports jax.
 if any("pytest" in arg for arg in sys.argv) and "--use-tpu" not in sys.argv:

@@ -4238,6 +4238,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
+        print(f"[DEBUG_KV_CACHES_KEYS] kv_caches keys = {list(kv_caches.keys())}", flush=True)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile

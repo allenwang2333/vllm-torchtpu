@@ -1,6 +1,8 @@
 import os
 os.environ["NEW_MODEL_DESIGN"] = "1"
 os.environ["MODEL_IMPL_TYPE"] = "vllm"
+os.environ["VLLM_NO_USAGE_STATS"] = "1"
+os.environ.setdefault("VLLM_FP4_CACHE_DIR", "/dev/shm/dsv4-flash-real-fp4")
 
 import sys
 import importlib.util
@@ -70,15 +72,17 @@ def main():
         },
     )
 
-    prompts = [
-        "<｜begin▁of▁sentence｜>User: Explain the difference between JAX and PyTorch in one sentence.\n\nAssistant:",
-        "<｜begin▁of▁sentence｜><｜User｜>Explain the theory of relativity in simple terms.<｜Assistant｜>",
+    conversation = [
+        {"role": "user", "content": "Explain the difference between JAX and PyTorch in one sentence."}
     ]
-
+    
+    tokenizer = llm.get_tokenizer()
+    prompt_text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    
     sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False, logprobs=5)
 
-    print("=== Testing manually formatted prompts with llm.generate ===")
-    outputs = llm.generate(prompts, sampling_params)
+    print("=== Testing formatted prompt with llm.generate ===")
+    outputs = llm.generate([prompt_text], sampling_params)
     for output in outputs:
         print(f"Prompt: {output.prompt!r}")
         print(f"Prompt token IDs: {output.prompt_token_ids}")
