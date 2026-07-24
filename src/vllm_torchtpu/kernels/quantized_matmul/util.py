@@ -105,7 +105,31 @@ def xla_quantized_matmul(
             dimension_numbers=(((1, ), (1, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
-    out *= jnp.expand_dims(w_scale.astype(jnp.float32), 0)
+    w_scale_f32 = w_scale.astype(jnp.float32)
+    w_scale_squeezed = jnp.squeeze(w_scale_f32)
+    if w_scale_squeezed.ndim == 0:
+        out *= w_scale_squeezed
+    elif w_scale_squeezed.ndim == 1:
+        out *= jnp.expand_dims(w_scale_squeezed, 0)
+    elif w_scale_squeezed.ndim == 2:
+        if w_scale_squeezed.shape[1] == 1:
+            out *= jnp.transpose(w_scale_squeezed)
+        elif w_scale_squeezed.shape[0] == 1:
+            out *= w_scale_squeezed
+        else:
+            # 2D FP8 block scale of shape (N_blocks, K_blocks) with block size 128x128
+            scale_expanded = jnp.repeat(jnp.repeat(w_scale_squeezed, 128, axis=0), 128, axis=1)
+            # Crop to match weight shape (N, K) if padded
+            scale_expanded = scale_expanded[:w_q.shape[0], :w_q.shape[1]]
+            w_q_dequant = w_q.astype(jnp.float32) * scale_expanded
+            out = jax.lax.dot_general(
+                x,
+                w_q_dequant,
+                dimension_numbers=(((1, ), (1, )), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+    else:
+        out *= w_scale_f32
     return out.astype(x.dtype)
 
 

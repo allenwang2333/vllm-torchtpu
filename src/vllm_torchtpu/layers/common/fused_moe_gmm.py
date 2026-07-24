@@ -225,6 +225,11 @@ def moe_gmm(
     w2_k = w2.shape[1]
     if w2.dtype == jnp.uint8:
         w2_k = w2_k * 2
+    if w2_k != gmm1_res.shape[1] and (w2.shape[2] == gmm1_res.shape[1] or w2.shape[2] * 2 == gmm1_res.shape[1]):
+        w2 = jnp.swapaxes(w2, 1, 2)
+        if w2_scale is not None:
+            w2_scale = jnp.swapaxes(w2_scale, 1, 2)
+        w2_k = gmm1_res.shape[1]
     gmm1_res = gmm1_res[:, :w2_k]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))

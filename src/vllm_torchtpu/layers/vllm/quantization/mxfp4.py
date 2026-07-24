@@ -73,6 +73,8 @@ from vllm.model_executor.layers.quantization.mxfp4 import (Mxfp4Config,
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
+import os
+import sys
 from enum import Enum
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm_torchtpu import envs
@@ -92,7 +94,9 @@ logger = init_logger(__name__)
 _orig_weight_loader = FusedMoE.weight_loader
 
 def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
-    if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2") and "weight" in weight_name and "scale" not in weight_name:
+    if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2"):
+        if "scale" in weight_name:
+            return True if return_success else None
         if shard_id == "w1":
             temp_param = self.w1_temp
             shard_dim = 0
@@ -103,7 +107,18 @@ def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, sha
             temp_param = self.w2_temp
             shard_dim = 1
 
-        expert_data = temp_param.data[expert_id]
+        num_local_experts = temp_param.shape[0]
+        experts_start = getattr(self, "expert_start", None)
+        if experts_start is None:
+            experts_start = moe_routing.get_experts_start(self)
+        if experts_start is None:
+            experts_start = 0
+
+        local_expert_id = expert_id - experts_start
+        if local_expert_id < 0 or local_expert_id >= num_local_experts:
+            return True if return_success else None
+
+        expert_data = temp_param.data[local_expert_id]
 
         if loaded_weight.ndim > 0:
             shard_size = expert_data.shape[shard_dim]
@@ -190,9 +205,11 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
 
 
 def _get_activation_str(activation) -> str:
-    """Convert MoEActivation enum or string to plain string."""
-    return activation.value if hasattr(activation,
-                                       'value') else str(activation)
+    """Convert MoEActivation enum or string to plain string, mapping silu to silu_and_mul_with_clamp for DeepSeek-V4."""
+    act_str = activation.value if hasattr(activation, 'value') else str(activation)
+    if act_str.lower() in ("silu", "silu_and_mul", "swiglu"):
+        return "silu_and_mul_with_clamp"
+    return act_str
 
 
 REQUANTIZED_BLOCK_SIZE = (
@@ -244,10 +261,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             **extra_weight_attrs,
         )
 
-        # 2. Allocate temporary UNPACKED bfloat16 tensors for w1, w3, w2 to receive checkpoint weights
-        layer.w1_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu")
-        layer.w3_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size, dtype=torch.bfloat16, device="cpu")
-        layer.w2_temp = torch.zeros(num_experts, hidden_size, intermediate_size_per_partition, dtype=torch.bfloat16, device="cpu")
+        # 2. Allocate temporary PACKED uint8 tensors for w1, w3, w2 to receive checkpoint weights
+        layer.w1_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size // 2, dtype=torch.uint8, device="cpu")
+        layer.w3_temp = torch.zeros(num_experts, intermediate_size_per_partition, hidden_size // 2, dtype=torch.uint8, device="cpu")
+        layer.w2_temp = torch.zeros(num_experts, hidden_size, intermediate_size_per_partition // 2, dtype=torch.uint8, device="cpu")
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, FusedMoE)
@@ -325,18 +342,29 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 logger.warning("Failed to load cached parameters from %s: %s", cache_path, e)
 
         if not loaded_from_cache:
-            # We read from the temp parameters loaded from the checkpoint
-            w1 = layer.w1_temp.data.to("cpu")
-            w3 = layer.w3_temp.data.to("cpu")
-            w2 = layer.w2_temp.data.to("cpu")
+            # 1. Load packed temp weights into CPU memory
+            orig_local_intermediate_size = self.intermediate_size
+            w1_packed = layer.w1_temp.data.to("cpu")
+            w3_packed = layer.w3_temp.data.to("cpu")
+            w2_packed = layer.w2_temp.data.to("cpu")
             w13_bias = layer.w13_bias.data.to("cpu") if has_bias and layer.w13_bias is not None else None
             w2_bias = layer.w2_bias.data.to("cpu") if has_bias and layer.w2_bias is not None else None
 
-            # Delete the temp parameters to free HBM/RAM immediately
+            # 2. Load scales (which were populated by default_weight_loader into w13_weight_scale / w2_weight_scale)
+            w1_scale = layer.w13_weight_scale.data.to("cpu")[:, :orig_local_intermediate_size, :]
+            w3_scale = layer.w13_weight_scale.data.to("cpu")[:, orig_local_intermediate_size:, :]
+            w2_scale = layer.w2_weight_scale.data.to("cpu")
+
+            # 3. Dequantize packed weights to BF16 (dequantize along Axis 2, which is hidden_size // 2 for w1/w3, and hidden_size for w2)
+            from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
+            w1_dequant = dequantize_mxfp4_packed(w1_packed, w1_scale, axis=2, out_dtype=torch.bfloat16)
+            w3_dequant = dequantize_mxfp4_packed(w3_packed, w3_scale, axis=2, out_dtype=torch.bfloat16)
+            w2_dequant = dequantize_mxfp4_packed(w2_packed, w2_scale, axis=2, out_dtype=torch.bfloat16)
+
+            # Delete the temp parameters and scales to free HBM/RAM immediately
             del layer.w1_temp
             del layer.w3_temp
             del layer.w2_temp
-            # Also delete the empty packed parameters, as we will re-allocate them on TPU after quantization!
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
@@ -347,13 +375,22 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             import gc
             gc.collect()
 
-            # 2. Concatenate w1 and w3 to form w13
-            w13_weight = torch.cat([w1, w3], dim=1).to(torch.float32)
-            w2_weight = w2.to(torch.float32)
+            # 4. Concatenate w1 and w3 to form w13
+            w13_weight = torch.cat([w1_dequant, w3_dequant], dim=1)
+            w2_weight = w2_dequant
 
             if layer_idx == 0:
-                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w13_weight: Mean={w13_weight.mean():.6f} Max={w13_weight.max()} Min={w13_weight.min()} HasNaN={torch.isnan(w13_weight).any()}", flush=True)
-                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w2_weight: Mean={w2_weight.mean():.6f} Max={w2_weight.max()} Min={w2_weight.min()} HasNaN={torch.isnan(w2_weight).any()}", flush=True)
+                w13_mean = w13_weight.mean().item()
+                w13_max = w13_weight.max().item()
+                w13_min = w13_weight.min().item()
+                w13_nan = torch.isnan(w13_weight).any().item()
+                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w13_weight: Mean={w13_mean:.6f} Max={w13_max:.6f} Min={w13_min:.6f} HasNaN={w13_nan}", flush=True)
+                
+                w2_mean = w2_weight.mean().item()
+                w2_max = w2_weight.max().item()
+                w2_min = w2_weight.min().item()
+                w2_nan = torch.isnan(w2_weight).any().item()
+                print(f"[DEBUG_DEQUANTIZED_WEIGHTS] layer_0 w2_weight: Mean={w2_mean:.6f} Max={w2_max:.6f} Min={w2_min:.6f} HasNaN={w2_nan}", flush=True)
 
             # 3. Transpose non-contracting dim to right-most dim:
             # w13_weight: (num_experts, 2 * intermediate_size, hidden_size) -> (num_experts, hidden_size, 2 * intermediate_size)
@@ -549,7 +586,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
-        activation_str = layer._tpu_activation_str
+        activation_str = getattr(layer, "_tpu_activation_str", "swiglu")
 
         # Step 1: Routing
         custom_routing_fn = getattr(layer, "custom_routing_function", None)
@@ -585,13 +622,19 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             activation=activation_str,
         )
         layer_idx = getattr(layer, "layer_idx", -1)
-        if layer_idx in (0, 3):
-            x_cpu = x.to("cpu")
-            router_logits_cpu = router_logits.to("cpu")
-            res_cpu = res.to("cpu")
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input x: shape={list(x_cpu.shape)} dtype={x_cpu.dtype} | mean={x_cpu.mean().item():.6f} std={x_cpu.std().item():.6f} min={x_cpu.min().item():.6f} max={x_cpu.max().item():.6f}", flush=True)
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts input router_logits: shape={list(router_logits_cpu.shape)} dtype={router_logits_cpu.dtype} | mean={router_logits_cpu.mean().item():.6f} std={router_logits_cpu.std().item():.6f} min={router_logits_cpu.min().item():.6f} max={router_logits_cpu.max().item():.6f}", flush=True)
-            print(f"[DEBUG_PYTORCH] model.layers.{layer_idx}.ffn.experts output: shape={list(res_cpu.shape)} dtype={res_cpu.dtype} | mean={res_cpu.mean().item():.6f} std={res_cpu.std().item():.6f} min={res_cpu.min().item():.6f} max={res_cpu.max().item():.6f}", flush=True)
+        if os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
+            x_flt = x.to(torch.float32)
+            rl_flt = router_logits.to(torch.float32)
+            res_flt = res.to(torch.float32)
+            x_mean = x_flt.mean().item()
+            x_std = (x_flt - x_mean).pow(2).mean().sqrt().item()
+            rl_mean = rl_flt.mean().item()
+            rl_std = (rl_flt - rl_mean).pow(2).mean().sqrt().item()
+            res_mean = res_flt.mean().item()
+            res_std = (res_flt - res_mean).pow(2).mean().sqrt().item()
+            print(f"[ACT_TRACE] [layers.{layer_idx}.moe] input_x: shape={list(x.shape)} mean={x_mean:.6f} std={x_std:.6f} min={x_flt.min().item():.6f} max={x_flt.max().item():.6f}", flush=True)
+            print(f"[ACT_TRACE] [layers.{layer_idx}.moe] router_logits: shape={list(router_logits.shape)} mean={rl_mean:.6f} std={rl_std:.6f} min={rl_flt.min().item():.6f} max={rl_flt.max().item():.6f}", flush=True)
+            print(f"[ACT_TRACE] [layers.{layer_idx}.moe] output_res: shape={list(res.shape)} mean={res_mean:.6f} std={res_std:.6f} min={res_flt.min().item():.6f} max={res_flt.max().item():.6f}", flush=True)
         return res
 
 

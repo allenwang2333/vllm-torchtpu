@@ -48,8 +48,10 @@ def tpu_grouped_topk(
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
         scores = gating_output.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        scores = torch.sqrt(torch.nn.functional.softplus(gating_output.float()))
     else:
-        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+        scores = gating_output.sigmoid()
 
     # Use standard static integers from shape to avoid SymInt dynamic shapes in Dynamo
     num_token = scores.shape[0]

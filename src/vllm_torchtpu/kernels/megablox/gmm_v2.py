@@ -73,7 +73,7 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
     acc_gate, acc_up = jnp.split(acc, 2, -1)
     match fuse_act:
-        case "silu":
+        case "swiglu" | "silu":
             return jax.nn.silu(acc_gate) * acc_up
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
@@ -982,8 +982,8 @@ def kernel_main(
                          cfgs.rhs_cfgs.dtype != jnp.float4_e2m1fn)
         w_boundary = rhs_ref.weight.shape[-1] // 2 if is_packed_fp4 else cfgs.out_size_n
         w_up = rhs_ref.weight.at[..., w_boundary:]
-        s_up = rhs_ref.scale.at[..., cfgs.out_size_n:] if rhs_ref.scale is not None else None
-        b_up = rhs_ref.bias.at[..., cfgs.out_size_n:] if rhs_ref.bias is not None else None
+        s_up = rhs_ref.scale.at[..., cfgs.out_size_n:] if (rhs_ref.scale is not None and rhs_ref.scale.shape[-1] > cfgs.out_size_n) else rhs_ref.scale
+        b_up = rhs_ref.bias.at[..., cfgs.out_size_n:] if (rhs_ref.bias is not None and rhs_ref.bias.shape[-1] > cfgs.out_size_n) else rhs_ref.bias
         rhs_up_ref = WeightsRef(weight=w_up, scale=s_up, bias=b_up)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
 
@@ -1169,8 +1169,10 @@ def validate_inputs(
         # Bias is matched to the logical output size
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
+        if rhs_scale.ndim == 3:
+            rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
         num_quant_blocks = rhs_scale.shape[1]
-        if rhs_scale.shape != (size_group, num_quant_blocks, 1, size_n):
+        if rhs_scale.shape[0] != size_group or rhs_scale.shape[1] != num_quant_blocks:
             raise AssertionError(
                 f"GMM scale validation failed: rhs_scale.shape={rhs_scale.shape}, size_group={size_group}, num_quant_blocks={num_quant_blocks}, size_n={size_n}, size_n_rhs={size_n_rhs}"
             )
@@ -1413,6 +1415,11 @@ def gmm_v2(
 
     del precision
 
+    orig_m = lhs.shape[0]
+    pad_m = (16 - (orig_m % 16)) % 16
+    if pad_m > 0:
+        lhs = jnp.pad(lhs, ((0, pad_m), (0, 0)))
+
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
     else:
@@ -1426,6 +1433,9 @@ def gmm_v2(
             vmem_limit_bytes = int(vmem_override)
         else:
             vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+
+    if rhs_scale is not None and rhs_scale.ndim == 3:
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
     cfgs = make_gmm_configs(
         lhs,
@@ -1530,4 +1540,4 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights, lut)[:, :cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights, lut)[:orig_m, :cfgs.out_size_n]

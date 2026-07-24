@@ -275,7 +275,10 @@ def dequantize_mxfp4_packed(
         Dequantized weights [E, out_dim, in_dim] as out_dtype.
     """
     weight_unpacked = unpack_uint8_to_fp4(weight_packed)
-    scale_fp32 = e8m0_to_fp32(scale_u8)
+    if is_floating_dtype(scale_u8.dtype):
+        scale_fp32 = scale_u8.to(torch.float32)
+    else:
+        scale_fp32 = e8m0_to_fp32(scale_u8)
     return dequantize_tensor(weight_unpacked, scale_fp32, axis, out_dtype)
 
 
