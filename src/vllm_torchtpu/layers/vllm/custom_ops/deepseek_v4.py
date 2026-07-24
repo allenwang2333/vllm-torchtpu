@@ -301,7 +301,7 @@ def _deepseek_v4_attention_jax(
     swa_only: bool,
     is_csa: bool,
     two_caches_same_buffer: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         print(f"[DEBUG_ZERO_CACHE] main_cache_kv.shape={main_cache_kv.shape} sw_cache.shape={sw_cache.shape} swa_only={swa_only}", flush=True)
         t = q.shape[0]
@@ -315,7 +315,7 @@ def _deepseek_v4_attention_jax(
                     main_distribution, attention_sinks):
             if arg is not None:
                 dummy_sum = dummy_sum + jnp.sum(arg) * 0
-        return dummy_out + dummy_sum, sw_cache + dummy_sum, dummy_out + dummy_sum, jnp.zeros((t, n_local_heads)) + dummy_sum, jnp.zeros((t, n_local_heads)) + dummy_sum
+        return dummy_out + dummy_sum, sw_cache + dummy_sum
 
     def _attention_local(
         q, new_kv, sw_cache, swa_kv_lens, swa_page_indices,
@@ -372,7 +372,7 @@ def _deepseek_v4_attention_jax(
         if swa_only:
             if sw_cache_was_5d:
                 updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
-            return swa_output + dummy_sum, updated_sw_cache, swa_output + dummy_sum, swa_l + dummy_sum, swa_m + dummy_sum
+            return swa_output + dummy_sum, updated_sw_cache
 
         if two_caches_same_buffer and not is_csa:
             main_cache_kv = updated_sw_cache
@@ -401,7 +401,7 @@ def _deepseek_v4_attention_jax(
         )
         if sw_cache_was_5d:
             updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
-        return output + dummy_sum, updated_sw_cache, swa_output + dummy_sum, swa_l + dummy_sum, swa_m + dummy_sum
+        return output + dummy_sum, updated_sw_cache
 
     data_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD)
     batch_spec = get_valid_spec(mesh, ShardingAxisName.ATTN_DATA)
@@ -425,12 +425,9 @@ def _deepseek_v4_attention_jax(
     out_specs = (
         data_spec,  # output
         P(),  # updated_sw_cache
-        data_spec,  # swa_output
-        data_spec,  # swa_l
-        data_spec,  # swa_m
     )
 
-    res_out, res_cache, res_swa_out, res_swa_l, res_swa_m = jax.shard_map(
+    res_out, res_cache = jax.shard_map(
         _attention_local,
         mesh=mesh,
         in_specs=in_specs,
@@ -442,7 +439,7 @@ def _deepseek_v4_attention_jax(
         main_kv_lens, extra, main_page_indices, main_cu_q_lens,
         main_distribution, attention_sinks
     )
-    return res_out, res_cache, res_swa_out, res_swa_l, res_swa_m
+    return res_out, res_cache
 
 
 class VllmCompressorStateCache(CompressorStateCache):
@@ -959,9 +956,6 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             output_partition_specs=(
                 get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # out (sharded along attention heads)
                 P(),                      # new_sw_cache
-                get_valid_spec(mesh, attn_data_axis, attn_head_axis, None),  # swa_out
-                get_valid_spec(mesh, attn_data_axis, attn_head_axis),        # swa_l
-                get_valid_spec(mesh, attn_data_axis, attn_head_axis),        # swa_m
             ),
         )
 
@@ -969,9 +963,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
             num_tokens = q.shape[0]
             out_tensor = torch.empty((num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim), dtype=q.dtype, device=q.device)
-            l_tensor = torch.empty((num_tokens, self.mla_attn.n_local_heads), dtype=torch.float32, device=q.device)
-            m_tensor = torch.empty((num_tokens, self.mla_attn.n_local_heads), dtype=torch.float32, device=q.device)
-            return out_tensor, torch.empty_like(sw_cache), out_tensor, l_tensor, m_tensor
+            return out_tensor, torch.empty_like(sw_cache)
         attn_jax_op.register_fake(_fake_attn)
         
         _attn_op_cache[op_name] = attn_jax_op
@@ -1165,18 +1157,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
 
         if rank == 0:
             print(f"[DEBUG_FORWARD_MQA_CACHES] prefix={self.mla_attn.prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}", flush=True)
-        if rank == 0 and main_cache_kv.shape[0] > 0:
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} q: shape={list(q.shape)} mean={q.float().mean().item():.6f} min={q.min().item():.6f} max={q.max().item():.6f}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} kv: shape={list(kv.shape)} mean={kv.float().mean().item():.6f} min={kv.min().item():.6f} max={kv.max().item():.6f}", flush=True)
-            if sw_cache is not None:
-                print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} sw_cache: shape={list(sw_cache.shape)} mean={sw_cache.float().mean().item():.6f} min={sw_cache.min().item():.6f} max={sw_cache.max().item():.6f}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} swa_seq_lens: {swa_seq_lens.tolist() if swa_seq_lens is not None else None}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} main_cache_kv: shape={list(main_cache_kv.shape)} mean={main_cache_kv.float().mean().item():.6f} min={main_cache_kv.min().item():.6f} max={main_cache_kv.max().item():.6f}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} main_kv_lens: {main_kv_lens.tolist() if main_kv_lens is not None else None}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} extra: {extra.tolist() if extra is not None else None}", flush=True)
-            if self.attn_sink is not None:
-                print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} attn_sink: shape={list(self.attn_sink.shape)} mean={self.attn_sink.float().mean().item():.6f} min={self.attn_sink.min().item():.6f} max={self.attn_sink.max().item():.6f}", flush=True)
-        output, new_sw_cache, swa_output, swa_l, swa_m = self.attn_op(
+        output, new_sw_cache = self.attn_op(
             q,
             kv,
             sw_cache,
@@ -1192,10 +1173,6 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             main_distribution,
             self.attn_sink,
         )
-        if rank == 0 and main_cache_kv.shape[0] > 0:
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} swa_output: shape={list(swa_output.shape)} mean={swa_output.float().mean().item():.6f} min={swa_output.min().item():.6f} max={swa_output.max().item():.6f}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} swa_l: shape={list(swa_l.shape)} mean={swa_l.float().mean().item():.6f} min={swa_l.min().item():.6f} max={swa_l.max().item():.6f}", flush=True)
-            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} swa_m: shape={list(swa_m.shape)} mean={swa_m.float().mean().item():.6f} min={swa_m.min().item():.6f} max={swa_m.max().item():.6f}", flush=True)
 
         if orig_sw_cache is not None and new_sw_cache is not None and new_sw_cache.numel() > 0:
             orig_sw_cache.copy_(new_sw_cache)
