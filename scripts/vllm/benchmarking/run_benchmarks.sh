@@ -111,6 +111,7 @@ BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 # Set to 0 for deterministic greedy decoding.
 BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+IS_MULTIMODAL=false
 EVAL_TOLERANCE=""
 
 # shellcheck source=/dev/null
@@ -365,6 +366,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "is_multimodal": $IS_MULTIMODAL,
     "eval_tolerance": $EVAL_TOLERANCE
 }
 EOF

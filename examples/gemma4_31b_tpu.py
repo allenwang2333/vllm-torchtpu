@@ -2,6 +2,9 @@ import argparse
 import os
 import time
 
+os.environ["VLLM_USE_V1"] = "0"
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams

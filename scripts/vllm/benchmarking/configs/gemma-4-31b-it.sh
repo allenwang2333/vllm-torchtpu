@@ -13,4 +13,5 @@ RANDOM_RANGE_RATIO="0.8"
 # XLA graph executables during _dummy_run() when running in compiled mode without triggering HBM OOM.
 GPU_MEMORY_UTILIZATION=0.8
 EVAL_TOLERANCE="0.02"
+IS_MULTIMODAL=true
 EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --max-model-len 2048"

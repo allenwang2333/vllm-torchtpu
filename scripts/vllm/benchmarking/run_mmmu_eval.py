@@ -66,12 +66,6 @@ def parse_args():
         default="standard (4 options)",
         help="Dataset config/subset name (default: 'standard (4 options)')",
     )
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help=
-        "Run offline direct vLLM engine evaluation on TPU without requiring HTTP server",
-    )
     return parser.parse_args()
 
 
@@ -321,7 +315,10 @@ def evaluate_sample(sample: Dict, host: str, port: int,
             prompt_text += "\n\nOptions:\n" + "\n".join(
                 f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
-    prompt_text += "\n\nRespond with only the final option letter in format (A), (B), (C), or (D)."
+    prompt_text += (
+        "\n\nPlease think step-by-step and provide a detailed explanation. "
+        "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
+    )
 
     payload = {
         "model":
@@ -367,8 +364,7 @@ def main():
 
     print("====================================================")
     print("  MMMU / MMMU-Pro Generative Vision Evaluation")
-    target_mode = "Offline Direct TPU Engine" if args.offline else f"http://{args.host}:{args.port}/v1/chat/completions"
-    print(f"  Target: {target_mode}")
+    print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
     print(f"  Model: {args.model} | Limit: {args.limit}")
     print("====================================================")
 
@@ -383,153 +379,40 @@ def main():
     results = []
 
     t0 = time.time()
-    if args.offline:
-        from transformers import AutoProcessor
-        from vllm.engine.arg_utils import EngineArgs
-        from vllm.engine.llm_engine import LLMEngine
-        from vllm.sampling_params import SamplingParams
+    for idx, sample in enumerate(samples, 1):
+        is_correct, pred, target = evaluate_sample(sample, args.host,
+                                                   args.port, args.model)
+        if is_correct:
+            correct_count += 1
 
-        tp_size = int(os.environ.get("TP_SIZE", "8"))
-        print(f"Initializing offline vLLM engine on TPU (TP={tp_size})...")
-        engine_args = EngineArgs(
-            model=args.model,
-            tensor_parallel_size=tp_size,
-            enforce_eager=True,
-            trust_remote_code=True,
-            dtype="bfloat16",
-            max_model_len=4096,
-            gpu_memory_utilization=0.9,
-            limit_mm_per_prompt={"image": 8},
-        )
-        engine = LLMEngine.from_engine_args(engine_args)
-        processor = AutoProcessor.from_pretrained(args.model,
-                                                  trust_remote_code=True)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+        results.append({
+            "id": sample["id"],
+            "predicted": pred,
+            "ground_truth": target,
+            "is_correct": is_correct,
+        })
 
-        inputs = []
-        for sample in samples:
-            question_clean = re.sub(r"<image \d+>", "",
-                                    sample["question"]).strip()
-            prompt_text = question_clean
-            options = sample.get("options", [])
-            if isinstance(options, list) and len(options) > 0:
-                if "(A)" not in prompt_text and "A." not in prompt_text:
-                    prompt_text += "\n\nOptions:\n" + "\n".join(
-                        f"({chr(65+idx)}) {opt}"
-                        for idx, opt in enumerate(options))
-            prompt_text += (
-                "\n\nPlease think step-by-step and provide a detailed explanation. "
-                "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
+        if idx % 10 == 0 or idx == total_count:
+            acc = correct_count / idx * 100.0
+            print(
+                f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
             )
-            img = sample["image"]
-            messages = [{
-                "role":
-                "user",
-                "content": [{
-                    "type": "image"
-                }, {
-                    "type": "text",
-                    "text": prompt_text
-                }]
-            }]
-            prompt_str = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
-            inputs.append({
-                "prompt": prompt_str,
-                "multi_modal_data": {
-                    "image": img
-                }
-            })
-
-        print(
-            f"Running CoT generative evaluation on {len(inputs)} samples in batches of 32..."
-        )
-        batch_size = 32
-        for i in range(0, len(inputs), batch_size):
-            chunk_inputs = inputs[i:i + batch_size]
-            chunk_samples = samples[i:i + batch_size]
-            for req_idx, inp in enumerate(chunk_inputs):
-                engine.add_request(f"req_{i}_{req_idx}", inp, sampling_params)
-            chunk_outputs_dict = {}
-            while engine.has_unfinished_requests():
-                step_outputs = engine.step()
-                for req_out in step_outputs:
-                    if req_out.finished:
-                        chunk_outputs_dict[
-                            req_out.request_id] = req_out.outputs[0].text
-            for req_idx, sample in enumerate(chunk_samples):
-                idx = len(results) + 1
-                gen_text = chunk_outputs_dict.get(f"req_{i}_{req_idx}", "")
-                pred = extract_answer(gen_text, sample.get("options"))
-                target = sample["answer"]
-                is_correct = pred == target
-                if is_correct:
-                    correct_count += 1
-                results.append({
-                    "id": sample["id"],
-                    "predicted": pred,
-                    "ground_truth": target,
-                    "is_correct": is_correct,
-                    "generated_text": gen_text,
-                })
-                if idx % 10 == 0 or idx == total_count:
-                    acc = correct_count / idx * 100.0
-                    print(
-                        f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
-                    )
-                    out_path = os.path.join(args.results_dir,
-                                            "mmmu_eval_results.json")
-                    with open(out_path, "w") as f:
-                        json.dump(
-                            {
-                                "model": args.model,
-                                "dataset_source": dataset_source,
-                                "is_synthetic": is_synthetic,
-                                "samples": idx,
-                                "accuracy": acc,
-                                "correct": correct_count,
-                                "details": results,
-                            },
-                            f,
-                            indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())
-    else:
-        for idx, sample in enumerate(samples, 1):
-            is_correct, pred, target = evaluate_sample(sample, args.host,
-                                                       args.port, args.model)
-            if is_correct:
-                correct_count += 1
-
-            results.append({
-                "id": sample["id"],
-                "predicted": pred,
-                "ground_truth": target,
-                "is_correct": is_correct,
-            })
-
-            if idx % 10 == 0 or idx == total_count:
-                acc = correct_count / idx * 100.0
-                print(
-                    f"[{idx}/{total_count}] Current Accuracy: {acc:.2f}% ({correct_count}/{idx})"
-                )
-                out_path = os.path.join(args.results_dir,
-                                        "mmmu_eval_results.json")
-                with open(out_path, "w") as f:
-                    json.dump(
-                        {
-                            "model": args.model,
-                            "dataset_source": dataset_source,
-                            "is_synthetic": is_synthetic,
-                            "samples": idx,
-                            "accuracy": acc,
-                            "correct": correct_count,
-                            "details": results,
-                        },
-                        f,
-                        indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
+            out_path = os.path.join(args.results_dir, "mmmu_eval_results.json")
+            with open(out_path, "w") as f:
+                json.dump(
+                    {
+                        "model": args.model,
+                        "dataset_source": dataset_source,
+                        "is_synthetic": is_synthetic,
+                        "samples": idx,
+                        "accuracy": acc,
+                        "correct": correct_count,
+                        "details": results,
+                    },
+                    f,
+                    indent=2)
+                f.flush()
+                os.fsync(f.fileno())
 
     t1 = time.time()
     accuracy = (correct_count /

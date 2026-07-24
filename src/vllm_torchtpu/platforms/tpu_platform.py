@@ -82,7 +82,7 @@ def _configure_torchtpu_eager_mode() -> None:
                     previous_mode.name)
         return
 
-    mode_str = os.getenv("TORCH_TPU_EAGER_MODE", "DEFER_AND_FUSE")
+    mode_str = envs.TORCH_TPU_EAGER_MODE
     try:
         execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_str)
     except AttributeError:
@@ -460,7 +460,7 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TORCH_TPU_EAGER_MODE"
     ]
 
     @classmethod

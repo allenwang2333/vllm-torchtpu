@@ -184,6 +184,7 @@ BENCH_ARGS+=(--port "$PORT")
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
+IS_MULTIMODAL=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("is_multimodal", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 
 fail=0
@@ -204,7 +205,11 @@ fi
 # 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
-    if [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
+    # Multimodal models (or models with strict alternation templates like Gemma 4) skip mmlu_llama
+    # because mmlu_llama requires multiturn prompt continuation (--gen_kwargs '{"continue_final_message": true}'),
+    # which violates strict user/assistant turn alternation rules. mmlu_pro with
+    # mmlu_pro_disable_multiturn_args is used instead alongside standalone MMMU-Pro evaluation.
+    if [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; then
         TASKS="${LM_EVAL_TASKS:-mmlu_pro}"
     else
         TASKS="${LM_EVAL_TASKS:-mmlu_llama mmlu_pro}"
@@ -215,18 +220,9 @@ if [ "$RUN_LM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 4b. Run Standalone Multimodal (MMMU & MMMU-Pro) Evaluation
+# 4b. Run Standalone Multimodal (MMMU-Pro) Evaluation
 # ========================================================
-if [ "$RUN_LM_EVAL" = "1" ] && [ "$CONFIG_NAME" = "gemma-4-31b-it" ]; then
-    echo "=== Running Standalone Multimodal (MMMU) Evaluation ==="
-    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
-      --host "$HOST" \
-      --port "$PORT" \
-      --model "$MODEL" \
-      --dataset "MMMU/MMMU" \
-      --limit "${MMMU_LIMIT:-100}" \
-      --results-dir "$RESULTS_DIR" || { echo "::error::MMMU evaluation failed!"; fail=1; }
-
+if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; }; then
     echo "=== Running Standalone Multimodal (MMMU-Pro) Evaluation ==="
     python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
       --host "$HOST" \
