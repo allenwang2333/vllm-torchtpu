@@ -503,8 +503,8 @@ class CorrectnessTest(parameterized.TestCase):
 class TestDeepSeekV4EdgeCases(absltest.TestCase):
 
     def test_swa_layer_none_main_page_indices(self):
-        """Test that _attention_local gracefully handles main_page_indices=None (SWA layers)."""
-        from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _attention_local
+        """Test that _deepseek_v4_attention_jax gracefully handles main_page_indices=None (SWA layers)."""
+        from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _deepseek_v4_attention_jax
         q = jnp.zeros((1, 8, 512), dtype=jnp.bfloat16)
         new_kv = jnp.zeros((1, 512), dtype=jnp.bfloat16)
         sw_cache = jnp.zeros((16, 16, 4, 640), dtype=jnp.uint8)
@@ -514,11 +514,12 @@ class TestDeepSeekV4EdgeCases(absltest.TestCase):
         swa_distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
         main_cache_kv = jnp.zeros((0, 16, 4, 640), dtype=jnp.uint8)
         
-        # main_page_indices=None (as occurs in SWA layers 0 and 1)
-        out, updated_sw_cache = _attention_local(
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ('attn_data', 'attn_head'))
+        out, updated_sw_cache = _deepseek_v4_attention_jax(
             q, new_kv, sw_cache, swa_kv_lens, swa_page_indices,
             swa_cu_q_lens, swa_distribution, main_cache_kv,
-            None, None, None, None, None, None
+            None, None, None, None, None, None,
+            mesh=mesh, is_csa=False, swa_only=True, two_caches_same_buffer=False
         )
         self.assertEqual(out.shape, q.shape)
 
@@ -534,7 +535,7 @@ class TestDeepSeekV4EdgeCases(absltest.TestCase):
         out, updated_cache = _deepseek_v4_attention_jax(
             q, new_kv, sw_cache, None, None, None, None,
             main_cache_kv, None, None, None, None, None, None,
-            mesh=mesh, is_csa=False, swa_only=False, num_tokens_across_dp=0
+            mesh=mesh, is_csa=False, swa_only=False, two_caches_same_buffer=False
         )
         self.assertEqual(out.shape, (0, 8, 512))
 
