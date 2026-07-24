@@ -240,7 +240,7 @@ def _localize_gdn_mamba_spec_for_pcp(
     )
 
 
-@QwenGatedDeltaNetAttention.register_oot
+# @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):

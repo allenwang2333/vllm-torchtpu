@@ -8,7 +8,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import \
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+try:
+    from vllm.v1.worker.cp_utils import get_total_cp_world_size
+except ImportError:
+    def get_total_cp_world_size():
+        return 1
+
 
 from vllm_torchtpu.layers.common.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR, DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,

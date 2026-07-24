@@ -67,7 +67,7 @@ def get_experts_start(layer) -> int | None:
     """Return the first global expert id owned by this shard, or None for non-EP.
 
     Mirrors the formula vLLM's ``determine_expert_map`` uses for linear
-    placement (``vllm/model_executor/layers/fused_moe/layer.py``), so this is
+    placement (``vllm.model_executor.layers.fused_moe.py``), so this is
     a pure function of ``ep_rank``, ``ep_size``, and ``global_num_experts`` --
     known at layer construction time. ``validate_linear_ep_placement`` enforces
     that the placement is linear before this value is used.

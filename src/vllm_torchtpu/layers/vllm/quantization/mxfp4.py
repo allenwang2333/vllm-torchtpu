@@ -52,7 +52,7 @@ from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEQuantConfig, mxfp4_w4a16_moe_quant_config)
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
+from vllm.model_executor.layers.fused_moe import (FusedMoE,
                                                         FusedMoEMethodBase)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import \
     Mxfp4MoeBackend as Mxfp4Backend
@@ -127,7 +127,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                 "using unquantized linear method.")
             return UnquantizedLinearMethod()
 
-        elif isinstance(layer, FusedMoE):
+        elif type(layer).__name__ == "MoERunner":
             # FusedMoE is the main use case for MXFP4 (MoE models like GPT-OSS)
             moe_config = self.get_moe_config(layer)
             return VllmMxfp4MoEMethod(moe_config)
@@ -172,7 +172,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        assert isinstance(layer, FusedMoE)
+        assert type(layer).__name__ == "MoERunner"
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
         activation_str = _get_activation_str(layer.activation)

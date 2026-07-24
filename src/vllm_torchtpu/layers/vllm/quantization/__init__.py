@@ -67,7 +67,7 @@ def get_tpu_quantization_config(
 
     # Map from quant method name to TPU config class
     method_to_config: Dict[Optional[str], Type[VllmQuantConfig]] = {
-        None: VllmUnquantizedConfig,
+        # None: VllmUnquantizedConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
@@ -75,6 +75,9 @@ def get_tpu_quantization_config(
         # TODO: Add more quantization methods as needed
         # quant_methods.AWQ: VllmAWQConfig,
     }
+
+    if model_config.quantization is None:
+        return vllm_config.quant_config
 
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(

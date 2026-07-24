@@ -19,7 +19,7 @@ These classes provide the foundation for all TPU-specific quantization configs.
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu import envs
@@ -113,7 +113,7 @@ class VllmQuantConfig:
         Returns:
             FusedMoEConfig with parallelism settings.
         """
-        assert isinstance(layer, FusedMoE)
+        assert type(layer).__name__ == "MoERunner"
         moe_config = layer.moe_config
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
         moe_config.moe_parallel_config.use_ep = use_ep
