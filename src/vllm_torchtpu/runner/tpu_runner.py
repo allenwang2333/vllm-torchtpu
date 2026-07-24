@@ -393,7 +393,7 @@ class TPUModelRunner(GPUModelRunner):
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        self.most_model_len = int(__import__("os").environ.get("VLLM_TPU_MOST_MODEL_LEN", "32768"))
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -467,18 +467,18 @@ class TPUModelRunner(GPUModelRunner):
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=getattr(self, "pin_memory", False))
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int32,
                                         device="cpu",
-                                        pin_memory=self.pin_memory)
+                                        pin_memory=getattr(self, "pin_memory", False))
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=getattr(self, "pin_memory", False))
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
@@ -498,14 +498,14 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, cdiv(self.vocab_size, 32)),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory)
+            pin_memory=getattr(self, "pin_memory", False))
         self.require_structured_out_cpu = torch.zeros(
             (self.max_num_reqs, 1),
             dtype=torch.bool,
             device="cpu",
-            pin_memory=self.pin_memory)
+            pin_memory=getattr(self, "pin_memory", False))
         self.structured_decode_arange = torch.arange(
-            0, 32, device="cpu", pin_memory=self.pin_memory)
+            0, 32, device="cpu", pin_memory=getattr(self, "pin_memory", False))
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and

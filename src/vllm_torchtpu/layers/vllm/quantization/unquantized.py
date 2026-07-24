@@ -40,8 +40,8 @@ import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -113,7 +113,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             )
             return UnquantizedLinearMethod()
 
-        if isinstance(layer, FusedMoE):
+        if type(layer).__name__ == "MoERunner":
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
             return VllmUnquantizedFusedMoEMethod(moe_config)
@@ -152,7 +152,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return self._forward_monolithic_tpu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        assert isinstance(layer, FusedMoE)
+        assert type(layer).__name__ == "MoERunner"
 
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.

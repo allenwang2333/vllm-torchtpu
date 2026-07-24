@@ -42,8 +42,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEMethodBase
 from vllm.model_executor.layers.linear import (
     LinearBase, UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method)
@@ -501,7 +501,7 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, FusedMoE):
+        if type(layer).__name__ == "MoERunner":
             if is_layer_skipped(
                     prefix=prefix,
                     ignored_layers=self.ignored_layers,
@@ -649,7 +649,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         For BF16 checkpoints (online quantization): quantize BF16 → FP8
         directly using the same requantization path.
         """
-        assert isinstance(layer, FusedMoE)
+        assert type(layer).__name__ == "MoERunner"
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         activation_str = _get_activation_str(layer.activation)

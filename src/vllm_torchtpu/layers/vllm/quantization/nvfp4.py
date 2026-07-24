@@ -40,8 +40,8 @@ from typing import Optional
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEMethodBase
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import \
@@ -158,7 +158,7 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
             if self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return VllmNvfp4LinearMethod(self, self.get_linear_config(layer))
-        if isinstance(layer, FusedMoE):
+        if type(layer).__name__ == "MoERunner":
             if self.is_layer_excluded(prefix):
                 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
                     VllmUnquantizedFusedMoEMethod
@@ -219,7 +219,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value})
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        assert isinstance(layer, FusedMoE)
+        assert type(layer).__name__ == "MoERunner"
         assert not self.moe.has_bias, "TPU NVFP4 MoE does not support bias."
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "

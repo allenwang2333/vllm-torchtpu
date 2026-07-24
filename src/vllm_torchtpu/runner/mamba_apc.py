@@ -3,7 +3,8 @@ import itertools
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+# from vllm.v1.worker.cp_utils import get_total_cp_world_size
+def get_total_cp_world_size(): return 1
 
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import (
     ensure_op_built, mamba_state_copy)

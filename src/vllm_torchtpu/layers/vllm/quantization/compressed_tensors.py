@@ -149,7 +149,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, FusedMoE):
+        if type(layer).__name__ == "MoERunner":
             scheme_dict = _get_moe_scheme_dict(self, layer, prefix)
         else:
             scheme_dict = self.get_scheme_dict(layer, prefix)
@@ -157,7 +157,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
         input_quant = (scheme_dict.get("input_activations")
                        if scheme_dict else None)
 
-        if isinstance(layer, FusedMoE):
+        if type(layer).__name__ == "MoERunner":
             if weight_quant is None:
                 return VllmUnquantizedFusedMoEMethod(
                     self.get_moe_config(layer))

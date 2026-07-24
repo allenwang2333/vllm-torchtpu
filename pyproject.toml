@@ -25,7 +25,8 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     "vllm==0.23.0",
-    "torch==2.11.0",
+    "torch==2.12.1",
+    "immutabledict",
     "torch-tpu==0.1.1.dev20260714090201",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
@@ -34,11 +35,11 @@ dependencies = [
     "numba==0.65.0",
     # Some multimodal-capable checkpoints (e.g. Gemma4) import torchvision at
     # class-definition time in their HF processor module, so this is needed
-    # even for text-only serving. Pinned to match torch==2.11.0 exactly (see
+    # even for text-only serving. Pinned to match torch==2.12.1 exactly (see
     # torchvision's own METADATA). NOTE: torch-tpu's custom torch build is
     # incompatible with torchvision's compiled `nms` op specifically (see
     # README troubleshooting tip) - plain import and non-nms ops are fine.
-    "torchvision==0.26.0",
+    "torchvision>=0.26.0",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
