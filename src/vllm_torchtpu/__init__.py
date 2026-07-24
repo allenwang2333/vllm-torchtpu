@@ -9,6 +9,27 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_aot_compile_cache_key() -> None:
+    """Include the TPU compiler hash in vLLM's outer AOT cache key."""
+    from vllm.compilation import caching
+
+    original = caching.aot_compile_hash_factors
+    if getattr(original, "_tpu_compiler_hash_patch", False):
+        return
+
+    def tpu_aot_compile_hash_factors(vllm_config):
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+        return [
+            *original(vllm_config),
+            compute_tpu_compilation_hash(vllm_config),
+        ]
+
+    tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
+    caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
+    logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
+
+
 def _patch_vllm_tpu_group_custom_ops() -> None:
     """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
 
@@ -48,42 +69,14 @@ def _patch_default_moe_runner_select_forward() -> None:
     if getattr(_dmr.MoERunner, "_tpu_select_forward_patch", False):
         return
 
-    _orig_moe_forward = _dmr._moe_forward
-    def patched_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
-        try:
-            from vllm.model_executor.layers.fused_moe.runner.moe_runner import get_layer_from_name, _resolve_layer_name
-            layer = get_layer_from_name(_resolve_layer_name(layer_name))
-            layer_idx = getattr(layer, "layer_idx", -1)
-            if layer_idx in (3, 4):
-                print(f"[DEBUG_FORWARD_HOOK] (Standard) layer_idx: {layer_idx} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
-        except Exception as e:
-            print(f"[DEBUG_FORWARD_HOOK_ERROR] Standard failed to get layer info: {e}", flush=True)
-        return _orig_moe_forward(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
-
-    _dmr._moe_forward = patched_moe_forward
-
-    _orig_moe_forward_shared = _dmr._moe_forward_shared
-    def patched_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded):
-        try:
-            from vllm.model_executor.layers.fused_moe.runner.moe_runner import get_layer_from_name, _resolve_layer_name
-            layer = get_layer_from_name(_resolve_layer_name(layer_name))
-            layer_idx = getattr(layer, "layer_idx", -1)
-            if layer_idx in (3, 4):
-                print(f"[DEBUG_FORWARD_HOOK] (Shared Experts) layer_idx: {layer_idx} | hidden_states shape: {list(hidden_states.shape)} | router_logits shape: {list(router_logits.shape)}", flush=True)
-        except Exception as e:
-            print(f"[DEBUG_FORWARD_HOOK_ERROR] Shared failed to get layer info: {e}", flush=True)
-        return _orig_moe_forward_shared(hidden_states, router_logits, shared_experts_input, input_ids, layer_name, hidden_dim_unpadded)
-
-    _dmr._moe_forward_shared = patched_moe_forward_shared
-
     def patched_select(self):
-        return (patched_moe_forward
-                if self.shared_experts is None else patched_moe_forward_shared)
+        return (_dmr._moe_forward
+                if self.shared_experts is None else _dmr._moe_forward_shared)
 
     _dmr.MoERunner._select_forward = patched_select
     _dmr.MoERunner._tpu_select_forward_patch = True
     logger.info(
-        "Applied TPU patch: DefaultMoERunner uses direct _moe_forward with print hooks.")
+        "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
 def _patch_vllm_disable_compile_ranges() -> None:
@@ -309,6 +302,127 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _run_engine_core_with_tpu_patches(*args, **kwargs):
+    _patch_vllm_hybrid_pcp_block_sizes()
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    original_run = EngineCoreProc._tpu_original_run_engine_core
+    return original_run(*args, **kwargs)
+
+
+def _patch_vllm_hybrid_pcp_block_sizes() -> None:
+    """Resolve full-attention + Mamba block sizes under TPU PCP.
+
+    Upstream vLLM rejects all multi-group KV cache configs when
+    ``pcp_world_size > 1`` because it cannot infer the scheduler block size for
+    mixed cache types. TorchTPU's Qwen3.5 path has a narrower, well-defined
+    layout: attention cache is token-parallel across PCP ranks, while GDN/Mamba
+    state is rank-local state. Use the effective token granularity seen by the
+    scheduler instead of rejecting the config.
+    """
+    import math
+    import sys
+
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
+                                            MambaSpec, UniformTypeKVCacheSpecs)
+
+    already_patched = getattr(kv_cache_utils,
+                              "_tpu_hybrid_pcp_block_sizes_patch", False)
+    original_resolve = getattr(
+        kv_cache_utils,
+        "_tpu_original_resolve_kv_cache_block_sizes",
+        kv_cache_utils.resolve_kv_cache_block_sizes,
+    )
+
+    def _iter_leaf_specs(spec: KVCacheSpec):
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            yield from spec.kv_cache_specs.values()
+        else:
+            yield spec
+
+    def _has_spec_type(spec: KVCacheSpec, spec_type: type) -> bool:
+        return any(
+            isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
+
+    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            return math.lcm(*(_effective_block_size(leaf, pcp)
+                              for leaf in spec.kv_cache_specs.values()))
+        if isinstance(spec, MambaSpec):
+            return spec.block_size
+        if isinstance(spec, AttentionSpec):
+            return spec.block_size * pcp
+        return spec.block_size
+
+    def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
+        cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+        dcp = parallel_config.decode_context_parallel_size
+        pcp = parallel_config.prefill_context_parallel_size
+        groups = kv_cache_config.kv_cache_groups
+
+        if len(groups) <= 1 or dcp != 1 or pcp == 1:
+            return original_resolve(kv_cache_config, vllm_config)
+
+        has_mamba = any(
+            _has_spec_type(group.kv_cache_spec, MambaSpec) for group in groups)
+        has_attention = any(
+            _has_spec_type(group.kv_cache_spec, AttentionSpec)
+            for group in groups)
+        if not (has_mamba and has_attention):
+            return original_resolve(kv_cache_config, vllm_config)
+
+        group_block_sizes = [
+            _effective_block_size(group.kv_cache_spec, pcp) for group in groups
+        ]
+        scheduler_block_size = math.lcm(*group_block_sizes)
+
+        connector_enabled = vllm_config.kv_transfer_config is not None
+        if not (cache_config.enable_prefix_caching or connector_enabled):
+            hash_block_size = scheduler_block_size
+        else:
+            # Mamba/GDN groups do not hash token KV blocks like attention
+            # groups. Keep hash granularity at the scheduler block size.
+            hash_block_size = scheduler_block_size
+
+        logger.info(
+            "Applied TPU PCP hybrid KV cache block-size resolution: "
+            "pcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
+            "hash_block_size=%d", pcp, group_block_sizes, scheduler_block_size,
+            hash_block_size)
+        return scheduler_block_size, hash_block_size
+
+    patched_resolve = (kv_cache_utils.resolve_kv_cache_block_sizes
+                       if already_patched else resolve_kv_cache_block_sizes)
+    if not already_patched:
+        kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes = (
+            original_resolve)
+        kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
+        kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    # EngineCore imports the function directly, so patch module bindings as
+    # well as the source module.
+    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
+
+    if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
+        EngineCoreProc._tpu_original_run_engine_core = (
+            EngineCoreProc.run_engine_core)
+        EngineCoreProc.run_engine_core = staticmethod(
+            _run_engine_core_with_tpu_patches)
+        EngineCoreProc._tpu_engine_core_patch_wrapper = True
+
+    if not already_patched:
+        logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
+                    "block sizes.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
@@ -356,7 +470,6 @@ else:
 
 import sys
 from importlib.abc import MetaPathFinder
-
 
 class PatchedLoader:
     def __init__(self, orig_loader, patch_func):
@@ -490,124 +603,3 @@ logger.info("Registered LazyPatcher import hook for vLLM V1 debugging.")
 
 def general_plugin_init() -> None:
     logger.info("Executing general plugin init...")
-
-
-def _run_engine_core_with_tpu_patches(*args, **kwargs):
-    _patch_vllm_hybrid_pcp_block_sizes()
-
-    from vllm.v1.engine.core import EngineCoreProc
-
-    original_run = EngineCoreProc._tpu_original_run_engine_core
-    return original_run(*args, **kwargs)
-
-
-def _patch_vllm_hybrid_pcp_block_sizes() -> None:
-    """Resolve full-attention + Mamba block sizes under TPU PCP.
-
-    Upstream vLLM rejects all multi-group KV cache configs when
-    ``pcp_world_size > 1`` because it cannot infer the scheduler block size for
-    mixed cache types. TorchTPU's Qwen3.5 path has a narrower, well-defined
-    layout: attention cache is token-parallel across PCP ranks, while GDN/Mamba
-    state is rank-local state. Use the effective token granularity seen by the
-    scheduler instead of rejecting the config.
-    """
-    import math
-    import sys
-
-    from vllm.v1.core import kv_cache_utils
-    from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec,
-                                            MambaSpec, UniformTypeKVCacheSpecs)
-
-    already_patched = getattr(kv_cache_utils,
-                              "_tpu_hybrid_pcp_block_sizes_patch", False)
-    original_resolve = getattr(
-        kv_cache_utils,
-        "_tpu_original_resolve_kv_cache_block_sizes",
-        kv_cache_utils.resolve_kv_cache_block_sizes,
-    )
-
-    def _iter_leaf_specs(spec: KVCacheSpec):
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            yield from spec.kv_cache_specs.values()
-        else:
-            yield spec
-
-    def _has_spec_type(spec: KVCacheSpec, spec_type: type) -> bool:
-        return any(
-            isinstance(leaf, spec_type) for leaf in _iter_leaf_specs(spec))
-
-    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            return math.lcm(*(_effective_block_size(leaf, pcp)
-                              for leaf in spec.kv_cache_specs.values()))
-        if isinstance(spec, MambaSpec):
-            return spec.block_size
-        if isinstance(spec, AttentionSpec):
-            return spec.block_size * pcp
-        return spec.block_size
-
-    def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
-        cache_config = vllm_config.cache_config
-        parallel_config = vllm_config.parallel_config
-        dcp = parallel_config.decode_context_parallel_size
-        pcp = parallel_config.prefill_context_parallel_size
-        groups = kv_cache_config.kv_cache_groups
-
-        if len(groups) <= 1 or dcp != 1 or pcp == 1:
-            return original_resolve(kv_cache_config, vllm_config)
-
-        has_mamba = any(
-            _has_spec_type(group.kv_cache_spec, MambaSpec) for group in groups)
-        has_attention = any(
-            _has_spec_type(group.kv_cache_spec, AttentionSpec)
-            for group in groups)
-        if not (has_mamba and has_attention):
-            return original_resolve(kv_cache_config, vllm_config)
-
-        group_block_sizes = [
-            _effective_block_size(group.kv_cache_spec, pcp) for group in groups
-        ]
-        scheduler_block_size = math.lcm(*group_block_sizes)
-
-        connector_enabled = vllm_config.kv_transfer_config is not None
-        if not (cache_config.enable_prefix_caching or connector_enabled):
-            hash_block_size = scheduler_block_size
-        else:
-            # Mamba/GDN groups do not hash token KV blocks like attention
-            # groups. Keep hash granularity at the scheduler block size.
-            hash_block_size = scheduler_block_size
-
-        logger.info(
-            "Applied TPU PCP hybrid KV cache block-size resolution: "
-            "pcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
-            "hash_block_size=%d", pcp, group_block_sizes, scheduler_block_size,
-            hash_block_size)
-        return scheduler_block_size, hash_block_size
-
-    patched_resolve = (kv_cache_utils.resolve_kv_cache_block_sizes
-                       if already_patched else resolve_kv_cache_block_sizes)
-    if not already_patched:
-        kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes = (
-            original_resolve)
-        kv_cache_utils.resolve_kv_cache_block_sizes = patched_resolve
-        kv_cache_utils._tpu_hybrid_pcp_block_sizes_patch = True
-
-    from vllm.v1.engine.core import EngineCoreProc
-
-    # EngineCore imports the function directly, so patch module bindings as
-    # well as the source module.
-    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
-        module = sys.modules.get(module_name)
-        if module is not None:
-            setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
-
-    if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
-        EngineCoreProc._tpu_original_run_engine_core = (
-            EngineCoreProc.run_engine_core)
-        EngineCoreProc.run_engine_core = staticmethod(
-            _run_engine_core_with_tpu_patches)
-        EngineCoreProc._tpu_engine_core_patch_wrapper = True
-
-    if not already_patched:
-        logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP "
-                    "block sizes.")
