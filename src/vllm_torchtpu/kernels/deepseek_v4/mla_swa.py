@@ -180,12 +180,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        p = jnp.where(mask, 0.0, jnp.exp(s - broadcast_minor(m_curr, s.shape)))
 
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        # Prevent NaN from -inf - (-inf) when a block is fully masked out
+        safe_diff = jnp.where(m_curr == m_prev, 0.0, m_prev - m_curr)
+        exp_m_diff = jnp.where(m_curr <= mask_value, 0.0, jnp.exp(safe_diff))
         l_prev = load_with_init(head_l_ref, 0.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
