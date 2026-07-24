@@ -1157,6 +1157,17 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
 
         if rank == 0:
             print(f"[DEBUG_FORWARD_MQA_CACHES] prefix={self.mla_attn.prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}", flush=True)
+        if rank == 0 and main_cache_kv.shape[0] > 0:
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} q: shape={list(q.shape)} mean={q.float().mean().item():.6f} min={q.min().item():.6f} max={q.max().item():.6f}", flush=True)
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} kv: shape={list(kv.shape)} mean={kv.float().mean().item():.6f} min={kv.min().item():.6f} max={kv.max().item():.6f}", flush=True)
+            if sw_cache is not None:
+                print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} sw_cache: shape={list(sw_cache.shape)} mean={sw_cache.float().mean().item():.6f} min={sw_cache.min().item():.6f} max={sw_cache.max().item():.6f}", flush=True)
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} swa_seq_lens: {swa_seq_lens.tolist() if swa_seq_lens is not None else None}", flush=True)
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} main_cache_kv: shape={list(main_cache_kv.shape)} mean={main_cache_kv.float().mean().item():.6f} min={main_cache_kv.min().item():.6f} max={main_cache_kv.max().item():.6f}", flush=True)
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} main_kv_lens: {main_kv_lens.tolist() if main_kv_lens is not None else None}", flush=True)
+            print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} extra: {extra.tolist() if extra is not None else None}", flush=True)
+            if self.attn_sink is not None:
+                print(f"[DEBUG_ATTN_TENSORS] prefix={self.custom_prefix} attn_sink: shape={list(self.attn_sink.shape)} mean={self.attn_sink.float().mean().item():.6f} min={self.attn_sink.min().item():.6f} max={self.attn_sink.max().item():.6f}", flush=True)
         output, new_sw_cache = self.attn_op(
             q,
             kv,
