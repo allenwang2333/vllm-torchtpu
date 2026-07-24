@@ -142,6 +142,9 @@ def select_experts(
                                         dim=-1)
     if renormalize:
         topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-6)
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
