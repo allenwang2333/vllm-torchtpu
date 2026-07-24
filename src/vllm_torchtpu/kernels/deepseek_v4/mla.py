@@ -460,7 +460,14 @@ def _mla_ragged_paged_attention_kernel(
         nope_fp8 = nope_fp8.reshape(bkv_sz, 7, 64)
         nope_scales = nope_scales.reshape(bkv_sz, 7, 1)
         dequant_nope = (nope_fp8 * nope_scales).reshape(bkv_sz, 448)
-        rope = pltpu.bitcast(bkv[:, 448:576].reshape(bkv_sz, 64, 2), jnp.bfloat16).reshape(bkv_sz, 64)
+        # Force evaluation and combine bytes to uint16/32 to prevent register sub-slice compiler bugs.
+        rope_bytes = bkv[:, 448:576] + 0
+        rope_bytes_reshaped = rope_bytes.reshape(bkv_sz, 64, 2)
+        byte0 = rope_bytes_reshaped[:, :, 0].astype(jnp.uint32)
+        byte1 = rope_bytes_reshaped[:, :, 1].astype(jnp.uint32)
+        rope_uint16 = byte0 | (byte1 << 8)
+        rope_float32_bits = rope_uint16 << 16
+        rope = pltpu.bitcast(rope_float32_bits, jnp.float32).astype(jnp.bfloat16).reshape(bkv_sz, 64)
         bkv = jnp.concatenate([dequant_nope, rope], axis=-1)
         return bkv
 
