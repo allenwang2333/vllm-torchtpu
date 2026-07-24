@@ -44,7 +44,7 @@ COPY --from=buildkite/test-engine-client /usr/local/bin/bktec /usr/local/bin/bkt
 
 # Install tools needed for CI (git, gcloud, lsof, fuser)
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git lsof psmisc lsb-release && \
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" | tee -a /etc/apt/sources.list.d/gcsfuse.list && \
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
@@ -78,6 +78,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 COPY . .
+RUN pip uninstall -y tpu_inference || true
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system -e ".[test,benchmarking]"
@@ -92,6 +93,7 @@ CMD ["/bin/bash"]
 FROM base AS prod
 WORKDIR /root/torchtpu-vllm
 COPY . .
+RUN pip uninstall -y tpu_inference || true
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
     uv pip install --system .

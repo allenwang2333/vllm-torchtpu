@@ -53,7 +53,6 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -76,9 +75,8 @@ from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    unified_kv_layout_enabled
-from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    unified_block_pool_enabled, unified_kv_layout_enabled)
 from vllm_torchtpu.runner.mamba_apc import MambaApcStateCopier
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -144,50 +142,17 @@ def _substitute_placeholder_token(
 
 logger = init_logger(__name__)
 
-_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
-    "invalid_block_group_index" in getattr(KVConnectorOutput,
-                                           "__dataclass_fields__", {}))
-
-
-def _build_kv_connector_output(
-    *,
-    finished_sending: set[str] | None,
-    finished_recving: set[str] | None,
-    kv_connector_worker_meta: Any | None,
-    invalid_block_ids: set[int],
-    invalid_block_group_index: int | None,
-) -> KVConnectorOutput:
-    """Build a connector output across the vLLM 0.23 API boundary.
-
-    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
-    does not expose ``invalid_block_group_index``. Newer vLLM versions support
-    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
-    0.23, but fail closed if a hybrid load actually fails: silently dropping
-    the group would make overlapping block IDs ambiguous to its scheduler.
-    """
-    kwargs: dict[str, Any] = {
-        "finished_sending": finished_sending,
-        "finished_recving": finished_recving,
-        "kv_connector_worker_meta": kv_connector_worker_meta,
-        "invalid_block_ids": invalid_block_ids,
-    }
-    if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-        kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
-    return KVConnectorOutput(**kwargs)
-
-
 # Smallest output size
 MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
-    return runner.sequence_layout_planner
+    planner = getattr(runner, "sequence_layout_planner", None)
+    if planner is None:
+        planner = create_sequence_layout_planner(runner.vllm_config)
+        runner.sequence_layout_planner = planner
+    return planner
 
 
 def _validate_libtpu_version() -> None:
@@ -351,16 +316,17 @@ class TPUModelRunner(GPUModelRunner):
         # for disagg serving.
         self._uniform_mamba_layout: bool = (self.vllm_config.kv_transfer_config
                                             is not None)
-        # Unified layout: attention KV and mamba state are fungible
-        # block-table blocks in one attention-shaped pool per cache tensor.
+        # Unified layout family: attention KV and mamba state are fungible
+        # block-table blocks in one shared buffer per kv_cache_tensor. On
+        # top of it, the unified block pool serves that buffer as one
+        # attention-shaped pool (mamba state addressed through the pool
+        # adapters); without the pool the buffer is flat int8 with typed
+        # per-state views (the layout kv-transfer connectors address).
         self._unified_kv_layout: bool = unified_kv_layout_enabled(
             self.vllm_config)
+        self._unified_block_pool: bool = unified_block_pool_enabled(
+            self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
-        # Set by initialize_kv_cache; None until then (dummy runs check this).
-        self.kv_cache_config: KVCacheConfig | None = None
-        # Layout plan of the most recent prepared batch; None before the
-        # first execute_model.
-        self._last_sequence_layout_plan = None
 
         # EP-DP lockstep state, refreshed each step by execute_model /
         # execute_dummy_batch: the coordinated (max-across-ranks) token
@@ -534,27 +500,6 @@ class TPUModelRunner(GPUModelRunner):
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
-        self.batch_counter = 0
-        self._init_phased_profiling()
-
-    def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if the environment variable is set."""
-        self.phased_profiling_dir = tpu_envs.PHASED_PROFILING_DIR
-        self.phase_based_profiler = None
-        if self.phased_profiling_dir:
-            global_rank = getattr(self.parallel_config, "rank", 0) or 0
-            world_size = getattr(self.parallel_config, "world_size", 1) or 1
-            self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
-                self.phased_profiling_dir,
-                worker_rank=global_rank,
-                world_size=world_size,
-                num_steps_to_profile_for=tpu_envs.
-                PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
-                num_decode_steps_to_skip=tpu_envs.
-                PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
-                decode_kv_len_threshold=tpu_envs.
-                PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
-            )
 
     # ----- Backend hooks overridden from GPUModelRunner -----
 
@@ -575,12 +520,6 @@ class TPUModelRunner(GPUModelRunner):
             return
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
-        # Upstream parity (gpu_model_runner calls this before every forward;
-        # base-class default is a no-op): lets connectors with async saves
-        # fence in-flight stores whose source blocks the scheduler is about
-        # to reuse (OffloadingConnector jobs_to_flush) before the forward
-        # overwrites them.
-        kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
         kv_connector.bind_connector_metadata(
             scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
@@ -597,14 +536,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None, set(), None
+            return None, None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
-        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
-        invalid_block_group_index = (
-            kv_connector.get_block_ids_with_load_errors_group_index()
-            if invalid_block_ids else None)
         # vLLM >=0.21 job model: store completions (and load completions) are
         # reported to the scheduler via the worker meta's `completed_jobs`,
         # NOT via finished_sending. Without plumbing this, the
@@ -616,8 +551,7 @@ class TPUModelRunner(GPUModelRunner):
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
-        return (finished_sending, finished_recving, worker_meta,
-                invalid_block_ids, invalid_block_group_index)
+        return finished_sending, finished_recving, worker_meta
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -627,15 +561,12 @@ class TPUModelRunner(GPUModelRunner):
         self.maybe_setup_kv_connector(
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
-        (finished_sending, finished_recving, worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
-        kv_connector_output = _build_kv_connector_output(
+        finished_sending, finished_recving, worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
+        kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
-            invalid_block_ids=invalid_block_ids,
-            invalid_block_group_index=invalid_block_group_index,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -761,6 +692,11 @@ class TPUModelRunner(GPUModelRunner):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+            # Custom get_kv_cache_spec override (e.g. MLA / SWACache)
+            elif not isinstance(attn_module, Attention) and hasattr(attn_module, "get_kv_cache_spec"):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
@@ -859,15 +795,15 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 continue
 
-        # Note: that each shared layer's target actually owns a KV cache (and
-        # that the shared layer was not itself allocated one) is enforced later
-        # against the concrete KVCacheConfig in
-        # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        res = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
-            enable_unified_kv_layout=self._unified_kv_layout,
+            enable_unified_block_pool=self._unified_kv_layout,
         )
+        logger.info(f"[DEBUG_RUNNER_SPECS] get_kv_cache_spec returned keys: {list(res.keys())}")
+        for k, v in res.items():
+            logger.info(f"  {k}: {v.__class__.__name__} block_size={v.block_size} page_size={v.page_size_bytes} page_size_padded={getattr(v, 'page_size_padded', None)}")
+        return res
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -901,21 +837,23 @@ class TPUModelRunner(GPUModelRunner):
         # With fp8 KV cache the shared layer reads the target's cached K/V and
         # dequantizes with its OWN scales, so mismatched scales/dtype would
         # silently corrupt attention.
-        attn_quant = attn_module.impl.kv_cache_quantized_dtype
-        target_quant = target_module.impl.kv_cache_quantized_dtype
+        attn_impl = getattr(attn_module, "impl", None)
+        target_impl = getattr(target_module, "impl", None)
+        attn_quant = getattr(attn_impl, "kv_cache_quantized_dtype", None)
+        target_quant = getattr(target_impl, "kv_cache_quantized_dtype", None)
         # Trigger the check if EITHER side is fp8: the asymmetric case (only one
         # side quantized) is just as unsafe -- e.g. the shared layer reads the
         # target's packed fp8 bytes as bf16 -- and must error rather than
         # silently corrupt, so None != "fp8_e4m3" correctly fails below.
         if attn_quant or target_quant:
             attn_kv_layout = (
-                attn_module._k_scale_float,
-                attn_module._v_scale_float,
+                getattr(attn_module, "_k_scale_float", None),
+                getattr(attn_module, "_v_scale_float", None),
                 attn_quant,
             )
             target_kv_layout = (
-                target_module._k_scale_float,
-                target_module._v_scale_float,
+                getattr(target_module, "_k_scale_float", None),
+                getattr(target_module, "_v_scale_float", None),
                 target_quant,
             )
             if attn_kv_layout != target_kv_layout:
@@ -954,7 +892,8 @@ class TPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     f"Shared KV layer {layer_name} must not have an "
                     "independent KV cache allocation.")
-        runner_only_attn_layers = self.runner_only_attn_layers
+        runner_only_attn_layers = getattr(self, "runner_only_attn_layers",
+                                          None)
         add_kv_sharing_layers_to_kv_cache_groups(
             self.shared_kv_cache_layers,
             kv_cache_config.kv_cache_groups,
@@ -1137,23 +1076,6 @@ class TPUModelRunner(GPUModelRunner):
                                                 int(uniform_page_size_bytes),
                                                 group_size)
 
-    def _available_kv_cache_hbm(self) -> int:
-        """KV-cache HBM budget for the block-count override paths.
-
-        Matches `TPUWorker.determine_available_memory()`: the
-        `utils.compute_hbm_budget` result (which reserves the
-        `gpu_memory_utilization` cap and `TPU_KV_CACHE_HEADROOM_MIB`
-        headroom) minus `utils.estimate_kv_connector_hbm_reserve` (HBM a
-        connector allocates after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
-        """
-        budget = utils.compute_hbm_budget(
-            [self.device], self.cache_config.gpu_memory_utilization)
-        return budget.available - utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config)
-
     def _maybe_set_compact_mamba_num_blocks_override(
             self, attn_page_size_bytes: int,
             unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
@@ -1215,7 +1137,12 @@ class TPUModelRunner(GPUModelRunner):
         if group_size <= 0:
             return
 
-        avail = self._available_kv_cache_hbm()
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block counts
+        # match the KV-cache budget vLLM is given (incl. the headroom knob).
+        budget = utils.compute_hbm_budget([self.device], gpu_mem_util)
+        avail = budget.available
         if avail <= 0:
             return
 
@@ -1466,9 +1393,12 @@ class TPUModelRunner(GPUModelRunner):
         OOM. Pinning to `num_blocks_tpu` preserves the headroom the
         single-step formula silently removes.
 
-        `avail` comes from `_available_kv_cache_hbm`, so the block count
-        pinned here matches the KV-cache budget
-        `TPUWorker.determine_available_memory()` hands vLLM.
+        `avail` comes from `utils.compute_hbm_budget`, the same helper
+        `TPUWorker.determine_available_memory()` uses, so it reserves both the
+        `gpu_memory_utilization` cap and the `TPU_KV_CACHE_HEADROOM_MIB`
+        headroom, and the block count pinned here matches the KV-cache budget
+        the worker hands vLLM. No safety margin is applied beyond those two
+        knobs.
 
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
@@ -1490,7 +1420,11 @@ class TPUModelRunner(GPUModelRunner):
         if cache_config.num_gpu_blocks_override is not None:
             return
 
-        avail = self._available_kv_cache_hbm()
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        # Shares utils.compute_hbm_budget() with
+        # TPUWorker.determine_available_memory(), so the pinned block count
+        # matches the KV-cache budget vLLM is given.
+        avail = utils.compute_hbm_budget([self.device], gpu_mem_util).available
         if avail <= 0:
             return
 
@@ -1519,7 +1453,7 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
-        layout_plan = self._last_sequence_layout_plan
+        layout_plan = getattr(self, "_last_sequence_layout_plan", None)
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -2328,23 +2262,6 @@ class TPUModelRunner(GPUModelRunner):
 
         num_decode_reqs = self._reorder_batch_for_rpa(scheduler_output)
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
-        if self.phase_based_profiler:
-            self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings,
-                scheduler_output.total_num_scheduled_tokens)
-            batch_composition_stats = runner_utils.get_batch_composition_stats(
-                batch_id=self.batch_counter,
-                input_batch=self.input_batch,
-                total_num_scheduled_tokens=scheduler_output.
-                total_num_scheduled_tokens,
-                num_reqs=self.input_batch.num_reqs,
-                padded_total_num_scheduled_tokens=padded_total_tokens,
-                scheduler_output=scheduler_output,
-            )
-            self.phase_based_profiler.step(batch_composition_stats)
-
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
         # all scheduled tokens (req order); mm_embeds_flat is the concatenated
@@ -2481,7 +2398,7 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
-            layout_plan = self._last_sequence_layout_plan
+            layout_plan = getattr(self, "_last_sequence_layout_plan", None)
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
@@ -2831,9 +2748,8 @@ class TPUModelRunner(GPUModelRunner):
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
-        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+        finished_sending, finished_recving, kv_worker_meta = (
+            self.get_finished_kv_transfers(scheduler_output))
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2881,14 +2797,11 @@ class TPUModelRunner(GPUModelRunner):
 
         kv_connector_output = (
             None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None and not invalid_block_ids) else
-            _build_kv_connector_output(
-                finished_sending=finished_sending,
-                finished_recving=finished_recving,
-                kv_connector_worker_meta=kv_worker_meta,
-                invalid_block_ids=invalid_block_ids,
-                invalid_block_group_index=invalid_block_group_index,
-            ))
+                     and kv_worker_meta is None) else KVConnectorOutput(
+                         finished_sending=finished_sending,
+                         finished_recving=finished_recving,
+                         kv_connector_worker_meta=kv_worker_meta,
+                     ))
 
         next_tokens_tpu = None
         copy_state = None
@@ -3085,13 +2998,17 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config)
 
+        from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+            _maybe_patch_for_deepseek_v4
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                            vllm_config=self.vllm_config), \
-             set_current_vllm_config(self.vllm_config):
+             set_current_vllm_config(self.vllm_config), \
+             _maybe_patch_for_deepseek_v4(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
+
         self.model = model
 
         # If using eagle3/mtp speculative decoding, load the draft model and
@@ -3109,13 +3026,15 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self._attention_kernels_initialized:
             return
+
+
         from vllm_torchtpu.layers.vllm.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
             _pallas_rpa_kernel_local)
 
         # Only draft proposers expose _draft_attn_layer_names; NgramProposer
         # operates purely on token IDs. no draft attention layers to relocate.
-        spec_drafter = self.drafter
+        spec_drafter = getattr(self, "drafter", None)
         draft_attn_names = getattr(spec_drafter, "_draft_attn_layer_names",
                                    None) or set()
 
@@ -3152,7 +3071,8 @@ class TPUModelRunner(GPUModelRunner):
                    num_blocks: int,
                    use_max_model_len: bool = True,
                    dp_lockstep: bool = False) -> None:
-        kv_cache_initialized = self.kv_cache_config is not None
+        kv_cache_initialized = getattr(self, "kv_cache_config",
+                                       None) is not None
 
         if self.supports_mm_inputs:
             input_ids = None
@@ -3191,7 +3111,7 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_initialized=kv_cache_initialized,
             )
 
-        if self.kv_cache_config is not None:
+        if getattr(self, "kv_cache_config", None) is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
             # only traces shapes/HBM, so the recurrent state read/written is
             # never consumed. Shape must match the GDN op's max_reqs
@@ -3828,14 +3748,14 @@ class TPUModelRunner(GPUModelRunner):
         # D2H / placeholder rollback on the torn-down synthetic request, and no
         # in-flight copy host buffer is freed mid-transfer (defensive: covers the
         # `if present:`-skip path). No-op in sync (always None).
-        if self._pre_async_results is not None:
+        if getattr(self, "_pre_async_results", None) is not None:
             try:
                 self._pre_async_results.wait_for_copy()
             except Exception:
                 pass
             self._pre_async_results = None
         try:
-            idx_map = self.input_batch.req_id_to_index
+            idx_map = getattr(self.input_batch, "req_id_to_index", {})
             present = {r for r in rids if r in self.requests or r in idx_map}
             if present:
                 so = SchedulerOutput.make_empty()
@@ -3859,7 +3779,7 @@ class TPUModelRunner(GPUModelRunner):
             except Exception:
                 pass
         try:
-            if self.drafter is not None:
+            if getattr(self, "drafter", None) is not None:
                 self.drafter.draft_chunks = None
         except Exception:
             pass
@@ -4069,10 +3989,11 @@ class TPUModelRunner(GPUModelRunner):
             kernel_block_sizes=kernel_block_sizes,
             device=self.device,
             cache_dtype=self.kv_cache_dtype,
+            unified_block_pool=self._unified_block_pool,
         )
         kv_caches = materialized.kv_caches
         self.kv_cache_raw_tensors = materialized.raw_tensors
-        if self._unified_kv_layout:
+        if self._unified_block_pool:
             self._build_mamba_copy_plan(kv_cache_config,
                                         materialized.raw_tensors)
         if kv_cache_config.has_mamba_layers:
@@ -4085,7 +4006,7 @@ class TPUModelRunner(GPUModelRunner):
                          target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        if self._unified_kv_layout:
+        if self._unified_block_pool:
             # Flush the pool zero-fill before any compiled execution. PJRT
             # only donates quiescent buffers: a pending write at enqueue time
             # makes every donated pool parameter fall back to a fresh
@@ -4119,7 +4040,7 @@ class TPUModelRunner(GPUModelRunner):
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self)
 
-        if (not self._unified_kv_layout and self._mamba_align_mode
+        if (not self._unified_block_pool and self._mamba_align_mode
                 and kv_cache_config.has_mamba_layers):
             self._mamba_apc_copier = MambaApcStateCopier(self)
 
@@ -4133,8 +4054,6 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        assert kv_cache_config.num_blocks is not None, (
-            "KVCacheConfig.num_blocks must be resolved by the scheduler")
         kv_cache_config = copy.deepcopy(kv_cache_config)
         # Mirror GPUModelRunner.initialize_kv_cache: needed by inherited
         # _update_states -> _may_reorder_batch which reads kv_cache_config.
@@ -4167,15 +4086,17 @@ class TPUModelRunner(GPUModelRunner):
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
 
-            block_size = spec.block_size
-            if attn_block_size is None:
-                attn_block_size = block_size
-            assert attn_block_size == block_size, "Block size across attention groups must be the same."
+            block_size = getattr(spec, "block_size", None)
+            if block_size is not None:
+                if attn_block_size is None:
+                    attn_block_size = block_size
+                assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
-        block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.kv_cache_groups
-        ]
+        block_sizes = []
+        for group in kv_cache_config.kv_cache_groups:
+            block_sizes.append(
+                getattr(group.kv_cache_spec, "block_size", attn_block_size)
+                or self.block_size)
 
         self.may_reinitialize_input_batch(kv_cache_config, block_sizes)
 
@@ -4267,7 +4188,11 @@ class TPUModelRunner(GPUModelRunner):
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
             else:
-                num_blocks = kv_cache_config.num_blocks
+                num_blocks = getattr(kv_cache_config, "num_blocks", None)
+                if num_blocks is None:
+                    page_size_bytes = _per_layer_spec(
+                        shared_by[0]).page_size_bytes
+                    num_blocks = tensor_size // page_size_bytes
 
             for layer_name in shared_by:
                 kv_cache_spec = _per_layer_spec(layer_name)
@@ -4313,6 +4238,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
+        print(f"[DEBUG_KV_CACHES_KEYS] kv_caches keys = {list(kv_caches.keys())}", flush=True)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile

@@ -8,6 +8,10 @@ import os
 # The issue was introduced by vllm-project/vllm#26440
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+# Default GMM max tile size limits to avoid compiler register pressure and VMEM spilling
+os.environ.setdefault("GMM_MAX_TILE_K", "256")
+os.environ.setdefault("GMM_MAX_TILE_N", "256")
+
 # Disable forced graph breaks for functional collectives by default.
 # torch_tpu commit 477f611f made the collective-ops graph-break guardrail
 # active by default on module import in non-absl environments, causing a
@@ -105,11 +109,8 @@ def _user_has_flag(flag_name: str) -> bool:
 
 _libtpu_extra_args: list[str] = []
 
-# --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
-# batched RPA attention kernel's scheduling metadata (default budget is too
-# small on --attention-backend CUSTOM).
-if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
-    _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
+
+
 
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
@@ -194,3 +195,25 @@ if vllm_xla_cache_path:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
+
+
+# Force-load torch_tpu to register the privateuse1 'tpu' backend renaming
+# process-wide. This handles cases where PYTHONPATH or import paths shadow
+# or skip sitecustomize.py execution. We call _init_device("tpu") directly
+# from the loader to bypass get_tpu_device_count() checks inside Docker containers
+# that don't mount /dev/vfio or /sys.
+if os.getenv("VLLM_BYPASS_TPU_INIT") != "1":
+    try:
+        print("[DEBUG_ENV_OVERRIDE] Attempting direct _init_device('tpu')", flush=True)
+        from torch_tpu._loader import _init_device
+        _init_device("tpu")
+        print("[DEBUG_ENV_OVERRIDE] Successfully initialized tpu device", flush=True)
+    except Exception as e:
+        print(f"[DEBUG_ENV_OVERRIDE] Direct _init_device failed with exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        try:
+            import torch_tpu
+            torch_tpu.load()
+        except ImportError:
+            pass
