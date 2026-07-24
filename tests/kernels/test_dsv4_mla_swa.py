@@ -519,7 +519,8 @@ class TestDeepSeekV4EdgeCases(absltest.TestCase):
             q, new_kv, sw_cache, swa_kv_lens, swa_page_indices,
             swa_cu_q_lens, swa_distribution, main_cache_kv,
             None, None, None, None, None, None,
-            mesh=mesh, is_csa=False, swa_only=True, two_caches_same_buffer=False
+            mesh=mesh, is_csa=False, swa_only=True, two_caches_same_buffer=False,
+            sm_scale=1.0, sliding_window=16, logical_page_size=16
         )
         self.assertEqual(out.shape, q.shape)
 
@@ -535,7 +536,8 @@ class TestDeepSeekV4EdgeCases(absltest.TestCase):
         out, updated_cache = _deepseek_v4_attention_jax(
             q, new_kv, sw_cache, None, None, None, None,
             main_cache_kv, None, None, None, None, None, None,
-            mesh=mesh, is_csa=False, swa_only=False, two_caches_same_buffer=False
+            mesh=mesh, is_csa=False, swa_only=False, two_caches_same_buffer=False,
+            sm_scale=1.0, sliding_window=16, logical_page_size=16
         )
         self.assertEqual(out.shape, (0, 8, 512))
 
