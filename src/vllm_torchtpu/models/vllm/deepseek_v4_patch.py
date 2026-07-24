@@ -857,6 +857,25 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             has_inf = torch.isinf(res).any().item()
             if has_nan or has_inf:
                 print(f"[NAN_DETECTION] MHCPostOp output has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
+            else:
+                max_val = res.abs().max().item()
+                if max_val > 1e10:
+                    print(f"[NAN_DETECTION_DETAIL] MHCPostOp output max value is very large: {max_val}", flush=True)
+                    mixed_residual = torch.einsum(
+                        "...ij,...ih->...jh",
+                        comb_res_mix.to(torch.float32),
+                        residual.to(torch.float32),
+                    )
+                    post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
+                    res_dbg = (mixed_residual + post_term).to(residual.dtype)
+
+                    print(f"[NAN_DETECTION_DETAIL]   x: mean={x.mean().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   residual: mean={residual.mean().item():.6f} min={residual.min().item():.6f} max={residual.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   post_layer_mix: mean={post_layer_mix.mean().item():.6f} min={post_layer_mix.min().item():.6f} max={post_layer_mix.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   comb_res_mix: mean={comb_res_mix.mean().item():.6f} min={comb_res_mix.min().item():.6f} max={comb_res_mix.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   mixed_residual: mean={mixed_residual.mean().item():.6f} min={mixed_residual.min().item():.6f} max={mixed_residual.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   post_term: mean={post_term.mean().item():.6f} min={post_term.min().item():.6f} max={post_term.max().item():.6f}", flush=True)
+                    print(f"[NAN_DETECTION_DETAIL]   res_dbg: mean={res_dbg.to(torch.float32).mean().item():.6f} min={res_dbg.to(torch.float32).min().item():.6f} max={res_dbg.to(torch.float32).max().item():.6f}", flush=True)
         return res
 
     MHCPreOp.forward_native = debug_mhc_pre_native
