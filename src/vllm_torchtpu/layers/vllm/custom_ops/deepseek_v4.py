@@ -314,7 +314,9 @@ def _deepseek_v4_attention_jax(
                     main_kv_lens, extra, main_page_indices, main_cu_q_lens,
                     main_distribution, attention_sinks):
             if arg is not None:
-                dummy_sum = dummy_sum + jnp.sum(arg) * 0
+                is_f8 = (arg.dtype == jnp.float8_e4m3fn or arg.dtype == jnp.float8_e5m2)
+                arg_check = arg.astype(jnp.float32) if is_f8 else arg
+                dummy_sum = dummy_sum + jnp.sum(arg_check) * 0
         return dummy_out + dummy_sum, sw_cache + dummy_sum
 
     def _attention_local(
