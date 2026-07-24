@@ -251,7 +251,7 @@ def _process_fp8_linear_weights(
         weight_scale_inv=weight_scale_inv,
         block_quant=block_quant,
         weight_block_size=weight_block_size,
-        logical_widths=layer.logical_widths,
+        logical_widths=getattr(layer, "logical_widths", None),
         out_dtype=torch.float32,
     )
     weight, weight_scale = quantize_tensor(
@@ -489,12 +489,14 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             ignored_layers = cls.get_from_keys_or(config,
                                                   ["modules_to_not_convert"],
                                                   None)
-        return cls(
+        instance = cls(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
             ignored_layers=ignored_layers,
         )
+        instance.is_channel_quant = True
+        return instance
 
     def get_quant_method(
         self,
@@ -550,6 +552,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
 
+
+
     def maybe_roundup_sizes(
         self,
         hidden_size: int,
@@ -577,6 +581,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
+        self.moe = layer
+        if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
+            layer.has_bias = layer.moe_config.has_bias
         if self.quant_config.is_checkpoint_fp8_serialized:
             Fp8MoEMethod.create_weights(self, layer, num_experts, hidden_size,
                                         intermediate_size_per_partition,
@@ -602,8 +609,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                                                       requires_grad=False)
                 w2_weight_scale = torch.nn.Parameter(w2_scale_data,
                                                      requires_grad=False)
-                layer.register_parameter("w13_weight_scale", w13_weight_scale)
-                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.register_parameter(f"w13_{self.weight_scale_name}", w13_weight_scale)
+                layer.register_parameter(f"w2_{self.weight_scale_name}", w2_weight_scale)
+
                 from vllm.model_executor.layers.fused_moe import \
                     FusedMoeWeightScaleSupported
                 attrs = dict(extra_weight_attrs)
@@ -672,10 +680,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                  activation=activation_str,
              )
 
-        if hasattr(layer, "w13_weight_scale"):
-            del layer.w13_weight_scale
-        if hasattr(layer, "w2_weight_scale"):
-            del layer.w2_weight_scale
+        if hasattr(layer, f"w13_{self.weight_scale_name}"):
+            delattr(layer, f"w13_{self.weight_scale_name}")
+        if hasattr(layer, f"w2_{self.weight_scale_name}"):
+            delattr(layer, f"w2_{self.weight_scale_name}")
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale,
@@ -718,7 +727,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = layer.custom_routing_function
+        custom_routing_fn = getattr(layer, "custom_routing_function", None)
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
@@ -732,7 +741,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
                 renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
                 layer=layer,
             )
 
@@ -764,6 +773,7 @@ class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
         if loaded_weight.ndim == 1:
             loaded_weight = loaded_weight.view(-1, 1)
+        print(f"[DEBUG_LOAD] load_merged_column_weight name={getattr(self, 'name', 'unknown')} self.data.shape={list(self.data.shape)} loaded_weight.shape={list(loaded_weight.shape)} tp_rank={self.tp_rank} tp_size={self.tp_size} kwargs={kwargs}", flush=True)
         super().load_merged_column_weight(loaded_weight, **kwargs)
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -795,11 +805,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def __init__(self,
                  quant_config: Fp8Config,
-                 linear_config: VllmQuantLinearConfig | None = None):
+                 linear_config: VllmQuantLinearConfig | None = None,
+                 prefix: str = ""):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
         self.quant_config = quant_config
+        self.quant_config.is_channel_quant = True
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = quant_config.activation_scheme == "static"
@@ -814,8 +826,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
-        self._linear_quant_config = _get_linear_quant_config(
-            self.linear_config)
+        
+        is_routed_expert = bool(prefix and ("experts" in prefix) and ("shared_experts" not in prefix))
+        import logging
+        logger = logging.getLogger("vllm.layers.quantization")
+        logger.warning(f"[DEBUG_PREFIX] prefix={prefix!r} is_routed_expert={is_routed_expert}")
+        if not is_routed_expert:
+            # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
+            self.weight_block_size = None
+            self.block_quant = False
+            self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None, False)
+        else:
+            self._linear_quant_config = _get_linear_quant_config(
+                self.linear_config)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
@@ -880,8 +903,6 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_quant_config=self._linear_quant_config,
                 ))
         else:
-            desired_quant_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
-                self._linear_quant_config)
             weight, weight_scale = quantize_tensor(
                 layer.weight.data.to(torch.float32),
                 quant_dtype=requant_dtype,
