@@ -1870,16 +1870,23 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}")
                 continue
             try:
+                # T3.1 sibling collapse: one registration carries the FA
+                # spans plus every GDN state class's spans under the SAME
+                # req_id/uuid — one D5 row per rank, one claim lifecycle.
+                # The controller filters registrations per requested tag at
+                # plan build.
+                pool_spans = list(fa_pool_spans)
+                pool_spans.extend(
+                    self._stage3_state_pool_spans(
+                        getattr(req_meta, "mamba_state_block_ids", None),
+                        transfer_rank, parallelism))
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,
                     unit=self._raiden_work_unit,
                     block_ids=list(local_ids),
-                    pool_spans=fa_pool_spans,
+                    pool_spans=pool_spans,
                 )
-                self._stage3_register_state_blocks(
-                    facade, req_id, uuid, transfer_rank,
-                    getattr(req_meta, "mamba_state_block_ids", None))
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
@@ -2051,22 +2058,21 @@ class TPURaidenConnectorWorker:
                 f"GDN state pools tagged {tag!r} disagree on live regions")
         return tuple(matching[0].regions)
 
-    def _stage3_register_state_blocks(self, facade: Any, req_id: str,
-                                      uuid: int, transfer_rank: int,
-                                      mamba_state_block_ids) -> None:
-        """Producer: sibling D5 registrations for the GDN state classes.
+    def _stage3_state_pool_spans(self, mamba_state_block_ids,
+                                 transfer_rank: int,
+                                 parallelism: int) -> list:
+        """Producer: the GDN state classes' span registrations.
 
         PCP GDN execution exchanges token shards for head shards.  Every PCP
         rank therefore owns a distinct q/k/v and SSM head slice.  Each rank
         declares its slice in compact-live byte space, and the controller
         combines the complete rank set into the full non-PCP destination
-        state. Under the uniform mamba layout the live recurrent state is in
-        each mamba group's first block-table slot; that block is lifecycle-
-        protected exactly like the FA blocks until the connector reports the
-        send terminal.
+        state. T3.1: the registrations ride the base request's single
+        register_request_blocks call (same req_id/uuid as FA) instead of
+        derived sibling registrations.
         """
         if not self._stage3_state_group_count:
-            return
+            return []
         if not mamba_state_block_ids:
             raise RuntimeError(
                 "GDN state registration requires the producer's per-group "
@@ -2076,29 +2082,17 @@ class TPURaidenConnectorWorker:
                 "GDN state registration group count disagrees with the "
                 f"manifest: blocks={len(mamba_state_block_ids)}, "
                 f"groups={self._stage3_state_group_count}")
-        pending = self._stage3_state_send_pending.setdefault(req_id, set())
+        from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import \
+            lower_gdn_state_shard_spans
+        registrations = []
         for tag in _STAGE3_STATE_CLASS_TAGS:
             for ordinal, block_id in enumerate(mamba_state_block_ids):
-                derived_req_id = _stage3_state_req_id(req_id, tag, ordinal)
-                derived_uuid = _stage3_state_uuid(uuid, tag, ordinal)
-                existing_base = self._stage3_state_send_source_to_base.get(
-                    derived_req_id)
-                existing_uuid = self._stage3_state_send_uuids.get(
-                    derived_req_id)
-                if (existing_base is not None and existing_base != req_id
-                        or existing_uuid is not None
-                        and existing_uuid != derived_uuid):
-                    raise RuntimeError(
-                        "Conflicting GDN state send identity for derived "
-                        f"request {derived_req_id!r}")
                 exact_tag = f"{tag}.g{ordinal}"
-                from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import \
-                    lower_gdn_state_shard_spans  # noqa: E501
                 registration = lower_gdn_state_shard_spans(
                     tag=exact_tag,
                     block_id=int(block_id),
                     transfer_rank=transfer_rank,
-                    parallelism=self._raiden_transfer_parallelism(),
+                    parallelism=parallelism,
                     regions=self._stage3_state_regions(exact_tag),
                 )
                 admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
@@ -2108,18 +2102,8 @@ class TPURaidenConnectorWorker:
                         f"manifest for {exact_tag}: lowered="
                         f"{registration.declared_bytes}, admitted="
                         f"{admitted_live_bytes}")
-                facade.register_request_blocks(
-                    req_id=derived_req_id,
-                    uuid=derived_uuid,
-                    unit=self._raiden_work_unit,
-                    block_ids=[],
-                    pool_spans=[registration],
-                )
-                self._stage3_state_send_source_to_base[derived_req_id] = (
-                    req_id)
-                self._stage3_state_send_uuids[derived_req_id] = derived_uuid
-                if derived_req_id not in self._stage3_state_send_terminals:
-                    pending.add(derived_req_id)
+                registrations.append(registration)
+        return registrations
 
     def _stage3_prune_state_send_tracking(self, base_req_id: str) -> None:
         """Drops bounded producer sibling tombstones with the base tombstone."""
@@ -2222,59 +2206,6 @@ class TPURaidenConnectorWorker:
         self._stage3_failed_send_bases.difference_update(ready)
         self._stage3_cancelled_send_bases.difference_update(ready)
         return done, failed, cancelled
-
-    def _submit_stage3_state_loads(self, facade: Any, destination_req_id: str,
-                                   source_req_id: str, uuid: int,
-                                   src_units: list,
-                                   src_controller_address: str,
-                                   dst_controller_address: str,
-                                   mamba_state_block_ids) -> None:
-        """Consumer: sibling state-class transfers for one request.
-
-        One transfer per (state class x mamba kv-cache group): each group
-        has its own block table, so each carries its own destination slot
-        and addresses the group-suffixed pool tag.
-        """
-        if not self._stage3_state_group_count:
-            return
-        if not mamba_state_block_ids:
-            raise RuntimeError(
-                "GDN state load requires the destination per-group mamba "
-                "state block ids")
-        if len(mamba_state_block_ids) != self._stage3_state_group_count:
-            raise RuntimeError(
-                "GDN state load group count disagrees with the manifest: "
-                f"blocks={len(mamba_state_block_ids)}, "
-                f"groups={self._stage3_state_group_count}")
-        pending: set[str] = set()
-        self._stage3_state_pending[destination_req_id] = pending
-        for tag in _STAGE3_STATE_CLASS_TAGS:
-            for ordinal, slot in enumerate(mamba_state_block_ids):
-                derived_req_id = _stage3_state_req_id(source_req_id, tag,
-                                                      ordinal)
-                derived_uuid = _stage3_state_uuid(uuid, tag, ordinal)
-                pending.add(derived_req_id)
-                self._stage3_state_source_to_dest[derived_req_id] = (
-                    destination_req_id)
-                accepted = self._start_stage3_transfer_with_d5_retry(
-                    facade,
-                    src_units=src_units,
-                    dst_units=[self._raiden_work_unit],
-                    req_id=derived_req_id,
-                    dst_device_block_ids=[int(slot)],
-                    dst_mem_type=self._raiden_hbm_memory_type(),
-                    use_block_chunks=True,
-                    src_controller_address=src_controller_address,
-                    dst_controller_address=dst_controller_address,
-                    uuid=derived_uuid,
-                    is_sender=False,
-                    num_tokens=None,
-                    transfer_pool_tags=[f"{tag}.g{ordinal}"],
-                )
-                if accepted is not True:
-                    raise RuntimeError(
-                        f"destination controller rejected the {tag}.g"
-                        f"{ordinal} state transfer")
 
     def _stage3_release_state_load(self, destination_req_id: str) -> None:
         """Drop sibling-transfer bookkeeping for one request."""
@@ -2394,6 +2325,29 @@ class TPURaidenConnectorWorker:
                 # Actual byte completion is deliberately *not* inferred from
                 # that acknowledgement; get_finished polls the local manager.
                 controller_contacted = True
+                # T3.1 sibling collapse: ONE transfer carries the FA
+                # payload plus every GDN state class. Tag order fixes the
+                # H2D order ranks executor-side (FA = group 0 uploads
+                # first; state classes land after it on aliased arena
+                # pages, replacing the old deferred-sibling submission).
+                transfer_tags = list(_STAGE3_TRANSFER_POOL_TAGS)
+                dst_blocks = list(local_blocks)
+                dst_counts = [len(local_blocks)]
+                mamba_state_block_ids = getattr(
+                    req_meta, "mamba_state_block_ids", None)
+                if self._stage3_state_group_count:
+                    if not mamba_state_block_ids or len(
+                            mamba_state_block_ids
+                    ) != self._stage3_state_group_count:
+                        raise RuntimeError(
+                            "GDN state load requires one destination state "
+                            "block per mamba group")
+                    for tag in _STAGE3_STATE_CLASS_TAGS:
+                        for ordinal, slot in enumerate(
+                                mamba_state_block_ids):
+                            transfer_tags.append(f"{tag}.g{ordinal}")
+                            dst_blocks.append(int(slot))
+                            dst_counts.append(1)
                 accepted = self._start_stage3_transfer_with_d5_retry(
                     facade,
                     src_units=src_units,
@@ -2402,7 +2356,7 @@ class TPURaidenConnectorWorker:
                     # destination's independently randomized ID is strictly a
                     # local scheduler lifecycle key.
                     req_id=source_req_id,
-                    dst_device_block_ids=local_blocks,
+                    dst_device_block_ids=dst_blocks,
                     dst_mem_type=self._raiden_hbm_memory_type(),
                     use_block_chunks=True,
                     src_controller_address=src_controller_address,
@@ -2410,21 +2364,13 @@ class TPURaidenConnectorWorker:
                     uuid=uuid,
                     is_sender=False,
                     num_tokens=num_tokens,
-                    transfer_pool_tags=list(_STAGE3_TRANSFER_POOL_TAGS),
+                    transfer_pool_tags=transfer_tags,
+                    dst_block_counts=dst_counts,
                 )
                 if accepted is not True:
                     raise RuntimeError(
                         "destination controller rejected Stage-3 transfer")
                 fa_accepted = True
-                # Deferred: the state-class siblings are submitted from
-                # _poll_finished once the FA transfer's native receive
-                # completes, so the state bytes are the last writer on the
-                # shared arena pages (see _stage3_deferred_state_loads).
-                self._stage3_deferred_state_loads[destination_req_id] = (
-                    facade, destination_req_id, source_req_id, uuid,
-                    src_units, src_controller_address,
-                    dst_controller_address,
-                    getattr(req_meta, "mamba_state_block_ids", None))
             except Exception as exc:  # pylint: disable=broad-except
                 missing_d5 = "Missing producer block registration" in str(exc)
                 if not controller_contacted or (missing_d5
@@ -2644,27 +2590,6 @@ class TPURaidenConnectorWorker:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
                 for req_id in expired_uncertain:
                     self._stage3_pending_controller_failures.pop(req_id, None)
-            # FA native receive completed: now submit the deferred state
-            # classes so their bytes land after FA's on the shared arena
-            # pages. Populating _stage3_state_pending here keeps this pass's
-            # completion gate below holding the base request open until the
-            # states finish.
-            if self._stage3_deferred_state_loads:
-                for dest in list(done_recving):
-                    deferred = self._stage3_deferred_state_loads.pop(
-                        dest, None)
-                    if deferred is None:
-                        continue
-                    try:
-                        self._submit_stage3_state_loads(*deferred)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.error(
-                            "Deferred Stage-3 state load submission failed "
-                            "destination_req_id=%s: %s", dest, exc)
-                        if dest not in failed_recving:
-                            failed_recving = list(failed_recving) + [dest]
-                for dest in failed_recving:
-                    self._stage3_deferred_state_loads.pop(dest, None)
             # Gate FA completion on the sibling state classes: the request
             # is done only when every configured class has landed. Failures
             # already collapsed onto the base ID above.
