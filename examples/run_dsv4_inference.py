@@ -44,7 +44,7 @@ def main():
     ep_size = int(os.getenv("VLLM_EP_SIZE", "8"))
     llm = LLM(
         model=os.getenv("DSV4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash"),
-        quantization=None,
+        quantization="deepseek_v4_fp8",
         tensor_parallel_size=tp_size,
         trust_remote_code=True,
         max_model_len=64,
@@ -71,12 +71,13 @@ def main():
     )
 
     prompts = [
-        "Explain the difference between JAX and PyTorch in one sentence.",
+        "<｜begin▁of▁sentence｜>User: Explain the difference between JAX and PyTorch in one sentence.\n\nAssistant:",
+        "<｜begin▁of▁sentence｜><｜User｜>Explain the theory of relativity in simple terms.<｜Assistant｜>",
     ]
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=50, ignore_eos=False, logprobs=5)
 
-    print("=== Testing raw and manually formatted prompts with llm.generate (ignore_eos=True) ===")
+    print("=== Testing manually formatted prompts with llm.generate ===")
     outputs = llm.generate(prompts, sampling_params)
     for output in outputs:
         print(f"Prompt: {output.prompt!r}")
@@ -85,20 +86,6 @@ def main():
         print(f"Generated text: {output.outputs[0].text!r}")
         if output.outputs[0].logprobs is not None and len(output.outputs[0].logprobs) > 0:
             print(f"Generated logprobs (step 1): {output.outputs[0].logprobs[0]}")
-        print("-" * 80)
-
-    print("=== Testing chat API with llm.chat (ignore_eos=True) ===")
-    messages = [
-        [{"role": "user", "content": "Explain the theory of relativity in simple terms."}],
-    ]
-    chat_outputs = llm.chat(messages, sampling_params)
-    for output in chat_outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        generated_tokens = output.outputs[0].token_ids
-        print(f"Chat Prompt: {prompt!r}")
-        print(f"Generated token IDs: {generated_tokens}")
-        print(f"Generated text: {generated_text!r}")
         print("-" * 80)
 
 if __name__ == "__main__":
