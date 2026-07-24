@@ -726,7 +726,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     torch.cuda.Event = DummyCudaEvent
 
     # 5. Patch HCHeadOp and MHCFusedPostPreOp forward_native with pure PyTorch implementations.
-    from vllm.model_executor.layers.mhc import HCHeadOp, MHCFusedPostPreOp
+    from vllm.model_executor.layers.mhc import HCHeadOp, MHCFusedPostPreOp, MHCPreOp, MHCPostOp
 
     def mhc_hc_head_native(
         self,
@@ -795,6 +795,43 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _orig_mhc_fused_post_pre_forward_native = MHCFusedPostPreOp.forward_native
     HCHeadOp.forward_native = mhc_hc_head_native
     MHCFusedPostPreOp.forward_native = mhc_fused_post_pre_native
+
+    _orig_mhc_pre_forward_native = MHCPreOp.forward_native
+    _orig_mhc_post_forward_native = MHCPostOp.forward_native
+
+    def debug_mhc_pre_native(self, residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, n_splits=1, norm_weight=None, norm_eps=0.0):
+        for name, t in [("residual", residual), ("fn", fn), ("hc_scale", hc_scale), ("hc_base", hc_base)]:
+            if t is not None:
+                has_nan = torch.isnan(t).any().item()
+                has_inf = torch.isinf(t).any().item()
+                if has_nan or has_inf:
+                    print(f"[NAN_DETECTION] MHCPreOp input {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
+        res = _orig_mhc_pre_forward_native(self, residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, n_splits, norm_weight, norm_eps)
+        for name, t in zip(["post_mix", "comb_mix", "layer_input"], res):
+            if t is not None:
+                has_nan = torch.isnan(t).any().item()
+                has_inf = torch.isinf(t).any().item()
+                if has_nan or has_inf:
+                    print(f"[NAN_DETECTION] MHCPreOp output {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
+        return res
+
+    def debug_mhc_post_native(self, x, residual, post_layer_mix, comb_res_mix):
+        for name, t in [("x", x), ("residual", residual), ("post_layer_mix", post_layer_mix), ("comb_res_mix", comb_res_mix)]:
+            if t is not None:
+                has_nan = torch.isnan(t).any().item()
+                has_inf = torch.isinf(t).any().item()
+                if has_nan or has_inf:
+                    print(f"[NAN_DETECTION] MHCPostOp input {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
+        res = _orig_mhc_post_forward_native(self, x, residual, post_layer_mix, comb_res_mix)
+        if res is not None:
+            has_nan = torch.isnan(res).any().item()
+            has_inf = torch.isinf(res).any().item()
+            if has_nan or has_inf:
+                print(f"[NAN_DETECTION] MHCPostOp output has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
+        return res
+
+    MHCPreOp.forward_native = debug_mhc_pre_native
+    MHCPostOp.forward_native = debug_mhc_post_native
 
     # 6. Patch bind_kv_cache to bypass TPU platform NotImplementedError
     import vllm.v1.worker.utils as worker_utils
