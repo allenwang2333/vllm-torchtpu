@@ -13,8 +13,16 @@ from torch_tpu._internal.utils import hardware
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-# Ensure src/ is in python path
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
+import os
+import sys
+# Ensure src/ is in python path dynamically
+src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
+sys.path.insert(0, src_path)
+
+# Purge pre-loaded vllm_torchtpu modules from sys.modules to prevent loading stale sitecustomize cached paths
+for key in list(sys.modules.keys()):
+    if key == "vllm_torchtpu" or key.startswith("vllm_torchtpu."):
+        del sys.modules[key]
 
 class DummyAttnSinkModule(torch.nn.Module):
     def __init__(self, mesh):
