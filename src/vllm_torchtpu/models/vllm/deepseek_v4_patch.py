@@ -180,7 +180,23 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             rl_cpu = router_logits.cpu().float()
             print(f"[DEBUG_PATCH] layer_{layer_idx} input hidden_states: shape={list(hs_cpu.shape)} dtype={hidden_states.dtype} | mean={hs_cpu.mean().item():.6f} std={hs_cpu.std().item():.6f} min={hs_cpu.min().item():.6f} max={hs_cpu.max().item():.6f}", flush=True)
             print(f"[DEBUG_PATCH] layer_{layer_idx} input router_logits: shape={list(rl_cpu.shape)} dtype={router_logits.dtype} | mean={rl_cpu.mean().item():.6f} std={rl_cpu.std().item():.6f} min={rl_cpu.min().item():.6f} max={rl_cpu.max().item():.6f}", flush=True)
-        return _orig_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids)
+        res = _orig_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids)
+        tensors_to_check = []
+        if isinstance(res, torch.Tensor):
+            tensors_to_check.append(("moe_output", res))
+        elif isinstance(res, tuple):
+            if len(res) > 0 and isinstance(res[0], torch.Tensor):
+                tensors_to_check.append(("shared_expert_output", res[0]))
+            if len(res) > 1 and isinstance(res[1], torch.Tensor):
+                tensors_to_check.append(("fused_expert_output", res[1]))
+        for name, tensor in tensors_to_check:
+            has_nan = torch.isnan(tensor).any().item()
+            if has_nan:
+                print(f"[NAN_DETECTION] NaN detected in {name} at layer {layer_idx}! shape={list(tensor.shape)}", flush=True)
+            elif layer_idx in (0, 3, 4):
+                tensor_cpu = tensor.cpu().float()
+                print(f"[DEBUG_PATCH] layer_{layer_idx} output {name}: shape={list(tensor_cpu.shape)} | mean={tensor_cpu.mean().item():.6f} std={tensor_cpu.std().item():.6f} min={tensor_cpu.min().item():.6f} max={tensor_cpu.max().item():.6f}", flush=True)
+        return res
 
     MoERunner._apply_quant_method = patched_apply_quant_method
 
@@ -191,13 +207,13 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         _orig_load_weights = cls.load_weights
         
         def patched_load_weights(self, weights):
-            print(f"[PATCH] Entering patched_load_weights on {self.__class__.__name__}", file=sys.stderr, flush=True)
-            params_keys = sorted(list(dict(self.named_parameters()).keys()))
-            print(f"[PATCH] Model parameters count: {len(params_keys)}", file=sys.stderr, flush=True)
-            for k in params_keys:
-                if "layers.0.attn.wo_b" in k:
-                    param = dict(self.named_parameters())[k]
-                    print(f"[PATCH]   Param: {k} | Shape: {list(param.shape)} | Type: {param.__class__.__name__}", file=sys.stderr, flush=True)
+            print(f"[PATCH] Entering patched_load_weights on DeepseekV4ForCausalLM", file=sys.stderr, flush=True)
+            print(f"[PATCH] Model parameters count: {len(list(self.parameters()))}", file=sys.stderr, flush=True)
+            named_params = dict(self.named_parameters())
+            for name in named_params.keys():
+                print(f"[PATCH]   Param: {name}", file=sys.stderr, flush=True)
+            print(f"[PATCH] Has model.embed_tokens.weight: {'model.embed_tokens.weight' in named_params}", file=sys.stderr, flush=True)
+            print(f"[PATCH] Has lm_head.weight: {'lm_head.weight' in named_params}", file=sys.stderr, flush=True)
             self.model.has_tilelang = False
             for idx, l in enumerate(self.model.layers):
                 l.layer_idx = idx
@@ -206,15 +222,20 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     l.ffn.layer_idx = idx
                     if hasattr(l.ffn, "experts"):
                         l.ffn.experts.layer_idx = idx
+            from vllm.models.deepseek_v4.amd.model import _make_deepseek_v4_weights_mapper
             quant_config = getattr(vllm_config, "quant_config", None)
-            expert_dtype = getattr(quant_config, "expert_dtype", "fp8")
+            expert_dtype = getattr(quant_config, "expert_dtype", "fp4")
             is_fp4_experts = (expert_dtype == "fp4")
-            orig_mapper = self.hf_to_vllm_mapper
+            orig_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
             
             outer_self = self
             class WrappedMapper:
                 def apply(self, w):
                     for name, loaded_weight in orig_mapper.apply(w):
+                        if name == "model.embed.weight":
+                            name = "model.embed_tokens.weight"
+                        if name in ("model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"):
+                            print(f"[PATCH_LOADED_KEY] Mapped key: {name} shape={list(loaded_weight.shape)} mean={loaded_weight.float().mean().item():.6f}", file=sys.stderr, flush=True)
                         if "layers.0.attn" in name:
                             print(f"[PATCH] Mapping: {name} shape={list(loaded_weight.shape)} dtype={loaded_weight.dtype}", file=sys.stderr, flush=True)
                         if not is_fp4_experts and ".experts." in name and name.endswith("weight_scale"):
@@ -310,28 +331,16 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         
             # Check if all expert layers have been pre-quantized and cached on disk.
             # If so, we can skip loading the heavy expert weights from safetensors to save CPU memory and time.
-            has_all_cached = False
             cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
-            if cache_dir and os.path.exists(cache_dir):
-                import re
-                import torch.distributed as dist
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                cached_files = os.listdir(cache_dir)
-                # Find cached files for this rank
-                pattern = re.compile(rf"rank_{rank}_layer_(\d+).*\.pt")
-                layers_found = set()
-                for f in cached_files:
-                    m = pattern.match(f)
-                    if m:
-                        layers_found.add(int(m.group(1)))
-                # Check layers 0 to num_layers-1
-                has_all_cached = True
-                for i in range(self.config.num_hidden_layers):
-                    if hasattr(self.model.layers[i], "ffn") and hasattr(self.model.layers[i].ffn, "experts"):
-                        if i not in layers_found:
-                            has_all_cached = False
-                            break
-                            
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+                cached_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
+                # Total expected cache files = num_hidden_layers (60) * num_ranks (8)
+                expected_files = self.config.num_hidden_layers * 8
+                has_all_cached = (len(cached_files) >= expected_files)
+            else:
+                has_all_cached = False
+
             if has_all_cached:
                 logger.warning("[PATCH] All expert weights are cached. Skipping loading expert weights from safetensors checkpoint!")
                 def filter_expert_weights(weights_iter):
@@ -339,13 +348,11 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         if ".experts." in name:
                             continue
                         yield name, loaded_weight
-                weights = filter_expert_weights(weights)
             else:
                 logger.warning("[PATCH] Cached expert weights not found or incomplete. Loading expert weights from safetensors checkpoint to generate cache.")
 
             self.hf_to_vllm_mapper = WrappedMapper()
             try:
-                print(f"[PATCH] Model state_dict keys related to layers.0.attn: {[k for k in self.model.state_dict().keys() if 'layers.0.attn.' in k]}", file=sys.stderr, flush=True)
                 # Update TP status of all parameters since new ones (like weight_scale)
                 # are registered during weight creation which runs AFTER linear layer __init__.
                 for name, module in self.model.named_modules():
@@ -392,6 +399,21 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
         cls.load_weights = patched_load_weights
 
+        _orig_compute_logits = getattr(cls, "compute_logits", None)
+        if _orig_compute_logits is not None:
+            def patched_compute_logits(self, hidden_states: torch.Tensor):
+                logits = _orig_compute_logits(self, hidden_states)
+                if logits is not None and not torch.compiler.is_compiling():
+                    h_mean = hidden_states.float().mean().item()
+                    h_std = hidden_states.float().std().item()
+                    w_mean = self.lm_head.weight.float().mean().item() if hasattr(self.lm_head, "weight") and self.lm_head.weight is not None else 0.0
+                    w_std = self.lm_head.weight.float().std().item() if hasattr(self.lm_head, "weight") and self.lm_head.weight is not None else 0.0
+                    top5_idx = torch.topk(logits[0], 5).indices.tolist()
+                    top5_val = [round(v, 4) for v in torch.topk(logits[0], 5).values.tolist()]
+                    print(f"[DEBUG_LOGITS] hidden_states mean={h_mean:.6f} std={h_std:.6f} | lm_head weight mean={w_mean:.6f} std={w_std:.6f} | logits max={logits.max().item():.4f} min={logits.min().item():.4f} top5={top5_idx} top5_vals={top5_val}", flush=True)
+                return logits
+            cls.compute_logits = patched_compute_logits
+
     # Patch custom Triton operations with PyTorch equivalents on TPU
     try:
         import vllm.models.deepseek_v4.attention as ds_attn
@@ -407,11 +429,54 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             eps: float,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # Standard PyTorch equivalent of GPU Triton RMSNorm kernel
-            qr_out = qr * torch.rsqrt(qr.pow(2).mean(-1, keepdim=True) + eps) * q_weight
-            kv_out = kv * torch.rsqrt(kv.pow(2).mean(-1, keepdim=True) + eps) * kv_weight
-            return qr_out, kv_out
+            orig_dtype = qr.dtype
+            qr_f = qr.float()
+            kv_f = kv.float()
+            qr_out = qr_f * torch.rsqrt(qr_f.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + q_weight.float())
+            kv_out = kv_f * torch.rsqrt(kv_f.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + kv_weight.float())
+            return qr_out.to(orig_dtype), kv_out.to(orig_dtype)
 
         def fused_indexer_q_rope_quant_pytorch(
+            positions: torch.Tensor,
+            q: torch.Tensor,
+            rotary_emb: torch.nn.Module,
+            q_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            # Fallback PyTorch implementation for fused_indexer_q_rope_quant
+            q_pe = rotary_emb(positions, q)
+            return q_pe
+
+        try:
+            import vllm.v1.attention.ops.rocm_aiter_mla_sparse as sparse_ops
+            orig_inv_rope = sparse_ops._apply_inv_rope_ref
+            def safe_inv_rope(rotary_emb, x, positions, rope_dim):
+                try:
+                    return orig_inv_rope(rotary_emb, x, positions, rope_dim)
+                except Exception:
+                    pos_1d = positions.flatten()
+                    return sparse_ops._apply_gptj_inv_rope_ref(x, pos_1d, rotary_emb.cos_sin_cache, rope_dim)
+            sparse_ops._apply_inv_rope_ref = safe_inv_rope
+        except Exception:
+            pass
+
+        try:
+            from vllm.model_executor.layers.mhc import MHCFusedPostPreOp
+            def mhc_fused_post_pre_native(
+                self,
+                x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+                rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                n_splits=1, tile_n=1, norm_weight=None, norm_eps=0.0
+            ):
+                import vllm.model_executor.kernels.mhc as mhc_kernels
+                res_cur = mhc_kernels.mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+                post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
+                    res_cur, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+                )
+                return res_cur, post_mix, comb_mix, layer_input
+            MHCFusedPostPreOp.forward_native = mhc_fused_post_pre_native
+        except Exception:
+            pass
+        def fused_indexer_q_rope_quant_pytorch_full(
             positions: torch.Tensor,
             index_q: torch.Tensor,
             index_q_cos_sin_cache: torch.Tensor,
@@ -472,6 +537,11 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         ds_attn.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
         fused_indexer_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
         common_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch
+
+        # Direct sys.modules update to override all imported references
+        for m in list(sys.modules.values()):
+            if m is not None and hasattr(m, "fused_q_kv_rmsnorm"):
+                setattr(m, "fused_q_kv_rmsnorm", fused_q_kv_rmsnorm_pytorch)
 
         print("[PATCH] Successfully monkey-patched fused_q_kv_rmsnorm and fused_indexer_q_rope_quant with PyTorch equivalents.", flush=True)
     except Exception as e:
@@ -572,7 +642,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             return t.torch()
                         return t
                     return jax.tree_util.tree_map(to_torch, res)
-            return _orig_amd_forward(
+            res = _orig_amd_forward(
                 self,
                 input_ids,
                 positions,
@@ -581,9 +651,21 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 *args,
                 **kwargs
             )
-
+            if not torch.compiler.is_compiling() and isinstance(res, torch.Tensor):
+                print(f"[DEBUG_FORWARD_RES] pid={os.getpid()} res shape={list(res.shape)} dtype={res.dtype} mean={res.float().mean().item():.6f} abs_mean={res.float().abs().mean().item():.6f}", file=sys.stderr, flush=True)
+            return res
 
         _AmdDeepseekV4ForCausalLM.forward = patched_amd_forward
+
+        def patched_compute_logits(self, hidden_states: torch.Tensor):
+            if not torch.compiler.is_compiling():
+                print(f"[DEBUG_COMPUTE_LOGITS_IN] pid={os.getpid()} hs shape={list(hidden_states.shape)} mean={hidden_states.float().mean().item():.6f} abs_mean={hidden_states.float().abs().mean().item():.6f}", file=sys.stderr, flush=True)
+            logits = self.logits_processor(self.lm_head, hidden_states)
+            if not torch.compiler.is_compiling() and logits is not None:
+                print(f"[DEBUG_COMPUTE_LOGITS_OUT] pid={os.getpid()} logits shape={list(logits.shape)} mean={logits.float().mean().item():.6f} abs_mean={logits.float().abs().mean().item():.6f} min={logits.float().min().item():.6f} max={logits.float().max().item():.6f}", file=sys.stderr, flush=True)
+            return logits
+
+        _AmdDeepseekV4ForCausalLM.compute_logits = patched_compute_logits
 
     # 1.5. Patch DeepseekV4Model to ensure _mtp_hidden_buffer is always allocated (prevents NoneType subscriptable errors in Dynamo)
     from vllm.models.deepseek_v4.amd.model import DeepseekV4Model
