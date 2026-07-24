@@ -382,11 +382,6 @@ def _deepseek_v4_attention_jax(
         if swa_m is not None and swa_m.ndim == 3:
             swa_m = jnp.squeeze(swa_m, axis=-1)
 
-        import jax.debug
-        jax.debug.print("[JAX_ATTN_DEBUG] swa_output: mean={} min={} max={}", swa_output.mean(), swa_output.min(), swa_output.max())
-        jax.debug.print("[JAX_ATTN_DEBUG] swa_l: mean={} min={} max={}", swa_l.mean(), swa_l.min(), swa_l.max())
-        jax.debug.print("[JAX_ATTN_DEBUG] swa_m: mean={} min={} max={}", swa_m.mean(), swa_m.min(), swa_m.max())
-
         output = mla_ragged_paged_attention(
             q=q,
             cache_kv=main_cache_kv,
@@ -404,7 +399,6 @@ def _deepseek_v4_attention_jax(
             num_kv_pages_per_block=1,
             num_queries_per_block=1,
         )
-        jax.debug.print("[JAX_ATTN_DEBUG] final output: mean={} min={} max={}", output.mean(), output.min(), output.max())
         if sw_cache_was_5d:
             updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
         return output + dummy_sum, updated_sw_cache
