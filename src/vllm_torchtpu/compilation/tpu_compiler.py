@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
@@ -20,7 +21,9 @@ import torch
 import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch_tpu._internal.compile import tpu_torch_compile
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.compile.compiler import StaticCompiler
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
@@ -32,7 +35,58 @@ logger = init_logger(__name__)
 # Type alias for the compile range tuple
 Range = tuple[int, int]
 
-_tpu_backend = TpuBackend()
+# Bucketed AOT compilation is pipelined: the FX->MLIR lowering runs on the
+# caller thread (it reads process-global deferred-graph state and is not
+# reentrant), while the MLIR->PjRt compile of each bucket runs on this pool
+# (GIL-free and thread-safe in torch_tpu). 0 disables pipelining.
+_TPU_COMPILE_THREADS = int(os.environ.get("TPU_COMPILE_THREADS", "4"))
+_compile_pool = (ThreadPoolExecutor(max_workers=_TPU_COMPILE_THREADS,
+                                    thread_name_prefix="tpu-compile")
+                 if _TPU_COMPILE_THREADS > 0 else None)
+if _compile_pool is not None:
+    logger.info(
+        "[TpuCompilerAdaptor] Pipelined compilation enabled: %d pool threads",
+        _TPU_COMPILE_THREADS)
+
+
+class _LazyCompiledArtifact:
+    """Facade over a StaticCompiler artifact whose PjRt executable is still
+    compiling on the pool; the first execution waits for the future."""
+
+    def __init__(self, artifact, future):
+        self._artifact = artifact
+        self._future = future
+
+    def __call__(self, *args):
+        if self._artifact._executable is None:
+            self._artifact._executable = self._future.result()
+        return self._artifact(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._artifact, name)
+
+
+class _PipelinedStaticCompiler(StaticCompiler):
+    """Lower on the caller thread, compile on the shared pool."""
+
+    def __init__(self, debug: bool = False):
+        super().__init__(debug=debug, build_executable=False)
+
+    def __call__(self, graph_module, example_inputs, is_fwd=True):
+        artifact = super().__call__(graph_module,
+                                    example_inputs,
+                                    is_fwd=is_fwd)
+        future = _compile_pool.submit(tpu_torch_compile.compile_mlir,
+                                      artifact.pending_mlir_module)
+        return _LazyCompiledArtifact(artifact, future)
+
+
+# Pipelined artifacts resolve their executable lazily, so they cannot pass
+# through the aot_autograd bundled cache's OutputCode contract; serialization
+# is disabled in pipelined mode (the disk cache is skipped there anyway).
+_tpu_backend = (TpuBackend(enable_serialization=False,
+                           compiler_factory=_PipelinedStaticCompiler)
+                if _compile_pool is not None else TpuBackend())
 
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
@@ -324,8 +378,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # __reduce__), not the aot_autograd wrapper (which has
         # unpicklable closures).
         handle = None
-        if (key is not None and self.cache_dir is not None
-                and not self._disable_cache
+        # Pipelined compiles return before the executable exists; pickling
+        # would force a blocking wait per bucket, so the disk cache is only
+        # written in the non-pipelined mode.
+        if (_compile_pool is None and key is not None
+                and self.cache_dir is not None and not self._disable_cache
                 and _tpu_backend._compiled_executables):
             try:
                 inner_exe = _tpu_backend._compiled_executables[-1]
