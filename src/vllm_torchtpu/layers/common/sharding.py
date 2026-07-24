@@ -143,10 +143,8 @@ class ShardingConfigManager:
     def get(cls, vllm_config: 'VllmConfig') -> 'ShardingConfigManager':
         """Reconstruct the manager from the JSON-native dict on the config."""
         data = vllm_config.additional_config.get(cls._ADDITIONAL_CONFIG_KEY)
-        assert data is not None, (
-            "ShardingConfigManager not initialized for this VllmConfig. "
-            "ShardingConfigManager.initialize(vllm_config) must run "
-            "(via TpuPlatform.check_and_update_config) before any get().")
+        if data is None:
+            return cls.initialize(vllm_config)
         return cls(ShardingStrategy(**data["sharding_strategy"]),
                    data["device_indexes"])
 
