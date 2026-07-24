@@ -16,7 +16,6 @@ import dataclasses
 import functools
 
 import jax
-import jax.numpy as jnp
 import torch
 from einops import rearrange
 from jax.sharding import PartitionSpec
@@ -76,7 +75,8 @@ def gdn_attention_core_tpu(
     # `num_spec` columns per slot. The extra columns are unused on TPU
     # (rollback keeps one full checkpoint per group slot instead of a
     # rolling window); only the first kernel_size - 1 columns hold data, so
-    # slice them out for the kernel and re-attach the tail afterwards.
+    # slice them out for the kernel and write the result back into the same
+    # (donated) buffer afterwards.
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
         conv_state_in = conv_state[:, :kernel_size - 1, :]
@@ -109,9 +109,14 @@ def gdn_attention_core_tpu(
         config=config,
     )
     if state_len > kernel_size - 1:
-        remaining_old_state = conv_state[:, kernel_size - 1:, :]
-        new_conv_state = jnp.concatenate([new_conv_state, remaining_old_state],
-                                         axis=1)
+        # Write the kernel result into the first kernel_size - 1 columns of the
+        # donated conv_state in place and leave the unused spec tail untouched.
+        # A concat here would materialize a fresh full-width array that no
+        # longer derives from the donated buffer, defeating the conv-cache
+        # input_output_alias (a full-width alloc + copy per GDN layer per step);
+        # the dynamic-update-slice keeps the write inside the donated buffer.
+        new_conv_state = conv_state.at[:, :kernel_size -
+                                       1, :].set(new_conv_state)
 
     return new_conv_state, new_recurrent_state, output
 
