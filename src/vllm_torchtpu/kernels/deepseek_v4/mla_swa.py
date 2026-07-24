@@ -1139,13 +1139,19 @@ def mla_sliding_window_ragged_paged_attention(
             (2, bq_sz, num_l_heads),
             jnp.float32,
         )
-        bm_double_buf = bl_double_buf
+        bm_double_buf = pltpu.VMEM(
+            (2, bq_sz, num_l_heads),
+            jnp.float32,
+        )
 
         l_scratch = pltpu.VMEM(
             (bq_sz * num_q_heads, 128),
             jnp.float32,
         )
-        m_scratch = l_scratch
+        m_scratch = pltpu.VMEM(
+            (bq_sz * num_q_heads, 128),
+            jnp.float32,
+        )
 
         acc_scratch = pltpu.VMEM(
             (bq_sz * num_q_heads, head_dim),
