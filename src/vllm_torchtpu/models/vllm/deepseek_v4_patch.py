@@ -842,6 +842,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             print(f"[NAN_DETECTION_DETAIL]   pre_mix: nan={torch.isnan(pre_mix).any().item()} inf={torch.isinf(pre_mix).any().item()} mean={pre_mix.mean().item():.6f} min={pre_mix.min().item():.6f} max={pre_mix.max().item():.6f}", flush=True)
             print(f"[NAN_DETECTION_DETAIL]   product: nan={torch.isnan(product).any().item()} inf={torch.isinf(product).any().item()} mean={product.mean().item():.6f} min={product.min().item():.6f} max={product.max().item():.6f}", flush=True)
             print(f"[NAN_DETECTION_DETAIL]   layer_input_dbg: nan={torch.isnan(layer_input_dbg).any().item()} inf={torch.isinf(layer_input_dbg).any().item()}", flush=True)
+        return res
 
     def debug_mhc_post_native(self, x, residual, post_layer_mix, comb_res_mix):
         for name, t in [("x", x), ("residual", residual), ("post_layer_mix", post_layer_mix), ("comb_res_mix", comb_res_mix)]:
