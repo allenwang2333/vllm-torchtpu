@@ -56,19 +56,12 @@ def main():
         enable_expert_parallel=ep_size > 1,
         enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
         additional_config={
-
             "compilation_config": {
                 "compile_sizes": [64],
             },
             "cache_config": {
                 "num_gpu_blocks_override": 512,
             },
-            "sharding": {
-                "sharding_strategy": {
-                    "enable_dp_attention": False,
-                    "expert_parallelism": ep_size,
-                }
-            }
         },
     )
 
