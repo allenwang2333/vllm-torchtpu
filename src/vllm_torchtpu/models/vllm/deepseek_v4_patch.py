@@ -962,6 +962,8 @@ def patched_decoder_load_weights(self, weights: Iterable[tuple[str, torch.Tensor
     expert_mapping = self.get_expert_mapping()
 
     for name, loaded_weight in weights:
+        if "wo_a" in name:
+            print(f"[DEBUG_LOAD_WEIGHTS] wo_a parameter name={name} shape={list(loaded_weight.shape)}", flush=True)
         # Bypass loading MTP draft keys in the target model.
         if "mtp." in name:
             continue

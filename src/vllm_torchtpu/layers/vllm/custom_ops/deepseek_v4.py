@@ -996,8 +996,14 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = q.dtype
+        qf = q.to(torch.float32)
+        
+        # Per-head RMSNorm (no weight) over the full head_dim.
+        rms = torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + self.mla_attn.eps)
+        qf = qf * rms
+        
         # Apply rotary embedding directly (rotates the last rotary_dim channels internally)
-        q_rotated, _ = self.mla_attn.rotary_emb(positions, q.to(torch.float32))
+        q_rotated, _ = self.mla_attn.rotary_emb(positions, qf)
         return q_rotated.to(orig_dtype)
 
     def kv_rope(
@@ -1184,7 +1190,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
                 positions: torch.Tensor) -> torch.Tensor:
         check_nan("o (input to o_proj)", o, self.custom_prefix)
         t = o.shape[0]
-        o_ref = torch.nan_to_num(o, nan=0.0).to(torch.bfloat16).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
+        o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
+        o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
+        o_ref = o_ref.to(torch.bfloat16)
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
@@ -1254,15 +1262,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         qr, kv = qr_kv.split([self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1)
         qr = self.q_norm(qr)
         
-        # Split kv into nope and rope parts, RMSNorm only the nope part
-        nope_dim = self.mla_attn.nope_head_dim
-        kv_nope, kv_rope = kv.split([nope_dim, self.mla_attn.head_dim - nope_dim], dim=-1)
-        
-        variance = kv_nope.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        rrms = torch.rsqrt(variance + self.kv_norm.variance_epsilon)
-        kv_nope = (kv_nope.to(torch.float32) * rrms).to(kv_nope.dtype) * self.kv_norm.weight[:nope_dim]
-        
-        kv = torch.cat([kv_nope, kv_rope], dim=-1)
+        kv = self.kv_norm(kv)
         
         check_nan("qr (after norm)", qr, self.custom_prefix)
         check_nan("kv (after norm)", kv, self.custom_prefix)
