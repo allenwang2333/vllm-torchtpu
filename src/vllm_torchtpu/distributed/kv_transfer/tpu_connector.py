@@ -1793,13 +1793,6 @@ class TPURaidenConnectorWorker:
             # registration/planning validation.
             from vllm_torchtpu.distributed.kv_transfer.v2.pool_byte_spans import (  # noqa: E501
                 lower_fa_spans, owned_token_ranges)
-            dst_page_tokens = int(
-                getattr(tpu_envs, "TPU_KV_RESHARD_DST_PAGE_TOKENS", 0) or 0)
-            if dst_page_tokens <= 0:
-                raise RuntimeError(
-                    "Byte-span lowering requires the producer to know the "
-                    "destination page geometry: set "
-                    "TPU_KV_RESHARD_DST_PAGE_TOKENS")
             owned_tokens = sum(end - start
                                for start, end in owned_token_ranges(
                                    num_tokens=num_tokens,
@@ -1817,7 +1810,6 @@ class TPURaidenConnectorWorker:
                 parallelism=parallelism,
                 interleave_tokens=interleave_tokens,
                 page_tokens=page_tokens,
-                dst_page_tokens=dst_page_tokens,
                 token_bytes=token_bytes,
                 block_ids=list(local_ids),
             )

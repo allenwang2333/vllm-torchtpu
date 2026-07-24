@@ -1265,12 +1265,10 @@ class TestTPURaidenConnectorWorker:
 
     @pytest.fixture(autouse=True)
     def _byte_lowering_defaults(self):
-        # Every producer worker gets the destination page geometry and
-        # measured FA token bytes required by registration-time lowering.
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_DST_PAGE_TOKENS",
-                   1024,
-                   create=True), \
-             patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
+        # Every producer worker gets the measured FA token bytes required by
+        # registration-time lowering. (T3.4: destination page geometry is
+        # controller-derived; no producer env exists.)
+        with patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
                           return_value=1024):
             yield
 
@@ -1715,7 +1713,6 @@ class TestTPURaidenConnectorWorker:
             parallelism=8,
             interleave_tokens=256,
             page_tokens=4096,
-            dst_page_tokens=1024,
             token_bytes=1024,
             block_ids=[100, 101],
         )
