@@ -500,5 +500,44 @@ class CorrectnessTest(parameterized.TestCase):
                                      distribution)
 
 
+class TestDeepSeekV4EdgeCases(absltest.TestCase):
+
+    def test_swa_layer_none_main_page_indices(self):
+        """Test that _attention_local gracefully handles main_page_indices=None (SWA layers)."""
+        from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _attention_local
+        q = jnp.zeros((1, 8, 512), dtype=jnp.bfloat16)
+        new_kv = jnp.zeros((1, 512), dtype=jnp.bfloat16)
+        sw_cache = jnp.zeros((16, 16, 4, 640), dtype=jnp.uint8)
+        swa_kv_lens = jnp.array([1], dtype=jnp.int32)
+        swa_page_indices = jnp.array([0], dtype=jnp.int32)
+        swa_cu_q_lens = jnp.array([0, 1], dtype=jnp.int32)
+        swa_distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+        main_cache_kv = jnp.zeros((0, 16, 4, 640), dtype=jnp.uint8)
+        
+        # main_page_indices=None (as occurs in SWA layers 0 and 1)
+        out, updated_sw_cache = _attention_local(
+            q, new_kv, sw_cache, swa_kv_lens, swa_page_indices,
+            swa_cu_q_lens, swa_distribution, main_cache_kv,
+            None, None, None, None, None, None
+        )
+        self.assertEqual(out.shape, q.shape)
+
+    def test_fp8_dummy_sum_type_promotion(self):
+        """Test that dummy sum loop in _deepseek_v4_attention_jax handles mixed FP8 and BF16 types without promotion errors."""
+        from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _deepseek_v4_attention_jax
+        q = jnp.zeros((0, 8, 512), dtype=jnp.bfloat16)
+        new_kv = jnp.zeros((0, 512), dtype=jnp.bfloat16)
+        sw_cache = jnp.zeros((0, 16, 4, 640), dtype=jnp.uint8)
+        main_cache_kv = jnp.zeros((0, 16, 4, 640), dtype=jnp.float8_e4m3fn)
+        
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ('attn_data', 'attn_head'))
+        out, updated_cache = _deepseek_v4_attention_jax(
+            q, new_kv, sw_cache, None, None, None, None,
+            main_cache_kv, None, None, None, None, None, None,
+            mesh=mesh, is_csa=False, swa_only=False, num_tokens_across_dp=0
+        )
+        self.assertEqual(out.shape, (0, 8, 512))
+
+
 if __name__ == "__main__":
     absltest.main()

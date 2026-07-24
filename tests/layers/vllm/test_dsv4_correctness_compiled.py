@@ -140,5 +140,39 @@ def test_attn_sink_suite():
     assert success, "One or more TP=8 worker processes failed!"
     print("All TP=8 worker processes completed successfully!", flush=True)
 
+def test_dsv4_layer_metadata_and_cache_selection():
+    """Unit test for metadata field extraction (_get_field) and main KV cache width selection."""
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _get_field, VllmDeepseekV4MLAAttention
+    
+    # 1. Test _get_field with dict and object
+    class DummyMetadata:
+        seq_lens = torch.tensor([10])
+        block_tables = torch.tensor([[0, 1]])
+
+    dict_meta = {"seq_lens": torch.tensor([10]), "block_tables": torch.tensor([[0, 1]])}
+    obj_meta = DummyMetadata()
+    
+    assert torch.equal(_get_field(dict_meta, "seq_lens"), torch.tensor([10]))
+    assert torch.equal(_get_field(obj_meta, "seq_lens"), torch.tensor([10]))
+    assert _get_field(dict_meta, "missing_key") is None
+    assert _get_field(obj_meta, "missing_key") is None
+    assert _get_field(None, "seq_lens") is None
+
+    # 2. Test main KV cache filtering by width (> 512)
+    dummy_attn = object.__new__(VllmDeepseekV4MLAAttention)
+    class DummyCompressorState:
+        kv_cache = torch.zeros((1, 16, 1, 4, 512), dtype=torch.uint8) # Indexer cache (512)
+    class DummyMLA:
+        compressor = type("DummyComp", (), {"state_cache": DummyCompressorState()})()
+        
+    dummy_attn.mla_attn = DummyMLA()
+    dummy_attn._get_active_sw_cache = lambda: torch.zeros((1, 16, 1, 4, 640), dtype=torch.uint8)
+    
+    # Cache width is 512 (indexer cache) -> _get_active_main_cache should ignore it and fallback to sw_cache (640)
+    selected_cache = dummy_attn._get_active_main_cache()
+    assert selected_cache.shape[-1] == 640
+
+
 if __name__ == "__main__":
+    test_dsv4_layer_metadata_and_cache_selection()
     test_attn_sink_suite()

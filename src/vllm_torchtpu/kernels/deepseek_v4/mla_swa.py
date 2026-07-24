@@ -658,13 +658,14 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         nope_scales = nope_scales.reshape(bkv_sz, 7, 1)
         dequant_nope = (nope_fp8 * nope_scales).reshape(bkv_sz, 448)
         
-        # Force evaluation and combine bytes to uint32 to prevent register sub-slice compiler bugs.
+        # Force evaluation and combine bytes to uint16/32 to prevent register sub-slice compiler bugs.
         rope_bytes = bkv[:, 448:576] + 0
         rope_bytes_reshaped = rope_bytes.reshape(bkv_sz, 64, 2)
         byte0 = rope_bytes_reshaped[:, :, 0].astype(jnp.uint32)
         byte1 = rope_bytes_reshaped[:, :, 1].astype(jnp.uint32)
-        rope_uint32 = byte0 | (byte1 << 8)
-        rope = pltpu.bitcast(rope_uint32, jnp.bfloat16).reshape(bkv_sz, 2, 64)[:, 0]
+        rope_uint16 = byte0 | (byte1 << 8)
+        rope_float32_bits = rope_uint16 << 16
+        rope = pltpu.bitcast(rope_float32_bits, jnp.float32).astype(jnp.bfloat16)
         
         bkv = jnp.concatenate([dequant_nope, rope], axis=-1)
         return bkv
@@ -820,10 +821,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                bq_sz * num_q_heads_per_q_packing,
-                head_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
             bl_x2_ref.at[bo_sem_idx][:bq_sz, :num_q_heads] = l_ref[
                 ..., 0].reshape(bq_sz, num_q_heads)
             bm_x2_ref.at[bo_sem_idx][:bq_sz, :num_q_heads] = m_ref[

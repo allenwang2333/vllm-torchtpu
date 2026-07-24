@@ -198,7 +198,9 @@ def _mla_ragged_paged_attention_kernel(
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        # Prevent NaN from -inf - (-inf) when a block is fully masked out
+        safe_diff = jnp.where(m_curr == m_prev, 0.0, m_prev - m_curr)
+        exp_m_diff = jnp.where(m_curr <= mask_value, 0.0, jnp.exp(safe_diff))
         l_prev = head_l_ref[...]
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr

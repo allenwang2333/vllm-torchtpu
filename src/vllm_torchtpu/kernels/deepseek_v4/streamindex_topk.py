@@ -613,7 +613,8 @@ def streamindex_topk(
 
         _, num_q_heads, head_dim = q.shape
 
-        bkv_p = num_kv_pages_per_block
+        pages_per_seq = page_indices.shape[0] // max_num_seqs
+        bkv_p = max(1, min(num_kv_pages_per_block, pages_per_seq))
         if static_q_len is not None:
             bq_sz = min(num_queries_per_block, static_q_len)
         else:
