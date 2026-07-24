@@ -44,12 +44,12 @@ def main():
     ep_size = int(os.getenv("VLLM_EP_SIZE", "8"))
     llm = LLM(
         model=os.getenv("DSV4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash"),
-        quantization="deepseek_v4_fp8",
+        quantization=None,
         tensor_parallel_size=tp_size,
         trust_remote_code=True,
         max_model_len=64,
         max_num_batched_tokens=64,
-        kv_cache_dtype="fp8_e4m3",
+        kv_cache_dtype="auto",
         gpu_memory_utilization=float(os.getenv("GPU_MEMORY_UTILIZATION", os.getenv("GPU_MEM_UTIL", "0.40"))),
         enable_expert_parallel=ep_size > 1,
         enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
