@@ -15,7 +15,13 @@
 
 import os
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src")))
+src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+sys.path.insert(0, src_path)
+
+# Purge pre-loaded vllm_torchtpu modules from sys.modules to prevent loading stale sitecustomize cached paths
+for key in list(sys.modules.keys()):
+    if key == "vllm_torchtpu" or key.startswith("vllm_torchtpu."):
+        del sys.modules[key]
 
 import jax
 import jax.numpy as jnp
