@@ -807,13 +807,41 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 if has_nan or has_inf:
                     print(f"[NAN_DETECTION] MHCPreOp input {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
         res = _orig_mhc_pre_forward_native(self, residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, n_splits, norm_weight, norm_eps)
+        has_output_nan = False
         for name, t in zip(["post_mix", "comb_mix", "layer_input"], res):
             if t is not None:
                 has_nan = torch.isnan(t).any().item()
                 has_inf = torch.isinf(t).any().item()
                 if has_nan or has_inf:
                     print(f"[NAN_DETECTION] MHCPreOp output {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}", flush=True)
-        return res
+                    if name == "layer_input":
+                        has_output_nan = True
+        if has_output_nan:
+            print("[NAN_DETECTION_DETAIL] Running step-by-step debug check inside MHCPreOp...", flush=True)
+            hc_mult = residual.shape[-2]
+            hidden_size = residual.shape[-1]
+            residual_flat = residual.view(-1, hc_mult, hidden_size)
+            num_tokens = residual_flat.shape[0]
+            x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
+            mixes = torch.matmul(x, fn.t())
+            sqrsum = x.square().sum(dim=-1, keepdim=True)
+            mixes_norm = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+            pre_logits = mixes_norm[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+            pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+            product = pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32)
+            layer_input_dbg = torch.sum(product, dim=1).to(torch.bfloat16)
+
+            print(f"[NAN_DETECTION_DETAIL]   x: nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()} mean={x.mean().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   fn: nan={torch.isnan(fn).any().item()} inf={torch.isinf(fn).any().item()} mean={fn.mean().item():.6f} min={fn.min().item():.6f} max={fn.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   hc_scale: {hc_scale.tolist()}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   hc_base: {hc_base.tolist()}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   mixes: nan={torch.isnan(mixes).any().item()} inf={torch.isinf(mixes).any().item()} mean={mixes.mean().item():.6f} min={mixes.min().item():.6f} max={mixes.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   sqrsum: nan={torch.isnan(sqrsum).any().item()} inf={torch.isinf(sqrsum).any().item()} mean={sqrsum.mean().item():.6f} min={sqrsum.min().item():.6f} max={sqrsum.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   mixes_norm: nan={torch.isnan(mixes_norm).any().item()} inf={torch.isinf(mixes_norm).any().item()} mean={mixes_norm.mean().item():.6f} min={mixes_norm.min().item():.6f} max={mixes_norm.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   pre_logits: nan={torch.isnan(pre_logits).any().item()} inf={torch.isinf(pre_logits).any().item()} mean={pre_logits.mean().item():.6f} min={pre_logits.min().item():.6f} max={pre_logits.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   pre_mix: nan={torch.isnan(pre_mix).any().item()} inf={torch.isinf(pre_mix).any().item()} mean={pre_mix.mean().item():.6f} min={pre_mix.min().item():.6f} max={pre_mix.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   product: nan={torch.isnan(product).any().item()} inf={torch.isinf(product).any().item()} mean={product.mean().item():.6f} min={product.min().item():.6f} max={product.max().item():.6f}", flush=True)
+            print(f"[NAN_DETECTION_DETAIL]   layer_input_dbg: nan={torch.isnan(layer_input_dbg).any().item()} inf={torch.isinf(layer_input_dbg).any().item()}", flush=True)
 
     def debug_mhc_post_native(self, x, residual, post_layer_mix, comb_res_mix):
         for name, t in [("x", x), ("residual", residual), ("post_layer_mix", post_layer_mix), ("comb_res_mix", comb_res_mix)]:
