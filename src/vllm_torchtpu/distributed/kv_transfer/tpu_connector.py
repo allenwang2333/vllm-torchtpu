@@ -97,33 +97,14 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 # Pool selection is vLLM policy expressed as request data: the connector names
 # the manifest tags to move and raiden resolves them against both peers'
 # registered manifests. Each GDN state class rides a sibling transfer with a
-# derived req_id and uuid so Raiden's per-uuid lifecycle stays untouched, and
-# the connector aggregates the completions.
+# T3.1: one transfer carries the FA payload plus every GDN state class
+# under the base req_id/uuid; the tags below define the canonical order
+# (FA first = H2D order rank 0).
 _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
-_STAGE3_STATE_REQ_SUFFIXES = {"gdn.conv": "#gc", "gdn.ssm": "#gs"}
-_STAGE3_STATE_UUID_SALTS = {"gdn.conv": 0x47444E43, "gdn.ssm": 0x47444E53}
 
 
-def _stage3_state_req_id(req_id: str, tag: str, ordinal: int) -> str:
-    return f"{req_id}{_STAGE3_STATE_REQ_SUFFIXES[tag]}{ordinal}"
-
-
-def _is_stage3_state_req_id(req_id: str) -> bool:
-    """Whether ``req_id`` is in the connector-private sibling namespace."""
-    for suffix in _STAGE3_STATE_REQ_SUFFIXES.values():
-        marker = req_id.rfind(suffix)
-        if marker >= 0 and req_id[marker + len(suffix):].isdigit():
-            return True
-    return False
-
-
-def _stage3_state_uuid(uuid: int, tag: str, ordinal: int) -> int:
-    salt = _STAGE3_STATE_UUID_SALTS[tag] ^ ((ordinal + 1) << 44)
-    return (int(uuid) ^ salt) or (salt + 7)
-
-
-@dataclass(frozen=True)
+@dataclass
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
 
@@ -1212,9 +1193,6 @@ class TPURaidenConnectorWorker:
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
         # completions parked until every state class lands.
-        self._stage3_state_source_to_dest: dict[str, str] = {}
-        self._stage3_state_pending: dict[str, set[str]] = {}
-        self._stage3_fa_done_awaiting_state: set[str] = set()
         # Deferred state-class load submissions, keyed by destination req id.
         # The FA payload and the GDN state slots address the SAME unified
         # arena pages (7 pools per storage, zero headroom), and the mamba
@@ -1222,18 +1200,12 @@ class TPURaidenConnectorWorker:
         # two H2Ds are last-writer-wins. Submitting the state classes only
         # after the FA transfer's native receive completes makes the state
         # bytes land last, deterministically.
-        self._stage3_deferred_state_loads: dict[str, tuple[Any, ...]] = {}
         # Producer-side sibling lifecycle. Native Raiden reports each GDN
         # state transfer under its connector-private derived request ID, but
         # vLLM knows only the base request. Keep those IDs entirely below the
         # connector boundary and expose the base send terminal only after FA
         # and every state sibling are terminal. The UUID table also lets each
         # PCP rank cast the required D5 completion vote for every sibling.
-        self._stage3_state_send_source_to_base: dict[str, str] = {}
-        self._stage3_state_send_uuids: dict[str, int] = {}
-        self._stage3_state_send_pending: dict[str, set[str]] = {}
-        self._stage3_state_send_terminals: set[str] = set()
-        self._stage3_state_send_terminal_cleanup: set[str] = set()
         self._stage3_fa_send_terminals: set[str] = set()
         self._stage3_failed_send_bases: set[str] = set()
         self._stage3_cancelled_send_bases: set[str] = set()
@@ -2106,45 +2078,17 @@ class TPURaidenConnectorWorker:
         return registrations
 
     def _stage3_prune_state_send_tracking(self, base_req_id: str) -> None:
-        """Drops bounded producer sibling tombstones with the base tombstone."""
-        derived_req_ids = [
-            req_id
-            for req_id, base in self._stage3_state_send_source_to_base.items()
-            if base == base_req_id
-        ]
-        for req_id in derived_req_ids:
-            self._stage3_state_send_source_to_base.pop(req_id, None)
-            self._stage3_state_send_uuids.pop(req_id, None)
-            self._stage3_state_send_terminals.discard(req_id)
-            self._stage3_state_send_terminal_cleanup.discard(req_id)
-        self._stage3_state_send_pending.pop(base_req_id, None)
+        """Drops producer terminal tracking with the base tombstone."""
         self._stage3_fa_send_terminals.discard(base_req_id)
         self._stage3_failed_send_bases.discard(base_req_id)
         self._stage3_cancelled_send_bases.discard(base_req_id)
 
     def _stage3_record_producer_send_terminals(self, done_sending,
                                                failed_sending) -> None:
-        """Records native terminals without exposing private sibling IDs."""
+        """Records native terminals (T3.1: one uuid, base req ids only)."""
         for req_id, failed in [
             (str(req_id), False) for req_id in done_sending
         ] + [(str(req_id), True) for req_id in failed_sending]:
-            base_req_id = self._stage3_state_send_source_to_base.get(req_id)
-            if base_req_id is not None:
-                if req_id not in self._stage3_state_send_terminals:
-                    self._stage3_state_send_terminals.add(req_id)
-                    self._stage3_state_send_terminal_cleanup.add(req_id)
-                    self._stage3_state_send_pending.get(base_req_id,
-                                                        set()).discard(req_id)
-                if failed:
-                    self._stage3_failed_send_bases.add(base_req_id)
-                continue
-            if _is_stage3_state_req_id(req_id):
-                # A stale connector-private terminal must never cross into
-                # vLLM, whose scheduler has no request under this ID.
-                logger.warning(
-                    "Ignoring unmapped Stage-3 producer state terminal "
-                    "req_id=%s", req_id)
-                continue
             if req_id in self._stage3_registered_sends:
                 self._stage3_fa_send_terminals.add(req_id)
                 if failed:
@@ -2158,47 +2102,10 @@ class TPURaidenConnectorWorker:
                     "Ignoring unmapped Stage-3 producer terminal req_id=%s",
                     req_id)
 
-    def _stage3_complete_state_send_terminals(self, facade: Any) -> None:
-        """Casts this producer rank's D5 terminal vote for every sibling."""
-        for req_id in sorted(self._stage3_state_send_terminal_cleanup):
-            uuid = self._stage3_state_send_uuids.get(req_id)
-            if uuid is None:
-                raise RuntimeError(
-                    "GDN state terminal is missing its registered UUID: "
-                    f"req_id={req_id}")
-            facade.complete_request_blocks(
-                req_id=req_id,
-                uuid=uuid,
-                unit=self._raiden_work_unit,
-            )
-            self._stage3_state_send_terminal_cleanup.remove(req_id)
-
-    def _stage3_cancel_unclaimed_state_sends(self, facade: Any,
-                                             base_req_id: str) -> None:
-        """Retires unclaimed sibling D5 entries with an expired base send."""
-        pending = self._stage3_state_send_pending.get(base_req_id, set())
-        for req_id in sorted(pending):
-            uuid = self._stage3_state_send_uuids.get(req_id)
-            if uuid is None:
-                raise RuntimeError(
-                    "GDN state cancellation is missing its registered UUID: "
-                    f"req_id={req_id}")
-            if facade.cancel_request_blocks_if_unclaimed(req_id=req_id,
-                                                         uuid=uuid):
-                pending.remove(req_id)
-                self._stage3_state_send_terminals.add(req_id)
-
     def _stage3_ready_producer_send_terminals(
             self) -> tuple[set[str], set[str], set[str]]:
-        """Collapses FA plus all state siblings onto scheduler-visible bases."""
-        ready = {
-            req_id
-            for req_id in self._stage3_fa_send_terminals
-            if not self._stage3_state_send_pending.get(req_id) and not any(
-                self._stage3_state_send_source_to_base.get(derived_req_id) ==
-                req_id
-                for derived_req_id in self._stage3_state_send_terminal_cleanup)
-        }
+        """Returns terminal base requests (T3.1: no sibling aggregation)."""
+        ready = set(self._stage3_fa_send_terminals)
         failed = ready & self._stage3_failed_send_bases
         cancelled = ready & self._stage3_cancelled_send_bases
         done = ready - failed - cancelled
@@ -2206,14 +2113,6 @@ class TPURaidenConnectorWorker:
         self._stage3_failed_send_bases.difference_update(ready)
         self._stage3_cancelled_send_bases.difference_update(ready)
         return done, failed, cancelled
-
-    def _stage3_release_state_load(self, destination_req_id: str) -> None:
-        """Drop sibling-transfer bookkeeping for one request."""
-        pending = self._stage3_state_pending.pop(destination_req_id, ())
-        for derived_req_id in pending:
-            self._stage3_state_source_to_dest.pop(derived_req_id, None)
-        self._stage3_fa_done_awaiting_state.discard(destination_req_id)
-        self._stage3_deferred_state_loads.pop(destination_req_id, None)
 
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any,
@@ -2476,7 +2375,6 @@ class TPURaidenConnectorWorker:
             self._stage3_finished_loads_pending_cleanup.intersection(
                 self._stage3_terminal_loads))
         for req_id in cleanup_req_ids:
-            self._stage3_release_state_load(req_id)
             source_req_id = self._stage3_source_req_ids.pop(req_id, None)
             if (source_req_id is not None
                     and self._stage3_destination_req_ids.get(source_req_id)
@@ -2516,41 +2414,11 @@ class TPURaidenConnectorWorker:
             # records that have no accepted controller submission.
             # Reshard plans carry the producer ID so D5 lookup and all four
             # role logs share one correlation key. Translate native terminal
-            # records back to decode-local IDs before touching scheduler state.
-            #
-            # GDN state-class siblings report under derived producer IDs.
-            # Intercept them first: a completed class shrinks its request's
-            # pending set; a failed class fails the whole request (surfaced
-            # through the base producer ID so the normal translation and
-            # recompute paths apply).
+            # records back to decode-local IDs before touching scheduler
+            # state. (T3.1: one transfer per request — no derived sibling
+            # IDs exist.)
             native_done_recving = list(done_recving)
             native_failed_recving = list(failed_recving)
-            if self._stage3_state_source_to_dest:
-                remaining_done = []
-                for req_id in native_done_recving:
-                    dest = self._stage3_state_source_to_dest.pop(req_id, None)
-                    if dest is None:
-                        remaining_done.append(req_id)
-                        continue
-                    pending = self._stage3_state_pending.get(dest)
-                    if pending is not None:
-                        pending.discard(req_id)
-                native_done_recving = remaining_done
-                remaining_failed = []
-                for req_id in native_failed_recving:
-                    dest = self._stage3_state_source_to_dest.pop(req_id, None)
-                    if dest is None:
-                        remaining_failed.append(req_id)
-                        continue
-                    self._stage3_state_pending.pop(dest, None)
-                    base_source = self._stage3_source_req_ids.get(dest)
-                    if (base_source is not None
-                            and base_source not in remaining_failed):
-                        remaining_failed.append(base_source)
-                    logger.error(
-                        "GDN state class transfer failed for "
-                        "destination_req_id=%s (derived id %s)", dest, req_id)
-                native_failed_recving = remaining_failed
             done_recving = [
                 destination_req_id for req_id in native_done_recving
                 if (destination_req_id := self._stage3_destination_request_id(
@@ -2590,36 +2458,10 @@ class TPURaidenConnectorWorker:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
                 for req_id in expired_uncertain:
                     self._stage3_pending_controller_failures.pop(req_id, None)
-            # Gate FA completion on the sibling state classes: the request
-            # is done only when every configured class has landed. Failures
-            # already collapsed onto the base ID above.
-            if self._stage3_state_pending or self._stage3_fa_done_awaiting_state:
-                gated_done = []
-                for dest in done_recving:
-                    if self._stage3_state_pending.get(dest):
-                        self._stage3_fa_done_awaiting_state.add(dest)
-                    else:
-                        self._stage3_state_pending.pop(dest, None)
-                        gated_done.append(dest)
-                for dest in list(self._stage3_fa_done_awaiting_state):
-                    if not self._stage3_state_pending.get(dest):
-                        self._stage3_state_pending.pop(dest, None)
-                        self._stage3_fa_done_awaiting_state.discard(dest)
-                        if (dest not in gated_done
-                                and dest not in self._stage3_terminal_loads):
-                            gated_done.append(dest)
-                done_recving = gated_done
-            for dest in failed_recving:
-                self._stage3_release_state_load(dest)
             self._stage3_terminal_loads.update(done_recving)
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
-            # Complete every derived D5 generation before making its base
-            # request scheduler-visible. A failed RPC retains the cleanup set
-            # and the FA terminal so the next poll retries without losing the
-            # eventual base completion.
-            self._stage3_complete_state_send_terminals(facade)
             now = time.perf_counter()
             expired_candidates = {
                 req_id
@@ -2634,11 +2476,8 @@ class TPURaidenConnectorWorker:
                     registration = self._stage3_registered_sends[req_id]
                     if facade.cancel_request_blocks_if_unclaimed(
                             req_id=req_id, uuid=registration.uuid):
-                        # The base was never claimed. Cancel each unclaimed
-                        # sibling too; if a sibling was already claimed, keep
-                        # the base gated until that native terminal arrives.
-                        self._stage3_cancel_unclaimed_state_sends(
-                            facade, req_id)
+                        # T3.1: one registration per request — the base
+                        # cancellation is the whole cancellation.
                         self._stage3_fa_send_terminals.add(req_id)
                         self._stage3_cancelled_send_bases.add(req_id)
             done_sending, sender_failures, cancelled_sends = (
