@@ -71,16 +71,18 @@ class TpuKVConnectorStats(KVConnectorStats):
     def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
         if not other.is_empty():
             for k, v in other.data.items():
+                if k not in self.data:
+                    self.data[k] = []
                 accumulator = self.data[k]
                 assert isinstance(accumulator, list)
-                accumulator.extend(v)
+                accumulator.extend(v or [])
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        d2h_transfer_time = np.asarray(self.data["d2h_transfer_time"])
-        h2d_transfer_time = np.asarray(self.data["h2d_transfer_time"])
-        kv_pull_time = np.asarray(self.data["kv_pull_time"])
-        mb_transferred = np.asarray(self.data["mb_transferred"])
+        d2h_transfer_time = np.asarray(self.data.get("d2h_transfer_time") or [])
+        h2d_transfer_time = np.asarray(self.data.get("h2d_transfer_time") or [])
+        kv_pull_time = np.asarray(self.data.get("kv_pull_time") or [])
+        mb_transferred = np.asarray(self.data.get("mb_transferred") or [])
 
         total_mb = mb_transferred.sum()
         avg_mb = total_mb / self.num_successful_transfers if self.num_successful_transfers > 0 else 0
@@ -104,7 +106,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "Num successful transfers":
             self.num_successful_transfers,
             "Num failed transfers":
-            self.data['num_failed_transfers'],
+            sum(self.data.get('num_failed_transfers') or []),
             "Avg KV pull time (ms)":
             round(kv_pull_time.mean(), 3) if kv_pull_time.size > 0 else 0.0,
             "P90 KV pull time (ms)":
@@ -117,15 +119,15 @@ class TpuKVConnectorStats(KVConnectorStats):
         }
 
     def is_empty(self) -> bool:
-        return (len(self.data["d2h_transfer_time"]) == 0
-                and len(self.data["h2d_transfer_time"]) == 0
-                and len(self.data["kv_pull_time"]) == 0
-                and len(self.data["mb_transferred"]) == 0
-                and len(self.data["num_failed_transfers"]) == 0)
+        return (len(self.data.get("d2h_transfer_time") or []) == 0
+                and len(self.data.get("h2d_transfer_time") or []) == 0
+                and len(self.data.get("kv_pull_time") or []) == 0
+                and len(self.data.get("mb_transferred") or []) == 0
+                and len(self.data.get("num_failed_transfers") or []) == 0)
 
     @property
     def num_successful_transfers(self) -> int:
-        return len(self.data["mb_transferred"])
+        return len(self.data.get("mb_transferred") or [])
 
 
 class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
@@ -213,8 +215,19 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues)
 
     def observe(self,
-                transfer_stats_data: dict[str, Any],
+                transfer_stats_data: dict[str, Any] | KVConnectorStats | None,
                 engine_idx: int = 0):
+        if transfer_stats_data is None:
+            return
+
+        if isinstance(transfer_stats_data, KVConnectorStats):
+            data = transfer_stats_data.data
+        else:
+            data = transfer_stats_data
+
+        if not isinstance(data, dict):
+            return
+
         for prom_obj, list_item_key in zip(
             [
                 self.tpu_histogram_d2h_transfer_time,
@@ -229,7 +242,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "mb_transferred",
             ],
         ):
-            for list_item in transfer_stats_data[list_item_key]:
+            for list_item in data.get(list_item_key) or []:
                 prom_obj[engine_idx].observe(list_item)
 
         for counter_obj, counter_item_key in zip(
@@ -238,5 +251,5 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
             ["num_failed_transfers"],
         ):
-            for list_item in transfer_stats_data[counter_item_key]:
+            for list_item in data.get(counter_item_key) or []:
                 counter_obj[engine_idx].inc(list_item)

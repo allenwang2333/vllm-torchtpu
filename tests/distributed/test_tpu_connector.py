@@ -2898,6 +2898,26 @@ class TestTPUConnectorStats(unittest.TestCase):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
 
+    def test_tpu_stats_reduce_num_failed_transfers_scalar(self):
+        stats = TpuKVConnectorStats()
+        stats.record_failed_transfer()
+        stats.record_failed_transfer()
+        reduced = stats.reduce()
+        assert isinstance(reduced["Num failed transfers"], (int, np.integer))
+        assert reduced["Num failed transfers"] == 2
+
+    def test_tpu_metrics_observe_kvconnectorstats_object(self):
+        stats = TpuKVConnectorStats()
+        stats.record_d2h_transfer(150.0)
+        # Observing a KVConnectorStats object instance directly should not raise TypeError
+        self.metrics.observe(stats, engine_idx=0)
+
+    def test_tpu_metrics_observe_empty_and_missing_keys(self):
+        # Observing empty dict or dict with missing keys should not raise KeyError
+        self.metrics.observe({}, engine_idx=0)
+        self.metrics.observe({"d2h_transfer_time": [50.0]}, engine_idx=0)
+        self.metrics.observe(None, engine_idx=0)
+
 
 class TestStage3SourceSpanParity:
     """V3: producer spans vs the kernel layout's own ground truth.
