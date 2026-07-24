@@ -150,7 +150,14 @@ def test_attn_sink_suite():
 
 def test_dsv4_layer_metadata_and_cache_selection():
     """Unit test for metadata field extraction (_get_field) and main KV cache width selection."""
-    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import _get_field, VllmDeepseekV4MLAAttention
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
+    
+    def _get_field(meta, field_name):
+        if meta is None:
+            return None
+        if isinstance(meta, dict):
+            return meta.get(field_name, None)
+        return getattr(meta, field_name, None)
     
     # 1. Test _get_field with dict and object
     class DummyMetadata:
