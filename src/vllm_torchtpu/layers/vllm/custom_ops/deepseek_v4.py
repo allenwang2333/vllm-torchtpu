@@ -38,18 +38,20 @@ def check_nan(name: str, tensor: torch.Tensor, prefix: str):
                type(tensor).__name__ == "FakeTensor" or
                (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
     if not is_fake:
-        has_nan = torch.isnan(tensor).any().item()
-        has_inf = torch.isinf(tensor).any().item()
-        if has_nan or has_inf:
-            nan_token_0 = (torch.isnan(tensor[0]).any().item() or torch.isinf(tensor[0]).any().item()) if tensor.shape[0] > 0 else False
-            print(f"[NAN_DETECTION] NaN/Inf detected in {name} at layer {prefix}! shape={list(tensor.shape)} has_nan={has_nan} has_inf={has_inf} token0_has_nan_inf={nan_token_0}", flush=True)
-            t_flt = tensor.to(torch.float32)
-            print(f"    min={t_flt.min().item():.6f} max={t_flt.max().item():.6f} mean={t_flt.mean().item():.6f}", flush=True)
-        elif os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
-            t_flt = tensor.to(torch.float32)
-            t_mean = t_flt.mean().item()
-            t_std = (t_flt - t_mean).pow(2).mean().sqrt().item()
-            print(f"[ACT_TRACE] [{prefix}] {name}: shape={list(tensor.shape)} mean={t_mean:.6f} std={t_std:.6f} min={t_flt.min().item():.6f} max={t_flt.max().item():.6f}", flush=True)
+        # isnan/isinf are not implemented for Float8 types; cast to float32 first.
+        is_float8 = (tensor.dtype == torch.float8_e4m3fn or tensor.dtype == torch.float8_e5m2)
+        if tensor.dtype.is_floating_point or is_float8:
+            t_check = tensor.to(torch.float32) if is_float8 else tensor
+            has_nan = torch.isnan(t_check).any().item()
+            has_inf = torch.isinf(t_check).any().item()
+            if has_nan or has_inf:
+                nan_token_0 = (torch.isnan(t_check[0]).any().item() or torch.isinf(t_check[0]).any().item()) if t_check.shape[0] > 0 else False
+                print(f"[NAN_DETECTION] NaN/Inf detected in {name} at layer {prefix}! shape={list(tensor.shape)} has_nan={has_nan} has_inf={has_inf} token0_has_nan_inf={nan_token_0}", flush=True)
+                print(f"    min={t_check.min().item():.6f} max={t_check.max().item():.6f} mean={t_check.mean().item():.6f}", flush=True)
+            elif os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
+                t_mean = t_check.mean().item()
+                t_std = (t_check - t_mean).pow(2).mean().sqrt().item()
+                print(f"[ACT_TRACE] [{prefix}] {name}: shape={list(tensor.shape)} mean={t_mean:.6f} std={t_std:.6f} min={t_check.min().item():.6f} max={t_check.max().item():.6f}", flush=True)
 
 
 
