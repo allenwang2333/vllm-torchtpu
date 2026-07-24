@@ -39,10 +39,22 @@ def _normalize_one_spec(
         kv_cache_dtype,
     )
     padded_page_size = spec.page_size_padded or 0
-    page_size = max(page_size, spec.real_page_size_bytes, padded_page_size)
-    if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:
+    
+    real_page_size = spec.real_page_size_bytes
+    if spec.kv_quant_mode.is_per_token_head:
+        real_page_size += 2 * spec.block_size * spec.num_kv_heads * 4
+
+    page_size = max(page_size, real_page_size, padded_page_size)
+    page_size = ((page_size + 127) // 128) * 128
+
+    import sys
+    print(f"[DEBUG_NORM_SPEC] {spec.__class__.__name__} page_size_padded={spec.page_size_padded} -> {page_size} (real={real_page_size})", file=sys.stderr, flush=True)
+
+    target_dtype = spec.dtype if spec.dtype == torch.uint8 else kv_cache_dtype
+
+    if spec.page_size_padded == page_size and spec.dtype == target_dtype:
         return spec
-    return replace(spec, dtype=kv_cache_dtype, page_size_padded=page_size)
+    return replace(spec, dtype=target_dtype, page_size_padded=page_size)
 
 
 def _has_hybrid_attention_and_mamba(

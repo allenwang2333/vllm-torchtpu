@@ -448,6 +448,15 @@ class TPUWorker(WorkerBase):
         _apply_model_specific_patches(self.model_config)
         self.model_runner.load_model()
 
+        import os
+        if os.environ.get("VLLM_BYPASS_TPU_INIT") == "1":
+            try:
+                import torchax
+                torchax.enable_globally()
+                logger.info("Enabled torchax globally inside TPUWorker.load_model AFTER model load complete")
+            except Exception as e:
+                logger.error(f"Failed to enable torchax in TPUWorker: {e}")
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()

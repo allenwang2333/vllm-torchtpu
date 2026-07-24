@@ -439,10 +439,13 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
+        "PHASED_PROFILING_DIR", "PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR",
+        "PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP",
+        "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",

@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dsv4-test-compile-patemotter
+  namespace: cloud-devkit-jobs
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      volumes:
+      - name: nfs-root-volume
+        nfs:
+          server: 172.30.171.18
+          path: /workspace
+      - name: local-ssd-volume
+        emptyDir:
+          sizeLimit: 100Gi
+      containers:
+      - name: test-compiler
+        image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          echo "=== Starting standalone compilation test ==="
+          python3 -u /root/cloud-devkit/torchtpu-vllm/examples/test_attention_compile.py
+        env:
+        - name: PYTHONPATH
+          value: /root/cloud-devkit/torchtpu-vllm/src
+        - name: HF_HOME
+          value: /mnt/local-cache/hf_cache
+        resources:
+          limits:
+            google.com/tpu: "4"
+            memory: 200Gi
+            cpu: "90"
+          requests:
+            google.com/tpu: "4"
+            memory: 128Gi
+            cpu: "90"
+        volumeMounts:
+        - name: nfs-root-volume
+          mountPath: /mnt/workspace
+        - name: nfs-root-volume
+          mountPath: /root/cloud-devkit/torchtpu-vllm
+          subPath: torchtpu-vllm
+        - name: local-ssd-volume
+          mountPath: /mnt/local-cache
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu7x-singlehost-2025
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1

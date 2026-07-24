@@ -90,7 +90,8 @@ def quantized_matmul_kernel(
     batch_block_size = tuned_value.batch_block_size
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
-    n_lane_multiplier = tuned_value.n_lane_multiplier
+    n_lane_multiplier = min(tuned_value.n_lane_multiplier, max(1, out_block_size // MXU_SIZE))
+
     # The num_blocks should become 1 in case of channelwise.
     channelwise_weight_scale = block_size == orig_n_in
     if channelwise_weight_scale and in_block_size != orig_n_in:
@@ -161,10 +162,14 @@ def quantized_matmul_kernel(
     # allowing the compiler to overlap output fusion and packing overhead with MXU computation
     # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
     compute_tile_n = MXU_SIZE * n_lane_multiplier
+    if out_block_size < compute_tile_n or out_block_size % compute_tile_n != 0:
+        compute_tile_n = min(out_block_size, MXU_SIZE)
+        n_lane_multiplier = max(1, compute_tile_n // MXU_SIZE)
     if out_block_size % compute_tile_n != 0:
         raise ValueError(
             f"{out_block_size=} must be divisible by {compute_tile_n=}.")
     steps_n = out_block_size // compute_tile_n
+
 
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
         pid_k = pl.program_id(2)

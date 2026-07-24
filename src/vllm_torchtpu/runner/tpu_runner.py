@@ -771,6 +771,11 @@ class TPUModelRunner(GPUModelRunner):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+            # Custom get_kv_cache_spec override (e.g. MLA / SWACache)
+            elif not isinstance(attn_module, Attention) and hasattr(attn_module, "get_kv_cache_spec"):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
@@ -869,15 +874,15 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 continue
 
-        # Note: that each shared layer's target actually owns a KV cache (and
-        # that the shared layer was not itself allocated one) is enforced later
-        # against the concrete KVCacheConfig in
-        # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        res = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
         )
+        logger.info(f"[DEBUG_RUNNER_SPECS] get_kv_cache_spec returned keys: {list(res.keys())}")
+        for k, v in res.items():
+            logger.info(f"  {k}: {v.__class__.__name__} block_size={v.block_size} page_size={v.page_size_bytes} page_size_padded={getattr(v, 'page_size_padded', None)}")
+        return res
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -3095,13 +3100,17 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config)
 
+        from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+            _maybe_patch_for_deepseek_v4
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                            vllm_config=self.vllm_config), \
-             set_current_vllm_config(self.vllm_config):
+             set_current_vllm_config(self.vllm_config), \
+             _maybe_patch_for_deepseek_v4(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
+
         self.model = model
 
         # If using eagle3/mtp speculative decoding, load the draft model and
@@ -3119,6 +3128,8 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self._attention_kernels_initialized:
             return
+
+
         from vllm_torchtpu.layers.vllm.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
             _pallas_rpa_kernel_local)
@@ -4323,6 +4334,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
+        print(f"[DEBUG_KV_CACHES_KEYS] kv_caches keys = {list(kv_caches.keys())}", flush=True)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile
