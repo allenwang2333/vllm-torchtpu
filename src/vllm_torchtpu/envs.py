@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
 
 
 def env_with_choices(
@@ -309,6 +310,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    "USE_BATCHED_RPA_SEQ_ON_LANE":
+    env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
 }
 
 
