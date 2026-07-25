@@ -323,9 +323,8 @@ def evaluate_sample(sample: Dict, host: str, port: int,
                 f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nPlease think step-by-step and provide a detailed explanation. "
-        "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
-    )
+        "\n\nAnswer with the option letter directly inside parentheses, e.g. (A). "
+        "Do not include explanations or commentary.")
 
     payload = {
         "model":
@@ -347,7 +346,7 @@ def evaluate_sample(sample: Dict, host: str, port: int,
             ],
         }],
         "max_tokens":
-        2048,
+        16,
         "temperature":
         0.0,
     }

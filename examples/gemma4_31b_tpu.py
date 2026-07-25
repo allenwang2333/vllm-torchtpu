@@ -2,8 +2,7 @@ import argparse
 import os
 import time
 
-os.environ["VLLM_USE_V1"] = "0"
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
@@ -43,6 +42,8 @@ def main():
         dtype="bfloat16",
         max_model_len=1024,
         kv_sharing_fast_prefill=False,
+        attention_backend="CUSTOM",
+        kv_cache_dtype="fp8",
         limit_mm_per_prompt={"image": 1} if args.multimodal else None,
     )
     t_init_end = time.time()
