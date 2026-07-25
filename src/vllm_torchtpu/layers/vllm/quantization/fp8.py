@@ -743,6 +743,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
                 layer=layer,
+                input_ids=input_ids,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an

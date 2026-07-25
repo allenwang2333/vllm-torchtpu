@@ -605,6 +605,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
                 layer=layer,
+                input_ids=input_ids,
             )
 
         res = fused_moe_gmm(

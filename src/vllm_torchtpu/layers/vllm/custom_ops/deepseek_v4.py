@@ -600,7 +600,7 @@ def _deepseek_v4_indexer_jax(
     k: int,
     compression_ratio: int,
     softmax_scale: float,
-    head_dim: int,
+    num_heads: int,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         t = q_rope.shape[0]
@@ -619,8 +619,10 @@ def _deepseek_v4_indexer_jax(
         q_quant, q_scales = _jax_quantize_tensor(
             jnp.float8_e4m3fn, q_rope, axis=-1)
         
+        # Matches the reference fused_indexer_q_rope_quant:
+        #   weights_out = weights * q_scale * softmax_scale * n_head**-0.5
         weights = (indexer_weights.astype(q_rope.dtype) * softmax_scale *
-                   (head_dim ** -0.5) * q_scales)
+                   (num_heads ** -0.5) * q_scales)
                    
         return streamindex_topk(
             q=q_quant,
@@ -703,7 +705,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             k=self.topk_tokens,
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
-            head_dim=self.head_dim,
+            num_heads=self.n_head,
         )
         
         op_name = "pallas::deepseek_v4_indexer"
@@ -1000,19 +1002,11 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         # Per-head RMSNorm (no weight) over the full head_dim.
         rms = torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + self.mla_attn.eps)
         qf = qf * rms
-        
-        # Apply rotary embedding to trailing channels.
-        rot_dim = self.mla_attn.rotary_emb.rotary_dim
-        nope_dim = qf.shape[-1] - rot_dim
-        
-        q_nope = qf[..., :nope_dim]
-        q_rot = qf[..., nope_dim:]
-        
-        q_padded = torch.cat([q_rot, torch.zeros_like(q_nope)], dim=-1)
-        q_padded_rotated, _ = self.mla_attn.rotary_emb(positions, q_padded)
-        q_rot_rotated = q_padded_rotated[..., :rot_dim]
-        
-        return torch.cat([q_nope, q_rot_rotated], dim=-1).to(orig_dtype)
+
+        # DeepseekV4ScalingRotaryEmbedding rotates the trailing rotary_dim
+        # channels internally, so pass the full head.
+        q_rotated, _ = self.mla_attn.rotary_emb(positions, qf)
+        return q_rotated.to(orig_dtype)
 
     def kv_rope(
             self,
@@ -1020,19 +1014,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = kv.dtype
-        kv_f = kv.unsqueeze(1).to(torch.float32)
-        
-        rot_dim = self.mla_attn.rotary_emb.rotary_dim
-        nope_dim = kv_f.shape[-1] - rot_dim
-        
-        kv_nope = kv_f[..., :nope_dim]
-        kv_rot = kv_f[..., nope_dim:]
-        
-        kv_padded = torch.cat([kv_rot, torch.zeros_like(kv_nope)], dim=-1)
-        kv_padded_rotated, _ = self.mla_attn.rotary_emb(positions, kv_padded)
-        kv_rot_rotated = kv_padded_rotated[..., :rot_dim]
-        
-        kv_rotated = torch.cat([kv_nope, kv_rot_rotated], dim=-1)
+        # DeepseekV4ScalingRotaryEmbedding rotates the trailing rotary_dim
+        # channels internally; unsqueeze a head dim so cos/sin broadcast.
+        kv_rotated, _ = self.mla_attn.rotary_emb(
+            positions, kv.unsqueeze(1).to(torch.float32))
         return kv_rotated.squeeze(1).to(orig_dtype)
 
     def attention_impl(
@@ -1171,7 +1156,11 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
 
         if is_csa:
             assert topk_indices is not None
-            max_valid_kv = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1).unsqueeze(1)
+            # Compressed slot i covers positions [4i, 4i+4); a query at pos p may
+            # attend slot i only when i < (p+1)//4 (matches the reference
+            # topk_len = (pos+1)//COMPRESS_RATIO — no clamp, so early tokens
+            # attend via SWA only instead of reading unwritten slot 0).
+            max_valid_kv = ((positions + 1).to(torch.int32) // self.compress_ratio).unsqueeze(1)
             extra = torch.where((topk_indices >= 0) & (topk_indices < max_valid_kv), topk_indices, torch.full_like(topk_indices, -1))
         else:
             extra = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1)
@@ -1210,14 +1199,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         check_nan("o (input to o_proj)", o, self.custom_prefix)
         t = o.shape[0]
         o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads, self.mla_attn.head_dim)
-        rot_dim = self.mla_attn.rotary_emb.rotary_dim
-        nope_dim = o_f.shape[-1] - rot_dim
-        o_nope = o_f[..., :nope_dim]
-        o_rot = o_f[..., nope_dim:]
-        o_padded = torch.cat([o_rot, torch.zeros_like(o_nope)], dim=-1)
-        o_padded_rotated, _ = self.mla_attn.rotary_emb(positions, o_padded, inverse=True)
-        o_rot_rotated = o_padded_rotated[..., :rot_dim]
-        o_ref = torch.cat([o_nope, o_rot_rotated], dim=-1).to(torch.bfloat16)
+        # Inverse GPT-J RoPE on the trailing rotary_dim channels of each head
+        # (mirrors rocm_inv_rope_einsum's _fused_inverse_rope_gptj).
+        o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
+        o_ref = o_ref.to(torch.bfloat16)
         
         # Dequantize wo_a.weight to match w.shape dynamically
         w = self.wo_a.weight
@@ -1236,7 +1221,6 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         else:
             s_flat = s.view(w.shape[0], 1)
             
-        s_flat = torch.nan_to_num(s_flat, nan=1.0)
         wo_a_dequant = w.to(o_ref.dtype) * s_flat.to(o_ref.dtype)
         check_nan("wo_a_dequant", wo_a_dequant, self.custom_prefix)
         
@@ -1248,14 +1232,13 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         wo_a_grouped = wo_a_dequant.view(n_local_groups, o_lora_rank, -1)
         
         z = torch.einsum("tgd,grd->tgr", o_ref_grouped, wo_a_grouped)
-        z_flat = torch.nan_to_num(z.flatten(1), nan=0.0)
+        z_flat = z.flatten(1)
         check_nan("z_flat", z_flat, self.custom_prefix)
 
         # --- wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).
         out = self.wo_b(z_flat)
         if isinstance(out, tuple):
             out = out[0]
-        out = torch.nan_to_num(out, nan=0.0)
         check_nan("out_o_proj", out, self.custom_prefix)
         return out
 
@@ -1302,10 +1285,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions,
             None,
         )
-        attn_output = torch.nan_to_num(attn_output, nan=0.0)
         check_nan("attn_output (attention_impl)", attn_output, self.custom_prefix)
 
-        out = torch.nan_to_num(self._o_proj(attn_output, positions), nan=0.0)
+        out = self._o_proj(attn_output, positions)
         check_nan("forward_out", out, self.custom_prefix)
         return out
 

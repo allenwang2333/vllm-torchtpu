@@ -109,6 +109,7 @@ def select_experts(
     renormalize: bool,
     scoring_fn: str,
     layer=None,
+    input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     gate = getattr(layer, "gate", None) if layer is not None else None
     is_grouped = (
@@ -138,12 +139,29 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
-        scoring_fn, router_logits),
-                                        k=topk,
-                                        dim=-1)
+    # Non-grouped path (DeepSeek-V4): mirrors the reference
+    # fused_topk_bias / _topk_softplus_sqrt_torch semantics:
+    #   scores = scoring_fn(logits); bias is used for expert SELECTION only;
+    #   weights are gathered from the UNBIASED scores; hash-MoE layers route
+    #   by hash_indices_table[input_ids] instead of topk.
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+
+    hash_indices_table = getattr(layer, "hash_indices_table", None) if layer is not None else None
+    e_score_correction_bias = getattr(layer, "e_score_correction_bias", None) if layer is not None else None
+
+    if hash_indices_table is not None and input_ids is not None:
+        # Hash MoE: expert ids predetermined by token id.
+        topk_ids = hash_indices_table[input_ids.long()].long()
+        topk_weights = scores.gather(1, topk_ids)
+    elif e_score_correction_bias is not None:
+        scores_for_choice = scores + e_score_correction_bias.float().unsqueeze(0)
+        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+
     if renormalize:
-        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-6)
+        topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
     routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor

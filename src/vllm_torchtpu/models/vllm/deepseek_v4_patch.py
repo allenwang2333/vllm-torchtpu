@@ -244,6 +244,18 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     l.ffn.layer_idx = idx
                     if hasattr(l.ffn, "experts"):
                         l.ffn.experts.layer_idx = idx
+                        # Hash-MoE layers (layer_idx < config.num_hash_layers)
+                        # route by gate.tid2eid[token_id], not by router logits.
+                        # The TPU routing (moe_routing.select_experts) receives
+                        # the RoutedExperts module as `layer`, so expose the
+                        # table there (plain attr; same Parameter object, so it
+                        # sees the checkpoint data once loaded).
+                        tid2eid = getattr(getattr(l.ffn, "gate", None), "tid2eid", None)
+                        if tid2eid is not None:
+                            runner = l.ffn.experts
+                            for tgt in (runner, getattr(runner, "routed_experts", None)):
+                                if tgt is not None:
+                                    object.__setattr__(tgt, "hash_indices_table", tid2eid)
             from vllm.models.deepseek_v4.amd.model import _make_deepseek_v4_weights_mapper
             quant_config = getattr(vllm_config, "quant_config", None)
             expert_dtype = getattr(quant_config, "expert_dtype", "fp4")
@@ -451,12 +463,14 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             kv_weight: torch.Tensor,
             eps: float,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # Standard PyTorch equivalent of GPU Triton RMSNorm kernel
+            # Standard PyTorch equivalent of the GPU Triton RMSNorm kernel
+            # (reference _fused_q_kv_rmsnorm_kernel computes y = x * rrms * w,
+            # with NO (1 + w) offset).
             orig_dtype = qr.dtype
             qr_f = qr.float()
             kv_f = kv.float()
-            qr_out = qr_f * torch.rsqrt(qr_f.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + q_weight.float())
-            kv_out = kv_f * torch.rsqrt(kv_f.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + kv_weight.float())
+            qr_out = qr_f * torch.rsqrt(qr_f.pow(2).mean(-1, keepdim=True) + eps) * q_weight.float()
+            kv_out = kv_f * torch.rsqrt(kv_f.pow(2).mean(-1, keepdim=True) + eps) * kv_weight.float()
             return qr_out.to(orig_dtype), kv_out.to(orig_dtype)
 
         def fused_indexer_q_rope_quant_pytorch(
