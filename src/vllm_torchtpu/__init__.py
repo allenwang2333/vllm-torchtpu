@@ -353,8 +353,30 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_tpu_platform_mem_get_info() -> None:
+    """Provide a general fallback for current_platform.mem_get_info() on TPU.
+
+    Multimodal vision models (Gemma 4 MM, etc.) query mem_get_info() during
+    resolution bucket selection. On GPU this calls cudaMemGetInfo. On TPU we
+    provide a static high-watermark estimate (64GB free / 96GB total).
+    """
+    try:
+        from vllm.platforms import current_platform
+        if not hasattr(
+                current_platform,
+                "mem_get_info") or current_platform.mem_get_info is None:
+            current_platform.mem_get_info = lambda: (64 * (1024**3), 96 *
+                                                     (1024**3))
+            logger.info(
+                "Applied TPU patch: current_platform.mem_get_info fallback for multimodal models."
+            )
+    except Exception:
+        pass
+
+
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_tpu_platform_mem_get_info()
 
     from vllm.v1.engine.core import EngineCoreProc
 
