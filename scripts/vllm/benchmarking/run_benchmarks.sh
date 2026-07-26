@@ -221,10 +221,8 @@ start_vllm_server() {
         return
     fi
 
-    if curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; then
-        echo "WARNING: Port $PORT is already occupied! Running cleanup_server.sh before launching new server..."
-        bash "$SCRIPT_DIR/cleanup_server.sh"
-    fi
+    echo "Running pre-launch cleanup to release any existing port 8000 or orphaned TPU device locks (/dev/vfio/*)..."
+    bash "$SCRIPT_DIR/cleanup_server.sh"
 
     $server_cmd >> "$RESULTS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
