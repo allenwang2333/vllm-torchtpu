@@ -516,25 +516,21 @@ def mla_attention(
         Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence layout `(T, N, D)`.
     """
     in_specs = (
-        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
-                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
-        query_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # q_rope_TNH
-        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
-        keyvalue_skh_sharding
-        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
-        P(ShardingAxisName.ATTN_DATA),  # kv_cache
-        P(ShardingAxisName.ATTN_DATA),  # md.seq_lens
-        P(ShardingAxisName.ATTN_DATA),  # md.block_tables
-        P(ShardingAxisName.ATTN_DATA),  # md.query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # md.distribution
+        query_tnh_sharding or P(None, "model", None),  # q_TNA
+        query_tnh_sharding or P(None, "model", None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(None, None),  # k_SA
+        keyvalue_skh_sharding or P(None, None),  # k_rope_SH
+        P(None),  # kv_cache
+        P(None),  # md.seq_lens
+        P(None),  # md.block_tables
+        P(None),  # md.query_start_loc
+        P(None),  # md.distribution
     )
     out_specs = (
         attn_o_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
+        or P(None, "model",
              None),  # attn output in token-major sequence format (T, N, D)
-        P(ShardingAxisName.ATTN_DATA),  # kv cache
+        P(None),  # kv cache
     )
 
     def _mla_ragged_paged_attention(q, q_rope, k, k_rope, cache, seq_lens,
@@ -656,26 +652,20 @@ def sparse_mla_attention(
         `topk_indices`; every token must have at least one valid entry.
     """
     in_specs = (
-        query_tnh_sharding or P(ShardingAxisName.ATTN_DATA,
-                                ShardingAxisName.ATTN_HEAD, None),  # q_TNA
-        query_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # q_rope_TNH
-        keyvalue_skh_sharding or P(ShardingAxisName.ATTN_DATA, None),  # k_SA
-        keyvalue_skh_sharding
-        or P(ShardingAxisName.ATTN_DATA, None),  # k_rope_SH
-        P(ShardingAxisName.ATTN_DATA),  # kv_cache
-        P(ShardingAxisName.ATTN_DATA),  # topk_indices
-        P(ShardingAxisName.ATTN_DATA),  # seq_lens
-        P(ShardingAxisName.ATTN_DATA),  # block_tables
-        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # request_distribution
+        query_tnh_sharding or P(None, "model", None),  # q_TNA
+        query_tnh_sharding or P(None, "model", None),  # q_rope_TNH
+        keyvalue_skh_sharding or P(None, None),  # k_SA
+        keyvalue_skh_sharding or P(None, None),  # k_rope_SH
+        P(None),  # kv_cache
+        P(None),  # topk_indices
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
     )
     out_specs = (
-        attn_o_tnh_sharding
-        or P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD,
-             None),  # attn output (T, N, D)
-        P(ShardingAxisName.ATTN_DATA),  # updated kv cache
+        attn_o_tnh_sharding or P(None, "model", None),  # attn output (T, N, D)
+        P(None),  # updated kv cache
     )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0

@@ -44,7 +44,6 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
 )
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
@@ -169,11 +168,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         # FP8 path: single tensor (per-token scale is folded into `weights`).
-        # FP4 path: (values, scales) tuple with scales required by the kernel.
-        if isinstance(q_quant, tuple):
-            q_values, q_scale = q_quant
-        else:
-            q_values, q_scale = q_quant, None
+        # FP4 path: (values, scales) tuple. TODO: the FP4 q scale is not yet
+        # plumbed into streamindex_topk -- the assert below still requires fp8
+        # q, so only the values are consumed today.
+        q_values = q_quant[0] if isinstance(q_quant, tuple) else q_quant
 
         k_quant, k_scale = _per_token_group_quant_fp8_tpu(
             k, self.quant_block_size, use_ue8m0=True

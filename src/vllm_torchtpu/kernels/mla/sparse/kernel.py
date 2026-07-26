@@ -1,6 +1,9 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
-from enum import Enum
+# `l` is the standard flash-attention softmax denominator (paired with `m` for
+# the row max), so keep the conventional name.
+# ruff: noqa: E741
+
 import functools
 
 import jax
