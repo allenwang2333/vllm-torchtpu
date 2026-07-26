@@ -358,6 +358,9 @@ def evaluate_sample(sample: Dict, host: str, port: int,
             resp = requests.post(url, json=payload, timeout=600)
             if resp.status_code == 200:
                 break
+            print(
+                f"[ERROR-HTTP-{resp.status_code}] Sample {sample.get('id', 'unknown')} attempt {attempt}: {resp.text[:500]}"
+            )
             if attempt == max_retries:
                 raise RuntimeError(
                     f"HTTP Error {resp.status_code} for sample {sample['id']}: {resp.text[:500]}"

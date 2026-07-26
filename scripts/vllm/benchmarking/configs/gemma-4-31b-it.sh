@@ -14,4 +14,4 @@ RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.8
 EVAL_TOLERANCE="0.02"
 IS_MULTIMODAL=true
-EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --max-model-len 4096"
+EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --max-model-len 4096 --limit-mm-per-prompt image=1 --generation-config vllm"
