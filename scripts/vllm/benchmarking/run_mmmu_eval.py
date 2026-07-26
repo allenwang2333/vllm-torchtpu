@@ -14,6 +14,7 @@ Technical Motivation:
 
 import argparse
 import base64
+import gc
 import io
 import json
 import os
@@ -370,6 +371,8 @@ def evaluate_sample(sample: Dict, host: str, port: int,
     generated_text = res_json["choices"][0]["message"]["content"]
     predicted = extract_answer(generated_text)
     is_correct = predicted == sample["answer"]
+    del img_b64, payload, res_json
+    gc.collect()
     return is_correct, predicted, sample["answer"]
 
 

@@ -2,6 +2,9 @@
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
+export MALLOC_TRIM_THRESHOLD_=65536
+export TPU_SKIP_MDS_QUERY=true
+
 PORT="${PORT:-8000}"
 HOST=""
 CONFIG_NAME=""
