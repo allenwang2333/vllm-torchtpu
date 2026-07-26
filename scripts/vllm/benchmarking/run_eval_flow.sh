@@ -205,7 +205,22 @@ if [ -f "$PERF_BASELINE" ]; then
 fi
 
 # ========================================================
-# 4. Run lm_eval
+# 4. Run Standalone Multimodal (MMMU-Pro) Evaluation FIRST
+# ========================================================
+if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; }; then
+    echo "=== Running Standalone Multimodal (MMMU-Pro) Evaluation ==="
+    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
+      --host "$HOST" \
+      --port "$PORT" \
+      --model "$MODEL" \
+      --dataset "MMMU/MMMU_Pro" \
+      --limit "${MMMU_LIMIT:-100}" \
+      --concurrency "${MMMU_CONCURRENCY:-16}" \
+      --results-dir "$RESULTS_DIR" || { echo "::error::MMMU-Pro evaluation failed!"; fail=1; }
+fi
+
+# ========================================================
+# 4b. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
     # Multimodal models (or models with strict alternation templates like Gemma 4) skip mmlu_llama
@@ -220,21 +235,6 @@ if [ "$RUN_LM_EVAL" = "1" ]; then
     for task in $TASKS; do
         run_lm_eval "$task"
     done
-fi
-
-# ========================================================
-# 4b. Run Standalone Multimodal (MMMU-Pro) Evaluation
-# ========================================================
-if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; }; then
-    echo "=== Running Standalone Multimodal (MMMU-Pro) Evaluation ==="
-    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
-      --host "$HOST" \
-      --port "$PORT" \
-      --model "$MODEL" \
-      --dataset "MMMU/MMMU_Pro" \
-      --limit "${MMMU_LIMIT:-100}" \
-      --concurrency "${MMMU_CONCURRENCY:-16}" \
-      --results-dir "$RESULTS_DIR" || { echo "::error::MMMU-Pro evaluation failed!"; fail=1; }
 fi
 
 # ========================================================
