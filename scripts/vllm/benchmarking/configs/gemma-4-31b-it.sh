@@ -15,4 +15,4 @@ GPU_MEMORY_UTILIZATION=0.75
 EVAL_TOLERANCE="0.02"
 IS_MULTIMODAL=true
 MAX_MODEL_LEN=4096
-EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --limit-mm-per-prompt image=1 --generation-config vllm"
+EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --limit-mm-per-prompt '{\"image\": 1}' --generation-config vllm"
