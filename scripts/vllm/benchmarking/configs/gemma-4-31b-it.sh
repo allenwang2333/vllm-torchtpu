@@ -9,9 +9,9 @@ QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="64"
 RANDOM_RANGE_RATIO="0.8"
-# Reserve 20% HBM headroom (GPU_MEMORY_UTILIZATION=0.8) to accommodate static pre-compiled
-# XLA graph executables during _dummy_run() when running in compiled mode without triggering HBM OOM.
-GPU_MEMORY_UTILIZATION=0.8
+# Reserve 25% HBM headroom (GPU_MEMORY_UTILIZATION=0.75) to accommodate large multimodal vision XLA compilation
+# scratch buffers at max-model-len 4096 without triggering PjRt TPU HBM OOM crashes.
+GPU_MEMORY_UTILIZATION=0.75
 EVAL_TOLERANCE="0.02"
 IS_MULTIMODAL=true
 EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --max-model-len 4096 --limit-mm-per-prompt image=1 --generation-config vllm"
