@@ -370,15 +370,25 @@ def evaluate_sample(sample: Dict, host: str, port: int,
             print(
                 f"[ERROR-HTTP-{resp.status_code}] Sample {sample.get('id', 'unknown')} attempt {attempt}: {resp.text[:200]}"
             )
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"HTTP Error {resp.status_code} for sample {sample.get('id', 'unknown')}: {resp.text[:500]}"
+                )
         except Exception as e:
             print(
                 f"[ERROR-EXC] Sample {sample.get('id', 'unknown')} attempt {attempt}: {e}"
             )
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Request failure for sample {sample.get('id', 'unknown')}: {e}"
+                ) from e
         time.sleep(2 * attempt)
 
     del img_b64, payload
     gc.collect()
-    return False, "ERROR", sample["answer"]
+    raise RuntimeError(
+        f"Evaluation failed for sample {sample.get('id', 'unknown')} after {max_retries} attempts."
+    )
 
 
 def main():
@@ -488,6 +498,10 @@ def main():
         f.flush()
         os.fsync(f.fileno())
     print(f"Results saved to: {output_file}")
+    if total_count > 0 and correct_count == 0:
+        raise RuntimeError(
+            f"MMMU Evaluation FAILED: 0/{total_count} correct predictions. Check server logs/health."
+        )
 
 
 if __name__ == "__main__":
