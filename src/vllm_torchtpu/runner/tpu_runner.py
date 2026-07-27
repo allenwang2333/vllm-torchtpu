@@ -95,6 +95,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -3002,7 +3004,15 @@ class TPUModelRunner(GPUModelRunner):
                                  inputs_embeds).shape[0]
             if envs.TPU_MOE_SKIP_PADDED_TOKENS:
                 self._token_padding_update(num_tokens_padded)
-            with set_forward_context(
+
+            req_id_kwargs = extract_request_ids_for_tracing(
+                self.input_batch.req_ids, start_index, num_reqs)
+
+            with TraceAnnotation(
+                    name="ModelForward",
+                    num_reqs=num_reqs,
+                    **req_id_kwargs,
+            ), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
