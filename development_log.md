@@ -7,15 +7,20 @@ Technical log of issue root causes, failure mechanics, and implemented code fixe
 ```bash
 ssh -o IdentitiesOnly=yes -i /Users/patemotter/.ssh/google_compute_engine alyssa \
   "sudo docker run --init --privileged --net=host --ipc=host --rm \
-  -v /home/patemotter_google_com/workspace/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py:/usr/local/lib/python3.12/site-packages/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py \
-  -v /home/patemotter_google_com/workspace/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py:/usr/local/lib/python3.12/site-packages/vllm_torchtpu/layers/vllm/custom_ops/gdn_attention_op.py \
+  -v /home/patemotter_google_com/workspace/vllm-torchtpu/src/vllm_torchtpu:/usr/local/lib/python3.12/site-packages/vllm_torchtpu \
   -e PYTHONPATH=/home/patemotter_google_com/workspace/vllm-torchtpu/src \
-  -e VLLM_TP_SIZE=8 -e VLLM_EP_SIZE=8 -e VLLM_NO_USAGE_STATS=1 \
+  -e HF_HOME=/home/patemotter_google_com/workspace/hf_cache \
+  -e TPU_LIBRARY_PATH=/home/patemotter_google_com/workspace/vllm-torchtpu/docker/libtpu.so \
+  -e LIBTPU_INIT_ARGS=\"--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1000000000 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1000000000\" \
+  -e TORCH_DIST_TIMEOUT=120 -e VLLM_TP_SIZE=8 -e VLLM_EP_SIZE=8 -e VLLM_NO_USAGE_STATS=1 \
+  -e VLLM_PLUGINS=torchtpu,torchtpu_general \
+  -e PYTHONWARNINGS=ignore -e TRANSFORMERS_VERBOSITY=error \
   -e VLLM_FP4_CACHE_DIR=/dev/shm/dsv4-flash-real-fp4 \
   -e JAX_COMPILATION_CACHE_DIR=/home/patemotter_google_com/workspace/jax_cache \
+  -e DSV4_PROMPT=\"Compare XLA and LLVM in two bullet points.\" \
   -v /dev/shm:/dev/shm -v /home/patemotter_google_com/workspace:/home/patemotter_google_com/workspace \
-  us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest \
-  bash -c 'rm -rf /tmp/ipc* /tmp/psm* /tmp/vllm* && python3 -u /home/patemotter_google_com/workspace/vllm-torchtpu/examples/run_dsv4_inference.py'"
+  vllm-torchtpu-local:latest \
+  bash -c 'python3 -u /home/patemotter_google_com/workspace/vllm-torchtpu/examples/run_dsv4_inference.py'"
 ```
 
 ---
@@ -193,6 +198,22 @@ Native JAX kernels developed directly for JAX workloads rarely encounter these e
   In `mla.py` and `mla_swa.py`, `run_mla_kernel` passed hardcoded `static_q_len = chunk_prefill_size` (64) during prefill execution. When vLLM compiled smaller prompt sequence ranges like `(16, 16)` (`q.shape[0] = 2` tokens per TP rank), `m_scratch` VMEM register buffer was allocated with shape `(q.shape[0] * num_q_heads, 128)` = `(8, 128)`. However, `static_q_len = 64` forced `bq_sz = min(8, 64) = 8`, causing `attention_sinks` concatenation inside `_kernel_body` to allocate `8 * 8 = 64` rows, producing a shape mismatch during `attention_sinks` `(64, 1)` - `m_ref` `(8, 128)` subtraction.
 - **Fix**:
   Updated `static_q_len` in prefill `run_mla_kernel` calls in [mla.py:L1052](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/mla.py#L1052) and [mla_swa.py:L1294](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/mla_swa.py#L1294) to `static_q_len = min(chunk_prefill_size, q.shape[0])`, ensuring `bq_sz` dynamic tile scaling matches actual VMEM array shapes across all sequence compile ranges.
+
+---
+
+### Issue #12: Build-time `RuntimeError` on non-SWA layers & `sm_scale` attribute resolution
+
+- **Symptom**:
+  ```text
+  RuntimeError: model.layers.0.attn: swa_cache_layer.block_size unavailable at attention-op build time
+  RuntimeError: model.layers.0.attn: attention scale unavailable at attention-op build time
+  ```
+- **Root Cause**:
+  1. In `_build_attn_op()`, an explicit validation check raised `RuntimeError` when `swa_cache_layer.block_size` was absent. However, non-SWA layers (such as CSA layer 0 with `compress_ratio=4`) do not construct `swa_cache_layer` (`swa_cache = None`), causing the validation check to fail on layer 0 during model construction.
+  2. `sm_scale` resolution queried `getattr(self.mla_attn, "scale", None)`, whereas `DeepseekV4Attention` defines the attention scaling factor under `self.softmax_scale`.
+- **Fix**:
+  1. Updated `_build_attn_op` in [custom_ops/deepseek_v4.py:L920-L930](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4.py#L920-L930) to guard `if swa_cache is not None:`, validating `swa_cache.block_size` only for SWA layers and providing fallback `16` for non-SWA layers.
+  2. Expanded `sm_scale` resolution in [custom_ops/deepseek_v4.py:L933-L940](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4.py#L933-L940) to check `scale`, `softmax_scale`, and fallback to `head_dim ** -0.5`.
 
 
 
