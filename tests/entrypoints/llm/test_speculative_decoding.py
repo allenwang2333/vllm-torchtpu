@@ -201,9 +201,18 @@ def test_eagle3_correctness_greedy(
 
 
 @pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
 def test_dflash_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
 ):
     model_name = "Qwen/Qwen3-4B"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
@@ -218,8 +227,8 @@ def test_dflash_correctness_greedy(
             "num_speculative_tokens": 15,
             "draft_tensor_parallel_size": 1,
         },
-        max_num_seqs=10,
-        async_scheduling=False,
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
         extra_kwargs={"gpu_memory_utilization": 0.6},
     )
 
@@ -340,12 +349,17 @@ def test_eagle3_performance(
 
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
     "max_num_seqs", [pytest.param(1, id="bs1"),
                      pytest.param(4, id="bs4")])
 def test_dflash_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
     max_num_seqs: int,
+    async_scheduling: bool,
 ):
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
 
@@ -361,7 +375,7 @@ def test_dflash_performance_greedy(
         min_acceptance_rate=0.08,
         max_num_seqs=max_num_seqs,
         model_name="Qwen/Qwen3-4B",
-        async_scheduling=False,
+        async_scheduling=async_scheduling,
         extra_kwargs={"gpu_memory_utilization": 0.6},
     )
 
