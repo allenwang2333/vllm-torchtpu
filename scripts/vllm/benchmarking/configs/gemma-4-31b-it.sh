@@ -17,5 +17,5 @@ EVAL_TOLERANCE="0.02"
 IS_MULTIMODAL=true
 MAX_MODEL_LEN=4096
 EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --generation-config vllm"
-MMMU_LIMIT=100
+MMMU_LIMIT="${MMMU_LIMIT:-100}"
 RUN_EVALPLUS=0

@@ -10,6 +10,48 @@ Technical Motivation:
 2. Avoids the official MMMU repo's offline PyTorch loader requirement (which would double-allocate
    TPU HBM alongside an active `vllm serve` process).
 3. Benchmarks live vLLM HTTP REST endpoints directly using standard HuggingFace MMMU validation samples.
+
+Usage Examples:
+
+1. Full Evaluation Flow (Launches Server & Runs Evaluation):
+    $ ./scripts/vllm/benchmarking/run_eval_flow.sh --config gemma-4-31b-it --run-lm-eval
+
+2. Override Sample Limit via Environment Variable (e.g., 100 samples):
+    $ MMMU_LIMIT=100 ./scripts/vllm/benchmarking/run_eval_flow.sh --config gemma-4-31b-it --run-lm-eval
+
+3. Standalone Verification Helper (Against an existing running server):
+    $ ./scripts/vllm/benchmarking/run_mmmu_verification.sh
+
+4. Direct Python CLI Execution (100 samples against running server):
+    $ python3 scripts/vllm/benchmarking/run_mmmu_eval.py \\
+        --host localhost \\
+        --port 8000 \\
+        --model google/gemma-4-31B-it \\
+        --dataset MMMU/MMMU_Pro \\
+        --limit 100 \\
+        --concurrency 32 \\
+        --results-dir /tmp/mmmu_pro_verification
+
+5. Full Dataset Evaluation (1,730 samples):
+    $ python3 scripts/vllm/benchmarking/run_mmmu_eval.py \\
+        --host localhost \\
+        --port 8000 \\
+        --model google/gemma-4-31B-it \\
+        --dataset MMMU/MMMU_Pro \\
+        --limit 0 \\
+        --concurrency 64 \\
+        --results-dir /tmp/mmmu_pro_full
+
+CLI Options Reference:
+  --host HOST             Server host name or IP (default: 'localhost')
+  --port PORT             Server HTTP port (default: 8000)
+  --model MODEL           Model tag registered in vLLM (default: 'google/gemma-4-31B-it')
+  --dataset DATASET       HuggingFace dataset path (default: 'MMMU/MMMU', supports 'MMMU/MMMU_Pro')
+  --limit LIMIT           Number of samples to evaluate (0 for all samples)
+  --concurrency NUM       Parallel HTTP request worker count (default: 64)
+  --config CONFIG         Dataset split/subset (default: 'standard (4 options)')
+  --allow-synthetic       Permit synthetic sample fallback if HF dataset fails to load (debug only)
+  --results-dir DIR       Directory to write result summary JSON (default: /tmp/perf_eval_gemma-4-31b-it)
 """
 
 import argparse
