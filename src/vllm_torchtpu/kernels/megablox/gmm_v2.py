@@ -217,6 +217,14 @@ class InputConfigs:
     has_scale: bool = False
 
     @property
+    def should_unpack(self) -> bool:
+        """True if weights are sub-byte (e.g. INT4) packed in INT32/UINT32 carriers."""
+        if self.quant_dtype is None:
+            return False
+        quant_bits = jax.dtypes.itemsize_bits(self.quant_dtype)
+        return quant_bits < 8 and self.dtype in (jnp.int32, jnp.uint32)
+
+    @property
     def should_dequantize_before_matmul(self) -> bool:
         """Dequantize rhs before matmul if block size limits MXU utilization."""
         if not self.has_scale:
@@ -856,6 +864,10 @@ def kernel_main(
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
+    if cfgs.rhs_cfgs.should_unpack:
+        rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+        rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
+
     # Fill metadata buffer and return number of group & m interations.
     num_gm = fill_metadata(
         lhs_group_sizes_ref,
@@ -915,7 +927,7 @@ def calculate_tiling(
     """Calculate optimal tile sizes for GMM kernel."""
 
     lhs_dtype = lhs_cfgs.dtype
-    rhs_dtype = rhs_cfgs.dtype
+    rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
 
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1047,16 +1059,18 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    packing_factor: int = 1,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
+    size_k = size_k * packing_factor
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_group, size_k // packing_factor, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1090,7 +1104,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
 
     dims = cfgs.dims
     lhs_dtype = cfgs.lhs_cfgs.quant_dtype or cfgs.lhs_cfgs.dtype
-    rhs_dtype = cfgs.rhs_cfgs.dtype
+    rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
 
     # We use bits for rhs since it could sub-byte dtype like int4.
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1129,6 +1143,30 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     )
 
 
+def get_packing_factor(
+    rhs: jax.Array,
+    quant_dtype: jnp.dtype | None,
+) -> int:
+    """Returns the packing factor for INT4 packed in a 32-bit carrier.
+        Sub-byte weights are packed along the contracting (K) dimension (axis 1).
+    """
+    if quant_dtype is None or quant_dtype == rhs.dtype:
+        return 1
+
+    if (quant_dtype != jnp.int4
+            or rhs.dtype not in (jnp.int32, jnp.uint32)):
+        raise ValueError(
+            "Pre-packed GMM only supports logical INT4 weights packed in "
+            f"INT32/UINT32 carrier; received logical {quant_dtype} "
+            f"and carrier {rhs.dtype}.")
+
+    storage_bits = jax.dtypes.itemsize_bits(
+        rhs.dtype)
+    quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
+
+    return storage_bits // quant_bits
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1144,20 +1182,22 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
+    packing_factor = get_packing_factor(rhs, rhs_quant_dtype)
+
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
-                           group_offset, fuse_act)
+                           group_offset, fuse_act, packing_factor)
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        rhs_quant_dtype = rhs_quant_dtype or rhs.dtype
         num_blocks = rhs_scale.shape[1]
         block_size = dims.size_k // num_blocks
     else:
         has_scale = False
-        rhs_quant_dtype = None
         block_size = dims.size_k
 
     rhs_cfgs = InputConfigs(
@@ -1244,6 +1284,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "maybe_quantize_lhs",
     "zero_initialize",
     "fuse_act",
+    "rhs_quant_dtype",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1262,6 +1303,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1284,6 +1326,7 @@ def gmm_v2(
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
+        rhs_quant_dtype: Logical dtype encoded by a pre-packed RHS carrier.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1314,6 +1357,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
