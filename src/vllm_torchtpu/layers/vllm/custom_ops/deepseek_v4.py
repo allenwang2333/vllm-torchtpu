@@ -1185,6 +1185,11 @@ class VllmDeepseekV4MLAAttention(AttentionLayerBase, ds_v4_amd_model.DeepseekV4A
 
         if is_csa:
             assert topk_indices is not None
+            if topk_indices.shape[0] < q.shape[0]:
+                pad_len = q.shape[0] - topk_indices.shape[0]
+                topk_indices = torch.nn.functional.pad(topk_indices, (0, 0, 0, pad_len), value=-1)
+            elif topk_indices.shape[0] > q.shape[0]:
+                topk_indices = topk_indices[:q.shape[0]]
             # Compressed slot i covers positions [4i, 4i+4); a query at pos p may
             # attend slot i only when i < (p+1)//4 (matches the reference
             # topk_len = (pos+1)//COMPRESS_RATIO — no clamp, so early tokens

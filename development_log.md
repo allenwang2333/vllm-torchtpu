@@ -228,6 +228,20 @@ Native JAX kernels developed directly for JAX workloads rarely encounter these e
 - **Fix**:
   Updated `TpuCompilerAdaptor.__init__` in [compilation/tpu_compiler.py:L148](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/compilation/tpu_compiler.py#L148) to `def __init__(self, vllm_config: VllmConfig | None = None):`, storing `self.vllm_config = vllm_config`.
 
+---
+
+### Issue #14: `RuntimeError: sub got incompatible shapes for broadcasting: (64, 1), (8, 128)`
+
+- **Symptom**:
+  ```text
+  RuntimeError: Worker failed with error 'sub got incompatible shapes for broadcasting: (64, 1), (8, 128).
+  While executing %deepseek_v4_attention_csa : [num_users=2] = call_function[target=torch.ops.pallas.deepseek_v4_attention_csa.default](args = ...
+  ```
+- **Root Cause**:
+  When static query shapes (e.g., `q.shape[0] = 64` or `positions.shape[0] = 64`) were passed into `attention_impl` for CSA layers, `self.indexer` returned `topk_indices` matching unpadded prompt token count (e.g., 8 rows: shape `(8, 128)`). In `forward_mqa()`, `max_valid_kv` was computed from `positions` (shape `(64, 1)`), leading to an invalid shape broadcast `(8, 128) < (64, 1)` inside XLA.
+- **Fix**:
+  Added row alignment in [custom_ops/deepseek_v4.py:L1188-L1192](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4.py#L1188-L1192) to pad `topk_indices` with `-1` (or slice) to match `q.shape[0]` before broadcasting with `max_valid_kv`.
+
 
 
 
