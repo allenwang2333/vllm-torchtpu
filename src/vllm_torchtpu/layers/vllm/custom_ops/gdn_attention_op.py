@@ -36,16 +36,7 @@ from vllm_torchtpu.layers.common.sequence_layout import \
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 from vllm_torchtpu.utils import get_dp_size
-
-
-@torch.library.custom_op("vllm_torchtpu::gdn_state_copy_", mutates_args=("state",))
-def gdn_state_copy_(state: torch.Tensor, new_state: torch.Tensor) -> None:
-    state.copy_(new_state)
-
-
-@gdn_state_copy_.register_fake
-def _gdn_state_copy_fake(state: torch.Tensor, new_state: torch.Tensor) -> None:
-    pass
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_state_copy_op import gdn_state_copy
 
 
 def gdn_attention_core_tpu(
@@ -301,8 +292,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
 
-            gdn_state_copy_(conv_state, new_conv)
-            gdn_state_copy_(recurrent_state, new_rec)
+            gdn_state_copy(conv_state, new_conv)
+            gdn_state_copy(recurrent_state, new_rec)
 
             return outputs
 
