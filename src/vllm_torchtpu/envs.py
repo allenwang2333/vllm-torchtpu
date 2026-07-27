@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     TORCH_TPU_EAGER_MODE: str = "DEFER_AND_FUSE"
 
 
-
 def env_with_choices(
     env_name: str,
     default: str | None,
