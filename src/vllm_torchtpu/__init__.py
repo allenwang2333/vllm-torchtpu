@@ -97,17 +97,20 @@ def _patch_expert_map_host_lookup() -> None:
         return
 
     def map_global_to_local(self, global_id: int) -> int:
-        if self._expert_map is None:
+        expert_map = self._expert_map
+        if expert_map is None:
             return global_id
-        cached = getattr(self, "_tpu_expert_map_host", None)
-        if (cached is None or cached[0] is not self._expert_map
-                or cached[1] != self._expert_map._version):
-            cached = (self._expert_map, self._expert_map._version,
-                      self._expert_map.tolist())
-            self._tpu_expert_map_host = cached
-        return cached[2][global_id]
+        if (self._tpu_expert_map_source is not expert_map
+                or self._tpu_expert_map_version != expert_map._version):
+            self._tpu_expert_map_source = expert_map
+            self._tpu_expert_map_version = expert_map._version
+            self._tpu_expert_map_host = expert_map.tolist()
+        return self._tpu_expert_map_host[global_id]
 
     cls.map_global_to_local = map_global_to_local
+    cls._tpu_expert_map_source = None
+    cls._tpu_expert_map_version = None
+    cls._tpu_expert_map_host = None
     cls._tpu_host_expert_map_patch = True
     logger.info("Applied TPU patch: host-side expert-map lookup.")
 
