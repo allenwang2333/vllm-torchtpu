@@ -86,6 +86,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID, AsyncPreResults, AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput)
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs, Eagle3Proposer
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -2465,7 +2467,19 @@ class TPUModelRunner(GPUModelRunner):
             # and packs the tokens into inputs_embeds; use whichever exists.
             num_tokens_padded = (input_ids if input_ids is not None else
                                  inputs_embeds).shape[0]
-            with set_forward_context(
+            
+            req_id_kwargs = extract_request_ids_for_tracing(
+                self.input_batch.req_ids, start_index, num_reqs, log_this_frame=False)
+            
+            import random
+            if random.random() < 0.10:
+                logger.info(f"Custom trace info [10% freq]: Custom Trace Annotation running with kwargs={req_id_kwargs}")
+
+            with TraceAnnotation(
+                    name="execute_model_custom",
+                    num_reqs=num_reqs,
+                    **req_id_kwargs,
+            ), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
