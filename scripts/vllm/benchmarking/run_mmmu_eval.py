@@ -70,9 +70,9 @@ def parse_args():
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=16,
+        default=64,
         help=
-        "Number of concurrent parallel HTTP requests to send (default: 16)",
+        "Number of concurrent parallel HTTP requests to send (default: 64)",
     )
     return parser.parse_args()
 
@@ -372,7 +372,7 @@ def evaluate_sample(sample: Dict, host: str, port: int,
 
     res_json = resp.json()
     generated_text = res_json["choices"][0]["message"]["content"]
-    predicted = extract_answer(generated_text)
+    predicted = extract_answer(generated_text, options=sample.get("options"))
     is_correct = predicted == sample["answer"]
     del img_b64, payload, res_json
     gc.collect()

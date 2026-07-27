@@ -189,6 +189,8 @@ MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 IS_MULTIMODAL=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("is_multimodal", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
+MMMU_LIMIT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("mmmu_limit", 1730))' "$RESULTS_DIR/config.json" 2>/dev/null || echo "${MMMU_LIMIT:-1730}")
+MMMU_CONCURRENCY=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("mmmu_concurrency", 64))' "$RESULTS_DIR/config.json" 2>/dev/null || echo "${MMMU_CONCURRENCY:-64}")
 
 fail=0
 evalplus_rc=0
@@ -214,27 +216,21 @@ if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NA
       --port "$PORT" \
       --model "$MODEL" \
       --dataset "MMMU/MMMU_Pro" \
-      --limit "${MMMU_LIMIT:-100}" \
-      --concurrency "${MMMU_CONCURRENCY:-16}" \
+      --limit "$MMMU_LIMIT" \
+      --concurrency "$MMMU_CONCURRENCY" \
       --results-dir "$RESULTS_DIR" || { echo "::error::MMMU-Pro evaluation failed!"; fail=1; }
 fi
 
 # ========================================================
 # 4b. Run lm_eval
 # ========================================================
-if [ "$RUN_LM_EVAL" = "1" ]; then
-    # Multimodal models (or models with strict alternation templates like Gemma 4) skip mmlu_llama
-    # because mmlu_llama requires multiturn prompt continuation (--gen_kwargs '{"continue_final_message": true}'),
-    # which violates strict user/assistant turn alternation rules. mmlu_pro with
-    # mmlu_pro_disable_multiturn_args is used instead alongside standalone MMMU-Pro evaluation.
-    if [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; then
-        TASKS="${LM_EVAL_TASKS:-mmlu_pro}"
-    else
-        TASKS="${LM_EVAL_TASKS:-mmlu_llama mmlu_pro}"
-    fi
+if [ "$RUN_LM_EVAL" = "1" ] && [ "$IS_MULTIMODAL" != "true" ] && [[ ! "$CONFIG_NAME" =~ gemma-?4|vl ]]; then
+    TASKS="${LM_EVAL_TASKS:-mmlu_llama mmlu_pro}"
     for task in $TASKS; do
         run_lm_eval "$task"
     done
+elif [ "$IS_MULTIMODAL" = "true" ]; then
+    echo "Multimodal vision-language model detected: standalone MMMU-Pro evaluation completed as primary gate; skipping text-only lm_eval."
 fi
 
 # ========================================================

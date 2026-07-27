@@ -365,7 +365,9 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
     "is_multimodal": $IS_MULTIMODAL,
-    "eval_tolerance": $EVAL_TOLERANCE
+    "eval_tolerance": $EVAL_TOLERANCE,
+    "mmmu_limit": ${MMMU_LIMIT:-1730},
+    "mmmu_concurrency": ${MMMU_CONCURRENCY:-64}
 }
 EOF
 
