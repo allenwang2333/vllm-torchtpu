@@ -84,7 +84,14 @@ class SortedExpertProfileRouter:
         """
         # Step 1: Count the actual number of tokens assigned to each physical expert in the current step
         flat_gates = topk_ids.flatten()
-        actual_counts = torch.bincount(flat_gates, minlength=self.num_experts)
+        
+        # Safety check: filter out negative IDs (e.g., padding) and out-of-bound IDs
+        valid_mask = (flat_gates >= 0) & (flat_gates < self.num_experts)
+        valid_gates = flat_gates[valid_mask]
+        
+        actual_counts = torch.bincount(valid_gates, minlength=self.num_experts)
+        # Ensure we strictly only have `num_experts` counts
+        actual_counts = actual_counts[:self.num_experts]
         
         # Step 2: Sort in descending order to identify the hottest and coldest experts
         sorted_actual_counts, sorted_expert_ids = torch.sort(actual_counts, descending=True)
