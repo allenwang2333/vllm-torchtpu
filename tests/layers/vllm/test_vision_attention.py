@@ -86,3 +86,31 @@ def test_vision_attention_falls_back_for_cross_attention(monkeypatch):
     assert called["args"][0] is query
     assert called["args"][1] is key
     assert called["args"][2] is value
+
+
+def test_forward_native_pads_non_128_head_dim(monkeypatch):
+    attn = make_attention(num_heads=2, head_size=72, scale=1.0 / (72**0.5))
+
+    query = torch.randn(1, 10, 2, 72)
+    key = torch.randn(1, 10, 2, 72)
+    value = torch.randn(1, 10, 2, 72)
+
+    sdpa_calls = {}
+
+    def fake_sdpa(q, k, v, dropout_p=0.0, is_causal=False, scale=None):
+        sdpa_calls["q"] = q
+        sdpa_calls["k"] = k
+        sdpa_calls["v"] = v
+        sdpa_calls["scale"] = scale
+        return q
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention",
+                        fake_sdpa)
+
+    out = attn.forward_native(query, key, value)
+
+    assert out.shape == query.shape
+    assert sdpa_calls["q"].shape == (1, 2, 10, 128)
+    assert sdpa_calls["k"].shape == (1, 2, 10, 128)
+    assert sdpa_calls["v"].shape == (1, 2, 10, 128)
+    assert sdpa_calls["scale"] == 1.0 / (72**0.5)
