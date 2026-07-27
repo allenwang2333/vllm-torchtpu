@@ -215,6 +215,75 @@ For completeness, these were checked closely against the reference and match:
    within a batch (compress reads the pre-write fp32 state view) but worth an
    audit for tiny-prompt decode.
 
+---
+
+# Round 2 (2026-07-26): Review of the "Working around bugs" commit
+
+The new Docker image ships **both** `tpu_inference` (the JAX-native TPU plugin)
+and `vllm_torchtpu` in site-packages. The two register competing vLLM plugins
+and out-of-tree custom ops, and several `tpu_inference` classes
+(`VllmUnquantizedLinearMethod`, `VllmMoERunner`, the GDN oot op) leaked into the
+PyTorch flow. Every issue in entries #2–#4 of `development_log.md` and the GDN
+`register_oot` collision is a symptom of this mixed install — the monkey-patches
+work around symptoms one at a time.
+
+**Recommended root fix:** run the image built from `docker/Dockerfile.local`
+(which `rm -rf`s `tpu_inference*`), drop the per-file `-v` mounts of
+`gdn_attention_op.py`, and additionally set
+`-e VLLM_PLUGINS=torchtpu,torchtpu_general` (both entry-point names from
+`pyproject.toml` — note the earlier Option-2 command's `VLLM_PLUGINS=torchtpu`
+silently disables the `torchtpu_general` plugin). Once isolated, the
+`tpu_inference` try/except patches in `deepseek_v4_patch.py` become inert.
+
+## Fix R2-1 (critical): `load_with_init` in `mla.py` dropped the SWA merge
+
+The Issue #9 "fix" (NameError on `load_with_init`) copied mla_swa.py's
+scratch-reinit pattern into `mla.py`'s `flash_attention`. That is wrong by
+design: in the main MLA kernel, `wait_fetch_swa()` **seeds** the `(m, l, acc)`
+scratch with the SWA kernel's partial unnormalized accumulation *before* the
+KV-block loop, and flash attention must continue the online softmax from that
+state. Re-initializing at `bkv_idx == 0` (m=-inf, l=0, acc=0) discarded the
+entire sliding-window contribution on every compressed-attention layer — the
+model only saw 1-in-4 compressed summaries plus sinks. Reverted to direct
+`head_{m,l,acc}_ref[...]` reads. (The original NameError came from an
+intermediate edit that *introduced* the `load_with_init` calls; the correct fix
+was to revert the calls, not define the function.)
+
+## Fix R2-2: NaN scrubbing inside both attention kernels removed
+
+`kv = jnp.where(jnp.isnan(kv) | jnp.isinf(kv), 0.0, kv)` was added to both
+kernel bodies. Masked lanes already neutralize NaN via
+`jnp.where(mask, mask_value, s)`; an **unmasked** NaN means a real bug
+(unwritten cache slot inside `kv_lens`, bad scale byte) that must surface, not
+be zeroed. Also a per-tile perf cost. Removed.
+
+## Fix R2-3: page-size / scale fallbacks made loud
+
+- `logical_page_size` fallback of `16` in `_build_attn_op` (real value is 64)
+  and `kv_packing` (=4) in `mla_swa.py` would silently misaddress every SWA
+  cache slot if ever hit. Now: `_build_attn_op` raises if
+  `swa_cache_layer.block_size` is unavailable (that only happens under the
+  mixed-plugin install); the in-kernel guard falls back to
+  `physical_page_size`, which is the correct runtime value.
+- `sm_scale` fallback `(128+64)**-0.5` was dimensionally wrong (head_dim=512).
+  Now raises if `scale` is missing instead of silently attenuating attention.
+
+## Reviewed and left in place (Round 2)
+
+- `cdiv` zero-guards, `s.shape[1]==0` / `broadcast_minor` zero-shape guards:
+  trace-time-only paths, harmless at runtime.
+- `static_q_len = min(chunk_prefill_size, q.shape[0])`: correct fix for the
+  (64,1)/(8,128) tile mismatch across compile size ranges.
+- `kv_lens_to_attend_segment` via `lax.dynamic_slice_in_dim` + reshape:
+  layout-equivalent to the old per-element stack (token-major, then heads).
+- The `_maybe_reduce_final_output` swap to the base `MoERunner` implementation:
+  the base does `tensor_model_parallel_all_reduce` when `ep_size > 1`, and the
+  functional collectives are registered with `allow_in_graph`. **Verify on
+  hardware** that the EP=8 combine actually happens (a missing all-reduce shows
+  up as expert-sparse/attenuated hidden states).
+- mxfp4 loader `tp_rank=0` forcing: consistent with pure-EP expert sharding
+  (each rank holds full weights for its 32 experts).
+
 ## Validation plan on v7x-8
 
 1. `pytest tests/kernels/test_dsv4_mla.py tests/kernels/test_dsv4_mla_swa.py

@@ -918,16 +918,29 @@ class VllmDeepseekV4MLAAttention(AttentionLayerBase, ds_v4_amd_model.DeepseekV4A
         is_csa = self.compress_ratio == 4
         two_caches_same_buffer = not swa_only
         swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
-        logical_page_size = (
-            swa_cache.block_size
-            if (swa_cache is not None and getattr(swa_cache, "block_size", 0) > 0)
-            else 16
-        )
-        
+        if swa_cache is not None and getattr(swa_cache, "block_size", 0) > 0:
+            logical_page_size = swa_cache.block_size
+        else:
+            # Never guess: a wrong logical page size (e.g. 16 vs the real 64)
+            # silently misaddresses every SWA cache slot. Missing block_size
+            # here usually means the layer was constructed by tpu_inference
+            # instead of vllm_torchtpu — fix plugin isolation instead.
+            raise RuntimeError(
+                f"{self.custom_prefix}: swa_cache_layer.block_size unavailable "
+                "at attention-op build time; refusing to guess the SWA cache "
+                "logical page size.")
+
+        sm_scale = getattr(self.mla_attn, "scale", None) or getattr(self, "scale", None)
+        if sm_scale is None:
+            raise RuntimeError(
+                f"{self.custom_prefix}: attention scale unavailable at "
+                "attention-op build time (expected head_dim**-0.5 from "
+                "DeepseekV4Attention.__init__).")
+
         wrapped_fn = functools.partial(
             _deepseek_v4_attention_jax,
             mesh=mesh,
-            sm_scale=getattr(self.mla_attn, "scale", getattr(self, "scale", 1.0 / (128 + 64)**0.5)),
+            sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
             swa_only=swa_only,

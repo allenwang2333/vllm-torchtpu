@@ -167,16 +167,16 @@ def _mla_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
-        kv = jnp.where(jnp.isnan(kv) | jnp.isinf(kv), 0.0, kv)
         head_l_ref = l_ref.at[:q.shape[0]]
         head_m_ref = m_ref.at[:q.shape[0]]
         head_acc_ref = acc_ref.at[:q.shape[0]]
 
-        is_first_bkv = (bkv_idx == 0)
-
-        def load_with_init(ref, init_val):
-            return jnp.where(is_first_bkv, jnp.full_like(ref[...], init_val),
-                             ref[...])
+        # NOTE: unlike mla_swa.py, this kernel must NOT re-initialize the
+        # (m, l, acc) scratch at bkv_idx == 0. wait_fetch_swa() seeds the
+        # scratch with the SWA kernel's partial (unnormalized) accumulation
+        # before the bkv loop, and flash attention continues the online
+        # softmax from that state — re-initializing here silently drops the
+        # entire sliding-window contribution from the layer output.
 
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
@@ -204,7 +204,7 @@ def _mla_ragged_paged_attention_kernel(
             s_rowmax = jnp.full((s.shape[0], 1), -jnp.inf, dtype=s.dtype)
         else:
             s_rowmax = jnp.max(s, axis=1, keepdims=True)
-        m_prev = load_with_init(head_m_ref, -jnp.inf)
+        m_prev = head_m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
         p = jnp.where(mask, 0.0, jnp.exp(s - broadcast_minor(m_curr, s.shape)))
@@ -215,10 +215,10 @@ def _mla_ragged_paged_attention_kernel(
         # Prevent NaN from -inf - (-inf) when a block is fully masked out
         safe_diff = jnp.where(m_curr == m_prev, 0.0, m_prev - m_curr)
         exp_m_diff = jnp.where(m_curr <= mask_value, 0.0, jnp.exp(safe_diff))
-        l_prev = load_with_init(head_l_ref, 0.0)
+        l_prev = head_l_ref[...]
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
-        o_prev = load_with_init(head_acc_ref, 0.0)
+        o_prev = head_acc_ref[...]
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
 

@@ -160,7 +160,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
-        kv = jnp.where(jnp.isnan(kv) | jnp.isinf(kv), 0.0, kv)
         head_l_ref = l_ref.at[:q.shape[0]]
         head_m_ref = m_ref.at[:q.shape[0]]
         head_acc_ref = acc_ref.at[:q.shape[0]]
@@ -1060,7 +1059,11 @@ def mla_sliding_window_ragged_paged_attention(
     _, physical_page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     physical_page_size = physical_page_size_per_kv_packing * kv_packing
     if logical_page_size <= 0:
-        logical_page_size = kv_packing
+        # Zero only occurs during fake-shape tracing (empty/uninitialized SWA
+        # cache). Fall back to the physical page size — NOT kv_packing (4):
+        # at real runtime the logical page equals the physical page (64 rows),
+        # and a 4-row logical page would misaddress every cache slot.
+        logical_page_size = physical_page_size
     assert logical_page_size <= physical_page_size
     assert logical_page_size % kv_packing == 0
     page_size_per_kv_packing = logical_page_size // kv_packing
