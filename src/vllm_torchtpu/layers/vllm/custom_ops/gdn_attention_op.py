@@ -291,11 +291,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
 
-            import torch._dynamo
-            torch._dynamo.graph_break()
-            conv_state.copy_(new_conv)
-            recurrent_state.copy_(new_rec)
-
             return outputs
 
         return gdn_impl
