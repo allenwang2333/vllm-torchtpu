@@ -145,7 +145,8 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     name = "tpu"
 
-    def __init__(self):
+    def __init__(self, vllm_config: VllmConfig | None = None):
+        self.vllm_config = vllm_config
         self.cache_dir: str | None = None
         self._disable_cache = False
 

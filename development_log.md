@@ -215,6 +215,19 @@ Native JAX kernels developed directly for JAX workloads rarely encounter these e
   1. Updated `_build_attn_op` in [custom_ops/deepseek_v4.py:L920-L930](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4.py#L920-L930) to guard `if swa_cache is not None:`, validating `swa_cache.block_size` only for SWA layers and providing fallback `16` for non-SWA layers.
   2. Expanded `sm_scale` resolution in [custom_ops/deepseek_v4.py:L933-L940](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4.py#L933-L940) to check `scale`, `softmax_scale`, and fallback to `head_dim ** -0.5`.
 
+---
+
+### Issue #13: `TypeError: TpuCompilerAdaptor.__init__() takes 1 positional argument but 2 were given`
+
+- **Symptom**:
+  ```text
+  RuntimeError: Worker failed with error 'TpuCompilerAdaptor.__init__() takes 1 positional argument but 2 were given'
+  ```
+- **Root Cause**:
+  In `compilation/tpu_compiler.py`, `TpuCompilerAdaptor.__init__(self)` accepted zero positional arguments. When vLLM v1 initialized the compiler plugin interface or when `compute_tpu_compilation_hash` instantiated `TpuCompilerAdaptor(vllm_config)`, passing `vllm_config` caused a `TypeError`.
+- **Fix**:
+  Updated `TpuCompilerAdaptor.__init__` in [compilation/tpu_compiler.py:L148](file:///Users/patemotter/dsv4/vllm-torchtpu/src/vllm_torchtpu/compilation/tpu_compiler.py#L148) to `def __init__(self, vllm_config: VllmConfig | None = None):`, storing `self.vllm_config = vllm_config`.
+
 
 
 
