@@ -226,6 +226,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 wrapped_fn,
                 mesh=pcp_mesh,
                 input_partition_specs=input_partition_specs,
+                donate_argnums=(3, 4),
             )
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
@@ -253,7 +254,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dp_enabled=dp_enabled,
             )
             gdn_jax_op = pallas.jax_op(op_name,
-                                       wrapped_fn)
+                                       wrapped_fn,
+                                       donate_argnums=(3, 4))
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
@@ -289,6 +291,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
 
+            import torch._dynamo
+            torch._dynamo.graph_break()
+            conv_state.copy_(new_conv)
+            recurrent_state.copy_(new_rec)
 
             return outputs
 
