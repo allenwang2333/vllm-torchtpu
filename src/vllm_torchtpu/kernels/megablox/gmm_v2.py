@@ -1062,7 +1062,7 @@ def validate_inputs(
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
-    size_k = size_k * packing_factor
+    size_k *= packing_factor
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
