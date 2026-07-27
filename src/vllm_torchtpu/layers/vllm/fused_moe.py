@@ -178,10 +178,10 @@ def fused_moe_gmm(
     topk_weights_masked = torch.where(valid_mask, topk_weights, torch.zeros_like(topk_weights))
     topk_ids_masked = torch.where(valid_mask, topk_ids, torch.zeros_like(topk_ids))
 
-    if experts_start is not None:
-        local_mask = (topk_ids >= experts_start) & (topk_ids < experts_start + 32)
-        num_local = local_mask.sum().item()
-        print(f"[DEBUG_ROUTE] Rank {torch.distributed.get_rank()} experts_start={experts_start} | Local routed: {num_local} / {topk_ids.numel()} | Topk IDs: {topk_ids.flatten()[:16].tolist()}", flush=True)
+    # if experts_start is not None:
+    #     local_mask = (topk_ids >= experts_start) & (topk_ids < experts_start + 32)
+    #     num_local = local_mask.sum().item()
+    #     print(f"[DEBUG_ROUTE] Rank {torch.distributed.get_rank()} experts_start={experts_start} | Local routed: {num_local} / {topk_ids.numel()} | Topk IDs: {topk_ids.flatten()[:16].tolist()}", flush=True)
 
     return fused_moe(
         hidden_states,

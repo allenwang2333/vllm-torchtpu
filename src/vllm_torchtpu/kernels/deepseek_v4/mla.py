@@ -28,8 +28,11 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
+    if isinstance(b, (int, float)):
+        if b == 0:
+            return 0
+        return (a + b - 1) // b
+    return jnp.where(b != 0, (a + jnp.maximum(1, b) - 1) // jnp.maximum(1, b), 0)
 
 
 def align_to(x, a):
@@ -164,9 +167,16 @@ def _mla_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
+        kv = jnp.where(jnp.isnan(kv) | jnp.isinf(kv), 0.0, kv)
         head_l_ref = l_ref.at[:q.shape[0]]
         head_m_ref = m_ref.at[:q.shape[0]]
         head_acc_ref = acc_ref.at[:q.shape[0]]
+
+        is_first_bkv = (bkv_idx == 0)
+
+        def load_with_init(ref, init_val):
+            return jnp.where(is_first_bkv, jnp.full_like(ref[...], init_val),
+                             ref[...])
 
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
@@ -179,18 +189,22 @@ def _mla_ragged_paged_attention_kernel(
             mask = kv_lens_to_attend_segment.reshape(s.shape) <= k_span
         else:
             assert bq_topk_indices is not None
+            bq_sz_curr = q.shape[0] // num_q_heads
             k_span = bkv_idx * bkv_sz + jnp.arange(bkv_sz, dtype=jnp.int32)
-            valid_mask = jnp.any(bq_topk_indices[:, None, :] == k_span[None, :,
+            valid_mask = jnp.any(bq_topk_indices[:bq_sz_curr, None, :] == k_span[None, :,
                                                                        None],
-                                 axis=-1)  # [bq_sz, bkv_sz]
+                                 axis=-1)  # [bq_sz_curr, bkv_sz]
             valid_mask = jnp.broadcast_to(
                 valid_mask[:, None, :],
-                (bq_sz, num_q_heads, bkv_sz)).reshape(s.shape)
+                (bq_sz_curr, num_q_heads, bkv_sz)).reshape(s.shape)
             mask = jnp.logical_not(valid_mask)
 
         s = jnp.where(mask, mask_value, s)
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
-        m_prev = head_m_ref[...]
+        if s.shape[1] == 0:
+            s_rowmax = jnp.full((s.shape[0], 1), -jnp.inf, dtype=s.dtype)
+        else:
+            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+        m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
         p = jnp.where(mask, 0.0, jnp.exp(s - broadcast_minor(m_curr, s.shape)))
@@ -201,10 +215,10 @@ def _mla_ragged_paged_attention_kernel(
         # Prevent NaN from -inf - (-inf) when a block is fully masked out
         safe_diff = jnp.where(m_curr == m_prev, 0.0, m_prev - m_curr)
         exp_m_diff = jnp.where(m_curr <= mask_value, 0.0, jnp.exp(safe_diff))
-        l_prev = head_l_ref[...]
+        l_prev = load_with_init(head_l_ref, 0.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
-        o_prev = head_acc_ref[...]
+        o_prev = load_with_init(head_acc_ref, 0.0)
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
 
@@ -474,6 +488,8 @@ def _mla_ragged_paged_attention_kernel(
     def broadcast_minor(src, shape):
         if src.shape == shape:
             return src
+        if shape[-1] == 0:
+            return jnp.zeros(shape, dtype=src.dtype)
         assert src.shape[:-1] == shape[:-1]
         assert src.shape[-1] % 128 == 0
         target_minor = align_to(shape[-1], src.shape[-1])
@@ -518,13 +534,12 @@ def _mla_ragged_paged_attention_kernel(
                 seq_idx, bq_idx, bq_sem_idx)
 
             if kv_lens_to_attend_ref is not None:
+                q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+                slice_lens = lax.dynamic_slice_in_dim(kv_lens_to_attend_ref, q_len_start, bq_sz)
                 kv_lens_to_attend_segment = jnp.broadcast_to(
-                    jnp.stack([
-                        kv_lens_to_attend_ref[q_start + bq_idx * bq_sz + i]
-                        for i in range(bq_sz)
-                    ])[:, None, None],
+                    slice_lens[:, None, None],
                     (bq_sz, num_q_heads, bkv_sz),
-                )
+                ).reshape(bq_sz * num_q_heads, bkv_sz)
             else:
                 kv_lens_to_attend_segment = None
 
@@ -593,14 +608,16 @@ def _mla_ragged_paged_attention_kernel(
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
+            m = m_ref[...]
+            l = l_ref[...]
             attention_sinks = jnp.concat(
                 [attention_sinks_ref[...] for _ in range(bq_sz)])[..., None]
             exp_attention_sinks = jnp.where(
-                (m_ref[...] <= -1e30) | (l_ref[...] <= 1e-10),
+                (m <= -1e30) | (l <= 1e-10),
                 0.0,
-                jnp.exp(attention_sinks - m_ref[...]),
+                jnp.exp(attention_sinks - m),
             )
-            L = l_ref[...] + exp_attention_sinks
+            L = l + exp_attention_sinks
             L = jnp.maximum(L, 1.0)
             L = broadcast_minor(L, acc.shape)
             out = lax.div(acc.astype(jnp.float32), L.astype(jnp.float32)).astype(q_dtype)
@@ -1032,7 +1049,7 @@ def mla_ragged_paged_attention(
             num_queries_per_block=num_queries_per_blocks[1],
             start_seq_idx=distribution[0],
             end_seq_idx=distribution[1],
-            static_q_len=chunk_prefill_size,
+            static_q_len=min(chunk_prefill_size, q.shape[0]),
             case=MlaCase.PREFILL,
         )
 

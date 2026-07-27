@@ -110,8 +110,6 @@ def _user_has_flag(flag_name: str) -> bool:
 _libtpu_extra_args: list[str] = []
 
 
-
-
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
@@ -127,11 +125,10 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
-if _libtpu_extra_args:
-    _assembled = " ".join(_libtpu_extra_args)
-    if _existing_libtpu_args:
-        _assembled = _assembled + " " + _existing_libtpu_args
-    os.environ["LIBTPU_INIT_ARGS"] = _assembled
+_assembled = " ".join(_libtpu_extra_args)
+if _existing_libtpu_args:
+    _assembled = _assembled + (" " if _assembled else "") + _existing_libtpu_args
+os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
 def _patch_jax_pallas_fori_lowering() -> None:

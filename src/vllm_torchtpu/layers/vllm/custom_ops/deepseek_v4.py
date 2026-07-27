@@ -34,9 +34,10 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 def check_nan(name: str, tensor: torch.Tensor, prefix: str):
     if tensor is None:
         return
-    is_fake = (tensor.device.type == "meta" or
-               type(tensor).__name__ == "FakeTensor" or
-               (hasattr(torch, "compiler") and torch.compiler.is_compiling()))
+    if (hasattr(torch, "_dynamo") and torch._dynamo.is_compiling()) or (hasattr(torch, "compiler") and torch.compiler.is_compiling()):
+        return
+    is_fake = (tensor.device.type in ("meta", "cpu") or
+               type(tensor).__name__ in ("FakeTensor", "SymbolicVariable", "TensorVariable"))
     if not is_fake:
         # isnan/isinf are not implemented for Float8 types; cast to float32 first.
         is_float8 = (tensor.dtype == torch.float8_e4m3fn or tensor.dtype == torch.float8_e5m2)
@@ -822,7 +823,10 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         )
 
 
-class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLayerBase):
+_orig_ds_v4_attention_cls = ds_v4_amd_model.DeepseekV4Attention
+
+
+class VllmDeepseekV4MLAAttention(AttentionLayerBase, ds_v4_amd_model.DeepseekV4Attention):
 
     def __init__(
         self,
@@ -841,7 +845,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
         dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
         try:
-            super().__init__(
+            _orig_ds_v4_attention_cls.__init__(
+                self,
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
@@ -912,12 +917,17 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
         two_caches_same_buffer = not swa_only
-        logical_page_size = self.mla_attn.swa_cache_layer.block_size if self.mla_attn.swa_cache_layer is not None else 0
+        swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
+        logical_page_size = (
+            swa_cache.block_size
+            if (swa_cache is not None and getattr(swa_cache, "block_size", 0) > 0)
+            else 16
+        )
         
         wrapped_fn = functools.partial(
             _deepseek_v4_attention_jax,
             mesh=mesh,
-            sm_scale=self.mla_attn.scale,
+            sm_scale=getattr(self.mla_attn, "scale", getattr(self, "scale", 1.0 / (128 + 64)**0.5)),
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
             swa_only=swa_only,
@@ -975,8 +985,8 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
     def attn_gemm(self, hidden_states):
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
 
-        if self.mla_attn.compressor is not None:
-            compressor = self.mla_attn.compressor
+        compressor = getattr(self.mla_attn, "compressor", None)
+        if compressor is not None:
             kv_score = hidden_states @ compressor.fused_wkv_wgate.weight.T
         else:
             kv_score = None
@@ -1031,24 +1041,23 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             positions: torch.Tensor,
             out: torch.Tensor,
     ) -> torch.Tensor:
-        import os
-        print(f"[DEBUG_SHAPES] pid={os.getpid()} qr shape={list(qr.shape)} | n_local_heads={self.mla_attn.n_local_heads} head_dim={self.mla_attn.head_dim}", flush=True)
         q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
-        print(f"[DEBUG_SHAPES] pid={os.getpid()} after rope q shape={list(q.shape)} kv shape={list(kv.shape)}", flush=True)
         check_nan("q (after rope)", q, self.custom_prefix)
         check_nan("kv (after rope)", kv, self.custom_prefix)
 
         topk_indices = None
+        compressor = getattr(self.mla_attn, "compressor", None)
         if self.indexer is not None:
-            assert self.mla_attn.compressor is not None
+            indexer_emb = getattr(self.mla_attn, "indexer_rotary_emb", getattr(self.mla_attn, "rotary_emb", None))
             topk_indices = self.indexer(hidden_states, qr, indexer_kv_score,
                                         indexer_weights, positions,
-                                        self.mla_attn.indexer_rotary_emb)
-            self.mla_attn.compressor(kv_score, positions, self.mla_attn.rotary_emb)
-        elif self.mla_attn.compressor is not None:
-            self.mla_attn.compressor(kv_score, positions, self.mla_attn.rotary_emb)
+                                        indexer_emb)
+            if compressor is not None:
+                compressor(kv_score, positions, self.mla_attn.rotary_emb)
+        elif compressor is not None:
+            compressor(kv_score, positions, self.mla_attn.rotary_emb)
 
         res = self.forward_mqa(
             q,
@@ -1097,9 +1106,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         rank = get_tensor_model_parallel_rank()
         attn_ctx = get_forward_context().attn_metadata
+        main_prefix = getattr(self.mla_attn, "prefix", getattr(self, "custom_prefix", ""))
         if rank == 0 and not hasattr(self, "_printed_ctx_keys"):
             self._printed_ctx_keys = True
-            print(f"[DEBUG_ATTN_CTX_TYPE] prefix={self.mla_attn.prefix} type={type(attn_ctx)} val={attn_ctx}", flush=True)
+            print(f"[DEBUG_ATTN_CTX_TYPE] prefix={main_prefix} type={type(attn_ctx)} val={attn_ctx}", flush=True)
 
         def _get_field(meta, field_name):
             if meta is None:
@@ -1109,10 +1119,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             return getattr(meta, field_name, None)
 
         if isinstance(attn_ctx, dict):
-            swa_layer_name = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "prefix", self.mla_attn.prefix)
-            swa_attn_metadata = attn_ctx.get(swa_layer_name, attn_ctx.get(self.mla_attn.prefix, next(iter(attn_ctx.values()), None)))
+            swa_layer_name = getattr(getattr(self.mla_attn, "swa_cache_layer", None), "prefix", main_prefix)
+            swa_attn_metadata = attn_ctx.get(swa_layer_name, attn_ctx.get(main_prefix, next(iter(attn_ctx.values()), None)))
             compressor_state_prefix = getattr(getattr(getattr(self.mla_attn, "compressor", None), "state_cache", None), "prefix", None)
-            main_layer_name = self.mla_attn.prefix
+            main_layer_name = main_prefix
             main_attn_metadata = attn_ctx.get(compressor_state_prefix) or attn_ctx.get(main_layer_name) or swa_attn_metadata
         else:
             swa_attn_metadata = attn_ctx
@@ -1163,16 +1173,12 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention, AttentionLa
             max_valid_kv = ((positions + 1).to(torch.int32) // self.compress_ratio).unsqueeze(1)
             extra = torch.where((topk_indices >= 0) & (topk_indices < max_valid_kv), topk_indices, torch.full_like(topk_indices, -1))
         else:
-            extra = torch.clamp((positions + 1).to(torch.int32) // self.compress_ratio, min=1)
+            extra = (positions + 1).to(torch.int32) // self.compress_ratio
             
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         rank = get_tensor_model_parallel_rank()
         if rank == 0:
-            kv_lens_str = main_kv_lens.tolist() if main_kv_lens is not None else "None"
-            print(f"[DEBUG_ATTN_INPUTS] prefix={self.custom_prefix} main_cache_kv.shape={list(main_cache_kv.shape)} mean={main_cache_kv.to(torch.float32).mean().item():.6f} is_csa={is_csa} extra.shape={list(extra.shape)} extra_min={extra.min().item()} extra_max={extra.max().item()} main_kv_lens={kv_lens_str}", flush=True)
-
-        if rank == 0:
-            print(f"[DEBUG_FORWARD_MQA_CACHES] prefix={self.mla_attn.prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}", flush=True)
+            print(f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}", flush=True)
         output, new_sw_cache = self.attn_op(
             q,
             kv,
@@ -1297,8 +1303,6 @@ def patch_deepseek_v4_mla_cls() -> None:
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
     if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
         ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention
-    if hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
-        ds_v4_amd_model.DeepseekV4MLAAttention = VllmDeepseekV4MLAAttention
     dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
     logger.info(
         "Patched DeepseekV4Attention, DeepseekV4ROCMAiterMLAAttention and DeepseekV4SWACache for TPU."

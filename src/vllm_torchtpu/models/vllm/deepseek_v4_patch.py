@@ -127,6 +127,33 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     except ImportError:
         pass
 
+    # Patch tpu_inference unquantized weight post-processing methods to avoid JAX sharding
+    try:
+        import tpu_inference.layers.vllm.quantization.unquantized as tpu_unquant
+        tpu_unquant.VllmUnquantizedEmbeddingMethod.process_weights_after_loading = lambda self, layer: None
+        tpu_unquant.VllmUnquantizedLinearMethod.process_weights_after_loading = lambda self, layer: None
+    except Exception:
+        pass
+
+    # Patch tpu_inference model wrapper context to prevent Dynamo data-dependent assert errors
+    try:
+        import tpu_inference.models.vllm.vllm_model_wrapper_context as vmwc
+        class _DummyWrapperContext:
+            mesh = None
+        vmwc.get_vllm_model_wrapper_context = lambda: _DummyWrapperContext()
+    except Exception:
+        pass
+
+    try:
+        import tpu_inference.layers.vllm.custom_ops.fused_moe as tpu_fused_moe
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+        tpu_fused_moe.get_vllm_model_wrapper_context = lambda: _DummyWrapperContext()
+        def _patched_maybe_reduce_final_output(self, states, trunc_size):
+            return MoERunner._maybe_reduce_final_output(self, states, trunc_size)
+        tpu_fused_moe.VllmMoERunner._maybe_reduce_final_output = _patched_maybe_reduce_final_output
+    except Exception:
+        pass
+
     # Patch vllm.distributed.parallel_state to reflect the TPU sharding strategy (TP vs EP)
     import vllm.distributed.parallel_state as ps
     import vllm.model_executor.layers.fused_moe.config as fmc
@@ -174,6 +201,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _orig_apply_quant_method = MoERunner._apply_quant_method
 
     def patched_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids=None):
+        if (hasattr(torch, "compiler") and torch.compiler.is_compiling()) or (hasattr(torch, "_dynamo") and torch._dynamo.is_compiling()):
+            return _orig_apply_quant_method(self, layer, hidden_states, router_logits, shared_experts_input, input_ids)
         layer_idx = getattr(layer, "layer_idx", -1)
         if layer_idx in (0, 3, 4):
             hs_cpu = hidden_states.cpu().float()
@@ -688,17 +717,19 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 *args,
                 **kwargs
             )
-            if not torch.compiler.is_compiling() and isinstance(res, torch.Tensor):
+            is_compiling = (hasattr(torch, "compiler") and torch.compiler.is_compiling()) or (hasattr(torch, "_dynamo") and torch._dynamo.is_compiling())
+            if not is_compiling and isinstance(res, torch.Tensor):
                 print(f"[DEBUG_FORWARD_RES] pid={os.getpid()} res shape={list(res.shape)} dtype={res.dtype} mean={res.float().mean().item():.6f} abs_mean={res.float().abs().mean().item():.6f}", file=sys.stderr, flush=True)
             return res
 
         _AmdDeepseekV4ForCausalLM.forward = patched_amd_forward
 
         def patched_compute_logits(self, hidden_states: torch.Tensor):
-            if not torch.compiler.is_compiling():
+            is_compiling = (hasattr(torch, "compiler") and torch.compiler.is_compiling()) or (hasattr(torch, "_dynamo") and torch._dynamo.is_compiling())
+            if not is_compiling:
                 print(f"[DEBUG_COMPUTE_LOGITS_IN] pid={os.getpid()} hs shape={list(hidden_states.shape)} mean={hidden_states.float().mean().item():.6f} abs_mean={hidden_states.float().abs().mean().item():.6f}", file=sys.stderr, flush=True)
             logits = self.logits_processor(self.lm_head, hidden_states)
-            if not torch.compiler.is_compiling() and logits is not None:
+            if not is_compiling and logits is not None:
                 print(f"[DEBUG_COMPUTE_LOGITS_OUT] pid={os.getpid()} logits shape={list(logits.shape)} mean={logits.float().mean().item():.6f} abs_mean={logits.float().abs().mean().item():.6f} min={logits.float().min().item():.6f} max={logits.float().max().item():.6f}", file=sys.stderr, flush=True)
             return logits
 
@@ -915,8 +946,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     print(f"[NAN_DETECTION_DETAIL]   res_dbg: mean={res_dbg.to(torch.float32).mean().item():.6f} min={res_dbg.to(torch.float32).min().item():.6f} max={res_dbg.to(torch.float32).max().item():.6f}", flush=True)
         return res
 
-    MHCPreOp.forward_native = debug_mhc_pre_native
-    MHCPostOp.forward_native = debug_mhc_post_native
+    # MHCPreOp.forward_native = debug_mhc_pre_native
+    # MHCPostOp.forward_native = debug_mhc_post_native
 
     # 6. Patch bind_kv_cache to bypass TPU platform NotImplementedError
     import vllm.v1.worker.utils as worker_utils

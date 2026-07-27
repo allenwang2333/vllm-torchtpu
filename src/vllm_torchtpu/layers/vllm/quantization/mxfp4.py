@@ -94,45 +94,51 @@ logger = init_logger(__name__)
 _orig_weight_loader = FusedMoE.weight_loader
 
 def patched_fused_moe_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
-    if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2"):
-        if "scale" in weight_name:
+    print(f"[DEBUG_LOADER_CALL] weight_name={weight_name} shard_id={shard_id} expert_id={expert_id} param_shape={list(param.shape)} loaded_shape={list(loaded_weight.shape)}", flush=True)
+    orig_tp_rank = self.moe_parallel_config.tp_rank
+    self.moe_parallel_config.tp_rank = 0
+    try:
+        if hasattr(self, "w1_temp") and shard_id in ("w1", "w3", "w2"):
+            if "scale" in weight_name:
+                return _orig_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
+            if shard_id == "w1":
+                temp_param = self.w1_temp
+                shard_dim = 0
+            elif shard_id == "w3":
+                temp_param = self.w3_temp
+                shard_dim = 0
+            else:
+                temp_param = self.w2_temp
+                shard_dim = 1
+
+            num_local_experts = temp_param.shape[0]
+            experts_start = getattr(self, "expert_start", None)
+            if experts_start is None:
+                experts_start = moe_routing.get_experts_start(self)
+            if experts_start is None:
+                experts_start = 0
+
+            local_expert_id = expert_id - experts_start
+            if local_expert_id < 0 or local_expert_id >= num_local_experts:
+                return True if return_success else None
+
+            expert_data = temp_param.data[local_expert_id]
+
+            if loaded_weight.ndim > 0:
+                shard_size = expert_data.shape[shard_dim]
+                start_offset = shard_size * 0  # Force tp_rank=0 for EP experts sharding
+                narrow_size = min(shard_size, loaded_weight.shape[shard_dim] - start_offset)
+                if narrow_size > 0:
+                    loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+                    if expert_data.shape[shard_dim] > loaded_weight.shape[shard_dim]:
+                        expert_data = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+                    print(f"[DEBUG_LOAD] shard_id={shard_id} expert_id={expert_id} | expert_shape={list(expert_data.shape)} loaded_shape={list(loaded_weight.shape)} shard_dim={shard_dim}", flush=True)
+                    expert_data.copy_(loaded_weight)
             return True if return_success else None
-        if shard_id == "w1":
-            temp_param = self.w1_temp
-            shard_dim = 0
-        elif shard_id == "w3":
-            temp_param = self.w3_temp
-            shard_dim = 0
-        else:
-            temp_param = self.w2_temp
-            shard_dim = 1
 
-        num_local_experts = temp_param.shape[0]
-        experts_start = getattr(self, "expert_start", None)
-        if experts_start is None:
-            experts_start = moe_routing.get_experts_start(self)
-        if experts_start is None:
-            experts_start = 0
-
-        local_expert_id = expert_id - experts_start
-        if local_expert_id < 0 or local_expert_id >= num_local_experts:
-            return True if return_success else None
-
-        expert_data = temp_param.data[local_expert_id]
-
-        if loaded_weight.ndim > 0:
-            shard_size = expert_data.shape[shard_dim]
-            start_offset = shard_size * self.tp_rank
-            narrow_size = min(shard_size, loaded_weight.shape[shard_dim] - start_offset)
-            if narrow_size > 0:
-                loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
-                if expert_data.shape[shard_dim] > loaded_weight.shape[shard_dim]:
-                    expert_data = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
-                print(f"[DEBUG_LOAD] shard_id={shard_id} expert_id={expert_id} | expert_shape={list(expert_data.shape)} loaded_shape={list(loaded_weight.shape)} shard_dim={shard_dim}", flush=True)
-                expert_data.copy_(loaded_weight)
-        return True if return_success else None
-
-    return _orig_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
+        return _orig_weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success)
+    finally:
+        self.moe_parallel_config.tp_rank = orig_tp_rank
 
 FusedMoE.weight_loader = patched_fused_moe_weight_loader
 logger.info("FusedMoE.weight_loader patched locally in VllmMxfp4MoEMethod.")

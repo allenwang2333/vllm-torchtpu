@@ -39,7 +39,48 @@ except Exception as e:
 from vllm import LLM, SamplingParams
 
 
+def check_tpu_device_availability(timeout_seconds=60):
+    """Wait until TPU devices /dev/accel* are free from locks before launching LLM."""
+    import time
+    import glob
+    import subprocess
+    import shutil
+
+    # Clean up stale shared memory and IPC handles first
+    for pattern in ("/tmp/ipc*", "/tmp/psm*", "/tmp/vllm*"):
+        for p in glob.glob(pattern):
+            try:
+                if shutil.os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    shutil.os.remove(p)
+            except Exception:
+                pass
+
+    start_time = time.time()
+    waited = False
+    while time.time() - start_time < timeout_seconds:
+        accel_files = glob.glob("/dev/accel*") + glob.glob("/dev/vfio/*")
+        if not accel_files:
+            break
+        try:
+            res = subprocess.run(["lsof"] + accel_files, capture_output=True, text=True)
+            if res.returncode != 0 or not res.stdout.strip():
+                break
+            print(f"[PREFLIGHT_WAIT] TPU chips busy (locked by background processes). Waiting for teardown...", flush=True)
+            waited = True
+        except Exception:
+            break
+        time.sleep(3)
+
+    if waited:
+        print("[PREFLIGHT_SUCCESS] TPU chips released. Waiting 5s buffer for driver stabilization...", flush=True)
+        time.sleep(5)
+    print("[PREFLIGHT_CHECK] All TPU chips free. Proceeding with LLM initialization.", flush=True)
+
+
 def main():
+    check_tpu_device_availability()
     # Instantiate the LLM. It will automatically use our TPU platform and patches.
     # We use TP=8 to utilize all 8 TPU chips on the v7x-8 node.
     tp_size = int(os.getenv("VLLM_TP_SIZE", "8"))
@@ -65,8 +106,9 @@ def main():
         },
     )
 
+    prompt_content = os.getenv("DSV4_PROMPT", "Explain the difference between XLA and LLVM in one sentence.")
     conversation = [
-        {"role": "user", "content": "Explain the difference between JAX and PyTorch in one sentence."}
+        {"role": "user", "content": prompt_content}
     ]
     
     tokenizer = llm.get_tokenizer()

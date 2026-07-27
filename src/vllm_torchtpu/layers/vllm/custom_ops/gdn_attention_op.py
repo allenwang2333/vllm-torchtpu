@@ -189,7 +189,6 @@ def gdn_attention_core_tpu_pcp_prefill(
     return new_conv_state, new_recurrent_state, output
 
 
-@QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def __init__(self, *args, **kwargs):
@@ -546,3 +545,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+
+
+from vllm.model_executor.custom_op import op_registry_oot
+
+if "QwenGatedDeltaNetAttention" not in op_registry_oot:
+    QwenGatedDeltaNetAttention.register_oot(VllmGatedDeltaNetAttention)
+

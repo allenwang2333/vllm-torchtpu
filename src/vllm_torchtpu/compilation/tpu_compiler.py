@@ -360,3 +360,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn = unwrap_fn
 
         return compiled_fn
+
+
+def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+    compiler = TpuCompilerAdaptor(vllm_config)
+    return compiler.compute_hash(vllm_config)

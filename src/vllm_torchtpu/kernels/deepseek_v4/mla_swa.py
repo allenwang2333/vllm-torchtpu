@@ -28,8 +28,11 @@ DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
+    if isinstance(b, (int, float)):
+        if b == 0:
+            return 0
+        return (a + b - 1) // b
+    return jnp.where(b != 0, (a + jnp.maximum(1, b) - 1) // jnp.maximum(1, b), 0)
 
 
 def align_to(x, a):
@@ -157,6 +160,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
+        kv = jnp.where(jnp.isnan(kv) | jnp.isinf(kv), 0.0, kv)
         head_l_ref = l_ref.at[:q.shape[0]]
         head_m_ref = m_ref.at[:q.shape[0]]
         head_acc_ref = acc_ref.at[:q.shape[0]]
@@ -176,7 +180,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
 
         s = jnp.where(mask, mask_value, s)
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
+        if s.shape[1] == 0:
+            s_rowmax = jnp.full((s.shape[0], 1), -jnp.inf, dtype=s.dtype)
+        else:
+            s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
@@ -675,6 +682,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def broadcast_minor(src, shape):
         if src.shape == shape:
             return src
+        if shape[-1] == 0:
+            return jnp.zeros(shape, dtype=src.dtype)
         assert src.shape[:-1] == shape[:-1]
         assert src.shape[-1] % 128 == 0
         target_minor = align_to(shape[-1], src.shape[-1])
@@ -1050,6 +1059,8 @@ def mla_sliding_window_ragged_paged_attention(
 
     _, physical_page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     physical_page_size = physical_page_size_per_kv_packing * kv_packing
+    if logical_page_size <= 0:
+        logical_page_size = kv_packing
     assert logical_page_size <= physical_page_size
     assert logical_page_size % kv_packing == 0
     page_size_per_kv_packing = logical_page_size // kv_packing
@@ -1280,7 +1291,7 @@ def mla_sliding_window_ragged_paged_attention(
             in_l=out_l,
             in_m=out_m,
             attention_sinks=attention_sinks,
-            static_q_len=chunk_prefill_size,
+            static_q_len=min(chunk_prefill_size, q.shape[0]),
             unnormalized_output=unnormalized_output,
             case=MlaCase.PREFILL,
         )

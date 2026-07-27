@@ -27,8 +27,11 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
+    if isinstance(b, (int, float)):
+        if b == 0:
+            return 0
+        return (a + b - 1) // b
+    return jnp.where(b != 0, (a + jnp.maximum(1, b) - 1) // jnp.maximum(1, b), 0)
 
 
 def align_to(x, a):

@@ -118,3 +118,7 @@ class VllmQuantConfig:
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
         moe_config.moe_parallel_config.use_ep = use_ep
         return moe_config
+
+    @property
+    def mesh(self):
+        return None
