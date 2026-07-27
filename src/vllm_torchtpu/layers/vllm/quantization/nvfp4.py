@@ -358,6 +358,21 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                 renormalize=layer.renormalize,
                 scoring_fn=layer.scoring_func,
             )
+        # SEPP Optimization Integration
+        if not hasattr(self, "sepp_router"):
+            self.sepp_router = moe_routing.SortedExpertProfileRouter(
+                num_experts=layer.moe_config.num_experts,
+                total_tokens=x.shape[0],
+                top_k=layer.moe_config.experts_per_token
+            )
+
+        _, static_profile, phys_to_profile_map = self.sepp_router.route_and_generate_indices(topk_ids)
+        
+        static_profile_tuple = tuple(static_profile)
+        map_tensor = torch.zeros(layer.moe_config.num_experts, dtype=torch.int32, device=x.device)
+        for phys, prof in phys_to_profile_map.items():
+            map_tensor[phys] = prof
+
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -371,6 +386,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            sepp_static_profile=static_profile_tuple,
+            phys_to_profile_map=map_tensor,
         )
 
 

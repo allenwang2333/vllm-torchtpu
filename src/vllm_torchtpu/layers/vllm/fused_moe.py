@@ -78,6 +78,7 @@ def _build_fused_moe_custom_op(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    sepp_static_profile: Optional[tuple] = None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -97,7 +98,8 @@ def _build_fused_moe_custom_op(
         activation=activation,
         use_ep=experts_start is not None,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD)
+        onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
+        sepp_static_profile=sepp_static_profile)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -118,8 +120,9 @@ def _get_fused_moe_custom_op(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    sepp_static_profile: Optional[tuple] = None,
 ):
-    cache_key = (topk, activation, experts_start)
+    cache_key = (topk, activation, experts_start, sepp_static_profile)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -127,6 +130,7 @@ def _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         experts_start=experts_start,
+        sepp_static_profile=sepp_static_profile,
     )
 
 
@@ -157,6 +161,8 @@ def fused_moe_gmm(
     experts_start: Optional[int],
     topk: int,
     activation: str,
+    sepp_static_profile: Optional[tuple] = None,
+    phys_to_profile_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -171,7 +177,12 @@ def fused_moe_gmm(
         topk=topk,
         activation=activation,
         experts_start=experts_start,
+        sepp_static_profile=sepp_static_profile,
     )
+    
+    if phys_to_profile_map is None:
+        phys_to_profile_map = torch.empty((0,), dtype=torch.int32, device=hidden_states.device)
+        
     return fused_moe(
         hidden_states,
         w1,
@@ -182,4 +193,5 @@ def fused_moe_gmm(
         w2_bias,
         topk_weights,
         topk_ids,
+        phys_to_profile_map,
     )

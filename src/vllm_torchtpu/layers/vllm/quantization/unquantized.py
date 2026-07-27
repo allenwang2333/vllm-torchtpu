@@ -272,6 +272,11 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
         _, static_profile, phys_to_profile_map = self.sepp_router.route_and_generate_indices(topk_ids)
+        
+        static_profile_tuple = tuple(static_profile)
+        map_tensor = torch.zeros(layer.moe_config.num_experts, dtype=torch.int32, device=x.device)
+        for phys, prof in phys_to_profile_map.items():
+            map_tensor[phys] = prof
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
@@ -288,4 +293,6 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            sepp_static_profile=static_profile_tuple,
+            phys_to_profile_map=map_tensor,
         )

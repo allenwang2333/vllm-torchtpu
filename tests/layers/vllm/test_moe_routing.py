@@ -86,3 +86,62 @@ def test_validate_linear_ep_placement_rejects_round_robin():
     with pytest.raises(NotImplementedError, match="linear EP placement"):
         moe_routing.validate_linear_ep_placement(
             SimpleNamespace(expert_placement_strategy="round_robin"))
+
+import torch
+
+def test_sepp_router_profile_generation():
+    router = moe_routing.SortedExpertProfileRouter(num_experts=4, total_tokens=100, top_k=2, alignment=16)
+    profile = router.static_profile
+    assert len(profile) == 4
+    # Profile should be sorted in descending order
+    assert profile == sorted(profile, reverse=True)
+    # All capacities must be aligned to 16
+    for cap in profile:
+        assert cap % 16 == 0
+
+def test_sepp_router_route_and_generate_indices():
+    router = moe_routing.SortedExpertProfileRouter(num_experts=4, total_tokens=4, top_k=2, alignment=16)
+    
+    # Simulate topk_ids where expert 2 is hottest, 0 is second, 3 is third, 1 is coldest
+    topk_ids = torch.tensor([
+        [2, 0],
+        [2, 0],
+        [2, 3],
+        [3, 1]
+    ])
+    
+    actual_counts, static_profile, phys_to_profile_map = router.route_and_generate_indices(topk_ids)
+    
+    # Check actual counts:
+    # Expert 0: 2 tokens
+    # Expert 1: 1 token
+    # Expert 2: 3 tokens
+    # Expert 3: 2 tokens
+    # Sorted actual counts should be [3, 2, 2, 1]
+    assert actual_counts.tolist() == [3, 2, 2, 1]
+    
+    # Hottest expert 2 -> profile index 0
+    # Next experts 0 and 3 -> profile index 1 and 2 (order can vary depending on sorting stability, but 2 should be index 0)
+    assert phys_to_profile_map[2] == 0
+    assert phys_to_profile_map[1] == 3
+
+def test_sepp_router_with_out_of_bound_ids():
+    router = moe_routing.SortedExpertProfileRouter(num_experts=4, total_tokens=4, top_k=2, alignment=16)
+    
+    # Simulate padded IDs (-1) and out-of-bound IDs (99)
+    topk_ids = torch.tensor([
+        [2, -1],
+        [99, 0],
+        [2, 3],
+        [3, -1]
+    ])
+    
+    actual_counts, static_profile, phys_to_profile_map = router.route_and_generate_indices(topk_ids)
+    
+    # Valid tokens: [2, 0, 2, 3, 3] -> Expert 2: 2, Expert 3: 2, Expert 0: 1, Expert 1: 0
+    assert actual_counts.tolist() == [2, 2, 1, 0]
+    
+    # It shouldn't crash and the returned arrays should correctly reflect valid distributions
+    assert len(phys_to_profile_map) == 4
+    for phys_id in phys_to_profile_map.keys():
+        assert 0 <= phys_id < 4

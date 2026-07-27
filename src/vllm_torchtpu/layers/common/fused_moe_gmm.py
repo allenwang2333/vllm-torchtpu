@@ -95,12 +95,14 @@ def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
     topk_weights_local: jax.Array,
+    phys_to_profile_map: jax.Array,
     *,
     local_num_experts: int,
     topk: int,
     use_ep: bool,
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
+    sepp_static_profile: tuple | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -124,32 +126,60 @@ def prepare_routed_gmm_inputs(
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
+    actual_group_sizes = (jax.nn.one_hot(
         topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
+                         valid_mask[:, None].astype(jnp.int32)).sum(axis=0)
 
-    if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
-            # Use one-hot matmul for permutation, which can be faster
-            # for small batch size
-            onehot = jax.nn.one_hot(token_indices_sorted,
-                                    num_tokens_local,
-                                    dtype=hidden_states_local.dtype)
-            x = onehot @ hidden_states_local
-        else:
-            # Match uLLM/reference EP routing: materialize the valid local
-            # expert prefix through SparseCore ragged_gather. Invalid
-            # non-local rows are sorted after the valid prefix.
-            valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            x = ragged_gather_v2(
-                hidden_states_local,
-                token_indices_sorted,
-                jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
-            )
+    if sepp_static_profile is not None:
+        static_profile_arr = jnp.array(sepp_static_profile, dtype=jnp.int32)
+        group_sizes_local = static_profile_arr[phys_to_profile_map]
+        total_padded_tokens = sum(sepp_static_profile)
+        
+        dynamic_offsets = jnp.cumsum(jnp.pad(actual_group_sizes, (1, 1)))[:-1]
+        static_offsets = jnp.cumsum(jnp.pad(group_sizes_local, (1, 1)))[:-1]
+        
+        sorted_expert_ids = sort_keys[sorted_indices]
+        local_idx_within_expert = jnp.arange(token_indices_sorted.shape[0]) - dynamic_offsets[sorted_expert_ids]
+        target_positions = static_offsets[sorted_expert_ids] + local_idx_within_expert
+        
+        is_valid_sorted = sorted_expert_ids < local_num_experts
+        target_positions = jnp.where(is_valid_sorted, target_positions, total_padded_tokens)
+        
+        padded_token_indices = jnp.full((total_padded_tokens + 1,), -1, dtype=jnp.int32)
+        padded_token_indices = padded_token_indices.at[target_positions].set(
+            jnp.where(is_valid_sorted, token_indices_sorted, -1)
+        )
+        padded_token_indices = padded_token_indices[:-1]
+        
+        x = jnp.where(
+            jnp.expand_dims(padded_token_indices >= 0, -1),
+            hidden_states_local[padded_token_indices],
+            0
+        )
+        argsort_revert_indices = target_positions[argsort_revert_indices]
     else:
-        x = hidden_states_local[token_indices_sorted]
+        group_sizes_local = actual_group_sizes
+        if use_ep and use_sparse_core:
+            if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+                # Use one-hot matmul for permutation, which can be faster
+                # for small batch size
+                onehot = jax.nn.one_hot(token_indices_sorted,
+                                        num_tokens_local,
+                                        dtype=hidden_states_local.dtype)
+                x = onehot @ hidden_states_local
+            else:
+                # Match uLLM/reference EP routing: materialize the valid local
+                # expert prefix through SparseCore ragged_gather. Invalid
+                # non-local rows are sorted after the valid prefix.
+                valid_count = group_sizes_local.sum(dtype=jnp.int32)
+                x = ragged_gather_v2(
+                    hidden_states_local,
+                    token_indices_sorted,
+                    jnp.array([0], dtype=jnp.int32),
+                    valid_count[None],
+                )
+        else:
+            x = hidden_states_local[token_indices_sorted]
     return (x, group_sizes_local, argsort_revert_indices, topk_weights_flat,
             valid_mask)
 
@@ -255,12 +285,14 @@ def fused_moe_func(
     w2_bias: jax.Array | None,
     topk_weights: jax.Array,
     topk_ids: jax.Array,
+    phys_to_profile_map: jax.Array,
     experts_start: int | None = None,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
     use_sparse_core: bool = True,
     onehot_moe_permute_threshold: int = 0,
+    sepp_static_profile: tuple | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -298,11 +330,13 @@ def fused_moe_func(
          hidden_states,
          topk_ids,
          topk_weights,
+         phys_to_profile_map,
          local_num_experts=w1.shape[0],
          topk=topk,
          use_ep=use_ep,
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+         sepp_static_profile=sepp_static_profile,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
