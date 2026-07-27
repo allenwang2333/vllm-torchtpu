@@ -56,4 +56,4 @@ def mamba_state_copy(state: torch.Tensor, src: torch.Tensor,
                      dst: torch.Tensor) -> None:
     """In-place `state[dst] = state[src]` along dim 0 with buffer donation."""
     ensure_op_built()
-    state.copy_(_mamba_state_copy_op(state, src, dst))
+    _mamba_state_copy_op(state, src, dst)

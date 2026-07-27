@@ -46,4 +46,4 @@ def ensure_op_built() -> None:
 def gdn_state_copy(state: torch.Tensor, new_state: torch.Tensor) -> None:
     """In-place state copy out-of-band via Pallas."""
     ensure_op_built()
-    state.copy_(_gdn_state_copy_op(state, new_state))
+    _gdn_state_copy_op(state, new_state)
