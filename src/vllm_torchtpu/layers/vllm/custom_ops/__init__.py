@@ -14,8 +14,6 @@
 
 from vllm_torchtpu.layers.vllm.custom_ops import \
     gdn_attention_op as gdn_attention_op
-from vllm_torchtpu.layers.vllm.custom_ops import \
-    gdn_state_copy_op as gdn_state_copy_op
 
 
 def _register_custom_ops() -> None:

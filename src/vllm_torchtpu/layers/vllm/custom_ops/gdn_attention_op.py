@@ -36,7 +36,6 @@ from vllm_torchtpu.layers.common.sequence_layout import \
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 from vllm_torchtpu.utils import get_dp_size
-from vllm_torchtpu.layers.vllm.custom_ops.gdn_state_copy_op import gdn_state_copy
 
 
 def gdn_attention_core_tpu(
@@ -225,7 +224,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             gdn_jax_op = pallas.jax_op(
                 op_name,
                 wrapped_fn,
-                donate_argnums=(3, 4),
                 mesh=pcp_mesh,
                 input_partition_specs=input_partition_specs,
             )
@@ -255,8 +253,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 dp_enabled=dp_enabled,
             )
             gdn_jax_op = pallas.jax_op(op_name,
-                                       wrapped_fn,
-                                       donate_argnums=(3, 4))
+                                       wrapped_fn)
 
             def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state,
                           *args, **kwargs):
@@ -292,8 +289,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 outputs = outputs.reshape(-1,
                                           local_num_v_heads * self.head_v_dim)
 
-            gdn_state_copy(conv_state, new_conv)
-            gdn_state_copy(recurrent_state, new_rec)
 
             return outputs
 
