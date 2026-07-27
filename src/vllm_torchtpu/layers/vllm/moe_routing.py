@@ -14,6 +14,106 @@
 """Routing helpers for TPU local MoE kernels."""
 
 import torch
+from typing import List, Tuple, Dict
+
+class SortedExpertProfileRouter:
+    """
+    Sorted-Expert Profile Padding (SEPP) routing algorithm tailored for TPU static graphs.
+    """
+    def __init__(self, num_experts: int, total_tokens: int, top_k: int, alignment: int = 32):
+        self.num_experts = num_experts
+        self.total_tokens = total_tokens
+        self.top_k = top_k
+        self.alignment = alignment
+        
+        # 1. Initialize a default static profile based on typical power-law distribution
+        self.static_profile = self._generate_default_profile()
+        print(f"[SEPP] Static descending bucket profile initialized successfully: {self.static_profile} (Total capacity: {sum(self.static_profile)})")
+
+    def _generate_default_profile(self) -> List[int]:
+        """
+        Generate a highly utilized, asymmetric descending static profile based on total token count, aligned to TPU memory boundaries.
+        """
+        max_assignments = self.total_tokens * self.top_k
+        profile = []
+        remaining = max_assignments
+        decay_factor = 0.65  # Simulated skewness factor for MoE routing
+        
+        for i in range(self.num_experts):
+            if i == self.num_experts - 1:
+                cap = remaining
+            else:
+                cap = int(remaining * (1 - decay_factor))
+                remaining -= cap
+            
+            # Align to optimal byte boundaries for TPU HBM transfers (usually 16 or 32)
+            aligned_cap = ((cap + self.alignment - 1) // self.alignment) * self.alignment
+            profile.append(max(aligned_cap, self.alignment))
+            
+        profile.sort(reverse=True)
+        return profile
+
+    def calibrate_profile_offline(self, history_counts: List[List[int]], percentile: float = 99.5):
+        """
+        [Optional advanced feature] Offline profile calibration using actual distribution history from warm-up runs.
+        """
+        sorted_history = [sorted(step, reverse=True) for step in history_counts]
+        transposed = list(zip(*sorted_history))
+        
+        calibrated_profile = []
+        for rank_history in transposed:
+            rank_tensor = torch.tensor(rank_history, dtype=torch.float32)
+            val = torch.quantile(rank_tensor, percentile / 100.0).item()
+            aligned_val = ((int(val) + self.alignment - 1) // self.alignment) * self.alignment
+            calibrated_profile.append(max(aligned_val, self.alignment))
+            
+        calibrated_profile.sort(reverse=True)
+        self.static_profile = calibrated_profile
+        print(f"[SEPP] Profile boundaries updated via warm-up history calibration: {self.static_profile}")
+
+    def route_and_generate_indices(self, topk_ids: torch.Tensor) -> Tuple[torch.Tensor, List[int], Dict[int, int]]:
+        """
+        Generate the static profile index mapping based on current step routing results.
+        
+        Input:
+            topk_ids: Shape [total_tokens, top_k], top-K physical expert IDs selected by each token
+        Returns:
+            sorted_actual_counts: Sorted physical expert token counts for current step
+            static_profile: Unchanged static graph compilation shape
+            physical_to_profile_map: Dictionary mapping physical expert ID to profile slot index (used for permutation phase)
+        """
+        # Step 1: Count the actual number of tokens assigned to each physical expert in the current step
+        flat_gates = topk_ids.flatten()
+        actual_counts = torch.bincount(flat_gates, minlength=self.num_experts)
+        
+        # Step 2: Sort in descending order to identify the hottest and coldest experts
+        sorted_actual_counts, sorted_expert_ids = torch.sort(actual_counts, descending=True)
+        
+        # Step 3: Create mapping dictionary
+        # e.g.: sorted_expert_ids[0] (hottest physical expert) -> Maps to profile index 0 (largest capacity)
+        #       sorted_expert_ids[-1] (coldest physical expert) -> Maps to profile index 7 (smallest capacity)
+        physical_to_profile_map = {
+            expert_id.item(): profile_idx 
+            for profile_idx, expert_id in enumerate(sorted_expert_ids)
+        }
+        
+        # Step 4: Calculate and output overflow rate monitoring (verifies if any physical expert exceeds mapped slot static capacity)
+        overflow_tokens = 0
+        for i, phys_id in enumerate(sorted_expert_ids):
+            actual = sorted_actual_counts[i].item()
+            allocated = self.static_profile[i]
+            if actual > allocated:
+                overflow_tokens += (actual - allocated)
+                
+        if overflow_tokens > 0:
+            overflow_rate = (overflow_tokens / flat_gates.numel()) * 100
+            # Print low-frequency warning only when there is a risk of token dropping
+            if overflow_rate > 1.0:
+                print(f"[SEPP WARNING] Communication overflow detected! Overflow tokens: {overflow_tokens} ({overflow_rate:.2f}%), suggest fine-tuning profile.")
+                
+        return sorted_actual_counts, self.static_profile, physical_to_profile_map
+
+import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger

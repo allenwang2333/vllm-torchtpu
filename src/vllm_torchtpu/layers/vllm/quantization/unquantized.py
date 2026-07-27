@@ -263,6 +263,16 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer=layer,
             )
 
+        # SEPP Optimization Integration
+        if not hasattr(self, "sepp_router"):
+            self.sepp_router = moe_routing.SortedExpertProfileRouter(
+                num_experts=layer.moe_config.num_experts,
+                total_tokens=x.shape[0],
+                top_k=layer.moe_config.experts_per_token
+            )
+
+        _, static_profile, phys_to_profile_map = self.sepp_router.route_and_generate_indices(topk_ids)
+
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
         return fused_moe_gmm(
