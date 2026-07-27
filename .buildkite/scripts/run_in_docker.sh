@@ -104,6 +104,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
+  -e VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-600000}" \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \

@@ -7,7 +7,7 @@ DATA_PARALLELISM=1
 ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="1024:1024"
-CONCURRENCY_OPTIONS="64"
+CONCURRENCY_OPTIONS="32"
 RANDOM_RANGE_RATIO="0.8"
 # Reserve 25% HBM headroom (GPU_MEMORY_UTILIZATION=0.75) to accommodate large multimodal vision XLA compilation
 # scratch buffers at max-model-len 4096 without triggering PjRt TPU HBM OOM crashes.
@@ -18,4 +18,5 @@ IS_MULTIMODAL=true
 MAX_MODEL_LEN=4096
 EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --generation-config vllm"
 MMMU_LIMIT="${MMMU_LIMIT:-100}"
+MMMU_CONCURRENCY="${MMMU_CONCURRENCY:-32}"
 RUN_EVALPLUS=0

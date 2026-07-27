@@ -16,6 +16,7 @@ x-perf-eval-defaults: &perf_eval_defaults
   env:
     MODEL_IMPL_TYPE: "vllm"
     BENCHMARK_WARMUP_RUNS: "1"
+    VLLM_RPC_TIMEOUT: "600000"
 
 steps:
   - group: "Perf and Eval on TPU"
