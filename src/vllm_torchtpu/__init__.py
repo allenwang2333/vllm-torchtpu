@@ -346,6 +346,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
                 binding.pcp_local_rank_remap,
                 binding.pcp_remap_source,
             )
+        _patch_tpu_platform_mem_get_info()
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
@@ -362,14 +363,11 @@ def _patch_tpu_platform_mem_get_info() -> None:
     """
     try:
         from vllm.platforms import current_platform
-        if not hasattr(
-                current_platform,
-                "mem_get_info") or current_platform.mem_get_info is None:
-            current_platform.mem_get_info = lambda: (64 * (1024**3), 96 *
-                                                     (1024**3))
-            logger.info(
-                "Applied TPU patch: current_platform.mem_get_info fallback for multimodal models."
-            )
+        current_platform.mem_get_info = lambda *a, **kw: (64 * (1024**3), 96 *
+                                                          (1024**3))
+        logger.info(
+            "Applied TPU patch: current_platform.mem_get_info fallback for multimodal models."
+        )
     except Exception:
         pass
 

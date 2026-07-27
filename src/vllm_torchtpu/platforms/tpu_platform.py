@@ -546,7 +546,18 @@ class TpuPlatform(Platform):
     def mem_get_info(
             cls,
             device: Union[int, str, torch.device] = None) -> Tuple[int, int]:
-        return torch.accelerator.get_memory_info(device)
+        try:
+            info = torch.accelerator.get_memory_info(device)
+            if isinstance(info, dict):
+                total = info.get("total", 96 * (1024**3))
+                free = info.get("free", total - info.get("allocated", 0))
+                return free, total
+            if info is not None and isinstance(
+                    info, (tuple, list)) and len(info) == 2:
+                return info[0], info[1]
+        except Exception:
+            pass
+        return (64 * (1024**3), 96 * (1024**3))
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:

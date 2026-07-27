@@ -324,8 +324,10 @@ def evaluate_sample(sample: Dict, host: str, port: int,
                 f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nAnswer with the option letter directly inside parentheses, e.g. (A). "
-        "Do not include explanations or commentary.")
+        "\n\nPlease analyze the image and question carefully. "
+        "Provide your step-by-step reasoning first, and conclude your answer with "
+        "'Therefore, the correct option is (X)' where X is the option letter of your choice."
+    )
 
     payload = {
         "model":
@@ -347,36 +349,36 @@ def evaluate_sample(sample: Dict, host: str, port: int,
             ],
         }],
         "max_tokens":
-        16,
+        1024,
         "temperature":
         0.0,
     }
 
-    max_retries = 5
+    max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(url, json=payload, timeout=600)
             if resp.status_code == 200:
-                break
+                res_json = resp.json()
+                generated_text = res_json["choices"][0]["message"]["content"]
+                predicted = extract_answer(generated_text,
+                                           options=sample.get("options"))
+                is_correct = predicted == sample["answer"]
+                del img_b64, payload, res_json
+                gc.collect()
+                return is_correct, predicted, sample["answer"]
             print(
-                f"[ERROR-HTTP-{resp.status_code}] Sample {sample.get('id', 'unknown')} attempt {attempt}: {resp.text[:500]}"
+                f"[ERROR-HTTP-{resp.status_code}] Sample {sample.get('id', 'unknown')} attempt {attempt}: {resp.text[:200]}"
             )
-            if attempt == max_retries:
-                raise RuntimeError(
-                    f"HTTP Error {resp.status_code} for sample {sample['id']}: {resp.text[:500]}"
-                )
-        except Exception:
-            if attempt == max_retries:
-                raise
-            time.sleep(3 * attempt)
+        except Exception as e:
+            print(
+                f"[ERROR-EXC] Sample {sample.get('id', 'unknown')} attempt {attempt}: {e}"
+            )
+        time.sleep(2 * attempt)
 
-    res_json = resp.json()
-    generated_text = res_json["choices"][0]["message"]["content"]
-    predicted = extract_answer(generated_text, options=sample.get("options"))
-    is_correct = predicted == sample["answer"]
-    del img_b64, payload, res_json
+    del img_b64, payload
     gc.collect()
-    return is_correct, predicted, sample["answer"]
+    return False, "ERROR", sample["answer"]
 
 
 def main():

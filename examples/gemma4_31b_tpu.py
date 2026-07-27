@@ -2,6 +2,8 @@ import argparse
 import os
 import time
 
+import vllm_torchtpu  # noqa: F401
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 
 from PIL import Image
@@ -40,10 +42,8 @@ def main():
         enforce_eager=True,
         trust_remote_code=True,
         dtype="bfloat16",
-        max_model_len=1024,
-        kv_sharing_fast_prefill=False,
-        attention_backend="CUSTOM",
-        kv_cache_dtype="fp8",
+        max_model_len=2048,
+        gpu_memory_utilization=0.75,
         limit_mm_per_prompt={"image": 1} if args.multimodal else None,
     )
     t_init_end = time.time()
