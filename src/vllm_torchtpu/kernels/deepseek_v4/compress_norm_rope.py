@@ -13,30 +13,27 @@
 # limitations under the License.
 """Compress, norm, RoPE, store DeepSeek-V4 KV cache at compression boundaries.
 
-Shared cache layout (sparse / head_dim=512 path)
--------------------------------------------------
-The compressor *state cache* and the compressed *KV cache* are collapsed into a
-single ``uint8`` ``jax.Array`` shaped like the MLA paged cache::
+Buffer layouts (sparse / head_dim=512 path)
+--------------------------------------------
+The compressor uses two physically separate ``uint8`` buffers:
 
-    [num_pages, page_size // PACKING, PACKING, width]   # PACKING=4, width=640
+* Dedicated compressor state buffer (``state_cache_buf``):
+    [num_state_pages, page_size // PACKING, PACKING, width]   # PACKING=4, width=640
 
-A page holds ``page_size`` (=64) KV row-slots of ``width`` (=640) bytes. Two
-logical caches overlay the same bytes (addressed by independent block tables,
-so their slot namespaces never collide):
+  Used as dedicated scratch memory to aggregate sliding window states without
+  touching real attention KV data.
 
-* Compressed KV -- written here, boundary tokens only, one row-slot per token.
-  The minor dim ``width`` = ``align_to(583, 128)`` = 640. The 583 used bytes are
-  ``[ nope 448 fp8 | rope 128 bf16 | scale 7 e8m0 ]`` and ``[583:640]`` is pad.
+* Compressed KV cache buffer (``cache``):
+    [num_pages, page_size // PACKING, PACKING, width]
 
-* Compressor state -- read here for the window pool. One state token spans
-  ``page_size // state_block_size`` (=16) row-slots; each row-slot stores the
-  first 512 bytes (= 128 f32) of state and pads ``[512:640]``. So a state
-  token's ``state_dim`` (=2048) f32 values tile 16 row-slots x 128 f32.
+  Written at compression boundaries (one row-slot per boundary token).
+  Minor dim ``width`` = ``align_to(583, 128)`` = 640. The 583 used bytes are
+  ``[ nope 448 fp8 | rope 128 bf16 | scale 7 ue8m0_u8 ]`` and ``[583:640]`` is pad.
 
-Shared cache layout (indexer / head_dim=128 path)
--------------------------------------------------
-Same ``[num_pages, page_size // 4, 4, width]`` layout with ``width = 256``.
-KV record: ``[ fp8 128 | scale 1 e8m0 ] + pad``.
+Buffer layouts (indexer / head_dim=128 path)
+---------------------------------------------
+Same two-buffer layout with ``width = 256``.
+KV record: ``[ fp8 128 | scale 1 ue8m0_u8 ] + pad``.
 """
 
 import jax
@@ -69,12 +66,16 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     *lead, dim = x.shape
     blocked = x.reshape(*lead, dim // block_size, block_size)
-    amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4,
-                    None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
-    q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
-    scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
-    return q, scale
+    amax = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4)
+
+    exponent = jnp.ceil(jnp.log2(amax / fp8_max))
+    scaled = blocked * jnp.exp2(-exponent)
+
+    # Explicit clip before fp8 cast: prevents fp32 scale rounding from pushing
+    # values slightly past fp8_max, which would otherwise cast to NaN (0x7F).
+    q = jnp.clip(scaled, -fp8_max, fp8_max).astype(jnp.float8_e4m3fn)
+    scale_u8 = jnp.squeeze(exponent + 127.0, -1).astype(jnp.uint8)
+    return q.reshape(x.shape), scale_u8
 
 
 def sparse_packed_width(nope_dim: int, rope_head_dim: int,
@@ -102,8 +103,8 @@ def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
     b = a + rope_head_dim * 2
     nope = _from_byte_lane(kv_cache[..., :a], jnp.float8_e4m3fn)
     rope = _from_byte_lane(kv_cache[..., a:b], jnp.bfloat16)
-    scale = _from_byte_lane(kv_cache[..., b:b + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., b:b + n_qb], jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return nope, rope, scale
 
 
@@ -112,8 +113,9 @@ def unpack_indexer_kv_cache(kv_cache: jax.Array, head_dim: int,
     """Split the packed indexer KV cache into ``(fp8, scale)`` views."""
     n_qb = head_dim // quant_block
     fp8 = _from_byte_lane(kv_cache[..., :head_dim], jnp.float8_e4m3fn)
-    scale = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
+                                  jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return fp8, scale
 
 
@@ -305,7 +307,8 @@ def gather_state_windows(
     req = token_to_req_indices[:, None]
     # Gather page numbers (optimized to 1D indexing to avoid 2D index bitpacking)
     max_blocks = block_table.shape[-1]
-    flat_index = req * max_blocks + (safe_pos // block_size)
+    # Wrap within this request's allocated state blocks.
+    flat_index = req * max_blocks + (safe_pos // block_size) % max_blocks
     block_numbers = block_table.reshape(-1)[flat_index]
     block_offsets = safe_pos % block_size
 
