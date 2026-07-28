@@ -57,6 +57,7 @@ def vllm_config():
     vllm_config.cache_config.mamba_block_size = None
     vllm_config.cache_config.cache_dtype = "auto"
     vllm_config.kv_transfer_config = None
+    vllm_config.speculative_config = None
     vllm_config.parallel_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
     vllm_config.parallel_config.prefill_context_parallel_size = 1
@@ -116,13 +117,50 @@ def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
     assert "final_block_size=1280 -> fa_raw_payload_slot_bytes=655360" in logs
     assert "-> fa_layout_padding_slot_bytes=655360" in logs
     assert "-> fa_physical_slot_bytes=1310720" in logs
-    assert ("-> slot_base_bytes=max(mamba_raw_state_bytes=1073152, "
+    assert ("-> slot_base_bytes=max(mamba_slot_state_bytes=1073152, "
             "fa_physical_slot_bytes=1310720) = 1310720" in logs)
     assert ("-> slot_alignment_bytes=16 -> "
             "final_block_slot_bytes=round_up(1310720, 16) = 1310720" in logs)
     assert "-> mamba_slot_padding_bytes=237568" in logs
     assert "-> fa_slot_tail_padding_bytes=0" in logs
     assert "kernel_blocks_per_logical_block" not in logs
+
+
+def test_hybrid_spec_decode_fit_covers_checkpoint_group(vllm_config):
+    # Speculative decoding keeps num_spec + 1 state checkpoints per unified
+    # slot (rollback by selection): the fit floor covers the whole group at
+    # the pooled GDN layer's slot geometry (ssm 1024 tok + conv 32 tok per
+    # checkpoint here), not window x raw bytes.
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration")
+    vllm_config.cache_config.block_size = 2112
+    vllm_config.cache_config.mamba_block_size = 2112
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.mamba_page_size_padded = None
+    vllm_config.speculative_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = 1
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeQwenMambaModel, None)), patch(
+                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
+               ) as mock_logger_info:
+        update_tpu_block_size_and_slot_config(vllm_config,
+                                              FakeBatchedRPAAttentionBackend)
+
+    # Per-checkpoint pitch 1024 + 32 = 1056 tokens, padded to whole
+    # 256-token kernel blocks (this backend's fixed kernel size) -> 1280;
+    # 2 checkpoints -> 2560-token blocks.
+    assert vllm_config.cache_config.block_size == 2560
+    assert vllm_config.cache_config.mamba_block_size == 2560
+    assert vllm_config.cache_config.mamba_page_size_padded == 2621440
+
+    logs = _format_logs(mock_logger_info)
+    assert "spec_window=2 x ckpt_group -> 2621440 B rounded_to_16 = 2560" \
+        in logs
+    assert "-> final_block_size=2560" in logs
+    assert ("-> slot_base_bytes=max(mamba_slot_state_bytes=2621440, "
+            "fa_physical_slot_bytes=2621440) = 2621440" in logs)
 
 
 def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
