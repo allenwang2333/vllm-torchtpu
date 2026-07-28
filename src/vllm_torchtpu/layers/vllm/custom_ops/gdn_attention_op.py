@@ -28,6 +28,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
@@ -270,8 +271,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
-        return _localize_gdn_mamba_spec_for_pcp(spec,
-                                                _get_pcp_size(vllm_config))
+        pcp_size = _get_pcp_size(vllm_config)
+        if pcp_size > 1 and envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:
+            # TODO: give PCP prefill a unified-pool implementation. Its
+            # kernel streams dense conv/recurrent tensors, which the pool
+            # does not hand out, so the pooled forward would quietly run
+            # the non-PCP path.
+            raise NotImplementedError(
+                "Prefill context parallelism has no unified-KV-pool "
+                "implementation for GDN layers; run with "
+                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
+        return _localize_gdn_mamba_spec_for_pcp(spec, pcp_size)
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:

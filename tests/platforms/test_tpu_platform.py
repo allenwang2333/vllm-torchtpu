@@ -200,9 +200,13 @@ class TestTpuPlatform:
             unified_kv_layout_enabled
         vllm_config.model_config.is_hybrid = True
 
-        # No env: ordinary non-unified allocation remains selected.
+        # No env: the unified pool is the default.
         vllm_config.kv_transfer_config = None
-        assert not unified_kv_layout_enabled(vllm_config)
+        assert unified_kv_layout_enabled(vllm_config)
+
+        with patch.dict("os.environ",
+                        {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}):
+            assert not unified_kv_layout_enabled(vllm_config)
 
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
@@ -320,8 +324,7 @@ class TestTpuPlatform:
         if pool_env:
             monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
         else:
-            monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL",
-                               raising=False)
+            monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
 
         with patch("vllm_torchtpu.platforms.tpu_platform."
                    "update_tpu_block_size_and_slot_config"):
