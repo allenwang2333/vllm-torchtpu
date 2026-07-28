@@ -282,7 +282,7 @@ def load_and_select_states(
             hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
         else:
             hbm_conv_state = load_state_region(
-                conv_state_slot_ref.at[idx], cfg.state_plan.conv,
+                conv_state_slot_ref.at[idx, 0], cfg.state_plan.conv,
                 (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(jnp.float32)
         prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
@@ -295,7 +295,7 @@ def load_and_select_states(
             hbm_recurrent_state = recurrent_slot_ref[idx, 0]
         else:
             hbm_recurrent_state = load_state_region(
-                recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
+                recurrent_slot_ref.at[idx, 0], cfg.state_plan.recurrent,
                 (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
         prev_recurrent_state = jnp.where(has_initial_state,
                                          hbm_recurrent_state, 0)

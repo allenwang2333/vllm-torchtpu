@@ -362,20 +362,32 @@ class ExternalStateBufferedRef(StateBufferedRef):
     window. copy_in/copy_out move the whole region with one contiguous
     async copy per slot, gated by the same first/last-tile and
     has_initial_state metadata as the dense path, so padded or invalid
-    slots move no bytes in either direction. The waits count slots like
-    the dense path (each slot's copy covers its full tile). vmem_ldst
-    applies the region's typed view when the tile is loaded or stored.
+    slots move no bytes in either direction. vmem_ldst applies the
+    region's typed view when the tile is loaded or stored.
+
+    The VMEM tile holds one region per window position,
+    [seq_tile_size, window_size, nblocks, nrows, *payload], mirroring the
+    dense path: the initial state — the checkpoint selected by the
+    sequence's read offset, addressed through the plan's checkpoint
+    pitch — is read into window position 0, and after compute the first
+    `min(r_size, window_size)` checkpoints are written back to
+    checkpoints `0..` of the slot. Without speculative decoding
+    `window_size` is 1 and the pitch is 0, reducing to a single region
+    per slot.
     """
 
     region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
     stride: int = dataclasses.field(metadata=dict(static=True))
+    ckpt_kb: int = dataclasses.field(metadata=dict(static=True))
+    ckpt_rows: int = dataclasses.field(metadata=dict(static=True))
 
-    def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
-        base = state_idx * self.stride + self.region.kb0
-        if self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]:
+    def _region_slice(self, src_ref: jax.Ref, state_idx, ckpt, nblocks):
+        base = state_idx * self.stride + ckpt * self.ckpt_kb + self.region.kb0
+        row0 = self.region.row0 + ckpt * self.ckpt_rows
+        if (self.ckpt_rows == 0 and self.region.row0 == 0
+                and self.region.nrows == src_ref.shape[1]):
             return src_ref.at[pl.ds(base, nblocks)]
-        return src_ref.at[pl.ds(base, nblocks),
-                          pl.ds(self.region.row0, self.region.nrows)]
+        return src_ref.at[pl.ds(base, nblocks), pl.ds(row0, self.region.nrows)]
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -394,9 +406,12 @@ class ExternalStateBufferedRef(StateBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             nblocks = jnp.where(should_read, self.region.nblocks, 0)
 
+            # Resume from the checkpoint of the last accepted token.
+            read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+
             pltpu.make_async_copy(
-                self._region_slice(src_ref, state_idx, nblocks),
-                vmem_ref.at[idx, pl.ds(0, nblocks)],
+                self._region_slice(src_ref, state_idx, read_ckpt, nblocks),
+                vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
                 sem,
             ).start()
 
@@ -412,13 +427,21 @@ class ExternalStateBufferedRef(StateBufferedRef):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            nblocks = jnp.where(is_last_tile, self.region.nblocks, 0)
+            # One checkpoint per valid window position, starting at the
+            # slot's checkpoint 0. `r_size` never exceeds `window_size` for
+            # windowed sequences; the clamp is for PER_SEQ tiles, which
+            # hold many tokens but keep only the final state.
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
 
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, pl.ds(0, nblocks)],
-                self._region_slice(dst_ref, state_idx, nblocks),
-                sem,
-            ).start()
+            for t in range(self.cfg.window_size):
+                should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+                nblocks = jnp.where(should_write, self.region.nblocks, 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, t, pl.ds(0, nblocks)],
+                    self._region_slice(dst_ref, state_idx, t, nblocks),
+                    sem,
+                ).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -437,9 +460,12 @@ class ExternalStateBufferedRef(StateBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
-        # Each slot's copy covers its full region tile (all nblocks), so wait
-        # per slot along the leading (sequence) dim.
-        wait_ref = vmem_ref.at[pl.ds(0, dma_size)]
+        # Each slot's copy covers one full region tile (all nblocks), read
+        # into window position 0; wait per slot along the window dim of one
+        # sequence row. NOTE: With bounds checks disabled, the descriptor
+        # may nominally exceed the window row; it is never executed, only
+        # used to wait for the same number of bytes `copy_in` issued.
+        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
@@ -453,11 +479,14 @@ class ExternalStateBufferedRef(StateBufferedRef):
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-            dma_size += jnp.where(is_last_tile, 1, 0)
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-        # Each slot's copy covers its full region tile (all nblocks), so wait
-        # per slot along the leading (sequence) dim.
-        wait_ref = vmem_ref.at[pl.ds(0, dma_size)]
+        # Each checkpoint's copy covers one full region tile; wait for that
+        # many region tiles along the window dim of one sequence row (the
+        # descriptor may nominally exceed it, see wait_in's NOTE).
+        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
@@ -548,13 +577,16 @@ def create_allocs(
     else:
         # Both state regions stream from the one external source ref
         # (passed as both state refs); the tiles keep the source's raw
-        # block layout and vmem_ldst applies the typed region view.
+        # block layout and vmem_ldst applies the typed region view. Like
+        # the dense path, the tile holds one region per window position
+        # (a single one without speculative decoding).
         plan = cfg.state_plan
-        window = conv_state_ref.shape[2:]
-        conv_shape = (cfg.seq_tile_size, plan.conv.nblocks, plan.conv.nrows,
-                      *window)
-        recurrent_shape = (cfg.seq_tile_size, plan.recurrent.nblocks,
-                           plan.recurrent.nrows, *window)
+        payload = conv_state_ref.shape[2:]
+        conv_shape = (cfg.seq_tile_size, cfg.window_size, plan.conv.nblocks,
+                      plan.conv.nrows, *payload)
+        recurrent_shape = (cfg.seq_tile_size, cfg.window_size,
+                           plan.recurrent.nblocks, plan.recurrent.nrows,
+                           *payload)
         state_buffered_partial = functools.partial(
             ExternalStateBufferedRef.input_output,
             buffer_count=pipeline_mode.buffer_count,
@@ -562,6 +594,8 @@ def create_allocs(
             cfg=cfg,
             metadata_ref=metadata_ref,
             stride=plan.stride,
+            ckpt_kb=plan.ckpt_kb,
+            ckpt_rows=plan.ckpt_rows,
         )
         conv_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=conv_shape),
