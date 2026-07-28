@@ -1,8 +1,7 @@
 import itertools
 
 import torch
-from vllm.distributed.parallel_state import \
-    get_context_model_parallel_world_size as get_total_cp_world_size
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -48,7 +47,12 @@ class MambaApcStateCopier:
         ensure_op_built()
 
     def _state_block_size(self) -> int:
-        return self.base_block_size * get_total_cp_world_size()
+        try:
+            cp_world_size = (get_dcp_group().world_size *
+                             get_pcp_group().world_size)
+        except Exception:
+            cp_world_size = 1
+        return self.base_block_size * cp_world_size
 
     def preprocess(self, scheduler_output) -> None:
         runner = self.runner

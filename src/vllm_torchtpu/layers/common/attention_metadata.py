@@ -4,8 +4,7 @@ from typing import Any
 
 import jax
 import torch
-from vllm.distributed.parallel_state import \
-    get_context_model_parallel_world_size as get_total_cp_world_size
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import \
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder
@@ -124,7 +123,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
-            self.target_block_size *= get_total_cp_world_size()
+            try:
+                cp_world_size = (get_dcp_group().world_size *
+                                 get_pcp_group().world_size)
+            except Exception:
+                cp_world_size = 1
+            self.target_block_size *= cp_world_size
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
 
