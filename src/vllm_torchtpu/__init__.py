@@ -346,6 +346,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
                 binding.pcp_local_rank_remap,
                 binding.pcp_remap_source,
             )
+        _patch_tpu_platform_mem_get_info()
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
@@ -353,8 +354,91 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_tpu_platform_mem_get_info() -> None:
+    """Provide a general fallback for current_platform.mem_get_info() on TPU.
+
+    Multimodal vision models (Gemma 4 MM, etc.) query mem_get_info() during
+    resolution bucket selection. On GPU this calls cudaMemGetInfo. On TPU we
+    provide a static high-watermark estimate (64GB free / 96GB total).
+    """
+    try:
+        from vllm.platforms import current_platform
+        current_platform.mem_get_info = lambda *a, **kw: (64 * (1024**3), 96 *
+                                                          (1024**3))
+        logger.info(
+            "Applied TPU patch: current_platform.mem_get_info fallback for multimodal models."
+        )
+    except Exception:
+        pass
+
+
+def _patch_vllm_unify_kv_cache_spec_page_size() -> None:
+    """Fix page size unification in vLLM V1 engine for specs with padded page sizes.
+
+    When unifying page sizes across KV cache specs by scaling block_size,
+    dataclasses.replace must update page_size_padded to match max_page_size
+    if page_size_padded is set; otherwise new_spec.page_size_bytes retains
+    the old padded page size and trips an assertion error in page_size_bytes
+    (assert self.page_size_padded >= real_page_size).
+    """
+    import sys
+    from dataclasses import replace
+
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
+    if getattr(kv_cache_utils, "_tpu_unify_page_size_patch", False):
+        return
+
+    def unify_kv_cache_spec_page_size(
+        kv_cache_spec: dict[str, KVCacheSpec], ) -> dict[str, KVCacheSpec]:
+        page_sizes = {
+            layer.page_size_bytes
+            for layer in kv_cache_spec.values()
+        }
+        if len(page_sizes) <= 1:
+            return kv_cache_spec
+
+        max_page_size = max(page_sizes)
+        new_kv_cache_spec = {}
+        for layer_name, layer_spec in kv_cache_spec.items():
+            if layer_spec.page_size_bytes == max_page_size:
+                new_kv_cache_spec[layer_name] = layer_spec
+            else:
+                layer_page_size = layer_spec.page_size_bytes
+                if max_page_size % layer_page_size != 0:
+                    raise NotImplementedError(
+                        "The page size of the layer is not divisible by the "
+                        "maximum page size. Cannot unify by adjusting block_size."
+                    )
+                ratio = max_page_size // layer_page_size
+                new_block_size = layer_spec.block_size * ratio
+                kwargs: dict[str, object] = {"block_size": new_block_size}
+                if getattr(layer_spec, "page_size_padded", None) is not None:
+                    kwargs["page_size_padded"] = max_page_size
+                new_spec = replace(layer_spec, **kwargs)
+                assert new_spec.page_size_bytes == max_page_size
+                new_kv_cache_spec[layer_name] = new_spec
+        return new_kv_cache_spec
+
+    kv_cache_utils.unify_kv_cache_spec_page_size = unify_kv_cache_spec_page_size
+    kv_cache_utils._tpu_unify_page_size_patch = True
+
+    for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, "unify_kv_cache_spec_page_size",
+                    unify_kv_cache_spec_page_size)
+
+    logger.info(
+        "Applied TPU patch: unify_kv_cache_spec_page_size page_size_padded handling."
+    )
+
+
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_unify_kv_cache_spec_page_size()
+    _patch_tpu_platform_mem_get_info()
 
     from vllm.v1.engine.core import EngineCoreProc
 

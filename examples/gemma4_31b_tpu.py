@@ -1,16 +1,17 @@
-import argparse
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import argparse
 import time
-
-import vllm_torchtpu  # noqa: F401
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.multimodal.image import convert_image_mode
+
+import vllm_torchtpu  # noqa: F401
 
 # Enable compilation cache
 os.environ["VLLM_XLA_CACHE_PATH"] = "/tmp/vllm_xla_cache"
