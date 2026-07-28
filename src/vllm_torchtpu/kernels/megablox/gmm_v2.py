@@ -219,7 +219,7 @@ class InputConfigs:
     @property
     def should_unpack(self) -> bool:
         """True if rhs weights are sub-byte (e.g. INT4) packed in INT32/UINT32 carriers."""
-        return get_rhs_packing_factor(self.dtype, self.quant_dtype) > 1
+        return get_packing_factor(self.dtype, self.quant_dtype) > 1
 
     @property
     def should_dequantize_before_matmul(self) -> bool:
@@ -1140,7 +1140,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     )
 
 
-def get_rhs_packing_factor(
+def get_packing_factor(
     storage_dtype: jnp.dtype | None,
     quant_dtype: jnp.dtype | None,
 ) -> int:
@@ -1182,7 +1182,7 @@ def make_gmm_configs(
 ):
     """Fills the GMM config for the GMM kernel."""
 
-    packing_factor = get_rhs_packing_factor(rhs.dtype, rhs_quant_dtype)
+    packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
                            group_offset, fuse_act, packing_factor)
