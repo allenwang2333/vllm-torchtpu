@@ -148,20 +148,6 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]
         return out[:, :seq_len].contiguous()
 
-    def forward_native(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            cu_seqlens: torch.Tensor | None = None,
-            max_seqlen: torch.Tensor | None = None,
-            sequence_lengths: torch.Tensor | None = None) -> torch.Tensor:
-        # TEMPORARY [REVIEWER FEEDBACK / V1 ENGINE]:
-        # Under native V1 engine, bypass custom head_dim padding workaround and delegate
-        # directly to standard vLLM native forward for SDPA fallback.
-        return super().forward_native(query, key, value, cu_seqlens,
-                                      max_seqlen, sequence_lengths)
-
     # torchtpu-vllm registers TpuPlatform as an out-of-tree plugin, so vLLM's
     # CustomOp.dispatch_forward routes to forward_oot. Alias forward_tpu to the
     # same impl so an in-tree TPU platform would also pick it up.
