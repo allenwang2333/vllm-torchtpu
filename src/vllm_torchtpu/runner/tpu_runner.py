@@ -4215,7 +4215,6 @@ class TPUModelRunner(GPUModelRunner):
             block_size = spec.block_size
             if attn_block_size is None:
                 attn_block_size = block_size
-            assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
         block_sizes = [
             group.kv_cache_spec.block_size
