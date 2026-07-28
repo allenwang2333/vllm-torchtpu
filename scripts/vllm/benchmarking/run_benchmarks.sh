@@ -299,6 +299,7 @@ run_benchmark_once() {
     fi
 
     set +e
+    # TEMPORARY: Reduced num-prompts from 320 to 10 for fast CI turnaround. Revert to 320 after validation.
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
@@ -308,7 +309,7 @@ run_benchmark_once() {
         --random-input-len "$input_len" \
         --random-output-len "$output_len" \
         --random-range-ratio "$RANDOM_RANGE_RATIO" \
-        --num-prompts 320 \
+        --num-prompts 10 \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --save-result \

@@ -372,8 +372,72 @@ def _patch_tpu_platform_mem_get_info() -> None:
         pass
 
 
+def _patch_vllm_unify_kv_cache_spec_page_size() -> None:
+    """Fix page size unification in vLLM V1 engine for specs with padded page sizes.
+
+    When unifying page sizes across KV cache specs by scaling block_size,
+    dataclasses.replace must update page_size_padded to match max_page_size
+    if page_size_padded is set; otherwise new_spec.page_size_bytes retains
+    the old padded page size and trips an assertion error in page_size_bytes
+    (assert self.page_size_padded >= real_page_size).
+    """
+    import sys
+    from dataclasses import replace
+
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
+    if getattr(kv_cache_utils, "_tpu_unify_page_size_patch", False):
+        return
+
+    def unify_kv_cache_spec_page_size(
+        kv_cache_spec: dict[str, KVCacheSpec], ) -> dict[str, KVCacheSpec]:
+        page_sizes = {
+            layer.page_size_bytes
+            for layer in kv_cache_spec.values()
+        }
+        if len(page_sizes) <= 1:
+            return kv_cache_spec
+
+        max_page_size = max(page_sizes)
+        new_kv_cache_spec = {}
+        for layer_name, layer_spec in kv_cache_spec.items():
+            if layer_spec.page_size_bytes == max_page_size:
+                new_kv_cache_spec[layer_name] = layer_spec
+            else:
+                layer_page_size = layer_spec.page_size_bytes
+                if max_page_size % layer_page_size != 0:
+                    raise NotImplementedError(
+                        "The page size of the layer is not divisible by the "
+                        "maximum page size. Cannot unify by adjusting block_size."
+                    )
+                ratio = max_page_size // layer_page_size
+                new_block_size = layer_spec.block_size * ratio
+                kwargs: dict[str, object] = {"block_size": new_block_size}
+                if getattr(layer_spec, "page_size_padded", None) is not None:
+                    kwargs["page_size_padded"] = max_page_size
+                new_spec = replace(layer_spec, **kwargs)
+                assert new_spec.page_size_bytes == max_page_size
+                new_kv_cache_spec[layer_name] = new_spec
+        return new_kv_cache_spec
+
+    kv_cache_utils.unify_kv_cache_spec_page_size = unify_kv_cache_spec_page_size
+    kv_cache_utils._tpu_unify_page_size_patch = True
+
+    for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, "unify_kv_cache_spec_page_size",
+                    unify_kv_cache_spec_page_size)
+
+    logger.info(
+        "Applied TPU patch: unify_kv_cache_spec_page_size page_size_padded handling."
+    )
+
+
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_unify_kv_cache_spec_page_size()
     _patch_tpu_platform_mem_get_info()
 
     from vllm.v1.engine.core import EngineCoreProc
