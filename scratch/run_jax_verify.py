@@ -1,0 +1,598 @@
+# Copyright 2026 Google LLC
+# Wrapper to run JAX reference model with backend patch
+
+import os
+import sys
+
+# Ensure local directories are in PYTHONPATH programmatically
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.32"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["VLLM_ENFORCE_EAGER"] = "1"
+os.environ["VLLM_BYPASS_TPU_INIT"] = "1"
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+import torch
+torch._dynamo.config.disable = True
+
+# Mock distributed barrier and TPU synchronization for JAX-only execution
+import torch.distributed as dist
+dist.barrier = lambda *args, **kwargs: None
+try:
+    import torch_tpu._internal.sync as tpu_sync
+    tpu_sync.synchronize = lambda *args, **kwargs: None
+except ImportError:
+    pass
+
+# Globally patch torch.device to redirect tpu allocation to cpu under JAX verification
+_orig_device = torch.device
+
+class DeviceMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _orig_device) or super().__instancecheck__(instance)
+    def __or__(cls, other):
+        import typing
+        return typing.Union[cls, other]
+    def __ror__(cls, other):
+        import typing
+        return typing.Union[other, cls]
+
+class PatchedDeviceClass(metaclass=DeviceMeta):
+    def __new__(cls, device_type, *args, **kwargs):
+        if device_type == "tpu" or (isinstance(device_type, str) and device_type.startswith("tpu:")):
+            print("[JAX_VERIFY_PATCH] Globally redirecting torch.device('tpu') -> torch.device('cpu')", flush=True)
+            return _orig_device("cpu")
+        return _orig_device(device_type, *args, **kwargs)
+
+torch.device = PatchedDeviceClass
+
+def redirect_tpu_device(func):
+    import functools
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if "device" in kwargs:
+            dev = kwargs["device"]
+            if dev == "tpu" or (isinstance(dev, str) and dev.startswith("tpu:")):
+                kwargs["device"] = "cpu"
+            elif isinstance(dev, _orig_device) and dev.type == "tpu":
+                kwargs["device"] = _orig_device("cpu")
+        return func(*args, **kwargs)
+    return wrapper
+
+# Patch core PyTorch tensor factory functions
+for name in ["empty", "zeros", "ones", "tensor", "arange", "full", "randn", "rand", "empty_like", "zeros_like", "ones_like"]:
+    if hasattr(torch, name):
+        setattr(torch, name, redirect_tpu_device(getattr(torch, name)))
+
+# Automatically propagate VllmConfig on initialization to quantization configs
+try:
+    from vllm.config import VllmConfig
+    _orig_vllm_config_init = VllmConfig.__init__
+    def patched_vllm_config_init(self, *args, **kwargs):
+        _orig_vllm_config_init(self, *args, **kwargs)
+        try:
+            from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+            VllmDeepseekV4Fp8Config.set_configs(self)
+            print("[JAX_VERIFY_PATCH] Automatically set VllmDeepseekV4Fp8Config configs from VllmConfig init!", flush=True)
+            @property
+            def get_mesh_prop(config_self):
+                from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+                return get_or_create_pcp_mesh()
+            VllmDeepseekV4Fp8Config.mesh = get_mesh_prop
+            print("[JAX_VERIFY_PATCH] Attached mesh property getter to VllmDeepseekV4Fp8Config class", flush=True)
+        except Exception as e:
+            print(f"[JAX_VERIFY_PATCH] Failed to set configs on init: {e}", flush=True)
+    VllmConfig.__init__ = patched_vllm_config_init
+except ImportError:
+    pass
+
+# Patch pallas.jax_op and torchax to support JAX-compilation of custom Pallas operators
+try:
+    import torchax.tensor as ta_tensor
+    import torchax.ops.ops_registry as ta_registry
+    import torch_tpu._internal.pallas as pallas_pkg
+    import torch_tpu._internal.pallas.pallas as pallas_mod
+
+    # 1. Patch pallas.jax_op to register custom JAX ops in torchax registry
+    _orig_jax_op = pallas_mod.jax_op
+    def patched_jax_op(name, fn=None, /, *args, **kwargs):
+        result = _orig_jax_op(name, fn, *args, **kwargs)
+        try:
+            namespace, op_name = name.split("::")
+            custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
+            custom_op = custom_op_packet.default
+            ta_registry.register_torch_dispatch_op(custom_op, result._backend_fns[None], is_jax_function=False)
+            print(f"[PATCH_JAX_OP] Registered custom op {name} with torchax registry", flush=True)
+        except Exception as e:
+            print(f"[PATCH_JAX_OP] Failed to register custom op {name} with torchax: {e}", flush=True)
+        return result
+    pallas_mod.jax_op = patched_jax_op
+    pallas_pkg.jax_op = patched_jax_op
+
+    # Force register quantized_matmul_kernel if it was imported eagerly
+    try:
+        import vllm_torchtpu.layers.vllm.linear_common as lc
+        namespace, op_name = "pallas", "quantized_matmul_kernel"
+        custom_op_packet = getattr(getattr(torch.ops, namespace), op_name)
+        custom_op = custom_op_packet.default
+        ta_registry.register_torch_dispatch_op(custom_op, lc._quantized_matmul_kernel_op._backend_fns[None], is_jax_function=False)
+        print("[PATCH_JAX_OP] Manually registered quantized_matmul_kernel", flush=True)
+    except Exception as e:
+        print(f"[PATCH_JAX_OP] Failed to manually register quantized_matmul_kernel: {e}", flush=True)
+
+    # 2. Patch XLADispatchMode to intercept "pallas" namespace
+    _orig_xla_dispatch = ta_tensor.XLADispatchMode.__torch_dispatch__
+    def patched_xla_dispatch(self, func, types, args=(), kwargs=None):
+        if func.namespace == "pallas":
+            print(f"[DEBUG_PALLAS_DISPATCH] func={func} types={types} args={[(type(a), getattr(a, '_elem', None) is not None) for a in args]}", flush=True)
+            print(f"[DEBUG_PALLAS_KEYS] ops={[str(k) for k in self.env._ops.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", flush=True)
+            print(f"[DEBUG_PALLAS_KEYS] decomps={[str(k) for k in self.env._decomps.keys() if 'pallas' in str(k) or 'matmul' in str(k)]}", flush=True)
+            return self.env.dispatch(func, types, args, kwargs)
+        return _orig_xla_dispatch(self, func, types, args, kwargs)
+    ta_tensor.XLADispatchMode.__torch_dispatch__ = patched_xla_dispatch
+    
+    print("[JAX_VERIFY_PATCH] Successfully patched pallas.jax_op and torchax dispatcher", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch pallas/torchax: {e}", flush=True)
+
+# Compatibility alias for renamed DeepseekV4Attention class in newer vLLM versions
+try:
+    import vllm.models.deepseek_v4.attention as att_mod
+    if not hasattr(att_mod, "DeepseekV4Attention") and hasattr(att_mod, "DeepseekV4MLAAttention"):
+        att_mod.DeepseekV4Attention = att_mod.DeepseekV4MLAAttention
+except ImportError:
+    pass
+
+try:
+    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
+    if not hasattr(ds_v4_amd_model, "DeepseekV4Attention"):
+        if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention
+        elif hasattr(ds_v4_amd_model, "DeepseekV4MLAAttention"):
+            ds_v4_amd_model.DeepseekV4Attention = ds_v4_amd_model.DeepseekV4MLAAttention
+except ImportError:
+    pass
+
+# Bypasses and monkey-patches for JAX verification
+try:
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+    def patched_wrapper_call(self, *args, **kwargs):
+        return self._call_with_optional_nvtx_range(self.forward, *args, **kwargs)
+    TorchCompileWithNoGuardsWrapper.__call__ = patched_wrapper_call
+    print("[JAX_VERIFY_PATCH] Bypassed TorchCompileWithNoGuardsWrapper globally", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch TorchCompileWithNoGuardsWrapper: {e}", flush=True)
+
+try:
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+    def patched_verify_and_split_kv_cache_groups(self):
+        attention_groups = []
+        for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            manager_cls = self.single_type_managers[i].__class__
+            spec = g.kv_cache_spec
+            for existing_spec, group_ids, existing_cls in attention_groups:
+                if existing_spec == spec:
+                    assert manager_cls is existing_cls
+                    group_ids.append(i)
+                    break
+            else:
+                attention_groups.append((spec, [i], manager_cls))
+        self.attention_groups = attention_groups
+    HybridKVCacheCoordinator.verify_and_split_kv_cache_groups = patched_verify_and_split_kv_cache_groups
+    print("[JAX_VERIFY_PATCH] Patched HybridKVCacheCoordinator globally", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch HybridKVCacheCoordinator: {e}", flush=True)
+
+try:
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    if AttentionLayerBase not in VllmDeepseekV4MLAAttention.__bases__:
+        VllmDeepseekV4MLAAttention.__bases__ = VllmDeepseekV4MLAAttention.__bases__ + (AttentionLayerBase,)
+    print("[JAX_VERIFY_PATCH] Added AttentionLayerBase to VllmDeepseekV4MLAAttention bases", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to add AttentionLayerBase base class: {e}", flush=True)
+
+try:
+    from vllm_torchtpu.layers.vllm.quantization.deepseek_v4_fp8 import VllmDeepseekV4Fp8Config
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+
+    _orig_get_quant_method = VllmDeepseekV4Fp8Config.get_quant_method
+
+    def patched_get_quant_method(self, layer, prefix):
+        print(f"[JAX_VERIFY_PATCH] get_quant_method called for: {layer.__class__.__name__} | {prefix}", flush=True)
+        if isinstance(layer, FusedMoE):
+            print(f"[JAX_VERIFY_PATCH] Redirecting FusedMoE to VllmMxfp4MoEMethod!", flush=True)
+            layer.prefix = prefix
+            moe_config = self.get_moe_config(layer)
+            if self.expert_dtype == "fp4":
+                return VllmMxfp4MoEMethod(moe_config)
+            else:
+                from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethod
+                layer.moe_config = moe_config
+                return VllmFp8MoEMethod(self, moe_config)
+        return _orig_get_quant_method(self, layer, prefix)
+
+    VllmDeepseekV4Fp8Config.get_quant_method = patched_get_quant_method
+    print("[JAX_VERIFY_PATCH] Successfully patched VllmDeepseekV4Fp8Config.get_quant_method for JAX.", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch VllmDeepseekV4Fp8Config: {e}", flush=True)
+
+# Patch linear layer weight loaders to expand 1D checkpoint scales to match 2D parameters
+try:
+    def pre_expand_scale_tensor(param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        param_shape = param.data.shape
+        if len(param_shape) == 2 and len(loaded_weight.shape) == 1:
+            loaded_weight = loaded_weight.unsqueeze(1).expand(loaded_weight.shape[0], param_shape[1])
+        print(f"[DEBUG_PRE_EXPAND] param_type: {cls_name} | param_shape: {param_shape} | expanded_shape: {loaded_weight.shape}", flush=True)
+        return loaded_weight
+
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    _orig_row_parallel_weight_loader_v2 = RowParallelLinear.weight_loader_v2
+    def patched_row_parallel_weight_loader_v2(self, param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_row_parallel_weight_loader_v2(self, param, loaded_weight)
+    RowParallelLinear.weight_loader_v2 = patched_row_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+    _orig_column_parallel_weight_loader_v2 = ColumnParallelLinear.weight_loader_v2
+    def patched_column_parallel_weight_loader_v2(self, param, loaded_weight):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_column_parallel_weight_loader_v2(self, param, loaded_weight)
+    ColumnParallelLinear.weight_loader_v2 = patched_column_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    _orig_merged_column_parallel_weight_loader_v2 = MergedColumnParallelLinear.weight_loader_v2
+    def patched_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_merged_column_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+    MergedColumnParallelLinear.weight_loader_v2 = patched_merged_column_parallel_weight_loader_v2
+
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+    _orig_qkv_parallel_weight_loader_v2 = QKVParallelLinear.weight_loader_v2
+    def patched_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs):
+        cls_name = param.__class__.__name__
+        if "ScaleParameter" in cls_name or "scale" in cls_name.lower():
+            loaded_weight = pre_expand_scale_tensor(param, loaded_weight)
+        return _orig_qkv_parallel_weight_loader_v2(self, param, loaded_weight, *args, **kwargs)
+    QKVParallelLinear.weight_loader_v2 = patched_qkv_parallel_weight_loader_v2
+    print("[JAX_VERIFY_PATCH] Successfully patched weight loaders for JAX.", flush=True)
+except Exception as e:
+    print(f"[JAX_VERIFY_PATCH] Failed to patch linear weight loaders: {e}", flush=True)
+
+# Manually patch DeepSeek V4 MLA class to JAX wrapper to run under CPU/JAX platform
+from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import patch_deepseek_v4_mla_cls
+patch_deepseek_v4_mla_cls()
+
+# Mock CUDA device capability, Stream, and Event allocation since they are unavailable on CPU/TPU
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+
+current_platform.get_device_capability = lambda *args, **kwargs: DeviceCapability(9, 0)
+
+class DummyCudaEvent:
+    def __init__(self, *args, **kwargs):
+        pass
+    def record(self, *args, **kwargs):
+        pass
+    def wait(self, *args, **kwargs):
+        pass
+    def query(self):
+        return True
+    def synchronize(self):
+        pass
+
+import torch
+torch.cuda.Stream = lambda *args, **kwargs: None
+torch.cuda.Event = DummyCudaEvent
+
+import types
+mock_tpu = types.ModuleType("torch.tpu")
+mock_tpu.Stream = DummyCudaEvent
+mock_tpu.Event = DummyCudaEvent
+mock_tpu.current_stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.default_stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.stream = lambda *args, **kwargs: DummyCudaEvent()
+mock_tpu.set_stream = lambda *args, **kwargs: None
+mock_tpu.synchronize = lambda *args, **kwargs: None
+mock_tpu.set_device = lambda *args, **kwargs: None
+mock_tpu.current_device = lambda *args, **kwargs: 0
+mock_tpu.device_count = lambda *args, **kwargs: 1
+mock_tpu.is_available = lambda *args, **kwargs: True
+torch.tpu = mock_tpu
+
+# Manually define weight name loader patch for the AMD model class
+from vllm.models.deepseek_v4.amd.model import DeepseekV4ForCausalLM as _AmdDeepseekV4ForCausalLM
+_amd_orig_load_weights = _AmdDeepseekV4ForCausalLM.load_weights
+
+def patched_amd_load_weights(self, weights):
+    try:
+        if hasattr(self, "model") and hasattr(self.model, "layers") and len(self.model.layers) > 0:
+            l = self.model.layers[0]
+            if hasattr(l, "ffn") and hasattr(l.ffn, "shared_experts") and hasattr(l.ffn.shared_experts, "down_proj"):
+                proj = l.ffn.shared_experts.down_proj
+                print(f"[DEBUG_SHARED_EXPERTS_PARAMS] down_proj state_dict keys: {list(proj.state_dict().keys())}", flush=True)
+                # Print class details of down_proj's linear method
+                if hasattr(proj, "quant_method"):
+                    print(f"[DEBUG_SHARED_EXPERTS_PARAMS] down_proj quant_method: {proj.quant_method.__class__.__name__}", flush=True)
+        if hasattr(self, "model") and hasattr(self.model, "hc_head"):
+            print(f"[DEBUG_HC_HEAD_PARAMS] hc_head state_dict keys: {list(self.model.hc_head.state_dict().keys())}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG_SHARED_EXPERTS_PARAMS] Failed to print: {e}", flush=True)
+
+    self.model.has_tilelang = False
+    for idx, l in enumerate(self.model.layers):
+        l.layer_idx = idx
+        l.has_tilelang = False
+        if hasattr(l, "ffn"):
+            l.ffn.layer_idx = idx
+            if hasattr(l.ffn, "experts"):
+                l.ffn.experts.layer_idx = idx
+
+    orig_mapper = self.hf_to_vllm_mapper
+    class WrappedMapper:
+        def apply(self, w):
+            for name, loaded_weight in orig_mapper.apply(w):
+                if "hc_head.hc_" in name:
+                    name = name.replace("hc_head.hc_", "hc_head_")
+                    
+                # Map MHC layer parameters from HF (nested) to vLLM (flat)
+                if ".attn_hc.base" in name:
+                    name = name.replace(".attn_hc.base", ".hc_attn_base")
+                elif ".attn_hc.fn" in name:
+                    name = name.replace(".attn_hc.fn", ".hc_attn_fn")
+                elif ".attn_hc.weight_scale_inv" in name:
+                    name = name.replace(".attn_hc.weight_scale_inv", ".hc_attn_scale")
+                elif ".ffn_hc.base" in name:
+                    name = name.replace(".ffn_hc.base", ".hc_ffn_base")
+                elif ".ffn_hc.fn" in name:
+                    name = name.replace(".ffn_hc.fn", ".hc_ffn_fn")
+                elif ".ffn_hc.weight_scale_inv" in name:
+                    name = name.replace(".ffn_hc.weight_scale_inv", ".hc_ffn_scale")
+                    
+                # Map shared experts from HF (gate_proj/up_proj/down_proj) to vLLM (w1/w3/w2)
+                if ".shared_experts.gate_proj" in name:
+                    name = name.replace(".shared_experts.gate_proj", ".shared_experts.w1")
+                elif ".shared_experts.up_proj" in name:
+                    name = name.replace(".shared_experts.up_proj", ".shared_experts.w3")
+                    
+                # Map layernorms
+                if ".input_layernorm" in name:
+                    name = name.replace(".input_layernorm", ".attn_norm")
+                elif ".post_attention_layernorm" in name:
+                    name = name.replace(".post_attention_layernorm", ".ffn_norm")
+                
+                # Map mlp to ffn
+                if ".mlp." in name:
+                    name = name.replace(".mlp.", ".ffn.")
+                
+                # Map attention parameters
+                # 1. Indexer Compressor mappings (HF -> vLLM)
+                if ".self_attn.compressor.indexer.gate_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.gate_proj", ".attn.indexer.compressor.wgate")
+                elif ".self_attn.compressor.indexer.kv_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.kv_proj", ".attn.indexer.compressor.wkv")
+                elif ".self_attn.compressor.indexer.kv_norm" in name:
+                    name = name.replace(".self_attn.compressor.indexer.kv_norm", ".attn.indexer.compressor.norm")
+                elif ".self_attn.compressor.indexer.position_bias" in name:
+                    name = name.replace(".self_attn.compressor.indexer.position_bias", ".attn.indexer.compressor.ape")
+                    
+                # 2. Indexer main mappings (HF -> vLLM)
+                elif ".self_attn.compressor.indexer.q_b_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.q_b_proj", ".attn.indexer.wq_b")
+                elif ".self_attn.compressor.indexer.scorer.weights_proj" in name:
+                    name = name.replace(".self_attn.compressor.indexer.scorer.weights_proj", ".attn.indexer.weights_proj")
+                    
+                # 3. Attention Compressor mappings (HF -> vLLM)
+                elif ".self_attn.compressor.gate_proj" in name:
+                    name = name.replace(".self_attn.compressor.gate_proj", ".attn.mla_attn.compressor.wgate")
+                elif ".self_attn.compressor.kv_proj" in name:
+                    name = name.replace(".self_attn.compressor.kv_proj", ".attn.mla_attn.compressor.wkv")
+                elif ".self_attn.compressor.kv_norm" in name:
+                    name = name.replace(".self_attn.compressor.kv_norm", ".attn.mla_attn.compressor.norm")
+                elif ".self_attn.compressor.position_bias" in name:
+                    name = name.replace(".self_attn.compressor.position_bias", ".attn.mla_attn.compressor.ape")
+                elif ".self_attn.q_a_proj" in name:
+                    name = name.replace(".self_attn.q_a_proj", ".attn.wq_a")
+                elif ".self_attn.q_a_norm" in name:
+                    name = name.replace(".self_attn.q_a_norm", ".attn.q_norm")
+                elif ".self_attn.q_b_proj" in name:
+                    name = name.replace(".self_attn.q_b_proj", ".attn.wq_b")
+                elif ".self_attn.kv_proj" in name:
+                    name = name.replace(".self_attn.kv_proj", ".attn.wkv")
+                elif ".self_attn.kv_norm" in name:
+                    name = name.replace(".self_attn.kv_norm", ".attn.kv_norm")
+                elif ".self_attn.o_a_proj" in name:
+                    name = name.replace(".self_attn.o_a_proj", ".attn.wo_a")
+                elif ".self_attn.o_b_proj" in name:
+                    name = name.replace(".self_attn.o_b_proj", ".attn.wo_b")
+                elif ".self_attn.sinks" in name:
+                    name = name.replace(".self_attn.sinks", ".attn.attn_sink")
+
+                yield name, loaded_weight
+
+    self.hf_to_vllm_mapper = WrappedMapper()
+    res = _amd_orig_load_weights(self, weights)
+
+    # Wrap get_kv_cache_spec to return dummy specs instead of None to bypass JAX KV cache manager assertions
+    from vllm.v1.attention.backends.mla.sparse_swa import SlidingWindowMLASpec
+    import torch
+
+    for name, module in self.model.named_modules():
+        if hasattr(module, "get_kv_cache_spec"):
+            orig_spec_fn = module.get_kv_cache_spec
+            def make_wrapped_fn(orig_fn, mod_name):
+                def wrapped_spec_fn(*args, **kwargs):
+                    spec = orig_fn(*args, **kwargs)
+                    if spec is None:
+                        print(f"[JAX_VERIFY_PATCH] Returning dummy KVCacheSpec for unused module: {mod_name}", flush=True)
+                        return SlidingWindowMLASpec(
+                            block_size=1,
+                            num_kv_heads=1,
+                            head_size=128,
+                            dtype=torch.uint8,
+                            sliding_window=1,
+                            cache_dtype_str="fp8",
+                            model_version="deepseek_v4",
+                        )
+                    return spec
+                return wrapped_spec_fn
+            module.get_kv_cache_spec = make_wrapped_fn(orig_spec_fn, name)
+
+    import torchax
+    torchax.enable_globally()
+    print("[RUN_JAX_VERIFY_PATCH] Enabled torchax globally after loading weights", flush=True)
+
+    # Clear/mock static_forward_context to force manual KV cache spec generation in JAX mode
+    class DummyZeroLenDict(dict):
+        def __len__(self):
+            return 0
+        def __bool__(self):
+            return False
+
+    if hasattr(self, "vllm_config") and hasattr(self.vllm_config, "compilation_config"):
+        if hasattr(self.vllm_config.compilation_config, "static_forward_context"):
+            self.vllm_config.compilation_config.static_forward_context = DummyZeroLenDict(
+                self.vllm_config.compilation_config.static_forward_context
+            )
+            print("[JAX_VERIFY_PATCH] Replaced static_forward_context on self.vllm_config with DummyZeroLenDict", flush=True)
+    if hasattr(self, "config") and hasattr(self.config, "compilation_config"):
+        if hasattr(self.config.compilation_config, "static_forward_context"):
+            self.config.compilation_config.static_forward_context = DummyZeroLenDict(
+                self.config.compilation_config.static_forward_context
+            )
+            print("[JAX_VERIFY_PATCH] Replaced static_forward_context on self.config with DummyZeroLenDict", flush=True)
+
+    return res
+
+_AmdDeepseekV4ForCausalLM.load_weights = patched_amd_load_weights
+
+# Also patch inner DeepseekV4Model.load_weights
+from vllm.models.deepseek_v4.amd.model import DeepseekV4Model
+_amd_orig_inner_load_weights = DeepseekV4Model.load_weights
+
+def patched_amd_inner_load_weights(self, weights):
+    def wrap_weights(w_iter):
+        for name, loaded_weight in w_iter:
+            if "experts" in name and ("w1" in name or "gate_proj" in name) and "scale" not in name:
+                print(f"[DEBUG_WRAP_WEIGHTS] name={name} shape={list(loaded_weight.shape)}", flush=True)
+            if ".attn." in name or ".self_attn." in name:
+                continue
+            if "hc_head.hc_" in name:
+                name = name.replace("hc_head.hc_", "hc_head_")
+            yield name, loaded_weight
+
+    return _amd_orig_inner_load_weights(self, wrap_weights(weights))
+
+DeepseekV4Model.load_weights = patched_amd_inner_load_weights
+
+# Patch forward method to execute within torchax.default_env()
+_orig_forward = _AmdDeepseekV4ForCausalLM.forward
+
+def patched_forward(self, *args, **kwargs):
+    import torchax
+    with torchax.default_env():
+        return _orig_forward(self, *args, **kwargs)
+
+_AmdDeepseekV4ForCausalLM.forward = patched_forward
+
+# Now add our repo to path and import offline_inference
+sys.path.insert(0, "/root/cloud-devkit/vllm-torchtpu")
+
+# Monkey-patch JAX quantization mapping for deepseek_v4_fp8
+import vllm_torchtpu.layers.common.quant_methods as qm
+qm.FP8 = "deepseek_v4_fp8"
+
+
+from examples.offline_inference import create_parser
+from vllm import LLM, SamplingParams
+
+# Monkey patch JAX MoE apply_monolithic to log inputs
+from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+_orig_apply_monolithic = VllmMxfp4MoEMethod.apply_monolithic
+
+def patched_apply_monolithic(self, layer, x, router_logits, input_ids=None):
+    prefix = getattr(layer, "prefix", "")
+    if "layers.0." in prefix or "layers.3." in prefix:
+        import jax
+        def print_stats(prefix, x_arr, r_arr):
+            print(f"[DEBUG_JAX] {prefix} input x: shape={list(x_arr.shape)} dtype={str(x_arr.dtype)} | mean={float(x_arr.mean()):.6f} std={float(x_arr.std()):.6f} min={float(x_arr.min()):.6f} max={float(x_arr.max()):.6f}", flush=True)
+            print(f"[DEBUG_JAX] {prefix} input router_logits: shape={list(r_arr.shape)} dtype={str(r_arr.dtype)} | mean={float(r_arr.mean()):.6f} std={float(r_arr.std()):.6f} min={float(r_arr.min()):.6f} max={float(r_arr.max()):.6f}", flush=True)
+        x_elem = getattr(x, "_elem", x)
+        r_elem = getattr(router_logits, "_elem", router_logits)
+        jax.debug.callback(print_stats, prefix, x_elem, r_elem)
+
+    res = _orig_apply_monolithic(self, layer, x, router_logits, input_ids)
+
+    if "layers.0." in prefix or "layers.3." in prefix:
+        import jax
+        def print_output_stats(prefix, res_arr):
+            print(f"[DEBUG_JAX] {prefix} output: shape={list(res_arr.shape)} dtype={str(res_arr.dtype)} | mean={float(res_arr.mean()):.6f} std={float(res_arr.std()):.6f} min={float(res_arr.min()):.6f} max={float(res_arr.max()):.6f}", flush=True)
+        res_elem = getattr(res, "_elem", res)
+        jax.debug.callback(print_output_stats, prefix, res_elem)
+
+    return res
+
+VllmMxfp4MoEMethod.apply_monolithic = patched_apply_monolithic
+
+def custom_main(args: dict):
+    # Patch DeepseekV4Attention to VllmDeepseekV4MLAAttention
+    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4 import VllmDeepseekV4MLAAttention
+    ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
+    print("[RUN_JAX_VERIFY_PATCH] Patched ds_v4_amd_model.DeepseekV4Attention -> VllmDeepseekV4MLAAttention", flush=True)
+
+    # Pop arguments not used by LLM
+    max_tokens = args.pop("max_tokens")
+    temperature = args.pop("temperature")
+    top_p = args.pop("top_p")
+    top_k = args.pop("top_k")
+    use_chat_template = args.pop("use_chat_template")
+    chat_template_kwargs = args.pop('chat_template_kwargs')
+
+    llm = LLM(**args)
+
+    sampling_params = llm.get_default_sampling_params()
+    sampling_params.logprobs = 5
+    sampling_params.max_tokens = 5
+    if temperature is not None:
+        sampling_params.temperature = temperature
+    if top_p is not None:
+        sampling_params.top_p = top_p
+    if top_k is not None:
+        sampling_params.top_k = top_k
+
+    prompts = [
+        "What is the speed of light in a vacuum?",
+    ]
+
+    print("Using custom main to dump logits and logprobs", flush=True)
+    outputs = llm.generate(prompts, sampling_params)
+
+    for output in outputs:
+        prompt = output.prompt
+        generated = output.outputs[0]
+        print(f"Prompt: {prompt!r}")
+        print(f"Prompt token IDs: {output.prompt_token_ids}")
+        print(f"Generated text: {generated.text!r}")
+        print(f"Generated token IDs: {generated.token_ids}")
+        if generated.logprobs is not None and len(generated.logprobs) > 0:
+            print(f"Generated logprobs (step 1): {generated.logprobs[0]}")
+        print("-" * 50)
+
+if __name__ == "__main__":
+    os.environ.setdefault('SKIP_JAX_PRECOMPILE', '1')
+    parser = create_parser()
+    args = vars(parser.parse_args())
+    custom_main(args)

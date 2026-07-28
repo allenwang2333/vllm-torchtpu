@@ -5,7 +5,9 @@ from functools import wraps
 from typing import Any, Callable, List, NamedTuple, Tuple, Union
 
 import jax
+import jax.numpy as jnp
 import torch
+
 from jax._src import dtypes
 from jax.sharding import Mesh
 from vllm import utils
@@ -247,4 +249,83 @@ def tpu_bind_kv_cache(
             runner_kv_caches.append(kv_caches[layer_name])
 
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        if layer_name in forward_context:
+            target_mod = forward_context[layer_name]
+            target_mod.kv_cache = kv_cache
+            print(f"[DEBUG_BIND_KV] bound kv_cache shape={kv_cache.shape} to layer_name={layer_name} mod_class={target_mod.__class__.__name__} mod_id={id(target_mod)}", flush=True)
+        else:
+            print(f"[DEBUG_BIND_KV_MISSING] layer_name={layer_name} NOT IN forward_context! keys={list(forward_context.keys())[:5]}", flush=True)
+
+
+_TORCH_TO_JAX_DTYPE = {
+    torch.float32: jnp.float32,
+    torch.float16: jnp.float16,
+    torch.bfloat16: jnp.bfloat16,
+    torch.int64: jnp.int64,
+    torch.int32: jnp.int32,
+    torch.int16: jnp.int16,
+    torch.int8: jnp.int8,
+    torch.uint8: jnp.uint8,
+    torch.bool: jnp.bool_,
+}
+
+if hasattr(torch, "float8_e4m3fn"):
+    _TORCH_TO_JAX_DTYPE[torch.float8_e4m3fn] = jnp.float8_e4m3fn
+if hasattr(torch, "float8_e5m2"):
+    _TORCH_TO_JAX_DTYPE[torch.float8_e5m2] = jnp.float8_e5m2
+
+
+def t2j_dtype(dtype: torch.dtype) -> jnp.dtype:
+    jax_dtype = _TORCH_TO_JAX_DTYPE.get(dtype)
+    if jax_dtype is None:
+        raise ValueError(f"Unsupported torch dtype: {dtype}")
+    return jax_dtype
+
+
+def j2t_dtype(dtype: jnp.dtype) -> torch.dtype:
+    dtype = jnp.dtype(dtype)
+    for k, v in _TORCH_TO_JAX_DTYPE.items():
+        if jnp.dtype(v) == dtype:
+            return k
+    raise ValueError(f"Unsupported JAX dtype: {dtype}")
+
+
+_DTYPE_STR_ALIAS_TO_JAX_DTYPE = {
+    "bf16": jnp.bfloat16,
+    "bfloat16": jnp.bfloat16,
+    "fp16": jnp.float16,
+    "float16": jnp.float16,
+    "fp32": jnp.float32,
+    "float32": jnp.float32,
+    "fp8": jnp.float8_e4m3fn,
+    "float8": jnp.float8_e4m3fn,
+    "float8_e4m3fn": jnp.float8_e4m3fn,
+    "float8_e5m2": jnp.float8_e5m2,
+}
+
+
+def to_jax_dtype(dtype: str | jnp.dtype | torch.dtype) -> jnp.dtype:
+    if isinstance(dtype, (str, type)):
+        if isinstance(dtype, str) and (dict_dtype :=
+                                       _DTYPE_STR_ALIAS_TO_JAX_DTYPE.get(
+                                           dtype, None)):
+            return dict_dtype
+        return jnp.dtype(dtype)
+    elif isinstance(dtype, torch.dtype):
+        return t2j_dtype(dtype)
+    elif isinstance(dtype, jnp.dtype):
+        return dtype
+    elif hasattr(dtype, 'dtype'):
+        return jnp.dtype(dtype.dtype)
+    else:
+        raise ValueError(f"Argument is unsupported data type {type(dtype)}")
+
+
+def to_torch_dtype(dtype: str | jnp.dtype | torch.dtype) -> torch.dtype:
+    dtype = to_jax_dtype(dtype)
+    return j2t_dtype(dtype)
+
+
+def get_jax_dtype_from_str_dtype(str_dtype: str) -> jnp.dtype:
+    return to_jax_dtype(str_dtype)
+

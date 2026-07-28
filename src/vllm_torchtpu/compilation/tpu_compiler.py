@@ -145,7 +145,8 @@ class TpuCompilerAdaptor(CompilerInterface):
 
     name = "tpu"
 
-    def __init__(self):
+    def __init__(self, vllm_config: VllmConfig | None = None):
+        self.vllm_config = vllm_config
         self.cache_dir: str | None = None
         self._disable_cache = False
 
@@ -360,3 +361,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn = unwrap_fn
 
         return compiled_fn
+
+
+def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+    compiler = TpuCompilerAdaptor(vllm_config)
+    return compiler.compute_hash(vllm_config)

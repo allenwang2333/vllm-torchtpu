@@ -14,6 +14,9 @@
 """Shared pytest configuration for all tests."""
 
 import os
+import sys
+
+
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
@@ -47,7 +50,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--use-tpu",
         action="store_true",
-        default=True,
+        default=False,
         help="Run tests on TPU device instead of CPU",
     )
 

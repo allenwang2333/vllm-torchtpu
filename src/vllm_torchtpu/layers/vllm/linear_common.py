@@ -50,44 +50,53 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
             raise ValueError(
                 f"Input hidden dim {k_dim} must be divisible by block scale "
                 f"count {sharded_num_blocks}.")
-        block_size = k_dim // sharded_num_blocks
-        return blockwise_quantized_matmul_kernel(
-            x,
-            w_q,
-            w_s,
-            x_q_dtype=x_q_dtype,
-            block_size=block_size,
+        return gmm_v2(
+            lhs=x,
+            rhs=jnp.expand_dims(w_q, 0),
+            group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+            rhs_scale=jnp.expand_dims(w_s, 0),
+            rhs_bias=None,
+            group_offset=jnp.array([0], dtype=jnp.int32),
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            maybe_quantize_lhs=True,
         )
     return xla_quantized_matmul(x, w_q, w_s)
 
 
-_quantized_matmul_kernel_op: Callable | None = None
-_quantized_matmul_kernel_op_lock = Lock()
+def _build_quantized_matmul_op() -> Callable:
+    """Pre-build the Pallas quantized matmul CustomOpDef at module load time.
+
+    Dynamo cannot trace C-extension context managers (Lock) or dynamic jax.jit
+    compilation inside a forward-pass graph trace. Pre-building the custom op
+    eagerly at module import time ensures jax.jit and op registration occur
+    outside of PyTorch Dynamo tracing.
+    """
+    op = pallas.jax_op("pallas::quantized_matmul_kernel",
+                       _quantized_matmul_jax)
+
+    def _fake_quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
+                               w_s: torch.Tensor):
+        del w_s
+        return torch.empty(x.shape[0],
+                           w_q.shape[0],
+                           dtype=x.dtype,
+                           device=x.device)
+
+    op.register_fake(_fake_quantized_matmul)
+    return op
+
+
+# Pre-warmed at import time to prevent PyTorch Dynamo graph breaks during model forward passes.
+_quantized_matmul_kernel_op: Callable = _build_quantized_matmul_op()
 
 
 def _get_quantized_matmul_op() -> Callable:
-    global _quantized_matmul_kernel_op
-    if _quantized_matmul_kernel_op is not None:
-        return _quantized_matmul_kernel_op
+    return _quantized_matmul_kernel_op
 
-    with _quantized_matmul_kernel_op_lock:
-        if _quantized_matmul_kernel_op is not None:
-            return _quantized_matmul_kernel_op
 
-        op = pallas.jax_op("pallas::quantized_matmul_kernel",
-                           _quantized_matmul_jax)
 
-        def _fake_quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
-                                   w_s: torch.Tensor):
-            del w_s
-            return torch.empty(x.shape[0],
-                               w_q.shape[0],
-                               dtype=x.dtype,
-                               device=x.device)
 
-        op.register_fake(_fake_quantized_matmul)
-        _quantized_matmul_kernel_op = op
-        return op
 
 
 def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,

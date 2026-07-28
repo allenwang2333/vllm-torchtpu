@@ -135,6 +135,7 @@ def prebuild_fused_moe_kernel(
     topk: int,
     activation: str,
     experts_start: Optional[int],
+    has_bias: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -172,6 +173,16 @@ def fused_moe_gmm(
         activation=activation,
         experts_start=experts_start,
     )
+    # Prevent negative indices in topk_ids to satisfy PyTorch-XLA CustomOp constraint.
+    valid_mask = topk_ids >= 0
+    topk_weights_masked = torch.where(valid_mask, topk_weights, torch.zeros_like(topk_weights))
+    topk_ids_masked = torch.where(valid_mask, topk_ids, torch.zeros_like(topk_ids))
+
+    # if experts_start is not None:
+    #     local_mask = (topk_ids >= experts_start) & (topk_ids < experts_start + 32)
+    #     num_local = local_mask.sum().item()
+    #     print(f"[DEBUG_ROUTE] Rank {torch.distributed.get_rank()} experts_start={experts_start} | Local routed: {num_local} / {topk_ids.numel()} | Topk IDs: {topk_ids.flatten()[:16].tolist()}", flush=True)
+
     return fused_moe(
         hidden_states,
         w1,
@@ -180,6 +191,6 @@ def fused_moe_gmm(
         w2_scale,
         w1_bias,
         w2_bias,
-        topk_weights,
-        topk_ids,
+        topk_weights_masked,
+        topk_ids_masked,
     )
