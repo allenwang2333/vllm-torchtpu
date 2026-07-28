@@ -40,15 +40,8 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention)
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing)
-from vllm_torchtpu.layers.common import sharding as sharding_mod
-from vllm_torchtpu.layers.common.sharding import (MESH_AXIS_NAMES,
-                                                  ShardingAxisName,
-                                                  ShardingAxisNameBase)
 
-# Force the N-D axis names (which carry `pcp`) regardless of NEW_MODEL_DESIGN.
-sharding_mod.ShardingAxisName._cls = ShardingAxisNameBase
-
-NQ, NKV, HD = 32, 2, 128
+NQ, NKV, HD = 32, 2, 256
 PAGE = 256  # per-rank block_size
 Q_BLOCK_SIZE = 512  # Tiling block size for Pallas vector registers
 DTYPE = jnp.bfloat16
@@ -62,6 +55,15 @@ _rand = lambda s: jnp.array(_rng.random(size=s, dtype=np.float32)).astype(DTYPE)
 
 
 def _bench(fn, *a):
+    """Benchmarks a JAX function execution time after warmup.
+
+    Args:
+        fn: Function to benchmark.
+        *a: Positional arguments to pass to fn.
+
+    Returns:
+        Average execution time in milliseconds.
+    """
     jax.block_until_ready(fn(*a))
     for _ in range(WARMUP):
         jax.block_until_ready(fn(*a))
@@ -72,13 +74,32 @@ def _bench(fn, *a):
 
 
 def _mesh(pcp, tp):
-    mesh_axis_names = (PCP_AXIS_NAME, ShardingAxisName.ATTN_HEAD)
+    """Creates a 2D JAX device mesh with PCP and model axes.
+
+    Args:
+        pcp: Context parallel degree.
+        tp: Tensor parallel degree.
+
+    Returns:
+        Jax Mesh object configured for (pcp, model) sharding.
+    """
+    mesh_axis_names = (PCP_AXIS_NAME, "model")
     n = pcp * tp
     return Mesh(np.array(jax.devices()[:n]).reshape((pcp, tp)), mesh_axis_names)
 
 
 def make_pcp_wrapper(pcp, tp, chunk, max_ctx):
-    """Drive sharded_pcp_ragged_paged_attention on the real mesh."""
+    """Drive sharded_pcp_ragged_paged_attention on the real mesh.
+
+    Args:
+        pcp: Context parallel size.
+        tp: Tensor parallel size.
+        chunk: Chunk token size.
+        max_ctx: Maximum context sequence length.
+
+    Returns:
+        A benchmark function accepting context length and returning execution time in ms.
+    """
     if jax.device_count() < pcp * tp:
         return lambda ctx: float("nan")
     mesh = _mesh(pcp, tp)
@@ -165,6 +186,14 @@ def make_tp(tp, chunk, max_ctx):
 
 
 def human(n):
+    """Formats a token count integer into a human-readable string (e.g. 16k, 1M).
+
+    Args:
+        n: Token count integer.
+
+    Returns:
+        Formatted string representation.
+    """
     return f"{n // 1024}k" if n < 1024 * 1024 else f"{n / 1024 / 1024:g}M"
 
 
