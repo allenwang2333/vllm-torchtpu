@@ -652,6 +652,7 @@ class TpuPlatform(Platform):
                 max_token_size=scheduler_config.max_num_batched_tokens,
                 linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
                 linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
+                padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
             )
         else:
             compilation_config.compile_sizes = sorted(

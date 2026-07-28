@@ -39,8 +39,12 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+<<<<<<< HEAD
     TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
+=======
+    VLLM_TPU_BUCKET_PADDING_GAP: int = 16
+>>>>>>> 77fd3081 (fix: move VLLM_TPU_BUCKET_PADDING_GAP env definition to vllm_torchtpu.envs)
 
 
 def env_with_choices(
@@ -246,6 +250,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Step for the linear range above.
     "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
     lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
+    # Bucket padding gap for TPU compile sizes
+    "VLLM_TPU_BUCKET_PADDING_GAP":
+    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
 }
 
 
