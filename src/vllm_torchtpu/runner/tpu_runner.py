@@ -68,6 +68,8 @@ from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend)
+from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
+    bind_pooled_gdn_geometry
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -4120,6 +4122,15 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        if self._unified_kv_layout and kv_cache_config.has_mamba_layers:
+            # The manager block size is only settled after the model is
+            # built, so the GDN layers take their pool geometry here, with
+            # the pool they will run against.
+            bind_pooled_gdn_geometry(
+                self.vllm_config.compilation_config.static_forward_context,
+                self.cache_config.block_size,
+            )
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()

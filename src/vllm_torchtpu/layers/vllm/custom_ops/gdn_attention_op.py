@@ -262,7 +262,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # (warmup/profiling runs check this).
         self.kv_cache = None
         self.gdn_op = self._build_gdn_op()
-        self.gdn_pooled_op = self._build_pooled_gdn_op()
+        # The pooled op is built in bind_pool_geometry() rather than here: it
+        # needs the manager block size, which the platform only settles after
+        # the model is built (update_block_size_for_backend runs after
+        # load_model, and for hybrid models it derives the size from the
+        # mamba state). Binding it alongside the pool keeps the op's block
+        # geometry from disagreeing with the pool's kernel-block geometry.
+        # The mesh is captured here because the model wrapper context is no
+        # longer active at bind time.
+        self.gdn_pooled_op = None
+        self._pool_mesh = get_vllm_model_wrapper_context().mesh
         self.gdn_pcp_op = (self._build_gdn_op(
             pcp_streaming=True) if self._pcp_streaming_enabled() else None)
 
@@ -437,12 +446,35 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
-    def _build_pooled_gdn_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
+    def bind_pool_geometry(self, pool_block_tokens: int) -> None:
+        """Build the pooled GDN op against the bound pool.
+
+        Called by the runner during KV-cache initialization — the one moment
+        where the settled manager block size and the pool tensor both exist.
+        The op is built here rather than lazily in forward because Dynamo
+        cannot trace op construction inside the compiled region.
+        """
+        kv_cache = self.kv_cache
+        assert kv_cache is not None and len(kv_cache) == 1, (
+            "bind_pool_geometry expects the unified block pool to be bound "
+            "on this layer", self.prefix)
+        # Backends with a fixed kernel block (batched RPA) get the pool born
+        # at kernel granularity, so a manager block is several pool blocks.
+        kernel_block_tokens = kv_cache[0].shape[1]
+        if pool_block_tokens % kernel_block_tokens != 0:
+            raise ValueError(
+                "Unified pool geometry mismatch for "
+                f"{self.prefix}: manager block_size={pool_block_tokens} is "
+                f"not a multiple of the pool's kernel block "
+                f"({kernel_block_tokens} tokens, pool shape "
+                f"{tuple(kv_cache[0].shape)}).")
+        self.gdn_pooled_op = self._build_pooled_gdn_op(pool_block_tokens)
+
+    def _build_pooled_gdn_op(self, pool_block_tokens: int):
         local_num_v_heads = self.num_v_heads // self.tp_size
         wrapped_fn = functools.partial(
             gdn_attention_pooled_core_tpu,
-            mesh=vllm_context.mesh,
+            mesh=self._pool_mesh,
             n_kq=self.num_k_heads // self.tp_size,
             n_v=local_num_v_heads,
             d_k=self.head_k_dim,
@@ -450,8 +482,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             kernel_size=self.conv_kernel_size,
             # Manager block size: the pool may be born at a smaller kernel
             # granularity for backends with a fixed kernel block.
-            pool_block_tokens=(
-                vllm_context.vllm_config.cache_config.block_size),
+            pool_block_tokens=pool_block_tokens,
         )
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
         # The recurrent state (arg 3) is the attention-shaped pool: the ssm
@@ -555,6 +586,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # metadata builder.
                 (recurrent_state, ) = kv_cache
                 assert attn_metadata.mamba_state_indices is not None
+                if self.gdn_pooled_op is None:
+                    raise RuntimeError(
+                        "Pooled GDN op was not bound during KV-cache "
+                        "initialization.")
                 state_indices = attn_metadata.mamba_state_indices.to(
                     torch.int32)
                 core_attn_out = self.gdn_pooled_op(
@@ -642,3 +677,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+
+
+def bind_pooled_gdn_geometry(forward_context: dict,
+                             pool_block_tokens: int) -> None:
+    """Bind the unified-pool block geometry to every GDN layer.
+
+    Runs from the runner right after the pool is attached to the layers, so
+    the op is built once, outside the compiled region, from a block size that
+    is final and a pool that exists.
+    """
+    for layer in forward_context.values():
+        if isinstance(layer, VllmGatedDeltaNetAttention):
+            layer.bind_pool_geometry(pool_block_tokens)

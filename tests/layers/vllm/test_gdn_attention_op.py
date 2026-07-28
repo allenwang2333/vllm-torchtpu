@@ -131,9 +131,11 @@ class TestVllmGatedDeltaNetAttention:
             attn = VllmGatedDeltaNetAttention()
 
         mock_build.assert_called_once_with()
-        mock_build_pooled.assert_called_once_with()
+        # The pooled op waits for bind_pool_geometry: the manager block size
+        # is not settled while the model is being built.
+        mock_build_pooled.assert_not_called()
         assert attn.gdn_op is regular_op
-        assert attn.gdn_pooled_op is pooled_op
+        assert attn.gdn_pooled_op is None
         assert attn.gdn_pcp_op is None
 
     def test_init_builds_pcp_gdn_op_when_pcp_enabled(self):
@@ -158,10 +160,37 @@ class TestVllmGatedDeltaNetAttention:
             attn = VllmGatedDeltaNetAttention()
 
         assert mock_build.call_args_list == [call(), call(pcp_streaming=True)]
-        mock_build_pooled.assert_called_once_with()
+        mock_build_pooled.assert_not_called()
         assert attn.gdn_op is regular_op
-        assert attn.gdn_pooled_op is pooled_op
+        assert attn.gdn_pooled_op is None
         assert attn.gdn_pcp_op is pcp_op
+
+    def test_bind_pool_geometry_builds_op_with_manager_block_size(self):
+        pooled_op = MagicMock()
+        attn = _qwen35_397b_gdn_attn("layers.0.linear_attn")
+        attn.gdn_pooled_op = None
+        # Pool born at the backend's 256-token kernel block; a 768-token
+        # manager block is three of them.
+        attn.kv_cache = [torch.zeros(6, 256, 1, 4, 8)]
+
+        with patch.object(VllmGatedDeltaNetAttention,
+                          "_build_pooled_gdn_op",
+                          return_value=pooled_op) as mock_build_pooled:
+            attn.bind_pool_geometry(768)
+
+        mock_build_pooled.assert_called_once_with(768)
+        assert attn.gdn_pooled_op is pooled_op
+
+    def test_bind_pool_geometry_rejects_block_size_pool_mismatch(self):
+        attn = _qwen35_397b_gdn_attn("layers.0.linear_attn")
+        attn.gdn_pooled_op = None
+        attn.kv_cache = [torch.zeros(6, 256, 1, 4, 8)]
+
+        # A stale manager block size (the pre-derivation default) must fail
+        # at bind, not minutes later inside the first backbone compile.
+        with pytest.raises(ValueError, match="Unified pool geometry mismatch"):
+            attn.bind_pool_geometry(16)
+        assert attn.gdn_pooled_op is None
 
     def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
         attn0 = _qwen35_397b_gdn_attn(
