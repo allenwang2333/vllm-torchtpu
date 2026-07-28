@@ -65,9 +65,6 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-os.environ["VLLM_USE_V1"] = "0"
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
 import requests
 
 

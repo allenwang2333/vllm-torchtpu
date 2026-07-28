@@ -890,12 +890,6 @@ class TpuPlatform(Platform):
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:
-        # Multimodal V1 support on TPU is experimental and missing mm_processor
-        if model_config and (
-                getattr(model_config, "is_multimodal_model", False)
-                or getattr(model_config, "is_multimodal", False) or getattr(
-                    model_config, "multimodal_config", None) is not None):
-            return False
         return True
 
     @classmethod
