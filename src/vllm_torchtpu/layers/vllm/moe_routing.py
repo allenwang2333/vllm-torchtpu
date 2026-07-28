@@ -99,6 +99,9 @@ def select_experts(
                                         dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if envs.ENABLE_MOE_HOTNESS_TRACKER:
+        from vllm_torchtpu.layers.vllm.moe_balancer import get_global_hotness_tracker
+        get_global_hotness_tracker().update(topk_ids)
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
