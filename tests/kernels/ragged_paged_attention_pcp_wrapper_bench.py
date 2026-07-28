@@ -55,21 +55,18 @@ _rand = lambda s: jnp.array(_rng.random(size=s, dtype=np.float32)).astype(DTYPE)
 
 
 def _bench(fn, *a):
-    """Benchmarks a JAX function execution time after warmup.
-
-    Args:
-        fn: Function to benchmark.
-        *a: Positional arguments to pass to fn.
-
-    Returns:
-        Average execution time in milliseconds.
-    """
+    # Amortize host dispatch/sync: block ONCE after queueing all iterations,
+    # so per-step latency reflects device time rather than ITERS separate
+    # host<->device round trips.  Blocking every iteration (the old behaviour)
+    # adds a fixed ~0.7 ms of host overhead that dominates at small ctx.
     jax.block_until_ready(fn(*a))
     for _ in range(WARMUP):
         jax.block_until_ready(fn(*a))
     t0 = time.perf_counter()
+    out = None
     for _ in range(ITERS):
-        jax.block_until_ready(fn(*a))
+        out = fn(*a)
+    jax.block_until_ready(out)
     return (time.perf_counter() - t0) / ITERS * 1e3
 
 
