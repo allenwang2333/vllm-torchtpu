@@ -38,6 +38,10 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    DP_SCHED_ENABLE_BUCKET_BUDGETING: bool = True
+    DP_SCHED_DYNAMIC_DRAIN: bool = False
+    DP_SCHED_DYNAMIC_DRAIN_MIN_REQS: int = 8
+    DP_SCHED_DYNAMIC_DRAIN_TIMEOUT_MS: int = 100
     MLA_XPOSE_N_TILE_SIZE: int = 160
 
 
@@ -247,6 +251,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # TpuDpScheduler: Cap prefill admission tokens to compilation bucket boundaries.
+    "DP_SCHED_ENABLE_BUCKET_BUDGETING":
+    lambda: env_bool("DP_SCHED_ENABLE_BUCKET_BUDGETING", default=True),
+    # TpuDpScheduler: Perform cross-rank CPU sync for dynamic prefill drain.
+    "DP_SCHED_DYNAMIC_DRAIN":
+    lambda: env_bool("DP_SCHED_DYNAMIC_DRAIN", default=False),
+    # TpuDpScheduler: Minimum waiting request count threshold across DP ranks for dynamic drain.
+    "DP_SCHED_DYNAMIC_DRAIN_MIN_REQS":
+    lambda: int(os.getenv("DP_SCHED_DYNAMIC_DRAIN_MIN_REQS") or "8"),
+    # TpuDpScheduler: Max waiting age in ms threshold across DP ranks for dynamic drain.
+    "DP_SCHED_DYNAMIC_DRAIN_TIMEOUT_MS":
+    lambda: int(os.getenv("DP_SCHED_DYNAMIC_DRAIN_TIMEOUT_MS") or "100"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
