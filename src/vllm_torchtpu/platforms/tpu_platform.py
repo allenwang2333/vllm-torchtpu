@@ -679,16 +679,32 @@ class TpuPlatform(Platform):
         compilation_config.compile_ranges_split_points = []
 
         model_config = vllm_config.model_config
-        if model_config is not None and model_config.dtype in (
-                torch.float16,
-                torch.float32,
-        ):
-            logger.warning(
-                "The TPU backend currently does not support %s. "
-                "Using bfloat16 instead.",
-                model_config.dtype,
-            )
-            model_config.dtype = torch.bfloat16
+        if model_config is not None:
+            if model_config.dtype in (
+                    torch.float16,
+                    torch.float32,
+            ):
+                logger.warning(
+                    "The TPU backend currently does not support %s. "
+                    "Using bfloat16 instead.",
+                    model_config.dtype,
+                )
+                model_config.dtype = torch.bfloat16
+
+            if (getattr(model_config, "is_multimodal_model", False)
+                    or getattr(model_config, "is_multimodal", False)
+                    or getattr(model_config, "multimodal_config",
+                               None) is not None):
+                if os.environ.get("VLLM_USE_V1", "0") == "1":
+                    logger.warning(
+                        "Multimodal models on TPU are not supported with V1 engine. "
+                        "Forcing VLLM_USE_V1=0.")
+                    os.environ["VLLM_USE_V1"] = "0"
+                    if hasattr(vllm_envs, "VLLM_USE_V1"):
+                        try:
+                            vllm_envs.VLLM_USE_V1 = False
+                        except Exception:
+                            pass
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
