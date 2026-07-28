@@ -21,34 +21,34 @@ logger = init_logger(__name__)
 
 
 class ExpertHotnessTracker:
-    """Thread-safe online rolling window tracker for MoE expert activation hotness."""
+    """Thread-safe, zero-sync TPU-native rolling window tracker for MoE expert activation hotness."""
 
     def __init__(self, num_experts: int = 512, window_decay: float = 0.95) -> None:
         self.num_experts = num_experts
         self.window_decay = window_decay
-        self._hotness_counts = torch.zeros(num_experts, dtype=torch.float32)
-        self._total_tokens = 0
-        self._lock = threading.Lock()
+        self._hotness_counts: torch.Tensor | None = None
 
     def update(self, topk_ids: torch.Tensor) -> None:
-        """Update activation counts from a routing step."""
+        """Update activation counts on TPU device asynchronously without CPU sync."""
         if topk_ids is None or topk_ids.numel() == 0:
             return
 
-        with self._lock:
-            counts = torch.bincount(topk_ids.reshape(-1).cpu(), minlength=self.num_experts)
-            counts_float = counts.to(torch.float32)
-            self._hotness_counts = (
-                self.window_decay * self._hotness_counts
-                + (1.0 - self.window_decay) * counts_float
-            )
-            self._total_tokens += topk_ids.shape[0]
+        if self._hotness_counts is None or self._hotness_counts.device != topk_ids.device:
+            self._hotness_counts = torch.zeros(
+                self.num_experts, dtype=torch.float32, device=topk_ids.device)
+
+        # Pure TPU non-blocking tensor operation -- 0 Device-to-Host sync stalls!
+        flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        ones = torch.ones_like(flat_ids, dtype=torch.float32)
+        self._hotness_counts.mul_(self.window_decay).scatter_add_(
+            0, flat_ids, ones * (1.0 - self.window_decay))
 
     def get_sorted_experts(self) -> list[int]:
         """Get expert IDs sorted by hotness (most hot to least hot)."""
-        with self._lock:
-            _, indices = torch.sort(self._hotness_counts, descending=True)
-            return indices.tolist()
+        if self._hotness_counts is None:
+            return list(range(self.num_experts))
+        _, indices = torch.sort(self._hotness_counts.cpu(), descending=True)
+        return indices.tolist()
 
     def compute_snake_expert_map(self, num_ranks: int) -> dict[int, int]:
         """Compute Snake/Zig-zag load-balanced mapping of global experts to EP ranks.
