@@ -37,11 +37,10 @@ class ExpertHotnessTracker:
             self._hotness_counts = torch.zeros(
                 self.num_experts, dtype=torch.float32, device=topk_ids.device)
 
-        # Pure TPU non-blocking tensor operation -- 0 Device-to-Host sync stalls!
+        # Pure functional TPU tensor math -- avoids XLA alias analysis hang on in-place scatter_add
         flat_ids = topk_ids.reshape(-1).to(torch.int64)
-        ones = torch.ones_like(flat_ids, dtype=torch.float32)
-        self._hotness_counts.mul_(self.window_decay).scatter_add_(
-            0, flat_ids, ones * (1.0 - self.window_decay))
+        counts = torch.nn.functional.one_hot(flat_ids, num_classes=self.num_experts).sum(dim=0).to(torch.float32)
+        self._hotness_counts = self._hotness_counts * self.window_decay + counts * (1.0 - self.window_decay)
 
     def get_sorted_experts(self) -> list[int]:
         """Get expert IDs sorted by hotness (most hot to least hot)."""
