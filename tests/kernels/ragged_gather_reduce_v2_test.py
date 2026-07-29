@@ -19,6 +19,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
@@ -27,6 +28,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce as ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_scatter import ragged_scatter
+
+pytestmark = pytest.mark.nightly
 
 jax.config.parse_flags_with_absl()
 
