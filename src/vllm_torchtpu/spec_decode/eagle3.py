@@ -125,7 +125,9 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
-        self.constant_draft_positions = self.speculative_config.use_gemma4_mtp(
+        self.constant_draft_positions = (
+            getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
+            and self.speculative_config.use_gemma4_mtp()
         )
 
     def load_model(self, target_model) -> None:
@@ -148,7 +150,8 @@ class Eagle3Proposer:
         maybe_share_embeddings(self.draft_model, target_model,
                                self._draft_replicated)
         self._maybe_share_lm_head(target_model)
-        if self.speculative_config.use_gemma4_mtp():
+        if (getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
+                and self.speculative_config.use_gemma4_mtp()):
             self._setup_gemma4_kv_sharing(target_attn_layer_names)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM

@@ -265,7 +265,8 @@ class TPUModelRunner(GPUModelRunner):
         if not self.speculative_config:
             return False
         return (self.speculative_config.use_eagle()
-                or self.speculative_config.use_gemma4_mtp()
+                or (getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
+                    and self.speculative_config.use_gemma4_mtp())
                 or self.speculative_config.method == "dflash")
 
     def __init__(
@@ -692,8 +693,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
-            elif self.speculative_config.use_eagle(
-            ) or self.speculative_config.use_gemma4_mtp():
+            elif self.speculative_config.use_eagle() or (
+                    getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
+                    and self.speculative_config.use_gemma4_mtp()):
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:
                 raise NotImplementedError(
