@@ -23,6 +23,13 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 
+def unpack_packed_u8_to_fp4_axis(w_packed: jax.Array, axis: int) -> jax.Array:
+    w_t = jnp.swapaxes(w_packed, axis, -1)
+    w_fp4 = jax.lax.bitcast_convert_type(w_t, jnp.float4_e2m1fn)
+    w_flat = jnp.reshape(w_fp4, w_fp4.shape[:-2] + (-1, ))
+    return jnp.swapaxes(w_flat, axis, -1)
+
+
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     """Unpack a uint8-packed E2M1 weight (2 fp4 per byte along the last axis)
     into ``float4_e2m1fn`` and move the contracting axis into GMM layout. Input
@@ -75,8 +82,9 @@ def gmm_wrapper(lhs,
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    is_fp4_weight = (rhs.dtype == jnp.uint8) or (jnp.issubdtype(
+        rhs.dtype, jnp.floating) and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    rhs_quant_dtype = jnp.float4_e2m1fn if is_fp4_weight else None
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -88,6 +96,7 @@ def gmm_wrapper(lhs,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
 
@@ -192,7 +201,16 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
     )
-    gmm1_res = gmm1_res[:, :w2.shape[1]]
+    w2_k = w2.shape[1]
+    if w2.dtype == jnp.uint8:
+        w2_k = w2_k * 2
+    if w2_k != gmm1_res.shape[1] and (w2.shape[2] == gmm1_res.shape[1]
+                                      or w2.shape[2] * 2 == gmm1_res.shape[1]):
+        w2 = jnp.swapaxes(w2, 1, 2)
+        if w2_scale is not None:
+            w2_scale = jnp.swapaxes(w2_scale, 1, 2)
+        w2_k = gmm1_res.shape[1]
+    gmm1_res = gmm1_res[:, :w2_k]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -273,9 +291,13 @@ def fused_moe_func(
     """
     num_tokens, hidden_size = hidden_states.shape
 
-    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
-    # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
-    # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
+    # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout.
+    # If they are packed uint8, unpack them to float4_e2m1fn here in JAX.
+    if w1.dtype in (jnp.uint8, jnp.int8):
+        w1 = unpack_packed_u8_to_fp4_axis(w1, axis=1)
+    if w2.dtype in (jnp.uint8, jnp.int8):
+        w2 = unpack_packed_u8_to_fp4_axis(w2, axis=1)
+
     _, padded_hidden_size, _ = w1.shape
 
     assert topk_weights.shape == (num_tokens, topk)
@@ -286,12 +308,14 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
+    valid = topk_weights > 0
     if experts_start is not None:
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights,
-                                 jnp.zeros_like(topk_weights))
+        valid = valid & (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+    else:
+        topk_ids = jnp.where(valid, topk_ids, jnp.full_like(topk_ids, -1))
+    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(
