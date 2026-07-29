@@ -14,7 +14,6 @@
 
 x-perf-eval-defaults: &perf_eval_defaults
   env:
-    MODEL_IMPL_TYPE: "vllm"
     BENCHMARK_WARMUP_RUNS: "1"
     VLLM_RPC_TIMEOUT: "600000"
 
@@ -47,7 +46,6 @@ steps:
         agents:
           queue: "tpu_v7x_2_queue"
         env:
-          MODEL_IMPL_TYPE: "vllm"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-0.6b-tp1 --run-lm-eval --results-dir /perf_eval_results"
@@ -61,7 +59,6 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
-          MODEL_IMPL_TYPE: "vllm"
           EVALPLUS_DATASETS: "humaneval mbpp"
           EVALPLUS_PARALLEL: "8"
         commands:
@@ -75,7 +72,6 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
-          MODEL_IMPL_TYPE: "vllm"
           EVALPLUS_DATASETS: "humaneval mbpp"
           EVALPLUS_PARALLEL: "8"
         commands:

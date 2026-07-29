@@ -67,7 +67,8 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend)
+                                                 PallasAttentionBackend,
+                                                 PallasMLAttentionBackend)
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -156,6 +157,7 @@ def _build_kv_connector_output(
     kv_connector_worker_meta: Any | None,
     invalid_block_ids: set[int],
     invalid_block_group_index: int | None,
+    kv_connector_stats: Any | None = None,
 ) -> KVConnectorOutput:
     """Build a connector output across the vLLM 0.23 API boundary.
 
@@ -170,6 +172,7 @@ def _build_kv_connector_output(
         "finished_recving": finished_recving,
         "kv_connector_worker_meta": kv_connector_worker_meta,
         "invalid_block_ids": invalid_block_ids,
+        "kv_connector_stats": kv_connector_stats,
     }
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
@@ -260,7 +263,16 @@ class TPUModelRunner(GPUModelRunner):
         vllm_config: VllmConfig,
         device: torch.device,
         original_parallel_config: ParallelConfig | None = None,
+        *,
+        profiler_rank: int,
+        profiler_world_size: int,
     ):
+        # Slice-global rank/world used to label phased-profiler traces; the
+        # worker resolves them from the TPU rank binding. Required rather than
+        # defaulted, because the obvious default -- parallel_config -- is the
+        # wrong scope and fails silently. See `_init_phased_profiling`.
+        self._profiler_rank = profiler_rank
+        self._profiler_world_size = profiler_world_size
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -566,8 +578,13 @@ class TPUModelRunner(GPUModelRunner):
         self.phase_based_profiler = None
         if self.phased_profiling_dir:
             profiler_config = self.vllm_config.profiler_config
-            global_rank = getattr(self.parallel_config, "rank", 0) or 0
-            world_size = getattr(self.parallel_config, "world_size", 1) or 1
+            # Deliberately not read from parallel_config: its rank is
+            # TPxPP-scoped, so every DP replica would call itself rank 0 and
+            # their traces would overwrite each other on merge. The worker
+            # resolves the slice-global rank from the TPU rank binding and
+            # passes it in.
+            global_rank = self._profiler_rank
+            world_size = self._profiler_world_size
             decode_kv_len_threshold = additional_config.get(
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
                 runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
@@ -626,7 +643,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None, set(), None
+            return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
@@ -642,11 +659,13 @@ class TPUModelRunner(GPUModelRunner):
         # forever -> the engine busy-spins / hangs. Mirrors
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
+        kv_connector_stats = kv_connector.get_kv_connector_stats()
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return (finished_sending, finished_recving, worker_meta,
-                invalid_block_ids, invalid_block_group_index)
+                invalid_block_ids, invalid_block_group_index,
+                kv_connector_stats)
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -657,14 +676,15 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
         (finished_sending, finished_recving, worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
         kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
+            kv_connector_stats=kv_connector_stats,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -871,7 +891,7 @@ class TPUModelRunner(GPUModelRunner):
                 page_size_padded = (
                     self._hybrid_uniform_page_size_bytes
                     if self._hybrid_uniform_page_size_bytes is not None else
-                    PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         attn_module.head_size,
@@ -2877,8 +2897,8 @@ class TPUModelRunner(GPUModelRunner):
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
         (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index
-         ) = self.get_finished_kv_transfers(scheduler_output)
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2924,15 +2944,16 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        kv_connector_output = (
-            None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None and not invalid_block_ids) else
-            _build_kv_connector_output(
+        kv_connector_output = (None if (
+            finished_sending is None and finished_recving is None
+            and kv_worker_meta is None and not invalid_block_ids
+            and kv_connector_stats is None) else _build_kv_connector_output(
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
                 kv_connector_worker_meta=kv_worker_meta,
                 invalid_block_ids=invalid_block_ids,
                 invalid_block_group_index=invalid_block_group_index,
+                kv_connector_stats=kv_connector_stats,
             ))
 
         next_tokens_tpu = None
@@ -3143,8 +3164,23 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self.speculative_config and self.speculative_config.use_eagle():
             self.drafter.load_model(self.model)
+
         # Ensure attention custom ops exist before any compile/inference path,
+        self._initialize_pallas_kernels()
+
+    def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
+        self._initialize_quantization_kernels()
+
+    def _initialize_quantization_kernels(self):
+        from vllm_torchtpu.layers.vllm.linear_common import (
+            _get_quantized_matmul_fp4_op, _get_quantized_matmul_op)
+
+        with set_current_vllm_config(self.vllm_config):
+            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
+            _get_quantized_matmul_op()
+            # Same for the NVFP4 W4A16 matmul op.
+            _get_quantized_matmul_fp4_op()
 
     def _initialize_attention_kernels(self) -> None:
         """Pre-build Pallas RPA attention kernels before torch.compile.
@@ -3164,12 +3200,14 @@ class TPUModelRunner(GPUModelRunner):
         draft_attn_names = getattr(spec_drafter, "_draft_attn_layer_names",
                                    None) or set()
 
-        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        layers = get_layers_from_vllm_config(self.vllm_config,
+                                             AttentionLayerBase)
         initialized_count = 0
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                             vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
-                if isinstance(attn_layer.impl, PallasAttentionBackendImpl):
+                if isinstance(getattr(attn_layer, "impl", None),
+                              PallasAttentionBackendImpl):
                     # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
                     # (non-shard_map) kernel.
                     if (name in draft_attn_names and
@@ -3269,8 +3307,9 @@ class TPUModelRunner(GPUModelRunner):
             # caller-supplied num_blocks and a single shared metadata.
             if self._attn_layer_names is None:
                 self._attn_layer_names = list(
-                    get_layers_from_vllm_config(self.vllm_config,
-                                                (Attention, MambaBase)).keys())
+                    get_layers_from_vllm_config(
+                        self.vllm_config,
+                        (AttentionLayerBase, MambaBase)).keys())
             block_tables = torch.zeros((num_reqs * num_blocks, ),
                                        dtype=torch.int32).to(self.device)
             attn_metadata = AttentionMetadata(
@@ -3915,25 +3954,29 @@ class TPUModelRunner(GPUModelRunner):
                            self.input_batch.num_reqs)
 
     @contextmanager
-    def _profile_no_cache_writes(self) -> Iterator[None]:
-        # Keep the kv=0-specialized profile compile out of the persistent
-        # serving cache. Flips only the disable flag; does not touch
-        # compile_sizes / compile_ranges_split_points / cache_dir, so
-        # capture_model sees its normal compile config.
-        saved_env = os.environ.get("VLLM_DISABLE_COMPILE_CACHE")
-        clear_envs = getattr(envs.__getattr__, "cache_clear", None)
-        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-        if clear_envs:
-            clear_envs()
+    def _profile_isolated_cache(self) -> Iterator[None]:
+        # Isolate the kv=0-specialized profile compile into a dedicated
+        # subdirectory ("profile_cache") so it can be cached across warm
+        # restarts without colliding with the real serving cache (kv > 0)
+        # or across different models / TP sizes / dtypes.
+        import hashlib
+
+        from vllm.compilation.caching import aot_compile_hash_factors
+
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            compute_tpu_compilation_hash
+        cc = self.vllm_config.compilation_config
+        base_cache_dir = cc.cache_dir or envs.VLLM_CACHE_ROOT
+        factors = aot_compile_hash_factors(self.vllm_config)
+        factors.append(compute_tpu_compilation_hash(self.vllm_config))
+        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
+        saved_cache_dir = cc.cache_dir
+        cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
+        os.makedirs(cc.cache_dir, exist_ok=True)
         try:
             yield
         finally:
-            if saved_env is None:
-                os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
-            else:
-                os.environ["VLLM_DISABLE_COMPILE_CACHE"] = saved_env
-            if clear_envs:
-                clear_envs()
+            cc.cache_dir = saved_cache_dir
 
     def profile_run(
         self,
@@ -3966,7 +4009,7 @@ class TPUModelRunner(GPUModelRunner):
             # program-region reservation, and the kv=0-specialized graphs are
             # dead after the dynamo reset below — one throwaway program keeps
             # the region within budget for capture_model's full bucket ladder.
-            with self._profile_no_cache_writes():
+            with self._profile_isolated_cache():
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
@@ -4328,6 +4371,25 @@ class TPUModelRunner(GPUModelRunner):
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
+                elif isinstance(kv_cache_spec, MLAAttentionSpec):
+                    # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
+                    # Because MLA maps all attention heads onto a single joint compressed latent key-value
+                    # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
+                    # across tensor parallel ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
+                    # Each device partition consistently retains a complete, unsliced replication of the
+                    # compressed latent cache structure across multi-chip execution loops.
+                    kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                        num_blocks,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        kv_cache_spec.dtype,
+                    )
+                    dtype = kv_cache_spec.dtype
+                    tpu_kv_cache = torch.zeros(kv_cache_shape,
+                                               dtype=dtype).to(self.device)
+
+                    kv_caches[layer_name] = tpu_kv_cache
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads

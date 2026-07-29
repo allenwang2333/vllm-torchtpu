@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 # TODO(ranlihao): add more flexible topology map
 TPU_MULTIHOST_TOPOLOGY_MAP = {
     16: "2,2,2,2",
+    32: "2,2,4,2",
 }
 
 # ---------------------------------------------------------------------------
@@ -194,6 +195,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
@@ -203,6 +205,7 @@ def apply_tpu_patches() -> None:
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
+    _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
@@ -516,8 +519,12 @@ class TpuPlatform(Platform):
                              **kwargs) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        if getattr(attn_selector_config, "use_mla", False):
+            selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+
         supported_backends = [
-            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM
+            AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.CUSTOM,
+            AttentionBackendEnum.FLASH_ATTN_MLA
         ]
         if selected_backend not in supported_backends:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
