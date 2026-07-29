@@ -836,7 +836,23 @@ class TpuPlatform(Platform):
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
+
+        # Mirror the two guards vLLM's base Platform.update_block_size_for_backend
+        # has (platforms/interface.py): model_config is None under some tests, and
+        # _find_non_ssm_backend is declared `type[AttentionBackend] | None`,
+        # returning None when no attention layer is non-SSM. This override
+        # dereferenced it unconditionally, so an attention-free model (no
+        # attention layers at all, e.g. a pure-SSM model) died with
+        # "'NoneType' object has no attribute 'get_page_size'". There is no
+        # attention page size to align to in that case.
+        if not vllm_config.model_config:
+            return
         backend_cls = cls._find_non_ssm_backend(vllm_config)
+        if backend_cls is None:
+            logger.info(
+                "No non-SSM attention backend found; leaving KV cache block "
+                "size at %s.", cache_config.block_size)
+            return
 
         is_hybrid = vllm_config.model_config.is_hybrid
         if not is_hybrid and not cache_config.user_specified_block_size:
