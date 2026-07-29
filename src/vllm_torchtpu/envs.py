@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     ENABLE_MOE_HOTNESS_TRACKER: bool = False
+    ENABLE_MOE_SNAKE_PROFILING: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
 
 
@@ -236,6 +237,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable MoE Expert Hotness Profiling and Tracker.
     "ENABLE_MOE_HOTNESS_TRACKER":
     lambda: env_bool("ENABLE_MOE_HOTNESS_TRACKER", default=False),
+    # Enable MoE Snake Load Balancer simulation mapping.
+    "ENABLE_MOE_SNAKE_PROFILING":
+    lambda: env_bool("ENABLE_MOE_SNAKE_PROFILING", default=True),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

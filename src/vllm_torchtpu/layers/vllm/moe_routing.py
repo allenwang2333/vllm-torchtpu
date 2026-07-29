@@ -102,6 +102,15 @@ def select_experts(
     if envs.ENABLE_MOE_HOTNESS_TRACKER:
         from vllm_torchtpu.layers.vllm.moe_balancer import get_global_hotness_tracker
         get_global_hotness_tracker().update(topk_ids)
+        
+    if getattr(envs, "ENABLE_MOE_SNAKE_PROFILING", False):
+        from vllm_torchtpu.layers.vllm.moe_balancer import get_global_hotness_tracker
+        tracker = get_global_hotness_tracker()
+        num_ranks = layer.moe_config.ep_size if (layer is not None and getattr(layer, 'moe_config', None) is not None) else 8
+        if num_ranks > 1:
+            logical_to_physical = tracker.compute_logical_to_physical_map(num_ranks)
+            topk_ids = logical_to_physical.to(topk_ids.device)[topk_ids.to(torch.int64)]
+            
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 

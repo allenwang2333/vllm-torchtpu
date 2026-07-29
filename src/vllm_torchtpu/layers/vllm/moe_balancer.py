@@ -70,6 +70,26 @@ class ExpertHotnessTracker:
 
         return expert_to_rank
 
+    def compute_logical_to_physical_map(self, num_ranks: int) -> torch.Tensor:
+        """Compute logical -> physical expert ID mapping for simulated Snake Routing."""
+        sorted_experts = self.get_sorted_experts()
+        logical_to_physical = torch.zeros(self.num_experts, dtype=torch.int64)
+        
+        experts_per_rank = self.num_experts // num_ranks
+        rank_counters = [0] * num_ranks
+        
+        for idx, logical_expert_id in enumerate(sorted_experts):
+            cycle = idx // num_ranks
+            rank_in_cycle = idx % num_ranks
+            assigned_rank = rank_in_cycle if cycle % 2 == 0 else num_ranks - 1 - rank_in_cycle
+            
+            # Map to a physical ID owned by the assigned rank
+            physical_id = assigned_rank * experts_per_rank + rank_counters[assigned_rank]
+            logical_to_physical[logical_expert_id] = physical_id
+            rank_counters[assigned_rank] += 1
+            
+        return logical_to_physical
+
 
 _GLOBAL_HOTNESS_TRACKER: ExpertHotnessTracker | None = None
 
