@@ -165,6 +165,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
+        self.is_k3_situ_aiter = False
         self.mxfp4_backend = Mxfp4Backend.TRITON
         self.apply_monolithic = self._select_monolithic()
 
@@ -173,7 +174,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
-        assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
+        # TPU MXFP4 supports both biased and unbiased MoE layers (e.g. Kimi-K3)
+
 
         activation_str = _get_activation_str(layer.activation)
         layer._tpu_activation_str = activation_str
@@ -206,7 +208,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         layer.w13_weight_scale = None
         layer.w2_weight_scale = None
 
-        if layer.w13_bias is not None:
+        w13_bias = getattr(layer, "w13_bias", None)
+        if w13_bias is not None:
             w13_bias = layer.w13_bias.data
             if w13_interleave:
                 w1_bias = w13_bias[:, ::2]
@@ -217,7 +220,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 w13_bias.unsqueeze(1).to(torch.float32),
                 requires_grad=False,
             )
-        if layer.w2_bias is not None:
+            
+        w2_bias = getattr(layer, "w2_bias", None)
+        if w2_bias is not None:
             layer.w2_bias = torch.nn.Parameter(
                 layer.w2_bias.data.unsqueeze(1).to(torch.float32),
                 requires_grad=False,
@@ -226,9 +231,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         if layer.w13_weight.device.type == "tpu":
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
-            if layer.w13_bias is not None:
+            if getattr(layer, "w13_bias", None) is not None:
                 sync.synchronize(layer.w13_bias, wait=True)
-            if layer.w2_bias is not None:
+            if getattr(layer, "w2_bias", None) is not None:
                 sync.synchronize(layer.w2_bias, wait=True)
 
         logger.info_once(
@@ -249,8 +254,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return mxfp4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
         )
 
     def _forward_monolithic_tpu(
@@ -258,6 +263,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
@@ -292,8 +298,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2=layer.w2_weight,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             experts_start=moe_routing.get_experts_start(layer),

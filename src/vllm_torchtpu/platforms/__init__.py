@@ -29,4 +29,9 @@ def _log_tpu_info() -> None:
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     _log_tpu_info()
+    try:
+        from vllm_torchtpu.kimi_mock_patch import patch_dummy_ops
+        patch_dummy_ops()
+    except Exception as e:
+        pass
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"

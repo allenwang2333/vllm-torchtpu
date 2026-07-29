@@ -212,6 +212,9 @@ def apply_tpu_patches() -> None:
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
 
+    from vllm_torchtpu.kimi_mock_patch import patch_kimi_k3
+    patch_kimi_k3()
+
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
     if model_config is None:

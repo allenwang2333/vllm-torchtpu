@@ -202,6 +202,11 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 return CompressedTensorsLinearMethod(self)
 
             case RoutedExperts():
+                if getattr(self, "quant_format", None) == "mxfp4-pack-quantized":
+                    from vllm_torchtpu.layers.vllm.quantization.mxfp4 import VllmMxfp4MoEMethod
+                    layer.moe_config = self.get_moe_config(layer)
+                    return VllmMxfp4MoEMethod(layer.moe_config)
+
                 layer.moe_config = self.get_moe_config(layer)
                 return VllmCompressedTensorsMoEMethod.get_moe_method(
                     self, layer, layer_name=prefix)

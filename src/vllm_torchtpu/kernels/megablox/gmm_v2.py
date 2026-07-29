@@ -73,6 +73,13 @@ def deinterleave_lane(val: jax.Array) -> tuple[jax.Array, jax.Array]:
     return lhs, rhs
 
 
+def situ(gate: jax.Array,
+         up: jax.Array,
+         *,
+         beta: float = 1.0) -> jax.Array:
+    gate = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+    return gate * up
+
 def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -106,6 +113,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
             return swigluoai(acc_gate, acc_up)
         case "silu_and_mul_with_clamp":
             return silu_and_mul_with_clamp(acc_gate, acc_up)
+        case "situ":
+            return situ(acc_gate, acc_up)
         case _:
             raise NotImplementedError(
                 f"Unsupported activation function: {fuse_act}")
