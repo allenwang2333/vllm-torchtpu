@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import portpicker
 import torch
+import vllm.envs as vllm_envs
 # Ensure the "tpu" torch.compile backend is registered before vllm
 # tries to use it (e.g. in @torch.compile decorators at import time).
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
@@ -595,7 +596,7 @@ class TpuPlatform(Platform):
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
 
-        if envs.VLLM_TPU_USING_PATHWAYS:
+        if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
                 "Pathways is not supported by torchtpu-vllm. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
@@ -651,7 +652,6 @@ class TpuPlatform(Platform):
                 max_token_size=scheduler_config.max_num_batched_tokens,
                 linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
                 linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
-                padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -762,7 +762,7 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
                     RayDistributedExecutorV2
                 parallel_config.distributed_executor_backend = RayDistributedExecutorV2

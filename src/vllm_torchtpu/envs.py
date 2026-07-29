@@ -39,23 +39,10 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
-<<<<<<< HEAD
-<<<<<<< HEAD
     TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
-=======
-    VLLM_TPU_BUCKET_PADDING_GAP: int = 16
-<<<<<<< HEAD
->>>>>>> 77fd3081 (fix: move VLLM_TPU_BUCKET_PADDING_GAP env definition to vllm_torchtpu.envs)
-=======
-=======
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
->>>>>>> b4df655d (chore: increase Dynamo recompile limits)
-    VLLM_XLA_USE_SPMD: bool = False
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
-    VLLM_TPU_USING_PATHWAYS: bool = False
-    VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
->>>>>>> 804aa672 (feat: add TPU configuration environment variables)
 
 
 def env_with_choices(
