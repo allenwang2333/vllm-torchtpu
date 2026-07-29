@@ -41,6 +41,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         num_computed_tokens=0,
         num_prompt_tokens=33,
         num_tokens=33,
+        shared_prefix_boundary=0,
     )
 
     num_new_tokens = Scheduler._mamba_block_aligned_split(
@@ -146,12 +147,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
-    def test_check_and_update_config_hybrid_block_size(self, mock_envs,
-                                                       mock_prepare_env,
+    def test_check_and_update_config_hybrid_block_size(self, mock_prepare_env,
                                                        mock_apply_patches,
                                                        vllm_config):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         # kv-transfer deployments run the split layout (the pool is opt-in
         # via the env and never engages for kv-transfer).
@@ -179,11 +177,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_check_and_update_config_hybrid_derives_block_size_with_env(
-            self, mock_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
 
@@ -230,11 +225,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_check_and_update_config_validates_mamba_apc_modes(
-            self, mock_envs, mock_prepare_env, mock_apply_patches, vllm_config,
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
             mamba_cache_mode, speculative_config, async_scheduling, message):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
@@ -262,11 +255,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
-            self, mock_envs, mock_prepare_env, mock_apply_patches, vllm_config,
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
             connector_name):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
         vllm_config.cache_config.block_size = 16
@@ -278,11 +269,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_check_and_update_config_accepts_v2_connector_with_unified_pool(
-            self, mock_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
         vllm_config.cache_config.block_size = 16
@@ -306,11 +294,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_check_and_update_config_gates_hybrid_offloading_on_pool(
-            self, mock_envs, mock_prepare_env, mock_apply_patches, vllm_config,
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
             monkeypatch, is_hybrid, pool_env, expect_error):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = is_hybrid
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.cache_dtype = "auto"
@@ -338,11 +324,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_language_model_only_multimodal_keeps_chunked_mm_input(
-            self, mock_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=True, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
@@ -357,11 +340,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.envs")
     def test_multimodal_forces_disable_chunked_mm_input(
-            self, mock_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
