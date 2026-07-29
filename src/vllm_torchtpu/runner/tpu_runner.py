@@ -400,8 +400,10 @@ class TPUModelRunner(GPUModelRunner):
         self.enforce_eager = self.model_config.enforce_eager
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
-        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limit.
+        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
         torch._dynamo.config.cache_size_limit = 1024
+        if hasattr(torch._dynamo.config, "accumulated_recompile_limit"):
+            torch._dynamo.config.accumulated_recompile_limit = 1024
 
         # Override parent's kv_cache_dtype with the TPU mapping (handles
         # auto -> bfloat16 for our supported dtype set).
