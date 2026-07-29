@@ -34,6 +34,13 @@ def _normalize_one_spec(
     if not isinstance(spec, AttentionSpec):
         return spec
 
+    if isinstance(spec, MLAAttentionSpec) and not spec.dtype.is_floating_point:
+        # Byte-typed MLA caches (DSA indexer K rows) keep their declared
+        # dtype; the fp8/bf16 KV normalization does not apply. Regular
+        # attention specs marked uint8 (vLLM's fp8-KV convention) still
+        # normalize to the TPU fp8 dtype below.
+        kv_cache_dtype = spec.dtype
+
     if isinstance(spec, MLAAttentionSpec):
         page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
             spec.block_size,

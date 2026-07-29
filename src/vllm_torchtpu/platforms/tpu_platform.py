@@ -286,6 +286,7 @@ def apply_tpu_patches() -> None:
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
+    _patch_deepseek_v2_indexer()
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     from vllm_torchtpu.model_loader_patches import \
@@ -945,8 +946,21 @@ class TpuPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
+        # Imported lazily: this module is loaded while vLLM resolves the
+        # current platform, and the attention module pulls in vllm.config,
+        # which would close an import cycle back into vllm.utils.torch_utils.
+        from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
+
         cache_config = vllm_config.cache_config
         backend_cls = cls._find_non_ssm_backend(vllm_config)
+        if backend_cls is None:
+            return
+
+        if not issubclass(backend_cls, PallasAttentionBackend):
+            logger.warning(
+                "The backend class %s is not a PallasAttentionBackend. "
+                "Skipping block size update.", backend_cls.__name__)
+            return
 
         is_hybrid = vllm_config.model_config.is_hybrid
         if not is_hybrid and not cache_config.user_specified_block_size:
