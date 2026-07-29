@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import (AttentionGroup,
@@ -279,6 +280,8 @@ class TPUModelRunner(GPUModelRunner):
         # TPU uses AOT bucket precompile (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        import jax
+        jax.local_devices()
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
@@ -467,18 +470,18 @@ class TPUModelRunner(GPUModelRunner):
         self.query_start_loc_cpu = torch.zeros(self.max_num_tokens + 1,
                                                dtype=torch.int32,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=getattr(self, 'pin_memory', False))
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int32,
                                         device="cpu",
-                                        pin_memory=self.pin_memory)
+                                        pin_memory=getattr(self, 'pin_memory', False))
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(self.max_num_tokens,
                                                dtype=torch.bool,
                                                device="cpu",
-                                               pin_memory=self.pin_memory)
+                                               pin_memory=getattr(self, 'pin_memory', False))
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
@@ -498,14 +501,14 @@ class TPUModelRunner(GPUModelRunner):
             (self.max_num_reqs, cdiv(self.vocab_size, 32)),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=self.pin_memory)
+            pin_memory=getattr(self, 'pin_memory', False))
         self.require_structured_out_cpu = torch.zeros(
             (self.max_num_reqs, 1),
             dtype=torch.bool,
             device="cpu",
-            pin_memory=self.pin_memory)
+            pin_memory=getattr(self, 'pin_memory', False))
         self.structured_decode_arange = torch.arange(
-            0, 32, device="cpu", pin_memory=self.pin_memory)
+            0, 32, device="cpu", pin_memory=getattr(self, 'pin_memory', False))
         self.sample_from_logits_func = self.sample_from_logits
 
         # TPU async-scheduling state (passed between execute_model and
@@ -3013,6 +3016,55 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     pooler_output.extend(out)
 
+        per_request_kv_cache_bytes: dict[str, int] = {}
+        if hasattr(self, "kv_cache_config") and hasattr(self.input_batch, "block_table"):
+            tp_size = getattr(self.parallel_config, "tensor_parallel_size", 1) if hasattr(self, "parallel_config") else 1
+            cp_size = get_kv_cache_shard_count()
+            pp_size = getattr(self.parallel_config, "pipeline_parallel_size", 1) if hasattr(self, "parallel_config") else 1
+
+            for i in range(self.input_batch.num_reqs):
+                req_id = self.input_batch.req_ids[i]
+                if req_id is None:
+                    continue
+                
+                total_bytes = 0
+                for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    bt_obj = self.input_batch.block_table[gid]
+                    bt_tensor = bt_obj.get_cpu_tensor()
+                    kernel_blocks = int((bt_tensor[i] != 0).sum().item())
+                    blocks_per_kv = getattr(bt_obj, "blocks_per_kv_block", 1)
+                    physical_blocks = cdiv(kernel_blocks, blocks_per_kv)
+                    
+                    spec = group.kv_cache_spec
+                    unpadded_bytes = 0
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        for leaf in spec.specs:
+                            if hasattr(leaf, "unpadded_page_size_bytes"):
+                                unpadded_bytes += leaf.unpadded_page_size_bytes
+                            elif hasattr(leaf, "page_size_bytes"):
+                                unpadded_bytes += dataclasses.replace(leaf, page_size_padded=None).page_size_bytes
+                    else:
+                        if hasattr(spec, "unpadded_page_size_bytes"):
+                            unpadded_bytes = spec.unpadded_page_size_bytes
+                        elif hasattr(spec, "page_size_bytes"):
+                            unpadded_bytes = dataclasses.replace(spec, page_size_padded=None).page_size_bytes
+                    
+                    is_mamba = isinstance(spec, MambaSpec) or (hasattr(spec, "specs") and any(isinstance(s, MambaSpec) for s in spec.specs))
+                    group_scale = (tp_size * pp_size) if is_mamba else (tp_size * cp_size * pp_size)
+                    
+                    total_bytes += physical_blocks * unpadded_bytes * group_scale
+                
+                per_request_kv_cache_bytes[req_id] = total_bytes
+                base_req_id = req_id.rsplit("-", 2)[0] if req_id.count("-") >= 2 else req_id.split("-")[0]
+                per_request_kv_cache_bytes[base_req_id] = total_bytes
+
+        kwargs = {}
+        if hasattr(ModelRunnerOutput, "__dataclass_fields__") and "per_request_kv_cache_bytes" in ModelRunnerOutput.__dataclass_fields__:
+            kwargs["per_request_kv_cache_bytes"] = per_request_kv_cache_bytes
+        elif hasattr(ModelRunnerOutput, "model_fields") and "per_request_kv_cache_bytes" in ModelRunnerOutput.model_fields:
+            # Pydantic support just in case
+            kwargs["per_request_kv_cache_bytes"] = per_request_kv_cache_bytes
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             # Snapshot of the req_id_to_index for the VLLM scheduler.
@@ -3024,6 +3076,7 @@ class TPUModelRunner(GPUModelRunner):
                                   for req_id in req_ids},
             pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
+            **kwargs,
         )
 
         async_output = AsyncTPUModelRunnerOutput(
