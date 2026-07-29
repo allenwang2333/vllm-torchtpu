@@ -88,6 +88,12 @@ torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+# Model definitions must be registered from a general plugin, not the platform
+# plugin: vLLM loads general plugins in EngineArgs before create_model_config(),
+# so the architecture mapping exists before ModelConfig resolves it. The platform
+# entry point runs too early -- vllm.utils.torch_utils is still partially
+# initialized there and importing ModelRegistry hits a circular import.
+torchtpu_models = "vllm_torchtpu.models:register_models"
 
 [tool.pytest.ini_options]
 markers = [
