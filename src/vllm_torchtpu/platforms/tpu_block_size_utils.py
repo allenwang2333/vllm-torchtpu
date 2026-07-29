@@ -23,6 +23,26 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     return tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 
 
+def gdn_spec_ckpt_blocks_enabled(vllm_config: "VllmConfig") -> bool:
+    """Whether speculative GDN checkpoints get their own pool blocks.
+
+    Follows vLLM's `MambaSpec.num_speculative_blocks` scheme: each request
+    is allocated `num_spec` extra blocks and the kernel is handed one block
+    index per checkpoint, so the pool block only ever has to hold a single
+    state. The alternative (the default) keeps the whole checkpoint group
+    inside one block, which makes block_size scale with
+    `num_speculative_tokens`.
+
+    Only meaningful for the unified pool with speculative decoding; the
+    compact layout already gives each request its own consecutive slots.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    if not tpu_envs.TPU_VLLM_GDN_SPEC_CKPT_BLOCKS:
+        return False
+    return (unified_kv_layout_enabled(vllm_config)
+            and vllm_config.speculative_config is not None)
+
+
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
@@ -149,6 +169,12 @@ def _mamba_spec_window(vllm_config: VllmConfig) -> int:
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None:
+        return 1
+    if gdn_spec_ckpt_blocks_enabled(vllm_config):
+        # Checkpoints are separate pool blocks (one index each), so a block
+        # holds a single state and the fit floor is spec-independent. The
+        # group's cost moves to `num_spec` extra blocks per request, paid
+        # per active request instead of by every block in the pool.
         return 1
     return int(spec_config.num_speculative_tokens) + 1
 
