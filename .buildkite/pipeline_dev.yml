@@ -105,22 +105,3 @@ steps:
         .buildkite/scripts/run_in_docker.sh bash -c '
           pytest -sv --timeout=600 -m "not nightly" \
             tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_8_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
