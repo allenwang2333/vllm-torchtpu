@@ -97,7 +97,7 @@ steps:
     key: demo_pytest
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_8_queue
+      queue: tpu_v7x_2_queue
     commands:
       - |
         # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
