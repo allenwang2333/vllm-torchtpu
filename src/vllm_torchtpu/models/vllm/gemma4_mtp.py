@@ -23,37 +23,26 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from vllm.sequence import IntermediateTensors
-
+    ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models.gemma4 import Gemma4MLP, _get_text_config
-from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
-    extract_layer_index,
-    get_draft_quant_config,
-    maybe_prefix,
-)
+from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
+                                              extract_layer_index,
+                                              get_draft_quant_config,
+                                              maybe_prefix)
+from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
@@ -207,8 +196,7 @@ class Gemma4MTPAttention(nn.Module):
             rope_parameters = dict(config.rope_parameters.copy())
             if self.is_sliding:
                 rope_parameters["rope_theta"] = getattr(
-                    config, "rope_local_base_freq", 10000.0
-                )
+                    config, "rope_local_base_freq", 10000.0)
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -261,6 +249,7 @@ class Gemma4MTPAttention(nn.Module):
 
 
 class Gemma4MTPDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config,
@@ -274,17 +263,14 @@ class Gemma4MTPDecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         layer_type = config.layer_types[layer_idx]
         is_full_attention = layer_type == "full_attention"
-        head_dim = (
-            getattr(config, "global_head_dim", config.head_dim)
-            if is_full_attention
-            else config.head_dim
-        )
+        head_dim = (getattr(config, "global_head_dim", config.head_dim)
+                    if is_full_attention else config.head_dim)
 
-        use_k_eq_v = is_full_attention and getattr(config, "attention_k_eq_v", False)
+        use_k_eq_v = is_full_attention and getattr(config, "attention_k_eq_v",
+                                                   False)
         if use_k_eq_v:
-            num_kv_heads = getattr(
-                config, "num_global_key_value_heads", config.num_key_value_heads
-            )
+            num_kv_heads = getattr(config, "num_global_key_value_heads",
+                                   config.num_key_value_heads)
         else:
             num_kv_heads = config.num_key_value_heads
 
@@ -297,7 +283,8 @@ class Gemma4MTPDecoderLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
-            attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
+            attn_logits_soft_cap=getattr(config, "attn_logit_softcapping",
+                                         None),
             prefix=f"{prefix}.self_attn",
         )
 
@@ -310,16 +297,14 @@ class Gemma4MTPDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                 eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                  eps=config.rms_norm_eps)
 
         self.register_buffer("layer_scalar", torch.ones(1))
 
@@ -353,6 +338,7 @@ class Gemma4MTPDecoderLayer(nn.Module):
 
 
 class Gemma4MultiTokenPredictor(nn.Module):
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -363,9 +349,8 @@ class Gemma4MultiTokenPredictor(nn.Module):
         self.quant_config = quant_config
 
         self.hidden_size = text_config.hidden_size
-        self.backbone_hidden_size = getattr(
-            config, "backbone_hidden_size", self.hidden_size
-        )
+        self.backbone_hidden_size = getattr(config, "backbone_hidden_size",
+                                            self.hidden_size)
         self.vocab_size = text_config.vocab_size
         self.num_mtp_layers = text_config.num_hidden_layers
 
@@ -400,9 +385,7 @@ class Gemma4MultiTokenPredictor(nn.Module):
                 cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.layers.{idx}",
-            )
-            for idx in range(self.num_mtp_layers)
-        )
+            ) for idx in range(self.num_mtp_layers))
 
         self.norm = RMSNorm(self.hidden_size, eps=text_config.rms_norm_eps)
 
@@ -529,7 +512,8 @@ class Gemma4MTP(nn.Module):
 
         draft_cfg = vllm_config.speculative_config.draft_model_config
         gen_cfg = draft_cfg.try_get_generation_config()
-        self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
+        self._suppress_token_ids = gen_cfg.get(
+            "suppress_tokens") if gen_cfg else None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -563,7 +547,7 @@ class Gemma4MTP(nn.Module):
                 lm_head_weight,
                 dim=0,
             )
-        lm_head_weight = lm_head_weight[: self.masked_embedding.vocab_size]
+        lm_head_weight = lm_head_weight[:self.masked_embedding.vocab_size]
         if tp_size > 1:
             lm_head_weight = lm_head_weight.contiguous()
             self._stable_full_lm_head_weight = lm_head_weight
@@ -595,7 +579,8 @@ class Gemma4MTP(nn.Module):
             self._get_full_lm_head_weight(),
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         self._stable_full_lm_head_weight = None
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -16,22 +16,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from vllm.config import (CacheConfig, CompilationConfig, ModelConfig,
+                         ParallelConfig, SchedulerConfig, VllmConfig,
+                         set_current_vllm_config)
 
-from vllm.config import (
-    ModelConfig,
-    CacheConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    VllmConfig,
-    CompilationConfig,
-    set_current_vllm_config,
-)
-from vllm_torchtpu.models.vllm.gemma4_mtp import (
-    Gemma4MTP,
-    Gemma4MTPMaskedEmbedder,
-    Gemma4MultiTokenPredictor,
-    Gemma4MTPAttention,
-)
+from vllm_torchtpu.models.vllm.gemma4_mtp import (Gemma4MTP,
+                                                  Gemma4MTPAttention,
+                                                  Gemma4MTPMaskedEmbedder,
+                                                  Gemma4MultiTokenPredictor)
 
 
 def test_masked_embedder_forward():
@@ -67,12 +59,12 @@ def test_masked_embedder_forward():
     # Assert that non-selected centroids are masked to the minimum float value
     min_val = torch.finfo(logits.dtype).min
     num_masked = (logits == min_val).sum().item()
-    
+
     # Each token selects centroid_intermediate_top_k centroids. Each centroid has (vocab_size / num_centroids) tokens.
     vocab_per_centroid = vocab_size // num_centroids
     num_selected = centroid_intermediate_top_k * vocab_per_centroid
     expected_masked = num_tokens * (vocab_size - num_selected)
-    
+
     assert num_masked == expected_masked
 
 
@@ -98,7 +90,7 @@ def test_masked_embedder_get_top_tokens():
     top_tokens = embedder.get_top_tokens(hidden_states, lm_head_weight)
 
     # Assert shape: [num_tokens]
-    assert top_tokens.shape == (num_tokens,)
+    assert top_tokens.shape == (num_tokens, )
     assert top_tokens.dtype == torch.long
 
 
@@ -124,7 +116,7 @@ def _get_vllm_test_config(hf_config):
         pipeline_parallel_size=1,
         tensor_parallel_size=1,
     )
-    
+
     draft_model_config = SimpleNamespace(hf_config=hf_config)
     draft_model_config.try_get_generation_config = lambda: None
     speculative_config = SimpleNamespace(
@@ -180,22 +172,25 @@ def test_gemma4_mtp_initialization():
     vllm_config = _get_vllm_test_config(hf_config)
 
     # Mock tensor parallel group coordinator
-    fake_tp_group = SimpleNamespace(world_size=1, rank_in_group=0, all_reduce=lambda x: x)
+    fake_tp_group = SimpleNamespace(world_size=1,
+                                    rank_in_group=0,
+                                    all_reduce=lambda x: x)
 
     # Patch distributed and helper functions to prevent real GPU/TPU cluster checks
     with mock.patch("vllm.distributed.parallel_state.get_tp_group", return_value=fake_tp_group), \
          mock.patch("vllm_torchtpu.models.vllm.gemma4_mtp.get_tensor_model_parallel_world_size", return_value=1), \
          mock.patch("vllm_torchtpu.models.vllm.gemma4_mtp.get_draft_quant_config", return_value=None):
-        
+
         with set_current_vllm_config(vllm_config):
             model = Gemma4MTP(vllm_config=vllm_config)
-            
+
             # Verify module layout
             assert isinstance(model.model, Gemma4MultiTokenPredictor)
             assert model.model.hidden_size == 128
             assert model.model.backbone_hidden_size == 256
             assert len(model.model.layers) == 2
-            
+
             # Verify sub-module classes
-            assert isinstance(model.model.layers[0].self_attn, Gemma4MTPAttention)
+            assert isinstance(model.model.layers[0].self_attn,
+                              Gemma4MTPAttention)
             assert isinstance(model.masked_embedding, Gemma4MTPMaskedEmbedder)
