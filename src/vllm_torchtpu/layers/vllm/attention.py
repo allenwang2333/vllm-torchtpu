@@ -948,9 +948,6 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_packing=kv_packing,
             )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
         return mla_v2_kernel.get_kv_cache_shape(
             total_num_pages=num_blocks,

@@ -38,6 +38,7 @@ from vllm.model_executor.layers.attention import (Attention,
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -930,6 +931,11 @@ class TPUModelRunner(GPUModelRunner):
                     page_size_padded=page_size_padded,
                     indexes_kv_by_block_stride=True,
                 )
+            elif isinstance(attn_module, DeepseekV32IndexerCache):
+                # DSA indexer K cache: the module declares its own uint8 spec
+                # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
+                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
+                    self.vllm_config)
             else:
                 continue
 
