@@ -44,7 +44,14 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
 =======
     VLLM_TPU_BUCKET_PADDING_GAP: int = 16
+<<<<<<< HEAD
 >>>>>>> 77fd3081 (fix: move VLLM_TPU_BUCKET_PADDING_GAP env definition to vllm_torchtpu.envs)
+=======
+    VLLM_XLA_USE_SPMD: bool = False
+    VLLM_TPU_MOST_MODEL_LEN: int | None = None
+    VLLM_TPU_USING_PATHWAYS: bool = False
+    VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+>>>>>>> 804aa672 (feat: add TPU configuration environment variables)
 
 
 def env_with_choices(
@@ -253,6 +260,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
+    # Most model length cap for TPU compile bucketing
+    "VLLM_TPU_MOST_MODEL_LEN":
+    lambda: int(val)
+    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
 }
 
 

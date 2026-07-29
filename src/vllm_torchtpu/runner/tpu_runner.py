@@ -55,6 +55,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
+from vllm_torchtpu import envs as torchtpu_envs
 from vllm_torchtpu import utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -339,7 +340,8 @@ class TPUModelRunner(GPUModelRunner):
         # TPU-specific delta + overrides.
 
         # TPU-only custom kwarg + alias kept for backwards-compat with worker.
-        self.original_parallel_config = original_parallel_config
+        self.original_parallel_config = (original_parallel_config
+                                         or vllm_config.parallel_config)
         self.device_config = vllm_config.device_config
 
         # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
@@ -391,8 +393,8 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
 
         # TPU env-var flags.
-        self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
-        self.use_spmd = envs.VLLM_XLA_USE_SPMD
+        self.check_recompilation = torchtpu_envs.VLLM_XLA_CHECK_RECOMPILATION
+        self.use_spmd = torchtpu_envs.VLLM_XLA_USE_SPMD
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
@@ -415,7 +417,7 @@ class TPUModelRunner(GPUModelRunner):
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
-        self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
+        self.most_model_len = torchtpu_envs.VLLM_TPU_MOST_MODEL_LEN
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -4079,8 +4081,9 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(group.kv_cache_spec,
                           AttentionSpec) and self.use_spmd:
                 num_kv_heads = group.kv_cache_spec.num_kv_heads
-                assert self.original_parallel_config is not None
-                tp_size = self.original_parallel_config.tensor_parallel_size
+                parallel_config = (self.original_parallel_config
+                                   or self.parallel_config)
+                tp_size = parallel_config.tensor_parallel_size
                 assert num_kv_heads % tp_size == 0, (
                     f"num_kv_heads {num_kv_heads} must be divisible by "
                     f"tp_size {tp_size} under SPMD mode")
@@ -4369,8 +4372,9 @@ class TPUModelRunner(GPUModelRunner):
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads
-                        assert self.original_parallel_config is not None
-                        tp_size = self.original_parallel_config.tensor_parallel_size
+                        parallel_config = (self.original_parallel_config
+                                           or self.parallel_config)
+                        tp_size = parallel_config.tensor_parallel_size
                         # TODO: Handle kv cache duplication under SPMD mode.
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
