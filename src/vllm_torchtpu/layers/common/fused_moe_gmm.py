@@ -308,75 +308,20 @@ def fused_moe_func(
     # Fast path for low-concurrency decode: a specialized C=N Pallas MoE kernel
     # that skips the gather/scatter permutation of the general gmm path. Only
     # engaged for small decode batches with topk == CN_MOE_TOP_K.
-    low_conc_threshold = getattr(envs, "MOE_LOW_CONC_THRESHOLD", 8)
+    # In vllm-torchtpu, fused_moe_func is called per-device by the torch
+    # bridge, so weights are already local — no shard_map needed.
+    import logging as _logging
+    _lc_logger = _logging.getLogger(__name__)
+    low_conc_threshold = int(__import__("os").getenv("MOE_LOW_CONC_THRESHOLD", "8"))
     if 1 <= num_tokens <= low_conc_threshold and topk == CN_MOE_TOP_K:
-        logger.info(
+        _lc_logger.info(
             "Taking fast low-concurrency C=N Pallas MoE path for "
             f"BS={num_tokens} decode (use_ep={use_ep}, "
             f"threshold={low_conc_threshold}).")
-
-        padded_hs = hidden_states
-        padded_topk_indices = topk_indices
-        padded_topk_weights = topk_weights
-
-        def _local_low_conc_moe(hs, w1_local, w1_scale_local, w2_local,
-                                w2_scale_local, topk_ids_local,
-                                topk_weights_local):
-            local_num_experts = w1_local.shape[0]
-            if use_ep:
-                ep_shard = jax.lax.axis_index(ShardingAxisName.EXPERT)
-                is_my_expert = (topk_ids_local // local_num_experts) == ep_shard
-                local_ids = jnp.where(
-                    is_my_expert, topk_ids_local % local_num_experts, 0)
-                local_weights = jnp.where(is_my_expert, topk_weights_local, 0.0)
-            else:
-                local_ids = topk_ids_local
-                local_weights = topk_weights_local
-
-            local_out = cn_moe_full(hs, w1_local, w1_scale_local, w2_local,
-                                    w2_scale_local, local_ids, local_weights,
-                                    use_ep=use_ep)
-            reduction_axes = (ShardingAxisName.EXPERT
-                              if use_ep else ShardingAxisName.MLP_TENSOR)
-            if not defer_all_reduce:
-                return jax.lax.psum(
-                    local_out, axis_name=reduction_axes).astype(hs.dtype)
-            else:
-                return local_out.astype(hs.dtype)
-
-        # TP vs EP weight/scale sharding. EP shards the expert axis; TP shards
-        # the intermediate dim (N for w1, I for w2), matching
-        # tensor_parallel_gmm.
-        if use_ep:
-            lc_w1_spec = P(ShardingAxisName.EXPERT, None, None)
-            lc_w1_scale_spec = P(ShardingAxisName.EXPERT, None, None, None)
-            lc_w2_spec = P(ShardingAxisName.EXPERT, None, None)
-            lc_w2_scale_spec = P(ShardingAxisName.EXPERT, None, None, None)
-        else:
-            lc_w1_spec = P(None, None, ShardingAxisName.MLP_TENSOR)
-            lc_w1_scale_spec = P(None, None, None, ShardingAxisName.MLP_TENSOR)
-            lc_w2_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
-            w2_nblocks = 1 if w2_scale is None else w2_scale.shape[1]
-            lc_w2_scale_spec = (P(None, None, None, None) if w2_nblocks == 1
-                                else P(None, ShardingAxisName.MLP_TENSOR, None, None))
-
-        out = jax.shard_map(
-            _local_low_conc_moe,
-            mesh=mesh,
-            in_specs=(
-                P(None, None),  # hs
-                lc_w1_spec,  # w1
-                lc_w1_scale_spec,  # w1_scale
-                lc_w2_spec,  # w2
-                lc_w2_scale_spec,  # w2_scale
-                P(None, None),  # topk_ids
-                P(None, None),  # topk_weights
-            ),
-            out_specs=P(None, None),
-            check_vma=False,
-        )(padded_hs, w1, w1_scale, w2, w2_scale, padded_topk_indices,
-          padded_topk_weights)
-
+        # topk_ids are already local (experts_start remap happened above).
+        # For EP, zero-weight entries are already masked above.
+        out = cn_moe_full(hidden_states, w1, w1_scale, w2, w2_scale,
+                          topk_ids, topk_weights, use_ep=use_ep)
         return out[:num_tokens, :hidden_size]
 
     x = moe_gmm(
