@@ -125,6 +125,8 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        self.constant_draft_positions = self.speculative_config.use_gemma4_mtp(
+        )
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -146,6 +148,8 @@ class Eagle3Proposer:
         maybe_share_embeddings(self.draft_model, target_model,
                                self._draft_replicated)
         self._maybe_share_lm_head(target_model)
+        if self.speculative_config.use_gemma4_mtp():
+            self._setup_gemma4_kv_sharing(target_attn_layer_names)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -185,6 +189,75 @@ class Eagle3Proposer:
             self.draft_model = model_loader.load_model(
                 vllm_config=draft_vllm_config,
                 model_config=draft_model_config,
+            )
+
+    def _setup_gemma4_kv_sharing(
+        self,
+        target_attn_layer_names: set[str],
+    ) -> None:
+        """Wire draft layers to share KV with the target model on TPU.
+
+        Each draft decoder layer is mapped to the last non-KV-shared
+        target layer of the same attention type (sliding or full).
+        """
+        from collections import defaultdict
+        draft_config = self.speculative_config.draft_model_config.hf_config
+        draft_text_config = getattr(draft_config, "text_config", draft_config)
+        if hasattr(draft_config, "get_text_config"):
+            draft_text_config = draft_config.get_text_config()
+
+        target_config = self.vllm_config.model_config.hf_config
+        target_text_config = getattr(target_config, "text_config",
+                                     target_config)
+        if hasattr(target_config, "get_text_config"):
+            target_text_config = target_config.get_text_config()
+
+        target_layer_types = getattr(target_text_config, "layer_types", [])
+
+        model_impl = getattr(self.draft_model, "model", self.draft_model)
+        if not hasattr(model_impl, "layers"):
+            return
+
+        target_num_kv_shared = getattr(target_text_config,
+                                       "num_kv_shared_layers", 0)
+        num_non_shared = len(target_layer_types) - target_num_kv_shared
+        type_to_target_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, lt in enumerate(target_layer_types[:num_non_shared]):
+            type_to_target_indices[lt].append(idx)
+
+        target_prefix = "model.layers"
+        for name in target_attn_layer_names:
+            if ".layers." in name:
+                target_prefix = name.split(".layers.")[0] + ".layers"
+                break
+
+        draft_layer_types = getattr(draft_text_config, "layer_types", [])
+        for draft_idx, layer in enumerate(model_impl.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn = getattr(layer.self_attn, "attn", None)
+            if attn is None:
+                continue
+
+            draft_layer_type = (draft_layer_types[draft_idx] if draft_idx
+                                < len(draft_layer_types) else "full_attention")
+            candidates = type_to_target_indices.get(draft_layer_type, [])
+            if not candidates:
+                logger.warning(
+                    "No target layer of type '%s' for draft layer %d",
+                    draft_layer_type,
+                    draft_idx,
+                )
+                continue
+
+            target_idx = candidates[-1]
+            target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            attn.kv_sharing_target_layer_name = target_layer_name
+            logger.info(
+                "Gemma4 MTP: draft layer %d (%s) -> %s",
+                draft_idx,
+                draft_layer_type,
+                target_layer_name,
             )
 
     def _maybe_share_lm_head(self, target_model) -> None:
@@ -456,7 +529,11 @@ class Eagle3Proposer:
                                  device=runner.device))
             for step in range(1, K):
                 for ci, chunk in enumerate(chunks):
-                    loop_positions[ci] = loop_positions[ci] + 1
+                    if not self.constant_draft_positions:
+                        loop_positions[ci] = loop_positions[ci] + 1
+                        seq_lens_delta = step
+                    else:
+                        seq_lens_delta = 0
                     # Prev step's [p] tokens feed directly — already bucketed.
                     loop_input_ids = draft_tokens_per_chunk[ci][-1]
                     last_hidden, hidden = self._forward_draft(
@@ -465,7 +542,7 @@ class Eagle3Proposer:
                         positions=loop_positions[ci],
                         target_hidden_states=loop_hidden[ci],
                         step_idx=step,
-                        seq_lens_delta=step,
+                        seq_lens_delta=seq_lens_delta,
                         num_rejected_np=(None if is_async else
                                          rejected_per_chunk[ci]),
                         num_tokens_padded=padded_nr_per_chunk[ci],
