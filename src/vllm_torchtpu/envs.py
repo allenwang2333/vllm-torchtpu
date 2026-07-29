@@ -39,8 +39,6 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
-    DP_SCHED_BUFFER_PREFILL: bool = False
-    DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS: int = 10000
     TORCH_TPU_EAGER_MODE: str = "DEFER_AND_FUSE"
 
 
@@ -252,13 +250,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
-    # TpuDpScheduler: buffer new prefills and flush them in batches.
-    "DP_SCHED_BUFFER_PREFILL":
-    lambda: bool(int(os.getenv("DP_SCHED_BUFFER_PREFILL") or "0")),
-    # TpuDpScheduler: flush buffered prefills once the oldest pending request
-    # has waited this long (bounds TTFT).
-    "DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS":
-    lambda: int(os.getenv("DP_SCHED_BUFFER_PREFILL_TIMEOUT_MS") or "10000"),
     # TorchTPU eager execution mode (e.g. "DEFER_AND_FUSE", "ASYNCHRONOUS")
     "TORCH_TPU_EAGER_MODE":
     lambda: os.getenv("TORCH_TPU_EAGER_MODE", "DEFER_AND_FUSE"),
