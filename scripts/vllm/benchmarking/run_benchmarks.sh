@@ -298,7 +298,6 @@ run_benchmark_once() {
         temperature_arg=(--temperature "$BENCHMARK_TEMPERATURE")
     fi
 
-    # TEMPORARY [FAST CI]: Reduced num-prompts from 320 to 2 for fast CI turnaround. Revert to 320 before final PR merge.
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
@@ -308,7 +307,7 @@ run_benchmark_once() {
         --random-input-len "$input_len" \
         --random-output-len "$output_len" \
         --random-range-ratio "$RANDOM_RANGE_RATIO" \
-        --num-prompts 2 \
+        --num-prompts 320 \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --save-result \

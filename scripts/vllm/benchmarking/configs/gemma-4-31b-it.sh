@@ -17,7 +17,6 @@ EVAL_TOLERANCE="0.02"
 IS_MULTIMODAL=true
 MAX_MODEL_LEN=4096
 EXTRA_SERVE_ARGS="--enforce-eager --trust-remote-code --generation-config vllm"
-# TEMPORARY: Bound MMMU_LIMIT to 10 for fast CI turnaround. Revert to 100 after validation.
-MMMU_LIMIT="${MMMU_LIMIT:-10}"
+MMMU_LIMIT="${MMMU_LIMIT:-100}"
 MMMU_CONCURRENCY="${MMMU_CONCURRENCY:-32}"
 RUN_EVALPLUS=0

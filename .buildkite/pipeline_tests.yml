@@ -31,8 +31,7 @@ steps:
       - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
         <<: *unit_test_defaults
-        # TEMPORARY: Disabled unit tests to speed up Gemma 4 PR turnaround. Revert to 'build.env("NIGHTLY") != "1"' when done.
-        if: 'false'
+        if: 'build.env("NIGHTLY") != "1"'
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -44,8 +43,7 @@ steps:
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
-        # TEMPORARY: Disabled unit tests to speed up Gemma 4 PR turnaround. Revert to 'build.env("NIGHTLY") != "1"' when done.
-        if: 'false'
+        if: 'build.env("NIGHTLY") != "1"'
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
