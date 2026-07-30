@@ -26,6 +26,9 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     echo "=== Running Perf/Eval ($(( i + 1 ))/${#configs[@]}): $config_name (Parallel Job: $job_index / $job_count) ==="
     echo "=========================================================="
 
+    # Clean up compilation caches from prior model runs to prevent /dev/shm or /tmp space exhaustion
+    rm -rf /dev/shm/torch_tpu_cache/* /tmp/torch_tpu_cache/* 2>/dev/null || true
+
     eval_args=(
         --config "$config_name"
         --run-lm-eval

@@ -16,6 +16,7 @@ x-perf-eval-defaults: &perf_eval_defaults
   env:
     BENCHMARK_WARMUP_RUNS: "1"
     VLLM_RPC_TIMEOUT: "600000"
+    TORCH_TPU_CACHE_DIR: "/tmp/torch_tpu_cache"
 
 steps:
   - group: "Perf and Eval on TPU"
