@@ -1,0 +1,114 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: lq-patemotter-google-com
+  name: dsv4-verify-v7x-8
+spec:
+  replicatedJobs:
+  - name: vllm-server
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        template:
+          spec:
+            containers:
+            - args:
+              - "mkdir -p /mnt/local-cache/torch_tpu_cache\nrm -rf /dev/shm/torch_tpu_cache\n\
+                ln -sfn /mnt/local-cache/torch_tpu_cache /dev/shm/torch_tpu_cache\n\
+                \n# Recover JAX cache from GCS\nmkdir -p /mnt/local-cache/jax_cache\n\
+                gcloud storage cp -r gs://cloud-tpu-inference-test-patemotter-archive/workspace/jax_cache/*\
+                \ /mnt/local-cache/jax_cache/ || true\n\necho \"=== [LOCAL SSD] Setting up 4-layer mock weights on local NVMe SSD ===\"\n\
+                mkdir -p /mnt/local-cache/dsv4-flash-4layer-fp8\n\
+                cp /root/cloud-devkit/torchtpu-vllm/examples/dsv4-flash-4layer-fp8/*.json /mnt/local-cache/dsv4-flash-4layer-fp8/\n\
+                MOCK_WEIGHTS_DIR=/mnt/local-cache/dsv4-flash-4layer-fp8 python3 /root/cloud-devkit/torchtpu-vllm/examples/generate_mock_weights.py\n\
+                \n\
+                echo \"=== Starting DeepSeek-V4-Flash Inference Engine ===\"\n\
+                # Run 4-layer validation model script on local NVMe SSD weights\n\
+                DSV4_MODEL_PATH=/mnt/local-cache/dsv4-flash-4layer-fp8 python3 -u /root/cloud-devkit/torchtpu-vllm/examples/verify_dsv4.py\n\
+                EXIT_CODE=$?\n\
+                \n\
+                # Archive JAX cache to GCS\n\
+                if [ -d \"/mnt/local-cache/jax_cache\" ]; then\n\
+                  echo \"=== [CACHE ARCHIVE] Saving JAX compilation cache to GCS ===\"\n\
+                  gcloud storage cp -r /mnt/local-cache/jax_cache/* gs://cloud-tpu-inference-test-patemotter-archive/workspace/jax_cache/\n\
+                fi\n\
+                exit $EXIT_CODE\n"
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: MALLOC_ARENA_MAX
+                value: '4'
+              - name: OMP_NUM_THREADS
+                value: '8'
+              - name: TPU_TOPOLOGY
+                value: 2x2x1
+              - name: TPU_LIBRARY_PATH
+                value: /mnt/workspace/libtpu.so
+              - name: PYTHONPATH
+                value: /root/cloud-devkit/torchtpu-vllm/src:/root/cloud-devkit/sglang/python
+              - name: HF_HOME
+                value: /mnt/local-cache/hf_cache
+              - name: JAX_COMPILER_CACHE_DIR
+                value: /mnt/local-cache/jax_cache
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/local-cache/vllm_cache
+              - name: TORCHINDUCTOR_CACHE_DIR
+                value: /mnt/local-cache/inductor_cache
+              - name: TRITON_CACHE_DIR
+                value: /mnt/local-cache/triton_cache
+              - name: TMPDIR
+                value: /mnt/local-cache/tmp
+              - name: ENABLE_QUANTIZED_MATMUL_KERNEL
+                value: '1'
+              - name: REQUANTIZE_BLOCK_SIZE
+                value: '128'
+              - name: MOE_REQUANTIZE_BLOCK_SIZE
+                value: '512'
+              - name: MOE_REQUANTIZE_WEIGHT_DTYPE
+                value: fp4
+              - name: NEW_MODEL_DESIGN
+                value: '1'
+              - name: MODEL_IMPL_TYPE
+                value: vllm
+              - name: VLLM_FP4_CACHE_DIR
+                value: '/mnt/local-cache/dsv4-flash-fp4'
+              - name: TPU_VMODULE
+                value: tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1
+              - name: TPU_STDERR_LOG_LEVEL
+                value: '0'
+              image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest
+              imagePullPolicy: Always
+              name: vllm-server
+              resources:
+                limits:
+                  cpu: '180'
+                  google.com/tpu: 4
+                  memory: 400Gi
+                requests:
+                  cpu: '180'
+                  google.com/tpu: 4
+                  memory: 256Gi
+              volumeMounts:
+              - mountPath: /mnt/workspace
+                name: nfs-root-volume
+              - mountPath: /root/cloud-devkit/torchtpu-vllm
+                name: nfs-root-volume
+                subPath: torchtpu-vllm
+              - mountPath: /mnt/local-cache
+                name: local-ssd-volume
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
+            volumes:
+            - name: nfs-root-volume
+              nfs:
+                path: /workspace
+                server: 172.30.171.18
+            - emptyDir:
+                sizeLimit: 350Gi
+              name: local-ssd-volume
+        ttlSecondsAfterFinished: 900

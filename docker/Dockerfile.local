@@ -1,0 +1,8 @@
+FROM us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest
+RUN rm -rf /usr/local/lib/python3.12/site-packages/tpu_inference*
+COPY libtpu.so /usr/local/lib/python3.12/site-packages/libtpu/libtpu.so
+# Base image predates the jax 0.10.2 bump in pyproject.toml (mainline commit 799c9fe3).
+# Force-reinstall to match so the SC Get lowering's needs_layout_passes path is used.
+# Pin numpy in the same resolve so it doesn't jump to 2.5.x, which numba/flax/mistral-common in
+# this image reject (numba requires numpy<2.5, flax/mistral-common require numpy<2.4 on py3.12).
+RUN pip install --no-cache-dir --force-reinstall jax==0.10.2 jaxlib==0.10.2 "numpy<2.4,>=2.0"
