@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 
 # streamindex_topk block-tuning knobs; bkv pages/block must keep
@@ -57,27 +58,23 @@ STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
 STREAMIDX_NUM_QUERIES_PER_BLOCK = 16
 
 
-def _per_token_group_quant_fp8_tpu(
-    x: torch.Tensor, group_size: int = 128, eps: float = 1e-10, use_ue8m0: bool = True
+def _per_token_group_quant_fp8(
+    x: torch.Tensor, group_size: int = 128, use_ue8m0: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_shape = x.shape
-    x_grouped = x.reshape(-1, group_size)
-    amax = torch.clamp(x_grouped.abs().max(dim=-1, keepdim=True).values, min=eps)
-    fp8_max = 448.0  # float8_e4m3fn max value
-    if use_ue8m0:
-        # ue8m0: scale is a power of two, stored as its e8m0 bit pattern
-        # (biased exponent, 1 byte/group) so it can be packed next to the
-        # fp8 values and bitcast to float8_e8m0fnu inside the TPU kernel.
-        exp = torch.ceil(torch.log2(amax / fp8_max))
-        scale = torch.exp2(exp)
-        scale_bits = (exp + 127).clamp(0, 254).to(torch.uint8)
-    else:
-        scale = amax / fp8_max
-        scale_bits = None
-    x_q = (x_grouped / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
-    out_scale = scale_bits if scale_bits is not None else scale
-    out_scale = out_scale.reshape(orig_shape[:-1] + (orig_shape[-1] // group_size,))
-    return x_q.reshape(orig_shape), out_scale
+    """Block fp8 quantization of `x` over its last axis.
+
+    Thin wrapper over the shared reference quantizer. With `use_ue8m0` the
+    scale is a power of two returned as its e8m0 bit pattern (biased exponent,
+    1 byte/group), so it can be packed next to the fp8 values and bitcast to
+    float8_e8m0fnu inside the TPU kernel; otherwise it is an fp32 scale.
+    """
+    return quantize_tensor(
+        x,
+        torch.float8_e4m3fn,
+        axis=-1,
+        block_size=group_size,
+        use_ue8m0=use_ue8m0,
+    )
 
 
 @SparseAttnIndexer.register_oot
@@ -169,7 +166,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
 
-        k_quant, k_scale = _per_token_group_quant_fp8_tpu(
+        k_quant, k_scale = _per_token_group_quant_fp8(
             k, self.quant_block_size, use_ue8m0=True
         )
         # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
@@ -323,7 +320,7 @@ class VllmTPUIndexer(Indexer):
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = _per_token_group_quant_fp8_tpu(
+        q_fp8, q_scale = _per_token_group_quant_fp8(
             q,
             self.quant_block_size,
             use_ue8m0=False, # Disable ue8m0 for q quantization since we don't need to store scale for q
@@ -331,10 +328,13 @@ class VllmTPUIndexer(Indexer):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
+        # q_scale is fp32, so fold it in and cast back: the kernel expects the
+        # weights in the activation dtype.
+        weights_dtype = weights.dtype
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
-        weights = weights.squeeze(-1)
+        weights = weights.squeeze(-1).to(weights_dtype)
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
@@ -433,8 +433,6 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
 
         if self.kv_cache_quantized_dtype is not None:
-            from vllm_torchtpu.layers.common.quantization import \
-                quantize_tensor
             W_UK_T, W_UK_T_scale = quantize_tensor(
                 self.W_UK_T, self.kv_cache_quantized_dtype, axis=1)
             self.W_UK_T = Parameter(W_UK_T.to(device), requires_grad=False)
