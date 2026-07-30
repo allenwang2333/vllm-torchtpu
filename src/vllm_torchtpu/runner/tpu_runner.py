@@ -803,6 +803,12 @@ class TPUModelRunner(GPUModelRunner):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+            # Custom get_kv_cache_spec override (e.g. MLA / SWACache)
+            elif not isinstance(attn_module, Attention) and hasattr(
+                    attn_module, "get_kv_cache_spec"):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
                 if (kv_tgt_layer :=
@@ -3130,11 +3136,14 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config)
 
+        from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+            _maybe_patch_for_deepseek_v4
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                            vllm_config=self.vllm_config), \
-             set_current_vllm_config(self.vllm_config):
+             set_current_vllm_config(self.vllm_config), \
+             _maybe_patch_for_deepseek_v4(self.vllm_config):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
@@ -4214,9 +4223,17 @@ class TPUModelRunner(GPUModelRunner):
             self._initialize_unified_kv_cache(kv_cache_config)
             return
 
-        attn_block_size = None
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                # DeepSeek-V4-style grouped spec: peek at a representative
+                # per-layer spec for type detection. All layers within one
+                # UniformTypeKVCacheSpecs group share the same spec type and
+                # block_size by construction, but different groups can have
+                # different block sizes (e.g. DSV4's full-MLA group vs. its
+                # several SWA sub-groups), so we don't enforce a single
+                # block_size across groups here.
+                spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
                 continue
@@ -4225,11 +4242,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Only AttentionSpec and MambaSpec are supported in KV cache groups > 1."
                 )
-
-            block_size = spec.block_size
-            if attn_block_size is None:
-                attn_block_size = block_size
-            assert attn_block_size == block_size, "Block size across attention groups must be the same."
 
         block_sizes = [
             group.kv_cache_spec.block_size
@@ -4298,7 +4310,9 @@ class TPUModelRunner(GPUModelRunner):
             # single layer's KV cache spec.
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
-            if len(shared_by) > 1:
+            if len(shared_by) > 1 and any(
+                    isinstance(layer_name_to_spec[name], MambaSpec)
+                    for name in shared_by):
                 total_group_page_size = 0
                 for name in shared_by:
                     spec = layer_name_to_spec[name]
@@ -4324,6 +4338,15 @@ class TPUModelRunner(GPUModelRunner):
                     else:
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
+            elif len(shared_by) > 1:
+                # Non-Mamba multi-layer sharing (e.g. DeepSeek-V4's
+                # page-size-bucketed groups from
+                # `_get_kv_cache_config_deepseek_v4`): every layer in
+                # `shared_by` has an identical page size by construction, so
+                # use any one representative layer's page size rather than
+                # summing across all of them.
+                page_size_bytes = _per_layer_spec(shared_by[0]).page_size_bytes
+                num_blocks = tensor_size // page_size_bytes
             else:
                 num_blocks = kv_cache_config.num_blocks
 
