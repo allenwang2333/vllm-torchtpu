@@ -107,9 +107,17 @@ def inner_kernel(
         # External source tiles: encode the state through the region's
         # typed view; copy_out pushes the raw bytes back to the source.
         for idx in range(cfg.seq_tile_size):
-            vmem_ldst.store_state_region(conv_state_slot_ref.at[idx],
-                                         cfg.state_plan.conv,
-                                         new_conv_state[idx])
+
+            def _store(idx=idx):
+                vmem_ldst.store_state_region(conv_state_slot_ref.at[idx],
+                                             cfg.state_plan.conv,
+                                             new_conv_state[idx])
+
+            if carry_conv_scratch_ref is None:
+                _store()
+            else:
+                # copy_out only DMAs the tile that ends a sequence.
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(_store)
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -181,9 +189,16 @@ def inner_kernel(
             recurrent_slot_ref.dtype)
     else:
         for idx in range(cfg.seq_tile_size):
-            vmem_ldst.store_state_region(recurrent_slot_ref.at[idx],
-                                         cfg.state_plan.recurrent,
-                                         new_recurrent_state[idx])
+
+            def _store(idx=idx):
+                vmem_ldst.store_state_region(recurrent_slot_ref.at[idx],
+                                             cfg.state_plan.recurrent,
+                                             new_recurrent_state[idx])
+
+            if carry_recurrent_scratch_ref is None:
+                _store()
+            else:
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(_store)
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
