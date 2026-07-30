@@ -57,10 +57,19 @@ def test_pallas_mla_attention_backend():
 
 
 def test_pallas_mla_attention_backend_fp8_ds_mla():
-    """Verify DeepSeek-V4 packed MLA KV-cache format shape computation."""
+    """DeepSeek-V4's packed MLA KV-cache format.
+
+    Per-token layout is *not* a uniform array of `head_size` elements of one
+    dtype -- it's [nope fp8 (head_size - 64 elems) | rope bf16 (64 elems) |
+    UE8M0 scales (1 per 64-wide nope block)], padded up to a 128-aligned
+    minor dim. For DSV4's head_size=512: nope=448, rope=64*2=128 bytes,
+    scales=448//64=7 bytes -> logical width 583, aligned to 640.
+    See kernels/deepseek_v4/compress_norm_rope.py's module docstring.
+    """
     assert "fp8_ds_mla" in PallasMLAttentionBackend.supported_kv_cache_dtypes
 
-    # Called directly with raw cache-dtype string "fp8_ds_mla".
+    # Called directly with the raw cache-dtype string (e.g. from
+    # tpu_block_size_utils.py's block-size planning).
     shape_str = PallasMLAttentionBackend.get_kv_cache_shape(
         num_blocks=10,
         block_size=256,
