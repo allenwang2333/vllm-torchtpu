@@ -40,6 +40,7 @@ def test_deepseek_v4_weight_mapping(monkeypatch):
         model = SimpleNamespace()
         model.config = SimpleNamespace(num_hidden_layers=4)
         model.model = SimpleNamespace(layers=[SimpleNamespace() for _ in range(4)])
+        model.model.named_modules = lambda: []
         model.hf_to_vllm_mapper = SimpleNamespace(
             apply=lambda w: [(w[0], torch.zeros(1))]
         )
@@ -93,6 +94,6 @@ def test_deepseek_v4_weight_mapping(monkeypatch):
 
 
     for input_pair, expected_key in test_cases:
-        mapped = list(mapper.apply(input_pair))
+        mapped = list(mapper.apply([input_pair]))
         assert len(mapped) == 1
         assert mapped[0][0] == expected_key
