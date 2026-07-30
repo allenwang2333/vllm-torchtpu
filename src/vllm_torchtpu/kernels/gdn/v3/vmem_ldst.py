@@ -16,6 +16,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
@@ -278,33 +279,43 @@ def load_and_select_states(
         # NOTE: The VMEM window holds one state per window position and the
         # initial state was DMA'd into position 0.
         # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-        if cfg.state_plan is None:
-            hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
-        else:
-            hbm_conv_state = load_state_region(
+        def _hbm_conv():
+            if cfg.state_plan is None:
+                return conv_state_slot_ref[idx, 0].astype(jnp.float32)
+            return load_state_region(
                 conv_state_slot_ref.at[idx], cfg.state_plan.conv,
                 (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(jnp.float32)
-        prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
-        if carry_conv_scratch_ref is not None:
-            prev_tile_conv = carry_conv_scratch_ref[idx]
-            prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
-                                        prev_tile_conv)
-
-        if cfg.state_plan is None:
-            hbm_recurrent_state = recurrent_slot_ref[idx, 0]
+        if carry_conv_scratch_ref is None:
+            prev_conv_state = jnp.where(has_initial_state, _hbm_conv(), 0)
         else:
-            hbm_recurrent_state = load_state_region(
+            # Later tiles resume from the carry, so decode the source
+            # once instead of on every tile.
+            @pl.when(is_first_tile)
+            def _(idx=idx):
+                carry_conv_scratch_ref[idx] = jnp.where(
+                    has_initial_state, _hbm_conv(), 0)
+
+            prev_conv_state = carry_conv_scratch_ref[idx]
+
+        def _hbm_recurrent():
+            if cfg.state_plan is None:
+                return recurrent_slot_ref[idx, 0]
+            return load_state_region(
                 recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
                 (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
-        prev_recurrent_state = jnp.where(has_initial_state,
-                                         hbm_recurrent_state, 0)
 
-        if carry_recurrent_scratch_ref is not None:
-            prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
-            prev_recurrent_state = jnp.where(is_first_tile,
-                                             prev_recurrent_state,
-                                             prev_tile_recurrent_scratch)
+        if carry_recurrent_scratch_ref is None:
+            prev_recurrent_state = jnp.where(has_initial_state,
+                                             _hbm_recurrent(), 0)
+        else:
+
+            @pl.when(is_first_tile)
+            def _(idx=idx):
+                carry_recurrent_scratch_ref[idx] = jnp.where(
+                    has_initial_state, _hbm_recurrent(), 0)
+
+            prev_recurrent_state = carry_recurrent_scratch_ref[idx]
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
