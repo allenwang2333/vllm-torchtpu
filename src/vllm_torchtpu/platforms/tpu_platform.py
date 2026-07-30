@@ -839,13 +839,19 @@ class TpuPlatform(Platform):
 
         is_hybrid = vllm_config.model_config.is_hybrid
         if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+            if hasattr(backend_cls, "get_page_size"):
+                default = backend_cls.get_page_size(vllm_config)
+            else:
+                default = cache_config.block_size
             cache_config.block_size = (  # type: ignore[assignment]
                 backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
-        min_page_size = backend_cls.get_min_page_size(vllm_config)
+        if hasattr(backend_cls, "get_min_page_size"):
+            min_page_size = backend_cls.get_min_page_size(vllm_config)
+        else:
+            min_page_size = 1
         if min_page_size > cache_config.block_size:
             logger.warning(
                 "Increase the page size from %s to %s to make sure there's"
