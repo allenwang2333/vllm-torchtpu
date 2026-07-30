@@ -138,38 +138,6 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
-def _regroup_rows(arr: jax.Array, width: int) -> jax.Array:
-    """(rows, lanes) -> (rows * lanes // width, width), row-major.
-
-    Rebuilds wider rows by lane-concatenating groups of consecutive rows;
-    all slices are 128-lane aligned, so no generic relayout is needed.
-    """
-    lanes = arr.shape[-1]
-    if width == lanes:
-        return arr
-    group = width // lanes
-    assert group * lanes == width, (width, lanes)
-    assert arr.shape[0] % group == 0, (arr.shape, group)
-    wide_rows = [
-        jnp.concat([arr[r * group + i][None] for i in range(group)], axis=-1)
-        for r in range(arr.shape[0] // group)
-    ]
-    return jnp.concat(wide_rows, axis=0)
-
-
-def _split_rows(arr: jax.Array, lanes: int) -> jax.Array:
-    """Inverse of ``_regroup_rows``: (rows, width) -> (rows', lanes)."""
-    width = arr.shape[-1]
-    if width == lanes:
-        return arr
-    group = width // lanes
-    narrow_rows = [
-        arr[r, i * lanes:(i + 1) * lanes][None] for r in range(arr.shape[0])
-        for i in range(group)
-    ]
-    return jnp.concat(narrow_rows, axis=0)
-
-
 def _region_rows_per_block(slot_ref: jax.Ref,
                            region: config.StateRegion) -> tuple[int, int]:
     """(typed rows per source block, typed lane count) of a slot tile."""
@@ -203,7 +171,7 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
         for j in range(region.nblocks)
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
-    return _regroup_rows(arr[:region.rows_used], shape[-1]).reshape(shape)
+    return arr[:region.rows_used].reshape(shape)
 
 
 def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
@@ -215,7 +183,7 @@ def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
     """
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
     arr = values.astype(region.view_dtype)
-    arr = _split_rows(arr.reshape(-1, arr.shape[-1]), out_lanes)
+    arr = arr.reshape(-1, out_lanes)
     capacity = region.nblocks * rows_pb
     if region.rows_used < capacity:
         arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
