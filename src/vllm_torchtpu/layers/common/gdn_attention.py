@@ -714,6 +714,7 @@ def run_jax_gdn_attention_pooled_local(
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
     read_offsets: Optional[jnp.ndarray] = None,
+    ckpt_indices: Optional[jnp.ndarray] = None,
     *,
     n_kq: int,
     n_v: int,
@@ -796,6 +797,7 @@ def run_jax_gdn_attention_pooled_local(
         d_v=d_v,
         kernel_size=kernel_size,
         window=window,
+        per_ckpt_indices=ckpt_indices is not None,
     )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
@@ -812,6 +814,7 @@ def run_jax_gdn_attention_pooled_local(
         distribution,
         seq_lens,
         read_offsets,
+        ckpt_indices,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -838,6 +841,7 @@ def run_jax_gdn_attention_pooled(
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
     slot_read_offsets: Optional[jnp.ndarray] = None,
+    ckpt_indices: Optional[jnp.ndarray] = None,
     *,
     n_kq: int,
     n_v: int,
@@ -904,6 +908,13 @@ def run_jax_gdn_attention_pooled(
         # Per-sequence read offsets (see below), replicated like the other
         # per-sequence inputs.
         in_specs = in_specs + (P(None), )
+    if ckpt_indices is not None:
+        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint,
+        # replicated like the other per-sequence inputs.
+        assert slot_read_offsets is not None, (
+            "ckpt_indices selects a checkpoint per sequence, which needs "
+            "slot_read_offsets to say which one")
+        in_specs = in_specs + (P(None, None), )
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -942,6 +953,10 @@ def run_jax_gdn_attention_pooled(
         extra_args = (slot_read_offsets[state_indices], )
     else:
         extra_args = ()
+    if ckpt_indices is not None:
+        # Already per-sequence (row s names sequence s's checkpoint blocks),
+        # so it needs no gather by state_indices.
+        extra_args = extra_args + (ckpt_indices, )
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,
