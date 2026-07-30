@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU W4A16 MoE implementation for Compressed Tensors."""
+"""TPU W4A16 MoE implementation for Compressed Tensors.
+
+This class supprts W4A16 and W4A8 quantization scheme where weights are quantized in int4 format.
+"""
 
 import ctypes
 import gc
