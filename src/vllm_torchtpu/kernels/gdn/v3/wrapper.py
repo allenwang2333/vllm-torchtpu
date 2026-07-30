@@ -405,6 +405,11 @@ def fused_conv1d_gdn(
     if pooled:
         assert conv_state is None and recurrent_state is None
         assert state_source is not None
+        # An external source stores one state per slot, not a checkpoint
+        # window, so the rollback reads/writes have nowhere to land.
+        assert num_spec_tokens == 0, (
+            "speculative decoding is not supported with an external state "
+            f"source (num_spec_tokens={num_spec_tokens})")
     else:
         assert state_source is None
         conv_out_dtype = conv_state.dtype
