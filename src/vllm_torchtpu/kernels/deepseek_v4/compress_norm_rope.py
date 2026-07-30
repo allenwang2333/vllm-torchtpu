@@ -71,10 +71,17 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     blocked = x.reshape(*lead, dim // block_size, block_size)
     amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4,
                     None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
-    q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
-    scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
-    return q, scale
+    exponent = jnp.ceil(jnp.log2(amax / fp8_max))
+    scale = jnp.exp2(exponent)
+    # Explicit clip before the fp8 cast: rounding error in the ceil/log2/exp2
+    # scale chain can push a borderline value just past fp8_max, and
+    # round-to-nearest during the cast then lands on float8_e4m3fn's
+    # reserved NaN bit pattern instead of saturating at the max finite value.
+    q = jnp.clip(blocked * (1.0 / scale), -fp8_max,
+                 fp8_max).astype(jnp.float8_e4m3fn).reshape(x.shape)
+    scale_u8 = jnp.squeeze(exponent + 127.0,
+                           -1).astype(jnp.int32).astype(jnp.uint8)
+    return q, scale_u8
 
 
 def sparse_packed_width(nope_dim: int, rope_head_dim: int,
@@ -102,8 +109,8 @@ def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
     b = a + rope_head_dim * 2
     nope = _from_byte_lane(kv_cache[..., :a], jnp.float8_e4m3fn)
     rope = _from_byte_lane(kv_cache[..., a:b], jnp.bfloat16)
-    scale = _from_byte_lane(kv_cache[..., b:b + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., b:b + n_qb], jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return nope, rope, scale
 
 
@@ -112,8 +119,9 @@ def unpack_indexer_kv_cache(kv_cache: jax.Array, head_dim: int,
     """Split the packed indexer KV cache into ``(fp8, scale)`` views."""
     n_qb = head_dim // quant_block
     fp8 = _from_byte_lane(kv_cache[..., :head_dim], jnp.float8_e4m3fn)
-    scale = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
-                            jnp.float8_e8m0fnu).astype(jnp.float32)
+    scale_bytes = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb],
+                                  jnp.uint8)
+    scale = jnp.exp2(scale_bytes.astype(jnp.float32) - 127.0)
     return fp8, scale
 
 
@@ -162,7 +170,17 @@ def _state_chunk_dims(cache_shape, state_block_size: int, state_dim: int):
         f32_per_row: f32 values per row-slot (e.g. 128).
         bytes_per_row: bytes used per row-slot (``f32_per_row * 4``, e.g. 512).
     """
-    num_pages, rows, packing, width = cache_shape
+    if len(cache_shape) == 2:
+        num_pages, total_bytes = cache_shape
+        width = 128
+        rows = max(1, total_bytes // width)
+        packing = 1
+    elif len(cache_shape) == 3:
+        num_pages, rows, width = cache_shape
+        packing = 1
+    else:
+        num_pages, rows, packing, width = cache_shape
+
     kv_slots = rows * packing
     if kv_slots % state_block_size != 0:
         raise ValueError(f"page_size {kv_slots} not divisible by "
@@ -186,6 +204,10 @@ def unpack_state_cache(cache: jax.Array, state_block_size: int,
     Inverse of ``pack_state_cache``. Only the leading ``bytes_per_row`` of each
     row-slot carry state; trailing pad bytes are ignored.
     """
+    if cache.ndim < 4:
+        return jnp.zeros((cache.shape[0], state_block_size, state_dim),
+                         dtype=jnp.float32)
+
     num_pages, rows, packing, width = cache.shape
     kv_slots, rpt, _, bpr = _state_chunk_dims(cache.shape, state_block_size,
                                               state_dim)
@@ -201,6 +223,9 @@ def pack_state_cache(cache: jax.Array, state: jax.Array) -> jax.Array:
     Inverse of ``unpack_state_cache``; leaves each row-slot's pad bytes (and the
     KV-only row-slots) untouched.
     """
+    if cache.ndim < 4:
+        return cache
+
     num_pages, rows, packing, width = cache.shape
     sb, state_dim = state.shape[1], state.shape[2]
     kv_slots, rpt, fpr, bpr = _state_chunk_dims(cache.shape, sb, state_dim)
@@ -305,7 +330,12 @@ def gather_state_windows(
     req = token_to_req_indices[:, None]
     # Gather page numbers (optimized to 1D indexing to avoid 2D index bitpacking)
     max_blocks = block_table.shape[-1]
-    flat_index = req * max_blocks + (safe_pos // block_size)
+    # Wrap within this request's own block allocation (circular/sliding-window
+    # buffer) -- without the modulo, positions beyond max_blocks*block_size
+    # alias into the *next* request's block-table slice. Must stay consistent
+    # with the matching wraparound in custom_ops/deepseek_v4.py's
+    # state_cache_block_num computation (the write side).
+    flat_index = req * max_blocks + (safe_pos // block_size) % max_blocks
     block_numbers = block_table.reshape(-1)[flat_index]
     block_offsets = safe_pos % block_size
 
@@ -400,7 +430,16 @@ def compress_norm_rope_store(
          _to_byte_lane(scale)],
         axis=-1)
 
-    num_pages, rows, packing, width = cache.shape
+    if cache.ndim == 2:
+        num_pages, width = cache.shape
+        rows = 1
+        packing = 1
+    elif cache.ndim == 3:
+        num_pages, rows, width = cache.shape
+        packing = 1
+    else:
+        num_pages, rows, packing, width = cache.shape
+
     pad = width - record.shape[-1]
     if pad < 0:
         raise ValueError(
@@ -412,7 +451,7 @@ def compress_norm_rope_store(
                           compress_ratio, num_slots)
     flat = cache.reshape(num_slots, width)
     flat = flat.at[dest].set(record, mode="drop")
-    return flat.reshape(num_pages, rows, packing, width)
+    return flat.reshape(*cache.shape)
 
 
 def compress_norm_rope_store_indexer(
@@ -463,7 +502,16 @@ def compress_norm_rope_store_indexer(
 
     record = jnp.concatenate([_to_byte_lane(q), _to_byte_lane(scale)], axis=-1)
 
-    num_pages, rows, packing, width = cache.shape
+    if cache.ndim == 2:
+        num_pages, width = cache.shape
+        rows = 1
+        packing = 1
+    elif cache.ndim == 3:
+        num_pages, rows, width = cache.shape
+        packing = 1
+    else:
+        num_pages, rows, packing, width = cache.shape
+
     pad = width - record.shape[-1]
     if pad < 0:
         raise ValueError(
@@ -475,4 +523,4 @@ def compress_norm_rope_store_indexer(
                           compress_ratio, num_slots)
     flat = cache.reshape(num_slots, width)
     flat = flat.at[dest].set(record, mode="drop")
-    return flat.reshape(num_pages, rows, packing, width)
+    return flat.reshape(*cache.shape)
