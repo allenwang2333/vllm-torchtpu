@@ -823,3 +823,43 @@ def test_eagle3_mtp_kv_sharing_setup():
 
     # Should map to the last target layer (index 1)
     assert draft_layer.self_attn.attn.kv_sharing_target_layer_name == "model.layers.1.self_attn.attn"
+
+
+def test_eagle3_mtp_kv_caches_binding():
+    """Verify that _bind_gemma4_shared_kv_caches correctly binds target KV caches to draft layers."""
+    speculative_config = SimpleNamespace(
+        draft_tensor_parallel_size=1,
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(layer_types=["full_attention"]))))
+    parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                layer_types=["full_attention", "full_attention"],
+                num_kv_shared_layers=0,
+            ))))
+    proposer = Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+
+    # Mock draft model structure
+    draft_layer = SimpleNamespace(self_attn=SimpleNamespace(
+        attn=SimpleNamespace(kv_sharing_target_layer_name=None,
+                             kv_cache=None)))
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        layers=[draft_layer]))
+
+    # Mock get_layers_from_vllm_config to return target layers
+    target_layer = SimpleNamespace(kv_cache=mock.sentinel.target_kv_cache)
+    with mock.patch(
+            "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config"
+    ) as mock_get_layers:
+        mock_get_layers.return_value = {
+            "model.layers.1.self_attn.attn": target_layer
+        }
+        proposer._bind_gemma4_shared_kv_caches()
+
+    # The draft layer's kv_cache should now point directly to target layer's kv_cache sentinel!
+    assert draft_layer.self_attn.attn.kv_cache is mock.sentinel.target_kv_cache

@@ -14,6 +14,7 @@ from vllm.config import (VllmConfig, get_layers_from_vllm_config,
                          set_current_vllm_config)
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_torchtpu.layers.common.attention_metadata import \
@@ -111,6 +112,8 @@ class Eagle3Proposer:
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
             draft_tp)
         self.draft_model = None
+        # Lazily resolved by _draft_has_moe once the draft model exists.
+        self._draft_has_moe_cache: bool | None = None
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
@@ -125,10 +128,9 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
-        self.constant_draft_positions = (
-            getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
-            and self.speculative_config.use_gemma4_mtp()
-        )
+        self.constant_draft_positions = (getattr(
+            self.speculative_config, "use_gemma4_mtp",
+            None) is not None and self.speculative_config.use_gemma4_mtp())
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -150,8 +152,8 @@ class Eagle3Proposer:
         maybe_share_embeddings(self.draft_model, target_model,
                                self._draft_replicated)
         self._maybe_share_lm_head(target_model)
-        if (getattr(self.speculative_config, "use_gemma4_mtp", None) is not None
-                and self.speculative_config.use_gemma4_mtp()):
+        if (getattr(self.speculative_config, "use_gemma4_mtp", None)
+                is not None and self.speculative_config.use_gemma4_mtp()):
             self._setup_gemma4_kv_sharing(target_attn_layer_names)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
@@ -262,6 +264,66 @@ class Eagle3Proposer:
                 draft_layer_type,
                 target_layer_name,
             )
+
+    def _bind_gemma4_shared_kv_caches(self) -> None:
+        """Bind target KV cache tensors to draft layers at runtime."""
+        model_impl = getattr(self.draft_model, "model", self.draft_model)
+        if not hasattr(model_impl, "layers"):
+            return
+
+        # Find target layers
+        target_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
+        )
+
+        draft_config = self.speculative_config.draft_model_config.hf_config
+        draft_text_config = getattr(draft_config, "text_config", draft_config)
+        if hasattr(draft_config, "get_text_config"):
+            draft_text_config = draft_config.get_text_config()
+
+        target_config = self.vllm_config.model_config.hf_config
+        target_text_config = getattr(target_config, "text_config",
+                                     target_config)
+        if hasattr(target_config, "get_text_config"):
+            target_text_config = target_config.get_text_config()
+
+        target_layer_types = getattr(target_text_config, "layer_types", [])
+        target_num_kv_shared = getattr(target_text_config,
+                                       "num_kv_shared_layers", 0)
+        num_non_shared = len(target_layer_types) - target_num_kv_shared
+
+        from collections import defaultdict
+        type_to_target_indices = defaultdict(list)
+        for idx, lt in enumerate(target_layer_types[:num_non_shared]):
+            type_to_target_indices[lt].append(idx)
+
+        # Locate target naming prefix in get_kv_cache_spec
+        target_prefix = "model.layers"
+        for name in target_layers:
+            if ".layers." in name:
+                target_prefix = name.split(".layers.")[0] + ".layers"
+                break
+
+        draft_layer_types = getattr(draft_text_config, "layer_types", [])
+        for draft_idx, layer in enumerate(model_impl.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn = getattr(layer.self_attn, "attn", None)
+            if attn is None:
+                continue
+
+            draft_layer_type = (draft_layer_types[draft_idx] if draft_idx
+                                < len(draft_layer_types) else "full_attention")
+            candidates = type_to_target_indices.get(draft_layer_type, [])
+            if not candidates:
+                continue
+
+            target_idx = candidates[-1]
+            target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            if target_layer_name in target_layers:
+                target_layer = target_layers[target_layer_name]
+                attn.kv_cache = getattr(target_layer, "kv_cache", None)
 
     def _maybe_share_lm_head(self, target_model) -> None:
         """Override of LLMBaseProposer._maybe_share_lm_head.
@@ -402,6 +464,10 @@ class Eagle3Proposer:
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
+
+        if (getattr(self.speculative_config, "use_gemma4_mtp", None)
+                is not None and self.speculative_config.use_gemma4_mtp()):
+            self._bind_gemma4_shared_kv_caches()
 
         K = self.speculative_config.num_speculative_tokens
 
@@ -1003,7 +1069,8 @@ class Eagle3Proposer:
                 num_tokens=num_tokens,
                 num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(
                     num_tokens),
-        ), set_vllm_model_wrapper_context(mesh=self.runner.mesh):
+        ), set_vllm_model_wrapper_context(mesh=self.runner.mesh,
+                                          vllm_config=self.runner.vllm_config):
             out = self.draft_model(**kwargs)
 
         return self._unwrap_model_out(out)
@@ -1026,7 +1093,18 @@ class Eagle3Proposer:
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
-        return self.draft_model.config.hidden_size
+        config = self.draft_model.config
+        # TODO: In the future, we may need to include logic to only do this for
+        # Gemma 4 MTP. Since the precompilation of compute_logits operates on
+        # the draft model's internal hidden states (width 1024), we must use
+        # the internal hidden_size rather than the backbone_hidden_size (5376)
+        # to ensure reduction dimensions align perfectly during graph tracing.
+        if hasattr(config, "hidden_size"):
+            return config.hidden_size
+        text_config = getattr(config, "text_config", config)
+        if hasattr(config, "get_text_config"):
+            text_config = config.get_text_config()
+        return text_config.hidden_size
 
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
