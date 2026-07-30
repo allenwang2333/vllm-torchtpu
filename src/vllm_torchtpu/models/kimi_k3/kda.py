@@ -11,7 +11,7 @@ from torch import nn
 
 from vllm_torchtpu.kernels.kda import kda_decode, kda_forward
 
-__all__ = ["KdaMetadata", "KimiK3DeltaAttention", "GatedRMSNorm"]
+__all__ = ["KdaMetadata", "KimiK3DeltaAttention", "GatedRMSNormSigmoid"]
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
@@ -342,7 +342,7 @@ class KimiK3DeltaAttention(nn.Module):
                 "KDA gate lower bound must be in "
                 f"[{_KDA_GATE_LOGBOUND_MIN}, 0). Got {self.gate_lower_bound}.")
 
-        self.o_norm = GatedRMSNormSigmoid(self.head_dim, activation="sigmoid")
+        self.o_norm = GatedRMSNormSigmoid(self.head_dim)
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
