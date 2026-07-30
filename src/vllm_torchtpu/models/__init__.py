@@ -29,11 +29,20 @@ def register_models() -> None:
     from vllm_torchtpu.logger import init_logger
     logger = init_logger(__name__)
 
+    # NOTE: kimi_k3.register() is deliberately NOT called. Its ARCH_TO_CLASS maps
+    # "KimiLinearForCausalLM" to the dummy-logits skeleton in
+    # models/kimi_k3/model.py, which globally overrides vLLM's in-tree model of
+    # the same name -- so any Kimi-Linear checkpoint served here would silently
+    # produce dummy output. Kimi-Linear is now the target and uses the in-tree
+    # model definition with only the KDA layer substituted, so the skeleton would
+    # actively break it. Re-enable when the K3 path is picked back up, and give
+    # the skeleton its own architecture name first.
+
     try:
-        from vllm_torchtpu.models import kimi_k3
-        kimi_k3.register()
+        from vllm_torchtpu.models import kimi_linear
+        kimi_linear.register()
     except Exception as error:
-        logger.warning("Could not register TPU Kimi model: %s",
+        logger.warning("Could not register TPU Kimi-Linear KDA layer: %s",
                        error,
                        exc_info=True)
 
