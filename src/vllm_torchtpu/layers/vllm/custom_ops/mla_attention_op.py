@@ -521,14 +521,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
+        self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
-        # skip_topk layers (GLM-5.2 index sharing) still need topk_tokens and
-        # the shared buffer: they don't run their indexer but consume the
-        # indices a previous layer wrote into the model-wide buffer.
-        if self.indexer is not None:
+        if self.indexer is not None and not self.skip_topk:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
-            self.topk_indices_buffer = mla_modules.topk_indices_buffer
 
         self.mla_attn = VllmTPUMLAAttention(
             num_heads=self.num_heads,
@@ -604,22 +601,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         topk_indices = None
-        if self.indexer and self.is_sparse:
-            # Non-skip layers run the indexer, which writes into the
-            # model-wide topk_indices_buffer; skip_topk layers (GLM-5.2
-            # index sharing) reuse whatever the previous non-skip layer
-            # wrote there in this pass. Either way the sparse path consumes
-            # the shared buffer, sliced to this batch (a copy-free view).
-            # Rows are valid-first with a -1 tail, as the sparse MLA kernel
-            # requires.
-            if not self.skip_topk:
-                self.indexer(hidden_states, q_c, positions,
-                             self.indexer_rope_emb)
-            assert self.topk_indices_buffer is not None, (
-                "sparse MLA layers require the model-wide topk_indices_buffer"
-            )
-            topk_indices = self.topk_indices_buffer[
-                : hidden_states.shape[0], : self.topk_tokens]
+        if self.is_sparse:
+            if self.indexer is not None and not self.skip_topk:
+                topk_index = self.indexer(hidden_states, q_c, positions,
+                                        self.indexer_rope_emb)
+            else:
+                # reuse the indices an earlier layer wrote into the shared buffer.
+                topk_index = self.topk_indices_buffer
+            topk_indices = topk_index[:hidden_states.shape[0]]
+
+            # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")
 
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
