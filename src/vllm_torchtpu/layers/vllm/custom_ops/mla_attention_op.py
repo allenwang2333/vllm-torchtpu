@@ -344,7 +344,7 @@ class VllmTPUIndexer(Indexer):
         q_fp8, q_scale = _per_token_group_quant_fp8_tpu(
             q,
             self.quant_block_size,
-            use_ue8m0=self.scale_fmt is not None,
+            use_ue8m0=False,
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
@@ -511,13 +511,27 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
 
+        self.topk_indices_buffer = mla_modules.topk_indices_buffer
+
         # skip_topk layers (GLM-5.2 index sharing) still need topk_tokens and
         # the shared buffer: they don't run their indexer but consume the
-        # indices a previous layer wrote into the model-wide buffer.
+        # indices a previous layer wrote into the model-wide buffer. Those
+        # layers are built with indexer=None, so fall back to the buffer width
+        # (it is allocated with the model-wide index_topk as its last dim).
+        self.topk_tokens = None
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
-            self.topk_indices_buffer = mla_modules.topk_indices_buffer
+            if self.topk_indices_buffer is not None:
+                # Indexer layers are the only place both values exist at once,
+                # so check the invariant the skip_topk fallback below relies on.
+                assert (self.topk_indices_buffer.shape[-1]
+                        == self.topk_tokens), (
+                            "topk_indices_buffer width "
+                            f"{self.topk_indices_buffer.shape[-1]} != "
+                            f"indexer.topk_tokens {self.topk_tokens}")
+        elif self.topk_indices_buffer is not None:
+            self.topk_tokens = self.topk_indices_buffer.shape[-1]
 
         self.mla_attn = VllmTPUMLAAttention(
             num_heads=self.num_heads,
@@ -593,23 +607,24 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         topk_indices = None
-        if self.indexer and self.is_sparse:
-            # Non-skip layers run the indexer, which writes into the
-            # model-wide topk_indices_buffer; skip_topk layers (GLM-5.2
-            # index sharing) reuse whatever the previous non-skip layer
-            # wrote there in this pass. Either way the sparse path consumes
-            # the shared buffer, sliced to this batch (a copy-free view).
-            # Rows are valid-first with a -1 tail, as the sparse MLA kernel
-            # requires.
-            if not self.skip_topk:
-                self.indexer(hidden_states, q_c, positions,
-                             self.indexer_rope_emb)
+        if self.is_sparse:
             assert self.topk_indices_buffer is not None, (
-                "sparse MLA layers require the model-wide topk_indices_buffer"
-            )
-            topk_indices = self.topk_indices_buffer[
-                : hidden_states.shape[0], : self.topk_tokens]
+                "sparse MLA layers require the model-wide topk_indices_buffer")
+            assert self.topk_tokens is not None
 
+            indexed = None
+            if self.indexer is not None and not self.skip_topk:
+                # The indexer returns the shared buffer it just wrote; consume
+                # that value instead of re-reading the attribute so the topk
+                # write stays ordered before this read in the traced graph.
+                indexed = self.indexer(hidden_states, q_c, positions,
+                                       self.indexer_rope_emb)
+            # skip_topk layers (indexer is None) reuse the indices an earlier
+            # layer wrote into the shared buffer.
+            if indexed is None:
+                indexed = self.topk_indices_buffer
+            topk_indices = indexed[:hidden_states.shape[0], :self.topk_tokens]
+            
         if llama_4_scaling is not None:
             q_nope *= llama_4_scaling
             q_pe *= llama_4_scaling
