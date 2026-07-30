@@ -84,17 +84,30 @@ Add `VLLM_CHECK_NAN=1 DSV4_TRACE_ACTIVATIONS=1` to the same command above (or to
 This exercises `check_nan()` in `layers/vllm/custom_ops/deepseek_v4/deepseek_v4_attention.py`
 (fixed this session -- was previously silently dead code due to a mis-indentation bug), called
 at ~16 named points per attention layer (`"q (after rope)"`, `"kv (after rope)"`,
-`"o (input to o_proj)"`, weight checks, etc.). Since the model produces zero NaN, the NaN
-branch won't fire; instead every call site prints:
+`"o (input to o_proj)"`, weight checks, etc.).
+
+**Not yet run this session** -- this session's baseline e2e run (Part 1.1) did not set
+`VLLM_CHECK_NAN=1`, so `check_nan()`'s first line (`if os.getenv("VLLM_CHECK_NAN") != "1":
+return`) made it a no-op the entire time; it produced zero evidence either way about NaN
+presence in *this* run. The "the model is NaN-free" claim in the investigation history
+(e.g. `docs/dsv4_running_and_testing.md`'s session 3 "zero NaN detections" result) is from
+past sessions' runs, not verified fresh here -- per this repo's own convention
+(`docs/dsv4_running_and_testing.md`'s "never trust an old log's numbers" note), don't treat
+that as settled without a fresh check if it matters for a decision.
+
+If run with `VLLM_CHECK_NAN=1 DSV4_TRACE_ACTIVATIONS=1` and the model is in fact still
+NaN-free, the *expected* behavior (from reading `check_nan()`'s code, not from having run
+it) is that the NaN branch won't fire and every call site instead prints:
 
 ```
 [ACT_TRACE] [<layer_prefix>] <name>: shape=[...] mean=... std=... min=... max=...
 ```
 
-~16 lines × 43 layers ≈ 700 lines total. Grep/scan for a layer where `std` spikes, collapses
-toward zero, or `mean` shifts abruptly -- a cheap way to get a *rough* candidate layer before
-committing to the full cross-repo comparison in Part 2. This does **not** tell you what's
-wrong, only "something looks statistically off starting around layer N."
+~16 lines × 43 layers ≈ 700 lines total, if that prediction holds. Grep/scan for a layer
+where `std` spikes, collapses toward zero, or `mean` shifts abruptly -- a cheap way to get a
+*rough* candidate layer before committing to the full cross-repo comparison in Part 2. This
+does **not** tell you what's wrong, only "something looks statistically off starting around
+layer N."
 
 ```bash
 docker run ... vllm-torchtpu-local:latest \
