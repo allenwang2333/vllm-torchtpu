@@ -21,7 +21,6 @@ import gc
 
 import jax.numpy as jnp
 import torch
-from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import \
     CompressedTensorsWNA16MoEMethod
@@ -29,6 +28,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
+    get_tpu_cpu_weight_loader_hook
 
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
@@ -63,16 +64,13 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         scheme = self.weight_quant
 
         num_bits = int(scheme.num_bits)
-        if num_bits != 4:
-            raise NotImplementedError(
-                "TPU compressed-tensors MoE supports only W4A16; "
-                f"received W{num_bits}A16.")
-
         quant_type = getattr(scheme, "type", None)
-        if quant_type is None or "int" not in str(quant_type).lower():
+        if quant_type is None or "int" not in str(
+                quant_type).lower() or num_bits != 4:
             raise NotImplementedError(
                 "TPU W4A16 MoE supports integer INT4 weights only; "
-                f"received quantization type {quant_type!r}.")
+                f"received quantization type {quant_type!r}. num_bits {num_bits}"
+            )
 
         if not bool(getattr(scheme, "symmetric", False)):
             raise NotImplementedError(
@@ -105,79 +103,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         orig_loader = extra_weight_attrs.get("weight_loader")
 
         # Inject our optimized TPU CPU weight loader hook
-        def _cpu_weight_loader_hook(param, loaded_weight, weight_name,
-                                    shard_id, expert_id, *args, **kwargs):
-            local_expert_id = layer._map_global_expert_id_to_local_expert_id(
-                expert_id)
-            if local_expert_id == -1:
-                return False
-            expert_id = local_expert_id
-
-            is_main_weight = ("w13_weight_packed" in weight_name
-                              or "w2_weight_packed" in weight_name
-                              or "w13_weight_scale" in weight_name
-                              or "w2_weight_scale" in weight_name)
-            if not is_main_weight:
-                return orig_loader(param, loaded_weight, weight_name, shard_id,
-                                   expert_id, *args, **kwargs)
-
-            if not hasattr(param, "_cpu_scratch"):
-                untransposed_shape = (param.shape[0], param.shape[2],
-                                      param.shape[1])
-                scratch = Parameter(torch.empty(untransposed_shape,
-                                                dtype=param.dtype,
-                                                device="cpu"),
-                                    requires_grad=False)
-                param._cpu_scratch = scratch
-
-            cpu_scratch = param._cpu_scratch
-            tp_size = self.moe.tp_size
-            tp_rank = self.moe.tp_rank
-
-            if "w13_weight_packed" in weight_name:
-                # Shard along dim 0
-                loaded_per_rank = loaded_weight.shape[0] // tp_size
-                start = loaded_per_rank * tp_rank
-                weight_shard = loaded_weight[start:start + loaded_per_rank]
-
-                shard_size = cpu_scratch.shape[1] // 2
-                offset = 0 if shard_id == "w1" else shard_size
-                cpu_scratch.data[expert_id, offset:offset +
-                                 weight_shard.shape[0], :].copy_(weight_shard)
-                return True
-            elif "w2_weight_packed" in weight_name:
-                # Shard along dim 1
-                loaded_per_rank = loaded_weight.shape[1] // tp_size
-                start = loaded_per_rank * tp_rank
-                weight_shard = loaded_weight[:, start:start + loaded_per_rank]
-
-                cpu_scratch.data[expert_id].copy_(weight_shard)
-                return True
-            elif "w13_weight_scale" in weight_name:
-                # Shard along dim 0
-                loaded_per_rank = loaded_weight.shape[0] // tp_size
-                start = loaded_per_rank * tp_rank
-                weight_shard = loaded_weight[start:start + loaded_per_rank, :]
-
-                shard_size = cpu_scratch.shape[1] // 2
-                offset = 0 if shard_id == "w1" else shard_size
-                cpu_scratch.data[expert_id, offset:offset +
-                                 weight_shard.shape[0], :].copy_(weight_shard)
-                return True
-            elif "w2_weight_scale" in weight_name:
-                # Shard along dim 1
-                loaded_per_rank = loaded_weight.shape[1] // tp_size
-                start = loaded_per_rank * tp_rank
-                weight_shard = loaded_weight[:, start:start + loaded_per_rank]
-
-                cpu_scratch.data[expert_id].copy_(weight_shard)
-                return True
-
-            # Fallback to default loader (e.g., for helper tensors)
-            return orig_loader(cpu_scratch, loaded_weight, weight_name,
-                               shard_id, expert_id, *args, **kwargs)
-
-        extra_weight_attrs["weight_loader"] = _cpu_weight_loader_hook
+        extra_weight_attrs["weight_loader"] = get_tpu_cpu_weight_loader_hook(
+            layer, orig_loader, self.moe.tp_size, self.moe.tp_rank)
 
         # Parent handles creating w13_weight_packed, scales, and auxiliary shape parameters
         super().create_weights(layer, num_experts, hidden_size,
