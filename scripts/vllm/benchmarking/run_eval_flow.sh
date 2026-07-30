@@ -209,7 +209,7 @@ fi
 # ========================================================
 # 4. Run Standalone Multimodal (MMMU-Pro) Evaluation FIRST
 # ========================================================
-if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || [[ "$CONFIG_NAME" =~ gemma-?4|vl ]]; }; then
+if [ "$RUN_LM_EVAL" = "1" ] && { [ "$IS_MULTIMODAL" = "true" ] || { [[ "$CONFIG_NAME" =~ gemma-?4|vl ]] && [[ ! "$CONFIG_NAME" =~ -text ]]; }; }; then
     echo "=== Running Standalone Multimodal (MMMU-Pro) Evaluation ==="
     python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
       --host "$HOST" \
@@ -224,7 +224,7 @@ fi
 # ========================================================
 # 4b. Run lm_eval
 # ========================================================
-if [ "$RUN_LM_EVAL" = "1" ] && [ "$IS_MULTIMODAL" != "true" ] && [[ ! "$CONFIG_NAME" =~ gemma-?4|vl ]]; then
+if [ "$RUN_LM_EVAL" = "1" ] && [ "$IS_MULTIMODAL" != "true" ] && { [[ ! "$CONFIG_NAME" =~ gemma-?4|vl ]] || [[ "$CONFIG_NAME" =~ -text ]]; }; then
     TASKS="${LM_EVAL_TASKS:-mmlu_llama mmlu_pro}"
     for task in $TASKS; do
         run_lm_eval "$task"
