@@ -283,6 +283,106 @@ def _patch_disable_dp_ubatch() -> None:
     logger.info("Applied TPU patch: disable DP microbatching.")
 
 
+def _patch_torch_sdpa_for_tpu() -> None:
+    """Pad head_dim for torch.nn.functional.scaled_dot_product_attention on TPU.
+
+    PyTorch XLA's SDPA C++ kernel requires head_dim % 128 == 0, seq_len % 512 == 0,
+    and attn_mask is None to use FLASH_ATTENTION. When any condition is violated
+    (e.g., head_dim=72, seq_len=2520 in Gemma 4 vision encoder), it falls back to
+    slow Math/SHLO attention which times out under DP on shared TPU hosts.
+    For non-causal 4D vision attention on TPU, this patch delegates execution to
+    vllm-torchtpu's custom Pallas vision flash attention kernel (TpuMMEncoderAttention._vision_op),
+    which uses 128-block sequence padding and segment IDs.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if getattr(F, "_tpu_sdpa_padded_patch", False):
+        return
+
+    _orig_sdpa = F.scaled_dot_product_attention
+
+    def _tpu_padded_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+        is_tpu = query.device.type == "xla" or "tpu" in str(query.device)
+        if is_tpu and not is_causal and query.dim() == 4:
+            from vllm_torchtpu.layers.vllm.vision_attention import (
+                TpuMMEncoderAttention,
+                _BLOCK_SIZE,
+                _vision_flash_core,
+            )
+            if TpuMMEncoderAttention._vision_op is None:
+                from torch_tpu._internal import pallas
+                op = pallas.jax_op("pallas::vision_flash_attention", _vision_flash_core)
+                op.register_fake(lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
+                TpuMMEncoderAttention._vision_op = op
+
+            bsz, num_heads, seq_len, head_dim = query.shape
+            target_dim = ((head_dim + 127) // 128) * 128
+            pad_dim = target_dim - head_dim
+            if scale is None:
+                scale = 1.0 / (head_dim ** 0.5)
+
+            if pad_dim > 0:
+                q_4d = F.pad(query, (0, pad_dim))
+                k_4d = F.pad(key, (0, pad_dim))
+                v_4d = F.pad(value, (0, pad_dim))
+            else:
+                q_4d, k_4d, v_4d = query, key, value
+
+            q_bshd = q_4d.transpose(1, 2)
+            k_bshd = k_4d.transpose(1, 2)
+            v_bshd = v_4d.transpose(1, 2)
+
+            pad = (-seq_len) % _BLOCK_SIZE
+            padded = seq_len + pad
+            seg = torch.zeros((bsz, padded), dtype=torch.int32, device=query.device)
+            seg[:, :seq_len] = 1
+
+            def _prep(x):
+                if pad:
+                    x = F.pad(x, (0, 0, 0, 0, 0, pad))
+                return x.permute(0, 2, 1, 3).contiguous()
+
+            op = TpuMMEncoderAttention._vision_op
+            out = op(_prep(q_bshd * scale), _prep(k_bshd), _prep(v_bshd), seg, seg)
+            out = out.permute(0, 2, 1, 3)[:, :seq_len].contiguous()
+            out_bhsd = out.transpose(1, 2)
+            return out_bhsd[..., :head_dim]
+
+        head_dim = query.shape[-1]
+        if is_tpu and head_dim % 128 != 0:
+            target_dim = ((head_dim + 127) // 128) * 128
+            pad_amount = target_dim - head_dim
+            if scale is None:
+                scale = 1.0 / (head_dim ** 0.5)
+            q_pad = F.pad(query, (0, pad_amount))
+            k_pad = F.pad(key, (0, pad_amount))
+            v_pad = F.pad(value, (0, pad_amount))
+            out_pad = _orig_sdpa(
+                q_pad, k_pad, v_pad,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                **kwargs
+            )
+            return out_pad[..., :head_dim]
+
+        return _orig_sdpa(
+            query, key, value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            **kwargs
+        )
+
+    F.scaled_dot_product_attention = _tpu_padded_sdpa
+    torch.nn.functional.scaled_dot_product_attention = _tpu_padded_sdpa
+    F._tpu_sdpa_padded_patch = True
+    logger.info("Applied TPU patch: padded SDPA for head_dim %% 128 != 0.")
+
+
 def _patch_moe_no_ep_tp_scope() -> None:
     """Keep non-EP MoE tensor parallelism scoped to each DP engine.
 

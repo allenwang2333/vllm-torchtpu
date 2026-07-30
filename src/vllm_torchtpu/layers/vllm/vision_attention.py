@@ -148,7 +148,56 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]
         return out[:, :seq_len].contiguous()
 
+    def forward_native(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            cu_seqlens: torch.Tensor | None = None,
+            max_seqlen: torch.Tensor | None = None,
+            sequence_lengths: torch.Tensor | None = None) -> torch.Tensor:
+        head_dim = query.shape[-1] if query.dim() == 4 else getattr(
+            self, "head_size", query.shape[-1] //
+            getattr(self, "num_heads", 1))
+        if head_dim % 128 != 0:
+            target_dim = ((head_dim + 127) // 128) * 128
+            pad_amount = target_dim - head_dim
+            scale = getattr(self, "scale", None)
+            if scale is None:
+                scale = 1.0 / (head_dim**0.5)
+
+            is_4d = query.dim() == 4
+            if not is_4d:
+                bsz, q_len = query.size()[:2]
+                kv_len = key.size(1)
+                q_4d, k_4d, v_4d = self.view_qkv_to_4d(query, key, value, bsz,
+                                                       q_len, kv_len)
+            else:
+                q_4d, k_4d, v_4d = query, key, value
+
+            q_pad = F.pad(q_4d, (0, pad_amount))
+            k_pad = F.pad(k_4d, (0, pad_amount))
+            v_pad = F.pad(v_4d, (0, pad_amount))
+
+            out_4d = F.scaled_dot_product_attention(
+                q_pad.transpose(1, 2),
+                k_pad.transpose(1, 2),
+                v_pad.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+            ).transpose(1, 2)
+
+            out = out_4d[..., :head_dim]
+            if not is_4d:
+                out = out.reshape(bsz, q_len, -1)
+            return out
+
+        return super().forward_native(query, key, value, cu_seqlens,
+                                      max_seqlen, sequence_lengths)
+
     # torchtpu-vllm registers TpuPlatform as an out-of-tree plugin, so vLLM's
     # CustomOp.dispatch_forward routes to forward_oot. Alias forward_tpu to the
     # same impl so an in-tree TPU platform would also pick it up.
     forward_tpu = forward_oot
+

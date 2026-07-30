@@ -208,9 +208,11 @@ def apply_tpu_patches() -> None:
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
+                               _patch_multiproc_worker_global_rank_env,
+                               _patch_torch_sdpa_for_tpu)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    _patch_torch_sdpa_for_tpu()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
