@@ -690,7 +690,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         if rank == 0 and not hasattr(self, "_printed_ctx_keys"):
             self._printed_ctx_keys = True
             print(
-                f"[DEBUG_ATTN_CTX_TYPE] prefix={main_prefix} type={type(attn_ctx)} val={attn_ctx}",
+                f"[DEBUG_ATTN_CTX_TYPE] prefix={main_prefix} type={type(attn_ctx)}",
                 flush=True)
 
         def _get_field(meta, field_name):
