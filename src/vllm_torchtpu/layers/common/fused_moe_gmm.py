@@ -18,6 +18,8 @@ import jax
 from jax import numpy as jnp
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.cn_moe_kernels import TOP_K as CN_MOE_TOP_K
+from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
