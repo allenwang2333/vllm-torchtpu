@@ -957,6 +957,12 @@ class ZmqShmKvConnectorBase:
                         "TPUConnectorWorker(%d) rank%d --> stage_inline timeout "
                         "uuid=%s (STAGE_NOTIFY never arrived)", self.node_id,
                         self.tp_rank, uuid)
+                    # Without STAGE_DONE this rank's shard never completes, so
+                    # rank0 keeps the slot pending and the consumer's PULL
+                    # blocks for its full timeout, leaking a consumer slot per
+                    # occurrence. Signal failure like the exception path below
+                    # so PULL serving answers _MSG_ERR immediately.
+                    self._signal_stage_done(uuid, failed=True)
                     return
                 self._worker_pending_stage_cv.wait(timeout=rem)
             info = self._worker_pending_stage.pop(uuid)
