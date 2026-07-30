@@ -194,3 +194,10 @@ if vllm_xla_cache_path:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
+    # With Tier-3 on, the executables that TpuCompilerAdaptor pickles under
+    # torch_compile_cache/ would duplicate every torch_tpu_tier3/*.bin.
+    # Ask TorchTPU to pickle executables as a cache-key link into the tiered
+    # cache instead (no-op on torch_tpu versions without the feature).
+    # TpuCompilerAdaptor.load() recompiles if a link dangles after eviction.
+    os.environ.setdefault("TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY",
+                          "1")

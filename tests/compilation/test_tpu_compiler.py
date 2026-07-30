@@ -237,3 +237,155 @@ class TestTpuCompilerCache:
                 compiler.initialize_cache(cache_dir="/original/cache/dir")
                 # Should fallback to the original directory
                 assert compiler.cache_dir == "/original/cache/dir"
+
+    def test_env_override_enables_pickle_by_cache_key(self):
+        """VLLM_XLA_CACHE_PATH opts into TorchTPU by-cache-key pickling."""
+        env_mock = {
+            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ.get(
+                "TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY") == "1"
+
+    def test_env_override_pickle_by_cache_key_no_clobber(self):
+        """An explicit opt-out of by-cache-key pickling is preserved."""
+        env_mock = {
+            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
+            "TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY": "0",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ.get(
+                "TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY") == "0"
+
+    def test_env_override_no_pickle_by_cache_key_without_xla_cache(self):
+        """Without VLLM_XLA_CACHE_PATH (no tier-3), the opt-in stays unset."""
+        with patch.dict(os.environ, {}, clear=True):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ.get(
+                "TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY") is None
+
+
+class TestTpuCompilerLoadFallback:
+
+    @staticmethod
+    def _make_graph():
+        import torch.fx as fx
+
+        def f(x):
+            return x + 1
+
+        return fx.symbolic_trace(f)
+
+    def test_load_falls_back_to_recompile_on_bad_artifact(self, tmp_path):
+        """A missing/corrupt/dangling artifact recompiles instead of crashing.
+
+        This is what keeps by-cache-key pickles
+        (TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY) safe: if the
+        native tier-2/tier-3 entry behind the link was evicted, unpickling
+        raises and load() must recompile through the backend.
+        """
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        sentinel_result = object()
+
+        class FakeBackend:
+            _compiled_executables = []
+
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, graph, example_inputs):
+                self.calls += 1
+                return lambda *args, **kwargs: sentinel_result
+
+        fake_backend = FakeBackend()
+
+        compiler = TpuCompilerAdaptor()
+        compiler.cache_dir = str(tmp_path)
+
+        key = "artifact_compile_range_8_8_subgraph_0"
+        bad_path = tmp_path / key
+        bad_path.write_bytes(b"not a pickle")
+
+        with patch.object(tpu_compiler, "_tpu_backend", fake_backend):
+            compiled_fn = compiler.load(
+                handle=(key, str(bad_path), False),
+                graph=self._make_graph(),
+                example_inputs=[],
+                graph_index=0,
+                compile_range=(8, 8),
+            )
+
+        assert fake_backend.calls == 1
+        assert compiled_fn() is sentinel_result
+
+    def test_load_falls_back_on_missing_file(self, tmp_path):
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        class FakeBackend:
+            _compiled_executables = []
+
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, graph, example_inputs):
+                self.calls += 1
+                return lambda *args, **kwargs: None
+
+        fake_backend = FakeBackend()
+
+        compiler = TpuCompilerAdaptor()
+        compiler.cache_dir = str(tmp_path)
+
+        missing = tmp_path / "no_such_artifact"
+        with patch.object(tpu_compiler, "_tpu_backend", fake_backend):
+            compiler.load(
+                handle=("no_such_artifact", str(missing), False),
+                graph=self._make_graph(),
+                example_inputs=[],
+                graph_index=0,
+                compile_range=(8, 8),
+            )
+
+        assert fake_backend.calls == 1
+
+    def test_load_fallback_repairs_artifact(self, tmp_path):
+        """After a fallback recompile, the artifact is re-saved for next start."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        class FakeBackend:
+            # A picklable stand-in for the freshly compiled executable.
+            _compiled_executables = ["fresh-executable"]
+
+            def __call__(self, graph, example_inputs):
+                return lambda *args, **kwargs: None
+
+        compiler = TpuCompilerAdaptor()
+        compiler.cache_dir = str(tmp_path)
+
+        key = "artifact_compile_range_8_8_subgraph_0"
+        bad_path = tmp_path / key
+        bad_path.write_bytes(b"not a pickle")
+
+        with patch.object(tpu_compiler, "_tpu_backend", FakeBackend()):
+            compiler.load(
+                handle=(key, str(bad_path), False),
+                graph=self._make_graph(),
+                example_inputs=[],
+                graph_index=0,
+                compile_range=(8, 8),
+            )
+
+        import pickle as pickle_mod
+        assert pickle_mod.loads(bad_path.read_bytes()) == "fresh-executable"

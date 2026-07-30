@@ -235,6 +235,18 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+def _unwrap_single_output(inner_fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Undo _ensure_tuple_output: unwrap 1-tuples back to the bare tensor."""
+
+    def unwrap_fn(*args, **kwargs):
+        result = inner_fn(*args, **kwargs)
+        if isinstance(result, (tuple, list)) and len(result) == 1:
+            return result[0]
+        return result
+
+    return unwrap_fn
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -271,24 +283,16 @@ class TpuCompilerAdaptor(CompilerInterface):
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
         return compute_tpu_compilation_hash(vllm_config)
 
-    def compile(
+    def _run_backend(
         self,
         graph: fx.GraphModule,
         example_inputs: list[Any],
-        compiler_config: dict[str, Any],
-        compile_range: Range,
-        key: str | None = None,
-    ) -> tuple[Callable[..., Any] | None, Any | None]:
-        """Compile a Dynamo-level FX graph to a TPU PjRt executable.
+    ) -> tuple[Callable[..., Any], bool]:
+        """Compile the FX graph via TpuBackend.
 
-        Delegates to TpuBackend which handles aot_autograd + fx_to_mlir
-        + compile_mlir internally.
+        Returns (compiled_fn, was_wrapped); compiled_fn already unwraps the
+        single-tensor tuple when the graph had to be tuple-normalized.
         """
-        logger.info(
-            "[TpuCompilerAdaptor] Compiling FX graph for range %s",
-            compile_range,
-        )
-
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
@@ -314,38 +318,68 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
-            inner_fn = compiled_fn
+            compiled_fn = _unwrap_single_output(compiled_fn)
+        return compiled_fn, was_wrapped
 
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
+    def _save_executable(self, key: str) -> str | None:
+        """Pickle the most recently compiled executable to cache_dir/key.
 
-            compiled_fn = unwrap_fn
+        With TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY=1 (set by
+        env_override.py when VLLM_XLA_CACHE_PATH is configured) the pickle
+        holds only the TorchTPU compilation cache key -- a link into the
+        native tier-2/tier-3 cache -- instead of a second copy of the
+        serialized executable bytes.
+
+        Returns the save path, or None if nothing was saved.
+        """
+        if (self.cache_dir is None or self._disable_cache
+                or not _tpu_backend._compiled_executables):
+            return None
+        try:
+            # We pickle the inner _TorchTpuCompiledExecutable (which has
+            # __reduce__), not the aot_autograd wrapper (which has
+            # unpicklable closures).
+            inner_exe = _tpu_backend._compiled_executables[-1]
+            save_path = os.path.join(self.cache_dir, key)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "wb") as f:
+                pickle.dump(inner_exe, f)
+            logger.info(
+                "[TpuCompilerAdaptor] Saved compiled executable to %s",
+                save_path,
+            )
+            return save_path
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Failed to save executable: %s", e)
+            return None
+
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compiler_config: dict[str, Any],
+        compile_range: Range,
+        key: str | None = None,
+    ) -> tuple[Callable[..., Any] | None, Any | None]:
+        """Compile a Dynamo-level FX graph to a TPU PjRt executable.
+
+        Delegates to TpuBackend which handles aot_autograd + fx_to_mlir
+        + compile_mlir internally.
+        """
+        logger.info(
+            "[TpuCompilerAdaptor] Compiling FX graph for range %s",
+            compile_range,
+        )
+
+        compiled_fn, was_wrapped = self._run_backend(graph, example_inputs)
 
         # Save the per-shape PjRt executable to disk.
-        # We pickle the inner _TorchTpuCompiledExecutable (which has
-        # __reduce__), not the aot_autograd wrapper (which has
-        # unpicklable closures).
         handle = None
-        if (key is not None and self.cache_dir is not None
-                and not self._disable_cache
-                and _tpu_backend._compiled_executables):
-            try:
-                inner_exe = _tpu_backend._compiled_executables[-1]
-                save_path = os.path.join(self.cache_dir, key)
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                with open(save_path, "wb") as f:
-                    pickle.dump(inner_exe, f)
+        if key is not None:
+            save_path = self._save_executable(key)
+            if save_path is not None:
                 handle = (key, save_path, was_wrapped)
-                logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable to %s",
-                    save_path,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[TpuCompilerAdaptor] Failed to save executable: %s", e)
 
         return compiled_fn, handle
 
@@ -363,14 +397,30 @@ class TpuCompilerAdaptor(CompilerInterface):
         aot_autograd (using the same graph) to reconstruct the full
         callable. This skips FX->MLIR->compile but still sets up the
         aot_autograd runtime wrapper that handles input mutations.
+
+        When the artifact cannot be loaded -- a missing or corrupt file, or a
+        by-cache-key pickle whose native tier-2/tier-3 cache entry was evicted
+        (TORCH_TPU_INTERNAL_PICKLE_EXECUTABLES_BY_CACHE_KEY) -- falls back to
+        recompiling through the backend. The native tiered cache makes that
+        cheap when only this artifact was lost: the FX->MLIR lowering reruns,
+        but the expensive XLA compile is a cache hit.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, was_wrapped = handle
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
-        with open(path, "rb") as f:
-            inner_exe = pickle.load(f)
+        try:
+            with open(path, "rb") as f:
+                inner_exe = pickle.load(f)
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Failed to load cached executable from "
+                "%s (%s); recompiling via the backend.", path, e)
+            compiled_fn, _ = self._run_backend(graph, example_inputs)
+            # Best-effort repair: re-save so the next start loads cleanly.
+            self._save_executable(key)
+            return compiled_fn
 
         # Re-create the aot_autograd wrapper around the cached executable.
         # The current torch_tpu executable already handles non-tensor argument
@@ -396,14 +446,6 @@ class TpuCompilerAdaptor(CompilerInterface):
             )(graph, example_inputs)
 
         if was_wrapped:
-            inner_fn = compiled_fn
-
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
-
-            compiled_fn = unwrap_fn
+            compiled_fn = _unwrap_single_output(compiled_fn)
 
         return compiled_fn
