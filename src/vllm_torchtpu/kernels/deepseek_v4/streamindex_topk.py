@@ -234,9 +234,15 @@ def _streamindex_topk_kernel(
         if not wait:
             for i in range(bkv_p):
                 sz_per_kv_packing = page_size_per_kv_packing
-                # Clamp: an out-of-range bkv_idx would otherwise read
-                # page_indices_ref out of bounds and DMA from an unrelated
-                # physical page. Matches the reference (tpu-inference).
+                # Clamp both the logical page-table index and the resulting
+                # physical HBM offset to valid bounds. Without this, a
+                # bkv_idx that runs past this sequence's actual valid page
+                # count (e.g. from an inflated kv_len) reads
+                # page_indices_ref out of its allocated range, and/or uses
+                # whatever garbage page number that yields as an HBM DMA
+                # offset -- silently reading unrelated physical pages
+                # instead of a masked-out-but-safe in-range page. Matches
+                # the reference (tpu-inference) implementation.
                 page_idx = jnp.minimum(page_indices_offset + i,
                                        num_page_indices - 1)
 
