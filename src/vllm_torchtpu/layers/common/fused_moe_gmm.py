@@ -17,9 +17,9 @@ import functools
 import jax
 from jax import numpy as jnp
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.cn_moe_kernels import TOP_K as CN_MOE_TOP_K
 from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
+from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
@@ -314,16 +314,22 @@ def fused_moe_func(
     # bridge, so weights are already local — no shard_map needed.
     import logging as _logging
     _lc_logger = _logging.getLogger(__name__)
-    low_conc_threshold = int(__import__("os").getenv("MOE_LOW_CONC_THRESHOLD", "8"))
+    low_conc_threshold = int(
+        __import__("os").getenv("MOE_LOW_CONC_THRESHOLD", "8"))
     if 1 <= num_tokens <= low_conc_threshold and topk == CN_MOE_TOP_K:
-        _lc_logger.info(
-            "Taking fast low-concurrency C=N Pallas MoE path for "
-            f"BS={num_tokens} decode (use_ep={use_ep}, "
-            f"threshold={low_conc_threshold}).")
+        _lc_logger.info("Taking fast low-concurrency C=N Pallas MoE path for "
+                        f"BS={num_tokens} decode (use_ep={use_ep}, "
+                        f"threshold={low_conc_threshold}).")
         # topk_ids are already local (experts_start remap happened above).
         # For EP, zero-weight entries are already masked above.
-        out = cn_moe_full(hidden_states, w1, w1_scale, w2, w2_scale,
-                          topk_ids, topk_weights, use_ep=use_ep)
+        out = cn_moe_full(hidden_states,
+                          w1,
+                          w1_scale,
+                          w2,
+                          w2_scale,
+                          topk_ids,
+                          topk_weights,
+                          use_ep=use_ep)
         return out[:num_tokens, :hidden_size]
 
     x = moe_gmm(
