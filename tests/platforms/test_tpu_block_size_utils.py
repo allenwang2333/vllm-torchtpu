@@ -57,7 +57,6 @@ def vllm_config():
     vllm_config.cache_config.mamba_block_size = None
     vllm_config.cache_config.cache_dtype = "auto"
     vllm_config.kv_transfer_config = None
-    vllm_config.speculative_config = None
     vllm_config.parallel_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
     vllm_config.parallel_config.prefill_context_parallel_size = 1
@@ -117,7 +116,7 @@ def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
     assert "final_block_size=1280 -> fa_raw_payload_slot_bytes=655360" in logs
     assert "-> fa_layout_padding_slot_bytes=655360" in logs
     assert "-> fa_physical_slot_bytes=1310720" in logs
-    assert ("-> slot_base_bytes=max(mamba_slot_state_bytes=1073152, "
+    assert ("-> slot_base_bytes=max(mamba_raw_state_bytes=1073152, "
             "fa_physical_slot_bytes=1310720) = 1310720" in logs)
     assert ("-> slot_alignment_bytes=16 -> "
             "final_block_slot_bytes=round_up(1310720, 16) = 1310720" in logs)
@@ -126,56 +125,20 @@ def test_hybrid_mamba_state_drives_fit_block_size_and_slot_logs(vllm_config):
     assert "kernel_blocks_per_logical_block" not in logs
 
 
-def test_hybrid_spec_decode_fit_covers_checkpoint_group(vllm_config):
-    # Speculative decoding keeps num_spec + 1 state checkpoints per unified
-    # slot (rollback by selection): the fit floor covers the whole group at
-    # the pooled GDN layer's slot geometry (ssm 1024 tok + conv 32 tok per
-    # checkpoint here), not window x raw bytes.
-    vllm_config.model_config.is_hybrid = True
-    vllm_config.model_config.architecture = (
-        "Qwen3_5MoeForConditionalGeneration")
-    vllm_config.cache_config.block_size = 2112
-    vllm_config.cache_config.mamba_block_size = 2112
-    vllm_config.cache_config.mamba_cache_mode = "align"
-    vllm_config.cache_config.mamba_page_size_padded = None
-    vllm_config.speculative_config = MagicMock()
-    vllm_config.speculative_config.num_speculative_tokens = 1
-
-    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
-               return_value=(FakeQwenMambaModel, None)), patch(
-                   "vllm_torchtpu.platforms.tpu_block_size_utils.logger.info"
-               ) as mock_logger_info:
-        update_tpu_block_size_and_slot_config(vllm_config,
-                                              FakeBatchedRPAAttentionBackend)
-
-    # Per-checkpoint pitch 1024 + 32 = 1056 tokens, padded to whole
-    # 256-token kernel blocks (this backend's fixed kernel size) -> 1280;
-    # 2 checkpoints -> 2560-token blocks.
-    assert vllm_config.cache_config.block_size == 2560
-    assert vllm_config.cache_config.mamba_block_size == 2560
-    assert vllm_config.cache_config.mamba_page_size_padded == 2621440
-
-    logs = _format_logs(mock_logger_info)
-    assert "spec_window=2 x ckpt_group -> 2621440 B rounded_to_16 = 2560" \
-        in logs
-    assert "-> final_block_size=2560" in logs
-    assert ("-> slot_base_bytes=max(mamba_slot_state_bytes=2621440, "
-            "fa_physical_slot_bytes=2621440) = 2621440" in logs)
-
-
 def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
         vllm_config, monkeypatch):
-    """One block per checkpoint means the fit floor stops scaling with K.
+    """Speculative decoding must not enlarge the block.
 
-    This is what the unified pool does for every speculative config: the
-    checkpoints live in `num_spec` extra ordinary blocks, so a block only
-    has to fit a single state and the floor is the no-spec one for every K.
-    The affine test above still lands on 2560 for K=1 because it leaves the
-    unified pool off, which is the only remaining user of that addressing.
+    Each of a request's `num_spec + 1` GDN state checkpoints gets its own
+    ordinary pool block (vLLM's `MambaSpec.num_speculative_blocks`), named
+    per checkpoint by `mamba_ckpt_indices`, so a block only ever has to fit
+    a single state. Holding the whole group inside one block instead would
+    put `num_spec + 1` back into this floor -- on Qwen3.5-397B at TP=1 with
+    K=4 that meant block_size 21760 rather than 4352.
     """
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     sizes = {}
-    for num_spec in (1, 3, 7):
+    for num_spec in (0, 1, 3, 7):
         vllm_config.model_config.is_hybrid = True
         vllm_config.model_config.architecture = (
             "Qwen3_5MoeForConditionalGeneration")
@@ -183,8 +146,11 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
         vllm_config.cache_config.mamba_block_size = 2112
         vllm_config.cache_config.mamba_cache_mode = "align"
         vllm_config.cache_config.mamba_page_size_padded = None
-        vllm_config.speculative_config = MagicMock()
-        vllm_config.speculative_config.num_speculative_tokens = num_spec
+        if num_spec == 0:
+            vllm_config.speculative_config = None
+        else:
+            vllm_config.speculative_config = MagicMock()
+            vllm_config.speculative_config.num_speculative_tokens = num_spec
 
         with patch(
                 "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
@@ -193,10 +159,9 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
                 vllm_config, FakeBatchedRPAAttentionBackend)
         sizes[num_spec] = vllm_config.cache_config.block_size
 
-    assert len(set(sizes.values())) == 1, sizes
-    # One checkpoint's 1056 tokens padded to this backend's 256-token
-    # kernel block = 1280, versus 2560 for K=1 on the affine path.
-    assert sizes[1] == 1280, sizes
+    # Every K lands on the no-spec floor: one checkpoint's 1056 tokens
+    # aligned up to this backend's 256-token kernel block.
+    assert set(sizes.values()) == {1280}, sizes
 
 
 def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):

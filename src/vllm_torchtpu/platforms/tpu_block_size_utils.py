@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -21,23 +20,6 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     del vllm_config
     from vllm_torchtpu import envs as tpu_envs
     return tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-
-
-def gdn_spec_ckpt_blocks_enabled(vllm_config: "VllmConfig") -> bool:
-    """Whether speculative GDN checkpoints get their own pool blocks.
-
-    Follows vLLM's `MambaSpec.num_speculative_blocks` scheme: each request
-    is allocated `num_spec` extra blocks and the kernel is handed one block
-    index per checkpoint, so the pool block only ever has to hold a single
-    state. The superseded alternative kept the whole checkpoint group inside
-    one block, which made block_size scale with `num_speculative_tokens`
-    (Qwen3.5-397B at TP=1, K=4: 21760 tokens instead of 4352).
-
-    Only meaningful for the unified pool with speculative decoding; the
-    compact layout already gives each request its own consecutive slots.
-    """
-    return (unified_kv_layout_enabled(vllm_config)
-            and vllm_config.speculative_config is not None)
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
@@ -119,23 +101,6 @@ def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
     return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
 
 
-def _hybrid_mamba_state_shapes(vllm_config: VllmConfig):
-    model_config = vllm_config.model_config
-    if not model_config.is_hybrid:
-        return None
-
-    from vllm.model_executor.models import ModelRegistry
-
-    model_cls, _ = ModelRegistry.resolve_model_cls(
-        model_config.architecture,
-        model_config=model_config,
-    )
-    # This helper is only used for the unified pool. Its pooled GDN op
-    # reads and writes the full TP-local state from one attention-shaped
-    # page, even when attention prefill is context-parallel.
-    return model_cls.get_mamba_state_shape_from_config(vllm_config)
-
-
 def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
     model_config = vllm_config.model_config
     if not model_config.is_hybrid:
@@ -149,85 +114,13 @@ def _hybrid_mamba_page_size_bytes(vllm_config: VllmConfig) -> int | None:
         model_config=model_config,
     )
     return MambaSpec(
-        shapes=_hybrid_mamba_state_shapes(vllm_config),
+        # This helper is only used for the unified pool. Its pooled GDN op
+        # reads and writes the full TP-local state from one attention-shaped
+        # page, even when attention prefill is context-parallel.
+        shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
         dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
         block_size=-1,
     ).page_size_bytes
-
-
-def _mamba_spec_window(vllm_config: VllmConfig) -> int:
-    """State checkpoints per unified mamba slot (num_spec_tokens + 1).
-
-    With speculative decoding, the pooled GDN kernel keeps one state
-    checkpoint per verify window position inside the request's state block
-    and rolls rejected drafts back by checkpoint selection; the block must
-    be sized to hold the whole checkpoint group. 1 without speculative
-    decoding (a single state per slot).
-    """
-    spec_config = vllm_config.speculative_config
-    if spec_config is None:
-        return 1
-    if gdn_spec_ckpt_blocks_enabled(vllm_config):
-        # Checkpoints are separate pool blocks (one index each), so a block
-        # holds a single state and the fit floor is spec-independent. The
-        # group's cost moves to `num_spec` extra blocks per request, paid
-        # per active request instead of by every block in the pool.
-        return 1
-    return int(spec_config.num_speculative_tokens) + 1
-
-
-def _backend_fixed_kernel_block(supported) -> int | None:
-    """The fixed kernel block size the backend will run, if it has one.
-
-    MultipleOf entries mean the kernel runs the manager block directly (no
-    splitting), so there is no fixed kernel granularity to pad against.
-    """
-    from vllm.v1.attention.backend import MultipleOf
-    fixed = [int(e) for e in supported if not isinstance(e, MultipleOf)]
-    return min(fixed) if fixed else None
-
-
-def _mamba_ckpt_group_tokens(vllm_config: VllmConfig, tok_bytes: int,
-                             window: int, kernel_block: int | None) -> int:
-    """Token footprint of one slot's checkpoint group in the unified pool.
-
-    Replicates the pooled GDN layer's slot geometry
-    (run_jax_gdn_attention_pooled_local / pool_adapters.v3_ckpt_pitch_tok):
-    the f32 ssm region occupies whole tokens, the bf16 conv region occupies
-    pow2-padded whole tokens right after it, and speculative checkpoints
-    repeat that layout at a fixed pitch — padded to whole kernel blocks
-    when the pool is born at a fixed kernel granularity smaller than the
-    group. Conservative where the spec shapes are wider than the kernel's
-    regions (e.g. vLLM widens the conv state by num_spec columns the TPU
-    kernel does not read), so the sized block always fits the layer's
-    group.
-    """
-    shapes = _hybrid_mamba_state_shapes(vllm_config)
-    assert shapes is not None
-    ssm_bytes = 0
-    conv_bytes = 0
-    for shape in shapes:
-        if len(shape) >= 3:
-            # Recurrent (ssm) state: kept in f32 by the kernel.
-            ssm_bytes += math.prod(shape) * 4
-        else:
-            # Conv state: kept in bf16 by the kernel.
-            conv_bytes += math.prod(shape) * 2
-    assert ssm_bytes > 0, shapes
-
-    ssm_ntok = _ceil_div(ssm_bytes, tok_bytes)
-    conv_ntok = 1
-    while conv_ntok * tok_bytes < conv_bytes or ssm_ntok % conv_ntok != 0:
-        conv_ntok *= 2
-    # Mirrors pool_adapters.v3_ckpt_pitch_tok: for MultipleOf backends the
-    # fit-derived manager block serves as its own kernel block, so the
-    # natural pitch holds (kernel_block is None); a fixed kernel block
-    # smaller than the group forces block-aligned checkpoints.
-    pitch_tok = ssm_ntok + conv_ntok
-    if (window > 1 and kernel_block is not None
-            and window * pitch_tok > kernel_block):
-        pitch_tok = _round_up_to_multiple(pitch_tok, kernel_block)
-    return window * pitch_tok
 
 
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
@@ -253,27 +146,14 @@ def _derive_tpu_block_slot_config(
                                          fa_raw_payload_bytes_per_token)
 
     mamba_raw_state_bytes = _hybrid_mamba_page_size_bytes(vllm_config)
-    mamba_spec_window = _mamba_spec_window(vllm_config)
-    mamba_slot_state_bytes = mamba_raw_state_bytes
     mamba_fit_block_size: int | None = None
     final_block_size = input_block_size
     block_size_source = "input_block_size"
     if mamba_raw_state_bytes is not None:
-        if mamba_spec_window > 1:
-            # Speculative decoding: the slot holds one state checkpoint per
-            # verify window position (rollback by selection), so the fit
-            # floor covers the whole checkpoint group at the pooled GDN
-            # layer's exact slot geometry.
-            group_ntok = _mamba_ckpt_group_tokens(
-                vllm_config, fa_physical_bytes_per_token, mamba_spec_window,
-                _backend_fixed_kernel_block(supported))
-            mamba_slot_state_bytes = (group_ntok * fa_physical_bytes_per_token)
-            mamba_fit_block_size = _round_up_to_multiple(group_ntok, 16)
-        else:
-            mamba_fit_block_size = _round_up_to_multiple(
-                _ceil_div(mamba_raw_state_bytes, fa_physical_bytes_per_token),
-                16,
-            )
+        mamba_fit_block_size = _round_up_to_multiple(
+            _ceil_div(mamba_raw_state_bytes, fa_physical_bytes_per_token),
+            16,
+        )
         user_specified = vllm_config.cache_config.user_specified_block_size
         if user_specified and input_block_size < mamba_fit_block_size:
             raise ValueError(
@@ -315,8 +195,8 @@ def _derive_tpu_block_slot_config(
     fa_physical_slot_bytes = _tpu_attention_slot_size_bytes(
         vllm_config, backend_cls, final_block_size)
     slot_base_bytes = fa_physical_slot_bytes
-    if mamba_slot_state_bytes is not None:
-        slot_base_bytes = max(mamba_slot_state_bytes, fa_physical_slot_bytes)
+    if mamba_raw_state_bytes is not None:
+        slot_base_bytes = max(mamba_raw_state_bytes, fa_physical_slot_bytes)
     final_block_slot_bytes = _round_up_to_multiple(slot_base_bytes,
                                                    _SLOT_ALIGNMENT_BYTES)
 
@@ -327,9 +207,9 @@ def _derive_tpu_block_slot_config(
     fa_slot_tail_padding_bytes = (final_block_slot_bytes -
                                   fa_physical_slot_bytes)
     mamba_slot_padding_bytes: int | None = None
-    if mamba_slot_state_bytes is not None:
+    if mamba_raw_state_bytes is not None:
         mamba_slot_padding_bytes = (final_block_slot_bytes -
-                                    mamba_slot_state_bytes)
+                                    mamba_raw_state_bytes)
 
     return {
         "backend": backend_cls.get_name(),
@@ -337,8 +217,6 @@ def _derive_tpu_block_slot_config(
         "input_block_size": input_block_size,
         "backend_supported_kernel_block_sizes": supported,
         "mamba_raw_state_bytes": mamba_raw_state_bytes,
-        "mamba_spec_window": mamba_spec_window,
-        "mamba_slot_state_bytes": mamba_slot_state_bytes,
         "fa_raw_payload_bytes_per_token": fa_raw_payload_bytes_per_token,
         "fa_physical_bytes_per_token": fa_physical_bytes_per_token,
         "fa_layout_padding_bytes_per_token": fa_layout_padding_bytes_per_token,
@@ -362,14 +240,8 @@ def _optional_log_value(value: int | None) -> int | str:
 def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
     mamba_fit_block_size = derivation["mamba_fit_block_size"]
     mamba_raw_state_bytes = derivation["mamba_raw_state_bytes"]
-    mamba_spec_window = derivation["mamba_spec_window"]
     if mamba_raw_state_bytes is None:
         mamba_fit_formula = "n/a"
-    elif mamba_spec_window > 1:
-        mamba_fit_formula = (
-            "spec_window=%s x ckpt_group -> %s B rounded_to_16 = %s" %
-            (mamba_spec_window, derivation["mamba_slot_state_bytes"],
-             mamba_fit_block_size))
     else:
         mamba_fit_formula = (
             "ceil(%s / %s) rounded_to_16 = %s" %
@@ -399,7 +271,7 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         "TPU block_slot derivation path: final_block_size=%s -> "
         "fa_raw_payload_slot_bytes=%s -> "
         "fa_layout_padding_slot_bytes=%s -> fa_physical_slot_bytes=%s -> "
-        "slot_base_bytes=max(mamba_slot_state_bytes=%s, "
+        "slot_base_bytes=max(mamba_raw_state_bytes=%s, "
         "fa_physical_slot_bytes=%s) = %s -> "
         "slot_alignment_bytes=%s -> "
         "final_block_slot_bytes=round_up(%s, %s) = %s -> "
@@ -409,7 +281,7 @@ def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
         derivation["fa_raw_payload_slot_bytes"],
         derivation["fa_layout_padding_slot_bytes"],
         derivation["fa_physical_slot_bytes"],
-        _optional_log_value(derivation["mamba_slot_state_bytes"]),
+        _optional_log_value(derivation["mamba_raw_state_bytes"]),
         derivation["fa_physical_slot_bytes"],
         derivation["slot_base_bytes"],
         derivation["slot_alignment_bytes"],
