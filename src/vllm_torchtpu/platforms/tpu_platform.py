@@ -646,7 +646,9 @@ class TpuPlatform(Platform):
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
-        if compilation_config.compile_sizes is None:
+        if os.getenv("DSV4_FORCE_COMPILE_SIZE") is not None:
+            compilation_config.compile_sizes = [int(x) for x in os.getenv("DSV4_FORCE_COMPILE_SIZE").split(",")]
+        elif compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
