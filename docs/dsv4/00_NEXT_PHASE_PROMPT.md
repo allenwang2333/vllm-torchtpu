@@ -157,7 +157,32 @@ reasoning required.
    across TP ranks; `tpu-inference` does not. `scratch/compare_sublayer.py`
    already contains the slicing fix — reuse it rather than re-deriving.
 
-### Implementation sketch
+### Status: the hook is BUILT and the control PASSES
+
+Already implemented in `models/vllm/deepseek_v4_patch.py`
+(`patched_layer_forward`), gated on `DSV4_SUBSTITUTE_LAYER` /
+`DSV4_SUBSTITUTE_MODE` / `DSV4_SUBSTITUTE_DIR`, inert when unset. You do not
+need to build it — you need to drive it.
+
+Control result (`DSV4_SUBSTITUTE_LAYER=0 DSV4_SUBSTITUTE_MODE=noise`):
+
+```
+SUBSTITUTE fired: 136
+[SUBSTITUTE] layer=0 step=0 mode=noise shape=(64, 4, 4096) absmax 20.75 -> 15.5
+Generated: ', ,系Ş,en,  \n,,,,,, and'      (normal: 'Here are two bullet points comparing...')
+```
+
+All three links verified: the hook **fires** on real forwards, it **actually
+replaces** the tensor, and it **causally changes** generation. Negatives from
+this sweep are therefore trustworthy — but re-run this control if you touch the
+hook (§2.1 rule 1).
+
+`shape=(64, 4, 4096)` also confirms the `hc_mult=4` layout empirically: 64
+tokens x 4 stream copies x 4096 hidden. Reference dumps share this layout, so
+direct substitution should be shape-compatible — the hook will say so loudly if
+it is not.
+
+### Implementation notes
 
 - Hook: the per-layer loop in `models/vllm/deepseek_v4_patch.py`, alongside the
   existing `DSV4_DUMP_HIDDEN_STATES` machinery (which already dumps
