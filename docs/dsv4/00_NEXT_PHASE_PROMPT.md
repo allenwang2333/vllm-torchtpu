@@ -3,6 +3,10 @@
 Seed document for the next investigation session. Read this **first and in
 full**. It is deliberately short; the rest of `docs/dsv4/` is reference.
 
+**Applies to whichever model/agent picks this up.** Before reporting anything,
+satisfy §2.1 — four non-negotiable checks. They exist because each one
+corresponds to a real, expensive mistake already made here.
+
 ---
 
 ## 1. Where things stand
@@ -40,6 +44,63 @@ exists.
 
 **Do not reason from them. Re-measure before forming any hypothesis.** The real
 divergence may be much smaller, or somewhere else entirely.
+
+---
+
+## 2.1 Non-negotiables — evidence you must produce
+
+Four checks. Each maps to a specific expensive failure from the previous
+session. **The user will ask for these; produce them unprompted.** They are
+model-agnostic — they protect against confident wrong answers from any agent,
+including the one that wrote this document (whose hypothesis hit rate here was
+**0 for 7**).
+
+### 1. Show the control before claiming a negative
+
+Never report "layer L is not the culprit" — or any other negative — without a
+positive control proving your instrument works.
+
+For the substitution sweep specifically: run
+`DSV4_SUBSTITUTE_LAYER=<L> DSV4_SUBSTITUTE_MODE=noise` and show that generation
+**visibly degrades**. If injecting noise changes nothing, the hook is not taking
+effect and every "no effect" result in the sweep is worthless.
+
+*Why:* a state-cache probe last session returned a clean, convincing `nz=0` for
+every window position. It was reading unrelated memory. With no control, that
+false negative was indistinguishable from a real finding and nearly became a
+published conclusion.
+
+### 2. Report evidence, not conclusions
+
+Every claim ships with the raw numbers that support it — byte counts, the sweep
+table, before/after magnitudes — in the same output. "Slot 3 is corrupt" is not
+a finding; `nz[nope/rope/scale/pad]=0/5/7/0` beside a healthy `448/128/7/0` and
+a never-written `0/0/0/0` is.
+
+*Why:* every genuine finding last session came with a control row in the same
+line. Every retracted one came from a summarised conclusion.
+
+### 3. Do not cite pre-fix numbers
+
+Any per-layer divergence figure from `history_*.md` is void (§2). If your
+reasoning references one, you skipped §2 and your conclusion is built on a
+machine that no longer exists. Re-measure.
+
+*Why:* those numbers were all taken while compressed KV was corrupt across every
+CSA layer.
+
+### 4. Confirm the environment before trusting any run
+
+State explicitly, per run batch, that you have:
+
+- cleared **both** compile caches (`default` *and* `tpu_tier2_cache`)
+- checked for stray `/dev/vfio` holders
+- used an **absolute** `cd` in the command
+
+*Why:* a half-cleared cache silently ran stale code and produced a
+bit-identical result that was misread as "the fix is a no-op." Stray workers and
+a drifting cwd each killed runs outright — the cwd one three separate times,
+including once immediately after it was documented.
 
 ---
 

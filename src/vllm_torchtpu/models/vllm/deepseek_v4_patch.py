@@ -1266,6 +1266,72 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             flush=True)
 
                     self._step_idx += 1
+
+            # Layer-substitution hook (see docs/dsv4/00_NEXT_PHASE_PROMPT.md
+            # 3.1). Replaces this layer's output with either the
+            # tpu-inference reference dump or noise, so a sweep over
+            # DSV4_SUBSTITUTE_LAYER=0..42 can localise the first diverging
+            # layer by brute force -- cheap in TPU runs, near-zero reasoning.
+            #
+            #   DSV4_SUBSTITUTE_LAYER  int, which layer to override
+            #   DSV4_SUBSTITUTE_MODE   "reference" (default) | "noise"
+            #   DSV4_SUBSTITUTE_DIR    reference dump dir (reference mode)
+            #
+            # "noise" is the control: it must visibly degrade generation. If it
+            # does not, the hook is not taking effect and every negative result
+            # from the sweep is worthless.
+            _sub = os.getenv("DSV4_SUBSTITUTE_LAYER")
+            if (_sub is not None and isinstance(x, torch.Tensor)
+                    and layer_idx == int(_sub)):
+                _mode = os.getenv("DSV4_SUBSTITUTE_MODE", "reference")
+                _n = getattr(self, "_sub_step_idx", 0)
+                self._sub_step_idx = _n + 1
+                _new = None
+                if _mode == "noise":
+                    # NB: torch.Tensor.std() is not implemented on TorchTPU
+                    # (aten::std.correction). Compute it manually, the same
+                    # way check_nan() in deepseek_v4_attention.py does.
+                    _f = x.detach().float()
+                    _mu = _f.mean()
+                    _sd = (_f - _mu).pow(2).mean().sqrt()
+                    _new = (torch.randn_like(_f) * _sd + _mu).to(x.dtype)
+                else:
+                    import numpy as np
+                    _dir = os.getenv(
+                        "DSV4_SUBSTITUTE_DIR",
+                        "/home/patemotter_google_com/workspace/scratch/"
+                        "hidden_states/tpu_inference")
+                    _p = f"{_dir}/layer{layer_idx:02d}_step{_n:03d}.npy"
+                    if os.path.exists(_p):
+                        _a = np.load(_p)
+                        if tuple(_a.shape) == tuple(x.shape):
+                            _new = torch.from_numpy(_a).to(device=x.device,
+                                                           dtype=x.dtype)
+                        else:
+                            print(
+                                f"[SUBSTITUTE] SHAPE MISMATCH layer={layer_idx}"
+                                f" step={_n} ref={tuple(_a.shape)} "
+                                f"live={tuple(x.shape)} -- NOT substituted",
+                                file=sys.stderr,
+                                flush=True)
+                    else:
+                        print(f"[SUBSTITUTE] missing {_p} -- NOT substituted",
+                              file=sys.stderr,
+                              flush=True)
+                if _new is not None:
+                    print(
+                        f"[SUBSTITUTE] layer={layer_idx} step={_n} "
+                        f"mode={_mode} shape={tuple(x.shape)} "
+                        f"absmax {x.detach().float().abs().max().item():.4g}"
+                        f" -> {_new.detach().float().abs().max().item():.4g}",
+                        file=sys.stderr,
+                        flush=True)
+                    if isinstance(res, tuple):
+                        res = (_new, ) + tuple(res[1:])
+                    elif isinstance(res, list):
+                        res = [_new] + list(res[1:])
+                    else:
+                        res = _new
         return res
 
     DeepseekV4DecoderLayer.forward = patched_layer_forward
