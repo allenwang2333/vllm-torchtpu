@@ -1326,12 +1326,10 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     _p = f"{_dir}/layer{layer_idx:02d}_step{_n:03d}.npy"
                     if os.path.exists(_p):
                         _a = np.load(_p)
-                        seq_len_jax = _a.shape[0] // 2
-                        seq_len_live = x_post.shape[0] // 2
+                        seq_len_jax = _a.shape[0]
+                        seq_len_live = x_post.shape[0]
                         if seq_len_jax != seq_len_live and _a.ndim == 3 and x_post.ndim == 3:
-                            stream1 = _a[0:seq_len_live]
-                            stream2 = _a[seq_len_jax:seq_len_jax+seq_len_live]
-                            _a_sliced = np.concatenate([stream1, stream2], axis=0)
+                            _a_sliced = _a[0:seq_len_live]
                             if tuple(_a_sliced.shape) == tuple(x_post.shape):
                                 _a = _a_sliced
                         if tuple(_a.shape) == tuple(x_post.shape):
