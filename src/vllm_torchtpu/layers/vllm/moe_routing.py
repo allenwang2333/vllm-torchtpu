@@ -77,6 +77,8 @@ def select_experts(
     """Compute local routed ids/weights for the non-EP path."""
     # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
     router_logits = maybe_force_random_routing(router_logits)
+    if layer is not None:
+        layer = getattr(layer, "routed_experts", layer)
     if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
@@ -111,6 +113,8 @@ def get_experts_start(layer) -> int | None:
     known at layer construction time. ``validate_linear_ep_placement`` enforces
     that the placement is linear before this value is used.
     """
+    if layer is not None:
+        layer = getattr(layer, "routed_experts", layer)
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
     base = layer.global_num_experts // layer.moe_config.ep_size
@@ -150,6 +154,8 @@ def validate_linear_ep_placement(layer) -> None:
     The kernel relies on a contiguous-block ``expert_map``, which vLLM only
     produces when ``expert_placement_strategy == "linear"``.
     """
+    if layer is not None:
+        layer = getattr(layer, "routed_experts", layer)
     strategy = layer.expert_placement_strategy
     if strategy != "linear":
         raise NotImplementedError(
