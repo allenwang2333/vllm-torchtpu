@@ -248,7 +248,22 @@ Hyper-Connections machinery, which has been observed to trip a TPU `UserFatal`
 (`RuntimeUnexpectedCoreHalt`) in a downstream Pallas kernel. A crash does prove
 causal effect, but you cannot compare generated text against it.
 
-Control result (`DSV4_SUBSTITUTE_LAYER=0 DSV4_SUBSTITUTE_MODE=noise`):
+Control result (`DSV4_SUBSTITUTE_LAYER=0 DSV4_SUBSTITUTE_MODE=shuffle`) —
+this is the one to reproduce:
+
+```
+SUBSTITUTE fired: 264
+[SUBSTITUTE] layer=0 step=0 mode=shuffle shape=(64, 4, 4096) absmax 20.75 -> 20.75
+crash lines: 0
+Generated: ',###package#package##packagepackage##package#package...'
+```
+
+Values preserved exactly (it is a permutation), no TPU fatal, and generation is
+comprehensively destroyed versus the fluent baseline. Causal effect proven, and
+you still get comparable text out.
+
+Earlier control result, kept for the record
+(`DSV4_SUBSTITUTE_MODE=noise`, before the stream-preservation fix):
 
 ```
 SUBSTITUTE fired: 136
