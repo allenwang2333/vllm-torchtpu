@@ -173,7 +173,45 @@ That isolates **context retrieval**, which in DSV4 is the sparse-attention path:
 CSA (`compress_ratio=4`) + the top-k indexer, and HCA (`compress_ratio=128`).
 Dense local SWA is a separate, simpler path.
 
-### The one-run discriminator
+### RESULT: the ablation has been run — sparse path is EXONERATED
+
+```
+baseline  : 'Here are two bullet points comparing the two given entities:
+             **Entity 1: "The quick brown fox jumps over the lazy dog"  Entity 2:'
+swa_only=1: 'Here are two bullet points comparing the key aspects of the two main
+             characters in the novel "The Kite Runner. The novel is about the kite runner.'
+```
+
+Disabling CSA/HCA/indexer entirely changed *which* topic is confabulated but not
+the failure mode: still fluent, still unfaithful, no crash, no degradation. So
+**the sparse-attention path is not the cause**, and the §3.0 hypothesis below
+(kept for the record) was wrong.
+
+### The sharpened symptom — read this carefully
+
+Both outputs correctly absorb **"compare two things in two bullet points"** and
+produce exactly that structure. What is lost is **"XLA" and "LLVM"**
+specifically, replaced by a confabulated topic.
+
+So the model is *not* blind to its context — the **instruction survives while
+specific content tokens do not**. Since this persists with sparse attention
+fully disabled, and SWA alone covers a 15-token prompt, the defect is upstream
+of which-tokens-are-retrievable. Candidates worth checking in roughly this
+order:
+
+1. **Tokenization / input_ids** — confirm the prompt tokenises identically to
+   the reference. `[DEBUG_INPUT_IDS]` already prints these. Cheap, and a
+   mismatch here would explain everything.
+2. **Embedding lookup** for those specific token ids.
+3. **Position encoding / RoPE** — content-position binding rather than content
+   itself.
+4. **The attention computation** (not the sparse *selection*, which is now
+   exonerated).
+
+Note this also means the 43-layer sweep (§3.1) is now the right next move rather
+than a guess — the ablation did its job by eliminating a subsystem.
+
+### The one-run discriminator (superseded — already run, see above)
 
 ```bash
 DSV4_FORCE_SWA_ONLY=1   # forces swa_only on every layer; sparse path disabled
