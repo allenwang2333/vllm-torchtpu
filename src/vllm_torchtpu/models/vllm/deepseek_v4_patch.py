@@ -279,22 +279,23 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         MoERunner
     _orig_apply_quant_method = MoERunner._apply_quant_method
 
-    def patched_apply_quant_method(self,
-                                   hidden_states,
-                                   router_logits,
-                                   shared_experts_input,
-                                   input_ids=None):
-        # NOTE (vLLM 0.25.1): _apply_quant_method no longer takes an explicit
-        # `layer` argument -- `self` (the MoERunner) already carries the
-        # layer context via self.routed_experts / self.layer_idx (see the
-        # patched_model_init loop that sets layer_idx on both the MoERunner
-        # and its .routed_experts submodule).
+    def patched_apply_quant_method(self, *args, **kwargs):
+        # NOTE (vLLM 0.25.1 vs 0.22.1): _apply_quant_method signature varies.
+        # 0.22.1: self, layer, hidden_states, router_logits, shared_experts_input, input_ids=None
+        # 0.25.1: self, hidden_states, router_logits, shared_experts_input, input_ids=None
         if (hasattr(torch, "compiler") and torch.compiler.is_compiling()) or (
                 hasattr(torch, "_dynamo") and torch._dynamo.is_compiling()):
-            return _orig_apply_quant_method(self, hidden_states, router_logits,
-                                            shared_experts_input, input_ids)
+            return _orig_apply_quant_method(self, *args, **kwargs)
+
+        if len(args) > 0 and isinstance(args[0], torch.nn.Module):
+            hidden_states = args[1] if len(args) > 1 else kwargs.get("hidden_states")
+            router_logits = args[2] if len(args) > 2 else kwargs.get("router_logits")
+        else:
+            hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+            router_logits = args[1] if len(args) > 1 else kwargs.get("router_logits")
+
         layer_idx = getattr(self, "layer_idx", -1)
-        if layer_idx in (0, 3, 4):
+        if layer_idx in (0, 3, 4) and hidden_states is not None and router_logits is not None:
             hs_cpu = hidden_states.cpu().float()
             rl_cpu = router_logits.cpu().float()
             print(
@@ -303,8 +304,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             print(
                 f"[DEBUG_PATCH] layer_{layer_idx} input router_logits: shape={list(rl_cpu.shape)} dtype={router_logits.dtype} | mean={rl_cpu.mean().item():.6f} std={rl_cpu.std().item():.6f} min={rl_cpu.min().item():.6f} max={rl_cpu.max().item():.6f}",
                 flush=True)
-        res = _orig_apply_quant_method(self, hidden_states, router_logits,
-                                       shared_experts_input, input_ids)
+        res = _orig_apply_quant_method(self, *args, **kwargs)
         tensors_to_check = []
         if isinstance(res, torch.Tensor):
             tensors_to_check.append(("moe_output", res))
