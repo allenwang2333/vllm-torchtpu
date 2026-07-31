@@ -159,24 +159,55 @@ def _fused_gate_intra_kernel(
   k_f32 = k.astype(jnp.float32)
   beta_f32 = beta.astype(jnp.float32)
 
-  # --- BC=16 sub-block factored Aqk/L (fla safe-gate style, j-batched) ---
-  # Per i_sc, batch the j_sc loop into a single (MB, 2*BC, K) x (MB, BT, K) matmul:
-  #   q_eg[m,r,k]   = q_i[m,r,k] * exp2(g_i[m,r,k] - gn_ref[m,k])
-  #   k_eg[m,r,k]   = k_i[m,r,k] * exp2(g_i[m,r,k] - gn_ref[m,k])    (Akk left)
-  #   k_eng[m,t,k]  = k[m,t,k]   * exp2(gn_ref[m,k] - g_cumsum[m,t,k]) (full BT)
-  # so Aqk[m,r,t]  = sum_k q_i[m,r,k] * k[m,t,k] * exp2(g_i[m,r,k] - g_cumsum[m,t,k]).
-  # Stack q_eg and k_eg along row dim and do one matmul -> split Aqk/Akk.
+  # --- BC=16 sub-block Aqk/L ---
+  # The quantity wanted is, for every causal pair (r, t):
+  #   Aqk[m,r,t] = sum_k q[m,r,k] * k[m,t,k] * exp2(g_cumsum[m,r,k]
+  #                                                 - g_cumsum[m,t,k])
+  # KDA's gate is *per channel*, so that decay is a rank-3 tensor over
+  # (r, t, k) and the sum over k cannot be folded into a plain matmul. The
+  # usual trick is to factor it through a per-sub-block reference row,
+  #   exp2(g_r - g_ref) * exp2(g_ref - g_t),
+  # which restores the matmul. But those two factors are a tiny*huge pair:
+  # their product is exp2(g_r - g_t) <= 1, while individually they saturate
+  # float32's exp2 range (~+/-128). Kimi-Linear's gate is unbounded
+  # (-exp(A_log) * softplus(.)) and reaches -1736 for a *single* token, so
+  # inside one sub-block one factor becomes 0 and the other inf, giving
+  # 0 * inf = NaN. Measured on real layer-0 weights: 26 of 32 heads NaN,
+  # which reached the sampler as non-finite logits and produced empty output.
+  # `safe_gate` only moved the reference row from 0 to BC//2, halving the
+  # worst-case exponent -- nowhere near enough, and no chunk size helps
+  # because the span is already per-token.
   #
-  # Anti-causal rows (t >= (i_sc+1)*BC) have positive `gn_ref - g_cumsum[t]`
-  # for negative-gate cumsum, which can overflow exp2. Mask those diffs to 0
-  # BEFORE exp2, then zero the resulting rows so they contribute 0 to matmul.
+  # So the diagonal block is computed *pairwise* instead. For causal pairs
+  # r >= t the exponent g_r - g_t is non-positive (g_cumsum is monotonically
+  # decreasing, since the activated gate is <= 0), so exp2 cannot overflow and
+  # underflow to 0 is the correct answer -- a fully decayed contribution.
+  # Columns strictly before the sub-block (t < i_s) keep the fast factored
+  # matmul: there both exponents are provably <= 0 as well, because
+  # g_cumsum[t] >= gn_ref for t < i_s and g_i[r] <= gn_ref for r >= i_s.
+  #
+  # This costs the single fused matmul on the diagonal blocks (NC of them, each
+  # BC x BC x K) in exchange for being numerically valid at any gate
+  # magnitude. `safe_gate` is consequently unused and kept only for API
+  # compatibility.
+  #
+  # PRECONDITION: the activated gate is <= 0, i.e. `lower_bound` (when given)
+  # is negative. `kda_forward` validates this.
   #
   # Use broadcasted_iota for 2D indices to avoid Mosaic-unsupported i1
   # shape casts (e.g. (BT,) -> (BT, 1) on bool tensors).
-  ref_idx = BC // 2 if safe_gate else 0
+  del safe_gate  # no longer selects a reference row; see above
   row_iota_bt_k = jax.lax.broadcasted_iota(jnp.int32, (BT, K), dimension=0)
-  row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=0)
-  col_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=1)
+  row_iota_bc = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=0)
+  col_iota_bc = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=1)
+  causal_bc = (row_iota_bc >= col_iota_bc)[None]   # [1, BC, BC]
+  strict_bc = (row_iota_bc > col_iota_bc)[None]    # [1, BC, BC]
+
+  # Contract the channel axis: [MB, BC, K] x [MB, K] -> [MB, BC]
+  _mv_k = lambda lhs, rhs: jax.lax.dot_general(
+    lhs, rhs, (((2,), (1,)), ((0,), (0,))),
+    preferred_element_type=jnp.float32,
+  )
 
   Aqk_rows = []
   L_rows = []
@@ -187,38 +218,54 @@ def _fused_gate_intra_kernel(
     g_i = g_cumsum[:, i_s : i_s + BC]    # [MB, BC, K]
     beta_i = beta_f32[:, i_s : i_s + BC]  # [MB, BC, 1]
 
-    gn_ref = g_i[:, ref_idx : ref_idx + 1, :]   # [MB, 1, K] — query sub-block ref
-    diff_i = g_i - gn_ref                        # [MB, BC, K], <= 0
-    exp_diff_i = jnp.exp2(diff_i)
+    # --- columns t < i_s: factored matmul (both exponents <= 0) ---
+    gn_ref = g_i[:, 0:1, :]                      # [MB, 1, K] — sub-block row 0
+    exp_diff_i = jnp.exp2(jnp.minimum(g_i - gn_ref, 0.0))
     q_eg = q_i * exp_diff_i     # [MB, BC, K]
     k_eg = k_i * exp_diff_i     # [MB, BC, K]
 
-    # j-side: full BT rows. Mask anti-causal rows BEFORE exp2 (avoids
-    # overflow when gn_ref - g_cumsum[t] is large positive). The 2D mask
-    # is built from broadcasted_iota to bypass the i1 reshape limitation.
-    valid_j = (row_iota_bt_k < (i_s + BC)).astype(jnp.float32)   # [BT, K]
-    diff_j_safe = (gn_ref - g_cumsum) * valid_j[None]              # [MB, BT, K]
-    k_eng_full = k_f32 * jnp.exp2(diff_j_safe) * valid_j[None]    # [MB, BT, K]
+    valid_j = (row_iota_bt_k < i_s).astype(jnp.float32)          # [BT, K]
+    diff_j = jnp.minimum(gn_ref - g_cumsum, 0.0) * valid_j[None]  # [MB, BT, K]
+    k_eng_full = k_f32 * jnp.exp2(diff_j) * valid_j[None]        # [MB, BT, K]
 
-    # Stack q_eg / k_eg and do one matmul: [MB, 2*BC, K] x [MB, K, BT] -> [MB, 2*BC, BT]
+    # Stack q_eg / k_eg: [MB, 2*BC, K] x [MB, BT, K] -> [MB, 2*BC, BT]
     qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)  # [MB, 2*BC, K]
     qk_dot = jax.lax.dot_general(
       qk_eg, k_eng_full, (((2,), (2,)), ((0,), (0,))),
       preferred_element_type=jnp.float32,
     )  # [MB, 2*BC, BT]
-    Aqk_row = qk_dot[:, :BC] * scale      # [MB, BC, BT]
-    Akk_row = qk_dot[:, BC:] * beta_i     # [MB, BC, BT]
+    Aqk_row = qk_dot[:, :BC]      # [MB, BC, BT]
+    Akk_row = qk_dot[:, BC:]      # [MB, BC, BT]
 
-    # Apply diagonal-block masks (causal for Aqk, strict-lower for Akk).
-    # All masks built from 2D iota; no i1 shape casts needed.
-    in_diag = (col_iota_bc_bt >= i_s) & (col_iota_bc_bt < i_s + BC)  # [BC, BT]
-    col_local = col_iota_bc_bt - i_s                                   # [BC, BT]
-    causal_diag = row_iota_bc_bt >= col_local                          # [BC, BT]
-    strict_diag = row_iota_bc_bt > col_local                           # [BC, BT]
-    aqk_keep = (~in_diag) | causal_diag
-    akk_keep = (~in_diag) | strict_diag
-    Aqk_row = jnp.where(aqk_keep[None], Aqk_row, jnp.float32(0.0))
-    Akk_row = jnp.where(akk_keep[None], Akk_row, jnp.float32(0.0))
+    # --- diagonal block t in [i_s, i_s + BC): exact per-channel decay ---
+    aqk_diag_rows = []
+    akk_diag_rows = []
+    for r in range(BC):
+      # g_i[r] - g_i[t] <= 0 for t <= r; the clamp is a no-op there and hard
+      # bounds the exponent for the masked-away t > r entries.
+      kw = k_i * jnp.exp2(jnp.minimum(g_i[:, r : r + 1, :] - g_i, 0.0))
+      aqk_diag_rows.append(_mv_k(kw, q_i[:, r, :])[:, None, :])  # [MB, 1, BC]
+      akk_diag_rows.append(_mv_k(kw, k_i[:, r, :])[:, None, :])
+    Aqk_diag = jnp.concatenate(aqk_diag_rows, axis=1)  # [MB, BC, BC]
+    Akk_diag = jnp.concatenate(akk_diag_rows, axis=1)  # [MB, BC, BC]
+    Aqk_diag = jnp.where(causal_bc, Aqk_diag, jnp.float32(0.0))
+    Akk_diag = jnp.where(strict_bc, Akk_diag, jnp.float32(0.0))
+
+    # Widen the [BC, BC] block to [BC, BT] at column offset i_s. Built by
+    # concatenation so every shape stays static; zero-width pads are skipped
+    # rather than passed to concatenate.
+    def _widen(blk):
+      parts = []
+      if i_s:
+        parts.append(jnp.zeros((MB, BC, i_s), jnp.float32))
+      parts.append(blk)
+      tail = BT - i_s - BC
+      if tail:
+        parts.append(jnp.zeros((MB, BC, tail), jnp.float32))
+      return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=2)
+
+    Aqk_row = (Aqk_row + _widen(Aqk_diag)) * scale
+    Akk_row = (Akk_row + _widen(Akk_diag)) * beta_i
 
     Aqk_rows.append(Aqk_row)
     L_rows.append(Akk_row)

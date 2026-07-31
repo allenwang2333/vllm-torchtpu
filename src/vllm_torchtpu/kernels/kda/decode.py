@@ -17,8 +17,9 @@ What is borrowed from GDN v3
 The token-step algebra and layout tricks come from
 ``gdn/v3/compute_gdn.py:recurrent_gdn_per_seq``:
 
-* ``l2_norm`` and ``fused_transpose_broadcast`` are imported directly rather
-  than reimplemented.
+* ``fused_transpose_broadcast`` is imported directly rather than
+  reimplemented. (L2 normalisation uses KDA's own fp32-accumulating helper --
+  see ``_l2_norm`` for why GDN's is not reused.)
 * The ordering that defers the ``k_t`` outer product until after ``v_new`` is
   formed --- multiplying earlier would expand the ``d_v`` axis by ``d_k``.
 * The paged-state contract: a state pool whose slot 0 is a reserved null block,
@@ -71,10 +72,22 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 # Reused verbatim from the GDN v3 recurrent path rather than reimplemented.
-from vllm_torchtpu.kernels.gdn.v3.compute_gdn import (fused_transpose_broadcast,
-                                                      l2_norm)
+from vllm_torchtpu.kernels.gdn.v3.compute_gdn import fused_transpose_broadcast
+from vllm_torchtpu.kernels.kda.utils import l2norm_fwd
 
 __all__ = ["kda_decode"]
+
+
+def _l2_norm(x: jax.Array) -> jax.Array:
+    """Row-wise L2 normalisation, accumulating in float32.
+
+    Uses KDA's own ``l2norm_fwd`` rather than GDN's ``l2_norm``: GDN sums the
+    squares in the *input* dtype, which is exact enough at this kernel's default
+    ``compute_dtype=float32`` but silently loses precision if a caller lowers it
+    to bfloat16 (128 squares accumulated with ~3 decimal digits). The chunked
+    KDA path always upcasts, so this also keeps prefill and decode consistent.
+    """
+    return l2norm_fwd(x)[0]
 
 
 def _activate_gate(g, a_log, dt_bias, lower_bound):
@@ -172,8 +185,8 @@ def _kernel(
     k = k_ref[0].astype(compute_dtype)
     v = v_ref[0].astype(compute_dtype)
 
-    q = l2_norm(q) * scale
-    k = l2_norm(k)
+    q = _l2_norm(q) * scale
+    k = _l2_norm(k)
 
     decay_2d = jnp.exp(
         _activate_gate(g_ref[0], a_log_ref[...], dt_bias_ref[...],

@@ -29,12 +29,16 @@ sequences) is the obvious follow-up and needs the decode rows split out of the
 packed layout first.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.causal_conv1d.causal_conv1d import \
     ragged_causal_conv1d
 from vllm_torchtpu.kernels.kda import kda_forward
+from vllm_torchtpu.utils import get_mesh_shape_product
 
 __all__ = ["kimi_linear_kda_core"]
 
@@ -75,6 +79,69 @@ def _segment_ids_from_cu_seqlens(query_start_loc: jax.Array, num_tokens: int,
 
 def kimi_linear_kda_core(
     q_proj_states: jax.Array,  # [num_tokens, proj]
+    *args,
+    mesh: jax.sharding.Mesh,
+    num_heads: int,
+    head_dim: int,
+    kernel_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Conv1d + KDA for one Kimi-Linear layer, bound to the worker's mesh.
+
+    The body runs under ``jax.shard_map`` on the mesh the runner built for this
+    worker, mirroring every ``gdn_attention.py`` path, so the computation is
+    placed on the worker's assigned device rather than JAX's default one. (Each
+    worker's mesh is single-device, so this has not been shown to change
+    behaviour on its own -- it is here to match GDN, not as a fix for a
+    diagnosed bug.)
+
+    Head-parallel axes are sharded on the mesh's ``"model"`` axis. Every
+    current TPU config gives each worker a single-device mesh (vLLM does TP
+    across processes, so each worker already owns its head shard) making these
+    specs a no-op, but they keep the op correct if a multi-device mesh is ever
+    used -- and a replicated spec would silently compute the wrong thing there.
+    """
+    tp_size = get_mesh_shape_product(mesh, "model")
+
+    in_specs = (
+        P(None, "model"),  # q_proj_states
+        P(None, "model"),  # k_proj_states
+        P(None, "model"),  # v_proj_states
+        P(None, "model"),  # g1
+        P(None, "model"),  # beta
+        P(None, None, "model"),  # conv_state
+        P(None, "model", None, None),  # recurrent_state
+        P("model", None, None),  # q_conv_weight
+        P("model", None, None),  # k_conv_weight
+        P("model", None, None),  # v_conv_weight
+        P("model"),  # A_log
+        P("model"),  # dt_bias
+        P(None),  # state_indices
+        P(None),  # query_start_loc
+        P(None),  # distribution
+        P(None),  # seq_lens
+    )
+    out_specs = (
+        P(None, None, "model"),  # new_conv_state
+        P(None, "model", None, None),  # new_recurrent_state
+        P(None, "model", None),  # out
+    )
+
+    body = functools.partial(
+        _kimi_linear_kda_local,
+        num_heads=num_heads // tp_size,
+        head_dim=head_dim,
+        kernel_size=kernel_size,
+    )
+    mapped = jax.shard_map(body,
+                           mesh=mesh,
+                           in_specs=in_specs,
+                           out_specs=out_specs,
+                           check_vma=False)
+    return mapped(q_proj_states, *args)
+
+
+def _kimi_linear_kda_local(
+    q_proj_states: jax.Array,  # [num_tokens, proj]
     k_proj_states: jax.Array,  # [num_tokens, proj]
     v_proj_states: jax.Array,  # [num_tokens, proj]
     g1: jax.Array,  # [num_tokens, proj]  raw gate
@@ -113,10 +180,24 @@ def kimi_linear_kda_core(
                         conv_state[..., 2 * proj:3 * proj])
 
     def conv(x, cs, w):
-        return ragged_causal_conv1d(x, cs, w, None, query_start_loc,
-                                    state_indices, distribution,
-                                    has_initial_state,
-                                    kernel_size=kernel_size)
+        """Ragged causal conv1d followed by SiLU, as the reference does.
+
+        Upstream calls ``causal_conv1d_fn(..., activation="silu")`` for all three
+        of q, k and v (see ``kimi_gdn_linear_attn.py``), and the GDN wrapper does
+        the same with ``jax.nn.silu`` after its fused conv. Omitting it is silent:
+        magnitudes stay comparable so the model still produces fluent text, but
+        every q/k/v is systematically wrong. It cost a gsm8k score of 0.16 while
+        the kernel tests -- which never touch conv1d -- stayed green.
+
+        The activation applies to the conv *output* only. ``new_conv_state`` is a
+        rolling window of raw input tokens and must stay pre-activation, which is
+        also what ``causal_conv1d_fn`` does with its ``conv_states`` argument.
+        """
+        out, new_cs = ragged_causal_conv1d(x, cs, w, None, query_start_loc,
+                                           state_indices, distribution,
+                                           has_initial_state,
+                                           kernel_size=kernel_size)
+        return jax.nn.silu(out), new_cs
 
     q, new_cs_q = conv(q_proj_states, cs_q, q_conv_weight)
     k, new_cs_k = conv(k_proj_states, cs_k, k_conv_weight)

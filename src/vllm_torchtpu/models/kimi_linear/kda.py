@@ -11,8 +11,9 @@ Registration goes through vLLM's ``PluggableLayer`` OOT mechanism rather than a
 monkeypatch. ``PluggableLayer.__new__`` keys on the *in-tree* class name, so
 registering under ``"KimiGatedDeltaNetAttention"`` means
 ``vllm/model_executor/models/kimi_linear.py`` builds this class instead, with no
-changes to the model definition. Because we do not define ``__init__``, the
-parent's runs unmodified.
+changes to the model definition. ``__init__`` only extends the parent's: it
+chains to ``super()`` and then builds the jax op and initialises ``kv_cache``,
+both of which must happen outside the compiled forward.
 
 ``_forward`` here is only an adapter: it reads the TPU platform's attention
 metadata and hands it to ``layers/common/kimi_linear_kda.py``, which does conv1d
@@ -65,16 +66,39 @@ def _register():
     class KimiLinearKDAAttention(KimiGatedDeltaNetAttention):
         """Kimi-Linear KDA on TPU. Only ``_forward`` differs from upstream."""
 
-        def _get_op(self):
-            """Build (and cache) this layer's torch<->jax op."""
-            op = getattr(self, "_tpu_kda_op", None)
-            if op is not None:
-                return op
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Both of these follow VllmGatedDeltaNetAttention in
+            # layers/vllm/custom_ops/gdn_attention_op.py, and both matter for
+            # the compiled path:
+            #
+            # * The op is built here, not lazily in `_forward`. `pallas.jax_op`
+            #   and `register_fake` are Python-level construction, so building
+            #   on first call would run them *during* Dynamo tracing of the
+            #   model graph.
+            # * `kv_cache` is bound by the runner during KV-cache init and must
+            #   exist before then, since warmup and the memory-profiling run
+            #   call `_forward` first. Setting it here means the guard below is
+            #   a plain None check rather than a getattr for a missing
+            #   attribute.
+            self.kv_cache = None
+            self.kda_op = self._build_op()
 
+        def _build_op(self):
+            """Build this layer's torch<->jax op."""
             from torch_tpu._internal import pallas
+
+            from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
+                get_vllm_model_wrapper_context
+
+            # The mesh binds the computation to *this worker's* device. Every
+            # GDN op path threads it for the same reason; omitting it places
+            # the op on JAX's default device, which only shows up at TP>1.
+            mesh = get_vllm_model_wrapper_context().mesh
 
             fn = functools.partial(
                 kimi_linear_kda_core,
+                mesh=mesh,
                 num_heads=self.local_num_heads,
                 head_dim=self.head_dim,
                 kernel_size=self.conv_size,
@@ -96,12 +120,17 @@ def _register():
                           seq_lens)
 
             name = f"pallas::kimilinear_kda_{self.prefix.replace('.', '_')}"
-            # Not donated: the states are also written back with copy_(), and the
-            # same cache tensors are reused next call -- donating them makes
-            # torch_tpu reject the second execution with "Donation requested for
-            # invalid buffer", visible only as a worker error while the caller
-            # silently gets stale results.
-            op = pallas.jax_op(name, wrapped)
+            # conv_state (5) and recurrent_state (6) are donated, and are ALSO
+            # written back with copy_() below -- XLA aliases the donated input
+            # to the program output, so the copy is in-place rather than a
+            # second full-sized write. This is the contract the GDN op uses
+            # (donate_argnums=(3, 4) plus copy_ writeback); without donation,
+            # torch_tpu's compiled mode aborts with "compiled_mode.cc: Check
+            # failed: ValidateAndReorderArguments ... identified an argument
+            # that was not provided", naming these two buffers. Eager mode
+            # tolerates the undonated form, which is why this only appeared
+            # once the model was compiled.
+            op = pallas.jax_op(name, wrapped, donate_argnums=(5, 6))
 
             def _fake(q, _k, _v, _g, _beta, conv_state, recurrent_state, *a,
                       **kw):
@@ -112,53 +141,133 @@ def _register():
                         torch.empty_like(recurrent_state), out)
 
             op.register_fake(_fake)
-            self._tpu_kda_op = op
             return op
 
-        def _forward(
+        def forward(
             self,
-            q_proj_states: torch.Tensor,
-            k_proj_states: torch.Tensor,
-            v_proj_states: torch.Tensor,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            output: torch.Tensor,
+        ) -> None:
+            """Full layer forward, overriding upstream's.
+
+            Upstream's ``forward`` routes the core through
+            ``torch.ops.vllm.kda_attention``, a ``direct_register_custom_op``
+            wrapper around ``_forward``. Dynamo does not trace into that op, so
+            its only graph inputs are the five tensors handed to it -- while
+            ``_forward`` goes on to read ``self.kv_cache``, the conv weights,
+            ``A_log`` and the attention metadata at runtime. Those buffers are
+            then referenced by the program without being arguments to it, and
+            torch_tpu aborts in ``TraverseAndCompile`` with "identified an
+            argument that was not provided". Materializing any one operand only
+            promotes the next: the boundary is the problem, not the tensor.
+
+            Overriding ``forward`` (as ``VllmGatedDeltaNetAttention`` does for
+            GDN) puts the jax op directly in the traced graph, so every operand
+            is a real graph input. Eager mode never showed this because there
+            is no graph to capture.
+
+            The body mirrors upstream's exactly apart from the core call, and
+            skips its ``[1, n, h, d]`` round-trip for ``g1``/``beta`` since this
+            core is token-major.
+            """
+            from einops import rearrange
+
+            num_tokens = hidden_states.size(0)
+            q = self.q_proj(hidden_states)[0]
+            k = self.k_proj(hidden_states)[0]
+            v = self.v_proj(hidden_states)[0]
+
+            # Already-activated beta, matching what the ported kernels expect.
+            beta = self.b_proj(hidden_states)[0].float().sigmoid()
+            g1 = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+
+            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            g2 = rearrange(g_proj_states,
+                           "... (h d) -> ... h d",
+                           d=self.head_dim)
+
+            core_attn_out = self._core(q, k, v, g1, beta, num_tokens,
+                                       hidden_states)
+
+            core_attn_out = self.o_norm(core_attn_out, g2)
+            core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+            output[:] = self.o_proj(core_attn_out)[0]
+
+        def _core(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
             g1: torch.Tensor,
             beta: torch.Tensor,
-            core_attn_out: torch.Tensor,
-        ) -> None:
-            """Adapter: hand the TPU metadata straight to the JAX core.
+            num_tokens: int,
+            hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+            """conv1d + KDA, returning ``[1, num_tokens, heads, head_dim]``.
 
-            Deliberately does no host-side work -- no ``.tolist()``, no branching
-            on prefill-vs-decode. The metadata arrays go in as-is and the kernels
+            Does no host-side work -- no ``.tolist()``, no branching on
+            prefill-vs-decode. The metadata arrays go in as-is and the kernels
             resolve the batch composition from ``request_distribution``.
             """
             from vllm.forward_context import get_forward_context
 
+            zeros = lambda: torch.zeros(
+                (1, num_tokens, self.local_num_heads, self.head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+
+            # Warmup and the memory-profiling run happen before the KV cache
+            # exists, so emit correctly shaped zeros and touch no state. Gate on
+            # the cache rather than the metadata: the TPU runner supplies
+            # metadata (with its mamba fields unset) even on those runs, unlike
+            # CUDA where upstream's `attn_metadata is None` check suffices.
+            kv_cache = self.kv_cache
+            if (kv_cache is None or len(kv_cache) < 2
+                    or kv_cache[0].numel() == 0):
+                return zeros()
+
             md = get_forward_context().attn_metadata
             if md is None:
-                return  # profile run before metadata exists
+                return zeros()
             if isinstance(md, dict):
                 md = md[self.prefix]
+            if md.mamba_state_indices is None:
+                raise RuntimeError(
+                    "Kimi-Linear KDA has a KV cache but the metadata carries "
+                    "no mamba_state_indices, so there is no slot mapping to "
+                    "use. The runner did not treat this layer as a mamba/SSM "
+                    "layer.")
 
-            assert md.mamba_state_indices is not None, (
-                "Kimi-Linear KDA needs mamba_state_indices; the runner did not "
-                "provide a mamba state mapping for this layer.")
+            conv_state, recurrent_state = kv_cache
 
-            conv_state, recurrent_state = self.kv_cache
-
-            # The parent hands g1/beta with a leading batch axis ([1, T, H, d]
-            # and [1, T, H]); the core is token-major.
-            g1 = g1[0].reshape(g1.shape[1], -1)
-            beta = beta[0]
-
-            new_conv, new_rec, out = self._get_op()(
-                q_proj_states, k_proj_states, v_proj_states, g1, beta,
-                conv_state, recurrent_state, self.q_conv1d.weight,
-                self.k_conv1d.weight, self.v_conv1d.weight,
-                self.A_log.reshape(-1), self.dt_bias,
+            # NOTE: no logging in here -- this is inside the compiled graph and
+            # Dynamo cannot trace a logger call under fullgraph=True.
+            new_conv, new_rec, out = self.kda_op(
+                q, k, v, g1, beta, conv_state, recurrent_state,
+                self.q_conv1d.weight, self.k_conv1d.weight,
+                self.v_conv1d.weight, self.A_log.reshape(-1), self.dt_bias,
                 md.mamba_state_indices.to(torch.int32), md.query_start_loc,
                 md.request_distribution, md.seq_lens)
 
             conv_state.copy_(new_conv)
             recurrent_state.copy_(new_rec)
-            core_attn_out[0, :out.shape[0]] = out.to(core_attn_out.dtype)
+
+            # Eager-only diagnostic (KDA_DEBUG=1). Never enable under
+            # torch.compile: the logging call and the .item() syncs are both
+            # untraceable. This is the only way to confirm the op actually ran
+            # and produced finite values -- with random weights a silently
+            # zeroed layer is indistinguishable from a working one.
+            import os as _os
+            if _os.environ.get("KDA_DEBUG") == "1":
+                from vllm.logger import init_logger as _il
+                _il(__name__).info(
+                    "[kda-debug] %s ran: out finite=%s absmax=%.4g "
+                    "state finite=%s", self.prefix,
+                    bool(torch.isfinite(out).all().item()),
+                    out.float().abs().max().item(),
+                    bool(torch.isfinite(new_rec).all().item()))
+
+            return out.unsqueeze(0)
 
     return KimiLinearKDAAttention
