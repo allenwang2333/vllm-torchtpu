@@ -725,23 +725,24 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
         activation_str = getattr(layer, "_tpu_activation_str", "swiglu")
 
         # Step 1: Routing
+        renormalize = getattr(layer, "renormalize",
+                              getattr(layer.moe_config, "renormalize", True))
         custom_routing_fn = getattr(layer, "custom_routing_function", None)
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
                 gating_output=router_logits,
                 topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
+                renormalize=renormalize,
             )
         else:
             topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
+                renormalize=renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
                 layer=layer,
-                input_ids=input_ids,
             )
 
         res = fused_moe_gmm(
