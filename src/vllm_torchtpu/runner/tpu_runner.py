@@ -4382,10 +4382,11 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 num_blocks = kv_cache_config.num_blocks
 
+            spec0 = _per_layer_spec(shared_by[0]) if len(shared_by) > 0 else None
             logger.info(
                 "[KV_SIZE_DEBUG] group tensor_size=%d shared_by=%s "
                 "num_blocks=%d spec0=%r", tensor_size, shared_by, num_blocks,
-                _per_layer_spec(shared_by[0]))
+                spec0)
 
             for layer_name in shared_by:
                 kv_cache_spec = _per_layer_spec(layer_name)
