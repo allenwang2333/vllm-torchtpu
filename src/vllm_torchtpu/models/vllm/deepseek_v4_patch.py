@@ -287,14 +287,16 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 hasattr(torch, "_dynamo") and torch._dynamo.is_compiling()):
             return _orig_apply_quant_method(self, *args, **kwargs)
 
+        layer = kwargs.get("layer")
         if len(args) > 0 and isinstance(args[0], torch.nn.Module):
+            layer = args[0]
             hidden_states = args[1] if len(args) > 1 else kwargs.get("hidden_states")
             router_logits = args[2] if len(args) > 2 else kwargs.get("router_logits")
         else:
             hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
             router_logits = args[1] if len(args) > 1 else kwargs.get("router_logits")
 
-        layer_idx = getattr(self, "layer_idx", -1)
+        layer_idx = getattr(layer, "layer_idx", -1) if layer is not None else getattr(self, "layer_idx", -1)
         if layer_idx in (0, 3, 4) and hidden_states is not None and router_logits is not None:
             hs_cpu = hidden_states.cpu().float()
             rl_cpu = router_logits.cpu().float()
