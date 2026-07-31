@@ -785,7 +785,16 @@ class TPUModelRunner(GPUModelRunner):
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
-        has_attention = any(isinstance(m, Attention) for m in layers.values())
+        # `MLAAttention` is not a subclass of `Attention` (it derives straight
+        # from `AttentionLayerBase`), so testing only `Attention` here misses
+        # MLA + mamba hybrids such as Kimi-Linear, and
+        # `_update_mamba_page_size_padded` -- which does handle MLA -- never
+        # runs. The mamba spec then keeps the platform's padded page (computed
+        # from the *unpadded* MLA head size) while the MLA spec reports the
+        # TPU-actual page from the padded head size, and the two disagree by
+        # exactly the head-size padding, so page-size unification raises.
+        has_attention = any(
+            isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and has_mamba and not self._unified_kv_layout:
             self._update_mamba_page_size_padded(layers)
@@ -1069,9 +1078,18 @@ class TPUModelRunner(GPUModelRunner):
             return
 
         first_attn_module = attn_modules[0]
-        num_kv_heads = first_attn_module.num_kv_heads if isinstance(
-            first_attn_module, Attention) else 1
-        attn_page_size_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        # MLA caches one compressed latent per token, not separate K and V, so
+        # its page is half what `PallasAttentionBackend` would report for the
+        # same head size. Using the wrong backend here makes the uniform page
+        # size disagree with the `MLAAttentionSpec` built below, which is what
+        # page-size unification then rejects.
+        if isinstance(first_attn_module, Attention):
+            attn_backend = PallasAttentionBackend
+            num_kv_heads = first_attn_module.num_kv_heads
+        else:
+            attn_backend = PallasMLAttentionBackend
+            num_kv_heads = 1
+        attn_page_size_bytes = attn_backend.get_kv_cache_page_size_bytes(
             self.block_size,
             num_kv_heads,
             first_attn_module.head_size,

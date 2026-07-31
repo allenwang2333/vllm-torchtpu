@@ -122,6 +122,19 @@ def kda_forward(
         raise ValueError(
             f"beta must be [H, B, T] = {q.shape[:3]}; got {beta.shape}")
 
+    # The kernel's intra-chunk decay relies on the activated gate being <= 0, so
+    # that the cumulative gate decreases along the chunk and every causal
+    # exponent g_r - g_t is non-positive (see the Aqk/L section of
+    # pallas_tpu_fwd.py). Both activations satisfy this only for a negative
+    # bound: -exp(A_log) * softplus(.) is always <= 0, while
+    # lower_bound * sigmoid(.) needs lower_bound < 0. A positive bound would
+    # make the decay grow along the chunk and silently return wrong values.
+    if lower_bound is not None and lower_bound >= 0:
+        raise ValueError(
+            "lower_bound must be negative (it bounds a log-decay); got "
+            f"{lower_bound}. A non-negative bound makes the gate increase "
+            "along the chunk, which this kernel does not support.")
+
     check_inputs_support(
         q,
         v,

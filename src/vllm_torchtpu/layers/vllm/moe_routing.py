@@ -65,6 +65,99 @@ def _apply_scoring_fn(scoring_fn: str,
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
 
 
+def _grouped_topk(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    *,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    layer,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grouped (expert-group) top-k routing, eager and TPU-traceable.
+
+    A faithful port of ``grouped_topk`` in
+    ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py``:
+    score the experts, score each expert *group*, keep the best ``topk_group``
+    groups, mask the rest to ``-inf``, and only then take the top ``topk``
+    experts. When a correction bias is present the biased scores drive both the
+    group scoring and the expert *selection*, while the unbiased scores supply
+    the routing *weights*; renormalization and ``routed_scaling_factor`` come
+    last.
+
+    Why reimplement it here rather than call vLLM's: that function carries
+    ``@torch.compile(dynamic=True)``, and torch_tpu's backend rejects the
+    resulting SymInt with "TPU backend: does not support dynamic shape". This
+    version keeps every shape static, so it traces cleanly.
+
+    Two deliberate deviations from the reference, neither changing the result:
+
+    * The group mask is built by comparison against ``arange`` instead of
+      ``torch.zeros_like(...).scatter_(...)``, avoiding an in-place scatter in
+      the compiled graph.
+    * Scores are computed in float32 (see ``_apply_scoring_fn``) rather than the
+      logits' dtype. Strictly more accurate, and it matches what the rest of
+      this module already does for ungrouped routing.
+
+    ``VLLM_BATCH_INVARIANT``'s ``sorted=True`` tie-breaking is not plumbed
+    through; ``torch.topk`` defaults to ``sorted=True`` here anyway.
+    """
+    scores = _apply_scoring_fn(scoring_fn, router_logits)  # [n_tokens, n_expert]
+    bias = getattr(layer, "e_score_correction_bias", None)
+    n_group = getattr(layer, "num_expert_group", None) or 1
+    topk_group = getattr(layer, "topk_group", None) or n_group
+
+    # NOTE: do not log from this function. It runs inside
+    # `@torch.compile(fullgraph=True)` regions, and `vllm_torchtpu.logger`
+    # returns a lazy proxy whose first attribute access calls `init_logger` ->
+    # `logging.getLogger`, which Dynamo cannot trace: the capture dies with
+    # "Attempted to call function marked as skipped". It is invisible under
+    # --enforce-eager and only fails once the model is compiled.
+
+    # Biased scores select; unbiased scores weight.
+    original_scores = scores
+    if bias is not None:
+        scores = scores + bias.to(scores.dtype).unsqueeze(0)
+
+    # With one group, or with every group kept, the mask admits all experts and
+    # this reduces to a plain top-k -- skip the work rather than build an
+    # all-true mask. (Kimi-Linear is exactly this case: 1 group of 256.)
+    if n_group > 1 and topk_group < n_group:
+        num_token = scores.shape[0]
+        group_size = scores.shape[-1] // n_group
+        grouped = scores.view(num_token, n_group, group_size)
+        if bias is not None:
+            # Reference scores a group by its two best experts, not its best.
+            group_scores = grouped.topk(2, dim=-1)[0].sum(dim=-1)
+        else:
+            group_scores = grouped.max(dim=-1).values  # [n_tokens, n_group]
+
+        group_idx = torch.topk(group_scores, k=topk_group,
+                               dim=-1)[1]  # [n_tokens, topk_group]
+        keep_group = (torch.arange(n_group, device=group_idx.device).view(
+            1, 1, -1) == group_idx.unsqueeze(-1)).any(dim=1)  # [n_tok, n_group]
+        score_mask = keep_group.unsqueeze(-1).expand(num_token, n_group,
+                                                     group_size).reshape(
+                                                         num_token, -1)
+        scores = torch.where(score_mask, scores,
+                             torch.full_like(scores, float("-inf")))
+
+    if bias is not None:
+        topk_ids = torch.topk(scores, k=topk, dim=-1)[1]
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    scaling = getattr(layer, "routed_scaling_factor", 1.0) or 1.0
+    if scaling != 1.0:
+        topk_weights = topk_weights * scaling
+
+    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -78,20 +171,14 @@ def select_experts(
     # Profiling-only override; a no-op unless FORCE_MOE_RANDOM_ROUTING is set.
     router_logits = maybe_force_random_routing(router_logits)
     if layer is not None and layer.use_grouped_topk:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
-            grouped_topk
-        topk_weights, topk_ids = grouped_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
+        return _grouped_topk(
+            hidden_states,
+            router_logits,
             topk=topk,
             renormalize=renormalize,
-            num_expert_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
-            scoring_func=scoring_fn,
-            routed_scaling_factor=layer.routed_scaling_factor,
-            e_score_correction_bias=layer.e_score_correction_bias,
+            scoring_fn=scoring_fn,
+            layer=layer,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
     topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
         scoring_fn, router_logits),

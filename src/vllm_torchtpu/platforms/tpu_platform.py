@@ -188,6 +188,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
+    from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
@@ -199,6 +200,13 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    # Kimi-K3 / Kimi-Linear KDA hybrids: teach get_num_layers_by_block_type to
+    # read `linear_attn_config`. It must live here rather than only in
+    # `_run_engine_core_with_tpu_patches`: that wrapper runs in the EngineCore
+    # process, while worker processes only run apply_tpu_patches(). Under
+    # `vllm serve` the workers therefore missed it and TPUModelRunner.__init__
+    # died with "The model is an hybrid without a layers_block_type or an
+    # attn_type_list, or a layer_types in the hf_config".
     _patch_vllm_kimi_kda_layer_counts()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
