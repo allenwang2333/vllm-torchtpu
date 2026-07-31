@@ -1239,8 +1239,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         flush=True)
             if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1":
                 if isinstance(res, (tuple, list)) and len(res) == 4:
-                    from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
-                    x_post = mhc_post_tilelang(res[0], res[1], res[2], res[3])
+                    import vllm.model_executor.kernels.mhc as mhc_kernels
+                    x_post = mhc_kernels.mhc_post_torch(res[0], res[1], res[2], res[3])
                 else:
                     x_post = x
 
@@ -1290,8 +1290,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             # from the sweep is worthless.
             _sub = os.getenv("DSV4_SUBSTITUTE_LAYER")
             if isinstance(res, (tuple, list)) and len(res) == 4:
-                from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
-                x_post = mhc_post_tilelang(res[0], res[1], res[2], res[3])
+                import vllm.model_executor.kernels.mhc as mhc_kernels
+                x_post = mhc_kernels.mhc_post_torch(res[0], res[1], res[2], res[3])
             else:
                 x_post = x
 
