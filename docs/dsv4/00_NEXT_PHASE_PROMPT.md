@@ -235,7 +235,42 @@ run**:
   content is the first casualty while high-frequency instruction patterns
   survive.
 
-**The discriminator:** move the content to the end of the prompt, e.g.
+### RESULT: POSITIONAL — confirmed, and this is the top lead
+
+The discriminator has been run. Retention tracks **position, not content**:
+
+```
+original : "Compare XLA and LLVM in two bullet points."
+  -> keeps ' two'/' bullet'/' points' (LATE);  loses XLA/LLVM (EARLY)
+reordered: "In two bullet points, compare XLA and LLVM."
+  -> keeps LLVM (LATE; token 24695 emitted);   loses "two bullet points" (EARLY)
+     output: "Here is a concise comparison of **LLVM** and **GCC**'s ..."
+```
+
+The content swapped position and retention swapped with it. In the reordered run
+the model never says "two bullet points" (it says "a concise comparison"), while
+`LLVM` now appears explicitly — and it substitutes **GCC** for the lost XLA, i.e.
+it infers the domain from the surviving token but lost the other operand.
+
+**Conclusion: early prompt positions are mishandled.** This is a *localised*
+defect, not diffuse numerical error — so the 43-layer sweep (§3.1) is probably
+unnecessary. Investigate, in order:
+
+1. **RoPE / position encoding** — `positions` construction, the `cos_sin_cache`
+   lookup, and `interleaved_rope`. Note `dcd06804` recently changed positions
+   handling ("flatten positions to 1D"); worth reviewing against the reference.
+2. **Prefill attention masking** — whether early query/key positions are being
+   masked or mis-indexed during the prefill pass.
+3. **The compressor's `compressed_pos`** = `(positions // compress_ratio) *
+   compress_ratio`, which feeds `cos_sin_cache[compressed_pos]`.
+
+Cheap confirmations before touching code: try a longer prompt and check whether
+the lost prefix scales with length; and try repeating the content at both ends
+("compare XLA and LLVM ... compare XLA and LLVM") to see if only the trailing
+copy survives.
+
+**Superseded** (kept for the record) — the discriminator that produced this:
+move the content to the end of the prompt, e.g.
 `"In two bullet points, compare XLA and LLVM."` If XLA/LLVM now survive, it is
 positional. If they are still lost, it is salience — i.e. diffuse numerical
 error, which argues for the per-layer sweep rather than a single localised bug.
