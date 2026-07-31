@@ -153,40 +153,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     except ImportError:
         pass
 
-    # Patch tpu_inference unquantized weight post-processing methods to avoid JAX sharding
-    try:
-        import tpu_inference.layers.vllm.quantization.unquantized as tpu_unquant
-        tpu_unquant.VllmUnquantizedEmbeddingMethod.process_weights_after_loading = lambda self, layer: None
-        tpu_unquant.VllmUnquantizedLinearMethod.process_weights_after_loading = lambda self, layer: None
-    except Exception:
-        pass
-
-    # Patch tpu_inference model wrapper context to prevent Dynamo data-dependent assert errors
-    try:
-        import tpu_inference.models.vllm.vllm_model_wrapper_context as vmwc
-
-        class _DummyWrapperContext:
-            mesh = None
-
-        vmwc.get_vllm_model_wrapper_context = lambda: _DummyWrapperContext()
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.layers.vllm.custom_ops.fused_moe as tpu_fused_moe
-        from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
-            MoERunner
-        tpu_fused_moe.get_vllm_model_wrapper_context = lambda: _DummyWrapperContext(
-        )
-
-        def _patched_maybe_reduce_final_output(self, states, trunc_size):
-            return MoERunner._maybe_reduce_final_output(
-                self, states, trunc_size)
-
-        tpu_fused_moe.VllmMoERunner._maybe_reduce_final_output = _patched_maybe_reduce_final_output
-    except Exception:
-        pass
-
     # Recover layer and input_ids parameters in select_experts via stack inspection
     import vllm_torchtpu.layers.vllm.moe_routing as mr
     _orig_select_experts = mr.select_experts
@@ -290,14 +256,22 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         layer = kwargs.get("layer")
         if len(args) > 0 and isinstance(args[0], torch.nn.Module):
             layer = args[0]
-            hidden_states = args[1] if len(args) > 1 else kwargs.get("hidden_states")
-            router_logits = args[2] if len(args) > 2 else kwargs.get("router_logits")
+            hidden_states = args[1] if len(args) > 1 else kwargs.get(
+                "hidden_states")
+            router_logits = args[2] if len(args) > 2 else kwargs.get(
+                "router_logits")
         else:
-            hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
-            router_logits = args[1] if len(args) > 1 else kwargs.get("router_logits")
+            hidden_states = args[0] if len(args) > 0 else kwargs.get(
+                "hidden_states")
+            router_logits = args[1] if len(args) > 1 else kwargs.get(
+                "router_logits")
 
-        layer_idx = getattr(layer, "layer_idx", -1) if layer is not None else getattr(self, "layer_idx", -1)
-        if layer_idx in (0, 3, 4) and hidden_states is not None and router_logits is not None:
+        layer_idx = getattr(layer, "layer_idx",
+                            -1) if layer is not None else getattr(
+                                self, "layer_idx", -1)
+        if layer_idx in (
+                0, 3,
+                4) and hidden_states is not None and router_logits is not None:
             hs_cpu = hidden_states.cpu().float()
             rl_cpu = router_logits.cpu().float()
             print(
@@ -793,173 +767,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
             cls.compute_logits = patched_compute_logits
 
-    # Patch custom Triton operations with PyTorch equivalents on TPU
-    try:
-        import vllm.models.deepseek_v4.attention as ds_attn
-        import vllm.models.deepseek_v4.common.ops as common_ops
-        import vllm.models.deepseek_v4.common.ops.fused_indexer_q as fused_indexer_ops
-        import vllm.models.deepseek_v4.common.ops.fused_qk_rmsnorm as fused_qk_ops
-
-        def fused_q_kv_rmsnorm_pytorch(
-            qr: torch.Tensor,
-            kv: torch.Tensor,
-            q_weight: torch.Tensor,
-            kv_weight: torch.Tensor,
-            eps: float,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            # Standard PyTorch equivalent of the GPU Triton RMSNorm kernel
-            # (reference _fused_q_kv_rmsnorm_kernel computes y = x * rrms * w,
-            # with NO (1 + w) offset).
-            orig_dtype = qr.dtype
-            qr_f = qr.float()
-            kv_f = kv.float()
-            qr_out = qr_f * torch.rsqrt(
-                qr_f.pow(2).mean(-1, keepdim=True) + eps) * q_weight.float()
-            kv_out = kv_f * torch.rsqrt(
-                kv_f.pow(2).mean(-1, keepdim=True) + eps) * kv_weight.float()
-            return qr_out.to(orig_dtype), kv_out.to(orig_dtype)
-
-        def fused_indexer_q_rope_quant_pytorch(
-            positions: torch.Tensor,
-            q: torch.Tensor,
-            rotary_emb: torch.nn.Module,
-            q_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            # Fallback PyTorch implementation for fused_indexer_q_rope_quant
-            q_pe = rotary_emb(positions, q)
-            return q_pe
-
-        try:
-            import vllm.v1.attention.ops.rocm_aiter_mla_sparse as sparse_ops
-            orig_inv_rope = sparse_ops._apply_inv_rope_ref
-
-            def safe_inv_rope(rotary_emb, x, positions, rope_dim):
-                try:
-                    return orig_inv_rope(rotary_emb, x, positions, rope_dim)
-                except Exception:
-                    pos_1d = positions.flatten()
-                    return sparse_ops._apply_gptj_inv_rope_ref(
-                        x, pos_1d, rotary_emb.cos_sin_cache, rope_dim)
-
-            sparse_ops._apply_inv_rope_ref = safe_inv_rope
-        except Exception:
-            pass
-
-        try:
-            from vllm.model_executor.layers.mhc import MHCFusedPostPreOp
-
-            def mhc_fused_post_pre_native(self,
-                                          x,
-                                          residual,
-                                          post_layer_mix,
-                                          comb_res_mix,
-                                          fn,
-                                          hc_scale,
-                                          hc_base,
-                                          rms_eps,
-                                          hc_pre_eps,
-                                          hc_sinkhorn_eps,
-                                          hc_post_mult_value,
-                                          sinkhorn_repeat,
-                                          n_splits=1,
-                                          tile_n=1,
-                                          norm_weight=None,
-                                          norm_eps=0.0):
-                import vllm.model_executor.kernels.mhc as mhc_kernels
-                res_cur = mhc_kernels.mhc_post_torch(x, residual,
-                                                     post_layer_mix,
-                                                     comb_res_mix)
-                post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
-                    res_cur, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
-                    hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
-                return res_cur, post_mix, comb_mix, layer_input
-
-            MHCFusedPostPreOp.forward_native = mhc_fused_post_pre_native
-        except Exception:
-            pass
-
-        def fused_indexer_q_rope_quant_pytorch_full(
-            positions: torch.Tensor,
-            index_q: torch.Tensor,
-            index_q_cos_sin_cache: torch.Tensor,
-            index_weights: torch.Tensor,
-            index_weights_softmax_scale: float,
-            index_weights_head_scale: float,
-            use_fp4: bool = False,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            assert not use_fp4, "FP4 path not supported on TPU"
-            num_tokens = positions.shape[0]
-            num_index_q_heads = index_q.shape[1]
-            index_q_head_dim = index_q.shape[2]
-
-            cos_sin = index_q_cos_sin_cache[positions]
-            rot_dim = cos_sin.shape[-1]
-            half_rot_dim = rot_dim // 2
-            cos = cos_sin[:, :half_rot_dim]
-            sin = cos_sin[:, half_rot_dim:]
-
-            nope_dim = index_q_head_dim - rot_dim
-            q_nope = index_q[..., :nope_dim]
-            q_rot = index_q[..., nope_dim:]
-
-            q_rot_reshaped = q_rot.view(num_tokens, num_index_q_heads,
-                                        half_rot_dim, 2)
-            x_even = q_rot_reshaped[..., 0]
-            x_odd = q_rot_reshaped[..., 1]
-
-            cos_expanded = cos.unsqueeze(1)
-            sin_expanded = sin.unsqueeze(1)
-
-            r_even = x_even * cos_expanded - x_odd * sin_expanded
-            r_odd = x_odd * cos_expanded + x_even * sin_expanded
-
-            r_even = r_even.to(torch.bfloat16).to(torch.float32)
-            r_odd = r_odd.to(torch.bfloat16).to(torch.float32)
-
-            r_stacked = torch.stack([r_even, r_odd], dim=-1)
-            q_rot_out = r_stacked.view(num_tokens, num_index_q_heads, rot_dim)
-
-            q_rot_final = torch.cat([q_nope, q_rot_out], dim=-1)
-
-            amax = torch.max(torch.abs(q_rot_final), dim=-1).values
-            scale = torch.clamp(amax, min=1e-4) / 448.0
-            scale = torch.exp2(torch.ceil(torch.log2(scale))).unsqueeze(-1)
-
-            index_q_fp8 = torch.clamp(q_rot_final / scale, -448.0,
-                                      448.0).to(torch.float8_e4m3fn)
-
-            scale_squeezed = scale.squeeze(-1)
-            index_weights_out = index_weights * scale_squeezed * index_weights_softmax_scale * index_weights_head_scale
-
-            return index_q_fp8, index_weights_out
-
-        # Overwrite all imports/locations of both functions
-        ds_attn.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
-        fused_qk_ops.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
-        common_ops.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_pytorch
-
-        ds_attn.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch_full
-        fused_indexer_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch_full
-        common_ops.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_pytorch_full
-
-        # Direct sys.modules update to override all imported references
-        for m in list(sys.modules.values()):
-            if m is not None:
-                if hasattr(m, "fused_q_kv_rmsnorm"):
-                    setattr(m, "fused_q_kv_rmsnorm",
-                            fused_q_kv_rmsnorm_pytorch)
-                if hasattr(m, "fused_indexer_q_rope_quant"):
-                    setattr(m, "fused_indexer_q_rope_quant",
-                            fused_indexer_q_rope_quant_pytorch_full)
-
-        print(
-            "[PATCH] Successfully monkey-patched fused_q_kv_rmsnorm and fused_indexer_q_rope_quant with PyTorch equivalents.",
-            flush=True)
-    except Exception as e:
-        print(f"[PATCH] Failed to patch Triton custom ops: {e}",
-              file=sys.stderr,
-              flush=True)
-
     # Capture and patch the standard CUDA/CPU variant from ds_v4
     try:
         _CudaDeepseekV4ForCausalLM = ds_v4.DeepseekV4ForCausalLM
@@ -1223,6 +1030,19 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 f"[DEBUG_PRE_LAYER_{layer_idx}] pid={os.getpid()} attn class={self.attn.__class__} forward={self.attn.forward}",
                 file=sys.stderr,
                 flush=True)
+        if (not is_compiling and layer_idx == 0
+                and os.getenv("DSV4_DEBUG_POSITIONS") == "1"):
+            # One-shot check of the "positional" hypothesis
+            # (docs/dsv4/00_NEXT_PHASE_PROMPT.md 3.0): is the `positions`
+            # tensor handed to layer 0 itself already wrong for early
+            # tokens, upstream of any RoPE/attention math?
+            _pos_arg = args[1] if len(args) > 1 else kwargs.get("positions")
+            if isinstance(_pos_arg, torch.Tensor):
+                print(
+                    f"[DEBUG_POSITIONS] pid={os.getpid()} shape={list(_pos_arg.shape)} "
+                    f"positions={_pos_arg.flatten().tolist()}",
+                    file=sys.stderr,
+                    flush=True)
         res = _orig_layer_forward(self, *args, **kwargs)
         is_compiling = (hasattr(torch, "compiler")
                         and torch.compiler.is_compiling()) or (hasattr(
@@ -1240,11 +1060,15 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1":
                 if isinstance(res, (tuple, list)) and len(res) == 4:
                     if any(r is None for r in res):
-                        print(f"[DEBUG_NULL_STREAM_DUMP] layer={layer_idx} streams={[r is None for r in res]}", file=sys.stderr, flush=True)
+                        print(
+                            f"[DEBUG_NULL_STREAM_DUMP] layer={layer_idx} streams={[r is None for r in res]}",
+                            file=sys.stderr,
+                            flush=True)
                         x_post = res[0]
                     else:
                         import vllm.model_executor.kernels.mhc as mhc_kernels
-                        x_post = mhc_kernels.mhc_post_torch(res[0], res[1], res[2], res[3])
+                        x_post = mhc_kernels.mhc_post_torch(
+                            res[0], res[1], res[2], res[3])
                 else:
                     x_post = x
 
@@ -1255,7 +1079,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         if not hasattr(self, "_step_idx"):
                             self._step_idx = 0
                         import numpy as np
-                        tensor_cpu = x_post.detach().cpu().to(torch.float32).numpy()
+                        tensor_cpu = x_post.detach().cpu().to(
+                            torch.float32).numpy()
                         os.makedirs(
                             "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
                             exist_ok=True)
@@ -1361,8 +1186,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             if tuple(_a_sliced.shape) == tuple(x_post.shape):
                                 _a = _a_sliced
                         if tuple(_a.shape) == tuple(x_post.shape):
-                            _new = torch.from_numpy(_a).to(device=x_post.device,
-                                                           dtype=x_post.dtype)
+                            _new = torch.from_numpy(_a).to(
+                                device=x_post.device, dtype=x_post.dtype)
                         else:
                             print(
                                 f"[SUBSTITUTE] SHAPE MISMATCH layer={layer_idx}"
@@ -1522,9 +1347,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     torch.cuda.Stream = lambda *args, **kwargs: None
     torch.cuda.Event = DummyCudaEvent
 
-    # 5. Patch HCHeadOp and MHCFusedPostPreOp forward_native with pure PyTorch implementations.
-    from vllm.model_executor.layers.mhc import (HCHeadOp, MHCFusedPostPreOp,
-                                                MHCPostOp, MHCPreOp)
+    # 5. Patch HCHeadOp forward_native with a pure PyTorch implementation.
+    from vllm.model_executor.layers.mhc import HCHeadOp
 
     def mhc_hc_head_native(
         self,
@@ -1539,6 +1363,19 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         # hc_fn: shape (hc_mult, hc_mult * hidden_size)
         # hc_scale: shape (1,)
         # hc_base: shape (hc_mult,)
+        #
+        # hc_fn/hc_scale/hc_base are declared dtype=torch.float32 in vLLM's
+        # own model definition (models/deepseek_v4/amd/model.py) -- true in
+        # both this repo and the reference's mirrored copy -- so the linear
+        # projection against hc_fn must run in fp32; casting the normalized
+        # activations down to bf16 first (matching the reference's
+        # VllmHCHeadOp.forward_tpu) raises `mm(): expected the two arguments
+        # to have the same dtype, got bfloat16 vs float32` against these
+        # real fp32 weights. That reference code is unreachable here anyway
+        # (this platform's `_enum = PlatformEnum.OOT`, so CustomOp dispatch
+        # never selects forward_tpu -- see dispatch_forward in
+        # vllm/model_executor/custom_op.py), so treat it as unvalidated
+        # rather than authoritative for this op.
         residual_flat = hidden_states.flatten(-2).float()
         residual_norm = residual_flat * torch.rsqrt(
             residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps)
@@ -1547,208 +1384,10 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(),
                          dim=-2).to(hidden_states.dtype)
 
-    def mhc_fused_post_pre_native(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        post_layer_mix: torch.Tensor,
-        comb_res_mix: torch.Tensor,
-        fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        rms_eps: float,
-        hc_pre_eps: float,
-        hc_sinkhorn_eps: float,
-        hc_post_mult_value: float,
-        sinkhorn_repeat: int,
-        n_splits: int = 1,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from vllm.model_executor.kernels.mhc.torch import (mhc_post_torch,
-                                                           mhc_pre_torch)
-        residual_cur = mhc_post_torch(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-        )
-        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre_torch(
-            residual_cur,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-        )
-        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
-
     import safetensors.torch
     safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
-    _orig_hc_head_forward_native = HCHeadOp.forward_native
-    _orig_mhc_fused_post_pre_forward_native = MHCFusedPostPreOp.forward_native
     HCHeadOp.forward_native = mhc_hc_head_native
-    MHCFusedPostPreOp.forward_native = mhc_fused_post_pre_native
-
-    _orig_mhc_pre_forward_native = MHCPreOp.forward_native
-    _orig_mhc_post_forward_native = MHCPostOp.forward_native
-
-    def debug_mhc_pre_native(self,
-                             residual,
-                             fn,
-                             hc_scale,
-                             hc_base,
-                             rms_eps,
-                             hc_pre_eps,
-                             hc_sinkhorn_eps,
-                             hc_post_mult_value,
-                             sinkhorn_repeat,
-                             n_splits=1,
-                             norm_weight=None,
-                             norm_eps=0.0):
-        for name, t in [("residual", residual), ("fn", fn),
-                        ("hc_scale", hc_scale), ("hc_base", hc_base)]:
-            if t is not None:
-                has_nan = torch.isnan(t).any().item()
-                has_inf = torch.isinf(t).any().item()
-                if has_nan or has_inf:
-                    print(
-                        f"[NAN_DETECTION] MHCPreOp input {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}",
-                        flush=True)
-        res = _orig_mhc_pre_forward_native(self, residual, fn, hc_scale,
-                                           hc_base, rms_eps, hc_pre_eps,
-                                           hc_sinkhorn_eps, hc_post_mult_value,
-                                           sinkhorn_repeat, n_splits,
-                                           norm_weight, norm_eps)
-        has_output_nan = False
-        for name, t in zip(["post_mix", "comb_mix", "layer_input"], res):
-            if t is not None:
-                has_nan = torch.isnan(t).any().item()
-                has_inf = torch.isinf(t).any().item()
-                if has_nan or has_inf:
-                    print(
-                        f"[NAN_DETECTION] MHCPreOp output {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}",
-                        flush=True)
-                    if name == "layer_input":
-                        has_output_nan = True
-        if has_output_nan:
-            print(
-                "[NAN_DETECTION_DETAIL] Running step-by-step debug check inside MHCPreOp...",
-                flush=True)
-            hc_mult = residual.shape[-2]
-            hidden_size = residual.shape[-1]
-            residual_flat = residual.view(-1, hc_mult, hidden_size)
-            num_tokens = residual_flat.shape[0]
-            x = residual_flat.view(num_tokens,
-                                   hc_mult * hidden_size).to(torch.float32)
-            mixes = torch.matmul(x, fn.t())
-            sqrsum = x.square().sum(dim=-1, keepdim=True)
-            mixes_norm = mixes * torch.rsqrt(sqrsum /
-                                             (hc_mult * hidden_size) + rms_eps)
-            pre_logits = mixes_norm[:, :hc_mult] * hc_scale[
-                0] + hc_base[:hc_mult]
-            pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
-            product = pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32)
-            layer_input_dbg = torch.sum(product, dim=1).to(torch.bfloat16)
-
-            print(
-                f"[NAN_DETECTION_DETAIL]   x: nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()} mean={x.mean().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   fn: nan={torch.isnan(fn).any().item()} inf={torch.isinf(fn).any().item()} mean={fn.mean().item():.6f} min={fn.min().item():.6f} max={fn.max().item():.6f}",
-                flush=True)
-            print(f"[NAN_DETECTION_DETAIL]   hc_scale: {hc_scale.tolist()}",
-                  flush=True)
-            print(f"[NAN_DETECTION_DETAIL]   hc_base: {hc_base.tolist()}",
-                  flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   mixes: nan={torch.isnan(mixes).any().item()} inf={torch.isinf(mixes).any().item()} mean={mixes.mean().item():.6f} min={mixes.min().item():.6f} max={mixes.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   sqrsum: nan={torch.isnan(sqrsum).any().item()} inf={torch.isinf(sqrsum).any().item()} mean={sqrsum.mean().item():.6f} min={sqrsum.min().item():.6f} max={sqrsum.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   mixes_norm: nan={torch.isnan(mixes_norm).any().item()} inf={torch.isinf(mixes_norm).any().item()} mean={mixes_norm.mean().item():.6f} min={mixes_norm.min().item():.6f} max={mixes_norm.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   pre_logits: nan={torch.isnan(pre_logits).any().item()} inf={torch.isinf(pre_logits).any().item()} mean={pre_logits.mean().item():.6f} min={pre_logits.min().item():.6f} max={pre_logits.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   pre_mix: nan={torch.isnan(pre_mix).any().item()} inf={torch.isinf(pre_mix).any().item()} mean={pre_mix.mean().item():.6f} min={pre_mix.min().item():.6f} max={pre_mix.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   product: nan={torch.isnan(product).any().item()} inf={torch.isinf(product).any().item()} mean={product.mean().item():.6f} min={product.min().item():.6f} max={product.max().item():.6f}",
-                flush=True)
-            print(
-                f"[NAN_DETECTION_DETAIL]   layer_input_dbg: nan={torch.isnan(layer_input_dbg).any().item()} inf={torch.isinf(layer_input_dbg).any().item()}",
-                flush=True)
-        return res
-
-    def debug_mhc_post_native(self, x, residual, post_layer_mix, comb_res_mix):
-        for name, t in [("x", x), ("residual", residual),
-                        ("post_layer_mix", post_layer_mix),
-                        ("comb_res_mix", comb_res_mix)]:
-            if t is not None:
-                has_nan = torch.isnan(t).any().item()
-                has_inf = torch.isinf(t).any().item()
-                if has_nan or has_inf:
-                    print(
-                        f"[NAN_DETECTION] MHCPostOp input {name} has NaN/Inf! has_nan={has_nan} has_inf={has_inf}",
-                        flush=True)
-        res = _orig_mhc_post_forward_native(self, x, residual, post_layer_mix,
-                                            comb_res_mix)
-        if res is not None:
-            has_nan = torch.isnan(res).any().item()
-            has_inf = torch.isinf(res).any().item()
-            if has_nan or has_inf:
-                print(
-                    f"[NAN_DETECTION] MHCPostOp output has NaN/Inf! has_nan={has_nan} has_inf={has_inf}",
-                    flush=True)
-            else:
-                max_val = res.abs().max().item()
-                if max_val > 1e10:
-                    print(
-                        f"[NAN_DETECTION_DETAIL] MHCPostOp output max value is very large: {max_val}",
-                        flush=True)
-                    mixed_residual = torch.einsum(
-                        "...ij,...ih->...jh",
-                        comb_res_mix.to(torch.float32),
-                        residual.to(torch.float32),
-                    )
-                    post_term = post_layer_mix.to(
-                        torch.float32) * x.unsqueeze(-2).to(torch.float32)
-                    res_dbg = (mixed_residual + post_term).to(residual.dtype)
-
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   x: mean={x.mean().item():.6f} min={x.min().item():.6f} max={x.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   residual: mean={residual.mean().item():.6f} min={residual.min().item():.6f} max={residual.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   post_layer_mix: mean={post_layer_mix.mean().item():.6f} min={post_layer_mix.min().item():.6f} max={post_layer_mix.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   comb_res_mix: mean={comb_res_mix.mean().item():.6f} min={comb_res_mix.min().item():.6f} max={comb_res_mix.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   mixed_residual: mean={mixed_residual.mean().item():.6f} min={mixed_residual.min().item():.6f} max={mixed_residual.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   post_term: mean={post_term.mean().item():.6f} min={post_term.min().item():.6f} max={post_term.max().item():.6f}",
-                        flush=True)
-                    print(
-                        f"[NAN_DETECTION_DETAIL]   res_dbg: mean={res_dbg.to(torch.float32).mean().item():.6f} min={res_dbg.to(torch.float32).min().item():.6f} max={res_dbg.to(torch.float32).max().item():.6f}",
-                        flush=True)
-        return res
-
-    # MHCPreOp.forward_native = debug_mhc_pre_native
-    # MHCPostOp.forward_native = debug_mhc_post_native
 
     # 6. Patch bind_kv_cache to bypass TPU platform NotImplementedError
     import vllm.v1.worker.utils as worker_utils
@@ -1782,26 +1421,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     worker_utils.bind_kv_cache = patched_bind_kv_cache
     tpu_runner.bind_kv_cache = patched_bind_kv_cache
-    import vllm.v1.core.kv_cache_utils as kv_utils
-    _orig_get_kv_cache_groups = kv_utils.get_kv_cache_groups
-
-    def patched_get_kv_cache_groups(vllm_config, kv_cache_spec):
-        print(
-            f"[DEBUG_GROUPS_INPUT] kv_cache_spec keys: {list(kv_cache_spec.keys())}",
-            flush=True)
-        for k, v in kv_cache_spec.items():
-            print(
-                f"  {k}: {v.__class__.__name__} window={getattr(v, 'sliding_window', None)} compress={getattr(v, 'compress_ratio', None)}",
-                flush=True)
-        res = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-        print(f"[DEBUG_GROUPS_OUTPUT] returned {len(res)} groups:", flush=True)
-        for idx, g in enumerate(res):
-            print(
-                f"  Group {idx}: {g.kv_cache_spec.__class__.__name__} layers={g.layer_names}",
-                flush=True)
-        return res
-
-    kv_utils.get_kv_cache_groups = patched_get_kv_cache_groups
 
     try:
         yield
