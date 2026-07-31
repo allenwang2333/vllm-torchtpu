@@ -685,7 +685,9 @@ class TpuPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
 
-        is_hybrid = model_config.is_hybrid
+        # `model_config` is optional here -- the dtype block above already
+        # guards for None, and unit tests build a VllmConfig without one.
+        is_hybrid = model_config is not None and model_config.is_hybrid
         if vllm_config.speculative_config is not None and scheduler_config.async_scheduling:
             method = vllm_config.speculative_config.method
             if not vllm_config.speculative_config.use_eagle():

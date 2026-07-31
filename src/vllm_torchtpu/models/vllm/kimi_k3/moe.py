@@ -7,7 +7,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
+# vLLM renamed the MoE entry point: `FusedMoE` (an nn.Module) became the
+# `FusedMoEFactory` function returning a MoERunner. The kwargs are
+# unchanged -- main's signature still accepts the K3-specific
+# activation_situ_beta / routed_input_transform / routed_output_transform.
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -110,7 +114,7 @@ class KimiMoE(nn.Module):
                      if config.hidden_act == "situ" else None)
         situ_linear_beta = (config.activation_situ_linear_beta
                             if config.hidden_act == "situ" else None)
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,

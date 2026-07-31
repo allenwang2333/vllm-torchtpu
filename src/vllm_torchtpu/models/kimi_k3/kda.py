@@ -255,7 +255,7 @@ class KimiK3DeltaAttention(nn.Module):
             ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear)
         from vllm.model_executor.models.utils import extract_layer_index
         from vllm.model_executor.utils import set_weight_attrs
-        from vllm.utils.math_utils import divide
+        from vllm.distributed.utils import divide
 
         del extract_layer_index  # kept for parity with upstream's imports
 

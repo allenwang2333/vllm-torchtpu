@@ -194,7 +194,7 @@ def test_small_experts_use_current_padded_weight_location(
                         lambda: 8)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
-    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="silu",
