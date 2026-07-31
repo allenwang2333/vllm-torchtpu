@@ -1198,6 +1198,8 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if positions.ndim > 1:
+            positions = positions.flatten()
         print(
             "=== [TRACE_DEBUG] VllmDeepseekV4MLAAttention.forward called! ===",
             flush=True)
