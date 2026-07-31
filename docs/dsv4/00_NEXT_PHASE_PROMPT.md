@@ -48,7 +48,9 @@ divergence may be much smaller, or somewhere else entirely.
 1. **Re-baseline.** Re-run the per-layer hidden-state comparison against
    `tpu-inference` on an identical prompt+checkpoint. Identify the first layer
    that diverges materially. This is a *measurement*, not a hypothesis — do it
-   before theorising.
+   before theorising. Per §4.0, prefer a **scripted sweep** that emits one
+   summary table over an interactive read-and-iterate loop; and consider the
+   layer-substitution sweep, which localises the culprit by brute force.
 2. **Audit for the same dtype bug elsewhere.** Grep every site that hands a raw
    `kv_cache` (or any `kv_cache_dtype`-typed tensor) to a kernel that expects
    packed bytes. The attention path is safe because it routes through
@@ -65,6 +67,31 @@ divergence may be much smaller, or somewhere else entirely.
 The previous session had a **0/7 hit rate on hypotheses and ~100% on
 measurements**. Weight your effort accordingly.
 
+### 4.0 THE BINDING CONSTRAINT: Claude usage, not TPU time
+
+**TPU experiments are cheap and plentiful here. Claude usage is the scarce
+resource.** Optimise for *fewer Claude turns*, not fewer runs. This inverts the
+usual instinct and should shape every decision below.
+
+- **One mega-instrumented run, not eight iterative ones.** The previous
+  session's biggest waste was the *shape* of the loop: add a probe -> run ->
+  read -> add another probe -> run. Each cycle costs several turns. Add every
+  plausible probe at once and produce a single rich log.
+- **Prefer brute-force experimental search over clever reasoning.** Example for
+  task 1: rather than reasoning about which layer diverges, run a
+  **layer-substitution sweep** — for each of the 43 layers, force that layer's
+  output to the reference value and see which run repairs generation. ~43 cheap
+  runs identify the culprit directly, with near-zero reasoning. Same for
+  ablations: disable the compressor, disable SWA, swap a kernel for the
+  reference's. Let the hardware search the space.
+- **Script the analysis; don't read logs by hand.** A harness that prints
+  `first divergent layer = X, cos_sim profile = [...]` costs one turn to write
+  and zero thereafter. Eyeballing logs costs a turn every time.
+- **Never poll.** Launch, then check once at the end. Monitor setup and repeated
+  log checks are pure cost with no analytical value.
+- **Batch questions.** If three things are worth knowing, instrument all three
+  before running, even if only one seems likely.
+
 ### 4.1 A contradiction in measured data outranks every open hypothesis
 
 If two measurements are mutually inconsistent under your model, **stop and
@@ -80,9 +107,11 @@ of the session.
 
 ### 4.2 Can a CPU script answer this?
 
-These kernels are **pure JAX** and run fine on CPU. Nearly every ~8-minute
-full-model run last session only refuted a hypothesis a 30-second script could
-have refuted. Reusable harness in [`scratch/cpu_repro/`](../../scratch/cpu_repro):
+These kernels are **pure JAX** and run fine on CPU. Still worth using, but note
+the reason under 4.0's constraint: CPU scripts are valuable because they iterate
+in seconds and so **cost fewer Claude turns**, not because TPU runs are
+expensive. Where a question needs the real model, just run it — and instrument
+it heavily while you're there. Reusable harness in [`scratch/cpu_repro/`](../../scratch/cpu_repro):
 
 | script | answers |
 |---|---|
