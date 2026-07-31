@@ -180,17 +180,21 @@ bug lived only in the dtype of the buffer handed in at the call site.
   (~1.1 GB) **and** `tpu_tier2_cache` (~4.7 GB). Older docs mention only the
   first; clearing just that one silently runs stale kernels. A bit-identical
   result after a real code edit is the tell.
+
   ```bash
   rm -rf /dev/shm/torch_tpu_cache/default/* /dev/shm/torch_tpu_cache/tpu_tier2_cache/*
   ```
+
 - **Never launch the repro with `nohup … & disown` from a tool-driven shell** —
   workers are killed mid-load and leave stray `/dev/vfio` holders. Run in the
   foreground of a backgrounded task. Check before every run:
-  ```bash
+
+```bash
   for i in 0 1 2 3 4 5 6 7; do sudo fuser /dev/vfio/$i; done
   ```
+
 - **Never hand-derive a paged-cache address in a probe.** Import the kernel's
-  own `_state_chunk_dims` and mirror `unpack_state_cache`'s indexing.
+own `_state_chunk_dims` and mirror `unpack_state_cache`'s indexing.
   `slot_mapping` indexes the *state view*
   (`[num_pages, state_block_size, state_dim]`), **not** the raw byte buffer
   (`[num_pages, rows, packing, width]`). A hand-derived address silently read

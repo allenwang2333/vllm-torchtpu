@@ -360,18 +360,19 @@ in Iteration 4, not yet a passing end-to-end result.
 
 - **Prompt:** `"Compare XLA and LLVM in two bullet points."`
 - **Reference Output (`tpu-inference`):**
-  
+
 ```text
   'Here are two key comparisons between XLA and LLVM:\n\n- **Scope and Purpose:** LLVM is a general-purpose, modular compiler infrastructure and toolchain designed to optimize and compile code for a wide variety of programming languages (e.g., C'
   ```
-  
+
 *(coherent and correct)*
 - **Test Output (`vllm-torchtpu`, post Iteration-4 fixes):**
-  
+
   ```text
 'I understand the nature of thepackage com.ibpackage, "spackage",\n  "package.json\n<package> <package 1package",\npackage main\n\nimport\n- * "Ir)package":package com.azurep\n>'
+
   ```
-  
+
   *(Incoherent, but no longer a crash and no longer the pre-fix repetition
 loop — a different symptom of the still-open Iteration 4 numerical bug.)*
 - **Coherence Audit:** Still failing on PyTorch, passing on JAX.
@@ -382,11 +383,11 @@ loop — a different symptom of the still-open Iteration 4 numerical bug.)*
 
 - **Prompt:** `"Compare XLA and LLVM in exactly two bullet points."`
 - **Test Output (`vllm-torchtpu`):**
-  
+
 ```text
   ',Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,Irästyle,'
   ```
-  
+
 *(Incoherent repetition loop — this was the all-zero-attention symptom,
   since fixed; see §2 Iteration 4.)*
 

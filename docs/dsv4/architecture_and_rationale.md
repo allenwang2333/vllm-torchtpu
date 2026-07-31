@@ -103,6 +103,7 @@ ValueError: Attempting to pass a Ref Ref<smem>{int32[274]} to a primitive: dynam
 `lax.dynamic_slice_in_dim(kv_lens_to_attend_ref, q_len_start, bq_sz)` was called directly on an SMEM scalar-prefetch `Ref` — invalid without first indexing it. This is a real, JAX-version-sensitive bug (plausibly surfaced by the `main`-branch "Bump JAX to 0.10.2" commit, which this branch is based on), independent of the output-write bug above. The discarded diff from §2.1 happened to also contain the correct fix for this line; it was reapplied on its own after confirming (via the reverted state failing this exact test) that it was necessary.
 
 **Fix:**
+
 ```python
 slice_lens = jnp.stack([kv_lens_to_attend_ref[q_len_start + i] for i in range(bq_sz)])
 ```
@@ -121,6 +122,7 @@ attention_sinks = jnp.concat([attention_sinks_ref[...] for _ in range(bq_sz)])[.
 — reading the full (padded) `attention_sinks_ref` without first slicing to `num_q_heads`. The sibling file `mla_swa.py` (never touched this session) already had the correct form (`attention_sinks_ref[:num_q_heads]`), confirming this was a `mla.py`-specific regression, not a case where the fix was wrong. `mla.py` has seen far more churn than `mla_swa.py` throughout this effort (per the regression-audit findings below), consistent with it losing a previously-applied fix.
 
 **Fix:**
+
 ```python
 sinks_clean = attention_sinks_ref[...][:num_q_heads]
 attention_sinks = jnp.concat([sinks_clean for _ in range(bq_sz)])[..., None]
@@ -185,6 +187,7 @@ Beyond the swa_cache/kv_cache issues above, the rest of the file's uncommitted d
 `quantize_fp8_ue8m0` (`kernels/deepseek_v4/compress_norm_rope.py`) was legitimately changed earlier this branch to return a plain biased-exponent `uint8` instead of a `float8_e8m0fnu`-typed value — a deliberate fix to avoid `float8_e8m0fnu`'s NaN-decoding byte patterns (`0xFF` decodes to NaN). `mla.py`/`mla_swa.py` already decode this correctly via `jnp.exp2(x - 127.0)`. The test's own reference implementation (`_boundary_store_ref`) never got updated to match and was still doing a raw `.astype(np.float32)` cast of the biased exponent (giving e.g. `130.0` instead of the real scale `2**(130-127) = 8.0`).
 
 **Fix:**
+
 ```python
 scale = np.exp2(np.asarray(scale[0]).astype(np.float32) - 127.0)
 ```
@@ -243,12 +246,14 @@ Tracing further surfaced a bigger, unresolved architectural question: the compre
 **Real root cause (confirmed via fresh dump + fix, verified against kernel tests):** `mla.py`'s and `mla_swa.py`'s `flash_attention` inner functions correctly zero the attention-weight `p` at masked/invalid key positions (`p = jnp.where(mask, 0.0, ...)`), but never sanitize the raw `kv` values before `pv = jnp.einsum("nm,md->nd", p, kv, ...)`. In IEEE-754, `0.0 * NaN == NaN`, so any `kv` row that's still poison bytes from a never-written cache page (confirmed: `0x7F`/`0xFF` bytes in `main_cache_kv`, decoding to NaN under fp8) corrupts the reduction at that column for *every* query in the block, regardless of the zero weight. Symptom matched exactly: on a first-15-token HCA prefill (`extra`/`kv_lens_to_attend` = 0 everywhere, i.e. nothing should be read from the compressed cache at all yet), one deterministic output column was NaN across every token and every head.
 
 **Fix applied** (both `mla.py` line ~210 and `mla_swa.py` line ~191, same pattern): compute `row_invalid = jnp.all(mask, axis=0)` (a key row masked out for *every* query in the block — safe to zero regardless of garbage content, since no query actually needs it), then zero those `kv` rows before the `pv` einsum:
+
 ```python
 row_invalid = jnp.all(mask, axis=0)
 row_scale = jnp.where(row_invalid, 0.0, 1.0).astype(kv.dtype)
 kv_clean = kv * row_scale[:, None]
 pv = jnp.einsum("nm,md->nd", p, kv_clean, preferred_element_type=jnp.float32)
 ```
+
 **Mosaic gotcha:** the first attempt used `jnp.where(row_invalid[:, None], 0.0, kv)`, reshaping the *boolean* `row_invalid` directly — this fails to compile (`MosaicError: unsupported shape cast`, `vector<16xi1> -> vector<16x1xi1>`). Mosaic doesn't support adding a trailing axis to an i1 (boolean) vector. Fix: only ever reshape/broadcast a float-dtype array; use the boolean only as a same-shape `jnp.where` condition (no reshape needed there), cast to `kv.dtype` first, *then* do the `[:, None]` broadcast.
 
 Verified: all 12 kernel tests still pass with both fixes. `mla_swa.py` needed the identical fix independently discovered — a first full-model run with only `mla.py` patched still showed NaN (now at both layers 2 and 3), because CSA/HCA layers share one physical cache buffer between the SWA kernel and the main kernel (`two_caches_same_buffer`), so the SWA kernel's own unguarded `pv` einsum was reading the same poisoned pages via its own separate vulnerability.

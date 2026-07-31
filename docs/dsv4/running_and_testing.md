@@ -16,11 +16,13 @@ docker images | grep vllm-torchtpu-local
 ```
 
 **If this image is missing** (it disappeared mid-session-7, cause unknown — not this session's doing, and the `vllm-torchtpu-local:latest` tag was gone with no obvious replacement): first try re-pulling/re-authenticating rather than rebuilding from scratch:
+
 ```bash
 gcloud auth configure-docker us-central1-docker.pkg.dev
 docker pull us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-patemotter_google_com:latest
 docker build -f docker/Dockerfile.local -t vllm-torchtpu-local:latest docker/
 ```
+
 **Correction (session 8): `docker/Dockerfile.local` is NOT a no-op FROM-only file** — it has two real build steps (`RUN rm -rf .../tpu_inference*` and `COPY libtpu.so ...`). A previous session's doc claimed pulling+retagging the raw registry image was sufficient; this is wrong and was verified wrong empirically (session 8: a raw pull+retag left `tpu_inference` present — `find_spec('tpu_inference')` returned non-`None`, i.e. `CONFLICT`, not `clean`). **Always run the `docker build` step**, not a plain `docker tag`, when restoring this image. (In session 8 the build's two custom layers hit the Docker layer cache and completed instantly, reproducing the exact prior image — but don't assume that cache will always be warm.) Verify if in doubt: same command below (must print `clean`, not `CONFLICT`).
 
 ```bash
@@ -145,8 +147,9 @@ This is left armed intentionally (see rationale doc §4) — it's the single mos
 1. **Before a run you care about, clear stale dumps**: `rm -f scratch/nan_dump_*.pt` — otherwise you can't tell which dumps are fresh (this tripped me up once this session; always check `ls -la --time-style=full-iso` against the run's actual timeframe if you forget).
 2. **After a run, find the true origin layer**, not just any layer that has a dump — NaN propagates through the residual stream, so every layer *after* the origin will also show a dump. Compare `q`/`kv` (the attention op's own inputs) for NaN: if they're already corrupted, the bug is upstream of that layer; if they're clean but `output` isn't, that layer's own kernel is the origin.
 3. **Inspect a dump** (must run inside the docker image — no local `torch`):
+
    ```bash
-   docker run --rm -v /home/patemotter_google_com/workspace:/home/patemotter_google_com/workspace \
+docker run --rm -v /home/patemotter_google_com/workspace:/home/patemotter_google_com/workspace \
      vllm-torchtpu-local:latest python3 -c "
    import torch
    data = torch.load('scratch/nan_dump_model.layers.<N>.attn_rank0.pt', map_location='cpu')
@@ -154,7 +157,9 @@ This is left armed intentionally (see rationale doc §4) — it's the single mos
        if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
            print(k, list(v.shape), 'NaN=', torch.isnan(v).sum().item(), '/', v.numel())
    "
+
    ```
+
 4. **For byte-level cache inspection** (e.g. checking if a specific cache position is a raw uninitialized/poison byte pattern vs. a computed value): load `main_cache_kv`/`sw_cache` (shape `[num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]`), index by `main_page_indices[0]` to get the physical page, reshape to `[page_size, lkv_dim]`, and inspect raw bytes at specific `(row, col)` positions directly — see the session's actual analysis commands for the exact pattern (they're reconstructable from `kernels/deepseek_v4/mla.py`'s `load_bkv` function, which documents the exact byte layout: 448 fp8 nope + 128 bf16 rope (packed as 2×64 bytes) + 7 UE8M0 scale bytes + padding).
 5. **`scratch/inspect_dump.py`** is a pre-existing (though `layers.0`-hardcoded) script doing a version of this — useful as a reference/template, edit the layer number before running.
 
@@ -173,12 +178,14 @@ Existing `float8_e4m3fn` NaN bit patterns (confirmed this session, `ml_dtypes`):
 **Ruled out (round 2)**: an isolated-kernel write bug in `mla_swa.py`'s `_pack_new_kv`/`_update_kv_cache` alone. Built `scratch/poison_fill_repro.py` (pre-fills the SWA cache with `0xFF` poison, calls the real `mla_sliding_window_ragged_paged_attention` on real TPU hardware with a scenario matching the real dump exactly — 15-token fresh prefill padded to 16, matching page size/page-index-1 start) — every in-range row was correctly, fully overwritten. The SWA write kernel itself is fine in isolation.
 
 **Confirmed architectural root cause**: `custom_ops/deepseek_v4.py`'s `_deepseek_v4_compressor_jax` (~lines 179-199) computes *both* the compressor's state slot mapping and its compressed-KV slot mapping by indexing into the **same** `state_block_tables` array:
+
 ```python
 state_cache_block_num = positions // state_block_size + token_to_req_indices * max_num_blocks_per_req
 slot_mapping = state_block_tables[state_cache_block_num] * state_block_size + state_cache_block_offset
 k_cache_block_num = (positions // compress_ratio) // k_block_size + token_to_req_indices * max_num_blocks_per_req
 kv_slot_mapping = state_block_tables[k_cache_block_num] * k_block_size + k_cache_block_offset
 ```
+
 For any token before the first compression boundary (`compress_ratio=128`, positions 0-14: `k_cache_block_num` evaluates to `0` for every one of them), `kv_slot_mapping` resolves to `state_block_tables[0]` — the *same* physical page number the state mapping also uses for early positions. `tests/kernels/test_dsv4_compressor.py`'s own test harness (`_make_inputs`) explicitly avoids this by placing state and KV pages in disjoint ranges (`kv_base = num_state_pages * PAGE_SIZE`, with a comment calling out exactly this hazard) — the real model's indexing has no equivalent separation. Since HCA layers share their cache buffer with the main/SWA attention cache (`two_caches_same_buffer`), and the compressor's (unconditional, every-token) state write runs before the attention forward's own SWA write in the same layer's `attn_gemm` → `forward_mqa` call order, the state write's physical target can coincide with rows the SWA write is also responsible for — and the SWA write's own dense sub-word packing logic (`_pack_new_kv`) evidently doesn't cleanly re-cover every byte lane on top of it, leaving the residual corruption (columns 10/34 in specific rows) that was observed.
 
 **Fixed and confirmed**: `custom_ops/deepseek_v4.py`'s `state_cache_block_num`/`k_cache_block_num` (in `_deepseek_v4_compressor_jax`) were missing the modulo wraparound against `max_num_blocks_per_req` that a circular/sliding-window buffer requires — real runtime values confirmed `state_block_size=1`, `max_num_blocks_per_req=8`, meaning any position beyond 8 aliased into the *next* request's block-table slice. Added `% max_num_blocks_per_req` to both the write side (`custom_ops/deepseek_v4.py`) and the read side (`gather_state_windows` in `compress_norm_rope.py`, which had the identical gap — fixing only one side would have created a new write/read mismatch). **Confirmed via a full model run**: layers 0-1 are now clean (previously the very first layer, an HCA type, already showed corruption). All 12 kernel tests still pass.
@@ -279,10 +286,12 @@ Fixing just the dtype gate was not enough to get a working run — it unmasked f
 All five fixes are in `_get_active_sw_cache`/`_get_active_main_cache`/`forward_mqa` in `deepseek_v4_attention.py` (helper: new `_as_kernel_cache_view` static method). **Result: the pipeline now runs end-to-end with zero crashes/exceptions for the first time in this entire investigation** — full prefill + decode to `max_tokens`, real (non-dummy) cache flowing through the SWA-only path throughout.
 
 **But the output is still garbled** — confirmed a *different* bug from all nine sessions' prior findings, via the same sub-layer bisection, rerun with matching prompt/tokenization against a fresh `tpu-inference` reference:
+
 ```
 sub_01_hc_pre_attn   mean_cos=1.000000  OK    (attention's *input* — matches exactly)
 sub_02_post_attn     mean_cos=0.133476  DIVERGE  (attention's *output* — no longer zero, but numerically wrong)
 ```
+
 Generated text (matching prompt `"Compare XLA and LLVM in two bullet points."`, tokenization verified identical): `'I understand the nature of thepackage com.ibpackage, "spackage",\n  "package.json\n<package> <package 1package",\npackage main\n\nimport\n- * "Ir)package":package com.azurep\n>'` — incoherent, but a different failure signature than any of sessions 4-8's recorded outputs (not the `000`-loop, not the `.`-loop, not `Irästyle` repetition) — consistent with this being new territory, not a recurrence of an old bug.
 
 **Important scope note for whoever picks this up**: `sub_02_post_attn` is dumped at the *entire attention module's* output (`x = self.attn(positions, x, None)` in `_forward_unfused_post_pre`) — this brackets `attn_gemm` (QKV projection) → `qnorm_rope`/`kv_rope` → `forward_mqa`/kernel call → `_o_proj` (dequant + grouped einsum + `wo_b`) *all together* as one black box. The divergence could be introduced anywhere in that range, not necessarily in the cache/kernel plumbing this session's fixes touched. **Recommended next step**: add 1-2 finer-grained dump points *inside* `attention_impl`/`forward_mqa` — e.g. right after `q = self.qnorm_rope(...)` / `kv = self.kv_rope(...)` (before the kernel call) and right after `self.attn_op(...)` returns (before `_o_proj`) — mirrored in `tpu-inference`'s equivalent (`tpu_inference/layers/vllm/custom_ops/experimental/deepseek_v4/deepseek_v4_attention.py`, same function names) to bisect within this range: projections/RoPE vs. the kernel/cache read-write cycle vs. `_o_proj`.
@@ -311,14 +320,17 @@ DSV4_NUM_GPU_BLOCKS=512 \
 DSV4_DUMP_HIDDEN_STATES=1 \
 nohup python examples/run_dsv4_inference.py > /home/patemotter_google_com/workspace/scratch/run_<name>.log 2>&1 &
 ```
+
 Takes ~10-13 min (mostly MoE weight loading from the `VLLM_FP4_CACHE_DIR` cache, `/dev/shm/dsv4-flash-real-fp4` — already warm, don't delete it). Tail the log or `pgrep -f run_dsv4_inference.py` to check progress; the background process does **not** exit when the launching shell command returns (it's `nohup`'d + backgrounded) — wait for `Generated text:` or a traceback in the log, not for the shell command itself to report done.
 
 The `tpu-inference` reference side needs its own separate venv/run — see §1.2-1.3 above for that environment; the existing reference dump at `scratch/hidden_states/tpu_inference/` (prompt `"Compare XLA and LLVM in two bullet points."`, 15 tokens, matches the command above) is still valid and doesn't need re-running unless the reference implementation itself has changed.
 
 After a run, compare with:
+
 ```bash
 python /home/patemotter_google_com/workspace/scratch/compare_sublayer.py
 ```
+
 (This script now lives in `scratch/` — it previously only existed in a background-job temp dir that gets cleaned up; copied here this session specifically so it survives into future sessions.)
 
 ### Files modified this session (uncommitted at session end — review before committing)

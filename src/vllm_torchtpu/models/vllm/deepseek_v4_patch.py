@@ -22,8 +22,8 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-import os
-import sys
+import os  # noqa: E402
+import sys  # noqa: E402
 
 print("[PATCH] Top-level import of deepseek_v4_patch.py",
       file=sys.stderr,
@@ -432,7 +432,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 file=sys.stderr,
                 flush=True)
             self.model.has_tilelang = False
-            for idx, l in enumerate(self.model.layers):
+            for idx, l in enumerate(self.model.layers):  # noqa: E741
                 l.layer_idx = idx
                 l.has_tilelang = False
                 if hasattr(l, "ffn"):
@@ -1675,7 +1675,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         )
 
 
-from typing import Iterable
+from typing import Iterable  # noqa: E402
 
 
 def patched_decoder_load_weights(
