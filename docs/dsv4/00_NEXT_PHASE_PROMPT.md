@@ -187,6 +187,14 @@ the failure mode: still fluent, still unfaithful, no crash, no degradation. So
 **the sparse-attention path is not the cause**, and the §3.0 hypothesis below
 (kept for the record) was wrong.
 
+### Ablation validity: confirmed
+
+`sliding_window = 128` (config.json) and the test prompt is ~15 tokens, so SWA
+alone covers the **entire** prompt. The ablation is therefore a fair test: with
+the sparse path disabled every token is still attendable via dense local
+attention, so losing content cannot be blamed on "no long-range mechanism".
+The exoneration holds.
+
 ### The sharpened symptom — read this carefully
 
 Both outputs correctly absorb **"compare two things in two bullet points"** and
@@ -208,8 +216,33 @@ order:
 4. **The attention computation** (not the sparse *selection*, which is now
    exonerated).
 
-Note this also means the 43-layer sweep (§3.1) is now the right next move rather
-than a guess — the ablation did its job by eliminating a subsystem.
+**Tokenization is already ruled out** (checked, no run needed):
+`'Compare'|' X','LA'|' and'|' LL','VM'|' in',' two',' bullet',' points','.'`
+= `43651 | 2137 11318 | 305 | 33792 24695 | 295 1234 37561 4365 16`, clean
+roundtrip. So candidate 1 above is closed.
+
+Cross-referencing those ids against the generated ones is informative: the model
+**copies** `' two'(1234) ' bullet'(37561) ' points'(4365)` verbatim from the
+prompt, but never emits `' X'(2137) 'LA'(11318) ' LL'(33792) 'VM'(24695)`. It
+retains the *late, generic* prompt tokens and drops the *early, specific* ones.
+
+Two readings fit that equally well, and they are **cleanly discriminable in one
+run**:
+
+- **Positional** — early prompt positions are mishandled (RoPE / position
+  binding).
+- **Salience** — residual numerical error degrades the signal, and rare/specific
+  content is the first casualty while high-frequency instruction patterns
+  survive.
+
+**The discriminator:** move the content to the end of the prompt, e.g.
+`"In two bullet points, compare XLA and LLVM."` If XLA/LLVM now survive, it is
+positional. If they are still lost, it is salience — i.e. diffuse numerical
+error, which argues for the per-layer sweep rather than a single localised bug.
+Run this before the 43-run sweep; it is one run and it changes which
+investigation you start.
+
+Note the ablation did its job either way by eliminating a subsystem.
 
 ### The one-run discriminator (superseded — already run, see above)
 
