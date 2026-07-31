@@ -62,6 +62,75 @@ divergence may be much smaller, or somewhere else entirely.
 
 ---
 
+## 3.1 Concrete recipe: the layer-substitution sweep
+
+This is the recommended **first experiment**, written out so it can be built in
+one turn rather than designed from scratch. It localises the culprit layer by
+brute force, which is the right trade when runs are cheap and turns are not
+(§4.0).
+
+### Idea
+
+For each layer `L` in `0..42`: run generation normally, but **overwrite layer
+`L`'s output with the reference's** (from `tpu-inference`) for every token, then
+record the generated text. The first `L` whose substitution repairs the output
+is where the divergence originates. One script, ~43 runs, one summary table, no
+reasoning required.
+
+### Prerequisites — verify BEFORE launching 43 runs
+
+1. **Regenerate or validate the reference dumps.** Existing ones live at
+   `scratch/hidden_states/tpu_inference/`. The reference implementation is
+   unchanged, so they *should* still be valid — but confirm the prompt,
+   checkpoint snapshot, `max_tokens`, and batch shape match the run you are
+   about to do. A 43-run sweep built on mismatched dumps is 43 wasted runs and,
+   worse, a confident wrong answer. Reference runner:
+   `scratch/run_dsv4_reference.py` (separate venv — see `running_and_testing.md`).
+2. **Mind the Hyper-Connections axis.** `config.json` has `"hc_mult": 4`, so
+   dumped hidden states are `(num_tokens, 4, hidden_size)` and the size-4 axis
+   is **4 stream copies, not 4 tokens**. A previous session lost significant
+   time to a comparison script that mistook it for a token axis and manufactured
+   a fake "embedding corruption" finding. Substitute the full
+   `(tokens, 4, hidden)` tensor.
+3. **Confirm head-sharding alignment.** `vllm-torchtpu` shards attention heads
+   across TP ranks; `tpu-inference` does not. `scratch/compare_sublayer.py`
+   already contains the slicing fix — reuse it rather than re-deriving.
+
+### Implementation sketch
+
+- Hook: the per-layer loop in `models/vllm/deepseek_v4_patch.py`, alongside the
+  existing `DSV4_DUMP_HIDDEN_STATES` machinery (which already dumps
+  `layer{NN}_step{NNN}.npy`, so the write path and naming are established —
+  invert it to *read*).
+- Gate on a new env var, e.g. `DSV4_SUBSTITUTE_LAYER=<int>` plus
+  `DSV4_SUBSTITUTE_DIR=<path>`; inert when unset.
+- Driver script: loop `L` over `0..42`, launch a run per `L`, capture generated
+  text, emit **one table** `layer -> generated_text_prefix -> repaired?`.
+- Run it unattended and read the table once. Do not poll (§4.0).
+
+### Interpreting the result
+
+| outcome | meaning |
+|---|---|
+| substitution at layer `L` repairs output, `L-1` does not | divergence originates in layer `L`; bisect its sub-blocks next |
+| **no** single layer repairs it | the error is distributed/accumulating, not one bad layer — switch to per-layer `cos_sim` profiling to find where it starts growing |
+| **every** layer from some point repairs it | consistent with a single origin upstream; take the earliest |
+| substitution changes nothing anywhere | the substitution hook itself is not taking effect — verify with a deliberate corruption (substitute noise and confirm output degrades) before trusting any negative result |
+
+That last row is the control, and it is not optional — see §4.4.
+
+### Cheaper variants worth batching alongside
+
+Since runs are cheap, launch these in the same sweep rather than sequentially:
+
+- **Ablations**: disable the compressor entirely; disable SWA; force
+  `swa_only` on all layers. Each isolates a subsystem.
+- **Prompt sensitivity**: 2–3 different prompts, to distinguish a systematic
+  numerical bug from prompt-specific behaviour.
+- **`max_tokens` sweep**: confirms whether quality degrades with depth.
+
+---
+
 ## 4. How to work — rules earned the hard way
 
 The previous session had a **0/7 hit rate on hypotheses and ~100% on
