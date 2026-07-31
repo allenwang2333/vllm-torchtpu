@@ -1382,7 +1382,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         # Iteration 7) -- historically also a recurring trouble spot per
         # earlier sessions' notes.
         dump = (os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1"
-                and layer_idx in (0, 2) and not is_compiling)
+                and layer_idx in (0, 1, 2) and not is_compiling)
         if not dump:
             return _orig_forward_unfused_post_pre(self, x, positions,
                                                   input_ids, post_mix, res_mix,
