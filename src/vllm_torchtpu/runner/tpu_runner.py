@@ -3338,14 +3338,29 @@ class TPUModelRunner(GPUModelRunner):
             sync.synchronize(out, wait=True)
         self._hidden_states_dtype = out.dtype
 
+    def _log_hbm_checkpoint(self, tag: str) -> None:
+        """Debug-only live HBM usage checkpoint (DSV4 OOM investigation)."""
+        try:
+            free_b, limit_b = torch.accelerator.get_memory_info(self.device)
+            used_gb = (limit_b - free_b) / (1 << 30)
+            free_gb = free_b / (1 << 30)
+            limit_gb = limit_b / (1 << 30)
+            logger.info(
+                "[HBM_CHECKPOINT] %s: used=%.2fGiB free=%.2fGiB limit=%.2fGiB",
+                tag, used_gb, free_gb, limit_gb)
+        except Exception as e:
+            logger.info("[HBM_CHECKPOINT] %s: <failed to read: %s>", tag, e)
+
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
         """Common boilerplate for each AOT bucket precompile pass."""
         logger.info("Compiling %s with different input shapes.", name)
+        self._log_hbm_checkpoint(f"before {name}")
         start = time.perf_counter()
         yield
         logger.info("Compilation finished in %.2f [secs].",
                     time.perf_counter() - start)
+        self._log_hbm_checkpoint(f"after {name}")
         self._update_num_xla_graphs(name)
 
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
@@ -4302,7 +4317,9 @@ class TPUModelRunner(GPUModelRunner):
                 return spec.kv_cache_specs[layer_name]
             return spec
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        self._log_hbm_checkpoint("initialize_kv_cache: before tensor loop")
+        for _kv_group_idx, kv_cache_tensor in enumerate(
+                kv_cache_config.kv_cache_tensors):
             # If the KV cache tensor is shared by multiple layers, then we
             # duplicate cache for each layer and `num_blocks` is calculated
             # based on the total size of the shared cache.
@@ -4341,14 +4358,34 @@ class TPUModelRunner(GPUModelRunner):
             elif len(shared_by) > 1:
                 # Non-Mamba multi-layer sharing (e.g. DeepSeek-V4's
                 # page-size-bucketed groups from
-                # `_get_kv_cache_config_deepseek_v4`): every layer in
-                # `shared_by` has an identical page size by construction, so
-                # use any one representative layer's page size rather than
-                # summing across all of them.
-                page_size_bytes = _per_layer_spec(shared_by[0]).page_size_bytes
-                num_blocks = tensor_size // page_size_bytes
+                # `_get_kv_cache_config_deepseek_v4`, aliased to vLLM's
+                # `_get_kv_cache_config_packed`): `kv_cache_tensor.size` here
+                # is NOT this group's own byte allocation -- vLLM's packed
+                # allocator sets `size=total_size` (the sum across *every*
+                # emitted KVCacheTensor / bucket, see `_get_kv_cache_config_packed`
+                # in vllm/v1/core/kv_cache_utils.py) on every single tensor it
+                # emits, since they all alias one shared, block-strided
+                # backing buffer (`byte_offset`/`block_stride` address each
+                # bucket's slice within it). Dividing that *global* total by
+                # one bucket's own page size (as this used to do) inflates
+                # `num_blocks` by roughly the number of buckets (confirmed:
+                # ~193x too large on a real DSV4 run, causing a ~15GiB
+                # allocation *per layer* and a spurious HBM OOM instead of
+                # respecting `num_gpu_blocks_override`). The already-correct,
+                # override-respecting global block count is
+                # `kv_cache_config.num_blocks` -- the same value the
+                # single-layer branch below uses; every layer in every group
+                # shares the exact same global `num_blocks` for a packed
+                # layout, so there is nothing group-specific to recompute
+                # here.
+                num_blocks = kv_cache_config.num_blocks
             else:
                 num_blocks = kv_cache_config.num_blocks
+
+            logger.info(
+                "[KV_SIZE_DEBUG] group tensor_size=%d shared_by=%s "
+                "num_blocks=%d spec0=%r", tensor_size, shared_by, num_blocks,
+                _per_layer_spec(shared_by[0]))
 
             for layer_name in shared_by:
                 kv_cache_spec = _per_layer_spec(layer_name)
@@ -4385,6 +4422,19 @@ class TPUModelRunner(GPUModelRunner):
                         kv_cache_spec.dtype,
                     )
                     dtype = kv_cache_spec.dtype
+                    _nbytes = 1
+                    for _d in kv_cache_shape:
+                        _nbytes *= _d
+                    _nbytes *= dtype.itemsize
+                    logger.info(
+                        "[KV_SIZE_DEBUG] MLA layer=%s shape=%s dtype=%s "
+                        "bytes=%d (%.3fGiB) compress_ratio=%r "
+                        "block_size=%r num_kv_heads=%r head_size=%r",
+                        layer_name, kv_cache_shape, dtype, _nbytes,
+                        _nbytes / (1 << 30),
+                        getattr(kv_cache_spec, "compress_ratio",
+                                None), kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype).to(self.device)
 
@@ -4412,6 +4462,9 @@ class TPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
+            self._log_hbm_checkpoint(
+                f"initialize_kv_cache: after group {_kv_group_idx} "
+                f"({len(shared_by)} layers, tensor_size={tensor_size})")
 
         self._add_shared_kv_cache_aliases(kv_caches)
 

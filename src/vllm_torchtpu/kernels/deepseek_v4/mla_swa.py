@@ -201,8 +201,24 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                         preferred_element_type=jnp.float32)
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        # Prevent NaN from -inf - (-inf) when a block is fully masked out
-        exp_cond = (m_curr == m_prev) | (m_curr <= mask_value)
+        # Guard only the genuine -inf - (-inf) hazard: m_curr can only be
+        # -inf if no valid KV entry has been seen in any block so far
+        # (m_curr = max(m_prev, s_rowmax) >= m_prev, so m_curr == -inf
+        # implies m_prev == -inf too). `m_curr == m_prev` alone is NOT a
+        # hazard -- it's the ordinary, extremely common case where a later
+        # (often fully-masked, e.g. beyond this query's causal position)
+        # block simply doesn't raise the running max, and exp(m_prev -
+        # m_curr) = exp(0) = 1 is the mathematically correct answer that
+        # must be computed to preserve l_prev/o_prev unchanged. The
+        # previous `(m_curr == m_prev) | ...` condition forced exp_m_diff
+        # to 0 in that ordinary case instead, silently discarding every
+        # earlier KV block's accumulated contribution whenever a
+        # subsequent block didn't update the max -- for a query whose
+        # causal window spans multiple blocks, only the last block to
+        # actually raise the max (often the very last block) survived,
+        # producing exactly-zero output for any query whose entire
+        # attendable range fit in blocks before the final one.
+        exp_cond = jnp.isneginf(m_curr)
         safe_m_prev = jnp.where(exp_cond, 0.0, m_prev)
         safe_m_curr = jnp.where(exp_cond, 0.0, m_curr)
         safe_diff = safe_m_prev - safe_m_curr
@@ -994,8 +1010,14 @@ def quantize_kv_inputs(kv: jax.Array):
     bf16_uint8 = jax.lax.bitcast_convert_type(rope, jnp.uint8).reshape(
         *batch_dims, 128)
 
-    scales_uint8 = (exponent + 127.0).astype(jnp.int32).astype(
-        jnp.uint8).reshape(*batch_dims, 7)
+    # Saturate rather than wrap: the reference casts to jnp.float8_e8m0fnu,
+    # which this libtpu lacks, so the byte is built by hand -- but an
+    # unclamped (exponent + 127) -> int32 -> uint8 chain wraps modulo 256 for
+    # exponents outside [-127, 128], silently converting a huge scale into a
+    # tiny one with nothing to flag it. Matches quantize_fp8_ue8m0.
+    scales_uint8 = jnp.clip(exponent + 127.0, 0.0,
+                            254.0).astype(jnp.int32).astype(jnp.uint8).reshape(
+                                *batch_dims, 7)
     pad_uint8 = jnp.zeros((*batch_dims, 57), dtype=jnp.uint8)
     quantized = jnp.concatenate(
         [fp8_uint8, bf16_uint8, scales_uint8, pad_uint8], axis=-1)
@@ -1023,7 +1045,6 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "logical_page_size",
         "unnormalized_output",
-        "tp_size",
     ),
     donate_argnames=("cache_kv", ),
 )
@@ -1050,7 +1071,6 @@ def mla_sliding_window_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     unnormalized_output: bool = False,
-    tp_size: int = 1,
 ) -> tuple[
         jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
         jax.
@@ -1128,9 +1148,7 @@ def mla_sliding_window_ragged_paged_attention(
     assert logical_page_size % kv_packing == 0
     page_size_per_kv_packing = logical_page_size // kv_packing
 
-    # Partition global query head count across tensor-parallel workers.
-    _, num_q_heads_global, _ = q.shape
-    num_q_heads = num_q_heads_global // tp_size
+    _, num_q_heads, _ = q.shape
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0

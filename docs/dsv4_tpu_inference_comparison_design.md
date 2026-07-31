@@ -261,8 +261,132 @@ every layer in a single run.
 
 ### 2.7 Estimated effort
 
-Rough, not a commitment: a few hours for a careful implementer who reads both codebases
-first -- most of the time goes to (a) finding tpu-inference's correct per-layer hook point
-under `jax.jit`, and (b) the sharding/quantization-equivalence checks in §2.6, not the
-comparison script itself (which is a small, mechanical numpy diff once both sides can
-produce comparable dumps).
+Rough, not a commitment: a few hours for a careful implementer. The main risk (JAX host callbacks under `jax.jit` / `torchax`) has been successfully resolved via a spike.
+
+---
+
+## Part 3: Feasibility Spike Results & Verified Code Snippets
+
+A feasibility check was executed on the remote VM (`alyssa`) on July 30, 2026, confirming that host callbacks function correctly within jitted `torchax`/JAX contexts.
+
+### 3.1 JAX Host Callback Spike Code
+We ran `scratch/test_callback.py` using `jax.debug.callback`:
+```python
+def host_callback(arr_np):
+    step = state["step_idx"]
+    os.makedirs("scratch", exist_ok=True)
+    filepath = f"scratch/test_callback_step{step:03d}.npy"
+    np.save(filepath, arr_np)
+    print(f"[CALLBACK] Saved {filepath} shape={arr_np.shape}", flush=True)
+    state["step_idx"] += 1
+```
+Output verified: JAX invokes the callback exactly once per step on host process 0, correctly updating host Python state (`step_idx`) across successive jitted calls.
+
+### 3.2 vllm-torchtpu Side Instrumentation
+In `src/vllm_torchtpu/models/vllm/deepseek_v4_patch.py`, extend `patched_layer_forward`:
+```python
+    def patched_layer_forward(self, *args, **kwargs):
+        res = _orig_layer_forward(self, *args, **kwargs)
+        is_compiling = (hasattr(torch, "compiler")
+                        and torch.compiler.is_compiling()) or (hasattr(
+                            torch, "_dynamo") and torch._dynamo.is_compiling())
+        if not is_compiling and os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                layer_idx = getattr(self, "layer_idx", -1)
+                if not hasattr(self, "_step_idx"):
+                    self._step_idx = 0
+
+                x = res[0] if isinstance(res, (tuple, list)) else res
+                if isinstance(x, torch.Tensor):
+                    import numpy as np
+                    tensor_cpu = x.detach().cpu().to(torch.float32).numpy()
+                    os.makedirs("scratch/hidden_states/vllm_torchtpu", exist_ok=True)
+                    filepath = f"scratch/hidden_states/vllm_torchtpu/layer{layer_idx:02d}_step{self._step_idx:03d}.npy"
+                    np.save(filepath, tensor_cpu)
+                    self._step_idx += 1
+        return res
+```
+
+### 3.3 tpu-inference Side Instrumentation
+In `tpu_inference/models/vllm/experimental/deepseek_v4.py`, update `DeepseekV4DecoderLayer`:
+1. Initialize fields in `__init__`:
+```python
+        self.layer_idx = extract_layer_index(prefix)
+        self.step_idx = 0
+```
+2. Instrument `forward`:
+```python
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None,
+               torch.Tensor | None]:
+        res = self._forward_unfused_post_pre(x, positions, input_ids,
+                                              post_mix, res_mix, residual)
+
+        if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1":
+            import jax
+            from torchax.interop import jax_view
+            out_tensor = res[0]
+            jax_x = jax_view(out_tensor).astype(jax.numpy.float32)
+
+            def save_tpu_inference_hidden_state(arr_np):
+                import os
+                import numpy as np
+                if jax.process_index() == 0:
+                    os.makedirs("scratch/hidden_states/tpu_inference", exist_ok=True)
+                    filepath = f"scratch/hidden_states/tpu_inference/layer{self.layer_idx:02d}_step{self.step_idx:03d}.npy"
+                    np.save(filepath, arr_np)
+                    self.step_idx += 1
+
+            jax.debug.callback(save_tpu_inference_hidden_state, jax_x)
+
+        return res
+```
+
+---
+
+## Part 4: Comparison Script Details (`compare_hidden_states.py`)
+
+A python script `scratch/compare_hidden_states.py` will load files matching `layer{layer_idx:02d}_step{step_idx:03d}.npy` from both directories and compute:
+1. **Cosine Similarity:**
+   $$\text{sim} = \frac{a \cdot b}{\|a\| \|b\|}$$
+2. **Relative L2 Error:**
+   $$\text{error} = \frac{\|a - b\|_2}{\|a\|_2 + \epsilon}$$
+
+Output is printed as a table sorted by layer index. The bisection search goal is to locate the lowest layer index $N$ where cosine similarity drops significantly below $1.0$ (e.g. $< 0.999$) or relative error spikes.
+
+---
+
+## Part 5: Iterative Bug Resolution and E2E Verification Workflow
+
+To run this process autonomously and thoroughly overnight, follow this iterative debug-loop:
+
+### 5.1 Diagnosis and Isolation Loop
+1. **Instrument & Dump:** Run both model steps with `DSV4_DUMP_HIDDEN_STATES=1` and fetch `.npy` dumps.
+2. **Find First Divergent Layer:** Identify the lowest layer $N$ where hidden states diverge.
+3. **Isolate Component:** Scrutinize the attention op or FFN/MoE op in layer $N$. Check sub-activation traces (e.g. output of attention block, output of linear projection layers) by adding temporary hook points or trace statements.
+4. **Determine Root Cause:** Compare `vllm-torchtpu` code with `tpu-inference` for that component. Look for:
+   * Mismatched scaling factors or transpose configurations.
+   * Discrepancies in quantization/dequantization scaling logic.
+   * Masking or padding mismatches.
+   * Numerical precision bugs (e.g. upcasting missing or incorrect).
+
+### 5.2 Fix and Verification Loop
+1. **Apply Fix:** Implement changes locally inside the `vllm-torchtpu` copy.
+2. **Sync to VM:** Deploy code changes to the VM.
+3. **Re-Run & Compare:** Run step dumps again. Verify that layer $N$ hidden states match within tolerance.
+4. **Advance Bisection:** Continue testing subsequent layers. If a new divergence point $M > N$ is found, repeat the loop for layer $M$.
+5. **E2E Validation:** Once all layers match (zero divergence), run the baseline end-to-end script (`bash scratch/run_dsv4_docker.sh`) on `alyssa`.
+6. **Check Output Correctness and Coherence:** The generation is successful ONLY if the output satisfies all of the following:
+   * **Coherent English:** Output must be grammatically correct, meaningful, and fluent English prose. Any gibberish, random symbol insertions, or nonsensical formatting is a failure.
+   * **Directly Addresses Prompt:** Must answer the prompt ("Compare XLA and LLVM in two bullet points.") with exactly two distinct, bulleted points.
+   * **Technical Accuracy:** The comparison must be technically accurate (e.g., highlighting XLA as a domain-specific linear algebra compiler for ML, and LLVM as a general-purpose compiler infrastructure).
+   * **Proper Termination:** Generation must stop gracefully (e.g. hitting end-of-sequence) instead of filling the token budget with repeating text or trailing garbage.
+7. **Document & Log:** Document each resolved issue, the applied fix, and final generated output in `docs/dsv4_bug_hunt_findings.md`.

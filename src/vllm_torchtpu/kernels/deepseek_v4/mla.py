@@ -633,6 +633,27 @@ def _mla_ragged_paged_attention_kernel(
             out = lax.div(acc.astype(jnp.float32),
                           L.astype(jnp.float32)).astype(q_dtype)
 
+            import os
+            if os.getenv("DSV4_DEBUG_MLA_EPILOGUE") == "1":
+
+                def _f32_bits(x):
+                    return pltpu.bitcast(
+                        jnp.max(jnp.abs(x)).astype(jnp.float32).reshape(1, 1),
+                        jnp.int32)[0, 0]
+
+                pl.debug_print(
+                    "[MLA_EPILOGUE] seq={} bq={} m_absmax_bits={} "
+                    "l_absmax_bits={} acc_absmax_bits={} out_absmax_bits={} "
+                    "sinks_absmax_bits={}",
+                    seq_idx,
+                    bq_idx,
+                    _f32_bits(m),
+                    _f32_bits(l_val),
+                    _f32_bits(acc),
+                    _f32_bits(out.astype(jnp.float32)),
+                    _f32_bits(attention_sinks),
+                )
+
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)

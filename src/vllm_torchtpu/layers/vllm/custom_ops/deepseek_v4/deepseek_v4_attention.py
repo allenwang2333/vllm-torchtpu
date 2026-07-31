@@ -174,9 +174,6 @@ def _deepseek_v4_attention_jax(
         if main_page_indices is not None:
             main_page_indices = main_page_indices.flatten()
 
-        tp_size = mesh.shape["model"] if (mesh is not None
-                                          and "model" in mesh.shape) else 1
-
         if sw_cache.shape[0] == 0:
             swa_output = jnp.zeros_like(q)
             updated_sw_cache = sw_cache
@@ -201,7 +198,6 @@ def _deepseek_v4_attention_jax(
                     num_kv_pages_per_block=1,
                     num_queries_per_block=1,
                     unnormalized_output=False if swa_only else True,
-                    tp_size=tp_size,
                 ))
 
         dummy_sum = 0.0
@@ -240,6 +236,24 @@ def _deepseek_v4_attention_jax(
             swa_l = jnp.squeeze(swa_l, axis=-1)
         if swa_m is not None and swa_m.ndim == 3:
             swa_m = jnp.squeeze(swa_m, axis=-1)
+
+        # Bisection probe for the CSA/HCA decode blowup: |out| <= |acc| in
+        # mla.py (its epilogue clamps the denominator to >= 1), and acc has
+        # exactly two sources -- this SWA unnormalized-accumulator handoff,
+        # and pv = p @ kv with p <= 1. Returning swa_output here in place of
+        # the MLA output routes the SWA accumulator through the *existing*
+        # dump path (sub_02b_post_kernel_output) with an identical shape and
+        # dtype, so no extra kernel outputs or host callbacks are needed
+        # (jax.debug.* breaks this codebase's AOT compile cache -- see
+        # docs/bisection_progress_report.md 6.2). If the ~1e27 magnitude
+        # shows up here, the bug is in mla_swa.py's unnormalized path; if
+        # this is bounded, the bug is in mla.py's own KV read/accumulate.
+        # NOTE: this edit is inside the traced function, so it requires
+        # `rm -rf /dev/shm/torch_tpu_cache/default/*` to take effect.
+        if os.getenv("DSV4_DEBUG_RETURN_SWA") == "1":
+            if sw_cache_was_5d:
+                updated_sw_cache = jnp.expand_dims(updated_sw_cache, axis=2)
+            return swa_output + dummy_sum, updated_sw_cache
 
         output = mla_ragged_paged_attention(
             q=q,
@@ -369,7 +383,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
                 aux_stream_list=aux_stream_list,
             )
             self.custom_prefix = prefix
-            _real_mla_attn = self.mla_attn
+            _real_mla_attn = getattr(self, "mla_attn", self)
             # self.mla_attn is collapsed to alias `self` below (to sidestep the
             # grandchild-module get_kv_cache_spec overwrite issue), which would
             # otherwise silently drop access to swa_cache_layer/compressor/indexer
@@ -601,6 +615,31 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
             kv.unsqueeze(1).to(torch.float32))
         return kv_rotated.squeeze(1).to(orig_dtype)
 
+    def _maybe_dump_sublayer(self, name: str, tensor: torch.Tensor,
+                             step: int) -> None:
+        # Finer-grained companion to deepseek_v4_patch.py's
+        # sub_01..sub_06 dumps (which bracket the *whole* attention module
+        # as one black box, "02_post_attn"). These bisect further within
+        # that range: 02a is q/kv right after RoPE (before the kernel
+        # call), 02b is the kernel's raw output (before _o_proj) -- mirrors
+        # tpu-inference's identically-named checkpoints in its
+        # attention_impl/forward_mqa so the two can be diffed directly.
+        if os.getenv("DSV4_DUMP_HIDDEN_STATES") != "1":
+            return
+        if torch.compiler.is_compiling():
+            return
+        if "layers.0." not in getattr(self, "custom_prefix", ""):
+            return
+        from vllm.distributed.parallel_state import \
+            get_tensor_model_parallel_rank
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        import numpy as np
+        outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"
+        os.makedirs(outdir, exist_ok=True)
+        np.save(f"{outdir}/sub_{name}_step{step:03d}.npy",
+                tensor.detach().cpu().to(torch.float32).numpy())
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -612,10 +651,15 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         positions: torch.Tensor,
         out: torch.Tensor,
     ) -> torch.Tensor:
+        dump_step = getattr(self, "_dsv4_dump_step", 0)
+        self._dsv4_dump_step = dump_step + 1
+
         q = self.wq_b(qr).view(qr.shape[0], self.mla_attn.n_local_heads,
                                self.mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
+        self._maybe_dump_sublayer("02a_pre_kernel_q", q, dump_step)
+        self._maybe_dump_sublayer("02a_pre_kernel_kv", kv, dump_step)
         check_nan("q (after rope)", q, self.custom_prefix)
         check_nan("kv (after rope)", kv, self.custom_prefix)
 
@@ -632,6 +676,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         elif compressor is not None:
             compressor(kv_score, positions, self.mla_attn.rotary_emb)
 
+        self._dsv4_dump_step_current = dump_step
         res = self.forward_mqa(
             q,
             kv,
@@ -641,35 +686,83 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         )
         return res
 
+    @staticmethod
+    def _as_kernel_cache_view(cache: torch.Tensor) -> torch.Tensor:
+        # The Pallas MLA/SWA kernels (mla.py, mla_swa.py) hard-require
+        # `cache_kv.dtype == uint8`: the cache stores a custom packed byte
+        # layout (quantized fp8 nope-values + raw rope bits + per-block
+        # scales, see quantize_kv_inputs) rather than a uniform semantic
+        # dtype. But vLLM's own KV-cache-spec/allocation pipeline allocates
+        # the actual backing tensor as `kv_cache_dtype` (e.g.
+        # torch.float8_e4m3fn for `--kv-cache-dtype=fp8_e4m3`), not the
+        # `torch.uint8` this class's own get_kv_cache_spec() declares --
+        # vLLM does not preserve that per-layer override through its
+        # spec-merging/allocation path. Since every candidate dtype here is
+        # exactly 1 byte/element (same as uint8), `.view(torch.uint8)` is a
+        # free, lossless bitcast of the identical underlying bytes -- no
+        # repacking needed, same trick used for MXFP4 weights elsewhere in
+        # this codebase (mxfp4.py's `loaded_weight.view(torch.uint8)`).
+        if cache.dtype != torch.uint8:
+            return cache.view(torch.uint8)
+        return cache
+
     def _get_active_sw_cache(self) -> torch.Tensor | None:
+        # NOTE: this used to additionally require `cache.dtype == torch.uint8`
+        # before accepting a candidate cache -- a leftover from an earlier
+        # stage of this project when the SWA cache really was instantiated as
+        # raw uint8 (see docs/old_attempts.md Step 3). Checkpoints now
+        # commonly use a real kv_cache_dtype (e.g. fp8_e4m3), so the real,
+        # correctly-bound cache tensor never matched that dtype check and
+        # this always fell through to `None` -- silently degrading every
+        # SWA-only/dense layer's attention to a zero-page empty cache instead
+        # of raising or using the real cache. Just check presence (dtype
+        # mismatches are handled by _as_kernel_cache_view instead).
+        #
+        # Before initialize_kv_cache() actually runs (e.g. during
+        # profile_run's memory-sizing pass), vLLM binds `.kv_cache` to a
+        # degenerate numel==0 placeholder rather than leaving it unset. That
+        # placeholder is `is not None` but carries no real data; treating it
+        # as a real cache sends a genuinely empty tensor into the Pallas
+        # kernel purely through operations XLA can constant-fold away (an
+        # empty array's contents never need reading), which silently drops
+        # it from the compiled kernel's operand list and desyncs it from the
+        # statically-declared signature (Mosaic "number of refinements must
+        # match number of op operands"). Skip it like a real None so
+        # forward_mqa's own zero-page dummy-cache fallback is used instead.
         if hasattr(self.mla_attn, "swa_cache_layer") and getattr(
                 self.mla_attn.swa_cache_layer, "kv_cache", None) is not None:
             cache = getattr(self.mla_attn.swa_cache_layer, "kv_cache")
-            if cache.dtype == torch.uint8:
-                return cache
+            if cache.numel() > 0:
+                return self._as_kernel_cache_view(cache)
         if hasattr(self, "kv_cache") and getattr(self, "kv_cache",
                                                  None) is not None:
             cache = getattr(self, "kv_cache")
-            if cache.dtype == torch.uint8:
-                return cache
+            if cache.numel() > 0:
+                return self._as_kernel_cache_view(cache)
         if hasattr(self.mla_attn, "kv_cache") and getattr(
                 self.mla_attn, "kv_cache", None) is not None:
             cache = getattr(self.mla_attn, "kv_cache")
-            if cache.dtype == torch.uint8:
-                return cache
+            if cache.numel() > 0:
+                return self._as_kernel_cache_view(cache)
         return None
 
     def _get_active_main_cache(self) -> torch.Tensor | None:
+        # See _get_active_sw_cache's note: dropped the stale
+        # `dtype == torch.uint8` requirement for the same reason. The
+        # `shape[-1] > 512` check is kept -- it distinguishes the main
+        # (uncompressed head_dim, e.g. 640) cache from the SWA cache
+        # (head_dim <= 512), which is a real structural distinction, not a
+        # dtype artifact.
         if hasattr(self, "kv_cache") and getattr(self, "kv_cache",
                                                  None) is not None:
             cache = getattr(self, "kv_cache")
-            if cache.dtype == torch.uint8 and cache.shape[-1] > 512:
-                return cache
+            if cache.numel() > 0 and cache.shape[-1] > 512:
+                return self._as_kernel_cache_view(cache)
         if hasattr(self.mla_attn, "kv_cache") and getattr(
                 self.mla_attn, "kv_cache", None) is not None:
             cache = getattr(self.mla_attn, "kv_cache")
-            if cache.dtype == torch.uint8 and cache.shape[-1] > 512:
-                return cache
+            if cache.numel() > 0 and cache.shape[-1] > 512:
+                return self._as_kernel_cache_view(cache)
         return self._get_active_sw_cache()
 
     def forward_mqa(
@@ -711,9 +804,42 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
                 getattr(getattr(self.mla_attn, "compressor", None),
                         "state_cache", None), "prefix", None)
             main_layer_name = main_prefix
-            main_attn_metadata = attn_ctx.get(
-                compressor_state_prefix) or attn_ctx.get(
-                    main_layer_name) or swa_attn_metadata
+            # `main_layer_name` (this layer's own attention prefix) must be
+            # tried *first* -- it addresses the shared main/compressed-KV
+            # buffer that `main_page_indices` below reads from. Trying
+            # `compressor_state_prefix` first (as introduced by 3cd0d62f) was
+            # only ever harmless because, at the time, the compressor's state
+            # cache and the shared main/compressed-KV cache aliased the same
+            # physical buffer. A later fix (see docs/dsv4_running_and_testing.md
+            # session 3) gave the compressor's state cache its own genuinely
+            # separate, disjoint physical buffer -- since then, this ordering
+            # has silently pointed CSA/HCA layers' attention reads at the
+            # *state* cache's block table instead of the main cache's own,
+            # causing reads from unrelated (uninitialized/garbage) physical
+            # pages once a query's valid range first includes a compressed
+            # slot that requires this metadata.
+            main_attn_metadata = attn_ctx.get(main_layer_name) or attn_ctx.get(
+                compressor_state_prefix) or swa_attn_metadata
+            if (os.getenv("DSV4_DEBUG_MAIN_META") == "1"
+                    and "layers.2." in str(main_layer_name)):
+                _main_bt = attn_ctx.get(main_layer_name)
+                _state_bt = attn_ctx.get(compressor_state_prefix)
+                same_obj = _main_bt is _state_bt
+                same_bt = (_main_bt is not None and _state_bt is not None
+                           and _main_bt.block_tables is not None
+                           and _state_bt.block_tables is not None and bool(
+                               torch.equal(_main_bt.block_tables,
+                                           _state_bt.block_tables)))
+                print(
+                    f"[MAIN_META_DEBUG] positions={positions[:6].tolist()} "
+                    f"main_layer_name={main_layer_name!r} "
+                    f"compressor_state_prefix={compressor_state_prefix!r} "
+                    f"same_metadata_object={same_obj} same_block_tables={same_bt} "
+                    f"main_bt_present={_main_bt is not None} state_bt_present={_state_bt is not None} "
+                    f"chosen_is_main={main_attn_metadata is _main_bt} "
+                    f"main_bt={_main_bt.block_tables[:8].tolist() if _main_bt is not None and _main_bt.block_tables is not None else None} "
+                    f"state_bt={_state_bt.block_tables[:8].tolist() if _state_bt is not None and _state_bt.block_tables is not None else None}",
+                    flush=True)
         else:
             swa_attn_metadata = attn_ctx
             main_attn_metadata = attn_ctx
@@ -764,11 +890,42 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
             main_distribution = _get_field(main_attn_metadata,
                                            "request_distribution")
         else:
-            main_cache_kv = sw_cache
-            main_kv_lens = None
-            main_page_indices = None
-            main_cu_q_lens = None
-            main_distribution = None
+            # A plain alias (`main_cache_kv = sw_cache`, same buffer) makes
+            # the Pallas custom kernel's two separate `sw_cache`/
+            # `main_cache_kv` formal parameters resolve to one identical
+            # input value; XLA's input deduplication then merges them into a
+            # single physical operand in the compiled kernel, desyncing it
+            # from the statically-declared 14-operand
+            # `input_partition_specs` (Mosaic "number of refinements must
+            # match number of op operands 14 vs 13"). `.clone()` gives it a
+            # distinct buffer so both formal parameters stay real, separate
+            # operands; unused for real math in the swa_only path anyway
+            # (see _deepseek_v4_attention_jax's swa_only branch).
+            main_cache_kv = sw_cache.clone()
+            # Reuse the SWA-side metadata tensors (same underlying batch)
+            # instead of Python `None`. `_deepseek_v4_attention_jax`'s
+            # swa_only branch never reads these for real math, but a `None`
+            # is an empty JAX pytree leaf -- it silently drops out of the
+            # jax_op's operand list instead of becoming a real argument,
+            # which desyncs the traced/compiled operand count from the
+            # statically-declared `input_partition_specs` length (surfaces
+            # as a Mosaic "number of refinements must match number of op
+            # operands" crash once this branch is actually exercised, e.g.
+            # once _get_active_sw_cache/_get_active_main_cache correctly
+            # find a real cache instead of always returning None). Cloned
+            # (not aliased) for the same reason main_cache_kv is cloned
+            # above: a plain alias is the same buffer as its swa_* twin,
+            # which XLA's input deduplication merges into one operand,
+            # desyncing the compiled kernel from the declared 14-operand
+            # signature.
+            main_kv_lens = swa_seq_lens.clone(
+            ) if swa_seq_lens is not None else None
+            main_page_indices = swa_block_tables.clone(
+            ) if swa_block_tables is not None else None
+            main_cu_q_lens = swa_query_start_loc.clone(
+            ) if swa_query_start_loc is not None else None
+            main_distribution = swa_request_distribution.clone(
+            ) if swa_request_distribution is not None else None
 
         if is_csa:
             assert topk_indices is not None
@@ -795,7 +952,7 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         rank = get_tensor_model_parallel_rank()
         if rank == 0:
             print(
-                f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None}",
+                f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}",
                 flush=True)
         if rank == 0 and main_prefix in ("model.layers.0.attn",
                                          "model.layers.2.attn"):
@@ -807,6 +964,92 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
                 f"main_cu_q_lens={main_cu_q_lens[:3].tolist() if main_cu_q_lens is not None else None} "
                 f"extra[:6]={(extra[:6].tolist() if extra.dim() == 1 else extra[:6].tolist())}",
                 flush=True)
+
+        # Read-side counterpart to DSV4_DEBUG_COMPRESSOR's dequant check:
+        # dequantize the compressed-KV rows this layer's attention is about
+        # to actually read (slots 0..main_kv_lens-1 of the sequence's first
+        # compressed page) and report their magnitude. mla.py's epilogue
+        # clamps L = max(l + exp(sinks), 1.0) >= 1 before out = acc / L, so
+        # |out| <= |acc| always -- an output of ~1e27 therefore *cannot*
+        # originate in the attention-sinks epilogue and must already be
+        # present in acc, whose only two sources are the SWA accumulator
+        # handoff and pv = p @ kv (p <= 1). This probe distinguishes the
+        # "kv rows are garbage" branch from the "SWA handoff is garbage"
+        # branch. Host-side only: no kernel-body change, so it does not by
+        # itself require a compile-cache clear.
+        if (os.getenv("DSV4_DEBUG_MAIN_KV") == "1" and rank == 0
+                and main_prefix == "model.layers.2.attn" and not swa_only
+                and main_cache_kv is not None and main_cache_kv.numel() > 0
+                and main_page_indices is not None
+                and main_kv_lens is not None):
+            import jax.numpy as jnp
+            import numpy as np
+
+            from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+                unpack_sparse_kv_cache
+            _mc = main_cache_kv
+            if _mc.ndim == 5:
+                _mc = _mc.squeeze(2)
+            # [num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+            _k_block_size = _mc.shape[1] * _mc.shape[2]
+            _width = _mc.shape[-1]
+            _flat = _mc.reshape(-1, _width)
+            _bt = main_page_indices.flatten()
+            _kv_len = int(main_kv_lens[0].item())
+            _page0 = int(_bt[0].item())
+            _rows = []
+            # Include one slot well past kv_len as a never-written control:
+            # if its raw bytes match slot 3's, slot 3 was never written and the
+            # "garbage" is just the buffer's initial contents.
+            _probe_slots = list(range(min(_kv_len, 8))) + [40]
+            for _slot in _probe_slots:
+                _row_idx = _page0 * _k_block_size + _slot
+                _row = _flat[_row_idx:_row_idx + 1].detach().cpu().numpy()
+                _nope, _rope, _scale = unpack_sparse_kv_cache(
+                    jnp.asarray(_row), 448, 64, 64)
+                _n = np.asarray(_nope.astype(jnp.float32))
+                _r = np.asarray(_rope.astype(jnp.float32))
+                _s = np.asarray(_scale).astype(np.float64)
+                # Raw bytes: the decoded views have repeatedly been ambiguous
+                # (rope decoding to exactly 2**97 == bf16 0x7000 == bytes
+                # "00 70", where 0x70 read as fp8_e4m3 is a perfectly ordinary
+                # 128.0). Reading the actual byte regions distinguishes "bad
+                # values" from "right values at the wrong offset".
+                _b = _row.reshape(-1).astype(np.uint8)
+                _nz_nope = int(np.count_nonzero(_b[:448]))
+                _nz_rope = int(np.count_nonzero(_b[448:576]))
+                _nz_scale = int(np.count_nonzero(_b[576:583]))
+                _nz_pad = int(np.count_nonzero(_b[583:640]))
+                _rows.append(f"slot{_slot}(row{_row_idx}): "
+                             f"nope_absmax={np.nanmax(np.abs(_n)):.4g} "
+                             f"rope_absmax={np.nanmax(np.abs(_r)):.4g} "
+                             f"scale_max={_s.max():.4g} "
+                             f"nz[nope/rope/scale/pad]={_nz_nope}/{_nz_rope}/"
+                             f"{_nz_scale}/{_nz_pad} "
+                             f"b[444:452]={_b[444:452].tolist()} "
+                             f"b[574:584]={_b[574:584].tolist()}")
+            print(
+                f"[MAIN_KV_DEQUANT_DEBUG] positions={positions[:4].tolist()} "
+                f"main_kv_lens[0]={_kv_len} page0={_page0} "
+                f"k_block_size={_k_block_size} | " + " | ".join(_rows),
+                flush=True)
+            # `two_caches_same_buffer` is hardcoded to `not swa_only` here,
+            # whereas the reference derives it (main_cache_index ==
+            # swa_cache_index). When it is True the compressed-KV read is
+            # redirected to `updated_sw_cache`; if the two caches are in fact
+            # distinct buffers that redirect points CSA/HCA attention at the
+            # wrong physical allocation entirely.
+            print(
+                f"[CACHE_IDENTITY_DEBUG] positions={positions[:4].tolist()} "
+                f"same_tensor_obj={sw_cache is main_cache_kv} "
+                f"same_data_ptr={sw_cache.data_ptr() == main_cache_kv.data_ptr()} "
+                f"sw_ptr={sw_cache.data_ptr()} main_ptr={main_cache_kv.data_ptr()} "
+                f"sw_shape={list(sw_cache.shape)} main_shape={list(main_cache_kv.shape)} "
+                f"two_caches_same_buffer_assumed={not swa_only} "
+                f"swa_bt={swa_block_tables.flatten()[:6].tolist() if swa_block_tables is not None else None} "
+                f"main_bt={main_page_indices.flatten()[:6].tolist()}",
+                flush=True)
+
         output, new_sw_cache = self.attn_op(
             q,
             kv,
@@ -824,10 +1067,12 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
             self.attn_sink,
         )
 
+        self._maybe_dump_sublayer("02b_post_kernel_output", output,
+                                  getattr(self, "_dsv4_dump_step_current", 0))
+
         if not torch.compiler.is_compiling():
             has_nan = torch.isnan(output).any().item()
             if has_nan:
-                import os
                 rank = os.getenv("RANK", "0")
                 clean_out = output[~torch.isnan(output)]
 
@@ -953,6 +1198,9 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        print(
+            "=== [TRACE_DEBUG] VllmDeepseekV4MLAAttention.forward called! ===",
+            flush=True)
         check_nan("hidden_states (forward input)", hidden_states,
                   self.custom_prefix)
 
@@ -1017,6 +1265,11 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
 
 def patch_deepseek_v4_mla_cls() -> None:
     import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
+    print(
+        f"[PATCH_MLA_DEBUG] ds_v4_amd_model has DeepseekV4ROCMAiterMLAAttention: {hasattr(ds_v4_amd_model, 'DeepseekV4ROCMAiterMLAAttention')}",
+        flush=True)
+    print(f"[PATCH_MLA_DEBUG] ds_v4_amd_model dir: {dir(ds_v4_amd_model)}",
+          flush=True)
     ds_v4_amd_model.DeepseekV4Attention = VllmDeepseekV4MLAAttention
     if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
         ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention

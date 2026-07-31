@@ -209,3 +209,8 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Benchmark results
 benchmark_runs/
+
+# Local scratch space: debug scripts, logs, dumped tensors (~255GB).
+# Never commit wholesale; the reusable CPU repro harness is force-added.
+scratch/
+!scratch/cpu_repro/

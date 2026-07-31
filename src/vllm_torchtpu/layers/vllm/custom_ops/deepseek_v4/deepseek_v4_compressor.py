@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -400,6 +401,15 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 _k_cache_obj, "prefix",
                 getattr(_k_cache_obj, "custom_prefix", None))
             k_cache_metadata = attn_ctx.get(k_cache_prefix_key, state_metadata)
+            if (os.getenv("DSV4_DEBUG_COMPRESSOR") == "1"
+                    and prefix_key is not None and "layers.2." in prefix_key):
+                print(
+                    f"[COMPRESSOR_META_DEBUG] prefix_key={prefix_key!r} "
+                    f"prefix_key_found={prefix_key in attn_ctx} "
+                    f"k_cache_prefix_key={k_cache_prefix_key!r} "
+                    f"k_cache_prefix_found={k_cache_prefix_key in attn_ctx} "
+                    f"attn_ctx_keys={[k for k in attn_ctx if 'layers.2.' in str(k)]}",
+                    flush=True)
         else:
             state_metadata = attn_ctx
             k_cache_metadata = attn_ctx
@@ -413,6 +423,21 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 state_block_tables = state_block_tables.flatten()
         else:
             state_req_dist = state_q_start_loc = state_seq_lens = state_block_tables = None
+
+        if (os.getenv("DSV4_DEBUG_COMPRESSOR") == "1"
+                and isinstance(attn_ctx, dict) and prefix_key is not None
+                and "layers.2." in prefix_key):
+            num_valid_reqs = state_req_dist[2].item(
+            ) if state_req_dist is not None else None
+            num_valid_tokens = (state_q_start_loc[num_valid_reqs].item()
+                                if state_q_start_loc is not None
+                                and num_valid_reqs is not None else None)
+            print(
+                f"[COMPRESSOR_META_DEBUG] positions={positions[:8].tolist()} "
+                f"state_req_dist={state_req_dist.tolist() if state_req_dist is not None else None} "
+                f"state_q_start_loc={state_q_start_loc.tolist() if state_q_start_loc is not None else None} "
+                f"num_valid_reqs={num_valid_reqs} num_valid_tokens={num_valid_tokens}",
+                flush=True)
 
         # `k_block_tables` addresses the shared main/compressed-KV buffer
         # (self.k_cache.kv_cache) -- the same page-table space the outer
@@ -430,8 +455,103 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         if getattr(self.k_cache, "kv_cache", None) is None:
             return
 
+        # The compressor kernels treat both of these as raw *byte* buffers:
+        # compress_norm_rope_store packs `[fp8 nope | bf16 rope | e8m0 scale]`
+        # into uint8 records, and pack_state_cache writes f32 state through
+        # `_to_byte_lane` (also uint8). But vLLM allocates the underlying
+        # tensors as `kv_cache_dtype` (torch.float8_e4m3fn here), and a JAX
+        # `.at[...].set(uint8_values)` into an fp8-typed array performs a
+        # NUMERIC CONVERSION, not a bitcast -- byte 108 becomes the fp8
+        # *number* 108.0, with an entirely different bit pattern. Verified:
+        # setting bytes [108,119,112,109] into an fp8 array reads back as
+        # [110,111,110,110].
+        #
+        # That silently destroyed every record the compressor wrote. The state
+        # cache then decoded back as ~7.87e31, which overflows RMSNorm's
+        # variance to inf -> rsqrt(inf)=0 -> an all-zero compressed vector ->
+        # an empty KV record. The attention path never hit this because it
+        # routes through `_as_kernel_cache_view`, which applies exactly this
+        # `.view(torch.uint8)`; the compressor was the one path that passed the
+        # raw fp8-typed tensors straight through.
+        #
+        # `.view()` shares storage, so copying back through these views writes
+        # the same memory the caches are bound to.
         orig_cache = self.k_cache.kv_cache
         state_cache_buf = self.state_cache.kv_cache
+        if orig_cache is not None and orig_cache.dtype != torch.uint8:
+            orig_cache = orig_cache.view(torch.uint8)
+        if (state_cache_buf is not None
+                and state_cache_buf.dtype != torch.uint8):
+            state_cache_buf = state_cache_buf.view(torch.uint8)
+
+        debug = (os.getenv("DSV4_DEBUG_COMPRESSOR") == "1"
+                 and "layers.2." in str(k_cache_prefix_key)
+                 and getattr(self, "head_dim", None) == 512
+                 and orig_cache.numel() > 0)
+
+        if debug:
+            # kv_score is the op's primary data input and the only one never
+            # inspected. The written record is provably not a
+            # compress_norm_rope product (RMSNorm bounds |normed| to
+            # ~sqrt(512)*max|w| ~= 22.6 and cos_sin is in [-1,1], so 2**97 is
+            # unreachable; A1 showed the byte pattern is unreachable from
+            # quantize_fp8_ue8m0; A5 showed the real function is healthy on
+            # both CPU and TPU). So the corruption must enter through the
+            # inputs -- and kv_score feeds both save_partial_states and, via
+            # the state cache, the gather window.
+            _ks = kv_score.detach().to(torch.float32)
+            _t0 = _ks[0]
+            print(
+                f"[COMPRESSOR_KVSCORE] positions[0]={int(positions[0].item())} "
+                f"shape={list(kv_score.shape)} dtype={kv_score.dtype} "
+                f"tok0[absmax={_t0.abs().max().item():.6g} "
+                f"nan={int(torch.isnan(_t0).sum().item())} "
+                f"inf={int(torch.isinf(_t0).sum().item())} "
+                f"nonzero={int((_t0 != 0).sum().item())}/{_t0.numel()}] "
+                f"all[absmax={_ks.abs().max().item():.6g} "
+                f"nan={int(torch.isnan(_ks).sum().item())} "
+                f"inf={int(torch.isinf(_ks).sum().item())}]",
+                flush=True)
+
+            # Read the target row's bytes BEFORE the op. CPU experiment A1
+            # (scratch/cpu_repro/a1_quantize_reachability.py) proved that the
+            # observed row-259 signature -- all-zero fp8 bytes together with
+            # all seven scale bytes == 109 -- is UNREACHABLE from any input to
+            # quantize_fp8_ue8m0 (all-zero input gives byte 105; byte 109
+            # requires amax ~1e-3, which always yields nonzero fp8). So the row
+            # is not a single coherent record, and the "one atomic
+            # .at[dest].set(record)" assumption is false.
+            #
+            # This splits the remaining possibilities:
+            #   before == after  -> the compressor's scatter never lands, and
+            #                       the bytes are residue from an earlier step
+            #                       (note layer 2's SWA cache IS this same
+            #                       tensor, and forward_mqa does
+            #                       orig_sw_cache.copy_(new_sw_cache) over the
+            #                       whole buffer after attention).
+            #   before clean     -> the scatter itself produces the bad row.
+            # Deliberately NOT a clone-diff (see bisection report 6.2 trap 3);
+            # this reads one known address and prints its bytes.
+            _cr = 4
+            _kbs = orig_cache.shape[1] * orig_cache.shape[2]
+            _mns = state_seq_lens.shape[0]
+            _mkb = k_block_tables.shape[0] // _mns
+            _p0 = int(positions[0].item())
+            _bn = ((_p0 // _cr) // _kbs) % _mkb
+            _slot = int(k_block_tables[_bn].item()) * _kbs + (
+                (_p0 // _cr) % _kbs)
+            _u8 = (orig_cache.view(torch.uint8)
+                   if orig_cache.dtype != torch.uint8 else orig_cache)
+            _row = _u8.reshape(-1, _u8.shape[-1])[_slot].detach().cpu().numpy()
+            print(
+                f"[COMPRESSOR_ROW_BEFORE] positions[0]={_p0} slot={_slot} "
+                f"nz[nope/rope/scale/pad]={int((_row[:448] != 0).sum())}/"
+                f"{int((_row[448:576] != 0).sum())}/"
+                f"{int((_row[576:583] != 0).sum())}/"
+                f"{int((_row[583:640] != 0).sum())} "
+                f"scale_bytes={_row[576:583].tolist()}",
+                flush=True)
+
         updated_cache, updated_state_cache_buf = self.compressor_op(
             kv_score,
             self.ape.clone(),
@@ -446,6 +566,298 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             state_cache_buf,
             orig_cache,
         )
+
+        if debug:
+            # No before/after diffing (torch/XLA buffer donation + async
+            # execution made that unreliable -- two different snapshot
+            # techniques gave two different, mutually-inconsistent answers).
+            # Instead directly recompute token 0's (the real token) own
+            # kv_slot_mapping in torch, mirroring _deepseek_v4_compressor_jax's
+            # exact formula, and dequantize *that* row via the same
+            # unpack_sparse_kv_cache() helper the passing kernel unit test
+            # (tests/kernels/test_dsv4_compressor.py) already trusts -- a
+            # genuine floating-point NaN check, not a byte-pattern guess.
+            import jax.numpy as jnp
+            import numpy as np
+
+            from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+                unpack_sparse_kv_cache
+            compress_ratio = 4
+            k_block_size = orig_cache.shape[1] * orig_cache.shape[2]
+            max_num_seqs = state_seq_lens.shape[0]
+            max_num_k_blocks_per_req = k_block_tables.shape[0] // max_num_seqs
+            pos0 = int(positions[0].item())
+            k_cache_block_num = ((pos0 // compress_ratio) //
+                                 k_block_size) % max_num_k_blocks_per_req
+            k_cache_block_offset = (pos0 // compress_ratio) % k_block_size
+            kv_slot0 = int(
+                k_block_tables[k_cache_block_num].item()) * k_block_size + \
+                k_cache_block_offset
+            # Dump the state-cache rows that gather_state_windows reads for
+            # this boundary window (positions pos0-compress_ratio+1 .. pos0),
+            # mirroring _deepseek_v4_compressor_jax's slot_mapping formula.
+            # The raw-byte probe showed compressed slot 3 is *written* but with
+            # an essentially empty payload (0/448 nope bytes, 5/128 rope bytes)
+            # rather than corrupted data -- i.e. the compressor had nothing to
+            # compress. Slots 0-2 are healthy because their whole window lives
+            # inside the single prefill call; slot 3's window straddles the
+            # prefill->decode boundary and is the only one needing state to
+            # persist across calls. If positions 12-14 read back as all-zero
+            # here, the state simply is not persisting.
+            # NOTE on addressing: `slot_mapping` indexes the *state view*
+            # ([num_pages, state_block_size, state_dim]), NOT the raw byte
+            # buffer ([num_pages, rows, packing, width]). Those are different
+            # flattenings -- a naive reshape(-1, width) lands on the wrong
+            # page entirely. Mirror unpack_state_cache's own indexing (via its
+            # _state_chunk_dims helper) rather than re-deriving it.
+            from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+                _state_chunk_dims
+
+            # ROOT CAUSE (offline recompute): the gathered state window reads
+            # back at ~7.87e31, which overflows RMSNorm's variance to inf ->
+            # rsqrt(inf)=0 -> normed=0 -> an all-zero compressed vector -> an
+            # empty record that destroys the healthy row at 259.
+            # Reading fp8/KV-style bytes (~100-120) as f32 lands exactly in the
+            # 1e26-1e31 range, so the state buffer is very likely aliased onto
+            # a real KV buffer. Compare data_ptrs to find out.
+            _sp = state_cache_buf.data_ptr()
+            _kp = orig_cache.data_ptr()
+            _sn = state_cache_buf.numel() * state_cache_buf.element_size()
+            _kn = orig_cache.numel() * orig_cache.element_size()
+            _overlap = (_sp < _kp + _kn) and (_kp < _sp + _sn)
+            print(
+                f"[COMPRESSOR_ALIAS_CHECK] positions[0]={pos0} "
+                f"state_ptr={_sp} state_bytes={_sn} "
+                f"kv_ptr={_kp} kv_bytes={_kn} "
+                f"same_ptr={_sp == _kp} ranges_overlap={_overlap} "
+                f"state_shape={list(state_cache_buf.shape)} "
+                f"state_dtype={state_cache_buf.dtype}",
+                flush=True)
+
+            _sb = int(self.state_cache.block_size)
+            _max_state_blocks = state_block_tables.shape[0] // max_num_seqs
+            _st = state_cache_buf
+            if _st.ndim == 5:
+                _st = _st.squeeze(2)
+            _st_u8 = _st.view(torch.uint8) if _st.dtype != torch.uint8 else _st
+            _coff = 2 if self.overlap else 1
+            _state_dim = 2 * _coff * self.head_dim
+            _kv_slots, _rpt, _fpr, _bpr = _state_chunk_dims(
+                tuple(_st_u8.shape), _sb, _state_dim)
+            _npages = _st_u8.shape[0]
+            _width = _st_u8.shape[-1]
+            _slots_view = _st_u8.reshape(_npages, _kv_slots, _width)
+            # The gather window is coff*compress_ratio wide (8 for CSA, since
+            # overlap=True), NOT compress_ratio -- w_idx < compress_ratio
+            # selects head-block 0 and the rest select block 1, so the two
+            # halves of the window live in different state blocks/pages.
+            _window = _coff * compress_ratio
+            _win = []
+            for _p in range(max(0, pos0 - _window + 1), pos0 + 1):
+                _bn = (_p // _sb) % _max_state_blocks
+                _slot = int(state_block_tables[_bn].item()) * _sb + (_p % _sb)
+                _pg, _off = _slot // _sb, _slot % _sb
+                if 0 <= _pg < _npages:
+                    _chunk = _slots_view[_pg,
+                                         _off * _rpt:(_off + 1) * _rpt, :_bpr]
+                    _nz = int((_chunk != 0).sum().item())
+                    # Per-head-block breakdown. unpack_state_cache reshapes
+                    # this chunk to [rpt, fpr] and flattens to state_dim, so
+                    # chunk row r is exactly head-block r -- and
+                    # save_partial_states packs the row as
+                    # [kv_a | kv_b | score_a | score_b]. Whole-row nz came out
+                    # at ~6120/8192 == 3/4, which means one of these four
+                    # blocks is entirely zero; this says which.
+                    _blk = [
+                        int((_chunk[_r] != 0).sum().item())
+                        for _r in range(_rpt)
+                    ]
+                else:
+                    _nz = -1
+                    _blk = []
+                _win.append(
+                    f"pos{_p}->slot{_slot}(pg{_pg},off{_off}):nz={_nz} "
+                    f"blk[kv_a/kv_b/sc_a/sc_b]={'/'.join(map(str, _blk))}")
+            print(
+                f"[COMPRESSOR_STATE_WINDOW] positions[0]={pos0} "
+                f"state_cache_buf.shape={list(state_cache_buf.shape)} "
+                f"state_block_size={_sb} max_state_blocks={_max_state_blocks} "
+                f"state_bt[:6]={state_block_tables[:6].tolist()} | " +
+                " | ".join(_win),
+                flush=True)
+
+            updated_cache_u8 = (updated_cache.view(torch.uint8)
+                                if updated_cache.dtype != torch.uint8 else
+                                updated_cache)
+            width = updated_cache_u8.shape[-1]
+            flat_after = updated_cache_u8.reshape(-1, width)
+            row0 = flat_after[kv_slot0:kv_slot0 + 1].detach().cpu().numpy()
+            row0_jax = jnp.asarray(row0)
+            nope_dim = 448
+            rope_head_dim = 64
+            quant_block = 64
+            nope, rope, scale = unpack_sparse_kv_cache(row0_jax, nope_dim,
+                                                       rope_head_dim,
+                                                       quant_block)
+            nope_f32 = np.asarray(nope.astype(jnp.float32))
+            rope_f32 = np.asarray(rope.astype(jnp.float32))
+            # Exact nonzero byte map of the written row. Standalone CPU *and*
+            # TPU runs of compress_norm_rope_store both produce a healthy
+            # 448/128/7 record (scratch/cpu_repro/a5_store_cpu_vs_tpu.py), so
+            # the kernel and its TPU lowering are both exonerated -- the row
+            # written in the real run is malformed in a way the function
+            # cannot produce. The byte positions say whether the record is
+            # shifted (nope fp8 data landing in the rope/scale regions: note
+            # 0x70/0x74 are ordinary fp8_e4m3 values, and reading them as bf16
+            # pairs yields exactly the observed 1e29/1e31) or something else.
+            _rowb = row0.reshape(-1).astype(np.uint8)
+            _nzi = np.nonzero(_rowb)[0]
+            print(
+                f"[COMPRESSOR_ROW_BYTEMAP] positions[0]={pos0} "
+                f"slot={kv_slot0} total_nonzero={_nzi.size} "
+                f"first32_idx={_nzi[:32].tolist()} "
+                f"first32_val={_rowb[_nzi[:32]].tolist()}",
+                flush=True)
+            # Recompute token 0's record OFFLINE from the REAL inputs and
+            # compare with what the op actually wrote. Every component is now
+            # individually verified correct (kv_score healthy; gather correct;
+            # compress_norm_rope_store byte-identically healthy on CPU AND TPU
+            # at real geometry; pack/unpack round-trip lossless) -- yet the
+            # integrated op emits a 12-nonzero-byte record. This isolates the
+            # op wrapper (pallas.jax_op + shard_map + donation) from the math.
+            try:
+                from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import (
+                    _state_chunk_dims, compress_norm_rope, quantize_fp8_ue8m0)
+                _coff = 2 if self.overlap else 1
+                _sdim = 2 * _coff * self.head_dim
+                _sb = int(self.state_cache.block_size)
+                _mnsb = state_block_tables.shape[0] // max_num_seqs
+                _stb = (state_cache_buf.squeeze(2)
+                        if state_cache_buf.ndim == 5 else state_cache_buf)
+                _stb8 = (_stb.view(torch.uint8)
+                         if _stb.dtype != torch.uint8 else _stb)
+                _ks_, _rpt_, _fpr_, _bpr_ = _state_chunk_dims(
+                    tuple(_stb8.shape), _sb, _sdim)
+                _sv = _stb8.reshape(_stb8.shape[0], _ks_, _stb8.shape[-1])
+                _win = _coff * compress_ratio
+                _rows = []
+                for _p in range(pos0 - _win + 1, pos0 + 1):
+                    if _p == pos0:
+                        _kvs = kv_score[0].detach().to(torch.float32).cpu()
+                        _sw = _coff * self.head_dim
+                        _apr = self.ape[_p % compress_ratio].detach().to(
+                            torch.float32).cpu()
+                        _rows.append(
+                            torch.cat([_kvs[:_sw],
+                                       _kvs[_sw:2 * _sw] + _apr]).numpy())
+                    elif _p < 0:
+                        _rows.append(np.zeros(_sdim, dtype=np.float32))
+                    else:
+                        _b = (_p // _sb) % _mnsb
+                        _s = int(state_block_tables[_b].item()) * _sb + (_p %
+                                                                         _sb)
+                        _pg, _of = _s // _sb, _s % _sb
+                        _ch = _sv[_pg, _of * _rpt_:(_of + 1) * _rpt_, :_bpr_]
+                        # [rpt, bpr] uint8 -> rpt*bpr bytes -> state_dim f32,
+                        # matching unpack_state_cache's own reshape order.
+                        _by = np.ascontiguousarray(
+                            _ch.detach().cpu().numpy().reshape(-1))
+                        _rows.append(_by.view(np.float32))
+                _w = jnp.asarray(np.stack(_rows)[None])  # [1, win, state_dim]
+                _wr = _w.reshape(1, _win, 4, self.head_dim)
+                _wc = (jnp.arange(_win) < compress_ratio)[None, :, None]
+                _kvw = jnp.where(_wc, _wr[:, :, 0, :], _wr[:, :, 1, :])
+                _scw = jnp.where(_wc, _wr[:, :, 2, :], _wr[:, :, 3, :])
+                _cmp = compress_norm_rope(
+                    kv_window=_kvw,
+                    score_window=_scw,
+                    valid_mask=jnp.ones((1, _win), dtype=bool),
+                    rms_weight=jnp.asarray(self.norm.weight.detach().to(
+                        torch.float32).cpu().numpy()),
+                    cos_sin_cache=jnp.asarray(
+                        rotary_emb.cos_sin_cache.detach().to(
+                            torch.float32).cpu().numpy()),
+                    compressed_pos=jnp.asarray([
+                        (pos0 // compress_ratio) * compress_ratio
+                    ]),
+                    rms_eps=self.rms_norm_eps,
+                    rope_head_dim=self.rope_head_dim)
+                _c = np.asarray(_cmp)[0]
+                _nd = self.head_dim - self.rope_head_dim
+                _q, _sc = quantize_fp8_ue8m0(_cmp[:, :_nd], self._quant_block)
+                print(
+                    f"[COMPRESSOR_OFFLINE_RECOMPUTE] positions[0]={pos0} "
+                    f"window={_win} "
+                    f"win_absmax={float(np.abs(np.stack(_rows)).max()):.6g} "
+                    f"compressed[nope_absmax={np.abs(_c[:_nd]).max():.6g} "
+                    f"rope_absmax={np.abs(_c[_nd:]).max():.6g}] "
+                    f"q_nonzero={int(np.count_nonzero(np.asarray(jnp.asarray(_q).view(jnp.uint8))))}/{_nd} "
+                    f"scale_bytes={np.asarray(_sc).reshape(-1).tolist()}",
+                    flush=True)
+            except Exception as _e:  # diagnostic only; never break the run
+                print(f"[COMPRESSOR_OFFLINE_RECOMPUTE] failed: {_e!r}",
+                      flush=True)
+
+            print(
+                f"[COMPRESSOR_DEQUANT_DEBUG] positions[0]={pos0} kv_slot0={kv_slot0} "
+                f"nope_nan_count={int(np.isnan(nope_f32).sum())}/{nope_f32.size} "
+                f"nope_absmax={float(np.nanmax(np.abs(nope_f32))) if not np.all(np.isnan(nope_f32)) else float('nan')} "
+                f"rope_nan_count={int(np.isnan(rope_f32).sum())}/{rope_f32.size} "
+                # rope_absmax is the decisive number: the attention-side probe
+                # (DSV4_DEBUG_MAIN_KV) sees rope~1.585e+29 in this same row at
+                # read time, but this print previously reported only
+                # rope_nan_count, so it was never known whether the compressor
+                # itself emitted that value or whether a later writer into the
+                # shared main/SWA buffer overwrote the row's rope bytes after
+                # this point. nope_absmax=0 alongside scale=2^-18 is internally
+                # inconsistent for a single coherent write (that scale implies a
+                # quantized max of ~224-448, not 0), which is what suggests two
+                # different writers touching one row.
+                f"rope_absmax={float(np.nanmax(np.abs(rope_f32))) if not np.all(np.isnan(rope_f32)) else float('nan')} "
+                f"scale_min={float(np.asarray(scale).min())} scale_max={float(np.asarray(scale).max())}",
+                flush=True)
+
+        if debug:
+            # The op's SECOND output is what poisons the state buffer if the
+            # wrapper (pallas.jax_op / shard_map / donation) is at fault:
+            # state_cache_buf.copy_() faithfully stores whatever comes back, so
+            # a corrupt updated_state_cache_buf at prefill is read as ~7.87e31
+            # by the decode-step gather. Compare the buffer's own state slots
+            # before and after this copy, decoded as f32 through the kernel's
+            # real geometry (never hand-derived -- see the addressing trap in
+            # bisection report 8.3).
+            def _slot_absmax(_buf, _slot):
+                _b = _buf.squeeze(2) if _buf.ndim == 5 else _buf
+                _b8 = _b.view(torch.uint8) if _b.dtype != torch.uint8 else _b
+                _ks, _rp, _fp, _bp = _state_chunk_dims(
+                    tuple(_b8.shape), int(self.state_cache.block_size),
+                    2 * (2 if self.overlap else 1) * self.head_dim)
+                _sv = _b8.reshape(_b8.shape[0], _ks, _b8.shape[-1])
+                _pg, _of = _slot // int(self.state_cache.block_size), _slot % \
+                    int(self.state_cache.block_size)
+                _ch = _sv[_pg, _of * _rp:(_of + 1) * _rp, :_bp]
+                _f = np.ascontiguousarray(
+                    _ch.detach().cpu().numpy().reshape(-1)).view(np.float32)
+                return float(np.abs(_f).max()), int((_f != 0).sum())
+
+            try:
+                from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+                    _state_chunk_dims
+                _sbz = int(self.state_cache.block_size)
+                _mnsb2 = state_block_tables.shape[0] // state_seq_lens.shape[0]
+                _bn2 = (pos0 // _sbz) % _mnsb2
+                _slot2 = int(state_block_tables[_bn2].item()) * _sbz + (pos0 %
+                                                                        _sbz)
+                _pre = _slot_absmax(state_cache_buf, _slot2)
+                _new = _slot_absmax(updated_state_cache_buf, _slot2)
+                print(
+                    f"[COMPRESSOR_STATE_OUT] positions[0]={pos0} "
+                    f"slot={_slot2} buf_before[absmax={_pre[0]:.6g} "
+                    f"nonzero={_pre[1]}] op_output[absmax={_new[0]:.6g} "
+                    f"nonzero={_new[1]}]",
+                    flush=True)
+            except Exception as _e2:
+                print(f"[COMPRESSOR_STATE_OUT] failed: {_e2!r}", flush=True)
 
         orig_cache.copy_(updated_cache)
         if state_cache_buf.numel() > 0:

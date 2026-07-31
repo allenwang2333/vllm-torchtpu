@@ -523,6 +523,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  enable_kv_cache_events,
                                                  dcp_world_size,
                                                  pcp_world_size,
+                                                 scheduler_block_size,
                                                  hash_block_size,
                                                  metrics_collector=None):
             groups = kv_cache_config.kv_cache_groups
@@ -555,6 +556,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 enable_kv_cache_events,
                 dcp_world_size,
                 pcp_world_size,
+                scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
             )

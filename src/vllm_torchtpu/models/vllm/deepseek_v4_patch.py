@@ -280,17 +280,20 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _orig_apply_quant_method = MoERunner._apply_quant_method
 
     def patched_apply_quant_method(self,
-                                   layer,
                                    hidden_states,
                                    router_logits,
                                    shared_experts_input,
                                    input_ids=None):
+        # NOTE (vLLM 0.25.1): _apply_quant_method no longer takes an explicit
+        # `layer` argument -- `self` (the MoERunner) already carries the
+        # layer context via self.routed_experts / self.layer_idx (see the
+        # patched_model_init loop that sets layer_idx on both the MoERunner
+        # and its .routed_experts submodule).
         if (hasattr(torch, "compiler") and torch.compiler.is_compiling()) or (
                 hasattr(torch, "_dynamo") and torch._dynamo.is_compiling()):
-            return _orig_apply_quant_method(self, layer, hidden_states,
-                                            router_logits,
+            return _orig_apply_quant_method(self, hidden_states, router_logits,
                                             shared_experts_input, input_ids)
-        layer_idx = getattr(layer, "layer_idx", -1)
+        layer_idx = getattr(self, "layer_idx", -1)
         if layer_idx in (0, 3, 4):
             hs_cpu = hidden_states.cpu().float()
             rl_cpu = router_logits.cpu().float()
@@ -300,9 +303,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             print(
                 f"[DEBUG_PATCH] layer_{layer_idx} input router_logits: shape={list(rl_cpu.shape)} dtype={router_logits.dtype} | mean={rl_cpu.mean().item():.6f} std={rl_cpu.std().item():.6f} min={rl_cpu.min().item():.6f} max={rl_cpu.max().item():.6f}",
                 flush=True)
-        res = _orig_apply_quant_method(self, layer, hidden_states,
-                                       router_logits, shared_experts_input,
-                                       input_ids)
+        res = _orig_apply_quant_method(self, hidden_states, router_logits,
+                                       shared_experts_input, input_ids)
         tensors_to_check = []
         if isinstance(res, torch.Tensor):
             tensors_to_check.append(("moe_output", res))
@@ -437,6 +439,15 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     l.ffn.layer_idx = idx
                     if hasattr(l.ffn, "experts"):
                         l.ffn.experts.layer_idx = idx
+                        # layer_idx is read off the RoutedExperts submodule
+                        # (not just the owning MoERunner) by quant methods'
+                        # process_weights_after_loading, e.g. for the
+                        # VLLM_FP4_CACHE_DIR pre-quantized-weight cache path
+                        # in mxfp4.py -- set it there too.
+                        routed_experts_for_idx = getattr(
+                            l.ffn.experts, "routed_experts", None)
+                        if routed_experts_for_idx is not None:
+                            routed_experts_for_idx.layer_idx = idx
                         # Hash-MoE layers (layer_idx < config.num_hash_layers)
                         # route by gate.tid2eid[token_id], not by router logits.
                         # The TPU routing (moe_routing.select_experts) receives
@@ -713,20 +724,24 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         file=sys.stderr,
                         flush=True)
 
-                # Manually invoke process_weights_after_loading on all FusedMoE layers
-                # because the standard vLLM loader checks hasattr(module, "quant_method")
-                # which returns False on FusedMoE layers (since it uses _quant_method instead)
-                for idx, l in enumerate(self.model.layers):
-                    if hasattr(l, "ffn") and hasattr(l.ffn, "experts"):
-                        moe_layer = l.ffn.experts
-                        if hasattr(moe_layer, "_quant_method"):
-                            if hasattr(moe_layer._quant_method,
-                                       "process_weights_after_loading"):
-                                print(
-                                    f"[PATCH] Manually invoking process_weights_after_loading on layer {idx} FusedMoE",
-                                    flush=True)
-                                moe_layer._quant_method.process_weights_after_loading(
-                                    moe_layer)
+                # NOTE (vLLM 0.25.1): process_weights_after_loading for MoE
+                # layers used to need a manual call here, because the
+                # standard vLLM loader's `hasattr(module, "quant_method")`
+                # check returned False for FusedMoE layers (which exposed
+                # their quant method as `_quant_method` instead). That is no
+                # longer true: FusedMoE is now a factory function returning a
+                # MoERunner, and the actual weight-holding submodule
+                # (RoutedExperts, at e.g. `layer.ffn.experts.routed_experts`)
+                # sets `self.quant_method` directly in its own __init__
+                # (vllm/model_executor/layers/fused_moe/routed_experts.py).
+                # vLLM's own generic `process_weights_after_loading()` walker
+                # (model_loader/utils.py, called right after this function
+                # returns) now finds and calls it automatically via
+                # `model.named_modules()`. A manual call here would double-
+                # process every MoE layer's weights -- the second call reads
+                # the *already-processed* (packed/quantized/on-TPU) tensors
+                # as if they were still raw, corrupting them or crashing with
+                # a shape mismatch.
 
                 import torch.distributed as dist
                 if dist.is_initialized():
@@ -950,11 +965,20 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     except Exception as e:
         print(f"Failed to patch CUDA variant: {e}", file=sys.stderr)
 
-    # Patch the AMD (ROCm) variant and register it
     _AmdDeepseekV4ForCausalLM = None
     try:
+        import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
         from vllm.models.deepseek_v4.amd.model import \
             DeepseekV4ForCausalLM as _AmdDeepseekV4ForCausalLM
+        _orig_decoder_init = ds_v4_amd_model.DeepseekV4DecoderLayer.__init__
+
+        def patched_decoder_init(self, *args, **kwargs):
+            _orig_decoder_init(self, *args, **kwargs)
+            print(
+                f"[DEBUG_DECODER_INIT] layer={self.layer_idx if hasattr(self, 'layer_idx') else 'unknown'} attn class={self.attn.__class__}",
+                flush=True)
+
+        ds_v4_amd_model.DeepseekV4DecoderLayer.__init__ = patched_decoder_init
         ds_v4.DeepseekV4ForCausalLM = _AmdDeepseekV4ForCausalLM
         patch_load_weights_for_class(_AmdDeepseekV4ForCausalLM)
     except Exception as e:
@@ -1188,6 +1212,15 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _orig_layer_forward = DeepseekV4DecoderLayer.forward
 
     def patched_layer_forward(self, *args, **kwargs):
+        layer_idx = getattr(self, "layer_idx", -1)
+        is_compiling = (hasattr(torch, "compiler")
+                        and torch.compiler.is_compiling()) or (hasattr(
+                            torch, "_dynamo") and torch._dynamo.is_compiling())
+        if not is_compiling and layer_idx == 0:
+            print(
+                f"[DEBUG_PRE_LAYER_{layer_idx}] pid={os.getpid()} attn class={self.attn.__class__} forward={self.attn.forward}",
+                file=sys.stderr,
+                flush=True)
         res = _orig_layer_forward(self, *args, **kwargs)
         is_compiling = (hasattr(torch, "compiler")
                         and torch.compiler.is_compiling()) or (hasattr(
@@ -1202,9 +1235,112 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         f"[DEBUG_LAYER_{layer_idx}] pid={os.getpid()} has_nan={has_nan} mean={x.float().mean().item():.6f} min={x.float().min().item():.6f} max={x.float().max().item():.6f}",
                         file=sys.stderr,
                         flush=True)
+            if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1" and isinstance(
+                    x, torch.Tensor):
+                rank = torch.distributed.get_rank(
+                ) if torch.distributed.is_initialized() else 0
+                if rank == 0:
+                    if not hasattr(self, "_step_idx"):
+                        self._step_idx = 0
+                    import numpy as np
+                    tensor_cpu = x.detach().cpu().to(torch.float32).numpy()
+                    os.makedirs(
+                        "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
+                        exist_ok=True)
+                    filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/layer{layer_idx:02d}_step{self._step_idx:03d}.npy"
+                    np.save(filepath, tensor_cpu)
+
+                    if layer_idx == 0:
+                        in_x = args[0] if len(args) > 0 else kwargs.get(
+                            "hidden_states", None)
+                        if isinstance(in_x, torch.Tensor):
+                            in_cpu = in_x.detach().cpu().to(
+                                torch.float32).numpy()
+                            in_filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/input_step{self._step_idx:03d}.npy"
+                            np.save(in_filepath, in_cpu)
+                        cur_input_ids = args[2] if len(
+                            args) > 2 else kwargs.get("input_ids", None)
+                        print(
+                            f"[DEBUG_INPUT_IDS] step={self._step_idx} input_ids={cur_input_ids.tolist() if isinstance(cur_input_ids, torch.Tensor) else cur_input_ids}",
+                            file=sys.stderr,
+                            flush=True)
+
+                    self._step_idx += 1
         return res
 
     DeepseekV4DecoderLayer.forward = patched_layer_forward
+
+    # 1.6. Sub-layer instrumentation (layer 0 only): dump hidden states at
+    # each of the 6 checkpoints inside _forward_unfused_post_pre, to localize
+    # the Layer-0 divergence found by the corrected hidden-state bisection
+    # (docs/bisection_progress_report.md) to attention vs. HC-mixing vs. FFN.
+    _orig_forward_unfused_post_pre = DeepseekV4DecoderLayer._forward_unfused_post_pre
+
+    def patched_forward_unfused_post_pre(self,
+                                         x,
+                                         positions,
+                                         input_ids,
+                                         post_mix=None,
+                                         res_mix=None,
+                                         residual=None):
+        layer_idx = getattr(self, "layer_idx", -1)
+        is_compiling = (hasattr(torch, "compiler")
+                        and torch.compiler.is_compiling()) or (hasattr(
+                            torch, "_dynamo") and torch._dynamo.is_compiling())
+        # Layer 2 (compress_ratio=4, CSA) added to the original layer-0-only
+        # instrumentation to bisect the decode-step blowup found between
+        # layer 1's and layer 2's output (see bisection_progress_report.md
+        # Iteration 7) -- historically also a recurring trouble spot per
+        # earlier sessions' notes.
+        dump = (os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1"
+                and layer_idx in (0, 2) and not is_compiling)
+        if not dump:
+            return _orig_forward_unfused_post_pre(self, x, positions,
+                                                  input_ids, post_mix, res_mix,
+                                                  residual)
+
+        rank = torch.distributed.get_rank(
+        ) if torch.distributed.is_initialized() else 0
+        if rank != 0:
+            return _orig_forward_unfused_post_pre(self, x, positions,
+                                                  input_ids, post_mix, res_mix,
+                                                  residual)
+
+        if not hasattr(self, "_step_idx"):
+            self._step_idx = 0
+        step = self._step_idx
+
+        import numpy as np
+        outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"
+        os.makedirs(outdir, exist_ok=True)
+        layer_suffix = f"_L{layer_idx}" if layer_idx != 0 else ""
+
+        def save(name, t):
+            np.save(f"{outdir}/sub_{name}{layer_suffix}_step{step:03d}.npy",
+                    t.detach().cpu().to(torch.float32).numpy())
+
+        residual_ = x
+        x1, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale,
+                                     self.hc_attn_base)
+        save("01_hc_pre_attn", x1)
+        x2 = self.attn_norm(x1)
+        x3 = self.attn(positions, x2, None)
+        save("02_post_attn", x3)
+        x4 = self.hc_post(x3, residual_, post, comb)
+        save("03_hc_post_attn", x4)
+
+        residual_ = x4
+        x5, post2, comb2 = self.hc_pre(x4, self.hc_ffn_fn, self.hc_ffn_scale,
+                                       self.hc_ffn_base)
+        save("04_hc_pre_ffn", x5)
+        x6 = self.ffn_norm(x5)
+        x7 = self.ffn(x6, input_ids)
+        save("05_post_ffn", x7)
+        x8 = self.hc_post(x7, residual_, post2, comb2)
+        save("06_hc_post_ffn", x8)
+        return x8, None, None, None
+
+    DeepseekV4DecoderLayer._forward_unfused_post_pre = patched_forward_unfused_post_pre
 
     # 2. Clear cached resolved architectures so the AMD model is picked up.
     from vllm.model_executor.model_loader import utils as _ml_utils

@@ -79,8 +79,17 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     # reserved NaN bit pattern instead of saturating at the max finite value.
     q = jnp.clip(blocked * (1.0 / scale), -fp8_max,
                  fp8_max).astype(jnp.float8_e4m3fn).reshape(x.shape)
-    scale_u8 = jnp.squeeze(exponent + 127.0,
-                           -1).astype(jnp.int32).astype(jnp.uint8)
+    # The reference encodes this scale as `scale.astype(jnp.float8_e8m0fnu)`.
+    # That dtype is unavailable on the pinned libtpu (see the matching note in
+    # mla_swa.py's quantize_kv_inputs), so the E8M0 byte is built by hand --
+    # but the manual form must still reproduce the cast's *saturating*
+    # behaviour. Without this clamp, `(exponent + 127).astype(int32)
+    # .astype(uint8)` wraps modulo 256 for any exponent outside [-127, 128],
+    # silently turning an enormous scale into a tiny one (or vice versa) with
+    # no NaN or Inf to flag it. E8M0's representable exponent range is
+    # [-127, 127] with 255 reserved as NaN, so clamp to that.
+    scale_u8 = jnp.clip(jnp.squeeze(exponent, -1) + 127.0, 0.0,
+                        254.0).astype(jnp.int32).astype(jnp.uint8)
     return q, scale_u8
 
 
@@ -253,8 +262,9 @@ def interleaved_rope(
     num_pairs = head_dim // 2
     nope_pairs = num_pairs - half_rope
 
-    even = x[..., 0::2]
-    odd = x[..., 1::2]
+    pairs = x.reshape(*x.shape[:-1], num_pairs, 2)
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
 
     cos = cos_sin[..., :half_rope]
     sin = cos_sin[..., half_rope:rope_head_dim]
@@ -266,10 +276,20 @@ def interleaved_rope(
     new_even = even * cos_full - odd * sin_full
     new_odd = odd * cos_full + even * sin_full
 
-    out = jnp.empty_like(x)
-    out = out.at[..., 0::2].set(new_even)
-    out = out.at[..., 1::2].set(new_odd)
-    return out
+    # Construct the interleaved result functionally (stack + reshape), exactly
+    # as the reference does, rather than allocating a buffer and filling it
+    # with two strided scatters (`jnp.empty_like` + `.at[..., 0::2].set(...)` +
+    # `.at[..., 1::2].set(...)`). The scatter form relies on the two strided
+    # writes together covering every element of an otherwise-uninitialized
+    # buffer; anything that leaves part of it unwritten surfaces as raw buffer
+    # contents in the output. That matched the observed failure exactly: the
+    # boundary-window record written for compressed slot 3 came back with its
+    # nope half reading 0.0 while its rope half read 1.585e+29 -- two regions
+    # of one row disagreeing, which a correctly-computed vector cannot do,
+    # since the RMSNorm immediately upstream divides by sqrt(mean(x^2)) and so
+    # drives its output to O(1) regardless of how large its input was.
+    out = jnp.stack([new_even, new_odd], axis=-1)
+    return out.reshape(x.shape)
 
 
 def compress_norm_rope(
