@@ -514,28 +514,17 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                    False):
         original_hybrid_init = hybrid_coordinator.__init__
 
-        def _hybrid_init_with_logical_pcp_blocks(self,
-                                                 kv_cache_config,
-                                                 max_model_len,
-                                                 max_num_batched_tokens,
-                                                 use_eagle,
-                                                 enable_caching,
-                                                 enable_kv_cache_events,
-                                                 dcp_world_size,
-                                                 pcp_world_size,
-                                                 scheduler_block_size,
-                                                 hash_block_size,
-                                                 metrics_collector=None):
+        def _hybrid_init_with_logical_pcp_blocks(self, *args, **kwargs):
+            args_list = list(args)
+            kv_cache_config = args_list[0] if len(args_list) > 0 else kwargs.get("kv_cache_config")
+            dcp_world_size = args_list[6] if len(args_list) > 6 else kwargs.get("dcp_world_size")
+            pcp_world_size = args_list[7] if len(args_list) > 7 else kwargs.get("pcp_world_size")
+
             groups = kv_cache_config.kv_cache_groups
-            if (pcp_world_size > 1 and _is_attention_mamba_hybrid(groups)):
+            if (pcp_world_size is not None and pcp_world_size > 1 and _is_attention_mamba_hybrid(groups)):
                 if dcp_world_size != 1:
                     raise ValueError("TPU hybrid PCP cache coordination does "
                                      "not support DCP.")
-                # The generic coordinator only needs logical token
-                # granularity. Encoding PCP into each group spec and then
-                # passing pcp_world_size=1 avoids multiplying block sizes
-                # twice and keeps its prefix-cache lookup, hashing, and
-                # allocation invariants internally consistent.
                 kv_cache_config = replace(
                     kv_cache_config,
                     kv_cache_groups=[
@@ -544,22 +533,16 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                     group.kv_cache_spec, pcp_world_size))
                         for group in kv_cache_config.kv_cache_groups
                     ])
-                pcp_world_size = 1
+                if len(args_list) > 0:
+                    args_list[0] = kv_cache_config
+                else:
+                    kwargs["kv_cache_config"] = kv_cache_config
+                if len(args_list) > 7:
+                    args_list[7] = 1
+                else:
+                    kwargs["pcp_world_size"] = 1
 
-            original_hybrid_init(
-                self,
-                kv_cache_config,
-                max_model_len,
-                max_num_batched_tokens,
-                use_eagle,
-                enable_caching,
-                enable_kv_cache_events,
-                dcp_world_size,
-                pcp_world_size,
-                scheduler_block_size,
-                hash_block_size,
-                metrics_collector,
-            )
+            original_hybrid_init(self, *args_list, **kwargs)
 
         hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
         hybrid_coordinator._tpu_hybrid_pcp_coordinator_patch = True
