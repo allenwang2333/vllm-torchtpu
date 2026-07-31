@@ -470,7 +470,13 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
 
-        swa_only = self.compress_ratio <= 1
+        # DSV4_FORCE_SWA_ONLY=1 disables the sparse-attention path
+        # (CSA top-k + HCA long-range) for every layer, leaving dense
+        # local SWA. One-run ablation: if output becomes prompt-faithful
+        # the accuracy gap lives in the sparse path; if not, that whole
+        # subsystem is exonerated. See docs/dsv4/00_NEXT_PHASE_PROMPT.md.
+        swa_only = (self.compress_ratio <= 1
+                    or os.getenv("DSV4_FORCE_SWA_ONLY") == "1")
         is_csa = self.compress_ratio == 4
         two_caches_same_buffer = not swa_only
         swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
@@ -851,7 +857,13 @@ class VllmDeepseekV4MLAAttention(ds_v4_amd_model.DeepseekV4Attention,
                                    dtype=torch.uint8,
                                    device=q.device)
 
-        swa_only = self.compress_ratio <= 1
+        # DSV4_FORCE_SWA_ONLY=1 disables the sparse-attention path
+        # (CSA top-k + HCA long-range) for every layer, leaving dense
+        # local SWA. One-run ablation: if output becomes prompt-faithful
+        # the accuracy gap lives in the sparse path; if not, that whole
+        # subsystem is exonerated. See docs/dsv4/00_NEXT_PHASE_PROMPT.md.
+        swa_only = (self.compress_ratio <= 1
+                    or os.getenv("DSV4_FORCE_SWA_ONLY") == "1")
         is_csa = self.compress_ratio == 4
 
         if swa_attn_metadata is not None:

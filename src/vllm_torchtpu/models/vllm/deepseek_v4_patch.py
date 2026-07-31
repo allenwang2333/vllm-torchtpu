@@ -1293,15 +1293,26 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             # does not, the hook is not taking effect and every negative result
             # from the sweep is worthless.
             _sub = os.getenv("DSV4_SUBSTITUTE_LAYER")
-            if isinstance(res, (tuple, list)) and len(res) == 4:
-                if any(r is None for r in res):
-                    print(f"[DEBUG_NULL_STREAM_SUB] layer={layer_idx} streams={[r is None for r in res]}", file=sys.stderr, flush=True)
-                    x_post = res[0]
+            # Only compute the substitution target when actually substituting.
+            # This block used to run on every layer of every forward, which
+            # cost an extra mhc_post_torch and emitted 11352 [DEBUG_NULL_STREAM]
+            # lines in a single 32-token run.
+            x_post = None
+            if _sub is not None and layer_idx == int(_sub):
+                if isinstance(res, (tuple, list)) and len(res) == 4:
+                    if any(r is None for r in res):
+                        # Normal for most layers: residual/post_mix/res_mix are
+                        # only populated in the fused-MHC path. res[0] is
+                        # already the [tokens, hc_mult, hidden] stream tensor
+                        # (empirically (64, 4, 4096)), which is what the
+                        # reference dumps, so it is the right target.
+                        x_post = res[0]
+                    else:
+                        import vllm.model_executor.kernels.mhc as mhc_kernels
+                        x_post = mhc_kernels.mhc_post_torch(
+                            res[0], res[1], res[2], res[3])
                 else:
-                    import vllm.model_executor.kernels.mhc as mhc_kernels
-                    x_post = mhc_kernels.mhc_post_torch(res[0], res[1], res[2], res[3])
-            else:
-                x_post = x
+                    x_post = x
 
             if (_sub is not None and isinstance(x_post, torch.Tensor)
                     and layer_idx == int(_sub)):
@@ -1309,7 +1320,24 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 _n = getattr(self, "_sub_step_idx", 0)
                 self._sub_step_idx = _n + 1
                 _new = None
-                if _mode == "noise":
+                if _mode == "shuffle":
+                    # PREFERRED CONTROL. Permute the real tensor along the
+                    # token axis: identical value distribution, wrong content.
+                    # Generation must degrade, but every value stays
+                    # in-distribution so downstream Pallas kernels behave.
+                    _t = x_post.detach()
+                    _perm = torch.randperm(_t.shape[0], device=_t.device)
+                    _new = _t[_perm].clone()
+                elif _mode == "noise":
+                    # Gaussian replacement. NOTE: with the stream tuple
+                    # correctly preserved, this propagates through the full
+                    # Hyper-Connections machinery and has been observed to trip
+                    # a TPU UserFatal (RuntimeUnexpectedCoreHalt) in a
+                    # downstream Pallas kernel -- the values are far
+                    # out-of-distribution. A crash does demonstrate causal
+                    # effect, but you cannot compare generated text against it,
+                    # so prefer mode=shuffle for the control.
+                    #
                     # NB: torch.Tensor.std() is not implemented on TorchTPU
                     # (aten::std.correction). Compute it manually, the same
                     # way check_nan() in deepseek_v4_attention.py does.
@@ -1354,7 +1382,26 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         f" -> {_new.detach().float().abs().max().item():.4g}",
                         file=sys.stderr,
                         flush=True)
-                    res = (_new, None, None, None)
+                    # Preserve the remaining stream state. The caller threads
+                    # all four values through EVERY subsequent layer:
+                    #   residual, post_mix, res_mix = None, None, None
+                    #   for layer in ...:
+                    #       hidden_states, residual, post_mix, res_mix = layer(...)
+                    # so returning (_new, None, None, None) resets the
+                    # Hyper-Connections state for layers L+1..42 -- they would
+                    # behave as if they were the first layer. That confounds
+                    # "replace layer L's output" with "wipe the HC streams",
+                    # making sweep results uninterpretable.
+                    #
+                    # NOTE: the noise control does NOT catch this. Generation
+                    # still degrades, so the control passes while the
+                    # experiment is invalid. See 2.1 rule 5.
+                    if isinstance(res, tuple):
+                        res = (_new, ) + tuple(res[1:])
+                    elif isinstance(res, list):
+                        res = [_new] + list(res[1:])
+                    else:
+                        res = _new
         return res
 
     DeepseekV4DecoderLayer.forward = patched_layer_forward

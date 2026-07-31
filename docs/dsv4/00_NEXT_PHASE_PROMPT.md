@@ -4,7 +4,7 @@ Seed document for the next investigation session. Read this **first and in
 full**. It is deliberately short; the rest of `docs/dsv4/` is reference.
 
 **Applies to whichever model/agent picks this up.** Before reporting anything,
-satisfy §2.1 — four non-negotiable checks. They exist because each one
+satisfy §2.1 — five non-negotiable checks. They exist because each one
 corresponds to a real, expensive mistake already made here.
 
 ---
@@ -49,7 +49,7 @@ divergence may be much smaller, or somewhere else entirely.
 
 ## 2.1 Non-negotiables — evidence you must produce
 
-Four checks. Each maps to a specific expensive failure from the previous
+Five checks. Each maps to a specific expensive failure from the previous
 session. **The user will ask for these; produce them unprompted.** They are
 model-agnostic — they protect against confident wrong answers from any agent,
 including the one that wrote this document (whose hypothesis hit rate here was
@@ -102,9 +102,36 @@ bit-identical result that was misread as "the fix is a no-op." Stray workers and
 a drifting cwd each killed runs outright — the cwd one three separate times,
 including once immediately after it was documented.
 
+### 5. A passing control does not mean the experiment is valid
+
+The control (rule 1) proves your instrument *fires*. It does **not** prove your
+instrument measures what you think. Separately check that your intervention
+changes **only** the thing you intend.
+
+*Why:* the substitution hook was once written to return
+`res = (_new, None, None, None)`. The layer output is a 4-tuple threaded through
+every subsequent layer (`hidden_states, residual, post_mix, res_mix`), and
+`None` is the *initial* state — so substituting at layer L silently reset the
+Hyper-Connections streams for layers L+1..42. The sweep would then measure
+"replace layer L's output **and** wipe the HC state", two confounded effects.
+
+The noise control passed the whole time: generation degraded exactly as
+expected. A passing control was fully compatible with an uninterpretable
+experiment.
+
+**Concrete check for any intervention:** enumerate everything the intervention
+touches, and confirm each is either (a) the intended target or (b) restored to
+what it would have been. For tuple/stream-carrying returns, preserve every
+element you are not deliberately replacing.
+
+---
+
 ---
 
 ## 3. First tasks, in order
+
+**0. Run the one-run ablation FIRST** (`DSV4_FORCE_SWA_ONLY=1`). See §3.0 — it
+can halve the search space in a single run, before any 43-run sweep.
 
 1. **Re-baseline.** Re-run the per-layer hidden-state comparison against
    `tpu-inference` on an identical prompt+checkpoint. Identify the first layer
@@ -122,6 +149,54 @@ including once immediately after it was documented.
    checkpoints), against `tpu-inference` as ground truth.
 
 ---
+
+## 3.0 Static narrowing: the symptom already localises the bug
+
+Do not treat the accuracy gap as a black box. **The failure mode is itself
+strong evidence**, and reading it costs nothing.
+
+Current output:
+
+> `Here are two bullet points comparing the two given entities:`
+> `**Entity 1: "The quick brown fox jumps over the lazy dog"`
+
+Two independent signals:
+
+- **Fluent, grammatical, well-structured** => the LM head, FFN, MoE, embeddings
+  and the overall forward pass are working. This is not "numbers drifted
+  everywhere."
+- **Generic filler + a pangram** ("the two given entities", "the quick brown
+  fox") => the model is generating from priors, *not from the prompt*. It is not
+  seeing its context.
+
+That isolates **context retrieval**, which in DSV4 is the sparse-attention path:
+CSA (`compress_ratio=4`) + the top-k indexer, and HCA (`compress_ratio=128`).
+Dense local SWA is a separate, simpler path.
+
+### The one-run discriminator
+
+```bash
+DSV4_FORCE_SWA_ONLY=1   # forces swa_only on every layer; sparse path disabled
+```
+
+- **Output becomes prompt-faithful** -> the bug is in CSA/HCA/indexer. You have
+  eliminated most of the model in a single run; go straight to that subsystem.
+- **Output stays unfaithful** -> the sparse path is exonerated, and the 43-layer
+  sweep (§3.1) is now warranted rather than speculative.
+
+Either way it is one run, and it makes the sweep either unnecessary or
+well-targeted.
+
+### Live candidates in that path
+
+Both are undocumented deviations from `tpu-inference`:
+
+1. **The top-k `max_valid_kv` clamp** in `forward_mqa` — vllm-torchtpu masks
+   `topk_indices >= (positions+1)//compress_ratio`; the reference passes the
+   indices raw. Plausibly a workaround for the *now-fixed* corrupt compressed
+   KV, i.e. possibly obsolete and now harmful.
+2. **`two_caches_same_buffer` hardcoded** to `not swa_only`, where the reference
+   derives it (`main_cache_index == swa_cache_index`).
 
 ## 3.1 Concrete recipe: the layer-substitution sweep
 
@@ -163,6 +238,15 @@ Already implemented in `models/vllm/deepseek_v4_patch.py`
 (`patched_layer_forward`), gated on `DSV4_SUBSTITUTE_LAYER` /
 `DSV4_SUBSTITUTE_MODE` / `DSV4_SUBSTITUTE_DIR`, inert when unset. You do not
 need to build it — you need to drive it.
+
+**Use `DSV4_SUBSTITUTE_MODE=shuffle` as the control**, not `noise`. Shuffle
+permutes the real tensor along the token axis: identical value distribution,
+wrong content, so generation degrades while every value stays in-distribution.
+`noise` replaces with Gaussian values and — now that the stream tuple is
+correctly preserved — propagates far out-of-distribution data through the full
+Hyper-Connections machinery, which has been observed to trip a TPU `UserFatal`
+(`RuntimeUnexpectedCoreHalt`) in a downstream Pallas kernel. A crash does prove
+causal effect, but you cannot compare generated text against it.
 
 Control result (`DSV4_SUBSTITUTE_LAYER=0 DSV4_SUBSTITUTE_MODE=noise`):
 
@@ -395,6 +479,7 @@ Refuted with evidence. Details in
 | `unpack_state_cache` `ndim<4` fallback | never fires; buffer is 5-D, squeezed to 4-D |
 | state not persisting across calls | refuted; positions 12–14 read back populated |
 | "one of four head-blocks is zero" | the ratio is a bf16-in-f32 artifact |
+| HCA `compress_ratio` clamp (`min(comp_ratio, block_size)`) | real deviation from the reference, but **inert here**: a live run declares 1/4/**128** unclamped, so `block_size` >= 128. Would bite only at `block_size < 128`. |
 
 ---
 
