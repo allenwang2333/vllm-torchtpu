@@ -1093,6 +1093,13 @@ class ZmqShmKvConnectorBase:
             self._lat.record(_LAT_D2H, total_ms)
             self._lat.record(_LAT_STAGE, total_ms)
             self.transfer_stats.record_d2h_transfer(total_ms)
+            self.transfer_stats.record_d2h_transfer_event(
+                bytes_transferred=entry.total_bytes,
+                duration_seconds=total_ms / 1000.0,
+                host_ip=self.host_ip,
+                device_id=str(self.tp_rank),
+                transfer_kind="kv_cache",
+            )
             logger.info(
                 "TPUConnectorWorker(%s) rank%d --> stage_done "
                 "uuid=%s slot=%d issue=%.2fms wait=%.2fms total=%.2fms "
@@ -1442,6 +1449,23 @@ class ZmqShmKvConnectorBase:
             self._lat.record(_LAT_WIRE, max_wire)
             self._lat.record(_LAT_UNPACK, max_unpack)
             self.transfer_stats.record_kv_pull(total_ms)
+            src_ip_str = str(entry.remote_host if isinstance(entry.remote_host, str) else entry.remote_host[0])
+            for _h, ch, w, u, ranks, _hdr in results:
+                ch_duration_s = (w + u) / 1000.0
+                ch_bytes = (
+                    len(ranks) * self.num_layers *
+                    self._coord_pool._used_per_layer(entry.num_blocks)
+                    if ranks else 0
+                )
+                self.transfer_stats.record_p2p_transfer_event(
+                    bytes_transferred=ch_bytes,
+                    duration_seconds=ch_duration_s,
+                    src_ip=src_ip_str,
+                    dst_ip=self.host_ip,
+                    src_rank=str(ranks[0]) if ranks else "0",
+                    dst_rank=str(self.tp_rank),
+                    stream_id=str(ch),
+                )
             per_ch_ms = ",".join(f"{w + u:.1f}"
                                  for _h, _c, w, u, _r, _hdr in results)
             logger.info(
@@ -1617,6 +1641,13 @@ class ZmqShmKvConnectorBase:
         self._lat.record(_LAT_INSERT, insert_ms_total)
         self._lat.record(_LAT_SCATTER, h2d_ms_total + insert_ms_total)
         self.transfer_stats.record_h2d_transfer(h2d_ms_total)
+        self.transfer_stats.record_h2d_transfer_event(
+            bytes_transferred=h2d_total_bytes,
+            duration_seconds=h2d_ms_total / 1000.0,
+            host_ip=self.host_ip,
+            device_id=str(self.tp_rank),
+            transfer_kind="kv_cache",
+        )
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
         logger.info(

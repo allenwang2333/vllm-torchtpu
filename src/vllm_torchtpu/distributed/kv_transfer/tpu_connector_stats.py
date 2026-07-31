@@ -61,9 +61,64 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record the decode (load) queue length."""
         self.data["decode_queue_length"].append(decode_queue_length)
 
+    def record_p2p_transfer_event(
+        self,
+        bytes_transferred: float,
+        duration_seconds: float,
+        src_ip: str,
+        dst_ip: str,
+        src_rank: str,
+        dst_rank: str,
+        stream_id: str,
+    ):
+        """Record a P2P inter-host transfer event with metadata."""
+        self.data["p2p_transfer_events"].append({
+            "bytes": float(bytes_transferred),
+            "duration": float(duration_seconds),
+            "src_ip": str(src_ip),
+            "dst_ip": str(dst_ip),
+            "src_rank": str(src_rank),
+            "dst_rank": str(dst_rank),
+            "stream_id": str(stream_id),
+        })
+
+    def record_h2d_transfer_event(
+        self,
+        bytes_transferred: float,
+        duration_seconds: float,
+        host_ip: str,
+        device_id: str,
+        transfer_kind: str = "kv_cache",
+    ):
+        """Record a Host-to-Device transfer event with metadata."""
+        self.data["h2d_transfer_events"].append({
+            "bytes": float(bytes_transferred),
+            "duration": float(duration_seconds),
+            "host_ip": str(host_ip),
+            "device_id": str(device_id),
+            "transfer_kind": str(transfer_kind),
+        })
+
+    def record_d2h_transfer_event(
+        self,
+        bytes_transferred: float,
+        duration_seconds: float,
+        host_ip: str,
+        device_id: str,
+        transfer_kind: str = "kv_cache",
+    ):
+        """Record a Device-to-Host transfer event with metadata."""
+        self.data["d2h_transfer_events"].append({
+            "bytes": float(bytes_transferred),
+            "duration": float(duration_seconds),
+            "host_ip": str(host_ip),
+            "device_id": str(device_id),
+            "transfer_kind": str(transfer_kind),
+        })
+
     def reset(self):
         # Must be serializable
-        self.data: dict[str, list[float | int]] = {
+        self.data: dict[str, list[Any]] = {
             "d2h_transfer_time": [],
             "h2d_transfer_time": [],
             "kv_pull_time": [],
@@ -71,6 +126,9 @@ class TpuKVConnectorStats(KVConnectorStats):
             "num_failed_transfers": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
+            "p2p_transfer_events": [],
+            "h2d_transfer_events": [],
+            "d2h_transfer_events": [],
         }
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
@@ -145,7 +203,10 @@ class TpuKVConnectorStats(KVConnectorStats):
                 and len(self.data["mb_transferred"]) == 0
                 and len(self.data["num_failed_transfers"]) == 0
                 and len(self.data["prefill_queue_length"]) == 0
-                and len(self.data["decode_queue_length"]) == 0)
+                and len(self.data["decode_queue_length"]) == 0
+                and len(self.data.get("p2p_transfer_events", [])) == 0
+                and len(self.data.get("h2d_transfer_events", [])) == 0
+                and len(self.data.get("d2h_transfer_events", [])) == 0)
 
     @property
     def num_successful_transfers(self) -> int:
@@ -253,6 +314,43 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
+        # Telemetry metrics required by P2P Observability Tool Design
+        self.counter_p2p_transfer_bytes_total = self._counter_cls(
+            name="test_p2p_transfer_bytes_total",
+            documentation="Total bytes transferred over P2P network streams.",
+            labelnames=labelnames + ["src_ip", "dst_ip", "src_rank", "dst_rank", "stream_id"],
+        )
+
+        self.counter_p2p_transfer_duration_seconds_total = self._counter_cls(
+            name="test_p2p_transfer_duration_seconds_total",
+            documentation="Total active duration (in seconds) spent executing P2P transfers.",
+            labelnames=labelnames + ["src_ip", "dst_ip", "stream_id"],
+        )
+
+        self.counter_h2d_transfer_bytes_total = self._counter_cls(
+            name="test_h2d_transfer_bytes_total",
+            documentation="Total bytes copied from Host memory to Accelerator Device memory.",
+            labelnames=labelnames + ["host_ip", "device_id", "transfer_kind"],
+        )
+
+        self.counter_h2d_transfer_duration_seconds_total = self._counter_cls(
+            name="test_h2d_transfer_duration_seconds_total",
+            documentation="Total active time spent on H2D transfers.",
+            labelnames=labelnames + ["host_ip", "device_id", "transfer_kind"],
+        )
+
+        self.counter_d2h_transfer_bytes_total = self._counter_cls(
+            name="test_d2h_transfer_bytes_total",
+            documentation="Total bytes copied from Accelerator Device memory to Host memory.",
+            labelnames=labelnames + ["host_ip", "device_id", "transfer_kind"],
+        )
+
+        self.counter_d2h_transfer_duration_seconds_total = self._counter_cls(
+            name="test_d2h_transfer_duration_seconds_total",
+            documentation="Total active time spent on D2H transfers.",
+            labelnames=labelnames + ["host_ip", "device_id", "transfer_kind"],
+        )
+
     def observe(self,
                 transfer_stats_data: dict[str, Any],
                 engine_idx: int = 0):
@@ -270,7 +368,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "mb_transferred",
             ],
         ):
-            for list_item in transfer_stats_data[list_item_key]:
+            for list_item in transfer_stats_data.get(list_item_key, []):
                 prom_obj[engine_idx].observe(list_item)
 
         for counter_obj, counter_item_key in zip(
@@ -279,7 +377,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
             ["num_failed_transfers"],
         ):
-            for list_item in transfer_stats_data[counter_item_key]:
+            for list_item in transfer_stats_data.get(counter_item_key, []):
                 counter_obj[engine_idx].inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
@@ -296,3 +394,53 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                     gauge_item_key]:
                 for list_item in transfer_stats_data[gauge_item_key]:
                     gauge_obj[engine_idx].set(list_item)
+
+        engine_labels = (
+            dict(zip(self._labelnames, self.per_engine_labelvalues[engine_idx]))
+            if engine_idx in self.per_engine_labelvalues else {}
+        )
+
+        for event in transfer_stats_data.get("p2p_transfer_events", []):
+            self.counter_p2p_transfer_bytes_total.labels(
+                **engine_labels,
+                src_ip=event["src_ip"],
+                dst_ip=event["dst_ip"],
+                src_rank=event["src_rank"],
+                dst_rank=event["dst_rank"],
+                stream_id=event["stream_id"],
+            ).inc(event["bytes"])
+            self.counter_p2p_transfer_duration_seconds_total.labels(
+                **engine_labels,
+                src_ip=event["src_ip"],
+                dst_ip=event["dst_ip"],
+                stream_id=event["stream_id"],
+            ).inc(event["duration"])
+
+        for event in transfer_stats_data.get("h2d_transfer_events", []):
+            self.counter_h2d_transfer_bytes_total.labels(
+                **engine_labels,
+                host_ip=event["host_ip"],
+                device_id=event["device_id"],
+                transfer_kind=event["transfer_kind"],
+            ).inc(event["bytes"])
+            self.counter_h2d_transfer_duration_seconds_total.labels(
+                **engine_labels,
+                host_ip=event["host_ip"],
+                device_id=event["device_id"],
+                transfer_kind=event["transfer_kind"],
+            ).inc(event["duration"])
+
+        for event in transfer_stats_data.get("d2h_transfer_events", []):
+            self.counter_d2h_transfer_bytes_total.labels(
+                **engine_labels,
+                host_ip=event["host_ip"],
+                device_id=event["device_id"],
+                transfer_kind=event["transfer_kind"],
+            ).inc(event["bytes"])
+            self.counter_d2h_transfer_duration_seconds_total.labels(
+                **engine_labels,
+                host_ip=event["host_ip"],
+                device_id=event["device_id"],
+                transfer_kind=event["transfer_kind"],
+            ).inc(event["duration"])
+
