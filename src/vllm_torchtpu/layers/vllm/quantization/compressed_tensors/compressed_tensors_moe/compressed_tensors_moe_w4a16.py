@@ -29,7 +29,7 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
-    get_tpu_cpu_weight_loader_hook
+    get_cpu_weight_loader_hook
 
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
@@ -103,7 +103,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         orig_loader = extra_weight_attrs.get("weight_loader")
 
         # Inject our optimized TPU CPU weight loader hook
-        extra_weight_attrs["weight_loader"] = get_tpu_cpu_weight_loader_hook(
+        extra_weight_attrs["weight_loader"] = get_cpu_weight_loader_hook(
             layer, orig_loader, self.moe.tp_size, self.moe.tp_rank)
 
         # Parent handles creating w13_weight_packed, scales, and auxiliary shape parameters

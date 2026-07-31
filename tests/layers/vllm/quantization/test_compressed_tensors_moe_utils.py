@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import torch
 
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
-    get_tpu_cpu_weight_loader_hook
+    get_cpu_weight_loader_hook
 
 
 class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
@@ -18,8 +18,7 @@ class TestGetTpuCpuWeightLoaderHook(unittest.TestCase):
         tp_size = 2
         tp_rank = 0
 
-        hook = get_tpu_cpu_weight_loader_hook(layer, orig_loader, tp_size,
-                                              tp_rank)
+        hook = get_cpu_weight_loader_hook(layer, orig_loader, tp_size, tp_rank)
 
         self.assertTrue(callable(hook))
 

@@ -22,6 +22,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
+    VllmCompressedTensorsW4ANMxfp4MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
 from vllm_torchtpu.layers.vllm.quantization.unquantized import \
     VllmUnquantizedFusedMoEMethod
@@ -81,7 +83,12 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
             return VllmCompressedTensorsW4A16MoEMethod(
                 weight_quant, input_quant, quant_config.get_moe_config(layer))
 
-        # 2. Dispatch FP8 MoE
+        # 2. Dispatch MXFP4 W4 MoE
+        if quant_config._is_mxfp4(weight_quant):
+            return VllmCompressedTensorsW4ANMxfp4MoEMethod(
+                quant_config.get_moe_config(layer))
+
+        # 3. Dispatch FP8 MoE
         if _is_weight_fp8(weight_quant):
             fp8_config = _build_fp8_config(weight_quant, input_quant)
             return VllmFp8MoEMethodTPU(fp8_config,

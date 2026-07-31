@@ -4,12 +4,17 @@ import torch
 from torch.nn import Parameter
 
 
-def get_tpu_cpu_weight_loader_hook(layer: torch.nn.Module,
-                                   orig_loader: Optional[Callable],
-                                   tp_size: int, tp_rank: int) -> Callable:
+def get_cpu_weight_loader_hook(layer: torch.nn.Module,
+                               orig_loader: Optional[Callable],
+                               tp_size: int,
+                               tp_rank: int,
+                               is_param_transposed: bool = True) -> Callable:
     """
     Returns a custom weight loader hook for TPU to intercept specific Compressed Tensors
     MoE weights and load them into a CPU scratchpad first, preventing TPU fragmentation.
+
+    If `is_param_transposed` is True, the layer's parameter is assumed to be in
+    [E, K, N] format, and the untransposed scratchpad will be [E, N, K].
     """
 
     def _cpu_weight_loader_hook(param: torch.nn.Parameter,
@@ -34,8 +39,12 @@ def get_tpu_cpu_weight_loader_hook(layer: torch.nn.Module,
             return False
 
         if not hasattr(param, "_cpu_scratch"):
-            untransposed_shape = (param.shape[0], param.shape[2],
-                                  param.shape[1])
+            if is_param_transposed:
+                untransposed_shape = (param.shape[0], param.shape[2],
+                                      param.shape[1])
+            else:
+                untransposed_shape = param.shape
+
             scratch = Parameter(torch.empty(untransposed_shape,
                                             dtype=param.dtype,
                                             device="cpu"),
