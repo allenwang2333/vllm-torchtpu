@@ -55,7 +55,7 @@ from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 # merge spills ~2.8M of registers per query row, so bq=32 needs ~93M of
 # vmem (> 64M) while bq=16 fits.
 STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
-STREAMIDX_NUM_QUERIES_PER_BLOCK = 16
+STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
 
 
 def _per_token_group_quant_fp8(
