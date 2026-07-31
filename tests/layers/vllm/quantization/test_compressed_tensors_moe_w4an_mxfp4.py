@@ -89,14 +89,24 @@ def test_mxfp4_create_weights_and_process():
     # Validate output
     assert hasattr(layer, "w13_weight")
     assert hasattr(layer, "w2_weight")
+    assert hasattr(layer, "w13_weight_scale")
+    assert hasattr(layer, "w2_weight_scale")
     assert not hasattr(layer, "w13_weight_packed")
 
-    # w13 should be transposed: untransposed [4, 128, 128] -> transposed [4, 128, 128]
-    assert layer.w13_weight.shape == (4, 128, 128)
-    # w2 should be transposed: untransposed [4, 128, 64] -> transposed [4, 64, 128]
+    # w13 native fp4 K-major: [E, K, N] -> N=64, K=128 -> [4, 128, 64]
+    assert layer.w13_weight.shape == (4, 128, 64)
+    # w2 native fp4 K-major: [E, K, N] -> N=128, K=64 -> [4, 64, 128]
     assert layer.w2_weight.shape == (4, 64, 128)
-    assert layer.w13_weight.dtype == torch.bfloat16
-    assert layer.w2_weight.dtype == torch.bfloat16
+
+    # w13_scale_4d: [E, num_blocks, 1, N] -> [4, 4, 1, 64]
+    assert layer.w13_weight_scale.shape == (4, 4, 1, 64)
+    # w2_scale_4d: [E, num_blocks, 1, N] -> [4, 2, 1, 128]
+    assert layer.w2_weight_scale.shape == (4, 2, 1, 128)
+
+    assert layer.w13_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
+                                             layer.w13_weight.dtype)
+    assert layer.w2_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
+                                            layer.w2_weight.dtype)
 
     # 3. _forward_monolithic_tpu
     x = torch.randn(2, 128, dtype=torch.bfloat16)

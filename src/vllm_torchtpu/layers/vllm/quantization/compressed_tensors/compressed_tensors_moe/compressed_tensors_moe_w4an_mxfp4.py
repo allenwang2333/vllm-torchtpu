@@ -7,9 +7,10 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import \
     CompressedTensorsW4A4Mxfp4MoEMethod
 
-from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
+from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
     get_cpu_weight_loader_hook
@@ -60,37 +61,28 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
 
-        # Retrieve weights from the CPU scratchpad
-        w13_weight_packed = layer.w13_weight_packed._cpu_scratch.data
-        w13_weight_scale = layer.w13_weight_scale._cpu_scratch.data
-        w2_weight_packed = layer.w2_weight_packed._cpu_scratch.data
-        w2_weight_scale = layer.w2_weight_scale._cpu_scratch.data
+        # Retrieve weights from the CPU scratchpad and move to TPU
+        w13_weight_packed = layer.w13_weight_packed._cpu_scratch.data.to("tpu")
+        w13_weight_scale = layer.w13_weight_scale._cpu_scratch.data.to("tpu")
+        w2_weight_packed = layer.w2_weight_packed._cpu_scratch.data.to("tpu")
+        w2_weight_scale = layer.w2_weight_scale._cpu_scratch.data.to("tpu")
 
-        # TODO this is just to keep in line with the non compressed_tensor mxfp4 behavior.
-        # We should improve this later to avoid having to store dequantized weights. maybe fix the scale and leave the dequantization to gmmv2
+        # Convert e8m0 scales to fp32
+        w13_scale = e8m0_to_fp32(w13_weight_scale)
+        w2_scale = e8m0_to_fp32(w2_weight_scale)
 
-        # Dequantize MXFP4 to bfloat16 directly on CPU
-        w13_weight = dequantize_mxfp4_packed(
-            w13_weight_packed,
-            w13_weight_scale,
-            axis=-1,
-            out_dtype=torch.bfloat16,
-        ).to(layer.w13_weight_packed.device)
+        def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
+            # scale shape: [E, N, num_blocks]
+            # gmm_v2 scale layout: [E, num_blocks, 1, N]
+            return scale.movedim(-1, 1).unsqueeze(-2)
 
-        w2_weight = dequantize_mxfp4_packed(
-            w2_weight_packed,
-            w2_weight_scale,
-            axis=-1,
-            out_dtype=torch.bfloat16,
-        ).to(layer.w2_weight_packed.device)
+        w13_scale_4d = _to_kernel_scale(w13_scale)
+        w2_scale_4d = _to_kernel_scale(w2_scale)
 
-        # Transpose for GMM Kernel
-        w13_weight = w13_weight.transpose(1, 2).contiguous()
-        w2_weight = w2_weight.transpose(1, 2).contiguous()
-
-        # Update layer parameters
-        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        # Unpack to native fp4 in the kernel's K-major layout once at load
+        # [E, N, K/2] uint8 -> [E, K, N] torch.float4_e2m1fn_x2
+        w13_weight = load_kmajor_fp4(w13_weight_packed)
+        w2_weight = load_kmajor_fp4(w2_weight_packed)
 
         # Clean up CPU scratchpads
         delattr(layer.w13_weight_packed, "_cpu_scratch")
@@ -98,10 +90,17 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         delattr(layer.w2_weight_packed, "_cpu_scratch")
         delattr(layer.w2_weight_scale, "_cpu_scratch")
 
+        # Update layer parameters
+        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale_4d,
+                                                    requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale_4d,
+                                                   requires_grad=False)
+
+        # Remove packed attributes
         delattr(layer, "w13_weight_packed")
-        delattr(layer, "w13_weight_scale")
         delattr(layer, "w2_weight_packed")
-        delattr(layer, "w2_weight_scale")
 
         if hasattr(layer, "weight"):
             layer.weight = layer.w13_weight
@@ -111,6 +110,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         if layer.w13_weight.device.type == "tpu":
             sync.synchronize(layer.w13_weight, wait=True)
             sync.synchronize(layer.w2_weight, wait=True)
+            sync.synchronize(layer.w13_weight_scale, wait=True)
+            sync.synchronize(layer.w2_weight_scale, wait=True)
 
         gc.collect()
         try:
@@ -158,13 +159,13 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
-        # Execute GMM Kernel with dequantized bfloat16 weights
+        # Execute GMM Kernel with native fp4 weights and scales
         return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
-            w1_scale=None,
-            w2_scale=None,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
             w1_bias=None,
             w2_bias=None,
             topk_weights=topk_weights,
