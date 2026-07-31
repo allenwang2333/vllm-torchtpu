@@ -23,14 +23,6 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     Accommodates both W4A4 and W4A16.
     """
 
-    def __init__(self, moe_config):
-        # Initialize upstream class but override to bypass custom kernels if necessary
-        super().__init__(moe_config)
-        self.apply_monolithic = self._select_monolithic()
-
-    def _select_monolithic(self):
-        return self._forward_monolithic_tpu
-
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -127,7 +119,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             experts_start=moe_routing.get_experts_start(layer),
         )
 
-    def _forward_monolithic_tpu(
+    def apply_monolithic(
         self,
         layer: RoutedExperts,
         x: torch.Tensor,
