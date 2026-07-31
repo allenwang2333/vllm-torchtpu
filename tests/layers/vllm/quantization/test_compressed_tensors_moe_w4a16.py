@@ -26,6 +26,8 @@ from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensor
     VllmCompressedTensorsConfig
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
     VllmCompressedTensorsMoEMethod
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_mxfp4 import \
+    VllmCompressedTensorsMxfp4MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
 
@@ -158,6 +160,7 @@ class TestCompressedTensorsConfigRouting:
     def test_get_moe_method_routing(self):
         # Mock VllmCompressedTensorsConfig and get_scheme_dict
         config = MagicMock(spec=VllmCompressedTensorsConfig)
+        config._is_mxfp4.return_value = False
 
         # 1. Test W4A16 routing
         weight_quant = FakeQuantArgs(num_bits=4,
@@ -203,9 +206,85 @@ class TestCompressedTensorsConfigRouting:
             VllmCompressedTensorsMoEMethod.get_moe_method(
                 config, layer, "model.layers.0.block")
 
+    def test_mxfp4_routing(self):
+        config = MagicMock(spec=VllmCompressedTensorsConfig)
+        weight_quant = FakeQuantArgs(num_bits=4,
+                                     strategy="group",
+                                     group_size=32,
+                                     quant_type="float")
+        config.get_scheme_dict.return_value = {
+            "weights": weight_quant,
+            "input_activations": None,
+        }
+        config._is_mxfp4.return_value = True
+
+        layer = FakeRoutedExperts()
+        method = VllmCompressedTensorsMoEMethod.get_moe_method(
+            config, layer, "model.layers.0.block")
+
+        assert isinstance(method, VllmCompressedTensorsMxfp4MoEMethod)
+        method.create_weights(layer,
+                              num_experts=2,
+                              hidden_size=128,
+                              intermediate_size_per_partition=64,
+                              params_dtype=torch.bfloat16,
+                              weight_loader=MagicMock())
+        assert layer.w13_weight_packed.shape == (2, 128, 64)
+        assert layer.w2_weight_packed.shape == (2, 128, 32)
+        assert layer.w13_weight_scale.shape == (2, 128, 4)
+        assert layer.w2_weight_scale.shape == (2, 128, 2)
+        assert layer.w13_weight_packed.dtype == torch.uint8
+        assert layer.w13_weight_scale.dtype == torch.uint8
+
 
 class TestW4MoEWeightPreprocessing:
     """Verify CPU weight packing and sign-extension logic."""
+
+    def test_mxfp4_load_transform_contract(self):
+        layer = FakeRoutedExperts(experts_per_token=2)
+        layer.activation = FakeActivation("situ")
+        method = VllmCompressedTensorsMxfp4MoEMethod(layer.moe_config)
+        method.create_weights(layer,
+                              num_experts=2,
+                              hidden_size=128,
+                              intermediate_size_per_partition=64,
+                              params_dtype=torch.bfloat16,
+                              weight_loader=MagicMock())
+
+        def fake_load(weight, scale):
+            output = torch.empty(weight.shape[0],
+                                 weight.shape[-1] * 2,
+                                 weight.shape[1] // 2,
+                                 dtype=torch.float4_e2m1fn_x2)
+            output_scale = torch.empty(scale.shape[0],
+                                       scale.shape[-1],
+                                       1,
+                                       scale.shape[1],
+                                       dtype=torch.float32)
+            return output, output_scale
+
+        with patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.load_kmajor_mxfp4",
+                side_effect=fake_load,
+        ) as load_op, patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.prebuild_fused_moe_kernel"
+        ), patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.moe_routing.get_experts_start",
+                return_value=None,
+        ):
+            method.process_weights_after_loading(layer)
+
+        assert load_op.call_count == 2
+        assert not hasattr(layer, "w13_weight_packed")
+        assert not hasattr(layer, "w2_weight_packed")
+        assert layer.w13_weight.shape == (2, 128, 64)
+        assert layer.w2_weight.shape == (2, 64, 64)
+        assert layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+        assert layer.w2_weight.dtype == torch.float4_e2m1fn_x2
+        assert layer.w13_weight_scale.shape == (2, 4, 1, 128)
+        assert layer.w2_weight_scale.shape == (2, 2, 1, 128)
+        assert layer.w13_weight_scale.dtype == torch.float32
+        assert layer.w2_weight_scale.dtype == torch.float32
 
     def test_xor_sign_conversion(self):
         """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""

@@ -22,23 +22,40 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (fused_moe_func,
                                                        requant_unpack_kmajor,
-                                                       unpack_fp4_to_e2m1)
+                                                       unpack_fp4_to_e2m1,
+                                                       unpack_mxfp4_to_kmajor)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int], Any],
                               Callable] = {}
 _load_kmajor_fp4_op = None
+_load_kmajor_mxfp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
+
+
+def get_fused_moe_activation(activation, moe_config) -> str:
+    """Encode vLLM's activation config for the Pallas GMM kernel."""
+    activation = (activation.value
+                  if hasattr(activation, "value") else str(activation))
+    if activation != "situ":
+        return activation
+
+    beta = moe_config.activation_situ_beta
+    linear_beta = moe_config.activation_situ_linear_beta
+    assert beta is not None
+    return f"situ:{beta}:{'none' if linear_beta is None else linear_beta}"
 
 
 def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     """One-time NVFP4 load transform: packed uint8 ``[..., N, K//2]`` -> native
-    fp4 ``torch.float4_e2m1fn_x2`` ``[..., K, N]`` (K-major).
+    fp4 ``torch.float4_e2m1fn_x2`` with logical shape ``[..., K, N]``.
 
     Unpacks (bitcast uint8 -> float4_e2m1fn) and transposes the contracting axis
     to gmm_v2's K-major layout ONCE at load. The result is stored as a native-fp4
     Parameter, so the forward hands it straight to gmm_v2 with no per-forward
-    unpack or transpose (which keeps the 480B HBM footprint bounded). Requires
+    unpack or transpose (which keeps the 480B HBM footprint bounded). Torch's
+    ``x2`` dtype packs the last dimension two values per byte; the Pallas bridge
+    restores the logical ``N`` dimension when passing it to JAX. Requires
     torch_tpu's native ``torch.float4_e2m1fn_x2`` dtype
     (google-pytorch/torch_tpu#1560).
     """
@@ -47,6 +64,24 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
         _load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor",
                                             unpack_fp4_to_e2m1)
     return _load_kmajor_fp4_op(w_u8)
+
+
+def load_kmajor_mxfp4(
+        w_u8: torch.Tensor,
+        scale_u8: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-time MXFP4 checkpoint transform for the TPU GMM kernel.
+
+    ``w_u8`` is packed E2M1 ``[..., N, K/2]`` and ``scale_u8`` is E8M0
+    ``[..., N, K/32]``. The Pallas op returns native E2M1 with logical shape
+    ``[..., K, N]`` and FP32 scales ``[..., K/32, 1, N]``. Torch stores the
+    E2M1 result with its last dimension packed two-per-byte; the scale keeps
+    logical ``N``. Both outputs are passed directly to ``gmm_v2`` at inference.
+    """
+    global _load_kmajor_mxfp4_op
+    if _load_kmajor_mxfp4_op is None:
+        _load_kmajor_mxfp4_op = pallas.jax_op("pallas::mxfp4_load_kmajor",
+                                              unpack_mxfp4_to_kmajor)
+    return _load_kmajor_mxfp4_op(w_u8, scale_u8)
 
 
 def requant_load_kmajor_fp4(w_u8: torch.Tensor, scale_f: torch.Tensor,

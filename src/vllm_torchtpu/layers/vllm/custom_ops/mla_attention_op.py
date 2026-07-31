@@ -81,11 +81,24 @@ class VllmTPUMLAAttention(MLAAttention):
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend
 
         try:
-            super().__init__(num_heads, scale, qk_nope_head_dim,
-                             qk_rope_head_dim, v_head_dim, q_lora_rank,
-                             kv_lora_rank, kv_b_proj, cache_config,
-                             quant_config, prefix, attn_backend, use_sparse,
-                             indexer, **extra_impl_args)
+            super().__init__(
+                num_heads=num_heads,
+                scale=scale,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                v_head_dim=v_head_dim,
+                q_lora_rank=q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                kv_b_proj=kv_b_proj,
+                dcp_q_replicate=False,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                attn_backend=attn_backend,
+                use_sparse=use_sparse,
+                indexer=indexer,
+                **extra_impl_args,
+            )
         finally:
             if original_mla_get_backend is not None:
                 mla_attention.get_mla_prefill_backend = original_mla_get_backend
@@ -214,6 +227,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.kv_b_proj = mla_modules.kv_b_proj
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
+        self.g_proj = mla_modules.g_proj
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
@@ -313,6 +327,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                           self.num_heads * self.v_head_dim),
         )
 
+        if self.g_proj is not None:
+            attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         return self.o_proj(attn_out)[0]
 
 

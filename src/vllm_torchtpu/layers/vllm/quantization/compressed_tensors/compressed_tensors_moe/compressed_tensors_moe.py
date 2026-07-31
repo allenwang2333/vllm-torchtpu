@@ -20,6 +20,8 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
     CompressedTensorsMoEMethod
 
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_mxfp4 import \
+    VllmCompressedTensorsMxfp4MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -67,7 +69,13 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
-        # 1. Dispatch W4 MoE (supports both W4A16 and W4A8 configurations)
+        # MXFP4 is FLOAT4 with E8M0 group scales. It must not enter the INT4
+        # packed-weight path below.
+        if quant_config._is_mxfp4(weight_quant):
+            return VllmCompressedTensorsMxfp4MoEMethod(
+                quant_config.get_moe_config(layer))
+
+        # 1. Dispatch INT4 MoE (supports both W4A16 and W4A8 configurations)
         is_w4 = weight_quant is not None and int(weight_quant.num_bits) == 4
         is_group_channel = (
             weight_quant.strategy == "group"

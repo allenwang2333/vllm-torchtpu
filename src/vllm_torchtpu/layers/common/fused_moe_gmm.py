@@ -35,6 +35,46 @@ def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
 
 
+def unpack_mxfp4_to_kmajor(
+        w_packed: jax.Array,
+        scale_e8m0: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Prepare checkpoint MXFP4 weights and scales for ``gmm_v2``.
+
+    Inputs use the compressed-tensors / MXFP4 checkpoint layout:
+    ``w_packed[..., N, K/2]`` contains two E2M1 values per uint8 and
+    ``scale_e8m0[..., N, K/32]`` contains one E8M0 scale per 32 values.
+
+    Outputs are native E2M1 ``weight[..., K, N]`` and FP32
+    ``scale[..., K/32, 1, N]``, exactly matching ``gmm_v2``'s rhs contract.
+    This runs once while loading weights; no unpacking or scale conversion is
+    performed in the model forward.
+    """
+    if w_packed.dtype != jnp.uint8:
+        raise TypeError(f"MXFP4 weight must be uint8, got {w_packed.dtype}.")
+    if scale_e8m0.dtype != jnp.uint8:
+        raise TypeError(f"MXFP4 scale must be uint8, got {scale_e8m0.dtype}.")
+    if w_packed.shape[:-1] != scale_e8m0.shape[:-1]:
+        raise ValueError(
+            "MXFP4 weight and scale leading dimensions must match: "
+            f"{w_packed.shape} vs {scale_e8m0.shape}.")
+
+    size_k = w_packed.shape[-1] * 2
+    scale_size_k = scale_e8m0.shape[-1] * 32
+    if size_k != scale_size_k:
+        raise ValueError("MXFP4 requires one E8M0 scale per 32 E2M1 values: "
+                         f"weight K={size_k}, scale K={scale_size_k}.")
+
+    weight = jax.lax.bitcast_convert_type(w_packed, jnp.float4_e2m1fn)
+    weight = weight.reshape(*w_packed.shape[:-1], size_k)
+    weight = jnp.swapaxes(weight, -1, -2)
+
+    exponent = (scale_e8m0.astype(jnp.int32) +
+                jnp.finfo(jnp.float8_e8m0fnu).minexp)
+    scale = jnp.ldexp(jnp.ones_like(scale_e8m0, dtype=jnp.float32), exponent)
+    scale = jnp.expand_dims(jnp.swapaxes(scale, -1, -2), -2)
+    return weight, scale
+
+
 def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
                           block: int) -> tuple[jax.Array, jax.Array]:
     """W4A8 requantization in JAX: unpack the checkpoint block-16 fp4 weight,
