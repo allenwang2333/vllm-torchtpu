@@ -80,8 +80,17 @@ def select_experts(
     if layer is not None:
         layer = getattr(layer, "routed_experts", layer)
     if layer is not None and layer.use_grouped_topk:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
-            grouped_topk
+        import vllm.model_executor.layers.fused_moe.router.grouped_topk_router as gt_router
+        if not getattr(gt_router.grouped_topk, "_tpu_patched", False):
+            unwrapped = getattr(gt_router.grouped_topk, "__wrapped__", gt_router.grouped_topk)
+            patched = torch.compile(
+                unwrapped,
+                dynamic=False,
+                backend="tpu",
+            )
+            patched._tpu_patched = True
+            gt_router.grouped_topk = patched
+        grouped_topk = gt_router.grouped_topk
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
