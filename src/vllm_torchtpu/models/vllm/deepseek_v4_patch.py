@@ -1237,37 +1237,43 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         f"[DEBUG_LAYER_{layer_idx}] pid={os.getpid()} has_nan={has_nan} mean={x.float().mean().item():.6f} min={x.float().min().item():.6f} max={x.float().max().item():.6f}",
                         file=sys.stderr,
                         flush=True)
-            if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1" and isinstance(
-                    x, torch.Tensor):
-                rank = torch.distributed.get_rank(
-                ) if torch.distributed.is_initialized() else 0
-                if rank == 0:
-                    if not hasattr(self, "_step_idx"):
-                        self._step_idx = 0
-                    import numpy as np
-                    tensor_cpu = x.detach().cpu().to(torch.float32).numpy()
-                    os.makedirs(
-                        "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
-                        exist_ok=True)
-                    filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/layer{layer_idx:02d}_step{self._step_idx:03d}.npy"
-                    np.save(filepath, tensor_cpu)
+            if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1":
+                if isinstance(res, (tuple, list)) and len(res) == 4:
+                    from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
+                    x_post = mhc_post_tilelang(res[0], res[1], res[2], res[3])
+                else:
+                    x_post = x
 
-                    if layer_idx == 0:
-                        in_x = args[0] if len(args) > 0 else kwargs.get(
-                            "hidden_states", None)
-                        if isinstance(in_x, torch.Tensor):
-                            in_cpu = in_x.detach().cpu().to(
-                                torch.float32).numpy()
-                            in_filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/input_step{self._step_idx:03d}.npy"
-                            np.save(in_filepath, in_cpu)
-                        cur_input_ids = args[2] if len(
-                            args) > 2 else kwargs.get("input_ids", None)
-                        print(
-                            f"[DEBUG_INPUT_IDS] step={self._step_idx} input_ids={cur_input_ids.tolist() if isinstance(cur_input_ids, torch.Tensor) else cur_input_ids}",
-                            file=sys.stderr,
-                            flush=True)
+                if isinstance(x_post, torch.Tensor):
+                    rank = torch.distributed.get_rank(
+                    ) if torch.distributed.is_initialized() else 0
+                    if rank == 0:
+                        if not hasattr(self, "_step_idx"):
+                            self._step_idx = 0
+                        import numpy as np
+                        tensor_cpu = x_post.detach().cpu().to(torch.float32).numpy()
+                        os.makedirs(
+                            "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
+                            exist_ok=True)
+                        filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/layer{layer_idx:02d}_step{self._step_idx:03d}.npy"
+                        np.save(filepath, tensor_cpu)
 
-                    self._step_idx += 1
+                        if layer_idx == 0:
+                            in_x = args[0] if len(args) > 0 else kwargs.get(
+                                "hidden_states", None)
+                            if isinstance(in_x, torch.Tensor):
+                                in_cpu = in_x.detach().cpu().to(
+                                    torch.float32).numpy()
+                                in_filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/input_step{self._step_idx:03d}.npy"
+                                np.save(in_filepath, in_cpu)
+                            cur_input_ids = args[2] if len(
+                                args) > 2 else kwargs.get("input_ids", None)
+                            print(
+                                f"[DEBUG_INPUT_IDS] step={self._step_idx} input_ids={cur_input_ids.tolist() if isinstance(cur_input_ids, torch.Tensor) else cur_input_ids}",
+                                file=sys.stderr,
+                                flush=True)
+
+                        self._step_idx += 1
 
             # Layer-substitution hook (see docs/dsv4/00_NEXT_PHASE_PROMPT.md
             # 3.1). Replaces this layer's output with either the
@@ -1283,7 +1289,13 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             # does not, the hook is not taking effect and every negative result
             # from the sweep is worthless.
             _sub = os.getenv("DSV4_SUBSTITUTE_LAYER")
-            if (_sub is not None and isinstance(x, torch.Tensor)
+            if isinstance(res, (tuple, list)) and len(res) == 4:
+                from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
+                x_post = mhc_post_tilelang(res[0], res[1], res[2], res[3])
+            else:
+                x_post = x
+
+            if (_sub is not None and isinstance(x_post, torch.Tensor)
                     and layer_idx == int(_sub)):
                 _mode = os.getenv("DSV4_SUBSTITUTE_MODE", "reference")
                 _n = getattr(self, "_sub_step_idx", 0)
@@ -1293,10 +1305,10 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     # NB: torch.Tensor.std() is not implemented on TorchTPU
                     # (aten::std.correction). Compute it manually, the same
                     # way check_nan() in deepseek_v4_attention.py does.
-                    _f = x.detach().float()
+                    _f = x_post.detach().float()
                     _mu = _f.mean()
                     _sd = (_f - _mu).pow(2).mean().sqrt()
-                    _new = (torch.randn_like(_f) * _sd + _mu).to(x.dtype)
+                    _new = (torch.randn_like(_f) * _sd + _mu).to(x_post.dtype)
                 else:
                     import numpy as np
                     _dir = os.getenv(
@@ -1307,21 +1319,21 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     if os.path.exists(_p):
                         _a = np.load(_p)
                         seq_len_jax = _a.shape[0] // 2
-                        seq_len_live = x.shape[0] // 2
-                        if seq_len_jax != seq_len_live and _a.ndim == 3 and x.ndim == 3:
+                        seq_len_live = x_post.shape[0] // 2
+                        if seq_len_jax != seq_len_live and _a.ndim == 3 and x_post.ndim == 3:
                             stream1 = _a[0:seq_len_live]
                             stream2 = _a[seq_len_jax:seq_len_jax+seq_len_live]
                             _a_sliced = np.concatenate([stream1, stream2], axis=0)
-                            if tuple(_a_sliced.shape) == tuple(x.shape):
+                            if tuple(_a_sliced.shape) == tuple(x_post.shape):
                                 _a = _a_sliced
-                        if tuple(_a.shape) == tuple(x.shape):
-                            _new = torch.from_numpy(_a).to(device=x.device,
-                                                           dtype=x.dtype)
+                        if tuple(_a.shape) == tuple(x_post.shape):
+                            _new = torch.from_numpy(_a).to(device=x_post.device,
+                                                           dtype=x_post.dtype)
                         else:
                             print(
                                 f"[SUBSTITUTE] SHAPE MISMATCH layer={layer_idx}"
                                 f" step={_n} ref={tuple(_a.shape)} "
-                                f"live={tuple(x.shape)} -- NOT substituted",
+                                f"live={tuple(x_post.shape)} -- NOT substituted",
                                 file=sys.stderr,
                                 flush=True)
                     else:
@@ -1331,17 +1343,12 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 if _new is not None:
                     print(
                         f"[SUBSTITUTE] layer={layer_idx} step={_n} "
-                        f"mode={_mode} shape={tuple(x.shape)} "
-                        f"absmax {x.detach().float().abs().max().item():.4g}"
+                        f"mode={_mode} shape={tuple(x_post.shape)} "
+                        f"absmax {x_post.detach().float().abs().max().item():.4g}"
                         f" -> {_new.detach().float().abs().max().item():.4g}",
                         file=sys.stderr,
                         flush=True)
-                    if isinstance(res, tuple):
-                        res = (_new, ) + tuple(res[1:])
-                    elif isinstance(res, list):
-                        res = [_new] + list(res[1:])
-                    else:
-                        res = _new
+                    res = (_new, None, None, None)
         return res
 
     DeepseekV4DecoderLayer.forward = patched_layer_forward
