@@ -35,7 +35,7 @@ from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensor
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     """
     TODO [rsinghc]: Implement MOE_REQUANTIZE_BLOCK_SIZE for enabling quantizedFP8 acitvations.
-    TODO [rsinghc]: optimize weight loading process.
+    TODO [rsinghc]: optimize weight loading process to see if we can get rid of the cpu weight loader hook.
     TPU compressed-tensors packed-weight W4 MoE implementation.
     Supports symmetric signed INT4 weights packed as eight values per INT32
     carrier. Other bit widths, FP4 formats, asymmetric quantization, and other
