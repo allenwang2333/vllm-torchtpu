@@ -594,7 +594,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
 
                 # Pack to shape [E, N, K // 2] for cache storage (uint8)
                 w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2))
-                w2_weight_processed = pack_fp4_indices(w2_indices)
+                w2_weight_processed = pack_fp4_indices(w2_indices.transpose(1, 2))
                 logger.info(
                     f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}"
                 )
