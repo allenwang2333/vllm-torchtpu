@@ -454,6 +454,15 @@ class TestMxfp4DSV4Correctness:
 
             method.process_weights_after_loading(layer)
 
+            # Print diagnostic weight comparison
+            w13_true = torch.cat([w1_true.transpose(1, 2), w3_true.transpose(1, 2)], dim=2)
+            w13_unpacked = layer.w13_weight.to(dtype=torch.float32).to("cpu")
+            scale_expanded = layer.w13_weight_scale.to("cpu").repeat_interleave(32, dim=1)
+            w13_dequant = w13_unpacked * scale_expanded.squeeze(2)
+            print("[DIAGNOSTIC] w13_true (slice):\n", w13_true[0, :5, :5])
+            print("[DIAGNOSTIC] w13_dequant (slice):\n", w13_dequant[0, :5, :5])
+            print("[DIAGNOSTIC] w13 max absolute diff:", (w13_dequant - w13_true).abs().max().item())
+
             x = torch.randn(num_tokens,
                             hidden_size,
                             generator=generator,
