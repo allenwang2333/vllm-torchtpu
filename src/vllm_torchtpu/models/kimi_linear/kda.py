@@ -36,9 +36,14 @@ real debugging time on the K3 prototype:
 * **The recurrent-state cache is ``[d_v, d_k]``** per slot, the transpose of what
   the kernels use; converted at the cache boundary in the JAX core.
 
-Not yet implemented: decode rows go through the chunked kernel rather than
-``kda_decode`` (see the core's module docstring), and speculative decoding is
-unsupported.
+Kernel selection follows upstream's Kimi layer: a decode-only batch runs
+``kda_decode`` (single-token recurrence), anything containing a prefill runs the
+chunked kernel over the whole batch. The choice is a device-side ``lax.cond`` in
+the core, since batch composition is only available here as a ``jax.Array``.
+
+Not yet implemented: conv1d uses the ragged path for both cases rather than
+splitting out a decode-update variant as upstream does, and speculative decoding
+is unsupported (upstream's Kimi layer does not support it either).
 """
 
 import functools

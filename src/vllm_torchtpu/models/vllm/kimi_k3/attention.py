@@ -4,6 +4,11 @@
 
 from __future__ import annotations
 
+# `jax` must be a *module* global, not a local of _build_kda_op: this file uses
+# deferred annotations, so `pallas.jax_op` resolving the wrapper's `jax.Array`
+# hints via inspect.signature(eval_str=True) evaluates them against module
+# globals and otherwise dies with "NameError: name 'jax' is not defined".
+import jax  # noqa: F401
 import torch
 from torch import nn
 from vllm.config import VllmConfig
@@ -333,16 +338,20 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
-        self.sconv_op = build_kimi_sconv_op(
-            prefix,
-            kernel_size=self.conv_size,
-            state_dim_first=is_conv_state_dim_first(),
-        )
-        self.kda_op = build_kimi_kda_op(
-            prefix,
-            lower_bound=self.gate_lower_bound,
-            eps=config.rms_norm_eps,
-        )
+        # One fused op (conv1d + KDA) over this repo's validated chunked/decode
+        # KDA kernels, replacing PR 220's `build_kimi_sconv_op` +
+        # `build_kimi_kda_op` pair. Those wrap a token-at-a-time
+        # `jax.lax.fori_loop` recurrence, which is correct but sequential in
+        # sequence length -- hopeless for prefill -- and its own unit test misses
+        # an independent torch reference by 4.7e-4 against a 2e-5 tolerance.
+        # `kimi_linear_kda_core` is the implementation validated end to end on
+        # Kimi-Linear (gsm8k 0.93), so K3 and Kimi-Linear now share one kernel
+        # path and a K3 discrepancy can be bisected against a working model.
+        #
+        # Built here, not lazily: `pallas.jax_op` / `register_fake` are Python
+        # construction and would otherwise run during Dynamo tracing of the
+        # compiled model graph.
+        self.kda_op = self._build_kda_op()
 
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -367,6 +376,80 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             conv_kernel_size=self.conv_size,
             num_spec=0,
         )
+
+    def _build_kda_op(self):
+        """Wrap ``kimi_linear_kda_core`` as this layer's torch<->jax op."""
+        import functools
+
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.layers.common.kimi_linear_kda import \
+            kimi_linear_kda_core
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
+            get_vllm_model_wrapper_context
+
+        fn = functools.partial(
+            kimi_linear_kda_core,
+            # The mesh binds the computation to this worker's device; every GDN
+            # op path threads it for the same reason.
+            mesh=get_vllm_model_wrapper_context().mesh,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            kernel_size=self.conv_size,
+            # K3 sets gate_lower_bound (-5.0): the bounded
+            # lower_bound * sigmoid(exp(A_log) * (g + dt_bias)) gate. Kimi-Linear
+            # leaves it None for the unbounded softplus form.
+            lower_bound=self.gate_lower_bound,
+        )
+
+        def wrapped(q_proj_states: jax.Array, k_proj_states: jax.Array,
+                    v_proj_states: jax.Array, g1: jax.Array, beta: jax.Array,
+                    conv_state: jax.Array, recurrent_state: jax.Array,
+                    q_conv_weight: jax.Array, k_conv_weight: jax.Array,
+                    v_conv_weight: jax.Array, A_log: jax.Array,
+                    dt_bias: jax.Array, state_indices: jax.Array,
+                    query_start_loc: jax.Array, distribution: jax.Array,
+                    seq_lens: jax.Array
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return fn(q_proj_states, k_proj_states, v_proj_states, g1, beta,
+                      conv_state, recurrent_state, q_conv_weight,
+                      k_conv_weight, v_conv_weight, A_log, dt_bias,
+                      state_indices, query_start_loc, distribution, seq_lens)
+
+        name = f"pallas::kimik3_kda_{self.prefix.replace('.', '_')}"
+        # conv_state (5) and recurrent_state (6) are donated and also written
+        # back with copy_(): XLA aliases the donated input to the program output.
+        # Without donation torch_tpu's compiled mode aborts in
+        # TraverseAndCompile with "identified an argument that was not
+        # provided", naming those buffers.
+        op = pallas.jax_op(name, wrapped, donate_argnums=(5, 6))
+
+        def _fake(q, _k, _v, _g, _beta, conv_state, recurrent_state, *a, **kw):
+            out = torch.empty((q.size(0), self.num_heads, self.head_dim),
+                              dtype=q.dtype, device=q.device)
+            return (torch.empty_like(conv_state),
+                    torch.empty_like(recurrent_state), out)
+
+        op.register_fake(_fake)
+        return op
+
+    def _gated_norm(self, out: torch.Tensor,
+                    output_gate: torch.Tensor) -> torch.Tensor:
+        """``RMSNorm(out) * sigmoid(output_gate)``, per head.
+
+        PR 220 folds this into its kernel (it passes ``o_norm.weight`` and
+        ``output_gate`` in). Our kernel returns the pre-norm core output, so the
+        layer applies it -- the same split the working Kimi-Linear layer uses.
+        Formula and float32 accumulation match ``GatedRMSNormSigmoid`` in
+        ``models/kimi_k3/kda.py``, which was validated against real GPU dumps
+        (rmse_rel 0.006).
+        """
+        x = out.float()
+        x = x * torch.rsqrt(
+            x.pow(2).mean(dim=-1, keepdim=True) + self.o_norm.variance_epsilon)
+        x = x * self.o_norm.weight.float()
+        gate = output_gate.view(-1, self.num_heads, self.head_dim).float()
+        return (x * torch.sigmoid(gate)).to(out.dtype)
 
     def _metadata(self) -> LinearAttentionMetadata | None:
         if not is_forward_context_available():
@@ -398,35 +481,55 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             g_a, _ = self.g_a_proj(hidden_states)
             output_gate, _ = self.g_b_proj(g_a)
 
-        metadata = self._metadata()
-        if (metadata is None or self.kv_cache is None
-                or self.kv_cache[0].numel() == 0):
-            output = torch.zeros_like(query)
+        # Metadata comes from the TPU runner (layers/common/attention_metadata.py),
+        # whose fields are jax.Arrays and which describes the batch with a
+        # `request_distribution` triple. PR 220's `_metadata()` instead requires
+        # vLLM's `LinearAttentionMetadata` (host-side num_prefills/num_decodes)
+        # and raises TypeError on anything else, so it cannot run on this runner
+        # -- the same contract mismatch that broke the first Kimi-Linear attempt.
+        # Read it the way the working Kimi-Linear layer does.
+        from vllm.forward_context import get_forward_context
+
+        del mixed_qkv  # our core takes q/k/v separately and packs internally
+
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            metadata = metadata.get(self.prefix)
+        cache_missing = (self.kv_cache is None or len(self.kv_cache) < 2
+                         or self.kv_cache[0].numel() == 0)
+        if (metadata is None or cache_missing
+                or getattr(metadata, "mamba_state_indices", None) is None):
+            # Warmup and the memory-profiling run precede KV-cache allocation.
+            output = torch.zeros(
+                (query.shape[0], self.num_heads * self.head_dim),
+                dtype=query.dtype,
+                device=query.device)
         else:
-            sconv_cache, recurrent_cache = self.kv_cache
-            mixed_qkv = self.sconv_op(
-                mixed_qkv,
-                sconv_cache,
+            conv_cache, recurrent_cache = self.kv_cache
+            # K3's b_proj is raw; the kernels take beta already activated.
+            # (Kimi-Linear's own forward sigmoids before calling the core.)
+            beta_act = torch.sigmoid(beta.float()).to(beta.dtype)
+            new_conv, new_rec, core_out = self.kda_op(
+                query,
+                key,
+                value,
+                raw_gate,
+                beta_act,
+                conv_cache,
+                recurrent_cache,
                 self.q_conv1d.weight,
                 self.k_conv1d.weight,
                 self.v_conv1d.weight,
-                metadata.query_start_loc,
-                metadata.state_indices_tensor,
-                metadata.seq_lens,
-            )
-            output = self.kda_op(
-                mixed_qkv,
-                raw_gate,
-                beta,
-                output_gate,
-                recurrent_cache,
                 self.A_log,
                 self.dt_bias,
-                self.o_norm.weight,
+                metadata.mamba_state_indices.to(torch.int32),
                 metadata.query_start_loc,
-                metadata.state_indices_tensor,
+                metadata.request_distribution,
                 metadata.seq_lens,
-            ).flatten(1)
+            )
+            conv_cache.copy_(new_conv)
+            recurrent_cache.copy_(new_rec)
+            output = self._gated_norm(core_out, output_gate).flatten(1)
 
         output, _ = self.o_proj(output)
         return output

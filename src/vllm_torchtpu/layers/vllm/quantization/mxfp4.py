@@ -158,9 +158,25 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         return True
 
     def __init__(self, moe: FusedMoEConfig):
-        # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
+        # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion) but reproduce the
+        # rest of the state it sets, so vLLM code that reads these attributes
+        # still works. Skipping the base init silently drops whatever it adds:
+        # `is_k3_situ_aiter` was added upstream for Kimi-K3 and its absence
+        # surfaced only as AttributeError partway through K3 model init.
         FusedMoEMethodBase.__init__(self, moe)
         self.mxfp4_backend = Mxfp4Backend.TRITON
+        self.weight_dtype = "mxfp4"
+        # ROCm/AITER-only fast path for K3's SiTU MXFP4 MoE; never taken on TPU.
+        self.is_k3_situ_aiter = False
+        # TPU dispatches through `apply_monolithic` below, not a modular-kernel
+        # experts class.
+        self.experts_cls = None
+        self.moe_kernel = None
+        self.max_capture_size = moe.max_capture_size
+        self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+        # Triton-only precision configs, unused on TPU.
+        self.w13_precision_config = None
+        self.w2_precision_config = None
         self.apply_monolithic = self._select_monolithic()
 
     def _select_monolithic(self):

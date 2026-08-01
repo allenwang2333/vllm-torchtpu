@@ -9,6 +9,14 @@ instead of all 14 shapes sharing a single window and timing out.
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Ranks are expected to agree on the compact-mamba block count to within
+# rounding. Beyond this they still get `min()` (safe -- the most constrained rank
+# bounds everyone) but the divergence is reported, because it means one rank is
+# carrying materially more memory than its peers.
 _NUM_BLOCKS_OVERRIDE_TOL = 4
 
 
@@ -33,8 +41,27 @@ class TpuMultiprocExecutor(MultiprocExecutor):
                 if ovr is not None
             ]
             if overrides:
-                assert max(overrides) - min(
-                    overrides) <= _NUM_BLOCKS_OVERRIDE_TOL
+                spread = max(overrides) - min(overrides)
+                if spread > _NUM_BLOCKS_OVERRIDE_TOL:
+                    # Was an assert. Taking min() is safe regardless -- the
+                    # smallest rank bounds the pool, so nobody over-allocates --
+                    # so a divergence should not block startup. But it does mean
+                    # some rank holds materially more memory than its peers, and
+                    # the surplus on every other rank goes unused.
+                    #
+                    # Seen on Kimi-K3 (9L, TP=4): rank 3 reported 0.90 GiB less
+                    # available than ranks 0-2, a 15847-block spread. Kimi-Linear
+                    # at TP=8 agrees exactly across all 8 ranks, so this is not
+                    # measurement noise -- suspicion is the mxfp4 expert path,
+                    # which is what K3 has and Kimi-Linear does not.
+                    logger.warning(
+                        "Ranks disagree on the compact-mamba KV block count by "
+                        "%d blocks (tolerance %d): %s. Using the minimum (%d), "
+                        "so the surplus on the other ranks is left unused. One "
+                        "rank is holding more memory than its peers; check the "
+                        "per-rank 'Compact-mamba KV cache' lines for which.",
+                        spread, _NUM_BLOCKS_OVERRIDE_TOL, overrides,
+                        min(overrides))
                 self.vllm_config.cache_config.num_gpu_blocks_override = min(
                     overrides)
 

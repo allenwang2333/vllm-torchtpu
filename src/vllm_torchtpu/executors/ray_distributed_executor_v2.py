@@ -41,6 +41,41 @@ from vllm_torchtpu.platforms.tpu_platform import TPU_MULTIHOST_TOPOLOGY_MAP
 
 logger = init_logger(__name__)
 
+_TPU_ENV_METADATA_URL = ("http://metadata.google.internal/computeMetadata/v1"
+                         "/instance/attributes/tpu-env")
+
+
+def read_tpu_env_metadata() -> dict[str, str]:
+    """Return this host's `tpu-env` GCE metadata as a plain dict.
+
+    libtpu validates the topology flags against exactly this metadata and
+    quotes it back in its error messages ("... but metadata is 1,2,4"), so it
+    is the authoritative source for HOST_BOUNDS / CHIPS_PER_HOST_BOUNDS rather
+    than a hardcoded table. Returns {} if the metadata server is unreachable
+    (e.g. non-GCE CI), leaving callers to fall back.
+
+    The payload is YAML-ish `KEY: 'value'` lines; parsed by hand to avoid
+    adding a yaml dependency to the import path.
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            _TPU_ENV_METADATA_URL, headers={"Metadata-Flavor": "Google"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode()
+    except Exception as e:  # noqa: BLE001 - metadata is best-effort
+        logger.debug("Could not read TPU metadata from %s: %s",
+                     _TPU_ENV_METADATA_URL, e)
+        return {}
+
+    out: dict[str, str] = {}
+    for line in body.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        out[key.strip()] = value.strip().strip("'\"")
+    return out
+
 
 class RayDistributedExecutorV2(RayExecutorV2):
     """Ray-based distributed executor V2 for TPU.
@@ -214,12 +249,124 @@ class RayDistributedExecutorV2(RayExecutorV2):
         for bundle in bundle_assignments:
             host_workers[bundle["node_ip"]].append(bundle)
 
-        sb_addresses = []
+        # ONE address per HOST, not per bundle. libtpu derives the expected
+        # count from HOST_BOUNDS in VM metadata (1,2,4 -> 8 hosts here) and
+        # rejects anything else:
+        #   Invalid --deepsea_slice_builder_worker_addresses specified.
+        #   Expected 8 worker addresses, got 64.
+        # The per-bundle form emitted 8 addresses per host because this rack
+        # exposes 8 VFIO devices per host (4 chips x 2 cores). Note torch_tpu's
+        # single-host launcher does pick one port per *device*, so the two
+        # contracts genuinely differ -- multi-host is per-host.
+        # TORCH_TPU_TOPOLOGY is handed to libtpu VERBATIM as
+        # --deepsea_host_bounds: passing a 6-field string produced "Illegal
+        # value '1,2,4,2,2,1' ... Incorrect number of elements specified for
+        # TPU dimensions, expected 3 got 6". So it carries HOST BOUNDS ONLY.
+        # There is no chips-per-host field in it, and an extra 4th field is
+        # just another host-bounds dimension -- "1,2,4,4" cleared the
+        # HOST_BOUNDS check but inflated the expected slicebuilder address
+        # count to 32 while CHIPS_PER_HOST_BOUNDS stayed at its 1,1,1 default.
+        # Chips-per-host has its own channel: libtpu reads
+        # TPU_CHIPS_PER_HOST_BOUNDS from the environment.
+        #
+        # Both values are validated against this host's `tpu-env` GCE metadata,
+        # which libtpu quotes verbatim when they disagree, so read them from
+        # there instead of guessing. On the 8-host tpu7x-64 rack this gives
+        # HOST_BOUNDS=1,2,4 and CHIPS_PER_HOST_BOUNDS=2,2,1 (TOPOLOGY 2x4x4).
+        #
+        # torch_tpu's single-host _V7_TOPOLOGY table is NOT usable here: it
+        # encodes per-host *chip* bounds (8 devices -> "2,2,1,2") with implied
+        # host bounds of 1,1,1. The single- and multi-host contracts differ.
+        #
+        # Order: explicit env override > VM metadata > world-size map (legacy;
+        # its 4-field entries predate the above and cannot express a rack that
+        # needs a non-trivial chips-per-host).
+        tpu_meta = read_tpu_env_metadata()
+        if tpu_meta:
+            logger.info(
+                "RayDistributedExecutorV2 | tpu-env metadata: HOST_BOUNDS=%s "
+                "CHIPS_PER_HOST_BOUNDS=%s TOPOLOGY=%s ACCELERATOR=%s",
+                tpu_meta.get("HOST_BOUNDS"),
+                tpu_meta.get("CHIPS_PER_HOST_BOUNDS"),
+                tpu_meta.get("TOPOLOGY"),
+                tpu_meta.get("TPU_ACCELERATOR_TYPE"))
+
+        topology = os.environ.get("TORCH_TPU_TOPOLOGY") or None
+        if topology:
+            logger.info(
+                "RayDistributedExecutorV2 | TORCH_TPU_TOPOLOGY=%s from the "
+                "environment (explicit override)", topology)
+        elif tpu_meta.get("HOST_BOUNDS"):
+            topology = tpu_meta["HOST_BOUNDS"]
+            logger.info(
+                "RayDistributedExecutorV2 | TORCH_TPU_TOPOLOGY=%s from VM "
+                "metadata HOST_BOUNDS", topology)
+        else:
+            topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None)
+            if topology is None:
+                raise ValueError(
+                    f"Cannot find topology for {self.world_size} chips. Supported: "
+                    f"{list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}. Set "
+                    "TORCH_TPU_TOPOLOGY=<host_x,host_y,host_z> (HOST BOUNDS "
+                    "only) and TPU_CHIPS_PER_HOST_BOUNDS=<x,y,z>; both must "
+                    "equal VM metadata (see "
+                    "`curl -H 'Metadata-Flavor: Google' metadata.google."
+                    "internal/computeMetadata/v1/instance/attributes/tpu-env`)."
+                )
+            logger.info(
+                "RayDistributedExecutorV2 | TORCH_TPU_TOPOLOGY=%s from "
+                "TPU_MULTIHOST_TOPOLOGY_MAP[%d]", topology, self.world_size)
+
+        # Same precedence for the second triple. Passed explicitly to the
+        # workers below: relying on inheritance through the raylet left it
+        # unset in the worker, which libtpu reported as "CHIPS_PER_HOST_BOUNDS
+        # ... Topology: 1,1,1 but metadata is 2,2,1".
+        chips_per_host = (os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS")
+                          or tpu_meta.get("CHIPS_PER_HOST_BOUNDS") or None)
+        logger.info(
+            "RayDistributedExecutorV2 | TPU_CHIPS_PER_HOST_BOUNDS=%s",
+            chips_per_host)
+
+        # libtpu wants one slicebuilder address per HOST, and since the string
+        # is host bounds, that count is exactly its product. This is now
+        # confirmed in THREE independent topologies, all rejecting anything
+        # else via --deepsea_slice_builder_worker_addresses:
+        #   * topology 2,2,1,2 (product 8) with 64 addresses: "Expected 8
+        #     worker addresses, got 64"
+        #   * topology 1,2,4,4 (product 32) with 8 addresses: "Expected 32,
+        #     got 8" (the stray 4th field made libtpu believe in 32 hosts)
+        #   * topology 1,1,4 (product 4, this rack) with 32 (one-per-rank)
+        #     addresses: "Expected 4 worker addresses, got 32"
+        # So per-host is the only address count libtpu ever accepts. What
+        # crashes at TP=32 on THIS rack (4 hosts x 8 devices/host) is a
+        # DIFFERENT, later stage: PjrtBackend::GetClient itself raises "RANK 5
+        # is out of bounds for TORCH_TPU_SLICEBUILDER_ADDRESSES (size 4)" once
+        # the (correct, 4-entry) address list is accepted -- i.e. something
+        # indexes this per-host list with the global torch.distributed RANK
+        # (0..31) instead of a host index (0..3). That looks like a genuine
+        # torch_tpu limitation/bug for >1 device per host in multi-host mode,
+        # not something fixable by changing how many addresses we construct.
+        topology_product = 1
+        for field in topology.split(","):
+            topology_product *= int(field)
+        host_ips = sorted(host_workers.keys())
+        if topology_product % len(host_ips):
+            raise ValueError(
+                f"TORCH_TPU_TOPOLOGY={topology} implies {topology_product} mesh "
+                f"devices, which does not divide evenly across {len(host_ips)} "
+                "hosts; cannot lay out slicebuilder addresses.")
+        per_host = topology_product // len(host_ips)
         base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
-        for ip in sorted(host_workers.keys()):
-            for i in range(len(host_workers[ip])):
-                sb_addresses.append(f"{ip}:{base_port + i}")
+        sb_addresses = [
+            f"{ip}:{base_port + i}" for ip in host_ips
+            for i in range(per_host)
+        ]
         slicebuilder_addresses = ",".join(sb_addresses)
+        logger.info(
+            "RayDistributedExecutorV2 | %d slicebuilder addresses "
+            "(%d/host x %d hosts) to match product(%s)=%d",
+            len(sb_addresses), per_host, len(host_ips), topology,
+            topology_product)
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = slicebuilder_addresses
         logger.info(
             f"RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {slicebuilder_addresses}"
@@ -234,12 +381,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
         master_addr = bundle_assignments[0]["node_ip"]
         master_port = str(get_open_port())
 
-        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None)
-        if topology is None:
-            raise ValueError(
-                f"Cannot find topology for {self.world_size} chips. "
-                f"The supported number of chips are {list(TPU_MULTIHOST_TOPOLOGY_MAP.keys())}"
-            )
         xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID",
                                           str(time.time_ns()))
         os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
@@ -262,6 +403,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "TORCH_TPU_XPROF_SESSION_ID": xprof_session_id,
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": slicebuilder_addresses,
             }
+            if chips_per_host:
+                worker_env_vars["TPU_CHIPS_PER_HOST_BOUNDS"] = chips_per_host
             self.ray_worker_handles[i].local_rank = local_rank
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
