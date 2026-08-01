@@ -136,14 +136,15 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 hidden_states=x,
                 gating_output=router_logits,
                 topk=layer.moe_config.experts_per_token,
-                renormalize=layer.moe_config.norm_topk_prob)
+                # renormalize=getattr(layer.moe_config, "norm_topk_prob", getattr(layer, "renormalize", True)))
+                renormalize=layer.renormalize)
         else:
             # Fallback to standard vLLM routing if no custom routing function is defined
             topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
                 topk=layer.moe_config.experts_per_token,
-                renormalize=layer.moe_config.norm_topk_prob,
+                renormalize=layer.renormalize,
                 scoring_fn=getattr(layer, "scoring_func", "softmax"),
                 layer=layer)
 

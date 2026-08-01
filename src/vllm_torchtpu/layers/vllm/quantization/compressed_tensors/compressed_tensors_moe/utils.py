@@ -45,11 +45,10 @@ def get_cpu_weight_loader_hook(layer: torch.nn.Module,
             else:
                 untransposed_shape = param.shape
 
-            scratch = Parameter(torch.empty(untransposed_shape,
-                                            dtype=param.dtype,
-                                            device="cpu"),
-                                requires_grad=False)
-            param._cpu_scratch = scratch
+            param._cpu_scratch = Parameter(torch.empty(untransposed_shape,
+                                                       dtype=param.dtype,
+                                                       device="cpu"),
+                                           requires_grad=False)
 
         cpu_scratch = param._cpu_scratch
 
