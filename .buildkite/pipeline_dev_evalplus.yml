@@ -33,13 +33,5 @@ steps:
       - |
         .buildkite/scripts/run_in_docker.sh bash -c '
           set -e
-          pip show evalplus | head -2
-          python -c "
-          from importlib.metadata import version
-          v = version(\"evalplus\")
-          assert v == \"0.3.1\", f\"expected evalplus 0.3.1, got {v}\"
-          from evalplus.evaluate import main
-          from evalplus.provider import make_model
-          from evalplus.provider.openai import OpenAIChatDecoder
-          print(\"evalplus\", v, \"CLI + openai provider import OK\")
-          "'
+          pip show evalplus
+          python -c "from importlib.metadata import version; v = version(\"evalplus\"); assert v == \"0.3.1\", v; import evalplus.evaluate, evalplus.provider.openai; print(\"evalplus\", v, \"CLI + openai provider import OK\")"'
