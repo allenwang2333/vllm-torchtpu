@@ -287,6 +287,44 @@ def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
     ), )
 
 
+# A pooled conv row is a bf16 view over the attention-shaped pool, so a head
+# is not a contiguous byte range. Two heads share one 512-byte view row and
+# each is split into two 128-byte fragments interleaved with its neighbour:
+#
+#     row (2 heads, 512 B):  [h0 lo][h1 lo][h0 hi][h1 hi]
+#
+# Units are therefore emitted at fragment granularity. Within one stride the
+# unit at index ``j`` carries head ``(j // 4) * 2 + (j % 2)``, fragment
+# ``(j % 4) // 2`` — consumers that reshard per head must recombine the two
+# fragments rather than slicing a head as one range.
+_LANE_TILE_BYTES = 128  # one 128-lane tile: the interleave granularity
+_VIEW_ROW_BYTES = 512  # bf16 view row over a 256-lane pool block
+
+
+def _conv_head_units(head_bytes: int, local_heads: int,
+                     what: str) -> tuple[int, int]:
+    """(unit_bytes, units_per_stride) for one conv segment.
+
+    A head is split only when it spans several lane tiles *and* shares a view
+    row with another head — otherwise it owns its tiles outright and stays
+    contiguous, which is what the plain per-head description already says.
+    """
+    if head_bytes <= 0:
+        raise ManifestError(f"GDN conv {what} head size must be positive")
+    fragments = head_bytes // _LANE_TILE_BYTES
+    heads_per_row = _VIEW_ROW_BYTES // head_bytes
+    if fragments < 2 or heads_per_row < 2:
+        return head_bytes, local_heads
+    # Both conditions can only hold together at head_bytes == 256, which is
+    # the geometry measured against a live pool.
+    if local_heads % heads_per_row:
+        raise ManifestError(
+            f"GDN conv {what} has {local_heads} local heads; the pooled "
+            f"layout pairs heads into {heads_per_row}-head view rows, so an "
+            "odd count would straddle a row boundary.")
+    return _LANE_TILE_BYTES, local_heads * fragments
+
+
 def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
                       geometry: GdnHeadGeometry) -> tuple[RegionSpec, ...]:
     if len(conv_shape) != 3:
@@ -306,25 +344,29 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
     v_offset = 2 * geometry.local_key_heads * key_bytes
+    kv_unit, kv_units = _conv_head_units(key_bytes, geometry.local_key_heads,
+                                         "q/k")
+    v_unit, v_units = _conv_head_units(value_bytes, geometry.local_value_heads,
+                                       "v")
     return (
         RegionSpec(name="gdn_conv_q",
                    offset_bytes=q_offset,
                    stride_bytes=row_stride,
-                   unit_bytes=key_bytes,
+                   unit_bytes=kv_unit,
                    num_units=taps,
-                   units_per_stride=geometry.local_key_heads),
+                   units_per_stride=kv_units),
         RegionSpec(name="gdn_conv_k",
                    offset_bytes=k_offset,
                    stride_bytes=row_stride,
-                   unit_bytes=key_bytes,
+                   unit_bytes=kv_unit,
                    num_units=taps,
-                   units_per_stride=geometry.local_key_heads),
+                   units_per_stride=kv_units),
         RegionSpec(name="gdn_conv_v",
                    offset_bytes=v_offset,
                    stride_bytes=row_stride,
-                   unit_bytes=value_bytes,
+                   unit_bytes=v_unit,
                    num_units=taps,
-                   units_per_stride=geometry.local_value_heads),
+                   units_per_stride=v_units),
     )
 
 

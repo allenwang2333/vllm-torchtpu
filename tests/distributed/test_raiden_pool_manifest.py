@@ -168,9 +168,9 @@ def test_pcp8_manifest_matches_live_geometry():
     conv_pool = next(p for p in manifest.pools if p.tag == rpm.TAG_GDN_CONV)
     q, k, v = conv_pool.regions
     assert (q.offset_bytes, q.stride_bytes, q.unit_bytes, q.num_units,
-            q.units_per_stride) == (0, 24_576, 256, 3, 16)
+            q.units_per_stride) == (0, 24_576, 128, 3, 32)
     assert k.offset_bytes == 4_096
-    assert (v.offset_bytes, v.units_per_stride) == (8_192, 64)
+    assert (v.offset_bytes, v.units_per_stride) == (8_192, 128)
 
     ssm_pool = next(p for p in manifest.pools if p.tag == rpm.TAG_GDN_SSM)
     (ssm_region, ) = ssm_pool.regions
@@ -562,3 +562,44 @@ def test_pool_dicts_coerce_into_raiden_pool_specs():
         assert spec.tag == entry.tag
         assert spec.block_stride_bytes == entry.block_stride_bytes
         assert spec.live_bytes_per_block == entry.live_bytes_per_block
+
+
+def test_conv_regions_are_fragment_granular():
+    """A pooled conv head is two 128 B fragments, not one contiguous range.
+
+    Two heads share a 512 B bf16 view row laid out as
+    ``[h0 lo][h1 lo][h0 hi][h1 hi]``, so units must be emitted per fragment.
+    Offsets below are measured from a live fp8 pool block (Qwen3.5 TP8).
+    """
+    geometry = rpm.GdnHeadGeometry(local_key_heads=2,
+                                   local_value_heads=8,
+                                   key_head_dim=128,
+                                   value_head_dim=128)
+    q, k, v = rpm._gdn_conv_regions(conv_shape=(4, 3, 1536),
+                                    itemsize=2,
+                                    geometry=geometry)
+
+    assert (q.offset_bytes, k.offset_bytes, v.offset_bytes) == (0, 512, 1024)
+    for region, heads in ((q, 2), (k, 2), (v, 8)):
+        assert region.unit_bytes == 128
+        assert region.units_per_stride == 2 * heads
+        # total coverage is unchanged by the finer granularity
+        assert region.live_bytes == 256 * heads * region.num_units
+
+    # unit j of a stride carries head (j // 4) * 2 + (j % 2)
+    measured_v0 = (1024, 1280)  # V0's two fragments, first tap
+    got = tuple(v.offset_bytes + j * v.unit_bytes for j in (0, 2))
+    assert got == measured_v0
+
+
+def test_conv_regions_keep_small_heads_contiguous():
+    """A head that fits in one lane tile owns it outright, so it stays whole."""
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=8,
+                                   key_head_dim=64,
+                                   value_head_dim=32)
+    q, _, v = rpm._gdn_conv_regions(conv_shape=(4, 3, 768),
+                                    itemsize=2,
+                                    geometry=geometry)
+    assert (q.unit_bytes, q.units_per_stride) == (128, 4)
+    assert (v.unit_bytes, v.units_per_stride) == (64, 8)
