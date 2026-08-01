@@ -310,6 +310,22 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
         has_bias = moe_config.has_bias if moe_config else False
         device = layer.w13_weight.device
 
+        is_tpu_v6e = False
+        try:
+            from vllm_torchtpu.tpu_info import get_tpu_type
+            tpu_type = get_tpu_type()
+            if tpu_type and tpu_type.startswith(("v5lite", "v6e")):
+                is_tpu_v6e = True
+        except Exception as e:
+            logger.warning(
+                "Failed to detect TPU type, defaulting to native FP4 path: %s",
+                e)
+
+        self.rhs_quant_dtype = None
+        if not is_tpu_v6e:
+            import jax.numpy as jnp
+            self.rhs_quant_dtype = getattr(jnp, "float4_e2m1fn", None)
+
         ep_size = getattr(
             layer, "ep_size",
             moe_parallel_config.ep_size if moe_parallel_config else 1)
@@ -532,18 +548,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 w2_bias_padded = None
 
             # 5. Quantize to FP8 (block-32) on TPU v6e, or FP4 (block-512) on other devices
-            is_tpu_v6e = False
-            try:
-                from vllm_torchtpu.tpu_info import get_tpu_type
-                tpu_type = get_tpu_type()
-                if tpu_type and tpu_type.startswith(("v5lite", "v6e")):
-                    is_tpu_v6e = True
-            except Exception as e:
-                logger.warning(
-                    "Failed to detect TPU type, defaulting to native FP4 path: %s",
-                    e)
-
-            self.rhs_quant_dtype = None
             if is_tpu_v6e:
                 logger.info(
                     "TPU v6e detected. Re-quantizing expert weights to FP8 float8_e4m3fn (block_size=32)"
@@ -595,8 +599,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                     w13_indices.transpose(1, 2)).transpose(1, 2)
                 w2_weight_processed = pack_fp4_indices(
                     w2_indices.transpose(1, 2)).transpose(1, 2)
-                import jax.numpy as jnp
-                self.rhs_quant_dtype = getattr(jnp, "float4_e2m1fn", None)
+                # rhs_quant_dtype is set at the start of process_weights_after_loading
                 logger.info(
                     f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}"
                 )
