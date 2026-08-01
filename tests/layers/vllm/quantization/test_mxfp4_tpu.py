@@ -105,8 +105,9 @@ class TestMxfp4MoETPU:
             layer.device = device
 
             # Create mock packed weights and scales (simulating MXFP4 model weights on TPU)
+            # K-major: K (128) is packed to 64, shape [num_experts, N, K // 2] is (num_experts, 1024, 64)
             w13_packed = torch.randint(0,
-                                       256, (num_experts, 64, 1024),
+                                       256, (num_experts, 1024, 64),
                                        dtype=torch.uint8,
                                        device="cpu")
             w13_scale = torch.randint(120,
@@ -129,7 +130,7 @@ class TestMxfp4MoETPU:
             os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir.name
 
             # Form dummy parameters on the layer so that process_weights knows the shapes for filename construction
-            layer.w13_weight = torch.nn.Parameter(w13_packed.to(device),
+            layer.w13_weight = torch.nn.Parameter(w13_packed.transpose(1, 2).to(device),
                                                   requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_packed.to(device),
                                                  requires_grad=False)

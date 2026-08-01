@@ -84,6 +84,7 @@ from vllm_torchtpu.layers.common.quantization import (pack_fp4_indices,
                                                       quantize_tensor_to_fp4)
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
@@ -322,9 +323,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 e)
 
         self.rhs_quant_dtype = None
-        if not is_tpu_v6e:
-            import jax.numpy as jnp
-            self.rhs_quant_dtype = getattr(jnp, "float4_e2m1fn", None)
 
         ep_size = getattr(
             layer, "ep_size",
@@ -594,17 +592,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 w2_indices, w2_weight_scale = quantize_tensor_to_fp4(
                     w2_weight_padded, axis=1, block_size=w2_block_size)
 
-                # Case A layout (packed contracting dim, unpacked non-contracting dim)
-                w13_weight_processed = pack_fp4_indices(
-                    w13_indices.transpose(1, 2)).transpose(1, 2)
-                w2_weight_processed = pack_fp4_indices(
-                    w2_indices.transpose(1, 2)).transpose(1, 2)
-                # rhs_quant_dtype is set at the start of process_weights_after_loading
+                # Pack to shape [E, N, K // 2] for cache storage (uint8)
+                w13_weight_processed = pack_fp4_indices(w13_indices.transpose(1, 2))
+                w2_weight_processed = pack_fp4_indices(w2_indices)
                 logger.info(
                     f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}"
                 )
-                w13_weight_processed = w13_weight_processed.contiguous()
-                w2_weight_processed = w2_weight_processed.contiguous()
 
                 s13 = w13_weight_scale.contiguous()
                 w13_weight_scale = torch.empty(s13.shape[0],
@@ -654,7 +647,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             w13_weight_processed = w13_weight_packed
             w2_weight_processed = w2_weight_packed
 
-        # Convert back to PyTorch-XLA parameters (retaining float/uint8 dtypes)
+        # Convert back to PyTorch-XLA parameters
         from torch.nn.parameter import Parameter
 
         def to_xla_parameter(tensor: torch.Tensor) -> Parameter:
@@ -663,12 +656,15 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             xla_tensor = tensor.to(device=device)
             return Parameter(xla_tensor, requires_grad=False)
 
-        if loaded_from_cache:
-            w13_weight_processed = w13_weight_packed
-            w2_weight_processed = w2_weight_packed
-
-        layer.w13_weight = to_xla_parameter(w13_weight_processed)
-        layer.w2_weight = to_xla_parameter(w2_weight_processed)
+        if is_tpu_v6e:
+            layer.w13_weight = to_xla_parameter(w13_weight_processed)
+            layer.w2_weight = to_xla_parameter(w2_weight_processed)
+        else:
+            # Non-v6e: Convert packed uint8 [E, N, K // 2] to native FP4 [E, K, N]
+            w13_fp4 = load_kmajor_fp4(w13_weight_processed.to(device))
+            w2_fp4 = load_kmajor_fp4(w2_weight_processed.to(device))
+            layer.w13_weight = Parameter(w13_fp4, requires_grad=False)
+            layer.w2_weight = Parameter(w2_fp4, requires_grad=False)
 
         layer.w13_weight_scale = to_xla_parameter(w13_weight_scale)
         layer.w2_weight_scale = to_xla_parameter(w2_weight_scale)
