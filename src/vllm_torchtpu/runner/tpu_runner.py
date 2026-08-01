@@ -3279,12 +3279,12 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         if self.kv_cache_config is not None:
-            # Dummy compact-mamba slot ids (all null slot 0): the dummy run
-            # only traces shapes/HBM, so the recurrent state read/written is
-            # never consumed. Shape must match the GDN op's max_reqs
-            # (= seq_lens length = num_reqs).
-            dummy_mamba_state_indices = (torch.zeros(
-                (num_reqs, ), dtype=torch.int32).to(self.device)
+            # Give every dummy request a distinct compact-mamba slot. Pallas
+            # convolution kernels write recurrent state in parallel, so
+            # aliasing all requests to the null slot creates an HBM DMA race
+            # even though the dummy state is never consumed.
+            dummy_mamba_state_indices = (torch.arange(
+                1, num_reqs + 1, dtype=torch.int32).to(self.device)
                                          if self._has_mamba_state else None)
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,

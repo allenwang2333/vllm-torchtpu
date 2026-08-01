@@ -84,6 +84,46 @@ def test_async_sub_indices_skips_new_req():
     assert src == [0, 1, 2, 3]
 
 
+def test_dummy_run_uses_distinct_mamba_state_slots():
+    runner = SimpleNamespace(
+        supports_mm_inputs=False,
+        device=torch.device("cpu"),
+        uses_mrope=False,
+        kv_cache_config=object(),
+        _has_mamba_state=True,
+        empty_slot_mappings=object(),
+        lora_config=None,
+        vllm_config=MagicMock(),
+        mesh=MagicMock(),
+        maybe_select_dummy_loras=lambda *args: contextlib.nullcontext(),
+        _build_attention_metadata=MagicMock(return_value=({}, None)),
+        forward_model=MagicMock(return_value=(torch.zeros((4, 2)), None)),
+    )
+    planner = MagicMock()
+    planner.prepare_dummy.return_value = SimpleNamespace(descriptor=object())
+
+    with patch.object(
+            tpu_runner,
+            "_get_sequence_layout_planner_for_runner",
+            return_value=planner), patch.object(
+                tpu_runner,
+                "set_forward_context",
+                return_value=contextlib.nullcontext()), patch.object(
+                    tpu_runner,
+                    "set_vllm_model_wrapper_context",
+                    return_value=contextlib.nullcontext()), patch.object(
+                        tpu_runner.sync, "synchronize"):
+        TPUModelRunner._dummy_run(runner,
+                                  num_tokens=4,
+                                  num_reqs=4,
+                                  num_blocks=1)
+
+    assert torch.equal(
+        runner._attn_metadata_builder_ctx.mamba_state_indices,
+        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+    )
+
+
 def test_get_finished_kv_transfers_drains_invalid_block_ids():
     connector = MagicMock()
     connector.get_finished.return_value = ({"sent"}, {"loaded"})
