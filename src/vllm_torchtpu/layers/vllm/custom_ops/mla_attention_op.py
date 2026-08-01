@@ -432,23 +432,13 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
         self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
 
-        if self.kv_cache_quantized_dtype is not None:
-            W_UK_T, W_UK_T_scale = quantize_tensor(
-                self.W_UK_T, self.kv_cache_quantized_dtype, axis=1)
-            self.W_UK_T = Parameter(W_UK_T.to(device), requires_grad=False)
-            self.W_UK_T_scale = Parameter(W_UK_T_scale.to(device),
-                                          requires_grad=False)
-
-            W_UV, W_UV_scale = quantize_tensor(self.W_UV,
-                                               self.kv_cache_quantized_dtype,
-                                               axis=1)
-            self.W_UV = Parameter(W_UV.to(device), requires_grad=False)
-            self.W_UV_scale = Parameter(W_UV_scale.to(device),
-                                        requires_grad=False)
-        else:
-            self.W_UK_T = Parameter(self.W_UK_T.to(device),
-                                    requires_grad=False)
-            self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
+        # Keep `W_UK_T`/`W_UV` in the activation dtype, matching upstream vLLM's
+        # `MLAAttention.process_weights_after_loading`: there is no quantized bmm
+        # for these two, so `forward_mla` upcasts them back to the activation
+        # dtype before `torch.bmm` anyway. Quantizing here only cost precision.
+        # `kv_cache_quantized_dtype` still governs the KV cache itself.
+        self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
+        self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
@@ -460,11 +450,7 @@ class VllmTPUMLAAttention(MLAAttention):
 
         if self.W_UK_T.device.type == "tpu":
             sync.synchronize(self.W_UK_T, wait=True)
-            if hasattr(self, "W_UK_T_scale"):
-                sync.synchronize(self.W_UK_T_scale, wait=True)
             sync.synchronize(self.W_UV, wait=True)
-            if hasattr(self, "W_UV_scale"):
-                sync.synchronize(self.W_UV_scale, wait=True)
 
         q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
         self.mla_op = self.impl._build_mla_op(self,
