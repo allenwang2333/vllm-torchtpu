@@ -108,16 +108,14 @@ def inner_kernel(
         # typed view; copy_out pushes the raw bytes back to the source.
         for idx in range(cfg.seq_tile_size):
 
-            def _store(idx=idx):
-                vmem_ldst.store_state_region(conv_state_slot_ref.at[idx],
-                                             cfg.state_plan.conv,
-                                             new_conv_state[idx])
-
+            args = (conv_state_slot_ref.at[idx], cfg.state_plan.conv,
+                    new_conv_state[idx])
             if carry_conv_scratch_ref is None:
-                _store()
+                vmem_ldst.store_state_region(*args)
             else:
                 # copy_out only DMAs the tile that ends a sequence.
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(_store)
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    functools.partial(vmem_ldst.store_state_region, *args))
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -190,15 +188,13 @@ def inner_kernel(
     else:
         for idx in range(cfg.seq_tile_size):
 
-            def _store(idx=idx):
-                vmem_ldst.store_state_region(recurrent_slot_ref.at[idx],
-                                             cfg.state_plan.recurrent,
-                                             new_recurrent_state[idx])
-
+            args = (recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
+                    new_recurrent_state[idx])
             if carry_recurrent_scratch_ref is None:
-                _store()
+                vmem_ldst.store_state_region(*args)
             else:
-                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(_store)
+                pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                    functools.partial(vmem_ldst.store_state_region, *args))
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]

@@ -193,6 +193,27 @@ def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
                                lane_split=region.lane_split)
 
 
+def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
+                     idx: int) -> jax.Array:
+    """One slot's conv state, decoded through the plan when there is one."""
+    # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
+    if cfg.state_plan is None:
+        return slot_ref[idx, 0].astype(jnp.float32)
+    return load_state_region(slot_ref.at[idx], cfg.state_plan.conv,
+                             (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(
+                                 jnp.float32)
+
+
+def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
+                          idx: int) -> jax.Array:
+    """One slot's recurrent state, decoded through the plan when there is one."""
+    if cfg.state_plan is None:
+        return slot_ref[idx, 0]
+    return load_state_region(
+        slot_ref.at[idx], cfg.state_plan.recurrent,
+        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
+
+
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -246,43 +267,28 @@ def load_and_select_states(
 
         # NOTE: The VMEM window holds one state per window position and the
         # initial state was DMA'd into position 0.
-        # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-        def _hbm_conv():
-            if cfg.state_plan is None:
-                return conv_state_slot_ref[idx, 0].astype(jnp.float32)
-            return load_state_region(
-                conv_state_slot_ref.at[idx], cfg.state_plan.conv,
-                (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(jnp.float32)
-
+        # Both scratches are allocated together (see GDNConfig.scratch_shapes).
         if carry_conv_scratch_ref is None:
-            prev_conv_state = jnp.where(has_initial_state, _hbm_conv(), 0)
+            prev_conv_state = jnp.where(
+                has_initial_state,
+                _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
+            prev_recurrent_state = jnp.where(
+                has_initial_state,
+                _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
         else:
-            # Later tiles resume from the carry, so decode the source
-            # once instead of on every tile.
+            # Later tiles resume from the carry, so decode both sources once
+            # instead of on every tile. One guard, not one per state.
+            # pl.when traces the body here, so `idx` is this iteration's.
             @pl.when(is_first_tile)
-            def _(idx=idx):
+            def _():
                 carry_conv_scratch_ref[idx] = jnp.where(
-                    has_initial_state, _hbm_conv(), 0)
+                    has_initial_state,
+                    _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
+                carry_recurrent_scratch_ref[idx] = jnp.where(
+                    has_initial_state,
+                    _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
 
             prev_conv_state = carry_conv_scratch_ref[idx]
-
-        def _hbm_recurrent():
-            if cfg.state_plan is None:
-                return recurrent_slot_ref[idx, 0]
-            return load_state_region(
-                recurrent_slot_ref.at[idx], cfg.state_plan.recurrent,
-                (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
-
-        if carry_recurrent_scratch_ref is None:
-            prev_recurrent_state = jnp.where(has_initial_state,
-                                             _hbm_recurrent(), 0)
-        else:
-
-            @pl.when(is_first_tile)
-            def _(idx=idx):
-                carry_recurrent_scratch_ref[idx] = jnp.where(
-                    has_initial_state, _hbm_recurrent(), 0)
-
             prev_recurrent_state = carry_recurrent_scratch_ref[idx]
 
         real_sizes_list.append(real_sizes)
