@@ -543,6 +543,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                     "Failed to detect TPU type, defaulting to native FP4 path: %s",
                     e)
 
+            self.rhs_quant_dtype = None
             if is_tpu_v6e:
                 logger.info(
                     "TPU v6e detected. Re-quantizing expert weights to FP8 float8_e4m3fn (block_size=32)"
@@ -589,9 +590,13 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
                 w2_indices, w2_weight_scale = quantize_tensor_to_fp4(
                     w2_weight_padded, axis=1, block_size=w2_block_size)
 
-                # Keep Case B layout (unpacked contracting dim, packed non-contracting dim) by calling pack on raw indices
-                w13_weight_processed = pack_fp4_indices(w13_indices)
-                w2_weight_processed = pack_fp4_indices(w2_indices)
+                # Case A layout (packed contracting dim, unpacked non-contracting dim)
+                w13_weight_processed = pack_fp4_indices(
+                    w13_indices.transpose(1, 2)).transpose(1, 2)
+                w2_weight_processed = pack_fp4_indices(
+                    w2_indices.transpose(1, 2)).transpose(1, 2)
+                import jax.numpy as jnp
+                self.rhs_quant_dtype = getattr(jnp, "float4_e2m1fn", None)
                 logger.info(
                     f"[DEBUG_MXFP4_SHAPES] layer_{layer_idx} w13_processed: {w13_weight_processed.shape}, w2_processed: {w2_weight_processed.shape}"
                 )
@@ -701,6 +706,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=use_ep,
+            rhs_quant_dtype=self.rhs_quant_dtype,
         )
 
     def get_fused_moe_quant_config(
@@ -758,6 +764,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, CustomOp):
             experts_start=moe_routing.get_experts_start(layer),
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
         )
         layer_idx = getattr(layer, "layer_idx", -1)
         if os.getenv("DSV4_TRACE_ACTIVATIONS") == "1":
