@@ -19,6 +19,7 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.has_bias = False
         self.activation = "silu"
         self.use_grouped_topk = False
+        self.renormalize = True
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id):
         return expert_id
@@ -93,13 +94,13 @@ def test_mxfp4_create_weights_and_process():
     assert hasattr(layer, "w2_weight_scale")
     assert not hasattr(layer, "w13_weight_packed")
 
-    # w13 native fp4 K-major: [E, K, N] -> N=64, K=128 -> [4, 128, 64]
+    # w13 native fp4 K-major: [E, K, N] -> N=128, K=128, last dim halved for float4_e2m1fn_x2 -> [4, 128, 64]
     assert layer.w13_weight.shape == (4, 128, 64)
-    # w2 native fp4 K-major: [E, K, N] -> N=128, K=64 -> [4, 64, 128]
-    assert layer.w2_weight.shape == (4, 64, 128)
+    # w2 native fp4 K-major: [E, K, N] -> N=128, K=64, last dim halved for float4_e2m1fn_x2 -> [4, 64, 64]
+    assert layer.w2_weight.shape == (4, 64, 64)
 
-    # w13_scale_4d: [E, num_blocks, 1, N] -> [4, 4, 1, 64]
-    assert layer.w13_weight_scale.shape == (4, 4, 1, 64)
+    # w13_scale_4d: [E, num_blocks, 1, N] -> [4, 4, 1, 128]
+    assert layer.w13_weight_scale.shape == (4, 4, 1, 128)
     # w2_scale_4d: [E, num_blocks, 1, N] -> [4, 2, 1, 128]
     assert layer.w2_weight_scale.shape == (4, 2, 1, 128)
 
