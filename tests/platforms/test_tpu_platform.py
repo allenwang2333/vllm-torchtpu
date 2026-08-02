@@ -24,9 +24,16 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu.platforms.tpu_platform import (
-    TpuPlatform, _validate_phased_profiling_config)
+    _DYNAMIC_COMPILE_TARGETS, TpuPlatform, _validate_phased_profiling_config)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
+
+
+def test_grouped_topk_dynamic_compile_is_registered_for_unwrapping():
+    assert (
+        "vllm.model_executor.layers.fused_moe.router.grouped_topk_router",
+        "grouped_topk",
+    ) in _DYNAMIC_COMPILE_TARGETS
 
 
 def test_scheduler_mamba_split_accepts_external_kv_tokens():
