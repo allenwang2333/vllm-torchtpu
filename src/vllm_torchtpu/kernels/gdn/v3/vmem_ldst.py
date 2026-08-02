@@ -268,13 +268,21 @@ def load_and_select_states(
         # NOTE: The VMEM window holds one state per window position and the
         # initial state was DMA'd into position 0.
         # Both scratches are allocated together (see GDNConfig.scratch_shapes).
-        if carry_conv_scratch_ref is None:
+        # Only the pool decode is worth guarding; a dense slot read is cheap
+        # enough that the guard costs more than it saves.
+        if carry_conv_scratch_ref is None or cfg.state_plan is None:
             prev_conv_state = jnp.where(
                 has_initial_state,
                 _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
             prev_recurrent_state = jnp.where(
                 has_initial_state,
                 _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
+            if carry_conv_scratch_ref is not None:
+                prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
+                                            carry_conv_scratch_ref[idx])
+                prev_recurrent_state = jnp.where(
+                    is_first_tile, prev_recurrent_state,
+                    carry_recurrent_scratch_ref[idx])
         else:
             # Later tiles resume from the carry, so decode both sources once
             # instead of on every tile. One guard, not one per state.
