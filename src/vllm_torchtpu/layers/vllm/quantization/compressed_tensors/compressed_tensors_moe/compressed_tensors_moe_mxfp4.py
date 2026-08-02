@@ -95,6 +95,27 @@ class VllmCompressedTensorsMxfp4MoEMethod(VllmMxfp4MoEMethod):
         layer.w2_bias = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        unpadded_size = self.moe.intermediate_size_per_partition_unpadded
+        padded_size = self.moe.intermediate_size_per_partition
+        if unpadded_size < padded_size:
+            if unpadded_size % self.group_size != 0:
+                raise ValueError(
+                    "MXFP4 unpadded intermediate size per partition must be "
+                    f"divisible by 32, got {unpadded_size}.")
+
+            # Checkpoint loading only writes the logical rows/groups, leaving
+            # these padding slices untouched.  Keep the parameters allocated
+            # with torch.empty() to avoid eager full-buffer initialization and
+            # its peak-memory cost during loading, then neutralize only the
+            # unused E8M0 scales in place.  Otherwise an uninitialized 0xff
+            # scale becomes infinity and can turn a padded zero weight into
+            # NaN during dequantization.
+            w13_scale = layer.w13_weight_scale.data
+            w13_scale[:, unpadded_size:padded_size, :].zero_()
+            w13_scale[:, padded_size + unpadded_size:, :].zero_()
+            layer.w2_weight_scale.data[:, :, unpadded_size //
+                                       self.group_size:].zero_()
+
         layer.w13_weight = torch.nn.Parameter(layer.w13_weight_packed.data,
                                               requires_grad=False)
         delattr(layer, "w13_weight_packed")

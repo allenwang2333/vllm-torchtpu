@@ -243,6 +243,8 @@ class TestW4MoEWeightPreprocessing:
     def test_mxfp4_load_transform_contract(self):
         layer = FakeRoutedExperts(experts_per_token=2)
         layer.activation = FakeActivation("situ")
+        layer.moe_config.intermediate_size_per_partition = 64
+        layer.moe_config.intermediate_size_per_partition_unpadded = 64
         method = VllmCompressedTensorsMxfp4MoEMethod(layer.moe_config)
         method.create_weights(layer,
                               num_experts=2,
@@ -285,6 +287,55 @@ class TestW4MoEWeightPreprocessing:
         assert layer.w2_weight_scale.shape == (2, 2, 1, 128)
         assert layer.w13_weight_scale.dtype == torch.float32
         assert layer.w2_weight_scale.dtype == torch.float32
+
+    def test_mxfp4_load_neutralizes_only_padded_scales(self):
+        layer = FakeRoutedExperts(experts_per_token=2)
+        layer.activation = FakeActivation("situ")
+        layer.moe_config.intermediate_size_per_partition = 64
+        layer.moe_config.intermediate_size_per_partition_unpadded = 32
+        method = VllmCompressedTensorsMxfp4MoEMethod(layer.moe_config)
+        method.create_weights(layer,
+                              num_experts=2,
+                              hidden_size=128,
+                              intermediate_size_per_partition=64,
+                              params_dtype=torch.bfloat16,
+                              weight_loader=MagicMock())
+        layer.w13_weight_scale.data.fill_(0xff)
+        layer.w2_weight_scale.data.fill_(0xff)
+
+        loaded_scales = []
+
+        def fake_load(weight, scale):
+            loaded_scales.append(scale.clone())
+            output = torch.empty(weight.shape[0],
+                                 weight.shape[-1] * 2,
+                                 weight.shape[1] // 2,
+                                 dtype=torch.float4_e2m1fn_x2)
+            output_scale = torch.empty(scale.shape[0],
+                                       scale.shape[-1],
+                                       1,
+                                       scale.shape[1],
+                                       dtype=torch.float32)
+            return output, output_scale
+
+        with patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.load_kmajor_mxfp4",
+                side_effect=fake_load,
+        ), patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.prebuild_fused_moe_kernel"
+        ), patch(
+                "vllm_torchtpu.layers.vllm.quantization.mxfp4.moe_routing.get_experts_start",
+                return_value=None,
+        ):
+            method.process_weights_after_loading(layer)
+
+        w13_scale, w2_scale = loaded_scales
+        assert torch.all(w13_scale[:, :32, :] == 0xff)
+        assert not w13_scale[:, 32:64, :].any()
+        assert torch.all(w13_scale[:, 64:96, :] == 0xff)
+        assert not w13_scale[:, 96:, :].any()
+        assert torch.all(w2_scale[:, :, :1] == 0xff)
+        assert not w2_scale[:, :, 1:].any()
 
     def test_xor_sign_conversion(self):
         """Symmetric unsigned INT4 [0, 15] should be converted to signed [-8, 7] via XOR."""
