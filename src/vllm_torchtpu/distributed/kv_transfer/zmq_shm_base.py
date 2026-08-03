@@ -141,6 +141,7 @@ class _CoordRecvEntry:
     # reporting across scheduler ticks while we wait for per-rank copies.
     reported_done: bool = False
     traceparent: str = ""
+    kv_span: Any = None
 
 
 @dataclass
@@ -1287,8 +1288,25 @@ class ZmqShmKvConnectorBase:
         to N producer ROUTER ports ``base_port + ch``. Each channel carries
         its subset of rank payloads; we reassemble them into a single
         rank->payload map then unpack all shards into shm."""
-        hosts = entry.remote_host if isinstance(entry.remote_host,
-                                                list) else [entry.remote_host]
+        traceparent = getattr(entry, "traceparent", "")
+        try:
+            from opentelemetry import trace
+            from opentelemetry.trace import Status, StatusCode
+            from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+            parent_ctx = None
+            if traceparent:
+                parent_ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
+            tracer = trace.get_tracer("vllm_torchtpu.kv_transfer")
+            kv_span = tracer.start_span("kv_cache_transfer", context=parent_ctx)
+            if kv_span and kv_span.is_recording():
+                kv_span.set_attribute("kv_transfer.uuid", str(entry.uuid))
+                kv_span.set_attribute("kv_transfer.num_blocks", entry.num_blocks)
+                entry.kv_span = kv_span
+        except Exception:
+            kv_span = None
+
+        hosts = entry.remote_host if isinstance(entry.remote_host, list) else [entry.remote_host]
         ports = entry.remote_port if isinstance(entry.remote_port,
                                                 list) else [entry.remote_port]
         num_hosts = len(hosts)
@@ -1603,6 +1621,14 @@ class ZmqShmKvConnectorBase:
                 h2d_total_bytes += src_view.numel() * src_view.element_size()
             alloc_t1 = time.perf_counter()
 
+            try:
+                from opentelemetry import trace
+
+                _h2d_tracer = trace.get_tracer("vllm_torchtpu.kv_transfer")
+                _h2d_span = _h2d_tracer.start_span("h2d_device_scatter")
+            except Exception:
+                _h2d_span = None
+
             h_t0 = time.perf_counter()
             h2d_future, device_shards = self._h2d_into_device_async(src_views)
             h2d_t_issued = time.perf_counter()
@@ -1627,6 +1653,15 @@ class ZmqShmKvConnectorBase:
         self.transfer_stats.record_h2d_transfer(h2d_ms_total)
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
+
+        if _h2d_span is not None:
+            try:
+                _h2d_span.set_attribute("h2d.ms", h2d_ms_total)
+                _h2d_span.set_attribute("h2d.throughput_mbps", h2d_mbps)
+                _h2d_span.set_attribute("h2d.num_blocks", num_blocks)
+                _h2d_span.end()
+            except Exception:
+                pass
 
         logger.info(
             "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%s "
@@ -1661,6 +1696,11 @@ class ZmqShmKvConnectorBase:
             try:
                 self._coord_rank0_send_notify(dummy, uuid)
             finally:
+                if getattr(entry_for_notify, "kv_span", None) is not None:
+                    try:
+                        entry_for_notify.kv_span.end()
+                    except Exception:
+                        pass
                 self._coord_pool.release_slot(entry_for_notify.slot_idx)
                 logger.info(
                     "PERF D scatter_complete req_id=%s uuid=%s ts=%.6f",

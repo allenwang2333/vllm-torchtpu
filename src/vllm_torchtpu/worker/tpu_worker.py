@@ -396,7 +396,39 @@ class TPUWorker(WorkerBase):
         return available
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        try:
+            from opentelemetry import context, trace
+            from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+            tracer = trace.get_tracer("torchtpu.worker")
+            req_links = []
+            req_contexts = []
+            req_id_to_trace_headers = getattr(scheduler_output, "req_id_to_trace_headers", {})
+
+            for req_id, trace_headers in req_id_to_trace_headers.items():
+                if trace_headers:
+                    try:
+                        ctx = TraceContextTextMapPropagator().extract(trace_headers)
+                        req_contexts.append((req_id, ctx))
+                        span_context = trace.get_current_span(ctx).get_span_context()
+                        if span_context.is_valid:
+                            req_links.append(trace.Link(span_context))
+                    except Exception:
+                        pass
+
+            first_ctx = req_contexts[0][1] if req_contexts else None
+            with tracer.start_as_current_span(
+                "torchtpu.worker.execute_model",
+                context=first_ctx,
+                links=req_links if req_links else None,
+            ) as exec_span:
+                exec_span.set_attribute(
+                    "torchtpu.total_num_scheduled_tokens",
+                    getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+                )
+                return self.model_runner.execute_model(scheduler_output)
+        except Exception:
+            return self.model_runner.execute_model(scheduler_output)
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
