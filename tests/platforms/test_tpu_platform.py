@@ -179,8 +179,8 @@ class TestTpuPlatform:
                                                        mock_apply_patches,
                                                        vllm_config):
         vllm_config.model_config.is_hybrid = True
-        # kv-transfer deployments run the split layout (the pool is opt-in
-        # via the env and never engages for kv-transfer).
+        # A hybrid architecture with no pooled state path runs the split
+        # layout, kv-transfer or not.
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "TPUConnector"
         vllm_config.cache_config.block_size = 123  # already set
@@ -192,8 +192,8 @@ class TestTpuPlatform:
                    "update_tpu_block_size_and_slot_config") as mock_update:
             TpuPlatform.update_block_size_for_backend(vllm_config)
 
-        # Without the unified-layout env the split-layout path must not run
-        # the block-size derivation helper.
+        # The split-layout path must not run the block-size derivation
+        # helper.
         mock_update.assert_not_called()
         # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
@@ -222,21 +222,37 @@ class TestTpuPlatform:
         # test_tpu_block_size_utils.py).
         mock_update.assert_called_once_with(vllm_config, mock_pallas)
 
-    def test_unified_kv_layout_enablement_contract(self, vllm_config):
+    def test_unified_kv_layout_enablement_contract(self, vllm_config,
+                                                   monkeypatch):
         from vllm_torchtpu.platforms.tpu_block_size_utils import \
             unified_kv_layout_enabled
+        monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+        pooled_arch = "Qwen3_5ForConditionalGeneration"
+        unpooled_arch = "KimiLinearForCausalLM"
         vllm_config.model_config.is_hybrid = True
-
-        # No env: ordinary non-unified allocation remains selected.
         vllm_config.kv_transfer_config = None
+
+        # A hybrid architecture without a pooled state path keeps the
+        # per-layer caches: its layers unpack a separate conv/ssm pair.
+        vllm_config.model_config.architecture = unpooled_arch
         assert not unified_kv_layout_enabled(vllm_config)
 
+        # A pooled GDN architecture selects the pool with no env set.
+        vllm_config.model_config.architecture = pooled_arch
+        assert unified_kv_layout_enabled(vllm_config)
+
+        # An explicit setting wins in either direction.
+        with patch.dict("os.environ",
+                        {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}):
+            assert not unified_kv_layout_enabled(vllm_config)
+
+        vllm_config.model_config.architecture = unpooled_arch
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
-            # The same env selects the pooled layout for local and transfer
-            # deployments.
             assert unified_kv_layout_enabled(vllm_config)
 
+            # The pooled layout is selected for local and transfer
+            # deployments alike.
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
 

@@ -852,13 +852,13 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
                                     == "OffloadingConnector" and is_hybrid)
             if (is_hybrid_offloading
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 # Hybrid CPU offloading transfers whole pool rows; the
                 # typed-view layout has no uniform per-block row to copy.
                 raise ValueError(
