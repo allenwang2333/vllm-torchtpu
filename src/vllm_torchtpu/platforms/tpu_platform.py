@@ -723,8 +723,7 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # align-mode mamba state seeding (MambaApcStateCopier on the
-        # typed-view layout, or the pool's seed copies); other cache modes
+        # the pool's align-mode mamba state seed copies; other cache modes
         # and speculative decoding must be rejected up front instead of
         # failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
