@@ -350,9 +350,10 @@ class TPUModelRunner(GPUModelRunner):
         # the full attention `num_blocks`, and the per-request slot id is
         # carried in `AttentionMetadata.mamba_state_indices` instead of being
         # derived from the attention `block_tables[:, 0]`. None until the
-        # override runs (and stays None if it is skipped, e.g. CPU-only tests
-        # or a user-pinned num_gpu_blocks_override) — in which case mamba and
-        # attention share the uniform `num_blocks` as before.
+        # compact sizing path runs (and stays None if it is skipped, e.g.
+        # CPU-only tests) — in which case mamba and attention share the
+        # uniform `num_blocks` as before. A user-pinned attention block count
+        # still uses compact Mamba slots; only the attention sizing is pinned.
         self._mamba_num_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and returned when it leaves
@@ -1281,9 +1282,24 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Compact mamba sizing skipped.")
             return
         cache_config = self.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
         if group_size <= 0:
+            return
+
+        pinned_attn_num_blocks = cache_config.num_gpu_blocks_override
+
+        # A user-pinned override controls the attention pool size, but must
+        # not disable compact Mamba indexing. Falling back to the uniform
+        # block-table path makes recurrent state follow attention block ids;
+        # that is both wasteful and can alias state across concurrent hybrid
+        # requests. Preserve the requested attention count and independently
+        # allocate one recurrent slot per request plus the null slot.
+        if pinned_attn_num_blocks is not None:
+            mamba_num_blocks = self.max_num_reqs + 1
+            self._mamba_num_blocks = int(mamba_num_blocks)
+            logger.info(
+                "Compact-mamba KV cache with user-pinned attention blocks: "
+                "num_gpu_blocks_override=%d (attn), _mamba_num_blocks=%d.",
+                pinned_attn_num_blocks, mamba_num_blocks)
             return
 
         avail = self._available_kv_cache_hbm()

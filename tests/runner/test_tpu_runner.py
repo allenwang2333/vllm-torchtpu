@@ -551,6 +551,28 @@ class TestTPURunner:
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
         return_value=4096)
+    def test_pinned_attention_blocks_keep_compact_mamba_slots(
+            self, mock_get_page_size):
+        """Pinning attention capacity must not disable per-request Mamba
+        slots or fall back to recurrent-state indexing via block tables."""
+        self.runner.cache_config.num_gpu_blocks_override = 260
+
+        layers = {}
+        mock_attn = MagicMock(spec=Attention)
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers['attn_0'] = mock_attn
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+
+        self.runner._update_mamba_page_size_padded(layers)
+
+        assert self.runner.cache_config.num_gpu_blocks_override == 260
+        assert self.runner._mamba_num_blocks == 17
+
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
+        return_value=4096)
     @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
            return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
     def test_kv_connector_reserve_shrinks_num_blocks_override(
