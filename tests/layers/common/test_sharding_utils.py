@@ -429,3 +429,19 @@ def test_sharding_utils_indivisible_errors():
                                                  split_sizes,
                                                  n_shards,
                                                  dim=0)
+
+
+def test_build_mesh_inferred_axis():
+    from vllm_torchtpu.layers.common.sharding import build_mesh, Sharding
+    devices = list(range(8))
+    strategy = {
+        "expert_parallelism": 1,
+        "sequence_parallelism": 2,
+        "tensor_parallelism": -1,
+    }
+    mesh = build_mesh(devices, strategy)
+    assert mesh.shape == {"expert": 1, "seq": 2, "model": 4}
+
+    sharding = Sharding()
+    assert "Sharding(" in repr(sharding)
+    assert "ShardingConfig(" in repr(sharding.get_sharding_cfg())
