@@ -119,6 +119,26 @@ use of `torch.empty` during weight loading.
   explicit equal `--num-gpu-blocks-override` avoids this nondeterministic
   validation failure. This is an existing KV-sizing synchronization issue,
   not an SP collective or model-correctness failure.
+- Compact hybrid sizing also consumed the entire reported KV budget for the
+  full K3 TP8 model. It selected roughly 33,000 MLA blocks and used
+  15.7--15.9 GiB per device, leaving no margin below the configured HBM cap
+  for the first cache-shaped executable. Both real and dummy full-depth runs
+  then stopped in `sample_tokens`. Pinning a capacity appropriate for the
+  validation workload (`--num-gpu-blocks-override=16` for short dummy probes,
+  64 for the 512-token real server) preserves runtime headroom. Automatic
+  compact sizing still needs a general reserve policy; the explicit block
+  count is the current operational workaround.
+- Full-depth bisection initially made the K3 timeout look like a graph-size or
+  final-layer problem. Compiled TP8 dummy variants with 4, 13, 49, 73, and 92
+  layers all generated, while the auto-sized 93-layer model stalled. Repeating
+  all 93 layers with 16 explicit blocks generated eight tokens in 1.20 seconds.
+  The final consecutive MLA layer and XLA graph depth are therefore not the
+  cause.
+- Real `mgoin/Kimi-K3-pruned75` additionally requires expert parallelism. With
+  explicit KV headroom but TP-only MoE, the first request still reached the
+  300-second RPC timeout. TP8 + EP8 keeps 28 complete, native-width experts on
+  each rank and returned `2 + 2 = 4` in 1.26 seconds. This EP distribution is
+  explicit (`--enable-expert-parallel`); XLA does not infer it.
 
 ## Validation configuration
 
@@ -222,29 +242,67 @@ different test examples were excluded because their otherwise sensible
 reasoning hit the deliberately small 256-token response cap before emitting a
 final answer; they were not counted as passes.
 
-### Full real K3 validation blocker
+### Full real K3 validation
 
-The full real K3 checkpoint was also loaded at TP8 x DP1 in compiled mode,
-because it does not fit the SP topology on this eight-chip host. Weight loading
-and MXFP4 repacking completed (442.52 GiB of checkpoint data), all eight ranks
-finished warmup compilation, and the API server reached
-`Application startup complete`. A cold load took about 780 seconds; a second
-run using the warm caches took about 292 seconds for loading plus 378 seconds
-for engine initialization, of which 208 seconds was compilation.
+The full real K3 checkpoint was validated at TP8 x EP8 x DP1 in compiled mode,
+because it does not fit the SP topology on this eight-chip host. This topology
+does not activate model-level SP; it validates real checkpoint loading, native
+expert layout, latent MoE, KDA/MLA execution, and repeated decode independently
+of the SP collectives. The working configuration was:
 
-Generation did not complete. An eight-request attempt and a separate
-single-request attempt both remained at zero generated tokens until the
-multiprocess executor's five-minute timeout. The isolated request had completed
-its 16-token prefill and scheduled four more tokens, but no worker response was
-returned; the terminal error was `RPC call to sample_tokens timed out`. The
-server then returned HTTP 500 and shut down. The checkpoint has no usable chat
-template, so these tests correctly used the raw completions endpoint; the
-failure occurred after request admission rather than during prompt rendering.
+```text
+vllm serve mgoin/Kimi-K3-pruned75 \
+  --tensor-parallel-size 8 --enable-expert-parallel \
+  --attention-backend CUSTOM --max-model-len 512 \
+  --max-num-batched-tokens 16 --max-num-seqs 1 \
+  --num-gpu-blocks-override 64 --trust-remote-code
+```
 
-This prevents reporting a ten-prompt real-K3 quality result. It is not evidence
-against the new SP path: TP8 x DP1 does not enable SP, and the same timeout was
-reproduced with one request, independently of concurrency. The evidence scopes
-the remaining issue to the existing real-K3 TP8 execution/sampling path. The
-real Kimi-Linear 10/10 check above validates full-checkpoint SP quality, while
-the reduced TP4 x DP2 K3 smoke validates K3-specific SP execution, including
-latent MoE, through an HTTP completion.
+The checkpoint contains 96 shards totaling 442.52 GiB. With EP8, weight
+loading took 70.72 seconds on the cached local filesystem. MXFP4 preparation
+produced 28 local experts per rank with native shapes
+`w13=[28,3584,3072]` and `w2=[28,3072,1792]`; it did not pad or zero-fill the
+checkpoint allocation. Engine initialization took 471.22 seconds, including
+260.70 seconds of compilation. A short arithmetic completion returned HTTP
+200 and `2 + 2 = 4` in 1.26 seconds.
+
+Two controls explain the earlier five-minute timeout:
+
+1. Full 93-layer dummy TP8 succeeds when KV capacity is pinned, so the graph,
+   final MLA layer, and dummy execution are healthy. Auto compact sizing had
+   filled the remaining HBM budget.
+2. Full real TP-only TP8 still times out with a small explicit cache. Enabling
+   EP8 changes the routed weights from 224 width-sharded experts per rank to 28
+   complete experts per rank and makes real inference execute normally.
+
+Ten deterministic examples from the official GSM8K test split were then sent
+sequentially through the raw completions endpoint. The XTML renderer used low
+thinking effort, and the largest uniform output allowance that fit every
+prompt in the 512-token context was 295 tokens.
+
+| Problem | Reference | Generated | Correct |
+|:---|---:|---:|:---:|
+| Duck-egg sales | 18 | 18 | yes |
+| Robe fabric | 3 | 3 | yes |
+| House flipping | 70,000 | 150 | no |
+| Weekly sprints | 540 | 540 | yes |
+| Chicken feed | 20 | 60 | no |
+| Discounted glasses | 64 | 48 | no |
+| Three sheep flocks | 260 | 240 | no |
+| Interrupted download | 160 | 120 | no |
+| Return drive | 45 | 120 | no |
+| Weekly overtime | 460 | 10 | no |
+
+Result: **10/10 HTTP completions, 3/10 numerically correct**. The run consumed
+1,697 prompt and 2,500 output tokens in 181.08 seconds; median request latency
+was 20.63 seconds. All responses were readable and problem-specific. The
+misses were model-quality failures from this deliberately 75%-expert-pruned
+checkpoint: some selected a plausible but wrong interpretation, while others
+repeated analysis until the output cap. There were no padding-only responses,
+NaNs, worker timeouts, runtime recompilations, or collective failures.
+
+This real TP8 result does not imply that XLA applied sequence parallelism
+automatically. EP8 was requested explicitly, and DP1 means the new SP predicate
+is false. Full-checkpoint SP quality is covered by Kimi-Linear's TP4 x DP2
+10/10 result above; the reduced K3 TP4 x DP2 smoke covers K3-specific SP and
+latent-MoE integration under the topology that fits this host.
