@@ -832,7 +832,6 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=layer.scoring_func,
                 layer=layer,
-                input_ids=input_ids,
             )
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
