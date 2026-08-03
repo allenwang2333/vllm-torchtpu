@@ -43,6 +43,11 @@ CAPTURE_LAYERS = os.environ.get("CAPTURE_LAYERS", "1,13,25")
 MAX_Q_ROWS = int(os.environ.get("MAX_Q_ROWS", "64"))
 
 CAPTURED = {}
+# Only capture once the real prefill is in flight. `kv_cache.numel() == 0`
+# rules out the memory-profiling pass, but vLLM also runs warmup forwards
+# *after* the cache is allocated, and those carry dummy activations whose
+# statistics are not the ones the quantizer will see in production.
+ARMED = [False]
 
 
 def _to_numpy(t):
@@ -71,9 +76,7 @@ def install_hook(target_indices):
         try:
             name = getattr(layer, "layer_name", "")
             idx = _layer_index(name)
-            # kv_cache.numel()==0 is the memory-probe pass, whose activations
-            # are dummies -- skip it or we would price garbage.
-            if (idx in target_indices and name not in CAPTURED
+            if (ARMED[0] and idx in target_indices and name not in CAPTURED
                     and kv_cache.numel() > 0 and isinstance(q, tuple)):
                 _capture(self, layer, name, q, kv_c_normed, k_pe)
         except Exception:
@@ -227,8 +230,12 @@ def main():
     )
 
     prompt = build_prompt(prompt_len)
+    # Arm only now: everything before this point (memory profiling, post-cache
+    # warmup) runs on dummy activations.
+    ARMED[0] = True
     # One token out: only the prefill activations matter here.
     llm.generate([prompt], SamplingParams(max_tokens=1, temperature=0.0))
+    ARMED[0] = False
 
     if not CAPTURED:
         print("### FATAL: nothing captured -- did the hook match any layer?")
