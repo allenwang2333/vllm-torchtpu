@@ -34,11 +34,11 @@ def kimi_short_conv_scan(
     num_tokens = x.shape[0]
     kernel_size = conv_weight.shape[-1]
     weights = jnp.swapaxes(conv_weight[:, 0, :], 0, 1)
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     # Dummy AOT runs may describe more one-token requests than fit in the
     # current token bucket; normal runtime metadata instead repeats the true
     # token total in its padded request tail.
     total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     sequence_ids = jnp.searchsorted(query_start_loc[1:],
                                     token_ids,
                                     side="right")
@@ -46,11 +46,13 @@ def kimi_short_conv_scan(
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     has_initial_state = seq_lens > query_lens
 
-    def step(state, inputs):
-        token_id, token, sequence_id = inputs
-        valid = token_id < total_tokens
+    def step(token_id, carry):
+        state, all_outputs = carry
+        token = x[token_id]
+        sequence_id = sequence_ids[token_id]
         state_idx = state_indices[sequence_id]
-        old_state = state[state_idx]
+        safe_state_idx = jnp.maximum(state_idx, 0)
+        old_state = state[safe_state_idx]
         is_first = token_id == query_start_loc[sequence_id]
         old_state = jnp.where(is_first & ~has_initial_state[sequence_id],
                               jnp.zeros_like(old_state), old_state)
@@ -60,15 +62,18 @@ def kimi_short_conv_scan(
                          axis=0).astype(x.dtype)
         new_state = window[-(kernel_size - 1):].astype(conv_state.dtype)
         state = jax.lax.cond(
-            valid,
-            lambda s: s.at[state_idx].set(new_state),
+            state_idx >= 0,
+            lambda s: s.at[safe_state_idx].set(new_state),
             lambda s: s,
             state,
         )
-        return state, jnp.where(valid, output, jnp.zeros_like(output))
+        all_outputs = all_outputs.at[token_id].set(output)
+        return state, all_outputs
 
-    new_state, output = jax.lax.scan(step, conv_state,
-                                     (token_ids, x, sequence_ids))
+    # Keep the static output shape without convolving padded token slots.
+    output = jnp.zeros_like(x)
+    new_state, output = jax.lax.fori_loop(0, total_tokens, step,
+                                          (conv_state, output))
     return output, new_state
 
 

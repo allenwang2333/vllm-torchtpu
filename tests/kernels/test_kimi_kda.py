@@ -147,3 +147,61 @@ def test_kimi_short_conv_scan_resets_each_new_sequence() -> None:
         np.asarray(new_state),
         np.asarray([[[1, 2], [3, 4]], [[0, 0], [5, 6]]], dtype=np.float32),
     )
+
+
+def test_kimi_recurrences_skip_padded_decode_tokens() -> None:
+    num_tokens, num_heads, head_dim = 16, 2, 4
+    key = jnp.ones((num_tokens, num_heads, head_dim), jnp.bfloat16)
+    projection = key.reshape(num_tokens, num_heads * head_dim)
+    mixed_qkv = jnp.concatenate((projection, projection, projection), axis=-1)
+    raw_gate = jnp.zeros((num_tokens, num_heads * head_dim), jnp.bfloat16)
+    beta = jnp.zeros((num_tokens, num_heads), jnp.bfloat16)
+    output_gate = jnp.zeros_like(raw_gate)
+    state = jnp.zeros((4, num_heads, head_dim, head_dim), jnp.float32)
+    starts = jnp.asarray([0, 1, 2, 3, 4, 4, 4, 4, 4], jnp.int32)
+    state_indices = jnp.asarray([0, 1, 2, 3, -1, -1, -1, -1],
+                                jnp.int32)
+    seq_lens = jnp.asarray([2, 2, 2, 2, 0, 0, 0, 0], jnp.int32)
+
+    output, new_state = ragged_kda(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        state,
+        jnp.zeros((num_heads, ), jnp.float32),
+        jnp.zeros((num_heads * head_dim, ), jnp.float32),
+        jnp.ones((head_dim, ), jnp.bfloat16),
+        starts,
+        state_indices,
+        seq_lens,
+        lower_bound=None,
+        eps=1e-5,
+    )
+    expected_output, expected_state = kda_step(
+        key[0], key[0], key[0],
+        raw_gate[0].reshape(num_heads, head_dim), beta[0],
+        output_gate[0].reshape(num_heads, head_dim),
+        jnp.zeros((num_heads, head_dim, head_dim), jnp.float32),
+        jnp.ones((num_heads, 1), jnp.float32),
+        jnp.zeros((num_heads, head_dim), jnp.float32),
+        jnp.ones((head_dim, ), jnp.bfloat16),
+        lower_bound=None,
+        eps=1e-5,
+    )
+    np.testing.assert_array_equal(np.asarray(output[:4]),
+                                  np.asarray([expected_output] * 4))
+    np.testing.assert_array_equal(np.asarray(output[4:]), 0)
+    np.testing.assert_allclose(np.asarray(new_state),
+                               np.asarray([expected_state] * 4))
+
+    conv_input = jnp.ones((num_tokens, 2), jnp.bfloat16)
+    conv_state = jnp.zeros((4, 2, 2), jnp.bfloat16)
+    conv_output, new_conv_state = kimi_short_conv_scan(
+        conv_input, conv_state, jnp.ones((2, 1, 3), jnp.bfloat16), starts,
+        state_indices, seq_lens)
+    np.testing.assert_array_equal(np.asarray(conv_output[:4]),
+                                  [[1, 1]] * 4)
+    np.testing.assert_array_equal(np.asarray(conv_output[4:]), 0)
+    np.testing.assert_array_equal(np.asarray(new_conv_state),
+                                  [[[0, 0], [1, 1]]] * 4)

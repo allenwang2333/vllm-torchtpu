@@ -120,8 +120,8 @@ def ragged_kda(
             or seq_lens.dtype != jnp.int32):
         raise TypeError("KDA metadata tensors must be int32")
 
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
     sequence_ids = jnp.searchsorted(query_start_loc[1:],
                                     token_ids,
                                     side="right")
@@ -131,24 +131,23 @@ def ragged_kda(
     decay = jnp.exp(a_log)[:, None]
     dt_bias_heads = dt_bias.reshape(num_heads, head_dim)
 
-    def step(state, inputs):
-        (token_id, qkv_token, gate_token, beta_token, output_gate_token,
-         sequence_id) = inputs
-        valid = token_id < total_tokens
+    def step(token_id, carry):
+        state, all_outputs = carry
+        sequence_id = sequence_ids[token_id]
         state_idx = state_indices[sequence_id]
         safe_state_idx = jnp.maximum(state_idx, 0)
         token_state = state[safe_state_idx]
         is_first = token_id == query_start_loc[sequence_id]
         token_state = jnp.where(is_first & ~has_initial_state[sequence_id],
                                 jnp.zeros_like(token_state), token_state)
-        qkv = qkv_token.reshape(3, num_heads, head_dim)
+        qkv = mixed_qkv[token_id].reshape(3, num_heads, head_dim)
         output, next_token_state = kda_step(
             qkv[0],
             qkv[1],
             qkv[2],
-            gate_token.reshape(num_heads, head_dim),
-            beta_token,
-            output_gate_token.reshape(num_heads, head_dim),
+            raw_gate[token_id].reshape(num_heads, head_dim),
+            beta[token_id],
+            output_gate[token_id].reshape(num_heads, head_dim),
             token_state,
             decay,
             dt_bias_heads,
@@ -156,19 +155,18 @@ def ragged_kda(
             lower_bound=lower_bound,
             eps=eps,
         )
-        should_store = valid & (state_idx >= 0)
         state = jax.lax.cond(
-            should_store,
+            state_idx >= 0,
             lambda s: s.at[safe_state_idx].set(next_token_state),
             lambda s: s,
             state,
         )
-        output = jnp.where(valid, output, jnp.zeros_like(output))
-        return state, output
+        all_outputs = all_outputs.at[token_id].set(output)
+        return state, all_outputs
 
-    new_state, output = jax.lax.scan(
-        step,
-        recurrent_state,
-        (token_ids, mixed_qkv, raw_gate, beta, output_gate, sequence_ids),
-    )
+    # num_tokens is the static compile bucket. A dynamic upper bound keeps
+    # decode from running the recurrence over its padded tail.
+    output = jnp.zeros((num_tokens, num_heads, head_dim), mixed_qkv.dtype)
+    new_state, output = jax.lax.fori_loop(0, total_tokens, step,
+                                          (recurrent_state, output))
     return output, new_state
