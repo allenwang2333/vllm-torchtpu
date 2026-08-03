@@ -59,6 +59,26 @@ class RayDistributedExecutorV2(RayExecutorV2):
         device_key = current_platform.ray_device_key
         return {"num_gpus": 0, "resources": {device_key: 1.0}}
 
+    def _build_runtime_env(self) -> dict:
+        """Apply startup-sensitive environment before Ray actors import.
+
+        TorchTPU, vLLM, and Hugging Face snapshot several of these variables
+        during import. Passing them later to ``initialize_worker`` is too late,
+        even though PJRT device creation itself is deferred.
+        """
+        runtime_env = super()._build_runtime_env()
+        env_vars = runtime_env.setdefault("env_vars", {})
+        for env_var in ("TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
+                        "TPU_CHIPS_PER_PROCESS_BOUNDS", "TPU_PROCESS_BOUNDS",
+                        "TPU_SKIP_MDS_QUERY", "TPU_ACCELERATOR_TYPE",
+                        "TPU_HBM_REPORT_ENABLE", "TPU_HBM_REPORT_FREQUENCY",
+                        "ALLOW_MULTIPLE_LIBTPU_LOAD", "LIBTPU_INIT_ARGS",
+                        "VLLM_CACHE_ROOT", "VLLM_CONFIG_ROOT", "HF_HOME",
+                        "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+            if value := os.environ.get(env_var):
+                env_vars.setdefault(env_var, value)
+        return runtime_env
+
     def _init_executor(self) -> None:
         """Initialize the RayDistributedExecutorV2 executor.
 
@@ -107,6 +127,30 @@ class RayDistributedExecutorV2(RayExecutorV2):
             bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
 
         driver_node = ray.get_runtime_context().get_node_id()
+
+        # Generic Ray ordering is driver-first and then lexicographic by the
+        # opaque node ID. On a TPU pod slice that can permute physical hosts
+        # (for example worker IDs 0, 2, 3, 1), while libtpu expects global
+        # process ranks and slice-builder endpoints to follow the physical TPU
+        # worker order. Prefer Ray's TPU worker label when it is available;
+        # retain the upstream ordering for unlabeled/non-pod Ray clusters.
+        node_tpu_worker_ids = {}
+        for node in ray.nodes():
+            if not node.get("Alive"):
+                continue
+            worker_id = node.get("Labels", {}).get("ray.io/tpu-worker-id")
+            if worker_id is not None:
+                node_tpu_worker_ids[node["NodeID"]] = int(worker_id)
+        if node_tpu_worker_ids and all(node_id in node_tpu_worker_ids
+                                       for _, node_id, _ in bundle_to_node_id):
+            bundle_to_node_id.sort(
+                key=lambda item: (node_tpu_worker_ids[item[1]], item[0]))
+            logger.info(
+                "RayDistributedExecutorV2 | Ordered bundles by physical TPU "
+                "worker ID: %s",
+                [(bundle_idx, node_tpu_worker_ids[node_id], node_ip)
+                 for bundle_idx, node_id, node_ip in bundle_to_node_id],
+            )
 
         bundle_assignments: list[dict[str, Any]] = []
         for rank, (bundle_id_idx, node_id,
@@ -216,7 +260,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         sb_addresses = []
         base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
-        for ip in sorted(host_workers.keys()):
+        # PyTorch/XLA's v7 topology uses one process endpoint per visible TPU
+        # device, with local ports repeated on each physical host. Keep the
+        # endpoint order identical to global rank order.
+        ordered_hosts = sorted(host_workers,
+                               key=lambda ip: min(b["rank"]
+                                                  for b in host_workers[ip]))
+        for ip in ordered_hosts:
             for i in range(len(host_workers[ip])):
                 sb_addresses.append(f"{ip}:{base_port + i}")
         slicebuilder_addresses = ",".join(sb_addresses)
@@ -225,7 +275,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
             f"RayDistributedExecutorV2 | Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {slicebuilder_addresses}"
         )
 
-        unique_node_ids = sorted(list(node_workers.keys()))
+        # node_workers preserves the physical host order established above.
+        unique_node_ids = list(node_workers.keys())
         node_id_to_rank = {
             node_id: r
             for r, node_id in enumerate(unique_node_ids)
@@ -234,7 +285,12 @@ class RayDistributedExecutorV2(RayExecutorV2):
         master_addr = bundle_assignments[0]["node_ip"]
         master_port = str(get_open_port())
 
-        topology = TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None)
+        # The same world size can have different host/device decompositions
+        # (for example, TP32 may be 8 hosts x 4 devices or 4 hosts x 8
+        # devices). Prefer an allocation-specific topology supplied by the
+        # launcher instead of assuming the generic world-size mapping.
+        topology = (os.environ.get("TORCH_TPU_TOPOLOGY")
+                    or TPU_MULTIHOST_TOPOLOGY_MAP.get(self.world_size, None))
         if topology is None:
             raise ValueError(
                 f"Cannot find topology for {self.world_size} chips. "
@@ -261,7 +317,23 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "TORCH_TPU_TOPOLOGY": topology,
                 "TORCH_TPU_XPROF_SESSION_ID": xprof_session_id,
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": slicebuilder_addresses,
+                "TPU_CHIPS_PER_PROCESS_BOUNDS": "1,1,1",
+                "TPU_PROCESS_BOUNDS": topology,
+                "CLOUD_TPU_TASK_ID": str(i),
+                "TPU_PROCESS_PORT": str(base_port + local_rank),
+                "TPU_PROCESS_ADDRESSES": slicebuilder_addresses,
+                "TPU_VISIBLE_CHIPS":
+                str(assigned_physical_tpu_ids[local_rank]),
             }
+            # Ray configures each one-TPU actor as an isolated 1x1x1 slice.
+            # On pod slices this masks the physical bounds inherited from the
+            # driver because RayWorkerProc applies driver env vars with
+            # setdefault(). Make the physical topology explicit so libtpu can
+            # validate the requested multi-host topology against VM metadata.
+            for bounds_var in ("TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS"):
+                if bounds_var in self.driver_env_vars:
+                    worker_env_vars[bounds_var] = self.driver_env_vars[
+                        bounds_var]
             self.ray_worker_handles[i].local_rank = local_rank
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
