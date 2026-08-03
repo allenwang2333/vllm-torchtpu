@@ -383,11 +383,27 @@ class VllmTPUMLAAttention(MLAAttention):
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend
 
         try:
-            super().__init__(num_heads, scale, qk_nope_head_dim,
-                             qk_rope_head_dim, v_head_dim, q_lora_rank,
-                             kv_lora_rank, kv_b_proj, cache_config,
-                             quant_config, prefix, attn_backend, use_sparse,
-                             indexer, **extra_impl_args)
+            # Keyword, not positional: upstream `MLAAttention.__init__` takes
+            # `dcp_q_replicate` between `kv_b_proj` and `cache_config`, so a
+            # positional call silently shifts every later argument by one --
+            # `quant_config` lands in `cache_config` and the constructor dies
+            # on `cache_config.cache_dtype`. Upstream's own wrapper passes
+            # these by keyword, which is why it never noticed.
+            super().__init__(num_heads,
+                             scale,
+                             qk_nope_head_dim,
+                             qk_rope_head_dim,
+                             v_head_dim,
+                             q_lora_rank,
+                             kv_lora_rank,
+                             kv_b_proj,
+                             cache_config=cache_config,
+                             quant_config=quant_config,
+                             prefix=prefix,
+                             attn_backend=attn_backend,
+                             use_sparse=use_sparse,
+                             indexer=indexer,
+                             **extra_impl_args)
         finally:
             if original_mla_get_backend is not None:
                 mla_attention.get_mla_prefill_backend = original_mla_get_backend
