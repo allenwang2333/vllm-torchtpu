@@ -139,6 +139,76 @@ def test_no_forward_output_preserves_invalid_block_ids():
     assert output.kv_connector_output.invalid_block_group_index == 2
 
 
+def test_kv_connector_disabled_scope_bypasses_connector_setup():
+    """Synthetic warmup must not require scheduler-built connector metadata."""
+    connector = object()
+    runner = SimpleNamespace()
+    runner._disable_kv_connector_for_warmup = (
+        TPUModelRunner._disable_kv_connector_for_warmup.__get__(runner))
+    runner.maybe_setup_kv_connector = (
+        TPUModelRunner.maybe_setup_kv_connector.__get__(runner))
+    scheduler_output = SimpleNamespace(kv_connector_metadata=None)
+
+    with patch.object(tpu_runner.kv_transfer_state, "_KV_CONNECTOR_AGENT",
+                      connector):
+        with runner._disable_kv_connector_for_warmup():
+            runner.maybe_setup_kv_connector(scheduler_output)
+            assert not tpu_runner.has_kv_transfer_group()
+
+        assert tpu_runner.kv_transfer_state._KV_CONNECTOR_AGENT is connector
+
+
+def test_kv_connector_disabled_scope_restores_agent_after_exception():
+    """A failed warmup must not leave real PD requests without a connector."""
+    connector = object()
+    runner = SimpleNamespace()
+    runner._disable_kv_connector_for_warmup = (
+        TPUModelRunner._disable_kv_connector_for_warmup.__get__(runner))
+
+    with patch.object(tpu_runner.kv_transfer_state, "_KV_CONNECTOR_AGENT",
+                      connector):
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            with runner._disable_kv_connector_for_warmup():
+                raise RuntimeError("warmup failed")
+
+        assert tpu_runner.kv_transfer_state._KV_CONNECTOR_AGENT is connector
+
+
+def test_capture_model_disables_connector_around_spec_warmup():
+    """The MTP warmup must be isolated without changing serving state."""
+    events = []
+
+    @contextlib.contextmanager
+    def disabled_scope():
+        events.append("connector-disabled")
+        try:
+            yield
+        finally:
+            events.append("connector-restored")
+
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        maybe_setup_dummy_loras=lambda _: contextlib.nullcontext(),
+        lora_config=None,
+        _precompile_timed=lambda _: contextlib.nullcontext(),
+        num_tokens_paddings=[],
+        _precompile_sampling_subgraphs=lambda: None,
+        _is_async_drafter=True,
+        drafter=SimpleNamespace(precompile=lambda: None),
+        _precompile_rejection_sampler=lambda: None,
+        _disable_kv_connector_for_warmup=disabled_scope,
+        _warmup_spec_decode=lambda: events.append("spec-warmup"),
+    )
+
+    TPUModelRunner.capture_model(runner)
+
+    assert events == [
+        "connector-disabled",
+        "spec-warmup",
+        "connector-restored",
+    ]
+
+
 def test_build_kv_connector_output_supports_vllm_023():
     with patch.object(
             tpu_runner,
