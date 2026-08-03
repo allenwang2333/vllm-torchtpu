@@ -1165,7 +1165,7 @@ class CpuTpuOffloadingHandlers:
             # buffers) alive on the factory, or they get GC'd after __init__
             # and raiden's D2h/H2d dereferences freed buffers (segfault).
             self._raiden_device_tensors = device_tensors
-            self._raiden_mgr = _kcm._impl.KVCacheManager(
+            self._raiden_mgr = _kcm._torch_impl().KVCacheManager(
                 device_tensors,
                 host_blocks_to_allocate=num_cpu_kernel_blocks,
                 unsafe_skip_buffer_lock=True,

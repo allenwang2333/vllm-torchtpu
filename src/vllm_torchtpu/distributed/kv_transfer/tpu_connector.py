@@ -883,18 +883,63 @@ class TPURaidenConnectorWorker:
                 return
             time.sleep(0.001)
 
+    def _raiden_kv_caches(self) -> list:
+        """Device KV buffers to register with raiden's KVCacheManager.
+
+        Layer-major: the per-layer cache tensors, one buffer per layer.
+
+        Block-major (VLLM_TPU_BLOCK_MAJOR_KV): the whole cache is a single
+        bundle tensor [num_blocks, num_layers, *trailing]. Registering the
+        bundle as one buffer makes raiden treat dim 0 (num_blocks) as the
+        block/major dimension and everything after it as the per-block
+        slice, so one block transfer moves that block's all-layer payload
+        in a single DMA instead of one DMA per layer.
+
+        Both disagg peers must share the flag: raiden's wire slice size is
+        product(shape[1:]) x itemsize (num_layers x per-layer block under
+        block-major), and it must match on producer and consumer.
+        """
+        assert self.runner is not None
+        bundle = getattr(self.runner, "_kv_cache_bundle", None)
+        if bundle is not None:
+            return [bundle]
+        kv_caches = list(self.runner.kv_caches)
+        # raiden HEAD's UnpackTorchTensor calls tensor.device() first thing and
+        # requires PrivateUse1 + contiguous + storage_offset()==0. Surface any
+        # entry that would trip it (an undefined/None entry throws the opaque
+        # ATen 'tensor does not have a device') with its index and properties.
+        bad: list[str] = []
+        for i, t in enumerate(kv_caches):
+            if t is None or not isinstance(t, torch.Tensor):
+                bad.append(f"[{i}] {type(t).__name__}")
+                continue
+            try:
+                props = (f"[{i}] dev={t.device} shape={tuple(t.shape)} "
+                         f"contig={t.is_contiguous()} off={t.storage_offset()}")
+                logger.info("TPURaidenConnectorWorker rank%d --> kv_cache %s",
+                            self.tp_rank, props)
+            except Exception as e:  # undefined tensor -> .device throws
+                bad.append(f"[{i}] unusable: {e}")
+        if bad:
+            raise RuntimeError(
+                "TPURaidenConnectorWorker: runner.kv_caches has entries "
+                "unusable by raiden's KVCacheManager: " + "; ".join(bad))
+        return kv_caches
+
     def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
         if self._raiden_transfer_engine is not None:
             return self._raiden_transfer_engine
         if self.runner is None:
             raise RuntimeError(
                 "register_runner must be called before transfer")
+        kv_caches = self._raiden_kv_caches()
+        block_major = getattr(self.runner, "_kv_cache_bundle", None) is not None
         max_blocks = self._max_request_blocks()
         num_slots = self._num_raiden_slots(max_blocks)
         local_control_port = self._rank_control_port(self.kv_transfer_port)
         from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
         engine = KVCacheManager(
-            kv_caches=list(self.runner.kv_caches),
+            kv_caches=kv_caches,
             node_id=self.tp_rank,
             local_control_port=local_control_port,
             max_blocks=max_blocks,
@@ -904,9 +949,10 @@ class TPURaidenConnectorWorker:
         self._raiden_transfer_engine = engine
         logger.info(
             "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
-            "control_port=%d data_port=%d max_blocks=%d num_slots=%d",
-            self.tp_rank, local_control_port, local_control_port + 1,
-            max_blocks, num_slots)
+            "control_port=%d data_port=%d max_blocks=%d num_slots=%d "
+            "block_major=%s buffers=%d", self.tp_rank, local_control_port,
+            local_control_port + 1, max_blocks, num_slots, block_major,
+            len(kv_caches))
         return engine
 
     def _rank_control_port(self, base_port: int) -> int:
@@ -931,12 +977,13 @@ class TPURaidenConnectorWorker:
         if override > 0:
             return override
         assert self.runner is not None
-        kv_layer = self.runner.kv_caches[0]
+        kv_caches = self._raiden_kv_caches()
+        kv_layer = kv_caches[0]
         dtype_bytes = torch.tensor([], dtype=kv_layer.dtype).element_size()
-        bytes_per_layer = dtype_bytes * max_blocks
+        bytes_per_buffer = dtype_bytes * max_blocks
         for dim in kv_layer.shape[1:]:
-            bytes_per_layer *= int(dim)
-        bytes_per_slot = bytes_per_layer * len(self.runner.kv_caches)
+            bytes_per_buffer *= int(dim)
+        bytes_per_slot = bytes_per_buffer * len(kv_caches)
         per_rank_budget = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         per_rank_budget //= max(1, self.tp_size)
         return max(1, per_rank_budget // max(1, bytes_per_slot))
