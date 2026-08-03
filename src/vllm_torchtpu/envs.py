@@ -36,10 +36,15 @@ if TYPE_CHECKING:
     FORCE_MOE_RANDOM_ROUTING: bool = False
     MOE_LOW_CONC_THRESHOLD: int = 8
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
+    TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
+    VLLM_TPU_BUCKET_PADDING_GAP: int = 0
+    VLLM_TPU_MOST_MODEL_LEN: int | None = None
 
 
 def env_with_choices(
@@ -220,6 +225,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_gather_reduce.
     "RAGGED_GATHER_REDUCE_VERSION":
     env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    # Capture one trace per inference phase instead of one continuous trace.
+    # The trace directory and iteration limits come from `profiler_config`;
+    # this only selects which profiler consumes them.
+    "USE_PHASED_PROFILER":
+    env_bool("USE_PHASED_PROFILER"),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
@@ -238,6 +248,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    # Pad token sizes linearly up to this size with step
+    # TPU_TOKEN_BUCKET_LINEAR_INTERVAL, then double after it. For example,
+    # if set to 64, the padding sizes will be 16, 32, 48, 64, 128, 256, etc.
+    # If set to 0, it will just double sizes(16, 32, 64, 128, ...).
+    "TPU_TOKEN_BUCKET_LINEAR_UNTIL":
+    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_UNTIL") or "0"),
+    # Step for the linear range above.
+    "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
+    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
+    # Bucket padding gap for TPU compile sizes
+    "VLLM_TPU_BUCKET_PADDING_GAP":
+    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
+
+    # Most model length cap for TPU compile bucketing
+    "VLLM_TPU_MOST_MODEL_LEN":
+    lambda: int(val)
+    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
 }
 
 

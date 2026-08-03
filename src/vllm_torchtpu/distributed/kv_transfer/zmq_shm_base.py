@@ -487,7 +487,7 @@ class ZmqShmKvConnectorBase:
             t0 = time.perf_counter()
             self._warmup_coord_once(n)
             logger.info(
-                "TPUConnectorWorker(%s) rank%d --> warmup num_blocks=%d "
+                "TPUConnectorWorker(%s) rank%d --> warmup num_blocks=%s "
                 "took %.2fs", self.node_id, self.tp_rank, n,
                 time.perf_counter() - t0)
         logger.info("TPUConnectorWorker(%s) rank%d --> warmup done in %.2fs",
@@ -957,6 +957,12 @@ class ZmqShmKvConnectorBase:
                         "TPUConnectorWorker(%d) rank%d --> stage_inline timeout "
                         "uuid=%s (STAGE_NOTIFY never arrived)", self.node_id,
                         self.tp_rank, uuid)
+                    # Without STAGE_DONE this rank's shard never completes, so
+                    # rank0 keeps the slot pending and the consumer's PULL
+                    # blocks for its full timeout, leaking a consumer slot per
+                    # occurrence. Signal failure like the exception path below
+                    # so PULL serving answers _MSG_ERR immediately.
+                    self._signal_stage_done(uuid, failed=True)
                     return
                 self._worker_pending_stage_cv.wait(timeout=rem)
             info = self._worker_pending_stage.pop(uuid)
@@ -1620,7 +1626,7 @@ class ZmqShmKvConnectorBase:
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
         logger.info(
-            "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%d "
+            "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%s "
             "layers=%d alloc=%.2fms h2d=%.2fms h2d_issue=%.2fms "
             "h2d_wait=%.2fms insert=%.2fms h2d_throughput=%.2fMiB/s path=%s",
             self.node_id, self.tp_rank, slot_idx, num_blocks, len(kv_caches),
@@ -1870,7 +1876,7 @@ class ZmqShmKvConnectorBase:
                 uuid, slot_idx, num_blocks, block_ids = obj
                 logger.info(
                     "TPUConnectorWorker(%s) rank%d --> STAGE_NOTIFY received "
-                    "uuid=%s slot=%d blocks=%d", self.node_id, self.tp_rank,
+                    "uuid=%s slot=%d blocks=%s", self.node_id, self.tp_rank,
                     uuid, slot_idx, num_blocks)
                 # Hand off to the main thread (waiting in
                 # _coord_worker_stage_inline); don't stage in an executor
@@ -2291,6 +2297,24 @@ class ZmqShmKvConnectorBase:
             kv_caches: list[torch.Tensor],
             local_blocks: list[int]) -> Optional[list[torch.Tensor]]:
         raise NotImplementedError
+
+    def get_kv_connector_stats(self) -> TpuKVConnectorStats | None:
+        """
+            Get the KV transfer stats for the worker.
+            """
+        if self._is_host_coordinator:
+            with self._coord_lock:
+                if self.is_producer:
+                    self.transfer_stats.record_prefill_queue_length(
+                        len(self._coord_send))
+                else:
+                    self.transfer_stats.record_decode_queue_length(
+                        len(self._coord_recv))
+
+        # Clear stats for next iteration
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
+        return None
 
 
 def _try_remove_ipc_endpoint(ipc_path: str) -> None:

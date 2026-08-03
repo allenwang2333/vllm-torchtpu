@@ -164,6 +164,25 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
                 "(TPU_KERNEL_ITER_MODE).")
 
 
+def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
+    """Fail fast on phased-profiling settings that would silently do nothing.
+
+    Both mistakes below produce a run that looks healthy and writes no
+    traces, which is only discovered once the benchmark has finished.
+    """
+    assert "phased_profiling_dir" not in vllm_config.additional_config, (
+        "Legacy additional_config['phased_profiling_dir'] is no longer "
+        "supported. Set USE_PHASED_PROFILER=true and "
+        "--profiler-config.torch_profiler_dir=<dir> instead.")
+    if envs.USE_PHASED_PROFILER:
+        # torch_profiler_dir truthy already implies profiler == "torch";
+        # ProfilerConfig's own validator rejects the dir without it.
+        assert vllm_config.profiler_config.torch_profiler_dir, (
+            "USE_PHASED_PROFILER is set but there is nowhere to write traces. "
+            "Add --profiler-config.profiler=torch with "
+            "--profiler-config.torch_profiler_dir=<dir>.")
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -182,10 +201,12 @@ def apply_tpu_patches() -> None:
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_disable_compile_ranges,
+                               _patch_vllm_hybrid_producer_prefix_hits,
                                _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
@@ -198,6 +219,8 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_kimi_kda_layer_counts()
+    _patch_vllm_hybrid_producer_prefix_hits()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
@@ -457,6 +480,13 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES"
     ]
 
+    # The "Platform" base class has import_kernels() that tries to import
+    # vllm._C, which is not available in the TPU Platform setup.
+    # Override it to do nothing so we won't cause confusing warning logs.
+    @classmethod
+    def import_kernels(cls) -> None:
+        return
+
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
@@ -593,6 +623,7 @@ class TpuPlatform(Platform):
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
+        _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
 
@@ -650,7 +681,8 @@ class TpuPlatform(Platform):
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
                 max_token_size=scheduler_config.max_num_batched_tokens,
-                padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP,
+                linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
+                linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -912,40 +944,48 @@ class TpuPlatform(Platform):
         return True
 
 
-def _get_token_paddings(min_token_size: int, max_token_size: int,
-                        padding_gap: int) -> list[int]:
-    """Generate a list of padding size, starting from min_token_size,
-    ending with a number that can cover max_token_size
+def _get_exponential_token_paddings(min_token_size: int,
+                                    max_token_size: int) -> list[int]:
+    """Sizes doubling from min_token_size until max_token_size is covered."""
+    paddings = []
+    num = min_token_size
+    while True:
+        paddings.append(num)
+        if num >= max_token_size:
+            return paddings
+        num *= 2
 
-    If padding_gap == 0 then:
-        increase 2X each time (exponential)
-    else:
-        first increase the size to twice,
-        then increase the padding size by padding_gap.
+
+def _get_linear_then_exponential_token_paddings(
+        min_token_size: int, max_token_size: int, linear_until: int,
+        linear_interval: int) -> list[int]:
+    """Sizes stepping by ``linear_interval`` to ``linear_until``, doubling after."""
+    linear_end = min(linear_until, max_token_size)
+    paddings = sorted(
+        {min_token_size}
+        | set(range(linear_interval, linear_end + 1, linear_interval)))
+    while paddings[-1] < max_token_size:
+        paddings.append(paddings[-1] * 2)
+    return paddings
+
+
+def _get_token_paddings(min_token_size: int,
+                        max_token_size: int,
+                        linear_until: int = 0,
+                        linear_interval: int = 16) -> list[int]:
+    """Generate a list of padding size, starting from min_token_size,
+    ending with a number that can cover max_token_size.
     """
     # assert min_token_size is power of 2
     assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
-    paddings = []
-    num = min_token_size
 
-    if padding_gap == 0:
-        logger.info("Using exponential token paddings:")
-        while True:
-            logger.info("    %d", num)
-            paddings.append(num)
-            if num >= max_token_size:
-                break
-            num *= 2
+    if linear_until:
+        # Linear padding sizes up to linear_until, then exponential doubling after that.
+        paddings = _get_linear_then_exponential_token_paddings(
+            min_token_size, max_token_size, linear_until, linear_interval)
     else:
-        logger.info("Using incremental token paddings:")
-        while num <= padding_gap:
-            logger.info("    %d", num)
-            paddings.append(num)
-            num *= 2
-        num //= 2
-        while num < max_token_size:
-            num += padding_gap
-            logger.info("    %d", num)
-            paddings.append(num)
-
+        # Double sizes from min_token_size until max_token_size is covered.
+        paddings = _get_exponential_token_paddings(min_token_size,
+                                                   max_token_size)
+    logger.info("Using token paddings: %s", paddings)
     return paddings

@@ -19,6 +19,7 @@ test runner.
 """
 
 import collections
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane)
+                                                   gmm_v2, interleave_lane,
+                                                   situ_and_mul)
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"])
@@ -46,6 +48,37 @@ def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5) -> None:
                                np.asarray(expected),
                                atol=atol,
                                rtol=rtol)
+
+
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_situ_and_mul(linear_beta):
+    gate = jnp.asarray([-3.0, 0.5, 7.0])
+    up = jnp.asarray([-30.0, 2.0, 40.0])
+    expected_gate = 4.0 * jnp.tanh(gate / 4.0) * jax.nn.sigmoid(gate)
+    expected_up = (up if linear_beta is None else linear_beta *
+                   jnp.tanh(up / linear_beta))
+
+    _assert_allclose(situ_and_mul(gate, up, 4.0, linear_beta),
+                     expected_gate * expected_up)
+
+
+@pytest.mark.parametrize("linear_beta", ["none", "25.0"])
+def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    gate = jnp.asarray([-3.0, 0.5, 7.0])
+    up = jnp.asarray([-30.0, 2.0, 40.0])
+    expected = situ_and_mul(
+        gate,
+        up,
+        beta=4.0,
+        linear_beta=None if linear_beta == "none" else float(linear_beta),
+    )
+
+    actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
+    _assert_allclose(actual, expected)
 
 
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
@@ -370,3 +403,70 @@ def test_gmm_nonlocal_groups_produce_zeros(group_config):
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected)
+
+
+def test_gmm_v2_int4_packed_matches_reference():
+    _require_tpu()
+
+    batch_size = 128
+    logical_k = 512
+    storage_k = logical_k // 8
+    out_size = 256
+    num_groups = 4
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, logical_k), jnp.bfloat16, -1, 1)
+
+    weight_key, scale_key = jax.random.split(key)
+    rhs_int4 = jax.random.randint(
+        weight_key,
+        (num_groups, logical_k, out_size),
+        minval=-8,
+        maxval=8,
+        dtype=jnp.int32,
+    )
+
+    group_size = 64
+    num_blocks = logical_k // group_size
+    rhs_scale = jax.random.uniform(
+        scale_key,
+        (num_groups, num_blocks, 1, out_size),
+        minval=0.5,
+        maxval=1.5,
+        dtype=jnp.bfloat16,
+    )
+
+    scale_tiled = jnp.repeat(rhs_scale, group_size, axis=1)
+    scale_tiled = jnp.squeeze(scale_tiled, axis=2)
+
+    rhs_dequantized = rhs_int4.astype(jnp.bfloat16) * scale_tiled
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_gmm(
+        lhs,
+        rhs_dequantized,
+        group_sizes,
+    )
+
+    rhs_uint4 = (rhs_int4 + 8) & 0x0F
+
+    rhs_reshaped = rhs_uint4.reshape(num_groups, storage_k, 8, out_size)
+
+    shifts = jnp.arange(8, dtype=jnp.int32) * 4
+    shifted = rhs_reshaped << shifts[None, None, :, None]
+    rhs_packed_int32 = jnp.sum(shifted, axis=2).astype(jnp.int32)
+
+    INT4_SIGN_XOR = -2004318072
+    rhs_packed_int32_xor = rhs_packed_int32 ^ INT4_SIGN_XOR
+
+    actual = gmm_v2(
+        lhs,
+        rhs_packed_int32_xor,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_quant_dtype=jnp.int4,
+    )
+
+    assert actual.shape == (batch_size, out_size)
+    _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)

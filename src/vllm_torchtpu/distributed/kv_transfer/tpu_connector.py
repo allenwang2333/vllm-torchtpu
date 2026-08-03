@@ -629,15 +629,6 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
     """TPU-specific transport hooks for the generic ZmqShmKvConnectorBase.
     """
 
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        """
-        Get the KV transfer stats for the worker.
-        """
-        # Clear stats for next iteration
-        if not self.transfer_stats.is_empty():
-            return self.transfer_stats.clone_and_reset()
-        return None
-
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,
                           wait_for_completion: bool = False,
@@ -1035,13 +1026,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             (num_tokens + scheduler_block_tokens - 1) //
             scheduler_block_tokens)
         normalized_block_ids = tuple(int(block_id) for block_id in block_ids)
-        # If the excluded last prompt token opened a new scheduler block, the
-        # full producer block table has one trailing ID that is outside the
-        # transfer prefix. This is the only safe count mismatch to trim.
-        if (len(normalized_block_ids) == expected_scheduler_blocks + 1
-                and prompt_tokens == num_tokens + 1
-                and num_tokens % scheduler_block_tokens == 0):
-            normalized_block_ids = normalized_block_ids[:-1]
+        # The producer may allocate trailing blocks for its excluded final
+        # prompt token or locally generated tokens. They are outside the
+        # transfer prefix; too few blocks remains an error.
+        if len(normalized_block_ids) > expected_scheduler_blocks:
+            normalized_block_ids = (
+                normalized_block_ids[:expected_scheduler_blocks])
         if len(normalized_block_ids) != expected_scheduler_blocks:
             raise ValueError(
                 "Stage-3 producer block IDs must cover every PCP scheduler "
@@ -2828,13 +2818,6 @@ class TPUConnectorHMAWorker(ZmqShmKvConnectorBase):
     # layer_name -> kv cache dict used to resolve each positional kv cache's
     # group by object id in _map_layers_to_groups.
     named_kv_caches: Optional[dict[str, Any]] = None
-
-    def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        """Get the KV transfer stats for the worker."""
-        # Clear stats for next iteration
-        if not self.transfer_stats.is_empty():
-            return self.transfer_stats.clone_and_reset()
-        return None
 
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,

@@ -23,7 +23,8 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.platforms.tpu_platform import (
+    TpuPlatform, _validate_phased_profiling_config)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
@@ -31,12 +32,17 @@ from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
 def test_scheduler_mamba_split_accepts_external_kv_tokens():
     # TPU PD decode feeds producer-restored KV in as external computed tokens.
     # Upstream vLLM must count them in the block-aligned split boundary.
-    scheduler = SimpleNamespace(cache_config=SimpleNamespace(block_size=16),
-                                use_eagle=False)
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        use_eagle=False,
+        mamba_partial_cache_hit=False,
+        hash_block_size=16,
+    )
     request = SimpleNamespace(
         num_computed_tokens=0,
         num_prompt_tokens=33,
         num_tokens=33,
+        shared_prefix_boundary=0,
     )
 
     num_new_tokens = Scheduler._mamba_block_aligned_split(
@@ -142,12 +148,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
-    def test_check_and_update_config_hybrid_block_size(self, mock_vllm_envs,
-                                                       mock_prepare_env,
+    def test_check_and_update_config_hybrid_block_size(self, mock_prepare_env,
                                                        mock_apply_patches,
                                                        vllm_config):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
         vllm_config.model_config.is_hybrid = True
         # kv-transfer deployments run the split layout (the pool is opt-in
         # via the env and never engages for kv-transfer).
@@ -175,11 +178,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_hybrid_derives_block_size_with_env(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 123  # already set
 
@@ -226,12 +226,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_validates_mamba_apc_modes(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config, mamba_cache_mode, speculative_config,
-            async_scheduling, message):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            mamba_cache_mode, speculative_config, async_scheduling, message):
         vllm_config.model_config.is_hybrid = True
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
@@ -259,11 +256,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config, connector_name):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            connector_name):
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
         vllm_config.cache_config.block_size = 16
@@ -275,11 +270,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_accepts_v2_connector_with_unified_pool(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
         vllm_config.cache_config.block_size = 16
@@ -303,11 +295,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_check_and_update_config_gates_hybrid_offloading_on_pool(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config, monkeypatch, is_hybrid, pool_env, expect_error):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config,
+            monkeypatch, is_hybrid, pool_env, expect_error):
         vllm_config.model_config.is_hybrid = is_hybrid
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.cache_dtype = "auto"
@@ -335,11 +325,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_language_model_only_multimodal_keeps_chunked_mm_input(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=True, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
@@ -354,11 +341,8 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    @patch("vllm_torchtpu.platforms.tpu_platform.vllm_envs")
     def test_multimodal_forces_disable_chunked_mm_input(
-            self, mock_vllm_envs, mock_prepare_env, mock_apply_patches,
-            vllm_config):
-        mock_vllm_envs.VLLM_TPU_USING_PATHWAYS = False
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
@@ -368,3 +352,37 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+
+class TestPhasedProfilingConfigValidation:
+    """Both mistakes here yield a run that looks healthy and writes no
+    traces, so they are rejected at startup rather than ignored."""
+
+    @staticmethod
+    def _config(additional_config=None, torch_profiler_dir=""):
+        vllm_config = MagicMock()
+        vllm_config.additional_config = additional_config or {}
+        vllm_config.profiler_config.torch_profiler_dir = torch_profiler_dir
+        return vllm_config
+
+    def test_legacy_additional_config_key_is_rejected(self):
+        with pytest.raises(AssertionError, match="USE_PHASED_PROFILER"):
+            _validate_phased_profiling_config(
+                self._config({"phased_profiling_dir": "/tmp/phased"}))
+
+    def test_phased_without_a_trace_dir_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+
+        with pytest.raises(AssertionError, match="nowhere to write traces"):
+            _validate_phased_profiling_config(self._config())
+
+    def test_phased_with_a_trace_dir_passes(self, monkeypatch):
+        monkeypatch.setenv("USE_PHASED_PROFILER", "true")
+
+        _validate_phased_profiling_config(
+            self._config(torch_profiler_dir="/tmp/phased"))
+
+    def test_unprofiled_run_passes(self, monkeypatch):
+        monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
+
+        _validate_phased_profiling_config(self._config())

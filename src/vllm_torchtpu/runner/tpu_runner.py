@@ -20,13 +20,14 @@ import jax
 import numpy as np
 import torch
 import torch_tpu  # noqa: F401
-import vllm.envs as envs
+import vllm.envs as vllm_envs
 # TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from packaging import version
 from torch_tpu._internal import sync
-from vllm.config import (CUDAGraphMode, ParallelConfig, VllmConfig,
+from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -54,7 +55,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import utils
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -271,7 +272,6 @@ class TPUModelRunner(GPUModelRunner):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        original_parallel_config: ParallelConfig | None = None,
         *,
         profiler_rank: int,
         profiler_world_size: int,
@@ -337,8 +337,7 @@ class TPUModelRunner(GPUModelRunner):
         # num_prompt_logprobs, input_batch, etc. The block below is only the
         # TPU-specific delta + overrides.
 
-        # TPU-only custom kwarg + alias kept for backwards-compat with worker.
-        self.original_parallel_config = original_parallel_config
+        self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
 
         # Set by `_update_mamba_page_size_padded` for hybrid attention+mamba
@@ -388,17 +387,16 @@ class TPUModelRunner(GPUModelRunner):
         # bucket and chunk count.
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
-
-        # TPU env-var flags.
-        self.check_recompilation = envs.VLLM_XLA_CHECK_RECOMPILATION
-        self.use_spmd = envs.VLLM_XLA_USE_SPMD
+        self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
+        self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
-        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limit.
+        # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
         torch._dynamo.config.cache_size_limit = 1024
+        torch._dynamo.config.accumulated_recompile_limit = 1024
 
         # Override parent's kv_cache_dtype with the TPU mapping (handles
         # auto -> bfloat16 for our supported dtype set).
@@ -560,37 +558,66 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
 
     def _init_phased_profiling(self) -> None:
-        """Initializes the phase-based profiler if configured via
-        additional_config['phased_profiling_dir']."""
-        additional_config = self.vllm_config.additional_config
-        self.phased_profiling_dir = additional_config.get(
-            runner_utils.PHASED_PROFILING_DIR_KEY, "")
+        """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
+
+        The trace directory comes from `profiler_config`, the same field the
+        standard torch profiler uses; the env var only selects which profiler
+        consumes it. The profiler itself is armed later by
+        `start_phased_profiling`/`stop_phased_profiling`, called from
+        TPUWorker.profile() so both profilers share one trigger.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        self.phased_profiling_dir = (profiler_config.torch_profiler_dir
+                                     if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
-        if self.phased_profiling_dir:
-            profiler_config = self.vllm_config.profiler_config
-            # Deliberately not read from parallel_config: its rank is
-            # TPxPP-scoped, so every DP replica would call itself rank 0 and
-            # their traces would overwrite each other on merge. The worker
-            # resolves the slice-global rank from the TPU rank binding and
-            # passes it in.
-            global_rank = self._profiler_rank
-            world_size = self._profiler_world_size
-            decode_kv_len_threshold = additional_config.get(
-                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
-                runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
-            self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
-                self.phased_profiling_dir,
-                worker_rank=global_rank,
-                world_size=world_size,
-                # max_iterations defaults to 0 ("no limit") for standard torch
-                # profiling; that's meaningless for the phased profiler, so
-                # fall back to its own default when unset.
-                num_steps_to_profile_for=(
-                    profiler_config.max_iterations
-                    or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
-                num_decode_steps_to_skip=profiler_config.delay_iterations,
-                decode_kv_len_threshold=decode_kv_len_threshold,
-            )
+
+    def start_phased_profiling(self,
+                               profile_prefix: str | None = None) -> None:
+        """Arms the phase-based profiler. Called from TPUWorker.profile()."""
+        if not self.phased_profiling_dir:
+            logger.warning(
+                "Phased profiling directory is not set. Skipping profiling.")
+            return
+        if self.phase_based_profiler is not None:
+            logger.warning(
+                "Phased profiler is already running. Ignoring start request.")
+            return
+        profiler_config = self.vllm_config.profiler_config
+        additional_config = self.vllm_config.additional_config
+        decode_kv_len_threshold = additional_config.get(
+            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+            runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+        # Same scoping as the standard profiler: the prefix names the run, and
+        # the per-phase subdirectories sit beneath it.
+        profile_dir = self.phased_profiling_dir
+        if profile_prefix:
+            profile_dir = os.path.join(profile_dir, profile_prefix)
+        # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
+        # so every DP replica would call itself rank 0 and their traces would
+        # overwrite each other on merge. The worker resolves the slice-global
+        # rank from the TPU rank binding and passes it in.
+        self.phase_based_profiler = runner_utils.PhaseBasedProfiler(
+            profile_dir,
+            worker_rank=self._profiler_rank,
+            world_size=self._profiler_world_size,
+            # max_iterations defaults to 0 ("no limit") for standard torch
+            # profiling; that's meaningless for the phased profiler, so fall
+            # back to its own default when unset.
+            num_steps_to_profile_for=(
+                profiler_config.max_iterations
+                or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
+            num_decode_steps_to_skip=profiler_config.delay_iterations,
+            decode_kv_len_threshold=decode_kv_len_threshold,
+        )
+
+    def stop_phased_profiling(self) -> None:
+        """Disarms the phase-based profiler. Called from TPUWorker.profile()."""
+        if self.phase_based_profiler is None:
+            logger.warning(
+                "Phased profiler is not running. Ignoring stop request.")
+            return
+        self.phase_based_profiler.finish()
+        self.phase_based_profiler = None
 
     # ----- Backend hooks overridden from GPUModelRunner -----
 
@@ -787,7 +814,8 @@ class TPUModelRunner(GPUModelRunner):
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
-        has_attention = any(isinstance(m, Attention) for m in layers.values())
+        has_attention = any(
+            isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
         if has_attention and has_mamba and not self._unified_kv_layout:
             self._update_mamba_page_size_padded(layers)
@@ -856,6 +884,7 @@ class TPUModelRunner(GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
+                            indexes_kv_by_block_stride=True,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -864,6 +893,7 @@ class TPUModelRunner(GPUModelRunner):
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
+                            indexes_kv_by_block_stride=True,
                         )
                 elif attn_module.attn_type in (
                         AttentionType.ENCODER,
@@ -896,6 +926,7 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
+                    indexes_kv_by_block_stride=True,
                 )
             else:
                 continue
@@ -1073,12 +1104,11 @@ class TPUModelRunner(GPUModelRunner):
         first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attn_page_size_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            self.block_size,
-            num_kv_heads,
-            first_attn_module.head_size,
-            self.kv_cache_dtype,
-        )
+        attention_backend = (PallasMLAttentionBackend if isinstance(
+            first_attn_module, MLAAttention) else PallasAttentionBackend)
+        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+            self.block_size, num_kv_heads, first_attn_module.head_size,
+            self.kv_cache_dtype)
 
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)
@@ -1378,6 +1408,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.cache_config.mamba_cache_mode != "align":
             self._mamba_copy_plan = []
+            self._mamba_state_block_size = None
             return
         layer_to_raw: dict[str, torch.Tensor] = {}
         for raw, kv_cache_tensor in zip(raw_tensors,
@@ -1385,6 +1416,7 @@ class TPUModelRunner(GPUModelRunner):
             for layer_name in kv_cache_tensor.shared_by:
                 layer_to_raw[layer_name] = raw
         plan: list[tuple[int, list[torch.Tensor]]] = []
+        state_block_size: int | None = None
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, MambaSpec):
                 continue
@@ -1397,6 +1429,8 @@ class TPUModelRunner(GPUModelRunner):
                     raws.append(raw)
             if raws:
                 plan.append((gid, raws))
+                state_block_size = group.kv_cache_spec.block_size
+        self._mamba_state_block_size = state_block_size
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
@@ -1425,7 +1459,37 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in live_req_ids:
                 del self._mamba_state_pos[req_id]
 
-        block_size = self.block_size
+        # Column stride of the mamba block tables, in logical (whole-sequence)
+        # tokens. Three block sizes meet here and only one is correct:
+        #   * self.block_size is the attention/scheduler size -- unrelated to
+        #     mamba tables, whose width is cdiv(max_model_len, mamba size) --
+        #     and a stale __init__-time snapshot besides (the executor
+        #     finalizes cache_config.block_size only after the runner is
+        #     constructed);
+        #   * the mamba groups' kv_cache_spec.block_size (the copy of
+        #     cache_config.mamba_block_size that get_kv_cache_spec bakes into
+        #     every MambaSpec, which then sizes these tables) is physical and
+        #     per-rank, and cannot be stale: specs are created only after the
+        #     platform finalizes block sizes;
+        #   * the scheduler appends a block id to a mamba row only once per
+        #     mamba_block_size * total_cp_world logical tokens, because the
+        #     PCP coordinator patch presents specs to the hybrid coordinator
+        #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
+        #     state is never token-sharded across CP ranks; the cp factor
+        #     exists purely to mirror that allocation cadence.
+        # Every reader of these tables must divide logical token counts by
+        # the allocator's stride. This is the same derivation
+        # AttentionMetadataBuilder.target_block_size uses for its state-slot
+        # lookup -- spec block size times cp world -- so the two readers
+        # cannot diverge. A smaller divisor visits columns the scheduler
+        # never filled: beyond the row width it raises IndexError, within it
+        # the null block silently swallows the recurrent state.
+        try:
+            cp_world_size = (get_dcp_group().world_size *
+                             get_pcp_group().world_size)
+        except Exception:
+            cp_world_size = 1
+        col_stride = self._mamba_state_block_size * cp_world_size
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []
@@ -1435,9 +1499,9 @@ class TPUModelRunner(GPUModelRunner):
             assert req_id is not None
             computed = int(num_computed[row])
             scheduled = scheduler_output.num_scheduled_tokens[req_id]
-            curr = (computed + scheduled - 1) // block_size
+            curr = (computed + scheduled - 1) // col_stride
             prev = self._mamba_state_pos.get(req_id,
-                                             (computed - 1) // block_size)
+                                             (computed - 1) // col_stride)
             self._mamba_state_pos[req_id] = curr
             if 0 <= prev != curr:
                 crossings.append((row, prev, curr))
@@ -3934,7 +3998,7 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
         cc = self.vllm_config.compilation_config
-        base_cache_dir = cc.cache_dir or envs.VLLM_CACHE_ROOT
+        base_cache_dir = cc.cache_dir or vllm_envs.VLLM_CACHE_ROOT
         factors = aot_compile_hash_factors(self.vllm_config)
         factors.append(compute_tpu_compilation_hash(self.vllm_config))
         hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
@@ -4072,8 +4136,8 @@ class TPUModelRunner(GPUModelRunner):
             if isinstance(group.kv_cache_spec,
                           AttentionSpec) and self.use_spmd:
                 num_kv_heads = group.kv_cache_spec.num_kv_heads
-                assert self.original_parallel_config is not None
-                tp_size = self.original_parallel_config.tensor_parallel_size
+                parallel_config = self.parallel_config
+                tp_size = parallel_config.tensor_parallel_size
                 assert num_kv_heads % tp_size == 0, (
                     f"num_kv_heads {num_kv_heads} must be divisible by "
                     f"tp_size {tp_size} under SPMD mode")
@@ -4362,8 +4426,8 @@ class TPUModelRunner(GPUModelRunner):
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     if self.use_spmd:
                         num_kv_heads = kv_cache_spec.num_kv_heads
-                        assert self.original_parallel_config is not None
-                        tp_size = self.original_parallel_config.tensor_parallel_size
+                        parallel_config = self.parallel_config
+                        tp_size = parallel_config.tensor_parallel_size
                         # TODO: Handle kv cache duplication under SPMD mode.
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "

@@ -61,6 +61,7 @@ from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       unpack_uint8_to_fp4)
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel,
                                                  requant_load_kmajor_fp4)
@@ -71,11 +72,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
-
-
-def _get_activation_str(activation) -> str:
-    return activation.value if hasattr(activation,
-                                       'value') else str(activation)
 
 
 def _fresh(t: torch.Tensor) -> torch.Tensor:
@@ -224,7 +220,8 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         assert self.moe.is_act_and_mul, (
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2].")
-        activation_str = _get_activation_str(layer.activation)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
         if activation_str == "swigluoai":
             raise NotImplementedError(
                 "NVFP4 MoE on TPU supports act_and_mul (silu/gelu) layouts; "
@@ -325,10 +322,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+        moe_routing.register_experts_start_buffer(
+            layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            experts_start=moe_routing.get_experts_start(layer),
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
     def apply_monolithic(
@@ -368,7 +367,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=None,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=moe_routing.get_experts_start(layer),
+            experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )

@@ -857,6 +857,62 @@ class TestTPURaidenConnectorScheduler:
         assert first_meta.reqs_to_send[req.request_id].num_tokens == (65_023)
         assert duplicate_meta.reqs_to_send == {}
 
+    @pytest.mark.parametrize("num_computed_tokens", [32_775, 32_768])
+    def test_v3_stage3_finish_trims_blocks_past_the_transfer_prefix(
+            self, num_computed_tokens):
+        """Blocks opened by tokens kept on the producer are trimmed."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = f"trim-{num_computed_tokens}"
+        req.prompt_token_ids = [0] * 32_768
+        req.num_prompt_tokens = 32_768
+        req.num_computed_tokens = num_computed_tokens
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        # Generation crossed the 32768-token scheduler block, so the producer
+        # table carries a second ID that is outside the transfer prefix.
+        block_ids = [100, 101]
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True), patch(f"{_MOD}.get_uuid",
+                                           return_value=778), patch(
+                                               f"{_MOD}.dist_utils."
+                                               "get_p2p_wait_pull_timeout",
+                                               return_value=30.0):
+            delay, params = producer.request_finished(req, block_ids)
+            meta = producer.build_connector_meta()
+
+        assert delay
+        assert params["num_tokens"] == 32_767
+        # Only the block covering the transferred prefix is published.
+        assert list(meta.reqs_to_send[req.request_id].local_block_ids) == [100]
+
+    def test_v3_stage3_finish_still_rejects_too_few_blocks(self):
+        """Trimming the tail must not mask a genuinely short block table."""
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        req = MagicMock()
+        req.request_id = "short"
+        req.prompt_token_ids = [0] * 65_536
+        req.num_prompt_tokens = 65_536
+        req.num_computed_tokens = 65_536
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        # 65535 transferred tokens need 2 scheduler blocks; only one given.
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                       "prefill-controller.test:27000",
+                       create=True):
+            with pytest.raises(ValueError, match="must cover every PCP"):
+                producer.request_finished(req, [100])
+
     def test_v3_stage3_finish_dedup_refuses_unsafe_inflight_eviction(self):
         producer = _make_raiden_scheduler(is_producer=True,
                                           block_size=4096,
@@ -3127,3 +3183,53 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_tpu_stats_aggregation_queue_lengths(self):
+        stats = TpuKVConnectorStats()
+        reduced = stats.reduce()
+        assert reduced["Prefill queue length"] == 0
+        assert reduced["Decode queue length"] == 0
+        assert stats.is_empty() is True
+
+        stats.record_prefill_queue_length(5)
+        stats.record_decode_queue_length(3)
+        reduced = stats.reduce()
+        assert reduced["Prefill queue length"] == 5
+        assert reduced["Decode queue length"] == 3
+        assert stats.is_empty() is False
+
+    def test_prometheus_gauge_queue_lengths(self):
+        mock_data = {
+            "d2h_transfer_time": [],
+            "h2d_transfer_time": [],
+            "kv_pull_time": [],
+            "mb_transferred": [],
+            "num_failed_transfers": [],
+            "prefill_queue_length": [4],
+            "decode_queue_length": [2],
+        }
+        self.metrics.observe(mock_data, engine_idx=0)
+        prefill_gauge = self.metrics.gauge_tpu_prefill_queue_length[0]
+        decode_gauge = self.metrics.gauge_tpu_decode_queue_length[0]
+        assert prefill_gauge._value.get() == 4.0
+        assert decode_gauge._value.get() == 2.0
+
+    def test_worker_in_flight_queue_length_stats(self):
+        worker = MagicMock()
+        worker._is_host_coordinator = True
+        worker.is_producer = False
+        worker._coord_recv = {"uuid1": MagicMock(), "uuid2": MagicMock()}
+        worker._coord_lock = MagicMock()
+        worker.transfer_stats = TpuKVConnectorStats()
+
+        stats = TPUConnectorWorker.get_kv_connector_stats(worker)
+        assert stats is not None
+        assert stats.data["decode_queue_length"] == [2]
+
+        worker.is_producer = True
+        worker._coord_send = {"uuid1": MagicMock()}
+        worker.transfer_stats = TpuKVConnectorStats()
+
+        stats = TPUConnectorWorker.get_kv_connector_stats(worker)
+        assert stats is not None
+        assert stats.data["prefill_queue_length"] == [1]
