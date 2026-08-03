@@ -4127,13 +4127,15 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
-                creq = CachedRequestData(req_ids=list(rids),
-                                         resumed_req_ids=set(),
-                                         new_token_ids=[],
-                                         all_token_ids={},
-                                         new_block_ids=[None] * R,
-                                         num_computed_tokens=list(nct),
-                                         num_output_tokens=[t + 1] * R)
+                creq = CachedRequestData(
+                    req_ids=list(rids),
+                    resumed_req_ids=set(),
+                    new_token_ids=[],
+                    all_token_ids={rid: [0] * (P + t + 1)
+                                   for rid in rids},
+                    new_block_ids=[None] * R,
+                    num_computed_tokens=list(nct),
+                    num_output_tokens=[t + 1] * R)
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
                 so.num_scheduled_tokens = {rid: 1 + K for rid in rids}

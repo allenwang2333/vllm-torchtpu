@@ -209,6 +209,43 @@ def test_capture_model_disables_connector_around_spec_warmup():
     ]
 
 
+def test_async_spec_batch_warmup_propagates_token_history():
+    """Async warmup cached requests must carry recoverable token history."""
+    cached_requests = []
+
+    def execute_model(scheduler_output):
+        if scheduler_output.scheduled_cached_reqs is not None:
+            cached_requests.append(scheduler_output.scheduled_cached_reqs)
+        return None
+
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        max_model_len=128,
+        max_num_tokens=64,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=64,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda _: None,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=16)
+
+    assert cached_requests
+    for request_data in cached_requests:
+        assert set(request_data.all_token_ids) == set(request_data.req_ids)
+        for req_id, num_output_tokens in zip(request_data.req_ids,
+                                             request_data.num_output_tokens):
+            assert len(
+                request_data.all_token_ids[req_id]) == 16 + num_output_tokens
+
+
 def test_build_kv_connector_output_supports_vllm_023():
     with patch.object(
             tpu_runner,
