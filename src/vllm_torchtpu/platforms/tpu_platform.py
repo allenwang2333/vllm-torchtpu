@@ -461,6 +461,13 @@ class TpuPlatform(Platform):
     ray_device_key: str = "TPU"
     dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"
+    # Ray otherwise treats each one-TPU worker actor as an isolated slice and
+    # overwrites TPU_CHIPS_PER_HOST_BOUNDS/TPU_HOST_BOUNDS with 1,1,1. That
+    # topology is invalid for multi-host pod slices. vLLM discovers Ray's
+    # physical assignments separately and maps local ranks to those IDs.
+    ray_noset_device_env_vars: list[str] = [
+        "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+    ]
     simple_compile_backend: str = "tpu"
     _is_hybrid: bool = False
 
@@ -470,7 +477,10 @@ class TpuPlatform(Platform):
 
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
-        "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
+        "TPU_CHIPS_PER_PROCESS_BOUNDS", "TPU_PROCESS_BOUNDS",
+        "TPU_SKIP_MDS_QUERY", "TPU_ACCELERATOR_TYPE",
+        "ALLOW_MULTIPLE_LIBTPU_LOAD", "TPU_MULTIHOST_BACKEND",
+        "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
         "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
         "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
         "MOE_REQUANTIZE_WEIGHT_DTYPE",

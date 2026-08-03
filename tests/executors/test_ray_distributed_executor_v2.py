@@ -169,9 +169,36 @@ class TestTpuRayDistributedExecutorV2:
 
         assert resource_kwargs == {"num_gpus": 0, "resources": {"TPU": 1.0}}
 
+    @patch.dict(
+        "os.environ", {
+            "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+            "TPU_HOST_BOUNDS": "1,1,4",
+            "HF_HOME": "/cache/huggingface",
+        })
+    @patch("vllm.v1.executor.ray_executor_v2.RayExecutorV2._build_runtime_env",
+           return_value={"env_vars": {
+               "EXISTING": "value"
+           }})
+    def test_build_runtime_env_propagates_startup_sensitive_vars(
+            self, mock_base_runtime_env, mock_wait_until_pg_ready, mock_get_ip,
+            mock_platform, mock_ray):
+        executor = RayDistributedExecutorV2(self.vllm_config)
+
+        runtime_env = executor._build_runtime_env()
+
+        env_vars = runtime_env["env_vars"]
+        assert env_vars["EXISTING"] == "value"
+        assert env_vars["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
+        assert env_vars["TPU_HOST_BOUNDS"] == "1,1,4"
+        assert env_vars["HF_HOME"] == "/cache/huggingface"
+        mock_base_runtime_env.assert_called_once_with()
+
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
-        return_value={})
+        return_value={
+            "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+            "TPU_HOST_BOUNDS": "1,1,4",
+        })
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_open_port",
            return_value=9000)
     @patch(
@@ -195,18 +222,27 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.util.placement_group.return_value = mock_placement_group
         mock_ray.nodes.return_value = [{
             "NodeID": "node_1",
+            "Alive": True,
+            "Labels": {
+                "ray.io/tpu-worker-id": "0"
+            },
             "Resources": {
                 "TPU": 4.0
             }
         }, {
             "NodeID": "node_2",
+            "Alive": True,
+            "Labels": {
+                "ray.io/tpu-worker-id": "1"
+            },
             "Resources": {
                 "TPU": 4.0
             }
         }]
 
-        # We have 2 workers on 2 different nodes (multi-host setup)
-        bundle_to_node = [(0, "node_1", "10.0.0.1"), (1, "node_2", "10.0.0.2")]
+        # Upstream Ray ordering can disagree with physical TPU worker order.
+        # The executor must restore worker 0, worker 1 ordering.
+        bundle_to_node = [(1, "node_2", "10.0.0.2"), (0, "node_1", "10.0.0.1")]
 
         # Mock get_bundles_sorted_by_node or similar utils
         with patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node", return_value=bundle_to_node), \
@@ -269,10 +305,13 @@ class TestTpuRayDistributedExecutorV2:
             assert worker_env_w0["NODE_RANK"] == "0"
             assert worker_env_w0["MASTER_ADDR"] == "10.0.0.1"
             assert worker_env_w0["TORCH_TPU_TOPOLOGY"] == "2x2"
-            assert "10.0.0.1:8070" in worker_env_w0[
-                "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
-            assert "10.0.0.2:8070" in worker_env_w0[
-                "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+            assert worker_env_w0["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
+                "10.0.0.1:8070,10.0.0.2:8070")
+            assert worker_env_w0["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
+            assert worker_env_w0["TPU_HOST_BOUNDS"] == "1,1,4"
+            assert worker_env_w0["TPU_PROCESS_BOUNDS"] == "2x2"
+            assert worker_env_w0["CLOUD_TPU_TASK_ID"] == "0"
+            assert worker_env_w0["TPU_VISIBLE_CHIPS"] == "4"
             assert kwargs_w0["assigned_physical_gpu_ids"] == [4]
 
             # Worker 1 (Rank 1, Node 2)
@@ -288,6 +327,8 @@ class TestTpuRayDistributedExecutorV2:
             assert worker_env_w1["NODE_RANK"] == "1"
             assert worker_env_w1["MASTER_ADDR"] == "10.0.0.1"
             assert worker_env_w1["TORCH_TPU_TOPOLOGY"] == "2x2"
+            assert worker_env_w1["CLOUD_TPU_TASK_ID"] == "1"
+            assert worker_env_w1["TPU_VISIBLE_CHIPS"] == "6"
             assert kwargs_w1["assigned_physical_gpu_ids"] == [6]
 
             executor.ray_worker_handles = []
