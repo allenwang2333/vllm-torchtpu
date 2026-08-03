@@ -3788,8 +3788,14 @@ class TPUModelRunner(GPUModelRunner):
                 "compatibility.", bundle_shape, sample_spec.dtype,
                 num_attn_layers, num_blocks_dim)
             self._kv_cache_bundle = torch.zeros(bundle_shape,
-                                                dtype=sample_spec.dtype).to(
-                                                    self.device)
+                                                dtype=sample_spec.dtype,
+                                                device=self.device)
+            # Materialize the bundle's device buffer now. It is allocated
+            # lazily (device=), and raiden's KVCacheManager unpacks it and
+            # calls AwaitBuffer() during offload registration -- before any
+            # forward runs to trigger the zeros-fill -- so without this sync
+            # that await blocks forever on a buffer future that never fires.
+            sync.synchronize(self._kv_cache_bundle, wait=True)
             # Expose the bundle to vLLM's cross-layer KV-cache machinery.
             # GPUModelRunner.initialize_kv_cache dispatches on these two
             # attributes to call register_cross_layers_kv_cache(bundle,
