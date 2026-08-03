@@ -45,6 +45,7 @@ class LoadMeta:
     # report would trip the scheduler's assert or prematurely resume the
     # request.
     report_completion: bool = True
+    traceparent: str = ""
 
 
 @dataclass

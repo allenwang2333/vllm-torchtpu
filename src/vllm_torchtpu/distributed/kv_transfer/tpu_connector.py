@@ -540,6 +540,11 @@ class TPUConnectorScheduler:
             return
 
         params = request.kv_transfer_params
+        traceparent = (
+            request.trace_headers.get("traceparent", "")
+            if getattr(request, "trace_headers", None)
+            else ""
+        )
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids()[0]
             # D must pull the whole prefill blocks regardless of partial
@@ -553,6 +558,7 @@ class TPUConnectorScheduler:
                 remote_port=params["remote_port"],
                 remote_side_channel_port=params["remote_side_channel_port"]
                 if "remote_side_channel_port" in params else None,
+                traceparent=traceparent,
             )
         else:
             # Full prefix-cache hit or async pull done -- we still need to
@@ -565,6 +571,7 @@ class TPUConnectorScheduler:
                 remote_port=params["remote_port"],
                 remote_side_channel_port=params["remote_side_channel_port"]
                 if "remote_side_channel_port" in params else None,
+                traceparent=traceparent,
             )
         logger.info(
             "TPUConnectorScheduler update_state_after_alloc --> reqs_to_load=%s",
@@ -616,6 +623,25 @@ class TPUConnectorScheduler:
                 remote_host=self.kv_ip,
                 remote_port=self.kv_port,
                 remote_side_channel_port=self.side_channel_port)
+
+            # Use request.trace_headers if available, fallback to active context
+            if (
+                hasattr(request, "trace_headers")
+                and request.trace_headers
+                and "traceparent" in request.trace_headers
+            ):
+                kv_transfer_params["traceparent"] = request.trace_headers["traceparent"]
+            else:
+                try:
+                    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+                    carrier = {}
+                    TraceContextTextMapPropagator().inject(carrier)
+                    if "traceparent" in carrier:
+                        kv_transfer_params["traceparent"] = carrier["traceparent"]
+                except ImportError:
+                    pass
+
             logger.info(
                 "TPUConnectorScheduler --> reqs_to_send=%s | kv_transfer_params=%s",
                 self.reqs_to_send, kv_transfer_params)

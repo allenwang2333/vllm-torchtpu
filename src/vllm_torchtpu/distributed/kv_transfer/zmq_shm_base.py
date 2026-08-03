@@ -140,6 +140,7 @@ class _CoordRecvEntry:
     # Have we already surfaced this req in get_finished()? Prevents duplicate
     # reporting across scheduler ticks while we wait for per-rank copies.
     reported_done: bool = False
+    traceparent: str = ""
 
 
 @dataclass
@@ -1270,6 +1271,7 @@ class ZmqShmKvConnectorBase:
             remote_host=remote_host,
             remote_port=remote_port,
             remote_side_channel_port=remote_side_channel_port,
+            traceparent=getattr(req_meta, "traceparent", ""),
         )
         with self._coord_lock:
             self._coord_recv[req_meta.uuid] = entry
@@ -1625,6 +1627,7 @@ class ZmqShmKvConnectorBase:
         self.transfer_stats.record_h2d_transfer(h2d_ms_total)
         h2d_mb = h2d_total_bytes / (1024 * 1024)
         h2d_mbps = h2d_mb / max(1e-3, h2d_ms_total / 1000.0)
+
         logger.info(
             "TPUConnectorWorker(%s) rank%d --> scatter slot=%d blocks=%s "
             "layers=%d alloc=%.2fms h2d=%.2fms h2d_issue=%.2fms "
