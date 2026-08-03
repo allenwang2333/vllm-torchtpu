@@ -87,6 +87,10 @@ torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+# Point vLLM's model registry at the TPU implementations. Without this the
+# architectures in a Kimi checkpoint resolve to vLLM's own model classes and the
+# TPU ones are never constructed.
+torchtpu_models = "vllm_torchtpu.models:register_models"
 
 [tool.pytest.ini_options]
 markers = [

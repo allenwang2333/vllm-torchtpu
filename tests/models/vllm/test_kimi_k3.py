@@ -441,6 +441,31 @@ class _ConvWeight(nn.Module):
         self.weight = nn.Parameter(torch.ones(4, 1, 3))
 
 
+def test_use_naive_kda_reads_the_registered_env_var(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flag must come from `vllm_torchtpu.envs`, not `os.environ`.
+
+    Only variables in that registry are folded into the TPU compile-cache key.
+    Reading the environment directly would leave both recurrences sharing one
+    cache entry, so flipping the flag would replay the other path's compiled
+    graph -- which is not hypothetical: it once made a whole before/after
+    measurement time the same kernel twice.
+    """
+    from vllm_torchtpu.compilation.tpu_compiler import _tpu_compile_env_factors
+
+    monkeypatch.delenv("VLLM_TPU_USE_NAIVE_KDA", raising=False)
+    assert kimi_attention.use_naive_kda() is False
+
+    monkeypatch.setenv("VLLM_TPU_USE_NAIVE_KDA", "1")
+    assert kimi_attention.use_naive_kda() is True
+    # The point of the indirection: the flag reaches the hashed factors.
+    assert _tpu_compile_env_factors()["VLLM_TPU_USE_NAIVE_KDA"] is True
+
+    monkeypatch.setenv("VLLM_TPU_USE_NAIVE_KDA", "0")
+    assert kimi_attention.use_naive_kda() is False
+    assert _tpu_compile_env_factors()["VLLM_TPU_USE_NAIVE_KDA"] is False
+
+
 def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
@@ -460,6 +485,7 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -478,16 +504,25 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         assert args[0] is sconv_cache
         return mixed_qkv
 
-    def kda_op(mixed_qkv, *args):
-        calls.append("kda")
+    def chunk_kda_op(mixed_qkv, *args):
+        calls.append("chunk")
         assert args[3] is recurrent_cache
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
+    def unexpected(name):
+
+        def op(*args, **kwargs):
+            raise AssertionError(f"{name} must not run for this batch")
+
+        return op
+
     layer.sconv_op = sconv_op
-    layer.kda_op = kda_op
+    layer.chunk_kda_op = chunk_kda_op
+    # The reference scan is only reachable via VLLM_TPU_USE_NAIVE_KDA.
+    layer.kda_op = unexpected("kda_op")
 
     output = layer(torch.arange(2), torch.ones(2, 4))
-    assert calls == ["sconv", "kda"]
+    assert calls == ["sconv", "chunk"]
     torch.testing.assert_close(output, torch.arange(8).view(2, 4).float())
 
 
@@ -555,12 +590,18 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    layer.use_naive_kda = False
     layer.sconv_op = kimi_custom_ops.build_kimi_sconv_op(
         "test_compile",
         kernel_size=3,
         state_dim_first=True,
     )
     layer.kda_op = kimi_custom_ops.build_kimi_kda_op(
+        "test_compile",
+        lower_bound=None,
+        eps=1e-5,
+    )
+    layer.chunk_kda_op = kimi_custom_ops.build_kimi_chunk_kda_op(
         "test_compile",
         lower_bound=None,
         eps=1e-5,
