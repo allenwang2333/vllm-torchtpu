@@ -17,7 +17,6 @@ This class supprts W4A16 and W4A8 quantization scheme where weights are quantize
 """
 
 import ctypes
-import gc
 
 import jax.numpy as jnp
 import torch
@@ -28,8 +27,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
-from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
-    get_cpu_weight_loader_hook
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    get_cpu_weight_loader_hook, release_memory_to_os)
 
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
@@ -150,11 +149,7 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         layer.w13_bias = None
         layer.w2_bias = None
 
-        gc.collect()
-        try:
-            ctypes.CDLL(None).malloc_trim(0)
-        except Exception:
-            pass
+        release_memory_to_os()
 
         activation_str = (layer.activation if isinstance(
             layer.activation, str) else layer.activation.value)

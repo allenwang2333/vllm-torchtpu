@@ -1,6 +1,3 @@
-import ctypes
-import gc
-
 import torch
 from torch_tpu._internal import sync
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -12,8 +9,8 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel)
-from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import \
-    get_cpu_weight_loader_hook
+from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+    get_cpu_weight_loader_hook, release_memory_to_os)
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
@@ -72,7 +69,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_scale_4d = _to_kernel_scale(w2_scale)
 
         # Unpack to native fp4 in the kernel's K-major layout once at load
-        # [E, N, K/2] uint8 -> [E, K, N] torch.float4_e2m1fn_x2
+        # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
         w13_weight = load_kmajor_fp4(w13_weight_packed)
         w2_weight = load_kmajor_fp4(w2_weight_packed)
 
@@ -105,11 +102,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             sync.synchronize(layer.w13_weight_scale, wait=True)
             sync.synchronize(layer.w2_weight_scale, wait=True)
 
-        gc.collect()
-        try:
-            ctypes.CDLL(None).malloc_trim(0)
-        except Exception:
-            pass
+        release_memory_to_os()
 
         activation_str = (layer.activation if isinstance(
             layer.activation, str) else layer.activation.value)

@@ -1,3 +1,5 @@
+import ctypes
+import gc
 from typing import Any, Callable, Optional
 
 import torch
@@ -32,6 +34,8 @@ def get_cpu_weight_loader_hook(layer: torch.nn.Module,
                           or "w13_weight_scale" in weight_name
                           or "w2_weight_scale" in weight_name)
 
+        # Special unpacking operations are not needed for other weights, so we can
+        # just use the original weight loader.
         if not is_main_weight:
             if orig_loader is not None:
                 return orig_loader(param, loaded_weight, weight_name, shard_id,
@@ -101,3 +105,12 @@ def get_cpu_weight_loader_hook(layer: torch.nn.Module,
         return False
 
     return _cpu_weight_loader_hook
+
+
+def release_memory_to_os() -> None:
+    """Forces Python GC and instructs the C allocator to return free memory to the OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
