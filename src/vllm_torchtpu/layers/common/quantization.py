@@ -106,10 +106,8 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     """
     # e8m0 minexp is -127 (same as jnp.float8_e8m0fnu)
     E8M0_MINEXP = -127
-    exponents = u8.to(torch.int32) + E8M0_MINEXP
-    ones = torch.ones_like(u8, dtype=torch.float32)
-    result = torch.ldexp(ones, exponents)
-    return result
+    exponents = (u8.to(torch.int32) + E8M0_MINEXP).to(torch.float32)
+    return torch.exp2(exponents)
 
 
 def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
