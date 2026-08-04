@@ -111,14 +111,48 @@ print('### torch_tpu still imports')
 fi
 echo "### lm_eval $(lm_eval --version 2>&1 | head -1 || python3 -c 'import lm_eval;print(lm_eval.__version__)' 2>/dev/null)"
 
-# The server must still be answering: a crash between /health and here would
-# otherwise surface as a wall of connection errors from every worker.
-curl -s -o /dev/null --connect-timeout 5 "http://localhost:$PORT/health" || {
-  echo "### FATAL: server not answering on :$PORT"; exit 4; }
+# ------------------------------------------------------------- readiness ---
+# BASE is localhost when this runs as glm_serve.sh's POST_READY_CMD, and the
+# JobSet headless DNS name when it runs as a separate CPU pod. In the split
+# case the server is not up yet -- this pod schedules immediately while the
+# TPU pod is still pulling and loading 433 GiB.
+BASE="${EVAL_BASE_URL:-http://localhost:${PORT}}"
+echo "### server base: $BASE"
 
-mkdir -p "$OUT_DIR"
+WAIT_HEALTH="${EVAL_WAIT_HEALTH:-5400}"
+waited=0
+until curl -sf -o /dev/null --connect-timeout 5 "$BASE/health"; do
+  if [ "$waited" -ge "$WAIT_HEALTH" ]; then
+    echo "### FATAL: no /health from $BASE within ${WAIT_HEALTH}s"
+    exit 4
+  fi
+  sleep 10
+  waited=$((waited + 10))
+  [ $((waited % 300)) -eq 0 ] && echo "### waiting for /health ... ${waited}s"
+done
+echo "### /health up after ${waited}s"
 
-MODEL_ARGS="base_url=http://localhost:${PORT}/v1/completions"
+# /health answers before the engine has finished compiling its graphs, so gate
+# on a real completion too. Without this the first lm_eval batch races the
+# warmup and 32 concurrent requests all time out at once.
+WAIT_GEN="${EVAL_WAIT_GEN:-1800}"
+probed=0
+until curl -sf -o /dev/null "$BASE/v1/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\": \"${MODEL}\", \"prompt\": \"hello\", \"max_tokens\": 4}"; do
+  if [ "$probed" -ge "$WAIT_GEN" ]; then
+    echo "### FATAL: no completion from $BASE within ${WAIT_GEN}s"
+    exit 4
+  fi
+  sleep 10
+  probed=$((probed + 10))
+  [ $((probed % 300)) -eq 0 ] && echo "### waiting for a completion ... ${probed}s"
+done
+echo "### engine served a completion after ${probed}s"
+
+mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR=/tmp/lm_eval_out && mkdir -p "$OUT_DIR"
+
+MODEL_ARGS="base_url=${BASE}/v1/completions"
 MODEL_ARGS="${MODEL_ARGS},model=${MODEL}"
 MODEL_ARGS="${MODEL_ARGS},tokenizer=${MODEL}"
 MODEL_ARGS="${MODEL_ARGS},max_gen_toks=${MAX_GEN}"

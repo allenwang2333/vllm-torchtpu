@@ -125,6 +125,7 @@ SERVER_CMD=(vllm serve "$MODEL"
   --enable-expert-parallel
   --gpu-memory-utilization "$MEM_UTIL"
   --trust-remote-code
+  --host 0.0.0.0
   --port "$PORT")
 # shellcheck disable=SC2206  # deliberate word split
 [ -n "${EXTRA_SERVE_ARGS:-}" ] && SERVER_CMD+=(${EXTRA_SERVE_ARGS})
@@ -192,6 +193,27 @@ if [ -n "${POST_READY_CMD:-}" ]; then
   bash -c "$POST_READY_CMD"
   POST_RC=$?
   echo "### POST_READY_RC=$POST_RC"
+fi
+
+# ------------------------------------------------------------ serve wait ----
+# Split-pod mode: a client in another pod drives this server, so it has to
+# stay up. The JobSet's successPolicy targets the client job, so when the
+# client finishes JobSet tears this pod down and releases the chips -- which
+# is the only thing that stops SERVE_WAIT running to the deadline.
+if [ "${SERVE_WAIT:-0}" = "1" ]; then
+  DEADLINE="${SERVE_WAIT_TIMEOUT:-14400}"
+  echo "### SERVE_WAIT=1: holding the server up for up to ${DEADLINE}s"
+  waited=0
+  while [ "$waited" -lt "$DEADLINE" ]; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "### server exited on its own after ${waited}s"
+      break
+    fi
+    sleep 30
+    waited=$((waited + 30))
+    [ $((waited % 600)) -eq 0 ] && echo "### still serving ... ${waited}s"
+  done
+  echo "### SERVE_WAIT done after ${waited}s"
 fi
 
 exit $POST_RC
