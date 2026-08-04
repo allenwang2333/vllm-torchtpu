@@ -104,6 +104,14 @@ _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
 
 
+@dataclass(frozen=True)
+class _Stage3MambaGroup:
+    """Stage-3 transfer geometry for one Mamba KV-cache group."""
+
+    index: int
+    num_speculative_blocks: int
+
+
 @dataclass
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
@@ -231,26 +239,32 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config)
         self.use_hma = use_hma
         self.use_raiden = use_raiden
+        self._stage3_enabled = (use_raiden and _use_raiden_stage3_transport())
         self._stage3_fa_group_index = 0
-        if use_raiden and _use_raiden_stage3_transport():
-            fa_groups = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if not isinstance(group.kv_cache_spec, MambaSpec)
-            ]
+        self._stage3_mamba_groups: tuple[_Stage3MambaGroup, ...] = ()
+        if self._stage3_enabled:
+            fa_groups: list[int] = []
+            mamba_groups: list[_Stage3MambaGroup] = []
+            for index, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                if isinstance(spec, MambaSpec):
+                    num_speculative_blocks = spec.num_speculative_blocks
+                    assert num_speculative_blocks >= 0, (
+                        "vLLM produced a MambaSpec with a negative "
+                        "num_speculative_blocks: "
+                        f"group={index}, value={num_speculative_blocks}")
+                    mamba_groups.append(
+                        _Stage3MambaGroup(
+                            index=index,
+                            num_speculative_blocks=num_speculative_blocks))
+                else:
+                    fa_groups.append(index)
             if len(fa_groups) != 1:
                 raise ValueError(
                     "Stage-3 Qwen3.5 resharding requires exactly one "
                     f"full-attention KV cache group, got {fa_groups}")
             self._stage3_fa_group_index = fa_groups[0]
-        self._stage3_mamba_group_indices: list[int] = []
-        if use_raiden and _use_raiden_stage3_transport():
-            mamba_groups = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ]
-            self._stage3_mamba_group_indices = mamba_groups
+            self._stage3_mamba_groups = tuple(mamba_groups)
         if use_hma:
             scheduler_cls = TPUConnectorHMAScheduler
             worker_cls = TPUConnectorHMAWorker
@@ -267,11 +281,11 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = scheduler_cls(vllm_config)
-            if use_raiden and _use_raiden_stage3_transport():
+            if self._stage3_enabled:
                 self.connector_scheduler._stage3_fa_group_index = (
                     self._stage3_fa_group_index)
-                self.connector_scheduler._stage3_mamba_group_indices = (
-                    self._stage3_mamba_group_indices)
+                self.connector_scheduler._stage3_mamba_groups = (
+                    self._stage3_mamba_groups)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -316,30 +330,19 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         if self.use_hma:
             return self.connector_scheduler.request_finished_all_groups(
                 request, block_ids)
-        if self.use_raiden and _use_raiden_stage3_transport():
-            if self._stage3_fa_group_index >= len(block_ids):
-                raise ValueError(
-                    "Stage-3 FA KV cache group is absent from request block "
-                    f"tables: index={self._stage3_fa_group_index}, "
-                    f"groups={len(block_ids)}")
-            mamba_block_ids = None
-            if self._stage3_mamba_group_indices:
-                mamba_block_ids = []
-                for mamba_gid in self._stage3_mamba_group_indices:
-                    if mamba_gid >= len(block_ids):
-                        raise ValueError(
-                            "GDN state reshard: mamba KV cache group is "
-                            "absent from request block tables: "
-                            f"index={mamba_gid}, groups={len(block_ids)}")
-                    mamba_block_ids.append(list(block_ids[mamba_gid]))
+        if self._stage3_enabled:
+            assert self._stage3_fa_group_index < len(block_ids), (
+                "Stage-3 FA KV cache group is absent from request block "
+                f"tables: index={self._stage3_fa_group_index}, "
+                f"groups={len(block_ids)}")
             # The use_hma branch returned above, so use_raiden here means
             # __init__ selected TPURaidenConnectorScheduler -- the only one
-            # of the three schedulers accepting mamba block ids. The checker
+            # of the three schedulers accepting grouped block ids. The checker
             # cannot narrow the union to that subclass.
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)  # type: ignore
+                all_group_block_ids=block_ids)  # type: ignore
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
@@ -763,7 +766,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_fa_group_index = 0
-        self._stage3_mamba_group_indices: list[int] = []
+        self._stage3_mamba_groups: tuple[_Stage3MambaGroup, ...] = ()
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
         dp_rank = vllm_config.parallel_config.data_parallel_rank if vllm_config.parallel_config else 0
         tp_size = vllm_config.parallel_config.tensor_parallel_size if vllm_config.parallel_config else 1
@@ -775,14 +778,38 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
 
+    def _select_stage3_committed_mamba_blocks(
+        self,
+        all_group_block_ids: tuple[list[int], ...],
+        *,
+        endpoint: str,
+    ) -> list[int]:
+        committed: list[int] = []
+        for ordinal, group in enumerate(self._stage3_mamba_groups):
+            assert group.index < len(all_group_block_ids), (
+                f"GDN state reshard: {endpoint} mamba KV cache group is "
+                "absent from request block tables: "
+                f"index={group.index}, groups={len(all_group_block_ids)}")
+            group_ids = all_group_block_ids[group.index]
+            required_blocks = group.num_speculative_blocks + 1
+            assert len(group_ids) >= required_blocks, (
+                f"GDN state reshard: {endpoint} mamba table cannot hold "
+                "the committed state and speculative checkpoints "
+                f"(ordinal {ordinal}, group={group.index}, "
+                f"blocks={len(group_ids)}, required={required_blocks})")
+            # vLLM appends K speculative checkpoint blocks after the current
+            # positional state block. Select that state relative to the tail
+            # so the result remains correct after the request spans pages.
+            committed.append(int(group_ids[-required_blocks]))
+        return committed
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         if self.is_producer:
-            if (_use_raiden_stage3_transport()
-                    and self._stage3_mamba_group_indices):
+            if (_use_raiden_stage3_transport() and self._stage3_mamba_groups):
                 self._maybe_truncate_for_mamba(request)
             return 0, False
         if not request.kv_transfer_params:
@@ -943,11 +970,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 source transfer parallelism must be positive")
 
         grouped_block_ids = blocks.get_block_ids()
-        if self._stage3_fa_group_index >= len(grouped_block_ids):
-            raise ValueError(
-                "Stage-3 FA KV cache group is absent from decode allocation: "
-                f"index={self._stage3_fa_group_index}, "
-                f"groups={len(grouped_block_ids)}")
+        assert self._stage3_fa_group_index < len(grouped_block_ids), (
+            "Stage-3 FA KV cache group is absent from decode allocation: "
+            f"index={self._stage3_fa_group_index}, "
+            f"groups={len(grouped_block_ids)}")
         local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
         expected_pages = ((num_tokens + self.block_size - 1) //
                           self.block_size)
@@ -958,22 +984,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"blocks={len(local_block_ids)}, expected={expected_pages}, "
                 f"num_tokens={num_tokens}, page_tokens={self.block_size}")
         mamba_state_block_ids: Optional[list[int]] = None
-        if self._stage3_mamba_group_indices:
-            # Live state = last live entry; 'align' mode pads the head of
-            # the table with the null block.
-            mamba_state_block_ids = []
-            for mamba_gid in self._stage3_mamba_group_indices:
-                if mamba_gid >= len(grouped_block_ids):
-                    raise ValueError(
-                        "GDN state reshard: mamba KV cache group is absent "
-                        f"from decode allocation: index={mamba_gid}, "
-                        f"groups={len(grouped_block_ids)}")
-                mamba_ids = list(grouped_block_ids[mamba_gid])
-                if not mamba_ids:
-                    raise ValueError(
-                        "GDN state reshard: destination mamba table is empty "
-                        f"(group {mamba_gid})")
-                mamba_state_block_ids.append(int(mamba_ids[-1]))
+        if self._stage3_mamba_groups:
+            mamba_state_block_ids = self._select_stage3_committed_mamba_blocks(
+                grouped_block_ids, endpoint="destination")
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -1002,7 +1015,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         request: "Request",
         block_ids: list[int],
-        mamba_block_ids: Optional[list[int]] = None,
+        all_group_block_ids: Optional[tuple[list[int], ...]] = None,
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
@@ -1100,17 +1113,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"limit={_STAGE3_FINISH_DEDUP_LIMIT}")
 
         mamba_state_block_ids: Optional[list[int]] = None
-        if self._stage3_mamba_group_indices:
-            if not mamba_block_ids:
-                raise ValueError("GDN state is present but the producer's "
-                                 "mamba block tables were not provided")
-            mamba_state_block_ids = []
-            for ordinal, group_ids in enumerate(mamba_block_ids):
-                if not group_ids:
-                    raise ValueError(
-                        "GDN state reshard: producer mamba table is empty "
-                        f"(ordinal {ordinal})")
-                mamba_state_block_ids.append(int(group_ids[-1]))
+        if self._stage3_mamba_groups:
+            assert all_group_block_ids is not None, (
+                "Stage-3 GDN producer finish must receive all KV-cache group "
+                "block tables")
+            mamba_state_block_ids = self._select_stage3_committed_mamba_blocks(
+                all_group_block_ids, endpoint="producer")
         uuid = get_uuid()
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
