@@ -24,9 +24,14 @@ class _Activation(Enum):
     SILU = "silu"
 
 
+class MockConfig:
+    activation_situ_beta = 4.0
+    activation_situ_linear_beta = None
+
+
 @pytest.mark.parametrize("activation", ["silu", _Activation.SILU])
 def test_get_fused_moe_activation_preserves_standard_activations(activation):
-    assert get_fused_moe_activation(activation, object()) == "silu"
+    assert get_fused_moe_activation(activation, MockConfig()) == "silu"
 
 
 @pytest.mark.parametrize(
