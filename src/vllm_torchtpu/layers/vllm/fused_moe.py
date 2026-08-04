@@ -17,7 +17,7 @@ import functools
 from typing import Any, Callable, Optional
 
 import torch
-from torch_tpu._internal import pallas
+from vllm_torchtpu.patches import pallas_patched as pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
