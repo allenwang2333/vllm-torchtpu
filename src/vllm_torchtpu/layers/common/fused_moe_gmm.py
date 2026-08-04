@@ -66,7 +66,10 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
 def quantize_to_native_fp4_kmajor(w: jax.Array,
                                   block: int) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
-    Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2."""
+    Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+
+    TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
+    """
 
     size_k = w.shape[-2]
     num_blocks = size_k // block
