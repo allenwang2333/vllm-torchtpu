@@ -113,12 +113,12 @@ def parse_and_dump(file_path, record_id):
                 "total_output_tokens",
                 "duration",
             ]
-            # Omit None values to keep JSON compact
+            # Flat payload; the tool that produced it goes in the typed
+            # metrics.type field, not a JSON wrapper. Omit None values to
+            # keep JSON compact.
             metrics_dict = {
-                "vllm_bench": {
-                    k: data.get(k)
-                    for k in bench_fields if data.get(k) is not None
-                }
+                k: data.get(k)
+                for k in bench_fields if data.get(k) is not None
             }
 
             # Build configuration & workload payload
@@ -151,7 +151,9 @@ def parse_and_dump(file_path, record_id):
                 record_id, created_time, repository, run_type, model_id, metrics, config
             ) VALUES (
                 '{unique_record_id}', {bq_timestamp}, '{repository}', '{run_type}', '{model_id}',
-                PARSE_JSON('{metrics_json_str}', wide_number_mode=>'round'),
+                STRUCT('vllm_bench',
+                       PARSE_JSON('{metrics_json_str}',
+                                  wide_number_mode=>'round')),
                 PARSE_JSON('{config_json_str}', wide_number_mode=>'round')
             );
             """
