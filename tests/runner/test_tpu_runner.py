@@ -1640,3 +1640,53 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1])
         }
         assert slots == {1, 2, 3, 4}
+
+
+def test_dsv4_compressor_state_cache_aliasing():
+    """Verify _alias_ds_v4_compressor_state_caches aliases compressor state caches to host k_cache."""
+    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+
+    mock_runner = MagicMock()
+    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+
+    layer_name = "model.layers.0.self_attn.compressor.state_cache"
+    host_name = "model.layers.0.self_attn"
+    compressor_mock = MagicMock(spec=CompressorStateCache)
+
+    mock_runner.vllm_config.compilation_config.static_forward_context[
+        layer_name] = compressor_mock
+
+    host_tensor = torch.zeros(10, 512)
+    kv_caches = {
+        layer_name: torch.ones(10, 512),
+        host_name: host_tensor,
+    }
+
+    TPUModelRunner._alias_ds_v4_compressor_state_caches(mock_runner, kv_caches)
+    assert kv_caches[layer_name] is host_tensor
+
+
+def test_tpu_platform_mla_block_size_override():
+    """Verify TpuPlatform.update_block_size_for_backend sets block_size=1024 for MLA models."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            user_specified_block_size=False,
+            block_size_unaligned=16,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_hybrid=False,
+        ),
+    )
+
+    backend_mock = MagicMock()
+    backend_mock.get_min_page_size.return_value = 1
+    with patch.object(TpuPlatform,
+                      "_find_non_ssm_backend",
+                      return_value=backend_mock):
+        TpuPlatform.update_block_size_for_backend(vllm_config)
+
+    assert vllm_config.cache_config.block_size == 1024
