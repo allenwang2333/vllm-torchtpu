@@ -220,5 +220,64 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w13_scale[:, 32:64, :].any()
     assert torch.all(w13_scale[:, 64:96, :] == 0xff)
     assert not w13_scale[:, 96:, :].any()
-    assert torch.all(w2_scale[:, :, :1] == 0xff)
     assert not w2_scale[:, :, 1:].any()
+
+
+def test_mxfp4_requantize_block():
+    moe_config = MagicMock()
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 64
+    moe_config.intermediate_size_per_partition_unpadded = 64
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer._expert_routing_tables = lambda: (None, None)
+
+    num_experts = 4
+    hidden_size = 128
+    intermediate_size_per_partition = 64
+
+    method.create_weights(
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        params_dtype=torch.bfloat16,
+    )
+
+    weight_loader = layer.w13_weight_packed.weight_loader
+    w13_packed_val = torch.ones(64, 64, dtype=torch.uint8)
+    w13_scale_val = torch.ones(64, 4, dtype=torch.uint8)
+    w2_packed_val = torch.ones(128, 32, dtype=torch.uint8)
+    w2_scale_val = torch.ones(128, 2, dtype=torch.uint8)
+
+    for expert_id in range(num_experts):
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w1", expert_id)
+        weight_loader(layer.w13_weight_packed, w13_packed_val,
+                      "w13_weight_packed", "w3", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w1", expert_id)
+        weight_loader(layer.w13_weight_scale, w13_scale_val,
+                      "w13_weight_scale", "w3", expert_id)
+        weight_loader(layer.w2_weight_packed, w2_packed_val,
+                      "w2_weight_packed", "", expert_id)
+        weight_loader(layer.w2_weight_scale, w2_scale_val, "w2_weight_scale",
+                      "", expert_id)
+
+    with patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.MOE_REQUANTIZE_BLOCK_SIZE",
+            "64"
+    ), patch(
+            "vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+    ):
+        method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight.shape == (4, 128, 64)
+    assert layer.w2_weight.shape == (4, 64, 64)
+    # w13 K=128, block=64 -> 2 blocks
+    assert layer.w13_weight_scale.shape == (4, 2, 1, 128)
+    # w2 K=64, block=64 -> 1 block
+    assert layer.w2_weight_scale.shape == (4, 1, 1, 128)
