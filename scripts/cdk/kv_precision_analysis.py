@@ -301,6 +301,26 @@ def _fmt(report: dict) -> str:
     return "\n".join(out)
 
 
+def scale_sweep(x: np.ndarray, scales: list) -> list:
+    """Round-trip error of `x` across candidate per-tensor scales.
+
+    Dividing by a power of two is exact in binary floating point -- it only
+    shifts the exponent -- so every power-of-two scale produces bit-identical
+    fp8 output. `k_scale = 1.0` is therefore not a neutral default but one
+    sample of the power-of-two case.
+
+    A non-power-of-two scale moves values within their binades, and e4m3's
+    relative step is 1/8 of a binade: worst just above a power of two, best
+    just below the next one. Choosing the scale so the distribution lands in
+    the favourable part of the binade is free precision.
+    """
+    out = []
+    for s in scales:
+        hat = per_tensor_fp8(x, s)
+        out.append((s, float(np.linalg.norm(hat - x) / np.linalg.norm(x))))
+    return out
+
+
 def synthetic(num_tokens: int = 512, seed: int = 0) -> dict:
     """Stand-in tensors for validating the harness without a device.
 
