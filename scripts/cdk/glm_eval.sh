@@ -57,7 +57,17 @@ CONC="${EVAL_CONCURRENT:-32}"
 MAX_GEN="${EVAL_MAX_GEN_TOKS:-4096}"
 MAX_LEN="${MAX_MODEL_LEN:-32768}"
 SEED="${EVAL_SEED:-42}"
-GEN_KWARGS="${EVAL_GEN_KWARGS:-max_new_tokens=4096,until=['<|im_end|>']}"
+# No `until` override: mmlu_pro stops on "Question:" and gpqa on "</s>", and a
+# global override replaces both. The reference command used until=['<|im_end|>'],
+# which is a ChatML token GLM does not have -- its EOS is <|endoftext|> and its
+# turn markers are <|user|>/<|assistant|>/<|observation|> -- so it never matched
+# and only served to discard the tasks' own stops.
+#
+# max_gen_toks does need overriding: mmlu_pro's default is 2048, and GLM-5.2 is
+# a reasoning model whose chain of thought can exceed that and get truncated
+# before it emits "The answer is X", which the scoring regex needs. 30000
+# matches what the working multi-node GLM recipe uses.
+GEN_KWARGS="${EVAL_GEN_KWARGS:-max_gen_toks=30000}"
 LM_EVAL_SRC="${LM_EVAL_SRC:-/nfs/lm-eval}"
 OUT_DIR="${EVAL_OUT_DIR:-/hf-cache/lm_eval_out}"
 LOG_SAMPLES="${EVAL_LOG_SAMPLES:-0}"
@@ -197,7 +207,6 @@ EVAL_CMD=(lm_eval
   --model local-completions
   --model_args "$MODEL_ARGS"
   --apply_chat_template
-  --tasks "$TASKS"
   --seed "$SEED"
   --gen_kwargs "$GEN_KWARGS"
   --output_path "$OUT_DIR")
@@ -206,11 +215,22 @@ EVAL_CMD=(lm_eval
 [ "$LIMIT" != "0" ] && EVAL_CMD+=(--limit "$LIMIT")
 [ "$LOG_SAMPLES" = "1" ] && EVAL_CMD+=(--log_samples)
 
-echo "### [cmd] ${EVAL_CMD[*]}"
+# One invocation per task, not one for all of them. lm_eval only writes
+# results when the whole run finishes, so a full mmlu_pro (12,032 items) that
+# fails or gets killed hours in would take a completed gpqa down with it.
+# Sequential runs bank each result as it lands; put the cheap task first.
+rc=0
 T0=$(date +%s)
-"${EVAL_CMD[@]}" 2>&1 | tee /tmp/lm_eval.log
-rc=${PIPESTATUS[0]}
-echo "### lm_eval exit=$rc after $(( $(date +%s) - T0 ))s"
+: > /tmp/lm_eval.log
+for task in ${TASKS//,/ }; do
+  echo "### ===== task: $task ====="
+  t0=$(date +%s)
+  "${EVAL_CMD[@]}" --tasks "$task" 2>&1 | tee -a /tmp/lm_eval.log
+  trc=${PIPESTATUS[0]}
+  echo "### task $task exit=$trc after $(( $(date +%s) - t0 ))s"
+  [ "$trc" -ne 0 ] && rc=$trc
+done
+echo "### lm_eval total $(( $(date +%s) - T0 ))s (worst exit=$rc)"
 
 echo "### --- results ---"
 # lm_eval prints a markdown table at the end; re-emit it so the score is in
