@@ -126,6 +126,30 @@ echo "### lm_eval $(lm_eval --version 2>&1 | head -1 || python3 -c 'import lm_ev
 # case the server is not up yet -- this pod schedules immediately while the
 # TPU pod is still pulling and loading 433 GiB.
 BASE="${EVAL_BASE_URL:-http://localhost:${PORT}}"
+
+# "discover" resolves the JobSet headless service instead of a per-pod DNS
+# name. Per-pod names need network.enableDNSHostnames, which makes JobSet
+# assign each pod a hostname/subdomain -- and with that set, every TPU worker
+# in the server pod aborts during device init with
+#   RAW: absl::container_internal::raw_hash_map<>::at
+# before the model is even loaded (reproduced twice; the identical single-pod
+# job serves fine). The headless service still publishes A records for all
+# pods without it, so find the one answering /health on the serving port.
+if [ "$BASE" = "discover" ]; then
+  echo "### discovering the server via the ${JS_NAME} headless service"
+  found=""
+  for attempt in $(seq 1 "${EVAL_DISCOVER_TRIES:-360}"); do
+    for ip in $(getent ahostsv4 "${JS_NAME}" 2>/dev/null | awk '{print $1}' | sort -u); do
+      if curl -sf -o /dev/null --connect-timeout 2 "http://${ip}:${PORT}/health"; then
+        found="http://${ip}:${PORT}"; break 2
+      fi
+    done
+    [ $((attempt % 20)) -eq 0 ] && echo "### still discovering ... ${attempt}0s"
+    sleep 10
+  done
+  [ -n "$found" ] || { echo "### FATAL: no pod answered /health on :${PORT}"; exit 4; }
+  BASE="$found"
+fi
 echo "### server base: $BASE"
 
 WAIT_HEALTH="${EVAL_WAIT_HEALTH:-5400}"
