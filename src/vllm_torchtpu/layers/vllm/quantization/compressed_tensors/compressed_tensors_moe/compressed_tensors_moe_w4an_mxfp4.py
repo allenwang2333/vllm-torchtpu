@@ -7,6 +7,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
+                                                 get_fused_moe_activation,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.utils import (
@@ -56,6 +57,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_packed = layer.w2_weight_packed._cpu_scratch.data.to("tpu")
         w2_weight_scale = layer.w2_weight_scale._cpu_scratch.data.to("tpu")
 
+        # Zero out the locations not written to by the retrival step.
+        unpadded_size = layer.moe_config.intermediate_size_per_partition_unpadded
+        padded_size = layer.moe_config.intermediate_size_per_partition
+        if unpadded_size < padded_size:
+            w13_weight_scale[:, unpadded_size:padded_size, :].zero_()
+            w13_weight_scale[:, padded_size + unpadded_size:, :].zero_()
+            w2_weight_scale[:, :, unpadded_size // self.group_size:].zero_()
+
         # Convert e8m0 scales to fp32
         w13_scale = e8m0_to_fp32(w13_weight_scale)
         w2_scale = e8m0_to_fp32(w2_weight_scale)
@@ -104,12 +113,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         release_memory_to_os()
 
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
+        moe_routing.register_experts_start_buffer(
+            layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
-            experts_start=moe_routing.get_experts_start(layer),
+            use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
 
     def apply_monolithic(
@@ -119,8 +130,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = (layer.activation if isinstance(
-            layer.activation, str) else layer.activation.value)
+        activation_str = get_fused_moe_activation(layer.activation,
+                                                  layer.moe_config)
 
         # Handle custom routing function if present
         custom_routing_fn = getattr(layer, "custom_routing_function", None)
@@ -156,7 +167,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             w2_bias=None,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            experts_start=moe_routing.get_experts_start(layer),
+            experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             rhs_quant_dtype=None,
