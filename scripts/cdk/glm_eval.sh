@@ -40,6 +40,15 @@
 #     ephemeral.
 set -uo pipefail
 
+# Same stale-handle hazard as glm_serve.sh: bash reads the script
+# incrementally, so an edit to the NFS copy mid-run aborts it. Re-exec local.
+if [ "${GLM_EVAL_LOCAL:-0}" != "1" ]; then
+  cp "${BASH_SOURCE[0]}" /tmp/glm_eval.local.sh || {
+    echo "### FATAL: could not stage the eval script locally"; exit 6; }
+  export GLM_EVAL_LOCAL=1
+  exec bash /tmp/glm_eval.local.sh "$@"
+fi
+
 MODEL="${MODEL_ID:-nvidia/GLM-5.2-NVFP4}"
 PORT="${SERVE_PORT:-8000}"
 TASKS="${EVAL_TASKS:-mmlu_pro}"

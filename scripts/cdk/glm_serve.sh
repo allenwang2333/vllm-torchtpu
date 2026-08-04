@@ -35,6 +35,20 @@
 #     SCRIPT=../../.claude/worktrees/glm-kv-probe/scripts/cdk/glm_serve
 set -uo pipefail
 
+# Re-exec from a local copy before doing anything else. bash reads a script
+# incrementally, so editing this file on the NFS export while a job is part
+# way through it invalidates the handle and the run dies at the next read
+# with "error reading input file: Stale file handle" -- which is exactly what
+# killed the first successful load, after the server was already up. The NFS
+# fast loop is worth keeping; this just makes it safe to edit mid-run.
+if [ "${GLM_SERVE_LOCAL:-0}" != "1" ]; then
+  export GLM_SERVE_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cp "${BASH_SOURCE[0]}" /tmp/glm_serve.local.sh || {
+    echo "### FATAL: could not stage the script locally"; exit 6; }
+  export GLM_SERVE_LOCAL=1
+  exec bash /tmp/glm_serve.local.sh "$@"
+fi
+
 MODEL="${MODEL_ID:-nvidia/GLM-5.2-NVFP4}"
 TP="${TP_SIZE:-8}"                     # 2x2x1 = 4 chips x 2 devices
 MAX_LEN="${MAX_MODEL_LEN:-32768}"
@@ -52,6 +66,15 @@ echo "### HF_TOKEN present: $([ -n "${HF_TOKEN:-}" ] && echo yes || echo no)"
 
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
+
+# XLA compilation of this model takes ~38 min across the eight shape buckets,
+# and vLLM caches it under $VLLM_CACHE_ROOT -- which defaults to ~/.cache/vllm
+# inside the container and dies with the pod. Point it at the weights PVC so
+# the next run reuses the graphs instead of recompiling. Keyed by config hash,
+# so a change that matters still recompiles.
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/hf-cache/vllm_cache}"
+mkdir -p "$VLLM_CACHE_ROOT"
+echo "### VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT"
 
 # Required, not tuning. Left unset, the NVFP4 MoE keeps the checkpoint's
 # native block-16 scales and dequantizes inside the gmm; because 16 < the
@@ -94,7 +117,7 @@ echo "### TPU_GMM_SCALE_BCAST_FALLBACK=${TPU_GMM_SCALE_BCAST_FALLBACK:-1}"
 # This branch's source must win over the main checkout that the recipe put on
 # PYTHONPATH ahead of us -- the fix for the positional MLAAttention super()
 # call lives here, and without it construction dies against this vLLM.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${GLM_SERVE_SRC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 export PYTHONPATH="${HERE}/../../src:${PYTHONPATH:-}"
 echo "### PYTHONPATH=$PYTHONPATH"
 
