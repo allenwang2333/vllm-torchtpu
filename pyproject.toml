@@ -48,7 +48,12 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.43",
+    # 0.0.45 rolls back the multihost "Topology HOST_BOUNDS does not match
+    # VM metadata" PjRt-init validation that 0.0.43-0.0.44.x wrongly apply
+    # to per-core process layouts on tpu7x multihost slices (see
+    # docs/multihost_v7x_bringup notes on the glm branches) — required for
+    # the tpu_v7x_16_queue GLM benchmark.
+    "libtpu==0.0.45",
     "ray[default]",
     "ray[data]",
 ]
@@ -77,6 +82,9 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
+    # Stream gs:// checkpoints via --load-format runai_streamer (multihost
+    # v7x-16 hosts have no disk for an HF download).
+    "runai-model-streamer[gcs]",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

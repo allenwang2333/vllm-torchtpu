@@ -156,6 +156,13 @@ class TPUWorker(WorkerBase):
         # TORCH_TPU_SLICEBUILDER_ADDRESSES and TORCH_TPU_TOPOLOGY are
         # already inherited from the parent process (set by
         # prepare_tpu_environment() in tpu_platform.py).
+        # Warm the platform device-name cache eagerly: fp8_dtype() (and thus
+        # the os.listdir-based PCI scan behind get_tpu_device_name) is
+        # reached from inside compiled model forwards, where dynamo cannot
+        # trace filesystem builtins.
+        from vllm.platforms import current_platform
+        current_platform.get_device_name()
+
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
         pcp_size = pc.prefill_context_parallel_size

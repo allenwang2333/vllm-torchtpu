@@ -48,6 +48,11 @@ TPU_MULTIHOST_TOPOLOGY_MAP = {
     32: "2,2,4,2",
 }
 
+# Lazily populated by TpuPlatform.get_device_name (warmed eagerly in
+# TPUWorker.init_device) so device-name lookups inside compiled forwards
+# never hit the os.listdir-based PCI scan under dynamo.
+_TPU_DEVICE_NAME_CACHE: Optional[str] = None
+
 # ---------------------------------------------------------------------------
 # Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.
 # Each entry is (module_path, function_name).
@@ -230,9 +235,11 @@ def apply_tpu_patches() -> None:
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
+                               _patch_multiproc_worker_global_rank_env,
+                               _patch_per_token_group_quant_fp8_native)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    _patch_per_token_group_quant_fp8_native()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -564,7 +571,15 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        return hardware.get_tpu_device_name()
+        # Cached: the PCI scan behind get_tpu_device_name does os.listdir,
+        # and fp8_dtype() is reached from inside compiled model forwards
+        # (e.g. deepseek_v2 per_token_group_quant_fp8) where dynamo cannot
+        # trace filesystem builtins. TPUWorker.init_device warms the cache
+        # eagerly so tracing only ever sees the constant.
+        global _TPU_DEVICE_NAME_CACHE
+        if _TPU_DEVICE_NAME_CACHE is None:
+            _TPU_DEVICE_NAME_CACHE = hardware.get_tpu_device_name()
+        return _TPU_DEVICE_NAME_CACHE
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
@@ -874,6 +889,19 @@ class TpuPlatform(Platform):
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
         backend_cls = cls._find_non_ssm_backend(vllm_config)
+
+        # Models can carry auxiliary attention backends that don't implement
+        # the TPU page-size interface (e.g. GLM-5.2's sparse-attention
+        # indexer resolves to upstream DeepseekV32IndexerBackend). If the
+        # finder picked one of those, keep the configured block size rather
+        # than crashing engine init.
+        if not hasattr(backend_cls, "get_page_size"):
+            logger.warning(
+                "Attention backend %s does not implement the TPU page-size "
+                "interface; keeping KV cache block size %s.",
+                getattr(backend_cls, "__name__", backend_cls),
+                cache_config.block_size)
+            return
 
         is_hybrid = vllm_config.model_config.is_hybrid
         if not is_hybrid and not cache_config.user_specified_block_size:

@@ -913,3 +913,69 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
         )
+
+
+def _patch_per_token_group_quant_fp8_native() -> None:
+    """Replace vLLM's per_token_group_quant_fp8 with a pure-torch version.
+
+    On TPU the upstream function reaches its Triton fallback
+    (``BLOCK = triton.next_power_of_2(...)`` + kernel launch), and triton
+    ships as a driverless stub here — tracing GLM-5.2's sparse-attention
+    indexer (deepseek_v2 -> per_token_group_quant_fp8) aborts with
+    "module 'triton' has no attribute 'next_power_of_2'". The group-wise
+    absmax quant is expressible in plain torch ops, which dynamo traces
+    cleanly.
+    """
+    import sys as _sys
+
+    import torch as _torch
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.platforms import current_platform
+
+    if getattr(fp8_utils, "_tpu_native_group_quant_patch", False):
+        return
+
+    def per_token_group_quant_fp8_tpu(
+        x,
+        group_size,
+        eps: float = 1e-10,
+        dtype=None,
+        column_major_scales: bool = False,
+        tma_aligned_scales: bool = False,
+        out_q=None,
+        use_ue8m0=None,
+    ):
+        fp8_dtype = (dtype
+                     if dtype is not None else current_platform.fp8_dtype())
+        finfo = _torch.finfo(fp8_dtype)
+        assert x.shape[-1] % group_size == 0, (
+            f"last dim {x.shape[-1]} not divisible by group_size {group_size}")
+        grouped = x.reshape(*x.shape[:-1], x.shape[-1] // group_size,
+                            group_size)
+        absmax = grouped.abs().amax(dim=-1, keepdim=True).to(_torch.float32)
+        scales = absmax.clamp(min=eps) / finfo.max
+        if use_ue8m0:
+            scales = _torch.exp2(_torch.ceil(_torch.log2(scales)))
+        quant = (grouped.to(_torch.float32) / scales).clamp(
+            finfo.min, finfo.max).to(fp8_dtype).reshape(x.shape)
+        if out_q is not None:
+            out_q.copy_(quant)
+            quant = out_q
+        scales = scales.squeeze(-1)
+        if column_major_scales:
+            scales = scales.transpose(-2, -1).contiguous().transpose(-2, -1)
+        return quant, scales
+
+    fp8_utils.per_token_group_quant_fp8 = per_token_group_quant_fp8_tpu
+    # from-imports bind the symbol per module; rebind already-imported users
+    # (modules imported later pick up the patched attribute naturally).
+    for mod_name in list(_sys.modules):
+        mod = _sys.modules.get(mod_name)
+        if (mod is not None and mod_name.startswith("vllm.")
+                and mod is not fp8_utils
+                and getattr(mod, "per_token_group_quant_fp8", None)
+                is not None):
+            mod.per_token_group_quant_fp8 = per_token_group_quant_fp8_tpu
+    fp8_utils._tpu_native_group_quant_patch = True
+    logger.info("Applied TPU patch: torch-native per_token_group_quant_fp8 "
+                "(upstream triton fallback is unusable on TPU).")
