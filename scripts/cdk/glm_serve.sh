@@ -53,6 +53,20 @@ echo "### HF_TOKEN present: $([ -n "${HF_TOKEN:-}" ] && echo yes || echo no)"
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
 
+# Required, not tuning. Left unset, the NVFP4 MoE keeps the checkpoint's
+# native block-16 scales and dequantizes inside the gmm; because 16 < the
+# MXU's 128 columns, `should_dequantize_before_matmul` takes the branch that
+# broadcasts the scale across sublanes with a zero-stride load, and Mosaic
+# only implements that when the base memref's lane dim is 128. GLM's is
+# tile_n = 2048, so compilation dies with
+#   "Not Implemented: The last dim size is not 128 in original base memref"
+# in WeightsRef.get_scale. Requantizing to a block >= 128 removes the
+# in-kernel dequant entirely and the broadcast with it. GLM's hidden (6144)
+# and moe_intermediate (2048) are both divisible by 512, so this takes the
+# fast JAX requant path rather than the torch pad-and-requant fallback.
+export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
+echo "### MOE_REQUANTIZE_BLOCK_SIZE=$MOE_REQUANTIZE_BLOCK_SIZE"
+
 # This branch's source must win over the main checkout that the recipe put on
 # PYTHONPATH ahead of us -- the fix for the positional MLAAttention super()
 # call lives here, and without it construction dies against this vLLM.
