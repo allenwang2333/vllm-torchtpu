@@ -17,6 +17,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.moe_parallel_config.use_ep = False
         self.moe_config.norm_topk_prob = True
         self.moe_config.has_bias = False
+        self.moe_config.intermediate_size_per_partition = 64
+        self.moe_config.intermediate_size_per_partition_unpadded = 32
         self.activation = "silu"
         self.use_grouped_topk = False
         self.renormalize = True
@@ -108,6 +110,25 @@ def test_mxfp4_create_weights_and_process():
                                              layer.w13_weight.dtype)
     assert layer.w2_weight.dtype == getattr(torch, "float4_e2m1fn_x2",
                                             layer.w2_weight.dtype)
+    # Verify that padding regions were zeroed out
+    # num_experts = 4, group_size = 32, hidden_size = 128, intermediate_size_per_partition = 64
+    # unpadded_size = 32.
+    # w13_scale 4D shape: [E, hidden_size // group_size, 1, 2 * padded_size] -> [4, 4, 1, 128]
+    # The zeroed regions on N dimension (dim 3) are:
+    # unpadded_size : padded_size -> 32 : 64
+    # padded_size + unpadded_size : 2 * padded_size -> 64 + 32 : 128 -> 96 : 128
+    assert (layer.w13_weight_scale[:, :, :, 32:64] == 0).all()
+    assert (layer.w13_weight_scale[:, :, :, 96:128] == 0).all()
+    # Ensure unpadded regions remain > 0
+    assert (layer.w13_weight_scale[:, :, :, :32] > 0).all()
+    assert (layer.w13_weight_scale[:, :, :, 64:96] > 0).all()
+
+    # w2_scale 4D shape: [E, padded_size // group_size, 1, hidden_size] -> [4, 2, 1, 128]
+    # Zeroing happens on dim 1 (num_blocks): unpadded_size // group_size = 32 // 32 = 1.
+    # So dim 1 index 1 onwards should be zero.
+    assert (layer.w2_weight_scale[:, 1:, :, :] == 0).all()
+    # Ensure unpadded region remains > 0
+    assert (layer.w2_weight_scale[:, :1, :, :] > 0).all()
 
     # 3. _forward_monolithic_tpu
     x = torch.randn(2, 128, dtype=torch.bfloat16)
