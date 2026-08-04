@@ -180,4 +180,18 @@ echo "### --- sparse / indexer evidence ---"
 grep -hiE "sparse|indexer|topk|fp8_ds_mla|kv_cache_dtype" "$SERVER_LOG" | tail -15 | sed 's/^/### /'
 
 echo "### LOAD_RESULT=OK smoke_rc=$SMOKE_RC"
-exit 0
+
+# ----------------------------------------------------------- post-ready -----
+# Anything that needs a live server (lm_eval, benchmarks) runs here rather
+# than in its own job: TPU quota is the scarce resource, and a second job
+# would pay another admission wait plus another weight load. Unset by default,
+# so a plain load check is unaffected.
+POST_RC=0
+if [ -n "${POST_READY_CMD:-}" ]; then
+  echo "### POST_READY_CMD: $POST_READY_CMD"
+  bash -c "$POST_READY_CMD"
+  POST_RC=$?
+  echo "### POST_READY_RC=$POST_RC"
+fi
+
+exit $POST_RC
