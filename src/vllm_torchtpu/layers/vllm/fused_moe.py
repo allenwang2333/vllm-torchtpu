@@ -16,13 +16,21 @@
 import functools
 from typing import Any, Callable, Optional
 
+import jax
 import torch
-from vllm_torchtpu.patches import pallas_patched as pallas
+from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
     unpack_fp4_to_e2m1)
+
+try:
+    if hasattr(torch, "float4_e2m1fn_x2") and hasattr(jax.numpy, "float4_e2m1fn"):
+        pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[jax.numpy.float4_e2m1fn.dtype] = torch.float4_e2m1fn_x2
+        pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch.float4_e2m1fn_x2] = jax.numpy.float4_e2m1fn.dtype
+except Exception:
+    pass
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, Optional[int], Any],
