@@ -67,6 +67,30 @@ export TORCHINDUCTOR_AUTOGRAD_CACHE=0
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 echo "### MOE_REQUANTIZE_BLOCK_SIZE=$MOE_REQUANTIZE_BLOCK_SIZE"
 
+# Mosaic ships inside libtpu, so the compiler that rejects the zero-stride
+# scale broadcast is a property of the libtpu build, not of vLLM or the
+# kernels. The only recipe anyone has GLM-5.2 serving from
+# (multihost/torchtpu/vllm-torchtpu-glm-5.2.yml) does not use the image's
+# libtpu at all -- it pulls a pinned build from GCS and points
+# TPU_LIBRARY_PATH at it. Set LIBTPU_BUILD to a date under
+# gs://cloud-devkit/libs/libtpu/ to do the same; unset uses the image's.
+LIBTPU_BUILD="${LIBTPU_BUILD:-}"
+if [ -n "$LIBTPU_BUILD" ]; then
+  LIBTPU_DEST="/root/cloud-devkit/base/bin/libtpu.so"
+  echo "### pinning libtpu to $LIBTPU_BUILD"
+  mkdir -p "$(dirname "$LIBTPU_DEST")"
+  if gcloud storage cp "gs://cloud-devkit/libs/libtpu/${LIBTPU_BUILD}/libtpu.so" \
+       "$LIBTPU_DEST" 2>&1 | tail -2; then
+    export TPU_LIBRARY_PATH="$LIBTPU_DEST"
+    ls -la "$LIBTPU_DEST" | sed 's/^/### /'
+  else
+    echo "### FATAL: could not fetch libtpu build $LIBTPU_BUILD"
+    exit 5
+  fi
+fi
+echo "### TPU_LIBRARY_PATH=${TPU_LIBRARY_PATH:-<image default>}"
+echo "### TPU_GMM_SCALE_BCAST_FALLBACK=${TPU_GMM_SCALE_BCAST_FALLBACK:-1}"
+
 # This branch's source must win over the main checkout that the recipe put on
 # PYTHONPATH ahead of us -- the fix for the positional MLAAttention super()
 # call lives here, and without it construction dies against this vLLM.

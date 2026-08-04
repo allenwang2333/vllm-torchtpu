@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import os
 import functools
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Tuple
@@ -22,6 +23,12 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Escape hatch so the zero-stride scale broadcast can be re-enabled unchanged,
+# to tell apart "the fallback fixed it" from "a different libtpu fixed it"
+# when both are in play. Default on; set to 0 to restore the original load.
+_SCALE_BCAST_FALLBACK = os.environ.get("TPU_GMM_SCALE_BCAST_FALLBACK",
+                                       "1") == "1"
 
 # Util.
 
@@ -175,8 +182,24 @@ class WeightsRef(RhsRef):
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if replicate_size is not None:
-            # Perform zero-stride load for efficient broadcasting across sublanes.
-            return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            # Perform zero-stride load for efficient broadcasting across
+            # sublanes -- but Mosaic only lowers a zero-stride tpu.strided_load
+            # when the base memref's lane dim is exactly 128, and otherwise
+            # fails the whole compile with
+            #   Not Implemented: The last dim size is not 128 in original base
+            #   memref
+            # The lane dim here is tile_n, which the gmm sizes from the MoE
+            # intermediate width; GLM-5.2 gives 2048 and cannot be tiled down
+            # to 128 at any TP that fits a 2x2x1 slice. Fall back to an
+            # explicit broadcast: identical values, one materialized vreg copy
+            # instead of the free strided read. The fast path is preserved for
+            # every shape that could already lower.
+            if (not _SCALE_BCAST_FALLBACK
+                    or self.scale.shape[-1] == pltpu.get_tpu_info().num_lanes):
+                return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            scale = self.scale[...]
+            return jnp.broadcast_to(
+                scale, (scale.shape[0], replicate_size, scale.shape[2]))
         return self.scale[...]
 
     def get_bias(self) -> jax.Array:
