@@ -195,9 +195,37 @@ echo "### engine served a completion after ${probed}s"
 
 mkdir -p "$OUT_DIR" 2>/dev/null || OUT_DIR=/tmp/lm_eval_out && mkdir -p "$OUT_DIR"
 
+# AutoTokenizer.from_pretrained(<repo id>) also loads AutoConfig, and the
+# image's transformers validates `layer_types` against a fixed allow-list that
+# does not include GLM-5.2's "deepseek_sparse_attention" -- so a tokenizer-only
+# load dies on the model config:
+#   StrictDataclassClassValidationError: validator 'validate_layer_type'
+# vLLM is unaffected and serves the model fine; this is purely lm_eval-side.
+# Handing it a directory with just the tokenizer files (no config.json) skips
+# AutoConfig entirely. Verified against transformers 5.8.0: repo id fails,
+# stripped dir loads as TokenizersBackend and apply_chat_template works.
+TOKDIR=/tmp/glm_tokenizer
+mkdir -p "$TOKDIR"
+SNAP=$(ls -d "${HF_HOME:-/hf-cache}"/hub/models--${MODEL//\//--}/snapshots/*/ 2>/dev/null | head -1)
+for f in tokenizer.json tokenizer_config.json chat_template.jinja special_tokens_map.json; do
+  if [ -n "$SNAP" ] && [ -f "$SNAP/$f" ]; then
+    cp -L "$SNAP/$f" "$TOKDIR/" 2>/dev/null
+  else
+    curl -sfL "https://huggingface.co/${MODEL}/resolve/main/$f" -o "$TOKDIR/$f" \
+      || rm -f "$TOKDIR/$f"
+  fi
+done
+if [ -f "$TOKDIR/tokenizer.json" ]; then
+  TOKENIZER="$TOKDIR"
+  echo "### tokenizer: stripped dir $TOKDIR ($(ls "$TOKDIR" | tr '\n' ' '))"
+else
+  TOKENIZER="$MODEL"
+  echo "### tokenizer: could not stage a stripped dir; falling back to $MODEL"
+fi
+
 MODEL_ARGS="base_url=${BASE}/v1/completions"
 MODEL_ARGS="${MODEL_ARGS},model=${MODEL}"
-MODEL_ARGS="${MODEL_ARGS},tokenizer=${MODEL}"
+MODEL_ARGS="${MODEL_ARGS},tokenizer=${TOKENIZER}"
 MODEL_ARGS="${MODEL_ARGS},max_gen_toks=${MAX_GEN}"
 MODEL_ARGS="${MODEL_ARGS},max_length=${MAX_LEN}"
 MODEL_ARGS="${MODEL_ARGS},num_concurrent=${CONC}"
