@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    MOE_LOCAL_EXPERT_AFFINITY_EPSILON: float = 0.0
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -225,6 +226,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is effectively disabled.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
+    # Local expert affinity bias threshold (epsilon) added to Top-K scores for
+    # experts residing on the local EP shard, cutting cross-chip All-to-All.
+    "MOE_LOCAL_EXPERT_AFFINITY_EPSILON":
+    lambda: float(os.getenv("MOE_LOCAL_EXPERT_AFFINITY_EPSILON") or "0.0"),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":

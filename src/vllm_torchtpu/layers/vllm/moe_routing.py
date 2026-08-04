@@ -65,6 +65,33 @@ def _apply_scoring_fn(scoring_fn: str,
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
 
 
+def _apply_local_expert_affinity(scores: torch.Tensor, layer) -> torch.Tensor:
+    """Apply epsilon affinity bonus to scores of experts residing on the local EP shard."""
+    from vllm_torchtpu import envs
+    affinity_eps = envs.MOE_LOCAL_EXPERT_AFFINITY_EPSILON
+    if affinity_eps <= 0.0 or layer is None:
+        return scores
+    experts_start = getattr(layer, "_experts_start", None)
+    if experts_start is None:
+        experts_start = get_experts_start(layer)
+    if experts_start is None:
+        return scores
+    if isinstance(experts_start, torch.Tensor):
+        experts_start_idx = int(experts_start.item())
+    else:
+        experts_start_idx = int(experts_start)
+
+    local_num_experts = (layer.w13_weight.shape[0] if hasattr(layer, "w13_weight")
+                         else getattr(layer, "local_num_experts", None))
+    if local_num_experts is None:
+        return scores
+
+    biased_scores = scores.clone()
+    biased_scores[:, experts_start_idx:experts_start_idx +
+                  local_num_experts] += affinity_eps
+    return biased_scores
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -80,9 +107,10 @@ def select_experts(
     if layer is not None and layer.use_grouped_topk:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk
+        gating_output = _apply_local_expert_affinity(router_logits, layer)
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
-            gating_output=router_logits,
+            gating_output=gating_output,
             topk=topk,
             renormalize=renormalize,
             num_expert_group=layer.num_expert_group,
@@ -93,10 +121,10 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    topk_weights, topk_ids = torch.topk(_apply_scoring_fn(
-        scoring_fn, router_logits),
-                                        k=topk,
-                                        dim=-1)
+    scores = _apply_scoring_fn(scoring_fn, router_logits)
+    biased_scores = _apply_local_expert_affinity(scores, layer)
+    _, topk_ids = torch.topk(biased_scores, k=topk, dim=-1)
+    topk_weights = torch.gather(scores, dim=-1, index=topk_ids)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
