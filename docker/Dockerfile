@@ -10,7 +10,7 @@ ARG BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-co
 FROM $BASE_IMAGE AS base
 
 # Install curl for health checks (minimal for base)
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl git build-essential gcc g++ cmake ninja-build && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/torchtpu-vllm
 
@@ -27,6 +27,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+    export CXX=g++; \
+    export CC=gcc; \
+    export VLLM_TARGET_DEVICE=empty; \
     uv pip install --system \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
