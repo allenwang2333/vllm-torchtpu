@@ -185,7 +185,6 @@ SERVER_CMD=(vllm serve "$MODEL"
   --max-model-len "$MAX_LEN"
   --enable-expert-parallel
   --gpu-memory-utilization "$MEM_UTIL"
-  --trust-remote-code
   --host 0.0.0.0
   --port "$PORT")
 # shellcheck disable=SC2206  # deliberate word split
