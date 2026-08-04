@@ -736,6 +736,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
+            if not unified_kv_layout_enabled(vllm_config):
+                # Seed copies live on the pooled path only, so the per-layer
+                # layout restores no Mamba state on a prefix-cache hit and
+                # would silently generate from an unrelated slot.
+                raise NotImplementedError(
+                    "Prefix caching on hybrid Mamba models requires the "
+                    "unified KV pool; remove "
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = \

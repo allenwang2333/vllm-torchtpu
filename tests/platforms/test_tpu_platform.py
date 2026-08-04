@@ -273,6 +273,8 @@ class TestTpuPlatform:
             self, mock_prepare_env, mock_apply_patches, vllm_config,
             mamba_cache_mode, speculative_config, async_scheduling, message):
         vllm_config.model_config.is_hybrid = True
+        # A pooled GDN architecture: hybrid prefix caching needs the pool.
+        vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
@@ -290,6 +292,24 @@ class TestTpuPlatform:
         else:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_hybrid_apc_without_pool(
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
+        # Opting out of the pool leaves align mode with no seed copies, so a
+        # prefix-cache hit would restore no Mamba state at all.
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        vllm_config.cache_config.block_size = 256
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = "align"
+
+        with pytest.raises(NotImplementedError, match="unified KV pool"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         "connector_name",
@@ -345,7 +365,8 @@ class TestTpuPlatform:
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.cache_dtype = "auto"
         if is_hybrid:
-            vllm_config.cache_config.enable_prefix_caching = True
+            # Prefix caching stays off: hybrid APC without the pool is
+            # rejected earlier, by its own gate, and would mask this one.
             vllm_config.cache_config.mamba_cache_mode = "align"
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "OffloadingConnector"
