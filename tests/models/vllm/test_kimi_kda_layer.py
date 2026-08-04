@@ -5,17 +5,20 @@ Validates ``KimiDeltaAttention`` end to end -- projections, short conv1d, KDA
 recurrence, gated norm, output projection and both KV-state pools -- against a
 naive float32 CPU reference in this file.
 
-Two interchangeable recurrences live behind the layer's one signature and both
-are covered here:
+Two paths live behind the layer's one signature and both are covered here:
 
-* ``chunk_kda_op`` -- the chunked Pallas kernel, dispatched for every batch
-  composition. Correct for a 1-token row too, since that is just a length-1
-  segment, which is why the layer needs no host-side branch.
-* ``kda_op`` -- the plain-XLA reference scan, selected for every batch when
-  ``VLLM_TPU_USE_NAIVE_KDA=1``.
+* ``dispatched_kda_op`` -- production. It emits both Pallas kernels every step
+  and restricts each to one side of ``request_distribution[0]``: the fused
+  convolution-plus-recurrence decode kernel takes the leading decode requests,
+  the convolution scan and the chunked kernel take the rest. The split is a
+  device value, so no host-side branch on batch composition is involved.
+* ``kda_op`` -- the plain-XLA reference scan behind ``sconv_op``, selected for
+  every batch when ``VLLM_TPU_USE_NAIVE_KDA=1``. It needs no dispatch.
 
-Tests named "decode" here mean a decode-*shaped* batch (one token per
-sequence) running through the chunked kernel, which is what production does.
+Tests named "decode" mean a decode-*shaped* batch, one token per sequence. Which
+kernel actually runs such a batch depends on the decode boundary, and
+``_run_pair`` takes a ``decode_end`` so a test can pin either side;
+``test_moving_the_decode_boundary_does_not_change_the_answer`` sweeps it.
 
 Both recurrences read the recurrent pool as ``[num_slots, H, K, V]``.
 """
@@ -265,9 +268,18 @@ class _Metadata:
     ``seq_len`` exceeds the number of tokens scheduled for it this step.
     """
 
-    def __init__(self, *, query_start_loc: torch.Tensor,
+    def __init__(self,
+                 *,
+                 query_start_loc: torch.Tensor,
                  mamba_state_indices: torch.Tensor,
-                 seq_lens: torch.Tensor) -> None:
+                 seq_lens: torch.Tensor,
+                 request_distribution: torch.Tensor | None = None) -> None:
+        if request_distribution is None:
+            num_reqs = int(mamba_state_indices.shape[0])
+            request_distribution = torch.zeros(3, dtype=torch.int32).to(
+                mamba_state_indices.device)
+            request_distribution[2] = num_reqs
+        self.request_distribution = request_distribution
         self.query_start_loc = query_start_loc
         self.mamba_state_indices = mamba_state_indices
         self.seq_lens = seq_lens
@@ -374,6 +386,12 @@ def _build_tpu_layer(weights: dict[str, torch.Tensor], num_heads: int,
         lower_bound=lower_bound,
         eps=O_NORM_EPS,
     )
+    m.dispatched_kda_op = kda_ops.build_kimi_dispatched_kda_op(
+        m.prefix,
+        lower_bound=lower_bound,
+        eps=O_NORM_EPS,
+        state_dim_first=is_conv_state_dim_first(),
+    )
     return m
 
 
@@ -477,6 +495,7 @@ def _run_pair(*,
               device,
               seed,
               path=PATH_AUTO,
+              decode_end=None,
               conv_state=None,
               recurrent_state=None,
               weights=None,
@@ -543,6 +562,17 @@ def _run_pair(*,
     query_lens_t = torch.tensor(query_lens, dtype=torch.int32)
     carry = torch.tensor([1 if h else 0 for h in has_initial_state],
                          dtype=torch.int32)
+    if decode_end is None:
+        # The runner's decode segment is a *leading* run of continuing requests
+        # with one scheduled token, so that is what this counts. A one-token
+        # request with no context is a length-1 prefill, not a decode.
+        decode_end = 0
+        for length, resumed in zip(query_lens, has_initial_state):
+            if length != 1 or not resumed:
+                break
+            decode_end += 1
+    distribution = torch.tensor([decode_end, decode_end, num_seqs],
+                                dtype=torch.int32)
     meta = _Metadata(
         query_start_loc=qsl.to(device),
         mamba_state_indices=torch.tensor(state_indices,
@@ -550,6 +580,7 @@ def _run_pair(*,
         # The ops read carry-in as seq_len > query_len, so +1 is enough to mark
         # it; the absolute sequence length is not used.
         seq_lens=(query_lens_t + carry).to(device),
+        request_distribution=distribution.to(device),
     )
     layer._metadata = lambda: meta
     positions = torch.arange(num_tokens, dtype=torch.long, device=device)
@@ -692,22 +723,23 @@ def _stub_dispatch_layer(*, use_naive_kda: bool):
     layer.sconv_op = record("sconv", activations)
     layer.kda_op = record("naive", torch.zeros(2, 2, 1))
     layer.chunk_kda_op = record("chunk", torch.zeros(2, 2, 1))
+    layer.dispatched_kda_op = record("dispatched", torch.zeros(2, 2, 1))
     return layer, calls, activations
 
 
 @pytest.mark.parametrize("use_naive_kda,expected", [
-    (False, ["sconv", "chunk"]),
+    (False, ["dispatched"]),
     (True, ["sconv", "naive"]),
 ])
 def test_core_attention_selects_the_expected_ops(use_naive_kda, expected):
     """Which recurrence runs, and that `sconv_op` always runs in front of it.
 
-    A host-side branch on a *static* flag, so this runs anywhere. Worth pinning
-    even though there is only one composition path: it is the guard against a
-    future kernel being dispatched here on batch composition, which cannot work
-    (see `_core_attention`), and against one that fuses the short convolution
-    being added without dropping `sconv_op` -- the input would then be convolved
-    twice and every step would be quietly wrong.
+    A host-side branch on a *static* flag, so this runs anywhere. Two things it
+    pins. First, that nothing gets dispatched here on batch *composition*, which
+    cannot work (see `_core_attention`). Second, that the dispatched op runs
+    alone: it does the short convolution itself, so an `sconv_op` call in front
+    of it would convolve the input twice and every step would be quietly wrong.
+    The reference scan is the opposite -- it needs `sconv_op` ahead of it.
     """
     layer, calls, activations = _stub_dispatch_layer(
         use_naive_kda=use_naive_kda)
@@ -1085,6 +1117,156 @@ def test_decode_batch_through_the_chunked_kernel_matches_reference(num_seqs):
     slots = _touched(state_indices)
     _assert_close(f"{tag} recurrent_state", reference.recurrent_state[slots],
                   rec_after[slots], STATE_RMSE)
+
+
+@requires_tpu
+@pytest.mark.parametrize("query_lens,has_initial_state", [
+    ([1, 1, 1, 1], [True, True, True, True]),
+    ([1, 1, 48], [True, True, False]),
+    ([1, 1, 1, 33], [True, True, True, True]),
+])
+def test_moving_the_decode_boundary_does_not_change_the_answer(
+        query_lens, has_initial_state):
+    """Sweep `request_distribution[0]` over a fixed batch.
+
+    Every value up to the batch's leading run of one-token requests is a legal
+    description of it -- a one-token request is correct either as a decode or as
+    a length-1 prefill segment -- so the boundary decides only *which* kernel
+    runs each request, never the result. This is the test for the dispatch
+    itself: it compares the fused decode kernel against the chunked one on
+    identical work, through the real layer, including the convolution and both
+    caches.
+
+    It is also the guard against the two segments interfering. Each advances
+    slots the other must not touch, and each does its own convolution, so a
+    boundary-by-one error or a double-applied convolution shows up here as a
+    disagreement rather than as slow drift over many steps.
+
+    On what this does and does not pin, from mutating the op: dropping the
+    convolution's segment restriction fails this file, and so does dropping
+    *both* recurrent-state guards -- the chunked kernel's `start_seq` and the
+    write-back exclusion. Dropping either one of those alone does not, because
+    they are redundant: the initial state handed to the chunked kernel is read
+    after the decode kernel has run, so a skipped segment's passthrough already
+    carries the decode result. Either guard alone therefore keeps the answer
+    right; only `start_seq` also keeps it cheap.
+    """
+    leading_decodes = 0
+    for length, resumed in zip(query_lens, has_initial_state):
+        if length != 1 or not resumed:
+            break
+        leading_decodes += 1
+    assert leading_decodes >= 2, "this batch cannot move the boundary"
+
+    common = dict(num_heads=2,
+                  head_dim=64,
+                  hidden_size=128,
+                  query_lens=query_lens,
+                  has_initial_state=has_initial_state,
+                  lower_bound=GATE_LOWER_BOUND,
+                  dtype=torch.bfloat16,
+                  device=torch.device("tpu"),
+                  seed=300 + len(query_lens))
+    slots = _touched(list(range(1, len(query_lens) + 1)))
+
+    baseline = None
+    for decode_end in range(leading_decodes + 1):
+        ref_out, tpu_out, _, layer = _run_pair(**common, decode_end=decode_end)
+        conv_state, recurrent_state = _final_pools(layer)
+        # Each boundary must be right on its own terms, not merely
+        # self-consistent with the others.
+        _assert_close(f"output vs reference at decode_end={decode_end}",
+                      ref_out, tpu_out, DECODE_RMSE)
+        if baseline is None:
+            baseline = (tpu_out, recurrent_state, conv_state)
+            continue
+        base_out, base_recurrent, base_conv = baseline
+        _assert_close(f"output at decode_end={decode_end} vs 0", base_out,
+                      tpu_out, DECODE_RMSE)
+        _assert_close(f"recurrent_state at decode_end={decode_end} vs 0",
+                      base_recurrent[slots], recurrent_state[slots],
+                      STATE_RMSE)
+        # The convolution cache too: both paths maintain it, and a wrong value
+        # there is invisible in this step's output and corrupts only the next.
+        _assert_close(f"conv_state at decode_end={decode_end} vs 0",
+                      base_conv[slots], conv_state[slots], STATE_RMSE)
+
+
+@requires_tpu
+@pytest.mark.parametrize("query_lens,has_initial_state", [
+    ([1, 48], [True, False]),
+    ([1, 1, 32], [True, True, False]),
+])
+def test_decode_and_prefill_segments_advance_only_their_own_slots(
+        query_lens, has_initial_state):
+    """The two kernels write disjoint parts of both caches.
+
+    The chunked kernel hands back the *initial* state for segments it was told
+    to skip, so writing that back would silently undo the decode step the fused
+    kernel just performed -- one step of drift per decode, invisible in a
+    single-step output comparison. Same hazard for the convolution cache, which
+    both paths maintain.
+    """
+    num_seqs = len(query_lens)
+    conv_state, recurrent_state = _make_pools(num_seqs + 1, 2, 64, CONV_SIZE,
+                                              77)
+    common = dict(num_heads=2,
+                  head_dim=64,
+                  hidden_size=128,
+                  query_lens=query_lens,
+                  has_initial_state=has_initial_state,
+                  lower_bound=GATE_LOWER_BOUND,
+                  dtype=torch.bfloat16,
+                  device=torch.device("tpu"),
+                  seed=411)
+    ref_out, tpu_out, _, layer = _run_pair(**common,
+                                           conv_state=conv_state,
+                                           recurrent_state=recurrent_state)
+    _assert_close("output", ref_out, tpu_out, DECODE_RMSE)
+    new_conv, new_recurrent = _final_pools(layer)
+
+    # Every live slot moved: nothing was skipped by both kernels at once.
+    for slot in range(1, num_seqs + 1):
+        assert not torch.allclose(
+            new_recurrent[slot].float().cpu(),
+            recurrent_state[slot].float().cpu(),
+        ), f"slot {slot} was never advanced by either kernel"
+    # Slot 0 is the reserved null block; both kernels dump their skipped writes
+    # there, so it may change, but no request may be pointed at it.
+    del new_conv
+
+
+@requires_tpu
+@pytest.mark.parametrize("query_lens,has_initial_state", [
+    ([1, 32], [True, False]),
+    ([1, 48, 1, 17], [True, False, True, False]),
+])
+def test_both_recurrences_agree_across_the_dispatch(query_lens,
+                                                    has_initial_state):
+    """The reference scan, which needs no dispatch, must agree with the split.
+
+    ``test_both_recurrences_agree`` covers this for the paths as a pair; this
+    pins it specifically for batches whose decode boundary is non-trivial, where
+    the dispatched op splits work the scan handles in one pass.
+    """
+    common = dict(num_heads=2,
+                  head_dim=64,
+                  hidden_size=128,
+                  query_lens=query_lens,
+                  has_initial_state=has_initial_state,
+                  lower_bound=GATE_LOWER_BOUND,
+                  dtype=torch.bfloat16,
+                  device=torch.device("tpu"),
+                  seed=512 + len(query_lens))
+    _, dispatched_out, _, dispatched_layer = _run_pair(**common,
+                                                       path=PATH_AUTO)
+    _, naive_out, _, naive_layer = _run_pair(**common, path=PATH_NAIVE)
+    slots = _touched(list(range(1, len(query_lens) + 1)))
+    _assert_close("output dispatched vs naive", naive_out, dispatched_out,
+                  DECODE_RMSE)
+    _assert_close("recurrent_state dispatched vs naive",
+                  _final_pools(naive_layer)[1][slots],
+                  _final_pools(dispatched_layer)[1][slots], STATE_RMSE)
 
 
 @requires_tpu
