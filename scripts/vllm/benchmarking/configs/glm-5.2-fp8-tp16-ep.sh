@@ -38,7 +38,11 @@ MAX_MODEL_LEN=10240
 MAX_NUM_BATCHED_TOKENS=8192
 MAX_NUM_SEQS=512
 SERVER_READY_WAIT_MIN=180
-GPU_MEMORY_UTILIZATION=0.95
+# 0.95 leaves too little HBM for XLA compile temporaries: capture_model
+# fails with "HLO temporaries (95.10G) exceeds available HBM (94.74G)"
+# on the 8192-token compile size (v7x-16, build 64 retry). 0.92 frees
+# ~3G/chip of KV-cache budget for the compiler's working set.
+GPU_MEMORY_UTILIZATION=0.92
 KV_CACHE_DTYPE="fp8"
 
 # GLM 5.2 is an MLA model: tpu_platform.get_attn_backend_cls forces
