@@ -219,6 +219,13 @@ the correct mask—but it currently prevents a valid before/after decode
 measurement. Earlier TP4 x DP2 / 16-token measurements are not applicable to
 this topology and have been removed.
 
+The baseline was repeated on the separately reserved `tpu-rack1-w-012`
+(Slurm job 287) with an isolated cache and padding skip disabled. All eight
+ranks again saved their one-token executables; rank 0 completed the initial
+warmup in 0.36 seconds, after which the engine reported that no shared-memory
+broadcast block had returned for 60 seconds. This reproduces the W014 result
+and rules out a node-specific failure.
+
 ## Benchmark results
 
 ### Earlier TP8 utilization profiling
