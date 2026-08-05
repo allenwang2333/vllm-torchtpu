@@ -26,6 +26,10 @@
 #                       three independent rounds).
 #
 # Intentional deviations from tpu_benchmark_daily (everything else matches):
+#   - TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 on both roles (they set 1): the v1
+#     HMA connector's _extract_kv_layout assumes one array per layer and
+#     crashes on the unified pool's per-layer mamba state lists
+#     (AttributeError at tpu_connector.py:2908, verified in build 52).
 #   - --mamba-cache-mode=align stays on the prefill server (their standalone
 #     prefill omits it): disagg requires the aligned mamba cache layout on
 #     both ends of the transfer.
@@ -159,8 +163,10 @@ spec:
                   value: "1"
                 - name: VLLM_XLA_CHECK_RECOMPILATION
                   value: "0"
+                # Deviation: daily sets 1; the v1 HMA connector crashes on
+                # the unified pool's mamba state lists (build 52).
                 - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-                  value: "1"
+                  value: "0"
                 # GKE topology plumbing (not part of the daily env).
                 - name: TPU_TOPOLOGY
                   value: "2x2x1"
@@ -360,8 +366,10 @@ spec:
                   value: "29645"
                 - name: LIBTPU_INIT_ARGS
                   value: "--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_scoped_vmem_limit_kib=65536"
+                # Deviation: daily sets 1; the v1 HMA connector crashes on
+                # the unified pool's mamba state lists (build 52).
                 - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-                  value: "1"
+                  value: "0"
                 # GKE topology plumbing (not part of the daily env).
                 - name: TPU_TOPOLOGY
                   value: "2x2x1"
