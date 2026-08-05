@@ -91,14 +91,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
     def _slice_placement_group_name(self) -> str:
         """Return the name of the placement group shared by all DP engines.
 
-        The group has to outlive the engine that created it so peers can
-        attach, which means a crashed run leaves it behind still holding the
-        cluster's chips. Naming it after the slice shape rather than anything
-        per-run makes the next run of that shape adopt the leftover instead of
-        deadlocking against it, and reserves exactly one such group per shape.
+        The DP coordinator rendezvous is the one identifier every engine of
+        this server already agrees on before any of them talks to Ray, so it
+        keys the group without needing a side channel.
         """
-        _, _, slice_world_size = self._get_dp_geometry()
-        return f"vllm-tpu-slice-{slice_world_size}"
+        parallel_config = self.parallel_config
+        return (f"vllm-tpu-slice-{parallel_config.data_parallel_master_ip}-"
+                f"{parallel_config.data_parallel_master_port}")
 
     def _get_or_create_shared_placement_group(
             self, placement_group_specs: List[Dict[str, float]]):
@@ -121,33 +120,18 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
             if existing is not None:
                 actual_bundles = len(existing.bundle_specs)
-                if actual_bundles == expected_bundles:
-                    logger.info(
-                        "RayDistributedExecutorV2 | Attached to shared slice "
-                        "placement group %s (%d bundles).", name,
-                        actual_bundles)
-                    return existing
-                # The name is keyed on the slice shape, so a group of the
-                # wrong width can only be a leftover from a run that Ray has
-                # not reclaimed. Reclaim it rather than waiting on chips that
-                # are never coming back.
-                logger.warning(
-                    "RayDistributedExecutorV2 | Slice placement group %s has "
-                    "%d bundles but this slice needs %d; removing the stale "
-                    "group.", name, actual_bundles, expected_bundles)
-                try:
-                    ray.util.remove_placement_group(existing)
-                except Exception:
-                    # A peer engine got there first; re-resolve below.
-                    logger.info(
-                        "RayDistributedExecutorV2 | Stale slice placement "
-                        "group %s was already removed.", name)
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out resolving shared slice placement group "
-                        f"{name!r} after {_SLICE_PG_TIMEOUT_S}s.")
-                time.sleep(_SLICE_PG_POLL_INTERVAL_S)
-                continue
+                if actual_bundles != expected_bundles:
+                    raise RuntimeError(
+                        f"Ray placement group {name!r} has {actual_bundles} "
+                        f"bundles but this slice needs {expected_bundles}. "
+                        "It is most likely a leftover from a differently "
+                        "shaped run; remove it with "
+                        "`ray.util.remove_placement_group("
+                        f"ray.util.get_placement_group({name!r}))` and retry.")
+                logger.info(
+                    "RayDistributedExecutorV2 | Attached to shared slice "
+                    "placement group %s (%d bundles).", name, actual_bundles)
+                return existing
 
             try:
                 created = ray.util.placement_group(
@@ -192,11 +176,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
         try:
             ray.util.remove_placement_group(placement_group)
         except Exception:
-            # Not fatal: the group is named for the slice shape, so the next
-            # run of this shape adopts it rather than deadlocking on it.
             logger.exception(
                 "RayDistributedExecutorV2 | Failed to remove shared slice "
-                "placement group.")
+                "placement group %s.", self._slice_placement_group_name())
 
     def shutdown(self) -> None:
         try:
