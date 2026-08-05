@@ -484,10 +484,13 @@ class TestTpuRayDistributedExecutorV2:
         assert executor.parallel_config.placement_group is created_pg
         assert executor._created_slice_pg is True
         kwargs = mock_ray.util.placement_group.call_args.kwargs
-        assert kwargs["name"] == "vllm-tpu-slice-127.0.0.1-29500"
+        # Named for the slice shape, not for anything that varies per run: a
+        # detached group outlives a crash, so the name has to be one the next
+        # run of the same shape will look up.
+        assert kwargs["name"] == "vllm-tpu-slice-4"
         assert kwargs["lifetime"] == "detached"
 
-    def test_stale_shared_placement_group_is_rejected(
+    def test_stale_shared_placement_group_is_reclaimed(
             self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
             mock_ray):
         mock_platform.ray_device_key = "TPU"
@@ -502,9 +505,15 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = \
             "node_1"
 
+        # A leftover group of the wrong width still holds the cluster's chips.
+        # Waiting on it would deadlock forever, so it has to be reclaimed.
         stale_pg = MagicMock()
         stale_pg.bundle_specs = [{"TPU": 1.0}] * 8
-        mock_ray.util.get_placement_group.return_value = stale_pg
+        mock_ray.util.get_placement_group.side_effect = [
+            stale_pg, ValueError("missing")
+        ]
+        created_pg = MagicMock()
+        mock_ray.util.placement_group.return_value = created_pg
 
         self.parallel_config.world_size = 1
         self.parallel_config.data_parallel_size = 2
@@ -513,6 +522,8 @@ class TestTpuRayDistributedExecutorV2:
         executor = RayDistributedExecutorV2(self.vllm_config)
         executor.vllm_config = self.vllm_config
         executor.parallel_config = self.parallel_config
+        executor._initialize_ray_cluster()
 
-        with pytest.raises(RuntimeError, match="leftover"):
-            executor._initialize_ray_cluster()
+        mock_ray.util.remove_placement_group.assert_called_once_with(stale_pg)
+        assert executor.parallel_config.placement_group is created_pg
+        assert executor._created_slice_pg is True
