@@ -78,8 +78,10 @@ if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
   TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
 fi
 
-# Spanner eval upload tracking & metadata variables (from PR #14)
+# Spanner/BigQuery eval upload tracking & metadata variables (from PR #14)
 SPANNER_EVAL_VARS=(
+  -e BQ_PROJECT_ID="${BQ_PROJECT_ID:-}"
+  -e BQ_TABLE="${BQ_TABLE:-}"
   -e CREATED_BY="${CREATED_BY:-}"
   -e GCP_INSTANCE_NAME="${GCP_INSTANCE_NAME:-}"
   -e NIGHTLY="${NIGHTLY:-}"
@@ -88,7 +90,7 @@ SPANNER_EVAL_VARS=(
 )
 
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=16g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
