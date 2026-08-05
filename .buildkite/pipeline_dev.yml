@@ -47,10 +47,10 @@ steps:
     soft_fail: true
     agents:
       queue: tpu_v7x_16_queue
-      # TEMPORARY: pin to the healthy slice; the other agent's worker host
-      # (currently tpu7x-16-ci-2) drops every ssh session. Remove once that
-      # slice is rebooted/repaired.
-      hostname: tpu7x-16-ci-1-cicd-us-central1-c
+    # TEMPORARY: jump shared-queue contention while iterating on GLM
+    # bring-up; drop before merging. (Hostname pin to ci-1 removed: the
+    # queue now has 3 agents and ci-2 runs multihost work again.)
+    priority: 100
     commands:
       - "bash .buildkite/scripts/torchrun_ab_test.sh"
     artifact_paths:
@@ -62,10 +62,10 @@ steps:
     depends_on: build_docker
     agents:
       queue: tpu_v7x_16_queue
-      # TEMPORARY: pin to the healthy slice; the other agent's worker host
-      # (currently tpu7x-16-ci-2) drops every ssh session. Remove once that
-      # slice is rebooted/repaired.
-      hostname: tpu7x-16-ci-1-cicd-us-central1-c
+    # TEMPORARY: jump shared-queue contention while iterating on GLM
+    # bring-up; drop before merging. (Hostname pin to ci-1 removed: the
+    # queue now has 3 agents and ci-2 runs multihost work again.)
+    priority: 100
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -81,10 +81,10 @@ steps:
       - smoke_multihost
     agents:
       queue: tpu_v7x_16_queue
-      # TEMPORARY: pin to the healthy slice; the other agent's worker host
-      # (currently tpu7x-16-ci-2) drops every ssh session. Remove once that
-      # slice is rebooted/repaired.
-      hostname: tpu7x-16-ci-1-cicd-us-central1-c
+    # TEMPORARY: jump shared-queue contention while iterating on GLM
+    # bring-up; drop before merging. (Hostname pin to ci-1 removed: the
+    # queue now has 3 agents and ci-2 runs multihost work again.)
+    priority: 100
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
