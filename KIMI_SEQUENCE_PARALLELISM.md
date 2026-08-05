@@ -18,12 +18,12 @@ SP is enabled only when all of the following hold:
 
 - pipeline parallel size is 1;
 - expert parallelism is enabled;
-- tensor parallel size is greater than 1; and
-- data parallel size is greater than 1.
+- tensor parallel size is greater than 1.
 
-This follows vLLM's NVIDIA Kimi-K3 implementation. On an eight-chip host the
-validation topology is TP4 x DP2 with EP8. TP8 x DP1 does **not** activate this
-path.
+The TPU Kimi implementation owns the complete SP path, including the FusedMoE
+EP dispatch, so TEP8 (`TP8 x EP8 x DP1`) activates it. This intentionally
+differs from the NVIDIA non-MegaMoE gate, which otherwise requires DP greater
+than one. XLA does not turn this on automatically.
 
 ## Design and fixes
 
@@ -105,12 +105,12 @@ use of `torch.empty` during weight loading.
   inability to export `new_empty` with the chunk op's symbolic token count.
   It is now a zero-width view of the sharded hidden states, which needs no
   allocation and preserves the correct token count.
-- The full 93-layer K3 checkpoint cannot fit the TP4 x DP2 SP topology on this
-  eight-chip host: replicated dense/shared MLP weights plus two DP replicas
-  exhaust HBM while MXFP4 weights are repacked. This is not a zero-fill
-  regression; checkpoint parameters continue to use `torch.empty`. Real K3
-  remains a TP8 x DP1 deployment on this host, where model-level SP is not
-  activated.
+- The full 93-layer K3 checkpoint cannot fit the earlier TP4 x DP2 SP topology
+  on this eight-chip host: replicated dense/shared MLP weights plus two DP
+  replicas exhaust HBM while MXFP4 weights are repacked. This is not a
+  zero-fill regression; checkpoint parameters continue to use `torch.empty`.
+  TEP8 keeps a single model replica and now activates model-level SP at
+  `TP8 x EP8 x DP1`.
 - Automatic compact-hybrid KV sizing derives its attention-block count from
   each rank's measured free HBM. During the real Kimi-Linear TP4 x DP2 load,
   those measurements differed by ten blocks while the multiprocess executor's
@@ -175,28 +175,49 @@ parallelism previously sharded the hidden states without sharding that mask or
 marking the rows added to make the token count divisible by TP. Consequently,
 each rank could route padding as if it were a real token.
 
-The TPU Kimi path now mirrors the NVIDIA implementation: before sharding the
-hidden states, it pads the existing scheduler mask with `True`, shards it over
-TP, and stores the local mask back in the forward context. The generic vLLM
-MoE path then applies the `-1` sentinel. The initial implementation used
-`new_zeros` with a symbolic token count, which TorchTPU's FX exporter cannot
-materialize during AOT export; deriving the mask with `zeros_like` from a
-hidden-state slice keeps the symbolic dimension tensor-backed and compiles.
+The TPU Kimi path now mirrors the NVIDIA behavior at the routing boundary. At
+model entry it extends the scheduler mask with `True` for every row that the
+mid-model reduce-scatter padding re-inserts after attention, and leaves that
+mask in global padded-token order. This is important: TPU EP dispatch
+all-gathers the token shards before routing, so every EP rank routes the same
+global token batch. A local one-row mask would broadcast incorrectly over that
+batch.
 
-The compiled batch-one A/B used `mgoin/Kimi-K3-pruned75` with dummy weights,
-four layers, TP4 x DP2 x EP8, a 16-token compile bucket, asynchronous
-scheduling, four warmup requests, and 20 measured requests generating 64
-tokens each. TP4 x DP2 is the eight-chip TEP topology that activates Kimi SP;
-TP8 x DP1 does not activate it. Each variant used isolated vLLM and XLA caches.
+The TPU MoE runner is patched to call `_moe_forward` directly and therefore
+bypasses vLLM's modular-kernel `_prepare`, where upstream normally applies the
+padding sentinel. TPU routing now applies the equivalent operation directly
+after top-k selection:
 
-| `VLLM_MOE_SKIP_PADDING` | Mean latency | p90 latency | Output throughput |
-|:---:|---:|---:|---:|
-| `0` | 530.18 ms | 538.47 ms | 120.71 tok/s |
-| `1` | 525.84 ms | 534.19 ms | 121.71 tok/s |
+```text
+topk_ids = where(is_padding[:, None], -1, topk_ids)
+```
 
-This is a **0.82% latency reduction** and **0.82% throughput increase** for
-this small diagnostic model. The improvement is real but modest; full-depth
-benefit can differ with the padding ratio and routed-expert workload.
+This applies to both grouped K3 routing and ordinary top-k routing. The mask is
+derived from a hidden-state slice when the scheduler did not provide one, so
+its symbolic token dimension remains tensor-backed during AOT export. It does
+not introduce a checkpoint allocation and does not change the intentional use
+of `torch.empty` during weight loading.
+
+For batch-size-one decode in TEP8 (`TP8 x EP8 x DP1`), the one real token is
+padded to eight immediately before the mid-model reduce-scatter. K3 routes 16
+experts per token, so the unmasked graph presents `8 x 16 = 128` routes to MoE.
+The global mask marks seven rows and leaves exactly `1 x 16 = 16` active
+routes. Inspection of the one-token compiled graph confirms the integer
+`where(..., -1, topk_ids)` in every MoE layer.
+
+The requested decode-only A/B configuration is: dummy
+`mgoin/Kimi-K3-pruned75`, TEP8, batch size 1, `compile_sizes=[1]`,
+`max_num_batched_tokens=1024`, 64 generated tokens, four warmups, and 20
+measured requests. Timing starts at the first streamed output token, excluding
+prefill/TTFT. No performance numbers are reported yet: the four-layer compiled
+TEP8 server stalls after the one-token profiling/warmup execution in the
+existing compiled SP collective path. Functional all-gather/reduce-scatter,
+device-mesh variants, all-reduce emulation, and TP-group reuse all reached the
+same stall. Those experimental communicator changes were discarded. This
+runtime blocker is independent of route masking—the compiled graph contains
+the correct mask—but it currently prevents a valid before/after decode
+measurement. Earlier TP4 x DP2 / 16-token measurements are not applicable to
+this topology and have been removed.
 
 ## Benchmark results
 
@@ -275,11 +296,12 @@ final answer; they were not counted as passes.
 
 ### Full real K3 validation
 
-The full real K3 checkpoint was validated at TP8 x EP8 x DP1 in compiled mode,
-because it does not fit the SP topology on this eight-chip host. This topology
-does not activate model-level SP; it validates real checkpoint loading, native
-expert layout, latent MoE, KDA/MLA execution, and repeated decode independently
-of the SP collectives. The working configuration was:
+Before TEP8 SP enablement, the full real K3 checkpoint was validated at
+TP8 x EP8 x DP1 in compiled mode because it did not fit the then-active
+TP4 x DP2 SP topology on this eight-chip host. That historical run did not
+activate model-level SP; it validated real checkpoint loading, native expert
+layout, latent MoE, KDA/MLA execution, and repeated decode independently of the
+SP collectives. The working configuration was:
 
 ```text
 vllm serve mgoin/Kimi-K3-pruned75 \
@@ -332,8 +354,7 @@ checkpoint: some selected a plausible but wrong interpretation, while others
 repeated analysis until the output cap. There were no padding-only responses,
 NaNs, worker timeouts, runtime recompilations, or collective failures.
 
-This real TP8 result does not imply that XLA applied sequence parallelism
-automatically. EP8 was requested explicitly, and DP1 means the new SP predicate
-is false. Full-checkpoint SP quality is covered by Kimi-Linear's TP4 x DP2
-10/10 result above; the reduced K3 TP4 x DP2 smoke covers K3-specific SP and
-latent-MoE integration under the topology that fits this host.
+This historical real TP8 result does not imply that XLA applied sequence
+parallelism automatically. EP8 was requested explicitly, and the TPU Kimi SP
+predicate had not yet been extended to DP1. The TEP8 change documented above
+now makes that model-level sharding explicit.
