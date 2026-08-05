@@ -83,7 +83,7 @@ FROM ci AS dev
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system -e ".[test,benchmarking]"
+    VLLM_TARGET_DEVICE=empty uv pip install --system -e ".[test,benchmarking]"
 
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
 CMD ["/bin/bash"]
@@ -97,7 +97,7 @@ WORKDIR /root/torchtpu-vllm
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    uv pip install --system .
+    VLLM_TARGET_DEVICE=empty uv pip install --system .
 
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
