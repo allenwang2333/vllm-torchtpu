@@ -17,13 +17,13 @@ DATA_PARALLELISM=1
 # PROBE(build 55): EP off — multihost EP sub-group creation crashes the TPU
 # program ("continuator halted") at init_model_parallel_group; TP-only
 # isolates it. Restore to true once EP-on-multihost is fixed.
-ENABLE_EP=false
+ENABLE_EP=true
 # No --quantization: the FP8 checkpoint self-describes (glm_cmds.yaml passes
 # none either).
 QUANTIZATION=""
 ISL_OSL_CONFIGS="8192:1024"
 CONCURRENCY_OPTIONS="64 256 512"
-NUM_PROMPTS=640
+NUM_PROMPTS=64
 # 0.8 in benchmark_serving.py/inferenceX semantics: sample lengths in
 # [0.8*len, len]. RANGE_RATIO_STYLE=min makes the runner translate this for
 # vllm bench serve (whose native 0.8 would mean [0.2*len, 1.8*len] and
