@@ -175,8 +175,13 @@ class WeightsRef(RhsRef):
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if replicate_size is not None:
-            # Perform zero-stride load for efficient broadcasting across sublanes.
-            return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            # Fast path: zero-stride load across sublanes when innermost dim matches lane width (128).
+            if self.scale.shape[-1] == pltpu.get_tpu_info().num_lanes:
+                return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            # Fallback: Mosaic stride-0 load is unsupported on non-128 dims (e.g. DSv4 dim 2048).
+            scale = self.scale[...]
+            return jnp.broadcast_to(
+                scale, (scale.shape[0], replicate_size, scale.shape[2]))
         return self.scale[...]
 
     def get_bias(self) -> jax.Array:

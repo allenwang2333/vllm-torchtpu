@@ -73,7 +73,7 @@ def patch_cuda_stubs() -> tuple:
 
     _orig_cuda_stream = getattr(torch.cuda, "Stream", None)
     _orig_cuda_event = getattr(torch.cuda, "Event", None)
-    torch.cuda.Stream = lambda *args, **kwargs: None
+    torch.cuda.Stream = DummyCudaStream
     torch.cuda.Event = DummyCudaEvent
 
     return _orig_get_device_capability, _orig_cuda_stream, _orig_cuda_event

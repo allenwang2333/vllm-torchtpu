@@ -363,7 +363,6 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 get_valid_spec(mesh, batch_axis),  # k_block_tables
                 P(),  # cache
             ),
-            output_partition_specs=(get_valid_spec(mesh), ),  # updated_cache
         )
 
         def _fake_compressor(kv_score, ape, norm_weight, cos_sin_cache,

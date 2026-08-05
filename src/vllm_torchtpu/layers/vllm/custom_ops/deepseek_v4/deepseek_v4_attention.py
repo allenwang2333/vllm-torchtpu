@@ -554,11 +554,6 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 P(),  # main_distribution
                 get_valid_spec(mesh, attn_head_axis),  # attention_sinks
             ),
-            output_partition_specs=(
-                get_valid_spec(mesh, attn_data_axis, attn_head_axis,
-                               None),  # out (sharded along attention heads)
-                P(),  # new_sw_cache
-            ),
         )
 
         def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):

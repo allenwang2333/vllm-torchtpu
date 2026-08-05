@@ -26,8 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane,
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, WeightsRef,
+                                                   apply_act_fn, gmm_v2,
+                                                   interleave_lane,
                                                    situ_and_mul)
 
 _GroupConfig = collections.namedtuple(
@@ -48,6 +49,27 @@ def _assert_allclose(actual, expected, atol=1e-5, rtol=1e-5) -> None:
                                np.asarray(expected),
                                atol=atol,
                                rtol=rtol)
+
+
+@pytest.mark.parametrize("replicate_size", [None, 2, 4])
+@pytest.mark.parametrize("last_dim", [128, 2048])
+def test_weights_ref_get_scale(monkeypatch, replicate_size, last_dim):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=128),
+    )
+    scale = jnp.arange(8 * 1 * last_dim, dtype=jnp.float32).reshape(
+        (8, 1, last_dim))
+    ref = WeightsRef(weight=None, scale=scale, bias=None)
+
+    actual = ref.get_scale(replicate_size)
+
+    if replicate_size is None:
+        expected = scale
+    else:
+        expected = jnp.broadcast_to(scale, (8, replicate_size, last_dim))
+
+    _assert_allclose(actual, expected)
 
 
 @pytest.mark.parametrize("linear_beta", [None, 25.0])

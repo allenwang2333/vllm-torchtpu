@@ -236,9 +236,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 P(),  # cu_q_lens
                 P(),  # distribution
             ),
-            output_partition_specs=(
-                get_valid_spec(mesh, batch_axis, None),  # indices
-            ),
         )
 
         def _fake_indexer(q_rope, indexer_weights, *args, **kwargs):

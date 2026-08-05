@@ -44,11 +44,10 @@ try:
 except Exception as e:
     logger.warning(f"Failed to register collectives in Dynamo: {e}")
 
+from typing import Iterable  # noqa: E402
+
 from vllm_torchtpu.models.vllm.deepseek_v4_requant import \
     attention_requantizer_generator  # noqa: E402
-
-
-from typing import Iterable  # noqa: E402
 
 
 def patched_decoder_load_weights(
