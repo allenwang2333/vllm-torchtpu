@@ -411,7 +411,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         if not cache_dir:
             return "", ""
         layer_idx = getattr(layer, "layer_idx", id(layer))
-        tp_rank = layer.moe_config.moe_parallel_config.tp_rank
+        moe_pcfg = getattr(layer.moe_config, "moe_parallel_config", None)
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        elif moe_pcfg is not None and getattr(moe_pcfg, "use_ep", False):
+            rank = getattr(moe_pcfg, "ep_rank", 0)
+        elif moe_pcfg is not None:
+            rank = getattr(moe_pcfg, "tp_rank", 0)
+        else:
+            rank = 0
         w13_str = (f"{layer.w13_weight.shape[1]}x{layer.w13_weight.shape[2]}"
                    if hasattr(layer, "w13_weight")
                    and layer.w13_weight.ndim >= 3 else "default")
@@ -420,7 +430,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                   else "default")
         cache_path = os.path.join(
             cache_dir,
-            f"rank_{tp_rank}_layer_{layer_idx}_w13_{w13_str}_w2_{w2_str}.pt")
+            f"rank_{rank}_layer_{layer_idx}_w13_{w13_str}_w2_{w2_str}.pt")
         return cache_dir, cache_path
 
     def _dequantize_and_pad(
@@ -558,21 +568,33 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             self._cleanup_temp_buffers(layer)
 
             if cache_path and not os.path.exists(cache_path):
+                tmp_path = f"{cache_path}.tmp_{os.getpid()}"
                 try:
                     os.makedirs(cache_dir, exist_ok=True)
                     torch.save(
                         {
                             "w13_weight_packed":
-                            w13_weight_processed.to("cpu"),
-                            "w2_weight_packed": w2_weight_processed.to("cpu"),
-                            "w13_weight_scale": w13_weight_scale.to("cpu"),
-                            "w2_weight_scale": w2_weight_scale.to("cpu"),
-                            "w13_bias_padded": w13_bias_padded,
-                            "w2_bias_padded": w2_bias_padded,
-                        }, cache_path)
+                            w13_weight_processed.view(torch.uint8).to("cpu"),
+                            "w2_weight_packed":
+                            w2_weight_processed.view(torch.uint8).to("cpu"),
+                            "w13_weight_scale":
+                            w13_weight_scale.to("cpu"),
+                            "w2_weight_scale":
+                            w2_weight_scale.to("cpu"),
+                            "w13_bias_padded":
+                            w13_bias_padded,
+                            "w2_bias_padded":
+                            w2_bias_padded,
+                        }, tmp_path)
+                    os.replace(tmp_path, cache_path)
                 except (PermissionError, OSError) as e:
                     logger.warning("Failed to save disk cache to %s: %s",
                                    cache_path, e)
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
                                               requires_grad=False)

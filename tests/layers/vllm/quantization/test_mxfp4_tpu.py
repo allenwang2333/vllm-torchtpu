@@ -215,3 +215,39 @@ class TestMxfp4MoETPU:
                 self._run_and_check_forward(layer2, method2, device)
             finally:
                 os.environ.pop("VLLM_FP4_CACHE_DIR", None)
+
+    def test_mxfp4_cache_path_ep_ranks(self, device):
+        """Verify distinct cache paths are generated for different EP ranks without collision."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir
+            try:
+                layer, method = _build_layer_and_method(device)
+                paths = set()
+                for ep_rank in range(8):
+                    layer.moe_config.moe_parallel_config.use_ep = True
+                    layer.moe_config.moe_parallel_config.ep_rank = ep_rank
+                    layer.moe_config.moe_parallel_config.tp_rank = 0
+
+                    _, cache_path = method._get_cache_path(layer)
+                    assert f"rank_{ep_rank}_" in os.path.basename(cache_path)
+                    paths.add(cache_path)
+
+                assert len(paths) == 8, (
+                    "All 8 EP ranks must generate distinct cache file paths.")
+            finally:
+                os.environ.pop("VLLM_FP4_CACHE_DIR", None)
+
+    def test_mxfp4_cache_path_dist_rank(self, device, monkeypatch):
+        """Verify distributed rank takes precedence when torch.distributed is initialized."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir
+            try:
+                import torch.distributed as dist
+                monkeypatch.setattr(dist, "is_initialized", lambda: True)
+                monkeypatch.setattr(dist, "get_rank", lambda: 5)
+
+                layer, method = _build_layer_and_method(device)
+                _, cache_path = method._get_cache_path(layer)
+                assert "rank_5_" in os.path.basename(cache_path)
+            finally:
+                os.environ.pop("VLLM_FP4_CACHE_DIR", None)
