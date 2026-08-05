@@ -159,6 +159,22 @@ def _substitute_placeholder_token(
 
 logger = init_logger(__name__)
 
+
+def _spec_warmup_all_token_ids(
+        req_ids: list[str],
+        num_computed_tokens: list[int]) -> dict[str, list[int]]:
+    """Build complete synthetic token histories for async cached requests."""
+    assert len(req_ids) == len(num_computed_tokens), (
+        "spec-decode warmup request IDs and computed-token counts must align: "
+        f"requests={len(req_ids)}, counts={len(num_computed_tokens)}")
+    # The current sampled token is not computed yet, so the complete sequence
+    # contains num_computed + 1 tokens at scheduler handoff.
+    return {
+        req_id: [0] * (num_computed + 1)
+        for req_id, num_computed in zip(req_ids, num_computed_tokens)
+    }
+
+
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
                                            "__dataclass_fields__", {}))
@@ -4413,10 +4429,11 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
+                all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(req_ids=list(rids),
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None] * R,
                                          num_computed_tokens=list(nct),
                                          num_output_tokens=[t + 1] * R)
@@ -4504,10 +4521,11 @@ class TPUModelRunner(GPUModelRunner):
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
+                all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(req_ids=[rid],
                                          resumed_req_ids=set(),
                                          new_token_ids=[],
-                                         all_token_ids={},
+                                         all_token_ids=all_token_ids,
                                          new_block_ids=[None],
                                          num_computed_tokens=[nct],
                                          num_output_tokens=[t + 1])
