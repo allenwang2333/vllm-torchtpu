@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from vllm.config import ParallelConfig
 from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              get_tp_group, tensor_model_parallel_all_gather,
+                              get_tensor_model_parallel_rank, get_tp_group,
+                              tensor_model_parallel_all_gather,
                               tensor_model_parallel_reduce_scatter)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
@@ -38,6 +39,27 @@ def shard(hidden_states: torch.Tensor) -> torch.Tensor:
     # it; this also retains the op's compile-safe symbolic output shape.
     assert hidden_states.ndim == 3 and hidden_states.shape[1] == 1
     return sequence_parallel_chunk(hidden_states.squeeze(1)).unsqueeze(1)
+
+
+def padding_mask(
+    is_padding: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Return this TP rank's padding mask after sequence-parallel padding."""
+    num_tokens = hidden_states.shape[0]
+    if is_padding is None:
+        # Keep the symbolic token dimension tensor-derived. TorchTPU's FX
+        # exporter cannot materialize ``new_zeros(SymInt)`` during AOT export.
+        is_padding = torch.zeros_like(hidden_states[:, 0], dtype=torch.bool)
+    assert is_padding.shape[0] == num_tokens
+
+    tp_size = get_tensor_model_parallel_world_size()
+    sp_pad = (-num_tokens) % tp_size
+    if sp_pad > 0:
+        is_padding = F.pad(is_padding, (0, sp_pad), value=True)
+    chunk = is_padding.shape[0] // tp_size
+    tp_rank = get_tensor_model_parallel_rank()
+    return is_padding[tp_rank * chunk:(tp_rank + 1) * chunk]
 
 
 def all_gather(hidden_states: torch.Tensor) -> torch.Tensor:

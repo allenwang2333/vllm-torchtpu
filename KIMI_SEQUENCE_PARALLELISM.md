@@ -167,6 +167,37 @@ shared expert, MLA transition, final gather, and separately compiled logits
 path end to end. The layer reduction is needed only to fit the diagnostic SP
 topology; the full topology's HBM limitation is described above.
 
+### Skipping sequence-parallel padding in MoE
+
+With `VLLM_MOE_SKIP_PADDING=1`, vLLM changes the routed expert IDs of rows
+marked by `forward_context.is_padding` to `-1`. Kimi's model-level sequence
+parallelism previously sharded the hidden states without sharding that mask or
+marking the rows added to make the token count divisible by TP. Consequently,
+each rank could route padding as if it were a real token.
+
+The TPU Kimi path now mirrors the NVIDIA implementation: before sharding the
+hidden states, it pads the existing scheduler mask with `True`, shards it over
+TP, and stores the local mask back in the forward context. The generic vLLM
+MoE path then applies the `-1` sentinel. The initial implementation used
+`new_zeros` with a symbolic token count, which TorchTPU's FX exporter cannot
+materialize during AOT export; deriving the mask with `zeros_like` from a
+hidden-state slice keeps the symbolic dimension tensor-backed and compiles.
+
+The compiled batch-one A/B used `mgoin/Kimi-K3-pruned75` with dummy weights,
+four layers, TP4 x DP2 x EP8, a 16-token compile bucket, asynchronous
+scheduling, four warmup requests, and 20 measured requests generating 64
+tokens each. TP4 x DP2 is the eight-chip TEP topology that activates Kimi SP;
+TP8 x DP1 does not activate it. Each variant used isolated vLLM and XLA caches.
+
+| `VLLM_MOE_SKIP_PADDING` | Mean latency | p90 latency | Output throughput |
+|:---:|---:|---:|---:|
+| `0` | 530.18 ms | 538.47 ms | 120.71 tok/s |
+| `1` | 525.84 ms | 534.19 ms | 121.71 tok/s |
+
+This is a **0.82% latency reduction** and **0.82% throughput increase** for
+this small diagnostic model. The improvement is real but modest; full-depth
+benefit can differ with the padding ratio and routed-expert workload.
+
 ## Benchmark results
 
 ### Earlier TP8 utilization profiling
