@@ -1,0 +1,246 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: torchtpu-vllm-glm-5-2-fp8-multi-host-async
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: ray-node
+    replicas: 2
+    template:
+      spec:
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+            labels:
+              app: vllm-glm-5-2-fp8-v7x-16
+          spec:
+            containers:
+            - name: vllm-node
+              image: <path_to_your_docker_image>
+              imagePullPolicy: Always
+              env:
+              - name: RECIPE_NAME
+                value: "vllm-glm-5-2-fp8-v7x-16"
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: POD_NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+              # - name: VLLM_TORCH_PROFILER_DIR
+              #   value: "/mnt/results/$(RECIPE_NAME)/$(JS_NAME)/profiler"
+              - name: VLLM_LOGGING_LEVEL
+                value: "DEBUG"
+              - name: VLLM_TARGET_DEVICE
+                value: "tpu"
+              - name: MODEL_IMPL_TYPE
+                value: "vllm"
+              - name: TPU_MULTIHOST_BACKEND
+                value: "ray"
+              - name: RAY_ADDRESS
+                value: "127.0.0.1:6379"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: TPU_PROCESS_ADDRESSES
+                value: "$(JS_NAME)-ray-node-0-0.$(JS_NAME).$(POD_NAMESPACE).svc.cluster.local:8476,$(JS_NAME)-ray-node-1-0.$(JS_NAME).$(POD_NAMESPACE).svc.cluster.local:8476"
+              # DO NOT ADD: These flags interfere with torch tpu init. 
+              # - name: TPU_PROCESS_BOUNDS
+              #   value: "1,1,2"
+              # - name: TPU_CHIPS_PER_PROCESS_BOUNDS
+              #   value: "2,2,1"
+              - name: TPU_PROCESS_PORT
+                value: "8476"
+              # Redirect logs, otherwise this can lead slowdown
+              # - name: RAY_LOG_TO_STDERR
+              #   value: "1"
+              # Perfetto trace
+              - name: RAY_DEDUP_LOGS
+                value: "0"
+              - name: TPU_LIBRARY_PATH
+                value: "/root/cloud-devkit/base/bin/libtpu.so"
+              - name: TPU_VMODULE
+                value: "tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1"
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "0"
+              # - name: TPU_MIN_LOG_LEVEL
+              #   value: "0"
+              # - name: TF_CPP_MIN_LOG_LEVEL
+              #   value: "0"
+              - name: MEGASCALE_NUM_SLICES
+                value: ""
+              - name: MEGASCALE_SLICE_ID
+                value: ""
+              - name: MEGASCALE_PORT
+                value: ""
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                value: ""
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  echo "JOBSET_JOB_INDEX=$JOBSET_JOB_INDEX"
+                  if [ -n "$TPU_LIBRARY_PATH" ]; then
+                    echo "TPU_LIBRARY_PATH is set to $TPU_LIBRARY_PATH. Copying libtpu.so from GCS..."
+                    mkdir -p "$(dirname "$TPU_LIBRARY_PATH")"
+                    gcloud storage cp gs://cloud-devkit/libs/libtpu/20260521/libtpu.so $TPU_LIBRARY_PATH
+                  else
+                    echo "TPU_LIBRARY_PATH is not set. Skipping copy."
+                  fi
+                  NODEPOOL=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/cluster-nodepool)
+                  echo "Node Pool: $NODEPOOL"
+                  export TPU_NODE_ID=$JOBSET_JOB_INDEX
+                  export TPU_WORKER_ID=$JOBSET_JOB_INDEX
+                  
+                  # Resolve head address
+                  HEAD_ADDR="${JS_NAME}-ray-node-0-0.${JS_NAME}"
+                  echo "Resolved Ray head address (HEAD_ADDR) as: ${HEAD_ADDR}"
+                  
+                  if [ "$JOBSET_JOB_INDEX" = "0" ]; then
+                    echo "Starting Ray head on $HOSTNAME..."
+                    ray start --head --port=6379
+                    
+                    sleep 10
+                    echo "Waiting for Ray workers to join..."
+                    until ray status 2>/dev/null | grep -q "16.0 TPU"; do
+                      sleep 2
+                    done
+                    echo "Worker joined. Ray cluster status:"
+                    ray status
+                    echo "Starting vLLM serve..."
+                    
+                    vllm serve "zai-org/GLM-5.2-FP8" \
+                      --tensor-parallel-size=16 \
+                      --max-model-len=32768 \
+                      --port 47903 \
+                      --async-scheduling \
+                      --no-enable-prefix-caching \
+                      --kv-cache-dtype=fp8 \
+                      --tool-call-parser=glm47 \
+                      --enable-auto-tool-choice \
+                      --reasoning-parser=glm45 \
+                      --safetensors-load-strategy=prefetch \
+                      --enable-expert-parallel
+                  else
+                    echo "Starting Ray worker on $HOSTNAME..."
+                    
+                    while ! timeout 1 bash -c "cat < /dev/null > /dev/tcp/${HEAD_ADDR}/6379" 2>/dev/null; do
+                        echo "Ray head at ${HEAD_ADDR} is not reachable yet, retrying in 2 seconds..."
+                        sleep 2
+                    done
+                    echo "Ray head at ${HEAD_ADDR} is reachable! Starting Ray worker..."
+                    
+                    sleep 5
+                    ray start --address=${HEAD_ADDR}:6379 --block
+                  fi                  
+              volumeMounts:
+              - name: hf-token-volume
+                mountPath: /root/.cache/huggingface/token
+                subPath: token
+                readOnly: true
+              - name: huggingface-storage
+                mountPath: /root/.cache/huggingface/
+              - name: dshm
+                mountPath: /dev/shm
+              resources:
+                limits:
+                  memory: 900Gi
+                  cpu: "32"
+                  google.com/tpu: 4
+                requests:
+                  memory: 900Gi
+                  cpu: "32"
+                  google.com/tpu: 4
+            volumes:
+            - name: hf-token-volume
+              secret:
+                secretName: vllm-hf-token
+                items:
+                - key: HF_TOKEN
+                  path: token
+            - name: huggingface-storage
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: "standard-rwo"
+                    accessModes: [ "ReadWriteOnce" ]
+                    resources:
+                      requests:
+                        storage: 1500Gi # Increased to 1500Gi for ~756GB checkpoint + HF cache
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-topology: "2x2x2"
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+  - name: benchmark
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            containers:
+            - name: sidecar-bench
+              image: vllm/vllm-tpu:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  HEAD_DNS="${JS_NAME}-ray-node-0-0.${JS_NAME}"
+                  echo "Waiting for vLLM server up"
+                  until curl -s http://$HEAD_DNS:47903/health > /dev/null; do
+                    sleep 5
+                  done
+                  # Get vLLM version (contains git hash if dev build)
+                  VLLM_VER=$(cd /workspace/tpu_inference/vllm && python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null | tr -d ' ')
+                  [ -z "$VLLM_VER" ] && VLLM_VER="unknown"
+                  # Get tpu-inference git hash
+                  TPU_INF_HASH=$(cd /workspace/tpu_inference && git rev-parse HEAD 2>/dev/null)
+                  [ -z "$TPU_INF_HASH" ] && TPU_INF_HASH="unknown"
+                  
+                  echo "Running a test prompt..."
+                  curl http://${HEAD_DNS}:47903/v1/chat/completions \
+                    -H "Content-Type: application/json" \
+                    -d '{ "model": "zai-org/GLM-5.2-FP8", "messages": [{"role": "user", "content": "Write a poem which is witty and funny and includes fruits like apples, banana and pineapple it must also some blah blah blah"}], "max_tokens": 200, "temperature": 0 }'
+                  echo ""
+                  
+                  echo "Starting lm_eval in 5 seconds..."
+                  sleep 5
+                  echo "trace-start-event: name=benchmark ts=$(date +'%s.%N') pid=bench tid=bench"
+                  lm_eval --model local-chat-completions \
+                    --model_args base_url=http://${HEAD_DNS}:47903/v1/chat/completions,model=${MODEL_NAME},max_gen_toks=30000,max_length=32768,num_concurrent=32,timeout=7200 \
+                    --apply_chat_template \
+                    --tasks ${TASK_NAME} \
+                    --seed 42 \
+                    --limit 100
+                  
+                  echo "trace-end-event: name=benchmark ts=$(date +'%s.%N') pid=bench tid=bench"
+                  exit 0                  
+              env:
+              - name: RECIPE_NAME
+                value: "vllm-glm-5-2-fp8-v7x-16"
+              - name: MODEL_NAME
+                value: "zai-org/GLM-5.2-FP8"
+              - name: TASK_NAME
+                value: "gsm8k"
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
