@@ -105,7 +105,7 @@ def build_insert_sql(record_id: str,
     default. Backticks around an override are accepted and normalized.
     """
     table = (bq_table or os.getenv("BQ_TABLE") or DEFAULT_BQ_TABLE).strip("`")
-    repository = os.getenv("REPOSITORY", "vllm-torchtpu")
+    repository = os.getenv("REPOSITORY") or "vllm-torchtpu"
     config_json = sql_escape(json.dumps(config))
     metrics_elems = ", ".join(
         f"STRUCT('{metrics_type}', "

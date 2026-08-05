@@ -76,10 +76,10 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
 
             # Build configuration & workload payload
             config_dict = {
-                "code_hash": os.getenv("BUILDKITE_COMMIT", "N/A"),
-                "image": os.getenv("DOCKER_IMAGE", "latest"),
-                "created_by": os.getenv("CREATED_BY", "buildkite"),
-                "device_type": os.getenv("TPU_VERSION", "tpu7x"),
+                "code_hash": os.getenv("BUILDKITE_COMMIT") or "N/A",
+                "image": os.getenv("DOCKER_IMAGE") or "latest",
+                "created_by": os.getenv("CREATED_BY") or "buildkite",
+                "device_type": os.getenv("TPU_VERSION") or "tpu7x",
                 "backend": data.get("backend", "vllm"),
                 "endpoint_type": data.get("endpoint_type", "disagg-proxy"),
                 "workload": {

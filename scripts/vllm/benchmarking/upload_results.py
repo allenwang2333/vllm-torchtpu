@@ -207,14 +207,17 @@ def main():
         # Populate column dictionary with required fields
         columns = {
             "RecordId": f"'{record_id}'",
-            "RunType": f"'{sql_escape(os.getenv('RUN_TYPE', 'DAILY'))}'",
+            # run_in_docker.sh exports these as empty strings when unset
+            # upstream; `or` falls back on empty too, unlike os.getenv's
+            # unset-only default.
+            "RunType": f"'{sql_escape(os.getenv('RUN_TYPE') or 'DAILY')}'",
             "MaxNumSeqs": str(max_num_seqs),
             "MaxNumBatchedTokens": str(max_num_batched_tokens),
             "TensorParallelSize": str(tensor_parallelism),
             "MaxModelLen": str(max_model_len),
             "Dataset": f"'{sql_escape(dataset)}'",
             "CreatedBy":
-            f"'{sql_escape(os.getenv('CREATED_BY', 'buildkite-agent'))}'",
+            f"'{sql_escape(os.getenv('CREATED_BY') or 'buildkite-agent')}'",
             "InputLen": str(input_len),
             "OutputLen": str(output_len),
             "Device": f"'{sql_escape(device)}'",
@@ -310,7 +313,7 @@ def main():
             bq_metrics.append(("lm_eval", accuracy_metrics))
         bq_config = {
             "code_hash": code_hash,
-            "created_by": os.getenv("CREATED_BY", "buildkite-agent"),
+            "created_by": os.getenv("CREATED_BY") or "buildkite-agent",
             "device_type": device,
             "run_by": run_by,
             "job_reference": str(job_ref),
@@ -336,7 +339,7 @@ def main():
         bq_sql = bq_utils.build_insert_sql(
             record_id=record_id,
             created_time=bq_utils.created_time_sql(res.get("date")),
-            run_type=os.getenv("RUN_TYPE", "DAILY"),
+            run_type=os.getenv("RUN_TYPE") or "DAILY",
             model_id=model,
             metrics=bq_metrics,
             config=bq_config,
