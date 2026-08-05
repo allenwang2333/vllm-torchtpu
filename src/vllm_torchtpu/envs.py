@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
+    VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
 
 
 def env_with_choices(
@@ -262,6 +263,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
+    # Kimi only. Under sequence parallelism the dense and shared-expert MLPs
+    # are replicated by default. Opt in to TP-sharding those weights and pay
+    # for an all-gather/reduce-scatter pair instead. This is intended for
+    # low-token decode workloads, not prefill or unified serving.
+    "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT":
+    env_bool("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT"),
 }
 
 

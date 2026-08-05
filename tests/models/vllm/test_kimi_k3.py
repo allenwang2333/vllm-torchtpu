@@ -368,14 +368,19 @@ def test_latent_moe_skips_legacy_tp_reduction_with_sequence_parallel(
 
 def test_kimi_mlp_replicates_weights_with_sequence_parallel(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    constructor_args: list[tuple[str, bool]] = []
+    constructor_args: list[tuple[str, bool, bool | None]] = []
 
     class FakeLinear(nn.Module):
 
-        def __init__(self, *args, disable_tp=False, **kwargs) -> None:
+        def __init__(self,
+                     *args,
+                     disable_tp=False,
+                     reduce_results=None,
+                     **kwargs) -> None:
             super().__init__()
             del args, kwargs
-            constructor_args.append((type(self).__name__, disable_tp))
+            constructor_args.append(
+                (type(self).__name__, disable_tp, reduce_results))
 
         def forward(self, hidden_states):
             return hidden_states, None
@@ -389,6 +394,11 @@ def test_kimi_mlp_replicates_weights_with_sequence_parallel(
     monkeypatch.setattr(kimi_layers, "MergedColumnParallelLinear", FakeColumn)
     monkeypatch.setattr(kimi_layers, "RowParallelLinear", FakeRow)
     monkeypatch.setattr(kimi_layers, "SiluAndMul", nn.Identity)
+    monkeypatch.setattr(
+        kimi_layers.envs,
+        "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
+        False,
+    )
     kimi_layers.KimiMLP(
         16,
         32,
@@ -396,7 +406,121 @@ def test_kimi_mlp_replicates_weights_with_sequence_parallel(
         use_sequence_parallel=True,
     )
 
-    assert constructor_args == [("FakeColumn", True), ("FakeRow", True)]
+    assert constructor_args == [("FakeColumn", True, None),
+                                ("FakeRow", True, True)]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "use_sequence_parallel", "eligible", "tp_size", "expected"),
+    [
+        (True, True, True, 8, True),
+        (False, True, True, 8, False),
+        (True, False, True, 8, False),
+        (True, True, False, 8, False),
+        (True, True, True, 1, False),
+        (True, True, True, 5, False),
+    ],
+)
+def test_shard_sequence_parallel_mlp_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    use_sequence_parallel: bool,
+    eligible: bool,
+    tp_size: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        kimi_layers.envs,
+        "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
+        enabled,
+    )
+    monkeypatch.setattr(kimi_layers,
+                        "get_tensor_model_parallel_world_size",
+                        lambda: tp_size)
+
+    assert kimi_layers.shard_sequence_parallel_mlp(
+        hidden_size=7168,
+        intermediate_size=6144,
+        use_sequence_parallel=use_sequence_parallel,
+        eligible=eligible,
+    ) is expected
+
+
+def test_kimi_mlp_shards_weights_with_sequence_parallel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    constructor_args: list[tuple[str, bool, bool | None]] = []
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self,
+                     *args,
+                     disable_tp=False,
+                     reduce_results=None,
+                     **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            constructor_args.append(
+                (type(self).__name__, disable_tp, reduce_results))
+
+    class FakeColumn(FakeLinear):
+        pass
+
+    class FakeRow(FakeLinear):
+        pass
+
+    monkeypatch.setattr(kimi_layers, "MergedColumnParallelLinear", FakeColumn)
+    monkeypatch.setattr(kimi_layers, "RowParallelLinear", FakeRow)
+    monkeypatch.setattr(kimi_layers, "SiluAndMul", nn.Identity)
+    monkeypatch.setattr(
+        kimi_layers.envs,
+        "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT",
+        True,
+    )
+    monkeypatch.setattr(kimi_layers,
+                        "get_tensor_model_parallel_world_size", lambda: 4)
+
+    layer = kimi_layers.KimiMLP(
+        16,
+        32,
+        "silu",
+        use_sequence_parallel=True,
+        can_shard_sequence_parallel=True,
+    )
+
+    assert layer.shard_sequence_parallel is True
+    assert constructor_args == [("FakeColumn", False, None),
+                                ("FakeRow", False, False)]
+
+
+def test_sharded_sequence_parallel_mlp_matches_replicated() -> None:
+    tp_size, hidden, intermediate, tokens_per_rank = 4, 16, 12, 3
+    torch.manual_seed(0)
+    num_tokens = tp_size * tokens_per_rank
+    inputs = torch.randn(num_tokens, hidden)
+    gate_weight = torch.randn(intermediate, hidden)
+    up_weight = torch.randn(intermediate, hidden)
+    down_weight = torch.randn(hidden, intermediate)
+    activation = torch.nn.functional.silu
+
+    replicated = (activation(inputs @ gate_weight.T) *
+                  (inputs @ up_weight.T)) @ down_weight.T
+    shard_size = intermediate // tp_size
+    partials = []
+    for rank in range(tp_size):
+        start = rank * shard_size
+        end = (rank + 1) * shard_size
+        partials.append((activation(inputs @ gate_weight[start:end].T) *
+                         (inputs @ up_weight[start:end].T)) @
+                        down_weight[:, start:end].T)
+    reduced = torch.stack(partials).sum(0)
+
+    for rank in range(tp_size):
+        start = rank * tokens_per_rank
+        end = (rank + 1) * tokens_per_rank
+        torch.testing.assert_close(reduced[start:end],
+                                   replicated[start:end],
+                                   atol=1e-5,
+                                   rtol=1e-5)
 
 
 def test_latent_moe_enables_fused_moe_sequence_parallel(
@@ -411,7 +535,10 @@ def test_latent_moe_enables_fused_moe_sequence_parallel(
             return hidden_states, None
 
     class FakeMLP(FakeLinear):
-        pass
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.shard_sequence_parallel = False
 
     class FakeNorm(FakeLinear):
 
@@ -469,6 +596,79 @@ def test_latent_moe_enables_fused_moe_sequence_parallel(
     transform = fused_moe_args["routed_output_transform"]
     assert transform.use_sequence_parallel is True
     assert layer.shared_experts is not None
+    assert fused_moe_args["shared_experts"] is layer.shared_experts
+
+
+def test_moe_runs_sharded_shared_expert_outside_fused_runner(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+        def forward(self, hidden_states):
+            return hidden_states, None
+
+    class FakeGate(FakeLinear):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.e_score_correction_bias = None
+
+    class FakeMLP(FakeLinear):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.shard_sequence_parallel = True
+
+        def forward(self, hidden_states):
+            return hidden_states * 3
+
+    class FakeRunner(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.routed_experts = SimpleNamespace(activation=None)
+            self.moe_config = SimpleNamespace()
+
+        def forward(self, *, hidden_states, router_logits):
+            del router_logits
+            return hidden_states * 2
+
+    fused_moe_args = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return FakeRunner()
+
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
+        enable_expert_parallel=True))
+    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
+                        lambda: vllm_config)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: 4)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
+    monkeypatch.setattr(kimi_moe, "FusedMoE", fake_fused_moe)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=128,
+    )
+    layer = kimi_moe.KimiMoE(
+        config,
+        quant_config=None,
+        prefix="moe",
+        use_sequence_parallel=True,
+    )
+    hidden_states = torch.randn(3, 16)
+
+    assert fused_moe_args["shared_experts"] is None
+    torch.testing.assert_close(layer(hidden_states), hidden_states * 5)
 
 
 @pytest.mark.parametrize(

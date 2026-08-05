@@ -121,10 +121,14 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
             use_sequence_parallel=use_sequence_parallel,
+            can_shard_sequence_parallel=True,
             situ_beta=getattr(config, "activation_situ_beta", None),
             situ_linear_beta=getattr(config, "activation_situ_linear_beta",
                                      None),
         ) if config.num_shared_experts > 0 else None)
+        self.shard_sequence_parallel_shared_experts = bool(
+            self.shared_experts is not None
+            and getattr(self.shared_experts, "shard_sequence_parallel", False))
 
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
@@ -145,7 +149,11 @@ class KimiMoE(nn.Module):
         moe_activation = ("silu" if config.hidden_act == "situ" else
                           config.hidden_act)
         self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
+            # The generic runner assumes replicated shared-expert weights in
+            # SP mode. Run the opt-in sharded MLP outside it so its own
+            # all-gather/reduce-scatter can restore the local token shard.
+            shared_experts=(None if self.shard_sequence_parallel_shared_experts
+                            else self.shared_experts),
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
             hidden_size=expert_hidden_size,
@@ -186,7 +194,12 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        shared_output = (self.shared_experts(hidden_states)
+                         if self.shard_sequence_parallel_shared_experts else
+                         None)
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states,
                               router_logits=router_logits)
+        if shared_output is not None:
+            output = output + shared_output
         return output.view(num_tokens, hidden_size)

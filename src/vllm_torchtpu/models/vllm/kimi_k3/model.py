@@ -80,6 +80,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.mlp",
                 use_sequence_parallel=self.use_sequence_parallel,
+                can_shard_sequence_parallel=True,
                 situ_beta=getattr(config, "activation_situ_beta", None),
                 situ_linear_beta=getattr(config, "activation_situ_linear_beta",
                                          None),

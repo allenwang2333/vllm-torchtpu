@@ -214,6 +214,42 @@ all-gather/reduce-scatter overhead is not amortized here. SP's purpose is to
 remove duplicated token work in the EP MoE and improve larger-batch scaling
 and memory behavior; a speedup should not be inferred from this microbenchmark.
 
+### TP-sharded shared expert
+
+[vLLM PR #50656](https://github.com/vllm-project/vllm/pull/50656) adds an
+opt-in alternative to replicating Kimi's dense and shared-expert MLP weights
+under sequence parallelism. With
+`VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT=1`, an eligible MLP all-gathers the token
+shards, applies its TP intermediate-dimension weight shard, and
+reduce-scatters the partial outputs. The reduce-scatter both sums the TP
+partials and restores the original token sharding. The optimization remains
+off by default and requires SP, TP greater than one, and hidden/intermediate
+dimensions divisible by TP.
+
+TPU has no MegaMoE path, and its generic `FusedMoE` runner assumes that the
+shared expert is replicated under SP. The TPU integration therefore runs only
+the opt-in sharded shared expert outside that runner, then adds its local token
+shard to the routed result. With the flag disabled, the existing fused and
+replicated path is unchanged. Dense Kimi MLPs use the same opt-in sharded
+implementation. No weight-loading zero-fill or second allocation is added.
+
+The compiled dummy-weight A/B used Kimi-Linear-48B-A3B-Instruct on one
+`tpu7x-8` host with TP4 x DP2 x EP8, a 16-token compile bucket, sequential
+batch-size-1 requests, 64 forced output tokens, four warmups, and 20 measured
+requests. Each variant used a fresh XLA compilation-cache directory.
+
+| Shared MLP layout | Median latency | Mean output tok/s | HBM used/rank |
+|:---|---:|---:|---:|
+| Replicated (default) | 1.280 s | 49.98 | 12.33 GiB |
+| TP-sharded (opt-in) | 1.295 s | 49.44 | 11.99 GiB |
+
+For this model and token bucket, sharding saves 0.34 GiB (2.8%) of measured
+HBM per rank but increases median batch-size-1 latency by 1.1% and reduces
+output throughput by 1.1%. The result is a memory win, not a speed win, on
+this TPU workload. As in the upstream change, the flag should be evaluated
+for low-token decode deployments and left off for prefill or unified serving
+unless a representative benchmark shows a benefit.
+
 ### Real-weight GSM8K sanity check
 
 The full Kimi-Linear checkpoint was served in compiled mode with the active SP

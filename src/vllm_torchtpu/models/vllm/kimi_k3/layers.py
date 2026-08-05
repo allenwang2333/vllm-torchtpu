@@ -6,12 +6,33 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+
+import vllm_torchtpu.envs as envs
+
+from .sequence_parallel import all_gather as sp_all_gather
+from .sequence_parallel import reduce_scatter as sp_reduce_scatter
+
+
+def shard_sequence_parallel_mlp(
+    hidden_size: int,
+    intermediate_size: int,
+    use_sequence_parallel: bool,
+    eligible: bool,
+) -> bool:
+    """Whether to TP-shard an eligible sequence-parallel Kimi MLP."""
+    if not (use_sequence_parallel and eligible
+            and envs.VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT):
+        return False
+    tp_size = get_tensor_model_parallel_world_size()
+    return (tp_size > 1 and intermediate_size % tp_size == 0
+            and hidden_size % tp_size == 0)
 
 
 class SituAndMul(nn.Module):
@@ -35,7 +56,12 @@ class SituAndMul(nn.Module):
 
 
 class KimiMLP(nn.Module):
-    """The standard vLLM merged-projection gated MLP."""
+    """Kimi MLP, optionally TP-sharded under sequence parallelism.
+
+    Normally every SP rank owns a disjoint token shard and a full copy of the
+    weights. The opt-in sharded form gathers all tokens, computes one TP weight
+    shard, then reduce-scatters partial outputs back to the token owners.
+    """
 
     def __init__(
         self,
@@ -47,16 +73,24 @@ class KimiMLP(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         use_sequence_parallel: bool = False,
+        can_shard_sequence_parallel: bool = False,
         situ_beta: float | None = None,
         situ_linear_beta: float | None = None,
     ) -> None:
         super().__init__()
+        self.shard_sequence_parallel = shard_sequence_parallel_mlp(
+            hidden_size,
+            intermediate_size,
+            use_sequence_parallel,
+            can_shard_sequence_parallel,
+        )
+        replicate = use_sequence_parallel and not self.shard_sequence_parallel
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
-            disable_tp=use_sequence_parallel,
+            disable_tp=replicate,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -64,8 +98,9 @@ class KimiMLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=use_sequence_parallel,
+            reduce_results=(False if self.shard_sequence_parallel else
+                            reduce_results),
+            disable_tp=replicate,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act == "silu":
@@ -79,9 +114,13 @@ class KimiMLP(nn.Module):
             raise ValueError(f"Unsupported Kimi activation {hidden_act!r}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.shard_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)
         hidden_states, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
+        if self.shard_sequence_parallel:
+            hidden_states = sp_reduce_scatter(hidden_states)
         return hidden_states
 
 
