@@ -321,18 +321,6 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    (x, group_sizes, argsort_revert_indices, topk_weights_flat,
-     valid_mask) = prepare_routed_gmm_inputs(
-         hidden_states,
-         topk_ids,
-         topk_weights,
-         local_num_experts=w1.shape[0],
-         topk=topk,
-         use_ep=use_ep,
-         use_sparse_core=use_sparse_core,
-         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     # Fast path for low-concurrency decode: a specialized C=N Pallas MoE kernel
     # that skips the gather/scatter permutation of the general gmm path. Only
     # engaged for small decode batches with topk == CN_MOE_TOP_K.
@@ -357,6 +345,19 @@ def fused_moe_func(
                           topk_weights,
                           use_ep=use_ep)
         return out[:num_tokens, :hidden_size]
+
+    (x, group_sizes, argsort_revert_indices, topk_weights_flat,
+     valid_mask) = prepare_routed_gmm_inputs(
+         hidden_states,
+         topk_ids,
+         topk_weights,
+         local_num_experts=w1.shape[0],
+         topk=topk,
+         use_ep=use_ep,
+         use_sparse_core=use_sparse_core,
+         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+     )
+    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
 
     x = moe_gmm(
         x,
