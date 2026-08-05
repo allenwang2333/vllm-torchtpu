@@ -135,6 +135,131 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+# vLLM source paths (relative to the vllm package root) whose contents shape
+# the compiled FX graphs. This is the deterministic replacement for
+# upstream's traced-files code_hash: same idea (hash the compiled-from
+# sources so local edits invalidate the cache), but the file set is declared
+# instead of observed from tracing, which made the key depend on the warmth
+# of the Dynamo AOT cache. The list mirrors what a fresh-process trace
+# actually touches (see phase-A traced_files) plus the compilation infra.
+# Directories are walked recursively for *.py. Keep in sync when new
+# graph-shaping modules appear; when in doubt, include — over-invalidation
+# only costs a recompile, staleness costs correctness.
+_VLLM_CACHE_KEY_PATHS = (
+    "model_executor/layers",
+    "model_executor/custom_op.py",
+    "model_executor/parameter.py",
+    "ir",
+    "compilation",
+    "distributed/communication_op.py",
+    "distributed/parallel_state.py",
+    "distributed/device_communicators/base_device_communicator.py",
+    "forward_context.py",
+)
+
+
+def _vllm_source_hash(vllm_config: VllmConfig) -> str:
+    """Digest of the declared vLLM sources plus the model's own module.
+
+    Covers local edits to a vllm checkout that the package version string
+    cannot see. The model file is resolved through the registry so each
+    architecture keys on its actual definition.
+    """
+    import vllm
+
+    hash_obj = hashlib.sha256()
+    vllm_root = Path(vllm.__file__).resolve().parent
+
+    files: list[Path] = []
+    for rel_path in _VLLM_CACHE_KEY_PATHS:
+        path = vllm_root / rel_path
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(sorted(path.rglob("*.py")))
+        else:
+            logger.warning(
+                "[resolve_static_cache_dir] vLLM cache key path missing: %s",
+                path)
+
+    try:
+        import inspect
+
+        from vllm.model_executor.models.registry import ModelRegistry
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            vllm_config.model_config.architectures,
+            model_config=vllm_config.model_config)
+        source_file = inspect.getsourcefile(model_cls)
+        if source_file:
+            files.append(Path(source_file))
+    except Exception as exc:
+        logger.warning(
+            "[resolve_static_cache_dir] Could not resolve model source: %s",
+            exc)
+
+    for path in sorted(set(files)):
+        try:
+            hash_obj.update(str(path).encode())
+            hash_obj.update(path.read_bytes())
+        except OSError as exc:
+            logger.warning(
+                "[resolve_static_cache_dir] Failed to read %s: %s", path, exc)
+
+    try:
+        import transformers
+        hash_obj.update(
+            f"transformers={transformers.__version__}".encode())
+    except Exception:
+        pass
+
+    return hash_obj.hexdigest()
+
+
+def resolve_static_cache_dir(vllm_config: VllmConfig) -> str:
+    """Deterministic, process-lifetime torch-compile cache directory.
+
+    Upstream VllmBackend derives the cache dir lazily, at whichever compile
+    finds `compilation_config.cache_dir` empty, from [env, config,
+    traced_files, compiler] hashes. Two problems with that on TPU:
+
+    1. `profile_run` compiles the backbone twice (throwaway kv=0 profile
+       compile, then the persistent compile after reset_compile_wrapper,
+       which wipes cache_dir), so the key is derived by the *second* compile.
+    2. The traced-files set observed by that second compile is not
+       deterministic across server restarts: with VLLM_USE_AOT_COMPILE, a
+       warm Dynamo AOT-artifact load skips tracing files a cold start does
+       trace (e.g. transformers' configuration_utils.py). Cold and warm
+       starts then land in different cache dirs and the executable cache
+       never hits.
+
+    Instead, compute the key once, before any compile, from declared inputs
+    only — no dependence on what tracing happens to observe:
+      - env factors (envs.compile_factors)
+      - vllm_config.compute_hash() (model, dtype, TP, compile sizes, ...)
+      - TpuCompilerAdaptor.compute_hash() (torch/torch_tpu versions, TPU
+        kernel + layer sources, KV-budget inputs)
+      - declared vLLM sources + the model's own module (_vllm_source_hash)
+
+    Callers set `compilation_config.cache_dir` to the returned path at
+    runner init; VllmBackend then never runs its own derivation.
+    """
+    from vllm.config.utils import hash_factors
+    from vllm.envs import VLLM_CACHE_ROOT, compile_factors
+
+    env_hash = hash_factors(compile_factors())
+    config_hash = vllm_config.compute_hash()
+    compiler_hash = TpuCompilerAdaptor().compute_hash(vllm_config)
+    factors = [env_hash, config_hash, compiler_hash,
+               _vllm_source_hash(vllm_config)]
+    hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
+    cache_dir = os.path.join(VLLM_CACHE_ROOT, "torch_compile_cache", hash_key)
+    logger.info(
+        "[resolve_static_cache_dir] Pinned compile cache dir: %s "
+        "(env=%s config=%s compiler=%s)", cache_dir, env_hash[:8],
+        config_hash[:8], compiler_hash[:8])
+    return cache_dir
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 

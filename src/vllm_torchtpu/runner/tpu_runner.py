@@ -25,8 +25,9 @@ import vllm.envs as envs
 from jax.sharding import Mesh
 from packaging import version
 from torch_tpu._internal import sync
-from vllm.config import (CUDAGraphMode, ParallelConfig, VllmConfig,
-                         get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.config import (CompilationMode, CUDAGraphMode, ParallelConfig,
+                         VllmConfig, get_layers_from_vllm_config,
+                         set_current_vllm_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -250,6 +251,17 @@ class TPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
+
+        # Pin the torch-compile cache dir once, before any compile, so every
+        # compile phase (profile, backbone, sampling subgraphs) shares one
+        # deterministic directory across server restarts. Left as-is when the
+        # user supplied an explicit -O cache_dir. See resolve_static_cache_dir
+        # for why the lazy upstream derivation breaks warm-start cache hits.
+        cc = vllm_config.compilation_config
+        if not cc.cache_dir and cc.mode == CompilationMode.VLLM_COMPILE:
+            from vllm_torchtpu.compilation.tpu_compiler import (
+                resolve_static_cache_dir)
+            cc.cache_dir = resolve_static_cache_dir(vllm_config)
         self.is_pooling_model = (self.model_config is not None and
                                  self.model_config.runner_type == "pooling")
 
@@ -538,10 +550,16 @@ class TPUModelRunner(GPUModelRunner):
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
-            return None, None, None
+            return None, None, None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
             scheduler_output.finished_req_ids)
+        # Blocks whose remote KV load failed. Without this the scheduler never
+        # sees them, `_handle_invalid_blocks` finds nothing to recover, and a
+        # failed pull silently decodes against never-populated blocks (neither
+        # the recompute nor the fail policy runs). Mirrors
+        # KVConnectorModelRunnerMixin._get_kv_connector_output.
+        invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
         # vLLM >=0.21 job model: store completions (and load completions) are
         # reported to the scheduler via the worker meta's `completed_jobs`,
         # NOT via finished_sending. Without plumbing this, the
@@ -553,7 +571,8 @@ class TPUModelRunner(GPUModelRunner):
         # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
-        return finished_sending, finished_recving, worker_meta
+        return (finished_sending, finished_recving, worker_meta,
+                invalid_block_ids)
 
     def kv_connector_no_forward(self, scheduler_output,
                                 vllm_config) -> ModelRunnerOutput:
@@ -563,12 +582,13 @@ class TPUModelRunner(GPUModelRunner):
         self.maybe_setup_kv_connector(
             scheduler_output,
             wait_for_completion=dist_utils.get_raiden_inline_load())
-        finished_sending, finished_recving, worker_meta = (
+        finished_sending, finished_recving, worker_meta, invalid_block_ids = (
             self.get_finished_kv_transfers(scheduler_output))
         kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             kv_connector_worker_meta=worker_meta,
+            invalid_block_ids=invalid_block_ids or set(),
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2749,8 +2769,9 @@ class TPUModelRunner(GPUModelRunner):
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
         self.maybe_wait_for_kv_save()
-        finished_sending, finished_recving, kv_worker_meta = (
-            self.get_finished_kv_transfers(scheduler_output))
+        (finished_sending, finished_recving, kv_worker_meta,
+         kv_invalid_block_ids) = (
+             self.get_finished_kv_transfers(scheduler_output))
 
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
@@ -2798,10 +2819,12 @@ class TPUModelRunner(GPUModelRunner):
 
         kv_connector_output = (
             None if (finished_sending is None and finished_recving is None
-                     and kv_worker_meta is None) else KVConnectorOutput(
+                     and kv_worker_meta is None
+                     and not kv_invalid_block_ids) else KVConnectorOutput(
                          finished_sending=finished_sending,
                          finished_recving=finished_recving,
                          kv_connector_worker_meta=kv_worker_meta,
+                         invalid_block_ids=kv_invalid_block_ids or set(),
                      ))
 
         next_tokens_tpu = None
@@ -3846,7 +3869,8 @@ class TPUModelRunner(GPUModelRunner):
             compiled = (self.model.get_language_model().model if hasattr(
                 self.model, "get_language_model") else self.model.model)
             reset_compile_wrapper(compiled)
-            # reset_compile_wrapper wipes cache_dir; restore so
+            # reset_compile_wrapper wipes cache_dir; restore the pinned dir
+            # (set at runner init, see resolve_static_cache_dir) so
             # capture_model can read/write the persistent cache.
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
