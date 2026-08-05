@@ -156,7 +156,6 @@ def static_validate_inputs(
     num_queries_per_blocks: tuple[int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
-    mixed_q_split: int = 1,
     transpose_kv_cache: bool = False,
     # Debug params.
     debug_mode: bool = False,
@@ -267,16 +266,10 @@ def static_validate_inputs(
             if num_kv_pages_per_block <= 0:
                 raise ValueError(
                     f"{num_kv_pages_per_block=} must be positive.")
-    if mixed_q_split <= 0:
-        raise ValueError(f"{mixed_q_split=} must be positive.")
     if num_queries_per_blocks is not None:
         for num_queries_per_block in num_queries_per_blocks:
             if num_queries_per_block <= 0:
                 raise ValueError(f"{num_queries_per_block=} must be positive.")
-        if num_queries_per_blocks[2] % mixed_q_split != 0:
-            raise ValueError(
-                f"{num_queries_per_blocks[2]=} must be divisible by"
-                f" {mixed_q_split=}")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 
@@ -334,7 +327,6 @@ def _mla_ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     batch_size: int = 1,
-    q_split: int = 1,
     debug_mode: bool = False,
 ):
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
@@ -346,8 +338,6 @@ def _mla_ragged_paged_attention_kernel(
     r_dim = q_pe_hbm_ref.shape[-1]
     q_packing = get_dtype_packing(ql_nope_hbm_ref.dtype)
     num_q_heads_per_q_packing = num_q_heads // q_packing
-    padded_num_q_heads = bq_nope_x2_ref.shape[-2]
-    padded_num_q_heads_per_q_packing = padded_num_q_heads // q_packing
     kv_dtype = cache_kv_hbm_ref.dtype
     if not transpose_kv_cache:
         total_num_pages, page_size_per_kv_packing, kv_packing, kv_dim = (
@@ -498,15 +488,14 @@ def _mla_ragged_paged_attention_kernel(
         head_acc_ref[...] = o_curr
 
     def flash_attention_step1_qk_softmax(
-        ql_nope,  # [actual_bq_sz * num_q_heads // q_split, lkv_dim]
-        q_pe,  # [actual_bq_sz * num_q_heads // q_split, r_dim]
+        ql_nope,  # [actual_bq_sz * num_q_heads, lkv_dim]
+        q_pe,  # [actual_bq_sz * num_q_heads, r_dim]
         kv_c,  # [bkv_sz, lkv_dim] if not transpose_kv_cache else [lkv_dim, bkv_sz] <- Correspond to data from bkvc_x2_ref
         k_pe,  # [bkv_sz, r_dim] if not transpose_kv_cache else [r_dim, bkv_sz] <- Correspond to data from bpe_x2_ref
         *,
         kv_len,
         q_len,
         bq_idx,
-        bq_offset,
         bkv_idx,
         head_l_ref,
         head_m_ref,
@@ -515,7 +504,9 @@ def _mla_ragged_paged_attention_kernel(
         assert len(q_pe.shape) == 2
         assert len(kv_c.shape) == 2
         assert len(k_pe.shape) == 2
+        assert ql_nope.shape[0] % num_q_heads == 0
         assert ql_nope.shape[0] == q_pe.shape[0]
+        assert q_pe.shape[0] % bq_sz == 0
         assert ql_nope.shape[1] == lkv_dim
         assert q_pe.shape[1] == r_dim
         if not transpose_kv_cache:
@@ -589,8 +580,7 @@ def _mla_ragged_paged_attention_kernel(
 
         if s.shape[0] % num_q_heads == 0 and s.shape[1] % 128 == 0:
             # Optimized mask logic.
-            threshold = (kv_len - q_len + (bq_idx * bq_sz + bq_offset) -
-                         bkv_idx * bkv_sz)
+            threshold = kv_len - q_len + bq_idx * bq_sz - bkv_idx * bkv_sz
             iota1 = lax.broadcasted_iota(jnp.int32, (num_q_heads, 128), 1)
             s_list = []
             for s_idx in range(s.shape[1] // 128):
@@ -612,10 +602,8 @@ def _mla_ragged_paged_attention_kernel(
             s = jnp.concatenate(s_list, axis=1)
         else:
             # Reference mask logic.
-            q_span = (
-                kv_len - q_len +
-                (bq_idx * bq_sz + bq_offset) + unsigned_floor_div(
-                    lax.broadcasted_iota(jnp.int32, s.shape, 0), num_q_heads))
+            q_span = (kv_len - q_len + bq_idx * bq_sz + unsigned_floor_div(
+                lax.broadcasted_iota(jnp.int32, s.shape, 0), num_q_heads))
             k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
                 jnp.int32, s.shape, 1)
             mask = q_span < k_span
@@ -1513,14 +1501,14 @@ def _mla_ragged_paged_attention_kernel(
                       sem=sem):
                 _async_copy(
                     ql_nope_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_nope_vmem_ref.at[pl.ds(0, sz), :num_q_heads],
+                    bq_nope_vmem_ref.at[pl.ds(0, sz)],
                     sem,
                     wait,
                 )
 
                 _async_copy(
                     q_pe_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_rope_vmem_ref.at[pl.ds(0, sz), :num_q_heads],
+                    bq_rope_vmem_ref.at[pl.ds(0, sz)],
                     sem,
                     wait,
                 )
@@ -1552,7 +1540,7 @@ def _mla_ragged_paged_attention_kernel(
                       q_len_start=q_len_start,
                       sem=sem):
                 _async_copy(
-                    vmem_ref.at[pl.ds(0, sz), :num_q_heads],
+                    vmem_ref.at[pl.ds(0, sz)],
                     o_hbm_ref.at[pl.ds(q_len_start, sz)],
                     sem,
                     wait,
@@ -1639,37 +1627,35 @@ def _mla_ragged_paged_attention_kernel(
     def load_batch_bq(bq_sem_idx, *, actual_bq_sz=bq_sz):
         q_nope_ref = (bq_nope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx].reshape(
-                batch_size, bq_sz, padded_num_q_heads_per_q_packing, lkv_dim))
+                batch_size, bq_sz * num_q_heads_per_q_packing, lkv_dim))
         q_nope_vec = pltpu.bitcast(
-            q_nope_ref[:, :actual_bq_sz],
+            q_nope_ref[:, :actual_bq_sz * num_q_heads_per_q_packing],
             q_dtype,
-        )[:, :, :num_q_heads].reshape(batch_size, actual_bq_sz * num_q_heads,
-                                      lkv_dim)
+        ).reshape(batch_size, actual_bq_sz * num_q_heads, lkv_dim)
         q_rope_ref = (bq_rope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx].reshape(
-                batch_size, bq_sz, padded_num_q_heads_per_q_packing, r_dim))
+                batch_size, bq_sz * num_q_heads_per_q_packing, r_dim))
         q_rope_vec = pltpu.bitcast(
-            q_rope_ref[:, :actual_bq_sz],
+            q_rope_ref[:, :actual_bq_sz * num_q_heads_per_q_packing],
             q_dtype,
-        )[:, :, :num_q_heads].reshape(batch_size, actual_bq_sz * num_q_heads,
-                                      r_dim)
+        ).reshape(batch_size, actual_bq_sz * num_q_heads, r_dim)
         return q_nope_vec, q_rope_vec
 
     def load_bq(batch_item_idx, bq_sem_idx, *, actual_bq_sz=bq_sz):
         q_nope_ref = (bq_nope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, batch_item_idx].reshape(
-                bq_sz, padded_num_q_heads_per_q_packing, lkv_dim))
+                bq_sz * num_q_heads_per_q_packing, lkv_dim))
         q_nope_vec = pltpu.bitcast(
-            q_nope_ref[:actual_bq_sz],
+            q_nope_ref[:actual_bq_sz * num_q_heads_per_q_packing],
             q_dtype,
-        )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, lkv_dim)
+        ).reshape(actual_bq_sz * num_q_heads, lkv_dim)
         q_rope_ref = (bq_rope_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, batch_item_idx].reshape(
-                bq_sz, padded_num_q_heads_per_q_packing, r_dim))
+                bq_sz * num_q_heads_per_q_packing, r_dim))
         q_rope_vec = pltpu.bitcast(
-            q_rope_ref[:actual_bq_sz],
+            q_rope_ref[:actual_bq_sz * num_q_heads_per_q_packing],
             q_dtype,
-        )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, r_dim)
+        ).reshape(actual_bq_sz * num_q_heads, r_dim)
         return q_nope_vec, q_rope_vec
 
     def load_bkv(batch_item_idx, bkv_sem_idx):
@@ -1830,12 +1816,7 @@ def _mla_ragged_paged_attention_kernel(
                     debug_print("[RPA debug] two step flash attention")
                     prev_p = None
                     prev_v = None
-                    prev_acc = None
                     prev_exp_m_diff = None
-
-                    q_len = actual_bq_sz * num_q_heads
-                    q_block_len = q_len // q_split
-                    bq_sz_for_each_split = bq_sz // q_split
                     for b in range(batch_size):
                         bkvc, bkpe = load_bkv_fn(
                             b,
@@ -1858,43 +1839,34 @@ def _mla_ragged_paged_attention_kernel(
                         debug_print("[RPA debug] bkpe.shape={}, {}",
                                     bkpe.shape[0], bkpe.shape[1])
 
-                        cu_q_len = (
-                            cu_q_lens_ref[batch_start_seq_idx + b + 1] -
-                            cu_q_lens_ref[batch_start_seq_idx + b])
-                        for q_idx in range(q_split):
-                            bq_start = q_block_len * q_idx
-                            bq_end = bq_start + q_block_len
-                            bq_offset = bq_sz_for_each_split * q_idx
+                        cur_p, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                            bq_nope_vec,
+                            bq_pe_vec,
+                            bkvc,
+                            bkpe,
+                            kv_len=kv_lens_ref[batch_start_seq_idx + b],
+                            q_len=(cu_q_lens_ref[batch_start_seq_idx + b + 1] -
+                                   cu_q_lens_ref[batch_start_seq_idx + b]),
+                            bq_idx=bq_idx,
+                            bkv_idx=bkv_idx,
+                            head_l_ref=l_ref.at[b, :bq_nope_vec.shape[0]],
+                            head_m_ref=m_ref.at[b, :bq_nope_vec.shape[0]],
+                        )
 
-                            cur_p, cur_exp_m_diff = flash_attention_step1_qk_softmax(
-                                bq_nope_vec[bq_start:bq_end],
-                                bq_pe_vec[bq_start:bq_end],
-                                bkvc,
-                                bkpe,
-                                kv_len=kv_lens_ref[batch_start_seq_idx + b],
-                                q_len=cu_q_len,
-                                bq_idx=bq_idx,
-                                bq_offset=bq_offset,
-                                bkv_idx=bkv_idx,
-                                head_l_ref=l_ref.at[b, bq_start:bq_end],
-                                head_m_ref=m_ref.at[b, bq_start:bq_end],
+                        if prev_p is not None:
+                            assert prev_v is not None
+                            assert prev_exp_m_diff is not None
+                            flash_attention_step2_pv(
+                                prev_p,
+                                prev_v,
+                                prev_exp_m_diff,
+                                bkv_idx,
+                                acc_ref.at[b - 1, :prev_p.shape[0]],
                             )
 
-                            if prev_p is not None:
-                                assert prev_v is not None
-                                assert prev_exp_m_diff is not None
-                                flash_attention_step2_pv(
-                                    prev_p,
-                                    prev_v,
-                                    prev_exp_m_diff,
-                                    bkv_idx,
-                                    prev_acc,
-                                )
-
-                            prev_p = cur_p
-                            prev_v = bkvc
-                            prev_exp_m_diff = cur_exp_m_diff
-                            prev_acc = acc_ref.at[b, bq_start:bq_end]
+                        prev_p = cur_p
+                        prev_v = bkvc
+                        prev_exp_m_diff = cur_exp_m_diff
 
                     # last flash attention 2nd step
                     assert prev_p is not None
@@ -1905,7 +1877,7 @@ def _mla_ragged_paged_attention_kernel(
                         prev_v,
                         prev_exp_m_diff,
                         bkv_idx,
-                        prev_acc,
+                        acc_ref.at[batch_size - 1, :prev_p.shape[0]],
                     )
                 else:  # One step flash attention
                     # Load bkv into vreg. There is no need to mask out invalid k/v entries,
@@ -1974,12 +1946,9 @@ def _mla_ragged_paged_attention_kernel(
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 batch_size,
-                bq_sz,
-                padded_num_q_heads_per_q_packing,
+                bq_sz * num_q_heads_per_q_packing,
                 lkv_dim,
-            )[:, :, :num_q_heads_per_q_packing] = pltpu.bitcast(
-                out.reshape(batch_size, bq_sz, num_q_heads, lkv_dim),
-                jnp.int32)
+            )[...] = pltpu.bitcast(out, jnp.int32)
 
             # Send cur bo
             start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
@@ -2049,8 +2018,7 @@ def prepare_q_inputs(
 
 
 def prepare_q_nope_inputs(
-    q: jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_head_dim]
-    vmem_limit_bytes: int | None = None,
+        q: jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_head_dim]
 ):
     """Packs and physically transposes q_nope to the layout expected by the MLA kernel.
 
@@ -2078,11 +2046,8 @@ def prepare_q_nope_inputs(
     )
     # Physical transpose: (N, T, D) -> (T, N, D), pipelined over T.
     try:
-        q = xpose_pipeline(q,
-                           transpose_axes=(1, 0, 2),
-                           n_tile=128,
-                           m_tile=32,
-                           vmem_limit_bytes=vmem_limit_bytes)[0]
+        q = xpose_pipeline(q, transpose_axes=(1, 0, 2), n_tile=128,
+                           m_tile=32)[0]
     except ValueError as e:
         logger.warning(
             f"xpose_pipeline failed for shape={q.shape} dtype={q.dtype} "
@@ -2127,7 +2092,6 @@ def prepare_outputs(
     actual_num_q_heads: int,
     actual_max_num_tokens: int,
     actual_head_dim: int,
-    vmem_limit_bytes: int | None = None,
 ):
     # Physical transpose: (T, N, D) -> (N, T, D), pipelined over T.
     try:
@@ -2137,8 +2101,7 @@ def prepare_outputs(
         out = xpose_pipeline(out,
                              transpose_axes=(1, 0, 2),
                              n_tile=_XPOSE_N_TILE_SIZE,
-                             m_tile=64,
-                             vmem_limit_bytes=vmem_limit_bytes)[0]
+                             m_tile=64)[0]
     except ValueError as e:
         sublane_multiple = get_dtype_packing(out.dtype) * 8
         logger.warning(
@@ -2164,7 +2127,6 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
-        "mixed_q_split",
         "s_dtype",
         "transpose_kv_cache",
         "two_step_flash_attention",
@@ -2200,7 +2162,6 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
-    mixed_q_split: int = 1,
     s_dtype: jnp.dtype = jnp.bfloat16,
     transpose_kv_cache: bool = False,
     two_step_flash_attention: bool = True,
@@ -2242,7 +2203,6 @@ def mla_ragged_paged_attention(
       mixed) cases.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
     decode_batch_size: the batch size for the decode case.
-    mixed_q_split: the number of query split to run parallel in mixed case.
     s_dtype: the dtype for q.k dot product.
     transpose_kv_cache: if true, kernel assumes the kv cache is transposed.
     two_step_flash_attention: if true, kernel compute QK attention and
@@ -2297,7 +2257,6 @@ def mla_ragged_paged_attention(
         num_queries_per_blocks=num_queries_per_blocks,
         vmem_limit_bytes=vmem_limit_bytes,
         decode_batch_size=decode_batch_size,
-        mixed_q_split=mixed_q_split,
         transpose_kv_cache=transpose_kv_cache,
         debug_mode=debug_mode,
     )
@@ -2305,9 +2264,7 @@ def mla_ragged_paged_attention(
     actual_num_q_heads, actual_max_num_tokens, actual_lkv_dim = ql_nope.shape
 
     ql_nope = prepare_q_nope_inputs(
-        ql_nope,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )  # [max_num_tokens, num_q_heads, lkv_dim]
+        ql_nope)  # [max_num_tokens, num_q_heads, lkv_dim]
     q_pe = prepare_q_inputs(q_pe)  # [max_num_tokens, num_q_heads, r_dim]
     if not transpose_kv_cache:
         _, _, kv_packing, _ = cache_kv.shape
@@ -2356,7 +2313,6 @@ def mla_ragged_paged_attention(
         s_dtype: jnp.dtype,
         p_same_dtype_as_v: bool,
         batch_size: int = 1,
-        q_split: int = 1,
         case: MlaCase = MlaCase.MIXED,
     ):
 
@@ -2423,17 +2379,13 @@ def mla_ragged_paged_attention(
                 cache_kv.dtype,
             )
 
-        q_packing = get_dtype_packing(ql_nope.dtype)
-        padded_num_q_heads_per_q_packing = unsigned_align_to(
-            num_q_heads // q_packing, 4)
-        padded_num_q_heads = padded_num_q_heads_per_q_packing * q_packing
         bq_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, padded_num_q_heads, lkv_dim),
+            (2, batch_size, bq_sz, num_q_heads, lkv_dim),
             ql_nope.dtype,
         )
 
         bq_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, padded_num_q_heads, r_dim),
+            (2, batch_size, bq_sz, num_q_heads, r_dim),
             q_pe.dtype,
         )
 
@@ -2493,7 +2445,6 @@ def mla_ragged_paged_attention(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     batch_size=batch_size,
-                    q_split=q_split,
                     s_dtype=s_dtype,
                     transpose_kv_cache=transpose_kv_cache,
                     two_step_flash_attention=two_step_flash_attention,
@@ -2614,17 +2565,12 @@ def mla_ragged_paged_attention(
         end_seq_idx=distribution[2],
         static_q_len=None,
         batch_size=1,
-        q_split=mixed_q_split,
         s_dtype=s_dtype,
         p_same_dtype_as_v=p_same_dtype_as_v,
         case=MlaCase.MIXED,
     )
     output = prepare_outputs(
-        ql_nope,
-        actual_num_q_heads,
-        actual_max_num_tokens,
-        actual_lkv_dim,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+        ql_nope, actual_num_q_heads, actual_max_num_tokens,
+        actual_lkv_dim)  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
 
     return output, updated_kv

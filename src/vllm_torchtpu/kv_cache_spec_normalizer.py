@@ -34,6 +34,11 @@ def _normalize_one_spec(
     if not isinstance(spec, AttentionSpec):
         return spec
 
+    if not spec.dtype.is_floating_point:
+        # Byte-typed caches (DSA indexer K rows) keep their declared dtype;
+        # the fp8/bf16 KV normalization does not apply.
+        kv_cache_dtype = spec.dtype
+
     if isinstance(spec, MLAAttentionSpec):
         page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
             spec.block_size,

@@ -120,24 +120,11 @@ def identity_fn_generator(num_scalars: int = 0):
 @jax.jit(static_argnames=['num_scalars'])
 def pin_vmem_custom_call(input_tensor: jax.Array, num_scalars: int = 0):
     """Prefetches buffers to VMEM."""
-    return jax.named_scope("prefetch")(pl.pallas_call(
-        identity_fn_generator(num_scalars),
-        in_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-        ],
-        out_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-        ],
-        out_shape=[
-            jax.ShapeDtypeStruct(input_tensor.shape, input_tensor.dtype),
-        ],
-        name="prefetch",
-    ))(input_tensor)
+    pass
 
 
 @jax.jit(static_argnames=[
-    'transpose_axes', 'n_tile', 'm_tile', 'parallel_axis', 'pipeline_axis',
-    'vmem_limit_bytes'
+    'transpose_axes', 'n_tile', 'm_tile', 'parallel_axis', 'pipeline_axis'
 ])
 def xpose_pipeline(input: jax.Array,
                    *,
@@ -145,8 +132,7 @@ def xpose_pipeline(input: jax.Array,
                    n_tile: int = 128,
                    m_tile: int = 128,
                    parallel_axis: int = 0,
-                   pipeline_axis: int = 1,
-                   vmem_limit_bytes: int | None = None):
+                   pipeline_axis: int = 1):
     """
     Double buffer transpose custom call implementation.
     n_tile is used to tile the parallel dimension while m_tile is used to tile the pipeline dimension.
@@ -157,10 +143,6 @@ def xpose_pipeline(input: jax.Array,
       m_tile: tile amount for the pipelined axis
       parallel_axis: index of the parallel axis
       pipeline_axis: index of the pipeline axis
-      vmem_limit_bytes: the vmem limit for the pallas kernel. With the default
-        (None), the kernel is subject to XLA's global scoped-vmem limit
-        (--xla_tpu_scoped_vmem_limit_kib, 32 MiB by default), which large
-        tile shapes can exceed at compile time.
     """
 
     def xpose_kernel(input_ref, output_ref):
@@ -253,8 +235,7 @@ def xpose_pipeline(input: jax.Array,
     return pl.pallas_call(xpose_kernel,
                           grid=grid,
                           compiler_params=pltpu.CompilerParams(
-                              dimension_semantics=("parallel", "arbitrary"),
-                              vmem_limit_bytes=vmem_limit_bytes),
+                              dimension_semantics=("parallel", "arbitrary")),
                           in_specs=input_specs,
                           out_specs=output_specs,
                           out_shape=[

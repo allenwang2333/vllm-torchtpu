@@ -12,17 +12,12 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
                                        MLAAttentionImpl)
-from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
-                                                 register_backend)
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
-    sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
-from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
@@ -49,7 +44,6 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.float8_e4m3fn,
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
-    "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
 }
@@ -82,15 +76,6 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
             f"The bit width must divide {packing_bits}, but got {bits} for "
             f"dtype={dtype}.")
     return packing_bits // bits
-
-
-def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
-    max_num_page_per_req = (1024 * 1024 // 2 //
-                            vllm_config.scheduler_config.max_num_seqs // 4)
-    min_page_size = cdiv(vllm_config.model_config.max_model_len,
-                         max_num_page_per_req)
-    min_page_size = 1 << (min_page_size - 1).bit_length()
-    return min_page_size
 
 
 def _pallas_rpa_kernel_impl(
@@ -307,7 +292,6 @@ def _pallas_rpa_kernel_batched(
 # =========================================================================================
 
 
-@register_backend(AttentionBackendEnum.FLASH_ATTN)
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
         "auto",
@@ -354,6 +338,9 @@ class PallasAttentionBackend(AttentionBackend):
             return (num_blocks, block_size, num_kv_heads_x2, 1,
                     padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        if not is_floating_dtype(kv_dtype):
+            raise NotImplementedError(
+                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
 
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
@@ -399,18 +386,12 @@ class PallasAttentionBackend(AttentionBackend):
     # we simply make sure that the size is smaller than half of SMEM capacity.
     @staticmethod
     def get_min_page_size(vllm_config: VllmConfig) -> int:
-        return get_tpu_min_page_size(vllm_config)
-
-    @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        return True
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            return (1, 0, 2, 3, 4, 5)
-        return (0, 1, 2, 3, 4)
+        max_num_page_per_req = (1024 * 1024 // 2 //
+                                vllm_config.scheduler_config.max_num_seqs // 4)
+        min_page_size = cdiv(vllm_config.model_config.max_model_len,
+                             max_num_page_per_req)
+        min_page_size = 1 << (min_page_size - 1).bit_length()
+        return min_page_size
 
     @staticmethod
     def get_max_num_seqs(model_len: int, page_size: int) -> int:
@@ -438,7 +419,6 @@ class PallasAttentionBackend(AttentionBackend):
         return page_size
 
 
-@register_backend(AttentionBackendEnum.CUSTOM)
 class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     """Pallas attention backend wired to the batched-RPA kernel.
 
@@ -883,7 +863,6 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
 
 
-@register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
 class PallasMLAttentionBackend(AttentionBackend):
     """TPU attention backend utilizing customized Pallas kernels for DeepSeek MLA.
     """
@@ -893,12 +872,7 @@ class PallasMLAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
-        "fp8_ds_mla",
     ]
-
-    # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
-    _DS_MLA_ROPE_HEAD_DIM = 64
-    _DS_MLA_QUANT_BLOCK = 64
 
     @staticmethod
     def get_name() -> str:
@@ -913,15 +887,6 @@ class PallasMLAttentionBackend(AttentionBackend):
         return PallasMLAttentionBackendImpl
 
     @staticmethod
-    def _is_ds_mla_packed_cache(cache_dtype_str: str | torch.dtype) -> bool:
-        # Recognizes both raw "fp8_ds_mla" string and resolved torch.uint8 dtype.
-        if isinstance(cache_dtype_str,
-                      str) and cache_dtype_str.lower().strip() == "fp8_ds_mla":
-            return True
-        return isinstance(cache_dtype_str,
-                          torch.dtype) and cache_dtype_str == torch.uint8
-
-    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
@@ -932,32 +897,13 @@ class PallasMLAttentionBackend(AttentionBackend):
         if (isinstance(cache_dtype_str, str)
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
-        if PallasMLAttentionBackend._is_ds_mla_packed_cache(cache_dtype_str):
-            # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to 128-aligned minor dim.
-            rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
-            quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
-            nope_dim = head_size - rope_head_dim
-            packed_width = sparse_packed_width(nope_dim, rope_head_dim,
-                                               quant_block)
-            kv_packing = get_dtype_packing(torch.uint8)
-            return mla_v2_kernel.get_kv_cache_shape(
-                total_num_pages=num_blocks,
-                page_size=block_size,
-                kv_dim=packed_width,
-                kv_dtype=None,
-                kv_packing=kv_packing,
-            )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        if not is_floating_dtype(kv_dtype):
-            raise NotImplementedError(
-                f"Integer KV cache dtype is not supported yet: {kv_dtype}")
         kv_packing = get_dtype_packing(kv_dtype)
-        return mla_v2_kernel.get_kv_cache_shape(
-            total_num_pages=num_blocks,
-            page_size=block_size,
-            kv_dim=head_size,
-            kv_dtype=None,
-            kv_packing=kv_packing,
+        return (
+            num_blocks,
+            cdiv(block_size, kv_packing),
+            kv_packing,
+            cdiv(head_size, 128) * 128,
         )
 
     @staticmethod
@@ -989,21 +935,6 @@ class PallasMLAttentionBackend(AttentionBackend):
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
         return 1024
-
-    @staticmethod
-    def get_min_page_size(vllm_config: VllmConfig) -> int:
-        return get_tpu_min_page_size(vllm_config)
-
-    @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        return True
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            return (1, 0, 2, 3, 4)
-        return (0, 1, 2, 3)
 
 
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
@@ -1146,6 +1077,84 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return mla_impl
 
+    def _build_sparse_mla_op(self, layer: Any):
+        """Build the GLM-5.2 sparse (DSA) MLA custom op for `layer`.
+
+        Fused KV-cache update & sparse attention evaluation in one pass.
+        Queries must be bf16 (pre-quantization); the kernel dequantizes gathered
+        KV to bf16.
+        """
+        from vllm_torchtpu.layers.common.attention_interface import \
+            sparse_mla_attention
+
+        vllm_context = get_vllm_model_wrapper_context()
+
+        # Per-tensor fp8 dequant scale for the packed nope cache -- the
+        # same checkpoint k_scale the dense path uses.
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu(
+            kv_cache: jax.Array,
+            q_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return sparse_mla_attention(
+                q_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                vllm_context.mesh,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+            )
+
+        op_name = ("pallas::sparse_mla_attention_"
+                   f"{layer.layer_name.replace('.', '_')}")
+        sparse_mla_jax_op = pallas.jax_op(op_name,
+                                          sparse_mla_attention_core_tpu,
+                                          donate_argnums=(0, ))
+
+        def _fake_sparse_mla(kv_cache, q_nope, q_pe, kv_c_normed, k_pe,
+                             topk_indices, *args, **kwargs):
+            num_tokens = q_nope.size(0)
+            out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
+            return torch.empty_like(kv_cache), torch.empty(
+                out_shape, dtype=q_nope.dtype, device=q_nope.device)
+
+        sparse_mla_jax_op.register_fake(_fake_sparse_mla)
+
+        def sparse_mla_impl(kv_cache: torch.Tensor, q_nope: torch.Tensor,
+                            q_pe: torch.Tensor, kv_c_normed: torch.Tensor,
+                            k_pe: torch.Tensor, topk_indices: torch.Tensor,
+                            seq_lens: torch.Tensor, block_tables: torch.Tensor,
+                            query_start_loc: torch.Tensor,
+                            request_distribution: torch.Tensor
+                            ) -> torch.Tensor:
+            new_kv, outputs = sparse_mla_jax_op(kv_cache, q_nope, q_pe,
+                                                kv_c_normed, k_pe,
+                                                topk_indices, seq_lens,
+                                                block_tables, query_start_loc,
+                                                request_distribution)
+            kv_cache.copy_(new_kv)
+            return outputs
+
+        return sparse_mla_impl
+
     def forward(
         self,
         layer: Any,
@@ -1178,17 +1187,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
         # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
         q_nope_t = q_nope.transpose(0, 1)
-        w_uk_t = layer.W_UK_T.to(
-            q_nope_t.dtype
-        ) if layer.W_UK_T.dtype != q_nope_t.dtype else layer.W_UK_T
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
+        ql_nope = torch.bmm(q_nope_t, layer.W_UK_T.to(q_nope_t.dtype))
         if hasattr(layer, "W_UK_T_scale"):
             ql_nope = ql_nope * layer.W_UK_T_scale
         ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
+        # Keep unquantized (bf16) query views for the sparse kernel: it
+        # dequantizes gathered KV to bf16 and has no q-scale plumbing, so
+        # it consumes bf16 queries directly. The dense op keeps its
+        # (validated) quantized inputs.
+        ql_nope_sparse = ql_nope
+        q_pe_sparse = q_pe
+
         if layer.kv_cache_quantized_dtype is not None:
+            # Enforce activation quantization across queries (`ql_nope`, `q_pe`) prior to kernel execution
+            ql_nope, _ = quantize_kv(layer.kv_cache_quantized_dtype,
+                                     ql_nope,
+                                     value=None,
+                                     k_scale=q_scale or k_scale)
+            q_pe, _ = quantize_kv(layer.kv_cache_quantized_dtype,
+                                  q_pe,
+                                  value=None,
+                                  k_scale=q_scale or k_scale)
             kv_c_normed, _ = quantize_kv(layer.kv_cache_quantized_dtype,
                                          kv_c_normed,
                                          value=None,
@@ -1198,37 +1220,57 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                   value=None,
                                   k_scale=k_scale)
 
-        if not hasattr(layer, "mla_op") or layer.mla_op is None:
-            layer.mla_op = self._build_mla_op(layer,
-                                              q_scale=q_scale,
-                                              k_scale=k_scale,
-                                              v_scale=v_scale)
-
         ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
-        outputs = layer.mla_op(
-            kv_cache,
-            ql_nope_flat,
-            q_pe_flat,
-            kv_c_normed_flat,
-            k_pe_flat,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
-        )
+        topk_indices = kwargs.get("topk_indices")
+        if topk_indices is not None:
+            if (not hasattr(layer, "sparse_mla_op")
+                    or layer.sparse_mla_op is None):
+                layer.sparse_mla_op = self._build_sparse_mla_op(layer)
+
+            ql_nope_sparse_flat = ql_nope_sparse.view(
+                -1, layer.num_heads, layer.kv_lora_rank)
+            q_pe_sparse_flat = q_pe_sparse.view(
+                -1, layer.num_heads, layer.qk_rope_head_dim)
+            outputs = layer.sparse_mla_op(
+                kv_cache,
+                ql_nope_sparse_flat,
+                q_pe_sparse_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                topk_indices,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
+        else:
+            if not hasattr(layer, "mla_op") or layer.mla_op is None:
+                layer.mla_op = self._build_mla_op(layer,
+                                                  q_scale=q_scale,
+                                                  k_scale=k_scale,
+                                                  v_scale=v_scale)
+
+            outputs = layer.mla_op(
+                kv_cache,
+                ql_nope_flat,
+                q_pe_flat,
+                kv_c_normed_flat,
+                k_pe_flat,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+            )
 
         outputs_t = outputs.reshape(-1, layer.num_heads,
                                     layer.kv_lora_rank).transpose(0, 1)
-        w_uv = layer.W_UV.to(
-            outputs_t.dtype
-        ) if layer.W_UV.dtype != outputs_t.dtype else layer.W_UV
-        out_proj = torch.bmm(outputs_t, w_uv)
+        out_proj = torch.bmm(outputs_t.to(torch.float32), layer.W_UV.to(torch.float32))
         if hasattr(layer, "W_UV_scale"):
-            out_proj = out_proj * layer.W_UV_scale
+            out_proj = out_proj * layer.W_UV_scale.to(torch.float32)
         outputs = out_proj.transpose(0, 1).to(input_dtype).reshape(
             -1, layer.num_heads * layer.v_head_dim)
 

@@ -234,9 +234,13 @@ def apply_tpu_patches() -> None:
     _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
-    from vllm_torchtpu import (_patch_disable_dp_ubatch,
+    from vllm_torchtpu import (_patch_deepseek_v2_indexer,
+                               _patch_disable_dp_ubatch,
+                               _patch_mla_prefill_backend,
                                _patch_multiproc_worker_global_rank_env,
                                _patch_per_token_group_quant_fp8_native)
+    _patch_mla_prefill_backend()
+    _patch_deepseek_v2_indexer()
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_per_token_group_quant_fp8_native()
@@ -502,6 +506,31 @@ class TpuPlatform(Platform):
     def import_kernels(cls) -> None:
         return
 
+    # Backend registration: this merge takes lihao/glm-5.2's attention.py
+    # (paired with its MLA/indexer kernels), which predates main's
+    # decorator-based registration — so register here explicitly.
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        del parser
+        from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
+                                                         register_backend)
+
+        register_backend(
+            AttentionBackendEnum.FLASH_ATTN,
+            "vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend",
+        )
+        if hasattr(AttentionBackendEnum, "FLASH_ATTN_MLA"):
+            register_backend(
+                AttentionBackendEnum.FLASH_ATTN_MLA,
+                "vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend",
+            )
+        # Experimental batched RPA — opt in via `--attention-backend CUSTOM`.
+        register_backend(
+            AttentionBackendEnum.CUSTOM,
+            "vllm_torchtpu.layers.vllm.attention."
+            "PallasBatchedRPAAttentionBackend",
+        )
+
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
         """Pick torch.distributed backend used by worker bootstrap.
@@ -555,6 +584,22 @@ class TpuPlatform(Platform):
                              **kwargs) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        backend_name = getattr(selected_backend, "name", None)
+        has_mla = hasattr(AttentionBackendEnum,
+                          "FLASH_ATTN_MLA") and (selected_backend == getattr(
+                              AttentionBackendEnum, "FLASH_ATTN_MLA"))
+        if (has_mla or backend_name == "FLASH_ATTN_MLA"
+                or getattr(attn_selector_config, "use_mla", False)):
+            logger.info("Using TPU Pallas MLA attention backend.")
+            return "vllm_torchtpu.layers.vllm.attention.PallasMLAttentionBackend"
+
+        backend_name = getattr(selected_backend, "name", None)
+        if backend_name == "CUSTOM":
+            logger.info("Using TPU Pallas attention backend (batched-RPA "
+                        "variant via CUSTOM; requires block_size=256).")
+            return ("vllm_torchtpu.layers.vllm.attention."
+                    "PallasBatchedRPAAttentionBackend")
+
         if getattr(attn_selector_config, "use_mla", False):
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
@@ -567,7 +612,13 @@ class TpuPlatform(Platform):
                         selected_backend)
             selected_backend = AttentionBackendEnum.FLASH_ATTN
         logger.info("Using %s backend.", selected_backend.name)
-        return selected_backend.get_path()
+        # Return explicit class paths: this branch's attention.py predates
+        # main's @register_backend decorators, so enum.get_path() would
+        # resolve to vLLM's default (GPU) backends.
+        if selected_backend == AttentionBackendEnum.FLASH_ATTN_MLA:
+            return ("vllm_torchtpu.layers.vllm.attention."
+                    "PallasMLAttentionBackend")
+        return "vllm_torchtpu.layers.vllm.attention.PallasAttentionBackend"
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
