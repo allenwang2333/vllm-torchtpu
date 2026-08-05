@@ -183,42 +183,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "group %s (%d bundles).", name, expected_bundles)
             return created
 
-    def _warn_if_device_capacity_short(self, device_str: str,
-                                       required: int) -> None:
-        """Name the groups holding the chips this slice is about to wait for.
-
-        A placement group is created asynchronously, so an over-subscribed
-        cluster shows up only as `_wait_until_pg_ready` never returning. Say
-        up front what is missing and who has it, rather than leaving a silent
-        several-minute wait to be diagnosed by hand.
-        """
-        try:
-            available = float(ray.available_resources().get(device_str, 0))
-            if available >= required:
-                return
-            holders = [
-                f"{pg.get('name') or '<unnamed>'} "
-                f"({pg['state']}, {len(pg['bundles'])} bundles)"
-                for pg in ray.util.placement_group_table().values()
-                if pg["state"] != "REMOVED"
-            ]
-        except Exception as exc:
-            # Purely diagnostic; never let it get between the caller and its
-            # placement group.
-            logger.debug(
-                "RayDistributedExecutorV2 | Could not read Ray resources to "
-                "check %s capacity: %r", device_str, exc)
-            return
-
-        logger.warning(
-            "RayDistributedExecutorV2 | Only %s of %d %s are free, so this "
-            "slice's placement group cannot be scheduled yet. Existing "
-            "placement groups: %s. A group left behind by a previous run "
-            "holds its chips until it is removed "
-            "(`ray.util.remove_placement_group`); `ray status` shows the "
-            "current totals.", available, required, device_str,
-            ", ".join(holders) or "none")
-
     def _remove_slice_placement_group(self) -> None:
         placement_group = self._slice_placement_group
         if not self._created_slice_pg or placement_group is None:
@@ -686,9 +650,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
         else:
             current_placement_group = ray.util.placement_group(
                 placement_group_specs, strategy="PACK")
-
-        self._warn_if_device_capacity_short(device_str,
-                                            len(placement_group_specs))
         _wait_until_pg_ready(current_placement_group)
 
         assert current_placement_group is not None
