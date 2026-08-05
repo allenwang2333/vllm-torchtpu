@@ -146,14 +146,16 @@ def parse_and_dump(file_path, record_id):
             metrics_json_str = json.dumps(metrics_dict).replace("'", "''")
             config_json_str = json.dumps(config_dict).replace("'", "''")
 
+            # metrics is ARRAY<STRUCT<type STRING, values JSON>>: one element
+            # per producing tool; this run contributes the vllm_bench group.
             sql = f"""
             INSERT INTO {bq_table} (
                 record_id, created_time, repository, run_type, model_id, metrics, config
             ) VALUES (
                 '{unique_record_id}', {bq_timestamp}, '{repository}', '{run_type}', '{model_id}',
-                STRUCT('vllm_bench',
-                       PARSE_JSON('{metrics_json_str}',
-                                  wide_number_mode=>'round')),
+                [STRUCT('vllm_bench' AS type,
+                        PARSE_JSON('{metrics_json_str}',
+                                   wide_number_mode=>'round') AS values)],
                 PARSE_JSON('{config_json_str}', wide_number_mode=>'round')
             );
             """
