@@ -220,6 +220,7 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
     assert not w13_scale[:, 32:64, :].any()
     assert torch.all(w13_scale[:, 64:96, :] == 0xff)
     assert not w13_scale[:, 96:, :].any()
+    assert torch.all(w2_scale[:, :, :1] == 0xff)
     assert not w2_scale[:, :, 1:].any()
 
 

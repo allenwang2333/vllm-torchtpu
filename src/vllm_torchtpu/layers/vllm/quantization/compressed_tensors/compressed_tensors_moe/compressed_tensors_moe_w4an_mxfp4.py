@@ -16,14 +16,14 @@ from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensor
     get_cpu_weight_loader_hook, release_memory_to_os)
 
 
+def _fresh(t: torch.Tensor) -> torch.Tensor:
+    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
+    the torch_tpu pallas boundary ships a plain row-major buffer)."""
+    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+
+
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         CompressedTensorsW4A4Mxfp4MoEMethod):
-
-    def _fresh(self, t: torch.Tensor) -> torch.Tensor:
-        """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-        the torch_tpu pallas boundary ships a plain row-major buffer)."""
-        return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
-
     """
     TPU compressed-tensors packed-weight W4AN MXFP4 MoE implementation.
     Accommodates both W4A4 and W4A16.
@@ -125,23 +125,23 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
             # Apply XLA fused requantization and kmajor layout shift
             w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
-                self._fresh(w13_weight_packed), w13_scale, requant_block)
+                _fresh(w13_weight_packed), w13_scale, requant_block)
             w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
-                self._fresh(w2_weight_packed), w2_scale, requant_block)
+                _fresh(w2_weight_packed), w2_scale, requant_block)
         else:
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]
                 # gmm_v2 scale layout: [E, num_blocks, 1, N]
-                return self._fresh(scale.movedim(-1, 1).unsqueeze(-2))
+                return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
 
             w13_scale_4d = _to_kernel_scale(w13_scale)
             w2_scale_4d = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
-            w13_weight = load_kmajor_fp4(self._fresh(w13_weight_packed))
-            w2_weight = load_kmajor_fp4(self._fresh(w2_weight_packed))
+            w13_weight = load_kmajor_fp4(_fresh(w13_weight_packed))
+            w2_weight = load_kmajor_fp4(_fresh(w2_weight_packed))
 
         # Clean up CPU scratchpads
         for parameter in (layer.w13_weight_packed, layer.w13_weight_scale,
