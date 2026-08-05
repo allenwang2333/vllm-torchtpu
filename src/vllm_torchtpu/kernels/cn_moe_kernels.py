@@ -723,11 +723,10 @@ def cn_gemv_w1w2_fused_mb_fp8(lhs,
     NBUF_W2 = max(_CN_NBUF, NUM_I_setup)
     NBUF_EFF = max(NBUF_W1, NBUF_W2)
 
-    # ---- Forward-fill IDs for EP (zero-weight → last real expert) ----
-    if use_ep:
-        effective_ids = _forward_fill_ids(sorted_ids, sorted_weights)
-    else:
-        effective_ids = sorted_ids
+    # ---- Forward-fill IDs (zero-weight → last real expert). Applies to
+    # both EP (non-local-expert masking) and TP (padding rows, once padded
+    # rows carry zero weight upstream) -- a no-op when no weight is zero.
+    effective_ids = _forward_fill_ids(sorted_ids, sorted_weights)
 
     # ---- Precompute lookahead tables (host-side, O(N_SLOTS)) ----
     seed_experts, lookahead_ids = _build_lookahead_tables(
