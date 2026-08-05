@@ -52,6 +52,7 @@ def _select_buf(ref, cur_buf, nbuf, tile_start=None, tile_size=None):
     tile_start/tile_size (static) select one tile within the slot, so
     multiple K/I-tiles can share a buffer without aliasing.
     """
+
     def _read(i):
         if tile_start is None:
             return ref[i]
@@ -80,10 +81,11 @@ def _start_w1_dma(gj, buf, k, w1_ref, w1_scale_ref, w1_bufs_ref, w1_s_bufs_ref,
         w1_scale_ref.at[pl.ds(gj, 1),
                         pl.ds(k_block_start, KB_TILE),
                         pl.ds(0, 1),
-                        pl.ds(0, 2 * ID)], w1_s_bufs_ref.at[pl.ds(buf, 1),
-                                                            pl.ds(k_block_start, KB_TILE),
-                                                            pl.ds(0, 1),
-                                                            pl.ds(0, 2 * ID)],
+                        pl.ds(0, 2 * ID)],
+        w1_s_bufs_ref.at[pl.ds(buf, 1),
+                         pl.ds(k_block_start, KB_TILE),
+                         pl.ds(0, 1),
+                         pl.ds(0, 2 * ID)],
         sem_ref.at[1 * NBUF_W1_ + buf]).start()
 
 
@@ -101,10 +103,11 @@ def _wait_w1_dma(gj, buf, k, w1_ref, w1_scale_ref, w1_bufs_ref, w1_s_bufs_ref,
         w1_scale_ref.at[pl.ds(gj, 1),
                         pl.ds(k_block_start, KB_TILE),
                         pl.ds(0, 1),
-                        pl.ds(0, 2 * ID)], w1_s_bufs_ref.at[pl.ds(buf, 1),
-                                                            pl.ds(k_block_start, KB_TILE),
-                                                            pl.ds(0, 1),
-                                                            pl.ds(0, 2 * ID)],
+                        pl.ds(0, 2 * ID)],
+        w1_s_bufs_ref.at[pl.ds(buf, 1),
+                         pl.ds(k_block_start, KB_TILE),
+                         pl.ds(0, 1),
+                         pl.ds(0, 2 * ID)],
         sem_ref.at[1 * NBUF_W1_ + buf]).wait()
 
 
@@ -122,10 +125,11 @@ def _start_w2_dma(gj, buf, m, w2_ref, w2_scale_ref, w2_bufs_ref, w2_s_bufs_ref,
         w2_scale_ref.at[pl.ds(gj, 1),
                         pl.ds(i_block_start, IB_TILE),
                         pl.ds(0, 1),
-                        pl.ds(0, H)], w2_s_bufs_ref.at[pl.ds(buf, 1),
-                                                       pl.ds(i_block_start, IB_TILE),
-                                                       pl.ds(0, 1),
-                                                       pl.ds(0, H)],
+                        pl.ds(0, H)],
+        w2_s_bufs_ref.at[pl.ds(buf, 1),
+                         pl.ds(i_block_start, IB_TILE),
+                         pl.ds(0, 1),
+                         pl.ds(0, H)],
         sem_ref.at[2 * NBUF_W1_ + NBUF_W2_ + buf]).start()
 
 
@@ -143,10 +147,11 @@ def _wait_w2_dma(gj, buf, m, w2_ref, w2_scale_ref, w2_bufs_ref, w2_s_bufs_ref,
         w2_scale_ref.at[pl.ds(gj, 1),
                         pl.ds(i_block_start, IB_TILE),
                         pl.ds(0, 1),
-                        pl.ds(0, H)], w2_s_bufs_ref.at[pl.ds(buf, 1),
-                                                       pl.ds(i_block_start, IB_TILE),
-                                                       pl.ds(0, 1),
-                                                       pl.ds(0, H)],
+                        pl.ds(0, H)],
+        w2_s_bufs_ref.at[pl.ds(buf, 1),
+                         pl.ds(i_block_start, IB_TILE),
+                         pl.ds(0, 1),
+                         pl.ds(0, H)],
         sem_ref.at[2 * NBUF_W1_ + NBUF_W2_ + buf]).wait()
 
 
@@ -233,11 +238,17 @@ def _expert_body(
         def _():
             _wait_w1_dma(gj, cur_w1_buf, k, **dma_kw_w1)
 
-        w1_fp8 = _select_buf(w1_bufs_ref, cur_w1_buf, NBUF_W1_,
-                             tile_start=k * K_TILE, tile_size=K_TILE)
+        w1_fp8 = _select_buf(w1_bufs_ref,
+                             cur_w1_buf,
+                             NBUF_W1_,
+                             tile_start=k * K_TILE,
+                             tile_size=K_TILE)
         k_block_start = (k * K_TILE) // QB
-        s1 = _select_buf(w1_s_bufs_ref, cur_w1_buf, NBUF_W1_,
-                         tile_start=k_block_start, tile_size=KB_TILE)
+        s1 = _select_buf(w1_s_bufs_ref,
+                         cur_w1_buf,
+                         NBUF_W1_,
+                         tile_start=k_block_start,
+                         tile_size=KB_TILE)
         lhs_tile = lhs_scratch_ref[pl.ds(0, M_PAD), pl.ds(k * K_TILE, K_TILE)]
 
         if DEQUANT_W1_AFTER_:
@@ -272,11 +283,17 @@ def _expert_body(
         def _():
             _wait_w2_dma(gj, cur_w2_buf, m, **dma_kw_w2)
 
-        w2_fp8 = _select_buf(w2_bufs_ref, cur_w2_buf, NBUF_W2_,
-                             tile_start=m * I_TILE, tile_size=I_TILE)
+        w2_fp8 = _select_buf(w2_bufs_ref,
+                             cur_w2_buf,
+                             NBUF_W2_,
+                             tile_start=m * I_TILE,
+                             tile_size=I_TILE)
         i_block_start = (m * I_TILE) // IB
-        s2 = _select_buf(w2_s_bufs_ref, cur_w2_buf, NBUF_W2_,
-                         tile_start=i_block_start, tile_size=IB_TILE)
+        s2 = _select_buf(w2_s_bufs_ref,
+                         cur_w2_buf,
+                         NBUF_W2_,
+                         tile_start=i_block_start,
+                         tile_size=IB_TILE)
         inter_tile = intermediate[:, m * I_TILE:(m + 1) * I_TILE]
 
         if DEQUANT_W2_AFTER_:

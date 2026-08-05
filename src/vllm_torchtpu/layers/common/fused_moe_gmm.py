@@ -17,6 +17,7 @@ import functools
 import jax
 from jax import numpy as jnp
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.cn_moe_kernels import TOP_K as CN_MOE_TOP_K
 from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
@@ -328,8 +329,7 @@ def fused_moe_func(
     # bridge, so weights are already local — no shard_map needed.
     import logging as _logging
     _lc_logger = _logging.getLogger(__name__)
-    low_conc_threshold = int(
-        __import__("os").getenv("MOE_LOW_CONC_THRESHOLD", "8"))
+    low_conc_threshold = envs.MOE_LOW_CONC_THRESHOLD
     if 1 <= num_tokens <= low_conc_threshold and topk == CN_MOE_TOP_K:
         _lc_logger.info("Taking fast low-concurrency C=N Pallas MoE path for "
                         f"BS={num_tokens} decode (use_ep={use_ep}, "
