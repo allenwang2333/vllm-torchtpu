@@ -369,7 +369,14 @@ class RayDistributedExecutorV2(RayExecutorV2):
         ])
 
         node_physical_tpu_ids: dict[str, list[int]] = defaultdict(list)
-        for node_id, physical_tpu_ids in worker_node_and_physical_tpu_ids:
+        # vLLM slots its per-engine workers by local_rank into a list sized
+        # world_size, so that index must stay within this engine. It is a
+        # different quantity from the slice-local rank computed below, which
+        # addresses the chips of the whole slice on a host.
+        engine_node_workers: dict[str, list[int]] = defaultdict(list)
+        for i, (node_id, physical_tpu_ids) in enumerate(
+                worker_node_and_physical_tpu_ids):
+            engine_node_workers[node_id].append(i)
             node_physical_tpu_ids[node_id].extend(physical_tpu_ids)
         for node_id, physical_tpu_ids in node_physical_tpu_ids.items():
             node_physical_tpu_ids[node_id] = sorted(physical_tpu_ids)
@@ -444,7 +451,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     "to chip mapping would be wrong.")
             node_ip = assignment["node_ip"]
             slice_rank = assignment["slice_rank"]
-            local_rank = host_local_rank[slice_rank]
+            # Slot inside this engine, handed to vLLM.
+            engine_local_rank = engine_node_workers[node_id].index(i)
+            # Position among the slice's chips on this host, handed to
+            # TorchTPU for physical binding.
+            slice_local_rank = host_local_rank[slice_rank]
             local_world_size = len(host_slice_ranks[node_ip])
             node_rank = node_rank_by_ip[node_ip]
             assigned_physical_tpu_ids = sorted(node_physical_tpu_ids[node_id])
@@ -472,15 +483,16 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 worker_env_vars.update(
                     slice_binding_env(
                         rank=slice_rank,
-                        local_rank=local_rank,
+                        local_rank=slice_local_rank,
                         world_size=slice_world_size,
                         local_world_size=local_world_size,
                     ))
-            self.ray_worker_handles[i].local_rank = local_rank
+            self.ray_worker_handles[i].local_rank = engine_local_rank
             logger.info(
-                "RayDistributedExecutorV2 | Worker rank=%d dp_rank=%d -> "
-                "slice_rank=%d local_rank=%d node=%s (node_rank=%d)", i,
-                dp_rank, slice_rank, local_rank, node_ip, node_rank)
+                "RayDistributedExecutorV2 | Worker rank=%d dp_rank=%d "
+                "engine_local_rank=%d -> slice_rank=%d slice_local_rank=%d "
+                "node=%s (node_rank=%d)", i, dp_rank, engine_local_rank,
+                slice_rank, slice_local_rank, node_ip, node_rank)
             # Print all environment variables that will be set on the worker
             combined_env = {**self.driver_env_vars, **worker_env_vars}
             logger.debug(
@@ -488,7 +500,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
-                    local_rank,
+                    engine_local_rank,
                     worker_env_vars,
                     self.driver_env_vars,
                     assigned_physical_gpu_ids=assigned_physical_tpu_ids,

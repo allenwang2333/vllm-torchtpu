@@ -307,8 +307,9 @@ class TestTpuRayDistributedExecutorV2:
             self, mock_mq, mock_init_method, mock_driver_env,
             mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray,
             monkeypatch):
-        # TP=2 x DP=2 over two 2-chip hosts. This engine is DP rank 1, so it
-        # owns the second window of slice ranks -- both on the second host.
+        # TP=2 x DP=4 over two 4-chip hosts. This engine is DP rank 1, so it
+        # owns slice ranks 2 and 3 -- partway along the first host's chips,
+        # which is where the per-engine and slice-local ranks diverge.
         monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
         monkeypatch.delenv("TORCH_TPU_DP_MASTER_PORT", raising=False)
         monkeypatch.delenv("TORCH_TPU_BASE_PORT", raising=False)
@@ -316,25 +317,21 @@ class TestTpuRayDistributedExecutorV2:
         mock_platform.ray_device_key = "TPU"
         mock_ray.is_initialized.return_value = True
         mock_placement_group = MagicMock()
-        mock_placement_group.bundle_specs = [{"TPU": 1.0}] * 4
+        mock_placement_group.bundle_specs = [{"TPU": 1.0}] * 8
         mock_ray.util.get_placement_group.return_value = mock_placement_group
 
-        bundle_to_node = [
-            (0, "node_1", "10.0.0.1"),
-            (1, "node_1", "10.0.0.1"),
-            (2, "node_2", "10.0.0.2"),
-            (3, "node_2", "10.0.0.2"),
-        ]
+        bundle_to_node = [(i, "node_1", "10.0.0.1") for i in range(4)]
+        bundle_to_node += [(i, "node_2", "10.0.0.2") for i in range(4, 8)]
 
         with patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node", return_value=bundle_to_node), \
-             patch("vllm_torchtpu.executors.ray_distributed_executor_v2.TPU_MULTIHOST_TOPOLOGY_MAP", {4: "1,2,2,1"}):
+             patch("vllm_torchtpu.executors.ray_distributed_executor_v2.TPU_MULTIHOST_TOPOLOGY_MAP", {8: "1,2,2,2"}):
             mock_ray.get_runtime_context().get_node_id.return_value = "node_1"
 
             self.parallel_config.world_size = 2
             self.parallel_config.tensor_parallel_size = 2
             self.parallel_config.pipeline_parallel_size = 1
             self.parallel_config.local_world_size = 2
-            self.parallel_config.data_parallel_size = 2
+            self.parallel_config.data_parallel_size = 4
             self.parallel_config.data_parallel_index = 1
             self.parallel_config.placement_group = mock_placement_group
 
@@ -348,7 +345,7 @@ class TestTpuRayDistributedExecutorV2:
             mock_ray.remote.return_value = mock_remote_class
 
             mock_ray.get.side_effect = [
-                [("node_2", [0]), ("node_2", [1])],
+                [("node_1", [2]), ("node_1", [3])],
                 [None, None],
                 [{
                     "status": "READY",
@@ -374,32 +371,41 @@ class TestTpuRayDistributedExecutorV2:
             assert all(name.endswith("_dp1") for name in actor_names)
             assert len(set(actor_names)) == 2
 
+            # vLLM slots workers into a list sized world_size, so the
+            # local_rank it is handed must stay inside this engine even though
+            # both workers sit further along the host's chips.
+            assert [
+                call[0][0] for call in
+                [a.initialize_worker.remote.call_args for a in actors]
+            ] == [0, 1]
+
             env_w0 = actors[0].initialize_worker.remote.call_args[0][1]
             env_w1 = actors[1].initialize_worker.remote.call_args[0][1]
 
-            # Slice-global ranks 2 and 3, host-local ranks 0 and 1.
+            # TorchTPU binds by the slice-local rank, which here is 2 and 3 --
+            # deliberately different from the per-engine 0 and 1 above.
             assert env_w0["TORCH_TPU_SLICE_RANK"] == "2"
-            assert env_w0["TORCH_TPU_SLICE_LOCAL_RANK"] == "0"
+            assert env_w0["TORCH_TPU_SLICE_LOCAL_RANK"] == "2"
             assert env_w1["TORCH_TPU_SLICE_RANK"] == "3"
-            assert env_w1["TORCH_TPU_SLICE_LOCAL_RANK"] == "1"
+            assert env_w1["TORCH_TPU_SLICE_LOCAL_RANK"] == "3"
             for env in (env_w0, env_w1):
-                assert env["TORCH_TPU_SLICE_WORLD_SIZE"] == "4"
-                assert env["TORCH_TPU_SLICE_LOCAL_WORLD_SIZE"] == "2"
-                assert env["LOCAL_WORLD_SIZE"] == "2"
+                assert env["TORCH_TPU_SLICE_WORLD_SIZE"] == "8"
+                assert env["TORCH_TPU_SLICE_LOCAL_WORLD_SIZE"] == "4"
+                assert env["LOCAL_WORLD_SIZE"] == "4"
                 assert env["NNODES"] == "2"
-                assert env["NODE_RANK"] == "1"
+                assert env["NODE_RANK"] == "0"
                 # Topology covers the whole DP*TP slice, not this engine.
-                assert env["TORCH_TPU_TOPOLOGY"] == "1,2,2,1"
+                assert env["TORCH_TPU_TOPOLOGY"] == "1,2,2,2"
                 assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
-                    "10.0.0.1:8070,10.0.0.1:8071,"
-                    "10.0.0.2:8070,10.0.0.2:8071")
+                    "10.0.0.1:8070,10.0.0.1:8071,10.0.0.1:8072,10.0.0.1:8073,"
+                    "10.0.0.2:8070,10.0.0.2:8071,10.0.0.2:8072,10.0.0.2:8073")
                 # One rendezvous shared by every DP engine, derived without a
                 # side channel: first port past the slicebuilder range.
-                assert env["TORCH_TPU_DP_SIZE"] == "2"
+                assert env["TORCH_TPU_DP_SIZE"] == "4"
                 assert env["TORCH_TPU_DP_MASTER_ADDR"] == "10.0.0.1"
-                assert env["TORCH_TPU_DP_MASTER_PORT"] == "8072"
+                assert env["TORCH_TPU_DP_MASTER_PORT"] == "8074"
                 assert env["MASTER_ADDR"] == "10.0.0.1"
-                assert env["MASTER_PORT"] == "8072"
+                assert env["MASTER_PORT"] == "8074"
 
             executor.ray_worker_handles = []
 
