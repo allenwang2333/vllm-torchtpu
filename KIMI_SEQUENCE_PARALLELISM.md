@@ -226,6 +226,19 @@ warmup in 0.36 seconds, after which the engine reported that no shared-memory
 broadcast block had returned for 60 seconds. This reproduces the W014 result
 and rules out a node-specific failure.
 
+The skip-enabled variant hangs at the same point, so the new `-1` routing mask
+is not the cause. Further W012 bisection also reproduced the stall after
+removing recurrent-state donation and after forcing all four diagnostic layers
+to MLA, ruling out KDA, short convolution, cache mutation, and Pallas donation.
+Splitting KDA from the compiled graph did not help. Splitting the SP
+collectives exposed a separate vLLM code-generation limitation: the stitching
+code accepts only integer `operator.getitem` indices, while the SP split graph
+contains slice indices. A validation-only extension for slice indices allowed
+that graph to compile, but eager all-gather and equivalent all-reduce
+formulations still blocked at the compiled/eager boundary. A host-side
+first-execution rendezvous also failed to remove the stall. All of these
+diagnostic changes were discarded; the PR retains only the padding-mask fix.
+
 ## Benchmark results
 
 ### Earlier TP8 utilization profiling
