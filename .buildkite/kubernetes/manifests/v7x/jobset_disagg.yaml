@@ -27,12 +27,14 @@
 # the unified layout, the servers run the proven TP8 geometry from the
 # original bring-up (KV sharded 8x, ~180KB per token per rank), changed
 # from that baseline only in:
-#   - --max-model-len 132096 (was 10240): admits the 8K-128K TTFT lengths
-#     plus decode headroom on both roles (their 252K length needs ~45GiB of
-#     KV for one request and still does not fit).
-#   - --gpu-memory-utilization 0.85 (was 0.70): one 128K request costs
-#     ~23GiB of the ~31.6GiB per-rank KV pool at 0.85. If transfer staging
-#     OOMs (the original bring-up ran 0.70 for headroom), lower this first.
+#   - --max-model-len 66560 (was 10240): admits the 8K-64K TTFT lengths
+#     plus decode headroom on both roles. The 128K and 252K lengths need
+#     ~23GiB and ~45GiB of KV for one request and do not fit the ~17GiB
+#     per-rank pool at gmu 0.70.
+#   - gpu-memory-utilization stays at the bring-up's proven 0.70: build 56
+#     ran 0.85 and the decode server OOMed (RESOURCE_EXHAUSTED) during the
+#     first transfer burst — the consumer-side KV insert needs the HBM
+#     headroom, exactly as the original bring-up found.
 # Client flags mirror the daily scripts: openai backend on /v1/completions,
 # random dataset with range-ratio 0, temperature 0, seed 42, request-rate
 # inf, percentiles 50/90/99.
@@ -124,7 +126,7 @@ spec:
                 image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
                 imagePullPolicy: IfNotPresent
                 command: [ "/bin/bash", "-c", "--" ]
-                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=132096 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.85 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
+                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=66560 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.70 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
                 env:
                 - name: HF_TOKEN
                   valueFrom:
@@ -294,7 +296,7 @@ spec:
                 image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
                 imagePullPolicy: IfNotPresent
                 command: [ "/bin/bash", "-c", "--" ]
-                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=132096 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.85 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
+                args: ["vllm serve --seed=42 --model=Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --max-model-len=66560 --max-num-batched-tokens=8192 --max-num-seqs=512 --no-enable-prefix-caching --tensor-parallel-size=8 --enable-expert-parallel --quantization=fp8 --kv-cache-dtype=fp8 --gpu-memory-utilization=0.70 --no-async-scheduling --disable-log-stats --language-model-only --attention-backend=FLASH_ATTN --mamba-cache-mode=align --no-disable-hybrid-kv-cache-manager --kv-transfer-config '{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"use_hma_connector\":true}}'"]
                 env:
                 - name: HF_TOKEN
                   valueFrom:
@@ -528,30 +530,31 @@ spec:
 
                     # Prefill throughput sweep (bench_all.sh): 8192/1 at
                     # concurrency 8-256, 512 prompts per level. The per-rank
-                    # KV pool holds ~16 concurrent 8K requests; higher tiers
-                    # are admission-queued by the server, so c>=32 measures
+                    # KV pool holds ~11 concurrent 8K requests; higher tiers
+                    # are admission-queued by the server, so c>=16 measures
                     # sustained capacity rather than true concurrency.
                     for c in 8 16 32 64 128 256; do
                       run_cell "pd_disagg_prefill_c${c}_i8192_o1.json" "$c" 8192 1 512 "ttft,e2el"
                     done
 
                     # Single-request TTFT sweep (bench_prefill_ttft.sh): 16
-                    # serial requests per input length. Their 258048 length
-                    # is omitted: one 252K request needs ~45GiB of KV, which
-                    # does not fit the per-rank pool without the unified
-                    # block pool.
-                    for ilen in 8192 16384 32768 65536 131072; do
+                    # serial requests per input length. Their 131072 and
+                    # 258048 lengths are omitted: one such request needs
+                    # ~23GiB / ~45GiB of KV, which does not fit the ~17GiB
+                    # per-rank pool without the unified block pool.
+                    for ilen in 8192 16384 32768 65536; do
                       run_cell "pd_disagg_ttft_c1_i${ilen}_o1.json" 1 "$ilen" 1 16 "ttft,e2el"
                     done
 
                     # Decode rounds: scaled stand-in for the daily
                     # C256/P65536/D1024 protocol, which needs ~2 orders of
                     # magnitude more KV than fits without the unified block
-                    # pool. C16/P8192/D1024 keeps all 16 requests truly
-                    # concurrent (~26.5GiB KV) so the TPOT plateau is real;
-                    # not directly comparable to the daily decode numbers.
+                    # pool. C8/P8192/D1024 keeps all 8 requests truly
+                    # concurrent (~13GiB of the ~17GiB pool) so the TPOT
+                    # plateau is real; not directly comparable to the daily
+                    # decode numbers.
                     for round in 1 2 3; do
-                      run_cell "pd_disagg_decode_round${round}_c16_i8192_o1024.json" 16 8192 1024 16 "ttft,tpot,itl,e2el"
+                      run_cell "pd_disagg_decode_round${round}_c8_i8192_o1024.json" 8 8192 1024 8 "ttft,tpot,itl,e2el"
                     done
 
                     echo "Benchmark complete! Results saved in /tmp/benchmark_results."
