@@ -200,9 +200,11 @@ def probe_peer_reachability(ips):
         print("note: ~/.ssh/id_rsa missing; run_multihost.sh generates one")
     user = os.environ.get("SSH_USER") or os.environ.get("USER") or "root"
     for ip in ips[1:]:
+        # Count only the numbered vfio groups, matching probe_local_chips();
+        # /dev/vfio also holds the 'vfio' control node and a 'devices' dir.
         rc, out, err = _run(
             ["ssh", *ssh_opts, f"{user}@{ip}",
-             "hostname; ls /dev/vfio 2>/dev/null | grep -vc '^vfio$' || true"],
+             "hostname; ls /dev/vfio 2>/dev/null | grep -c '^[0-9][0-9]*$' || true"],
             timeout=45)
         if rc == 0:
             lines = out.splitlines()
