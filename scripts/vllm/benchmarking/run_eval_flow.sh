@@ -187,9 +187,11 @@ run_mm_eval() {
         # existing eval regression/calibrate machinery works unmodified.
         python3 -c "
 import json
-report = json.load(open('$report_json'))
+with open('$report_json') as f:
+    report = json.load(f)
 out = {'results': {'$task': {'acc,none': report['score']}}}
-json.dump(out, open('$RESULTS_DIR/results_${task}.json', 'w'), indent=2)
+with open('$RESULTS_DIR/results_${task}.json', 'w') as f:
+    json.dump(out, f, indent=2)
 print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + ')')
 "
     else
@@ -207,11 +209,13 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
 
         python3 -c "
 import json
-report = json.load(open('$RESULTS_DIR/mmmu_eval_results.json'))
+with open('$RESULTS_DIR/mmmu_eval_results.json') as f:
+    report = json.load(f)
 acc = report.get('accuracy', 0.0)
 acc_ratio = acc / 100.0 if acc > 1.0 else acc
 out = {'results': {'$task': {'acc,none': acc_ratio}}}
-json.dump(out, open('$RESULTS_DIR/results_${task}.json', 'w'), indent=2)
+with open('$RESULTS_DIR/results_${task}.json', 'w') as f:
+    json.dump(out, f, indent=2)
 print('$task: score=' + str(acc_ratio) + ' (samples=' + str(report.get('samples', 0)) + ')')
 "
     fi

@@ -13,18 +13,19 @@ Technical Motivation:
 """
 
 import argparse
+import ast
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import io
 import json
 import os
 import re
 import sys
+import threading
 import time
 
-os.environ["VLLM_USE_V1"] = "0"
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
+from PIL import Image
 import requests
 
 
@@ -169,7 +170,6 @@ def load_mmmu_samples(
                 for item in ds:
                     if limit > 0 and len(samples) >= limit:
                         break
-                    from PIL import Image
                     images = []
                     for k in sorted(item.keys()):
                         val = item[k]
@@ -182,8 +182,6 @@ def load_mmmu_samples(
                     options_raw = item.get("options", [])
                     if isinstance(options_raw, str):
                         try:
-                            import ast
-
                             options = ast.literal_eval(options_raw)
                         except Exception:  # noqa: BLE001
                             options = []
@@ -307,8 +305,6 @@ def load_mmmu_samples(
 def evaluate_sample(sample: dict, host: str, port: int,
                     model: str) -> tuple[bool, str, str]:
     """Send a single multimodal request to vLLM /v1/chat/completions."""
-    import re
-
     url = f"http://{host}:{port}/v1/chat/completions"
     img_b64 = encode_image_base64(sample["image"])
 
@@ -396,9 +392,6 @@ def main():
     print("====================================================")
     print("  MMMU / MMMU-Pro Generative Vision Evaluation")
     print(f"  Target: http://{args.host}:{args.port}/v1/chat/completions")
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     print(f"  Concurrency: {args.concurrency} parallel workers")
     print("====================================================")
 
