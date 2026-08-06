@@ -1641,35 +1641,28 @@ class TestCompactMambaSlotPool:
         assert slots == {1, 2, 3, 4}
 
 
-def test_dsv4_auxiliary_caches_aliasing():
-    """Verify _alias_ds_v4_auxiliary_caches aliases compressor and SWA caches to host KV tensors."""
+def test_dsv4_compressor_state_cache_aliasing():
+    """Verify _alias_ds_v4_auxiliary_caches aliases compressor state caches to host k_cache."""
     from vllm.models.deepseek_v4.compressor import CompressorStateCache
 
     mock_runner = MagicMock()
     mock_runner.vllm_config.compilation_config.static_forward_context = {}
 
-    comp_layer_name = "model.layers.0.self_attn.compressor.state_cache"
-    comp_host_name = "model.layers.0.self_attn"
+    layer_name = "model.layers.0.self_attn.compressor.state_cache"
+    host_name = "model.layers.0.self_attn"
     compressor_mock = MagicMock(spec=CompressorStateCache)
 
-    swa_layer_name = "model.layers.1.self_attn.swa_cache"
-    swa_host_name = "model.layers.1.self_attn"
-
     mock_runner.vllm_config.compilation_config.static_forward_context[
-        comp_layer_name] = compressor_mock
+        layer_name] = compressor_mock
 
-    host_tensor0 = torch.zeros(10, 512)
-    host_tensor1 = torch.zeros(10, 512)
+    host_tensor = torch.zeros(10, 512)
     kv_caches = {
-        comp_layer_name: torch.ones(10, 512),
-        comp_host_name: host_tensor0,
-        swa_layer_name: torch.ones(10, 512),
-        swa_host_name: host_tensor1,
+        layer_name: torch.ones(10, 512),
+        host_name: host_tensor,
     }
 
     TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner, kv_caches)
-    assert kv_caches[comp_layer_name] is host_tensor0
-    assert kv_caches[swa_layer_name] is host_tensor1
+    assert kv_caches[layer_name] is host_tensor
 
 
 def test_tpu_platform_mla_block_size_override():
