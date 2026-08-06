@@ -226,6 +226,37 @@ warmup in 0.36 seconds, after which the engine reported that no shared-memory
 broadcast block had returned for 60 seconds. This reproduces the W014 result
 and rules out a node-specific failure.
 
+Fresh-cache W012 trials show that this stall depends on the static token
+bucket rather than simply on SP padding or collective divisibility:
+
+| Compile size | Result | Backbone compile | Initial warmup |
+|---:|:---|---:|---:|
+| 1 | stalls after warmup | - | 0.36 s |
+| 8 | stalls after warmup | completed | 0.37 s |
+| 16 | server healthy | 45.16 s | 0.37 s |
+| 32 | server healthy | 37.35 s | 0.39 s |
+
+All four trials used TEP8, model-level SP, dummy four-layer pruned K3,
+asynchronous scheduling, `max_num_batched_tokens=1024`, `max_num_seqs=1`, and
+`num_gpu_blocks_override=16`. Compile sizes 8, 16, and 32 are all divisible by
+TP8 and therefore add no reduce-scatter padding. Their different outcomes are
+further evidence that SP padding did not break an SPMD shape assumption. The
+32-token run emitted one 60-second shared-memory warning while slower ranks
+were still compiling the sampling/logprob graphs, then recovered and reached
+a healthy API server; it was not a deadlock. In this diagnostic model, 16 is
+the smallest static bucket observed to start successfully, but this does not
+yet identify the underlying runtime/compiler defect.
+
+The explicit 16-block KV override remains necessary for a safe diagnostic
+run, but it is independent of the collective stall. Repeating size 16 without
+the override made compact-hybrid sizing select 4,308,109 attention blocks and
+9 Mamba blocks, consuming its full estimated 82.19 GiB per rank and leaving no
+compilation or execution margin. The same selection occurred both with and
+without `kv_cache_memory_bytes=64 MiB`, confirming that the compact-hybrid
+path currently ignores that byte limit. Sixteen blocks provide 186 cached
+tokens for this 128-token probe while retaining HBM headroom; the value is a
+conservative benchmark setting, not a requirement imposed by SP.
+
 The skip-enabled variant hangs at the same point, so the new `-1` routing mask
 is not the cause. Further W012 bisection also reproduced the stall after
 removing recurrent-state donation and after forcing all four diagnostic layers
