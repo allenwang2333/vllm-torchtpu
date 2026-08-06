@@ -34,6 +34,8 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 # TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    "metrics_path",
+    "metrics_dir",
 })
 
 
@@ -132,6 +134,56 @@ def get_batch_composition_stats(
     }
     stats["phase"] = determine_phase_from_batch_composition_stats(stats).name
     return stats
+
+
+def dump_batch_composition_metrics(
+    metrics_dir: str,
+    scheduler_output: "VllmSchedulerOutput",
+    requests: dict[str, Any],
+    padded_total_tokens: int,
+    rank: int = 0,
+) -> None:
+    """Logs forward-pass batch sequence length composition metrics as JSONL."""
+    rank_dir = os.path.join(metrics_dir, f"rank_{rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+    metrics_file = os.path.join(rank_dir, "batch_metrics.jsonl")
+
+    decode_lens = []
+    prefill_lens = []
+    decode_context_lens = []
+    prefill_context_lens = []
+    total_tokens = 0
+
+    for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+        num_tokens_int = int(num_tokens)
+        total_tokens += num_tokens_int
+        req_state = requests.get(req_id)
+        context_len = int(req_state.num_computed_tokens) if req_state else 0
+
+        if num_tokens_int == 1:
+            decode_lens.append(num_tokens_int)
+            decode_context_lens.append(context_len)
+        else:
+            prefill_lens.append(num_tokens_int)
+            prefill_context_lens.append(context_len)
+
+    padding_tokens = padded_total_tokens - total_tokens
+
+    metrics = {
+        "rank": rank,
+        "shard_decode_lens": [decode_lens],
+        "shard_prefill_lens": [prefill_lens],
+        "shard_decode_context_lens": [decode_context_lens],
+        "shard_prefill_context_lens": [prefill_context_lens],
+        "shard_total_tokens": [total_tokens],
+        "shard_padding_tokens": [padding_tokens],
+        "total_padding_tokens": padding_tokens,
+        "total_decode_reqs": len(decode_lens),
+        "total_prefill_reqs": len(prefill_lens),
+    }
+
+    with open(metrics_file, "a") as f:
+        f.write(json.dumps(metrics) + "\n")
 
 
 class PhaseBasedProfiler:

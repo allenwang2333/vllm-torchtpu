@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    VLLM_TPU_METRICS_DIR: str | None = None
+    VLLM_TPU_METRICS_PATH: str | None = None
+    VLLM_TPU_DUMP_BATCH_METRICS: bool = False
 
 
 def env_with_choices(
@@ -279,6 +282,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunked kernel.
     "VLLM_TPU_USE_NAIVE_KDA":
     env_bool("VLLM_TPU_USE_NAIVE_KDA"),
+
+    # Path/directory to dump forward-pass batch sequence length composition metrics JSONL.
+    "VLLM_TPU_METRICS_DIR":
+    lambda: os.getenv("VLLM_TPU_METRICS_DIR") or os.getenv("TPU_METRICS_DIR")
+    or os.getenv("VLLM_TPU_METRICS_PATH") or os.getenv("TPU_METRICS_PATH"),
+    "VLLM_TPU_METRICS_PATH":
+    lambda: os.getenv("VLLM_TPU_METRICS_PATH") or os.getenv("TPU_METRICS_PATH")
+    or os.getenv("VLLM_TPU_METRICS_DIR") or os.getenv("TPU_METRICS_DIR"),
+    # Flag to guard dumping forward-pass batch composition metrics.
+    "VLLM_TPU_DUMP_BATCH_METRICS":
+    lambda: env_bool("VLLM_TPU_DUMP_BATCH_METRICS")
+    () or env_bool("TPU_DUMP_BATCH_METRICS")(),
 }
 
 

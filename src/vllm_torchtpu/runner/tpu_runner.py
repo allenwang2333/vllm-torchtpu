@@ -2526,6 +2526,27 @@ class TPUModelRunner(GPUModelRunner):
             )
             self.phase_based_profiler.step(batch_composition_stats)
 
+        metrics_dir = (envs.VLLM_TPU_METRICS_DIR or envs.VLLM_TPU_METRICS_PATH
+                       or
+                       (self.vllm_config.additional_config.get("metrics_dir")
+                        if self.vllm_config.additional_config else None) or
+                       (self.vllm_config.additional_config.get("metrics_path")
+                        if self.vllm_config.additional_config else None))
+        if not metrics_dir and envs.VLLM_TPU_DUMP_BATCH_METRICS:
+            metrics_dir = "/tmp/tpu_batch_metrics"
+
+        if metrics_dir:
+            padded_total_tokens = _get_padded_token_len(
+                self.num_tokens_paddings,
+                scheduler_output.total_num_scheduled_tokens)
+            runner_utils.dump_batch_composition_metrics(
+                metrics_dir=metrics_dir,
+                scheduler_output=scheduler_output,
+                requests=self.requests,
+                padded_total_tokens=padded_total_tokens,
+                rank=self._profiler_rank,
+            )
+
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
         # all scheduled tokens (req order); mm_embeds_flat is the concatenated
