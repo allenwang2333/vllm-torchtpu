@@ -71,7 +71,7 @@ _STANDARD_KEYS = frozenset({
     "python_tracer_level",
 })
 
-_ALLOWED_VALUE_CHARS = re.compile(r'^[a-zA-Z0-9_./,:-]*$')
+_ALLOWED_VALUE_CHARS = re.compile(r'^[a-zA-Z0-9_./,:\-\s]*$')
 _OPTION_PATTERN = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$')
 
 
@@ -536,9 +536,15 @@ class TPUWorker(WorkerBase):
             check_experimental = advanced_opts.pop(
                 "check_experimental_options", True)
 
+            logger.info("Initializing TpuProfilerConfig with the following parsed configurations:")
+            logger.info(f" -> run_dir: {self.profile_capture_dir}")
+            logger.info(f" -> standard_opts: {standard_opts}")
+            logger.info(f" -> advanced_opts (experimental_options): {advanced_opts}")
+            logger.info(f" -> check_experimental_options: {check_experimental}")
+
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
-                host_tracer_level=standard_opts.get("host_tracer_level", 2),
+                host_tracer_level=standard_opts.get("host_tracer_level", 1),
                 device_tracer_level=standard_opts.get("device_tracer_level",
                                                       1),
                 python_tracer_level=standard_opts.get("python_tracer_level",
