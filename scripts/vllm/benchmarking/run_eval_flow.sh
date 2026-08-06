@@ -147,50 +147,74 @@ run_lm_eval() {
     fi
 }
 
-# Multimodal eval via evalscope (https://evalscope.readthedocs.io/), hitting
+# Multimodal eval via evalscope or native run_mmmu_eval.py, hitting
 # the live OpenAI-compatible endpoint directly -- lm-eval has no multimodal
-# support, so mmmu_pro can't go through run_lm_eval. --limit is applied
-# *per subset* by evalscope (30 subjects in mmmu_pro), not overall, so
-# MM_EVAL_LIMIT=10 means <=300 total samples, not 10.
+# support, so mmmu_pro goes through run_mm_eval.
 run_mm_eval() {
     local task="$1"
     local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
-    local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
-    local mm_limit="${MM_EVAL_LIMIT:-4}"
-    local mm_batch_size="${MM_EVAL_BATCH_SIZE:-128}"
+    local mm_limit="${MMMU_LIMIT:-${MM_EVAL_LIMIT:-100}}"
+    local mm_concurrency="${MMMU_CONCURRENCY:-1}"
+    local mm_batch_size="${MM_EVAL_BATCH_SIZE:-1}"
 
-    echo "Running evalscope for task: $task (limit=$mm_limit/subset, eval-batch-size=$mm_batch_size)..."
-    rm -rf "$mm_workdir"
-    evalscope eval \
-        --model "$MODEL" \
-        --eval-type openai_api \
-        --api-url "http://$HOST:$PORT/v1/chat/completions" \
-        --api-key EMPTY \
-        --datasets "$task" \
-        --limit "$mm_limit" \
-        --eval-batch-size "$mm_batch_size" \
-        --no-timestamp \
-        --work-dir "$mm_workdir"
+    if command -v evalscope &>/dev/null; then
+        local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
+        local evalscope_limit="${MM_EVAL_LIMIT:-4}"
+        echo "Running evalscope for task: $task (limit=$evalscope_limit/subset, eval-batch-size=$mm_batch_size)..."
+        rm -rf "$mm_workdir"
+        evalscope eval \
+            --model "$MODEL" \
+            --eval-type openai_api \
+            --api-url "http://$HOST:$PORT/v1/chat/completions" \
+            --api-key EMPTY \
+            --datasets "$task" \
+            --limit "$evalscope_limit" \
+            --eval-batch-size "$mm_batch_size" \
+            --no-timestamp \
+            --work-dir "$mm_workdir"
 
-    local report_json
-    report_json=$(find "$mm_workdir" -path "*/reports/*/${task}.json" | head -1)
-    if [ -z "$report_json" ]; then
-        echo "::error::evalscope did not produce a ${task}.json report under $mm_workdir"
-        fail=1
-        return
-    fi
+        local report_json
+        report_json=$(find "$mm_workdir" -path "*/reports/*/${task}.json" | head -1)
+        if [ -z "$report_json" ]; then
+            echo "::error::evalscope did not produce a ${task}.json report under $mm_workdir"
+            fail=1
+            return
+        fi
 
-    # Translate evalscope's report into check_regression.py's lm-eval-style
-    # results_*.json schema ({"results": {task: {"acc,none": score}}}) so the
-    # existing eval regression/calibrate machinery works unmodified.
-    python3 -c "
+        # Translate evalscope's report into check_regression.py's lm-eval-style
+        # results_*.json schema ({"results": {task: {"acc,none": score}}}) so the
+        # existing eval regression/calibrate machinery works unmodified.
+        python3 -c "
 import json
 report = json.load(open('$report_json'))
 out = {'results': {'$task': {'acc,none': report['score']}}}
 json.dump(out, open('$RESULTS_DIR/results_${task}.json', 'w'), indent=2)
 print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + ')')
 "
+    else
+        echo "Running run_mmmu_eval.py for task: $task (limit=$mm_limit, concurrency=$mm_concurrency)..."
+        python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
+            --host "$HOST" \
+            --port "$PORT" \
+            --model "$MODEL" \
+            --dataset "MMMU/MMMU_Pro" \
+            --config "standard (4 options)" \
+            --limit "$mm_limit" \
+            --concurrency "$mm_concurrency" \
+            --allow-synthetic \
+            --results-dir "$RESULTS_DIR"
+
+        python3 -c "
+import json
+report = json.load(open('$RESULTS_DIR/mmmu_eval_results.json'))
+acc = report.get('accuracy', 0.0)
+acc_ratio = acc / 100.0 if acc > 1.0 else acc
+out = {'results': {'$task': {'acc,none': acc_ratio}}}
+json.dump(out, open('$RESULTS_DIR/results_${task}.json', 'w'), indent=2)
+print('$task: score=' + str(acc_ratio) + ' (samples=' + str(report.get('samples', 0)) + ')')
+"
+    fi
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
@@ -266,15 +290,10 @@ if [ "$RUN_CODE_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 6. Run multimodal evals (evalscope, live API endpoint)
+# 6. Run multimodal evals (evalscope or run_mmmu_eval, live API endpoint)
 # ========================================================
 if [ "$RUN_MM_EVAL" = "1" ]; then
-    if ! command -v evalscope &>/dev/null; then
-        echo "::error::--run-mm-eval requires the 'evalscope' CLI (pip install evalscope)."
-        fail=1
-    else
-        run_mm_eval "mmmu_pro"
-    fi
+    run_mm_eval "mmmu_pro"
 fi
 
 # ========================================================

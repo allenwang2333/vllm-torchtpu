@@ -37,16 +37,25 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     # host disk. Left unpruned, later configs fail with ENOSPC.
     rm -rf /root/.cache/vllm/torch_compile_cache
 
+    config_file="scripts/vllm/benchmarking/configs/${config_name}.sh"
+    is_multimodal=0
+    if [ -f "$config_file" ] && grep -qE '^\s*IS_MULTIMODAL\s*=\s*true' "$config_file" 2>/dev/null; then
+        is_multimodal=1
+    elif [[ "$config_name" == *multimodal* ]] || [[ "$config_name" == *gemma-4-31b-it* ]] || [[ "$config_name" == *gemma4-31b* ]]; then
+        is_multimodal=1
+    fi
+
     eval_args=(
         --config "$config_name"
-        --run-lm-eval
         --results-dir "/perf_eval_results/$config_name"
     )
+    if [ "$is_multimodal" -eq 1 ]; then
+        eval_args+=(--run-mm-eval)
+    else
+        eval_args+=(--run-lm-eval)
+    fi
     if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
         eval_args+=(--run-code-eval)
-    fi
-    if [[ "$config_name" == *multimodal* ]]; then
-        eval_args+=(--run-mm-eval)
     fi
 
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then
