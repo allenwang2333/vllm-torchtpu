@@ -37,13 +37,15 @@ _SKIP_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".npz", ".gguf")
 
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
-        print(f"usage: {argv[0]} gs://bucket/prefix /local/dir", file=sys.stderr)
+        print(f"usage: {argv[0]} gs://bucket/prefix /local/dir",
+              file=sys.stderr)
         return 2
 
     src, dest = argv[1], argv[2]
     if not src.startswith("gs://"):
-        print(f"[stage-tokenizer] ERROR: source must be a gs:// URI, got {src!r}",
-              file=sys.stderr)
+        print(
+            f"[stage-tokenizer] ERROR: source must be a gs:// URI, got {src!r}",
+            file=sys.stderr)
         return 2
 
     bucket_name, _, prefix = src[len("gs://"):].partition("/")
@@ -67,10 +69,11 @@ def main(argv: list[str]) -> int:
         copied += 1
 
     if copied == 0:
-        print(f"[stage-tokenizer] ERROR: no tokenizer files found under {src}. "
-              f"Checked bucket={bucket_name!r} prefix={prefix!r}; every object "
-              f"was either nested or a weights file {_SKIP_SUFFIXES}.",
-              file=sys.stderr)
+        print(
+            f"[stage-tokenizer] ERROR: no tokenizer files found under {src}. "
+            f"Checked bucket={bucket_name!r} prefix={prefix!r}; every object "
+            f"was either nested or a weights file {_SKIP_SUFFIXES}.",
+            file=sys.stderr)
         return 1
 
     print(f"[stage-tokenizer] staged {copied} file(s) into {dest}")
