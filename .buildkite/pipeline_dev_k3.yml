@@ -38,10 +38,18 @@ steps:
     agents:
       queue: tpu_v7x_32_queue
     env:
-      # 1561 GB of checkpoint. Stage 1 measured runai_streamer at 2.1 GiB/s
-      # from GCS, which puts a clean stream near 12 min/host, but hold the
-      # 4-hour budget tpu-inference-dev build 775 used so a slow or degraded
-      # read fails with worker-side logs rather than a launcher timeout.
+      # 1561 GB of checkpoint, and runai_streamer defaults to
+      # MemoryCapMode.unlimited -- it sizes its host buffer as the SUM of all
+      # chunks, i.e. the whole checkpoint. On the pod that hit a Ray OOM kill at
+      # 44% of the stream, head node at 898/944 GB (build 82). The serve command
+      # therefore pins RUNAI_STREAMER_MEMORY_LIMIT to 16 GiB per worker via
+      # --model-loader-extra-config; 8 workers per host is ~128 GiB of buffer
+      # rather than everything.
+      #
+      # Each worker still READS the whole checkpoint and keeps only its shard --
+      # tt has no sharded-read equivalent of tpu-inference's
+      # K3_SHARDED_EXPERT_STREAMING -- so the cap trades load time for fitting in
+      # RAM. Hence the 4-hour budget, same as tpu-inference-dev build 775.
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       # The CI image sets this to 1, making any compile at request time fatal.
       # The bench serves shapes the warmup sweep does not cover.
@@ -58,6 +66,7 @@ steps:
             --max-num-batched-tokens 512 \
             --max-num-seqs 1 \
             --compilation-config '{\"compile_sizes\":[16,64,256,512]}' \
+            --model-loader-extra-config '{\"memory_limit\":17179869184}' \
             --attention-backend CUSTOM \
             --trust-remote-code \
             --language-model-only \
