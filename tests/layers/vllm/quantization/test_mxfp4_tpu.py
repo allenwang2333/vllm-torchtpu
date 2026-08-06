@@ -1,5 +1,3 @@
-import os
-import tempfile
 from types import SimpleNamespace
 
 import torch
@@ -214,42 +212,3 @@ class TestMxfp4MoETPU:
         assert w2_weight_processed.dtype == torch.uint8
         assert w13_weight_scale.shape[0] == w13_weight_processed.shape[0]
         assert w2_weight_scale.shape[0] == w2_weight_processed.shape[0]
-
-    def test_mxfp4_cache_hit(self, device):
-        """Test optional on-disk cache hit path."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir
-            try:
-                # First pass populates cache
-                layer, method = _build_layer_and_method(device)
-                method.process_weights_after_loading(layer)
-
-                # Second pass hits cache
-                layer2, method2 = _build_layer_and_method(device)
-                method2.process_weights_after_loading(layer2)
-
-                assert layer2.w13_weight.shape == layer.w13_weight.shape
-                assert layer2.w2_weight.shape == layer.w2_weight.shape
-                self._run_and_check_forward(layer2, method2, device)
-            finally:
-                os.environ.pop("VLLM_FP4_CACHE_DIR", None)
-
-    def test_mxfp4_cache_path_ep_ranks(self, device):
-        """Verify distinct cache paths are generated for different EP ranks."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            os.environ["VLLM_FP4_CACHE_DIR"] = temp_dir
-            try:
-                layer, method = _build_layer_and_method(device)
-                paths = set()
-                for ep_rank in range(8):
-                    layer.moe_config.moe_parallel_config.use_ep = True
-                    layer.moe_config.moe_parallel_config.ep_rank = ep_rank
-                    layer.moe_config.moe_parallel_config.tp_rank = 0
-
-                    _, cache_path = method._get_cache_path(layer)
-                    assert f"rank_{ep_rank}_" in os.path.basename(cache_path)
-                    paths.add(cache_path)
-
-                assert len(paths) == 8
-            finally:
-                os.environ.pop("VLLM_FP4_CACHE_DIR", None)

@@ -415,35 +415,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                                     device="cpu")
         layer.weight_loader = types.MethodType(_dsv4_weight_loader, layer)
 
-    def _get_cache_path(self, layer: RoutedExperts) -> tuple[str, str]:
-        # TODO(upstream): Replace this environment-variable based startup cache
-        # with a generic vLLM weight caching mechanism in a follow-up PR.
-        cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
-        if not cache_dir:
-            return "", ""
-        layer_idx = getattr(layer, "layer_idx", id(layer))
-        moe_pcfg = getattr(layer.moe_config, "moe_parallel_config", None)
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            rank = dist.get_rank()
-        elif moe_pcfg is not None and getattr(moe_pcfg, "use_ep", False):
-            rank = getattr(moe_pcfg, "ep_rank", 0)
-        elif moe_pcfg is not None:
-            rank = getattr(moe_pcfg, "tp_rank", 0)
-        else:
-            rank = 0
-        w13_str = (f"{layer.w13_weight.shape[1]}x{layer.w13_weight.shape[2]}"
-                   if hasattr(layer, "w13_weight")
-                   and layer.w13_weight.ndim >= 3 else "default")
-        w2_str = (f"{layer.w2_weight.shape[1]}x{layer.w2_weight.shape[2]}"
-                  if hasattr(layer, "w2_weight") and layer.w2_weight.ndim >= 3
-                  else "default")
-        cache_path = os.path.join(
-            cache_dir,
-            f"rank_{rank}_layer_{layer_idx}_w13_{w13_str}_w2_{w2_str}.pt")
-        return cache_dir, cache_path
-
     def _dequantize_and_pad(
         self,
         layer: RoutedExperts,
@@ -551,63 +522,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
-        cache_dir, cache_path = self._get_cache_path(layer)
-        cached = (torch.load(cache_path, map_location="cpu")
-                  if cache_path and os.path.exists(cache_path) else None)
-
-        if cached is not None:
-            logger.info(
-                "Loading pre-quantized DeepSeek-V4 MXFP4 parameters "
-                "from cache: %s", cache_path)
-            w13_weight_processed = cached["w13_weight_packed"].to(device)
-            w2_weight_processed = cached["w2_weight_packed"].to(device)
-            w13_weight_scale = cached["w13_weight_scale"].to(device)
-            w2_weight_scale = cached["w2_weight_scale"].to(device)
-            w13_bias_padded = cached.get("w13_bias_padded")
-            w13_bias_padded = (w13_bias_padded.to(device)
-                               if w13_bias_padded is not None else None)
-            w2_bias_padded = cached.get("w2_bias_padded")
-            w2_bias_padded = (w2_bias_padded.to(device)
-                              if w2_bias_padded is not None else None)
-            self._cleanup_temp_buffers(layer)
-        else:
-            (w13_weight_padded, w2_weight_padded, w13_bias_padded,
-             w2_bias_padded,
-             orig_intermediate) = self._dequantize_and_pad(layer)
-            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-             w2_weight_scale) = self._requantize_native_fp4(
-                 w13_weight_padded, w2_weight_padded, orig_intermediate,
-                 device)
-            self._cleanup_temp_buffers(layer)
-
-            if cache_path and not os.path.exists(cache_path):
-                tmp_path = f"{cache_path}.tmp_{os.getpid()}"
-                try:
-                    os.makedirs(cache_dir, exist_ok=True)
-                    torch.save(
-                        {
-                            "w13_weight_packed":
-                            w13_weight_processed.view(torch.uint8).to("cpu"),
-                            "w2_weight_packed":
-                            w2_weight_processed.view(torch.uint8).to("cpu"),
-                            "w13_weight_scale":
-                            w13_weight_scale.to("cpu"),
-                            "w2_weight_scale":
-                            w2_weight_scale.to("cpu"),
-                            "w13_bias_padded":
-                            w13_bias_padded,
-                            "w2_bias_padded":
-                            w2_bias_padded,
-                        }, tmp_path)
-                    os.replace(tmp_path, cache_path)
-                except (PermissionError, OSError) as e:
-                    logger.warning("Failed to save disk cache to %s: %s",
-                                   cache_path, e)
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
+         orig_intermediate) = self._dequantize_and_pad(layer)
+        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+         w2_weight_scale) = self._requantize_native_fp4(
+             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+        self._cleanup_temp_buffers(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
                                               requires_grad=False)
