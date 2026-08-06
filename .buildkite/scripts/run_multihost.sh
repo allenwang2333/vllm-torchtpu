@@ -263,6 +263,13 @@ docker system prune -a --volumes -f || true
 CLUSTER_ENV_ARGS=(
   -e TPU_MULTIHOST_BACKEND=ray
   -e HF_HOME=/root/.cache/huggingface
+  # Ray's memory monitor kills workers at 95% of node memory. Its "used"
+  # figure can include reclaimable page cache, which a streaming weight load
+  # generates in bulk -- K3 was killed at 898/944 GB at three different stream
+  # positions (44%, 58%, 73%), which is what cache-driven variance looks like
+  # rather than a deterministic allocation. Set to 0 to disable the monitor and
+  # let the kernel reclaim instead. Default 250 is Ray's own default.
+  -e "RAY_memory_monitor_refresh_ms=${RAY_MEMORY_MONITOR_REFRESH_MS:-250}"
 )
 eval "declare -a EXTRA_DOCKER_ARGS_ARRAY=(${EXTRA_DOCKER_ARGS:-})"
 

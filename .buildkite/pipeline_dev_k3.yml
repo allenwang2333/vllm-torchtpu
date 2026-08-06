@@ -54,6 +54,13 @@ steps:
       # The CI image sets this to 1, making any compile at request time fatal.
       # The bench serves shapes the warmup sweep does not cover.
       VLLM_XLA_CHECK_RECOMPILATION: "0"
+      # Ray killed workers at ~898/944 GB at three different stream positions
+      # (44%, 58%, 73% in builds 82/85/83). That variance points at reclaimable
+      # page cache being counted as used rather than a deterministic
+      # allocation, so let the kernel reclaim instead of Ray killing. If the
+      # memory is genuinely anonymous this just moves the failure to the kernel
+      # OOM killer, which is no worse and tells us the same thing.
+      RAY_MEMORY_MONITOR_REFRESH_MS: "0"
     commands:
       - |
         .buildkite/scripts/run_multihost.sh \
