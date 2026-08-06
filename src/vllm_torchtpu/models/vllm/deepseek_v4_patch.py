@@ -327,40 +327,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
         def patched_load_weights(self, weights):
 
-            # Check if all expert layers have been pre-quantized and cached on disk.
-            cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-                cached_files = [
-                    f for f in os.listdir(cache_dir) if f.endswith(".pt")
-                ]
-                # Total expected cache files = (num_hidden_layers - first_k_dense_replace) * tp_size
-                from vllm.distributed import \
-                    get_tensor_model_parallel_world_size
-                first_k_dense = getattr(self.config, "first_k_dense_replace",
-                                        1)
-                num_moe_layers = self.config.num_hidden_layers - first_k_dense
-                tp_size = get_tensor_model_parallel_world_size()
-                expected_files = num_moe_layers * tp_size
-                has_all_cached = (len(cached_files) >= expected_files)
-            else:
-                has_all_cached = False
-
-            if has_all_cached:
-                import vllm.model_executor.model_loader.weight_utils as wu
-                logger.info(
-                    "All expert weights are cached on disk. Skipping MoE experts from checkpoint files."
-                )
-                _orig_should_skip_weight = wu.should_skip_weight
-
-                def patched_should_skip_weight(weight_name, local_expert_ids):
-                    if ".experts." in weight_name:
-                        return True
-                    return _orig_should_skip_weight(weight_name,
-                                                    local_expert_ids)
-
-                wu.should_skip_weight = patched_should_skip_weight
-
             self.model.has_tilelang = False
             for idx, l in enumerate(self.model.layers):  # noqa: E741
                 l.layer_idx = idx
@@ -543,43 +509,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                                 "weight_scale")
 
                         yield name, loaded_weight
-
-            # Check if all expert layers have been pre-quantized and cached on disk.
-            # If so, we can skip loading the heavy expert weights from safetensors to save CPU memory and time.
-            cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-                cached_files = [
-                    f for f in os.listdir(cache_dir) if f.endswith(".pt")
-                ]
-                # Total expected cache files = (num_hidden_layers - first_k_dense_replace) * tp_size
-                from vllm.distributed import \
-                    get_tensor_model_parallel_world_size
-                first_k_dense = getattr(self.config, "first_k_dense_replace",
-                                        1)
-                num_moe_layers = self.config.num_hidden_layers - first_k_dense
-                tp_size = get_tensor_model_parallel_world_size()
-                expected_files = num_moe_layers * tp_size
-                has_all_cached = (len(cached_files) >= expected_files)
-            else:
-                has_all_cached = False
-
-            if has_all_cached:
-                logger.warning(
-                    "[PATCH] All expert weights are cached. Skipping loading expert weights from safetensors checkpoint!"
-                )
-
-                def filter_expert_weights(weights_iter):
-                    for name, loaded_weight in weights_iter:
-                        if ".experts." in name:
-                            continue
-                        yield name, loaded_weight
-
-                weights = filter_expert_weights(weights)
-            else:
-                logger.warning(
-                    "[PATCH] Cached expert weights not found or incomplete. Loading expert weights from safetensors checkpoint to generate cache."
-                )
 
             self.hf_to_vllm_mapper = WrappedMapper()
             try:
