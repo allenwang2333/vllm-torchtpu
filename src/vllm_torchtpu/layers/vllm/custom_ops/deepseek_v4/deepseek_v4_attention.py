@@ -493,7 +493,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         swa_only = (self.compress_ratio <= 1
                     or os.getenv("DSV4_FORCE_SWA_ONLY") == "1")
         is_csa = self.compress_ratio == 4
-        two_caches_same_buffer = not swa_only
+        two_caches_same_buffer = False
         swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
         if swa_cache is not None and getattr(swa_cache, "block_size", 0) > 0:
             logical_page_size = swa_cache.block_size
