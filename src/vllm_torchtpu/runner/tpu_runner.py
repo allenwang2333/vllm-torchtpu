@@ -1671,6 +1671,10 @@ class TPUModelRunner(GPUModelRunner):
         previous one, for every mamba group, on every pool buffer hosting
         that group's layers.
         """
+        if (getattr(envs, "TPU_VLLM_ENABLE_ZERO_COPY_MAMBA", True)
+                and getattr(self.cache_config, "mamba_cache_mode", None) in ("none", "align")):
+            logger.info_once("[ZERO-COPY MAMBA] Bypassing _collect_mamba_state_seed_copies (seed copy kernels bypassed)")
+            return
         if not self._mamba_copy_plan:
             return
         live_req_ids = set(self.input_batch.req_id_to_index.keys())
@@ -1906,6 +1910,10 @@ class TPUModelRunner(GPUModelRunner):
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
+        if (getattr(envs, "TPU_VLLM_ENABLE_ZERO_COPY_MAMBA", True)
+                and getattr(self.cache_config, "mamba_cache_mode", None) in ("none", "align")):
+            logger.info_once("[ZERO-COPY MAMBA] Bypassing _flush_mamba_state_seed_copies (seed copy kernels bypassed)")
+            return
         if not self._pending_mamba_state_copies:
             return
         for raw, src_t, dst_t in self._pending_mamba_state_copies:

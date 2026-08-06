@@ -28,6 +28,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
@@ -72,9 +73,13 @@ def gdn_attention_core_tpu(
     # rolling window); only the first kernel_size - 1 columns hold data, so
     # slice them out for the kernel and write the result back into the same
     # (donated) buffer afterwards.
-    state_len = conv_state.shape[1]
+    dim_first = is_conv_state_dim_first()
+    state_len = conv_state.shape[1] if dim_first else conv_state.shape[2]
     if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
+        if dim_first:
+            conv_state_in = conv_state[:, :kernel_size - 1, :]
+        else:
+            conv_state_in = conv_state[:, :, :kernel_size - 1]
     else:
         conv_state_in = conv_state
 
@@ -108,8 +113,12 @@ def gdn_attention_core_tpu(
         # longer derives from the donated buffer, defeating the conv-cache
         # input_output_alias (a full-width alloc + copy per GDN layer per step);
         # the dynamic-update-slice keeps the write inside the donated buffer.
-        new_conv_state = conv_state.at[:, :kernel_size -
-                                       1, :].set(new_conv_state)
+        if dim_first:
+            new_conv_state = conv_state.at[:, :kernel_size -
+                                           1, :].set(new_conv_state)
+        else:
+            new_conv_state = conv_state.at[:, :, :kernel_size -
+                                           1].set(new_conv_state)
 
     return new_conv_state, new_recurrent_state, output
 
@@ -246,7 +255,9 @@ def _localize_gdn_mamba_spec_for_pcp(
     unpadded_page_size = dataclasses.replace(
         spec, page_size_padded=None).page_size_bytes
     page_size_padded = spec.page_size_padded
-    if page_size_padded == unpadded_page_size:
+    if page_size_padded is not None:
+        page_size_padded = page_size_padded // pcp_size
+    if page_size_padded == unpadded_page_size // pcp_size:
         page_size_padded = None
 
     return dataclasses.replace(
@@ -691,7 +702,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # mutation-aware custom op below, so AOT functionalization threads
             # the updated pool between layers and TorchTPU can preserve the
             # Pallas input/output alias.
-            recurrent_state.set_(new_rec)
+            if not getattr(envs, "TPU_VLLM_ENABLE_ZERO_COPY_MAMBA", True):
+                recurrent_state.copy_(new_rec)
+            else:
+                recurrent_state.set_(new_rec)
             return outputs, z
 
         stateful_op_name = ("vllm_torchtpu::gdn_attention_pooled_pcp_stateful_"

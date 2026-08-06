@@ -249,7 +249,7 @@ def time_function(func):
 
 
 def tpu_bind_kv_cache(
-    kv_caches: dict[str, torch.Tensor],
+    kv_caches: dict[str, Any],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,

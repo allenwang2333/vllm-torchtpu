@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
+import math
 import torch
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         EncoderOnlyAttentionSpec,
@@ -11,7 +12,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
-LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
+LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,159 @@ def build_kernel_block_size_by_group_id(
     return kernel_block_size_by_gid
 
 
+def _to_torch_dtype(dt: Any) -> torch.dtype:
+    if isinstance(dt, torch.dtype):
+        return dt
+    if isinstance(dt, str):
+        if hasattr(torch, dt):
+            return getattr(torch, dt)
+        if dt.startswith("torch."):
+            return getattr(torch, dt.split(".", 1)[1])
+    return torch.empty((), dtype=dt).dtype
+
+
+def make_mamba_cache_tensors(
+    raw: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    spec: MambaSpec,
+) -> list[torch.Tensor]:
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+
+    if raw.dim() > 2:
+        return [raw]
+
+    raw_nbytes = raw.numel() * raw.element_size()
+    page_bytes = int(getattr(spec, "page_size_bytes", 0) or getattr(spec, "page_size_padded", 0) or 0)
+    dtypes = (
+        tuple(spec.dtypes)
+        if hasattr(spec, "dtypes") and spec.dtypes
+        else (getattr(spec, "dtype", torch.float32),) * len(spec.shapes)
+    )
+
+    per_block_bytes_list = []
+    for i, s in enumerate(spec.shapes):
+        dt = _to_torch_dtype(dtypes[i])
+        per_block_elems = (
+            math.prod(s[1:])
+            if (raw.dim() == 2 and len(s) == raw.dim())
+            else math.prod(s)
+        )
+        per_block_bytes_list.append(per_block_elems * dt.itemsize)
+
+    total_per_block_bytes = sum(per_block_bytes_list)
+
+    if raw.dim() == 1:
+        if page_bytes > 0 and page_bytes > total_per_block_bytes:
+            num_blocks = raw_nbytes // page_bytes
+        else:
+            num_blocks = (
+                raw_nbytes // total_per_block_bytes
+                if total_per_block_bytes > 0
+                else 1
+            )
+    elif raw.dim() == 2:
+        num_blocks = raw.shape[0]
+    else:
+        num_blocks = 1
+
+    expected_state_shapes = [
+        tuple(s)
+        if (len(s) > 0 and len(s) == raw.dim() if raw.dim() == 2 else False)
+        else tuple([num_blocks] + list(s))
+        for s in spec.shapes
+    ]
+
+    if raw.dim() == 2:
+        states = []
+        elem_offset = 0
+        for i, shape in enumerate(expected_state_shapes):
+            dt = _to_torch_dtype(dtypes[i])
+            per_block_elems = (
+                math.prod(shape[1:]) if len(shape) > 1 else math.prod(shape)
+            )
+            end_offset = elem_offset + per_block_elems
+            assert end_offset <= raw.shape[1], (
+                f"Element offset {end_offset} exceeds 2D raw dim 1 size {raw.shape[1]}"
+            )
+            state = raw[:, elem_offset:end_offset].reshape(shape)
+            if state.dtype != dt:
+                if state.element_size() == dt.itemsize:
+                    state = state.contiguous().view(dt)
+                else:
+                    state = state.to(dt)
+            states.append(state)
+            elem_offset = end_offset
+        return states
+
+    if raw.dim() == 1:
+        if (
+            page_bytes > 0
+            and page_bytes > total_per_block_bytes
+            and raw_nbytes >= num_blocks * page_bytes
+        ):
+            states = []
+            storage_offset_bytes = 0
+            for i, shape in enumerate(expected_state_shapes):
+                dt = _to_torch_dtype(dtypes[i])
+                itemsize = dt.itemsize
+                per_block_bytes = per_block_bytes_list[i]
+                assert page_bytes % itemsize == 0, (
+                    f"page_bytes ({page_bytes}) must be divisible by itemsize ({itemsize})"
+                )
+                assert storage_offset_bytes % itemsize == 0, (
+                    f"storage_offset_bytes ({storage_offset_bytes}) must be divisible by itemsize ({itemsize})"
+                )
+                dense_stride = torch.empty(shape, dtype=dt).stride()
+                stride_0 = page_bytes // itemsize
+                offset_elems = storage_offset_bytes // itemsize
+                strides = (stride_0, *dense_stride[1:])
+
+                raw_dt = raw.view(dt) if raw.dtype != dt else raw
+                max_elem = (
+                    offset_elems
+                    + (num_blocks - 1) * stride_0
+                    + (
+                        sum(
+                            (d - 1) * st
+                            for d, st in zip(shape[1:], dense_stride[1:])
+                        )
+                        if len(shape) > 1
+                        else 0
+                    )
+                )
+                assert max_elem < raw_dt.numel(), (
+                    f"Max element index {max_elem} exceeds raw tensor numel {raw_dt.numel()}"
+                )
+                state = raw_dt.as_strided(shape, strides, offset_elems)
+                states.append(state)
+                storage_offset_bytes += per_block_bytes
+            return states
+        else:
+            states = []
+            byte_offset = 0
+            raw_bytes = (
+                raw.view(torch.uint8) if raw.dtype != torch.uint8 else raw
+            )
+            for i, shape in enumerate(expected_state_shapes):
+                dt = _to_torch_dtype(dtypes[i])
+                total_state_bytes = num_blocks * per_block_bytes_list[i]
+                assert byte_offset + total_state_bytes <= raw_nbytes, (
+                    f"Byte offset {byte_offset + total_state_bytes} exceeds raw nbytes {raw_nbytes}"
+                )
+                raw_slice = raw_bytes[
+                    byte_offset : byte_offset + total_state_bytes
+                ]
+                state = (
+                    raw_slice.view(dt) if raw_slice.dtype != dt else raw_slice
+                )
+                state = state.reshape(shape)
+                states.append(state)
+                byte_offset += total_state_bytes
+            return states
+
+    return [raw]
+
+
 def materialize_kv_cache_tensors(
     *,
     kv_cache_config: KVCacheConfig,
@@ -300,7 +454,7 @@ def materialize_kv_cache_tensors(
             for layer_name in group.layer_names:
                 raw = layer_to_raw[layer_name]
                 if isinstance(spec, MambaSpec):
-                    kv_caches[layer_name] = [raw]
+                    kv_caches[layer_name] = make_mamba_cache_tensors(raw, spec)
                 elif isinstance(spec, AttentionSpec):
                     kv_caches[layer_name] = raw
                 else:

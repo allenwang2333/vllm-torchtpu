@@ -9,7 +9,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.distributed.kv_transfer.v2 import \
     raiden_pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
-    format_kv_cache_layout_summary, materialize_kv_cache_tensors)
+    format_kv_cache_layout_summary, materialize_kv_cache_tensors, make_mamba_cache_tensors)
 
 
 class FakeAttentionBackend:
@@ -423,3 +423,77 @@ def test_pool_layout_summary_shows_single_pool_state():
     assert "state[0]: shape=(4, 16, 2, 2, 8)" in summary
     assert "contiguous=True" in summary
     assert "storage_offset_bytes=0" in summary
+
+
+def test_make_mamba_cache_tensors_f1_1d_byte_slicing():
+    # 1D raw tensor with dtype float32 (non-uint8)
+    num_blocks = 2
+    shape1 = (16,)  # per-block shape -> full (2, 16)
+    shape2 = (8,)   # per-block shape -> full (2, 8)
+    spec = MambaSpec(
+        shapes=[shape1, shape2],
+        dtypes=[torch.float32, torch.float16],
+        block_size=16,
+    )
+    bytes_state1 = num_blocks * 16 * torch.float32.itemsize
+    bytes_state2 = num_blocks * 8 * torch.float16.itemsize
+    total_bytes = bytes_state1 + bytes_state2
+
+    raw_float32 = torch.zeros(total_bytes // 4, dtype=torch.float32)
+    states = make_mamba_cache_tensors(raw_float32, spec)
+
+    assert len(states) == 2
+    assert states[0].shape == (2, 16)
+    assert states[0].dtype == torch.float32
+    assert states[1].shape == (2, 8)
+    assert states[1].dtype == torch.float16
+
+
+def test_make_mamba_cache_tensors_f2_shape_deduction_and_num_blocks():
+    # Unpaged vs Paged 1D raw tensor num_blocks calculation
+    shape = (4, 4)
+    spec_unpaged = MambaSpec(
+        shapes=[shape],
+        dtypes=[torch.float32],
+        block_size=16,
+    )
+    # per-block bytes = 4*4*4 = 64 bytes. For 3 blocks -> 192 bytes = 48 float32 elements.
+    raw_1d = torch.zeros(48, dtype=torch.float32)
+    states_unpaged = make_mamba_cache_tensors(raw_1d, spec_unpaged)
+    assert len(states_unpaged) == 1
+    assert states_unpaged[0].shape == (3, 4, 4)
+
+    # Paged: page_size_padded = 128 (where total_per_block_bytes = 64)
+    spec_paged = MambaSpec(
+        shapes=[shape],
+        dtypes=[torch.float32],
+        block_size=16,
+        page_size_padded=128,
+    )
+    # raw_nbytes = 256 -> num_blocks = 256 // 128 = 2
+    raw_paged = torch.zeros(64, dtype=torch.float32)  # 256 bytes
+    states_paged = make_mamba_cache_tensors(raw_paged, spec_paged)
+    assert len(states_paged) == 1
+    assert states_paged[0].shape == (2, 4, 4)
+
+
+def test_make_mamba_cache_tensors_f3_2d_type_casting():
+    # 2D raw tensor slicing with type casting requiring contiguous view
+    raw_2d = torch.zeros((4, 32), dtype=torch.uint8)
+    spec = MambaSpec(
+        shapes=[(16,)],
+        dtypes=[torch.float16],
+        block_size=16,
+    )
+    states = make_mamba_cache_tensors(raw_2d, spec)
+    assert len(states) == 1
+    assert states[0].shape == (4, 16)
+    assert states[0].dtype == torch.float16
+
+
+def test_make_mamba_cache_tensors_f4_dim_greater_than_2():
+    # raw tensor with dim > 2 returns [raw]
+    raw_3d = torch.zeros((2, 4, 8), dtype=torch.float32)
+    spec = MambaSpec(shapes=[(4, 8)], dtypes=[torch.float32], block_size=16)
+    res = make_mamba_cache_tensors(raw_3d, spec)
+    assert res == [raw_3d]

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_VLLM_ENABLE_ZERO_COPY_MAMBA: bool = True
 
 
 def env_with_choices(
@@ -293,6 +294,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":
     env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    "TPU_VLLM_ENABLE_ZERO_COPY_MAMBA":
+    env_bool("TPU_VLLM_ENABLE_ZERO_COPY_MAMBA", default=True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA":
     lambda: [
