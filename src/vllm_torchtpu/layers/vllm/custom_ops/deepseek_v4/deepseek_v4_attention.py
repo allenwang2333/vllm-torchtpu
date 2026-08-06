@@ -986,18 +986,20 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 get_tensor_model_parallel_rank
             rank = get_tensor_model_parallel_rank()
             if rank == 0:
-                logger.debug(
-                    f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}"
+                print(
+                    f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}",
+                    flush=True,
                 )
             if rank == 0 and main_prefix in ("model.layers.0.attn",
                                              "model.layers.2.attn"):
-                logger.debug(
+                print(
                     f"[DEBUG_DECODE_STEP] prefix={main_prefix} positions={positions[:6].tolist()} "
                     f"swa_seq_lens={swa_seq_lens[:3].tolist() if swa_seq_lens is not None else None} "
                     f"main_kv_lens={main_kv_lens[:3].tolist() if main_kv_lens is not None else None} "
-                    f"swa_query_start_loc={swa_query_start_loc[:3].tolist() if swa_query_start_loc is not None else None} "
-                    f"main_cu_q_lens={main_cu_q_lens[:3].tolist() if main_cu_q_lens is not None else None} "
-                    f"extra[:6]={(extra[:6].tolist() if extra.dim() == 1 else extra[:6].tolist())}"
+                    f"swa_block_tables={swa_block_tables[:3].tolist() if swa_block_tables is not None else None} "
+                    f"main_page_indices={main_page_indices[:3].tolist() if main_page_indices is not None else None} "
+                    f"extra[:6]={(extra[:6].tolist() if extra.dim() == 1 else extra[:6].tolist())}",
+                    flush=True,
                 )
 
         # Read-side counterpart to DSV4_DEBUG_COMPRESSOR's dequant check:
