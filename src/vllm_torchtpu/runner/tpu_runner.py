@@ -4331,14 +4331,14 @@ class TPUModelRunner(GPUModelRunner):
             for raw in self.kv_cache_raw_tensors:
                 sync.synchronize(raw, wait=True)
 
-        logger.info(
-            "%s",
+        print(
             format_kv_cache_layout_summary(
                 kv_cache_config=kv_cache_config,
                 kv_caches=kv_caches,
                 raw_tensors=self.kv_cache_raw_tensors,
                 attn_groups=self.attn_groups,
             ),
+            flush=True,
         )
 
         self.kv_caches = []
