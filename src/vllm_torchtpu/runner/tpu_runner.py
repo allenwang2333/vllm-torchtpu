@@ -1069,28 +1069,36 @@ class TPUModelRunner(GPUModelRunner):
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    def _alias_ds_v4_compressor_state_caches(
+    def _alias_ds_v4_auxiliary_caches(
             self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Point each DeepSeek-V4 compressor state cache at its host's tensor."""
+        """Point DeepSeek-V4 compressor state and SWA caches at their host's tensor."""
         static_forward_context = (
             self.vllm_config.compilation_config.static_forward_context)
         state_suffix = ".compressor.state_cache"
         for layer_name in list(kv_caches.keys()):
             attn_module = static_forward_context.get(layer_name)
-            if not isinstance(attn_module, CompressorStateCache):
+            if isinstance(
+                    attn_module,
+                    CompressorStateCache) or layer_name.endswith(state_suffix):
+                assert layer_name.endswith(state_suffix), layer_name
+                base = layer_name[:-len(state_suffix)]
+                # Map compressor state cache layer name to host attention layer's k_cache.
+                host_layer_name = base + ".k_cache" if base.endswith(
+                    ".indexer") else base
+            elif (layer_name.endswith(".swa_cache")
+                  or layer_name.endswith(".swa_cache_layer")
+                  or (attn_module is not None and type(attn_module).__name__
+                      in ("DeepseekV4SWACache", "VllmDeepseekV4SWACache"))):
+                host_layer_name = (layer_name.removesuffix(
+                    ".swa_cache").removesuffix(".swa_cache_layer"))
+            else:
                 continue
-            assert layer_name.endswith(state_suffix), layer_name
-            base = layer_name[:-len(state_suffix)]
-            # Map compressor state cache layer name to host attention layer's k_cache.
-            host_layer_name = base + ".k_cache" if base.endswith(
-                ".indexer") else base
+
             if host_layer_name not in kv_caches:
                 raise ValueError(
-                    "DeepSeek-V4 compressor state cache has no "
-                    "compressed-KV layer to overlay: "
-                    f"state_cache={layer_name!r}, expected KV layer "
-                    f"{host_layer_name!r}, known layers="
-                    f"{sorted(kv_caches.keys())}")
+                    "DeepSeek-V4 auxiliary cache has no host KV layer to overlay: "
+                    f"cache={layer_name!r}, expected KV layer {host_layer_name!r}, "
+                    f"known layers={sorted(kv_caches.keys())}")
             kv_caches[layer_name] = kv_caches[host_layer_name]
 
     def _update_attention_page_size_padded(
@@ -4568,7 +4576,7 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     raise NotImplementedError
 
-        self._alias_ds_v4_compressor_state_caches(kv_caches)
+        self._alias_ds_v4_auxiliary_caches(kv_caches)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile

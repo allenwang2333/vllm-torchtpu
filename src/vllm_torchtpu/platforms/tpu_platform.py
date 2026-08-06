@@ -893,10 +893,7 @@ class TpuPlatform(Platform):
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
-        if hasattr(backend_cls, "get_min_page_size"):
-            min_page_size = backend_cls.get_min_page_size(vllm_config)
-        else:
-            min_page_size = 1
+        min_page_size = backend_cls.get_min_page_size(vllm_config)
         if min_page_size > cache_config.block_size:
             logger.warning(
                 "Increase the page size from %s to %s to make sure there's"
