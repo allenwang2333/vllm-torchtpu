@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import os
+import sys
+
+# Set high Python recursion limit, default limit (1000) hit during dsv4 compile
+sys.setrecursionlimit(50000)
 
 # Disable CUDA-specific shared experts stream for TPU
 # This prevents errors when trying to create CUDA streams on TPU hardware
