@@ -29,11 +29,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowMLASpec)
-
-if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
-    DeepseekSparseSWABackend.get_min_page_size = classmethod(
-        lambda cls, vllm_config: 1)
-
 from vllm_torchtpu.kernels.deepseek_v4.mla import mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.mla_swa import \
     mla_sliding_window_ragged_paged_attention
@@ -1397,6 +1392,11 @@ def patch_deepseek_v4_mla_cls() -> None:
     if hasattr(ds_v4_amd_model, "DeepseekV4ROCMAiterMLAAttention"):
         ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention
     dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
+    if hasattr(ds_v4_amd_model, "DeepseekV4SWACache"):
+        ds_v4_amd_model.DeepseekV4SWACache = VllmDeepseekV4SWACache
+    if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
+        DeepseekSparseSWABackend.get_min_page_size = classmethod(
+            lambda cls, vllm_config: 1)
     logger.info(
         "Patched DeepseekV4Attention, DeepseekV4ROCMAiterMLAAttention and DeepseekV4SWACache for TPU."
     )
