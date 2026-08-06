@@ -47,7 +47,7 @@ scaling.
 
 import os
 import types
-from typing import Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 import torch
@@ -263,11 +263,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=getattr(layer, "w2_bias", None),
         )
 
+    rhs_quant_dtype: Any = None
+
     def _forward_monolithic_tpu(
         self,
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
@@ -285,6 +288,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
             )
         else:
+            select_kwargs = {}
+            if input_ids is not None:
+                select_kwargs["input_ids"] = input_ids
             topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -292,6 +298,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=layer.scoring_func,
                 layer=layer,
+                **select_kwargs,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -309,6 +316,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
         )
 
 
@@ -370,6 +378,7 @@ def _dsv4_weight_loader(self,
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
+    rhs_quant_dtype = jnp.float4_e2m1fn
 
     def create_weights(
         self,
@@ -628,51 +637,5 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
-        )
-
-    def _forward_monolithic_tpu(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        activation_str = layer._tpu_activation_str
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            select_kwargs = {}
-            if input_ids is not None:
-                select_kwargs["input_ids"] = input_ids
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-                layer=layer,
-                **select_kwargs,
-            )
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=getattr(layer, "w13_bias", None),
-            w2_bias=getattr(layer, "w2_bias", None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
