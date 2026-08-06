@@ -45,9 +45,8 @@ scaling.
    - Returns output tensor
 """
 
-import os
 import types
-from typing import Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 import torch
@@ -263,11 +262,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=getattr(layer, "w2_bias", None),
         )
 
+    rhs_quant_dtype: Any = None
+
     def _forward_monolithic_tpu(
         self,
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
@@ -285,6 +287,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
             )
         else:
+            select_kwargs = {}
+            if input_ids is not None:
+                select_kwargs["input_ids"] = input_ids
             topk_weights, topk_ids = moe_routing.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -292,6 +297,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 renormalize=layer.renormalize,
                 scoring_fn=layer.scoring_func,
                 layer=layer,
+                **select_kwargs,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -309,11 +315,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             experts_start=layer._experts_start,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
         )
 
 
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
-                          if envs.MOE_REQUANTIZE_BLOCK_SIZE else 32)
+                          if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
 
 
 def _dsv4_weight_loader(self,
@@ -370,6 +377,7 @@ def _dsv4_weight_loader(self,
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
+    rhs_quant_dtype = jnp.float4_e2m1fn
 
     def create_weights(
         self,
@@ -405,33 +413,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                                     dtype=torch.uint8,
                                     device="cpu")
         layer.weight_loader = types.MethodType(_dsv4_weight_loader, layer)
-
-    def _get_cache_path(self, layer: RoutedExperts) -> tuple[str, str]:
-        cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR", "")
-        if not cache_dir:
-            return "", ""
-        layer_idx = getattr(layer, "layer_idx", id(layer))
-        moe_pcfg = getattr(layer.moe_config, "moe_parallel_config", None)
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            rank = dist.get_rank()
-        elif moe_pcfg is not None and getattr(moe_pcfg, "use_ep", False):
-            rank = getattr(moe_pcfg, "ep_rank", 0)
-        elif moe_pcfg is not None:
-            rank = getattr(moe_pcfg, "tp_rank", 0)
-        else:
-            rank = 0
-        w13_str = (f"{layer.w13_weight.shape[1]}x{layer.w13_weight.shape[2]}"
-                   if hasattr(layer, "w13_weight")
-                   and layer.w13_weight.ndim >= 3 else "default")
-        w2_str = (f"{layer.w2_weight.shape[1]}x{layer.w2_weight.shape[2]}"
-                  if hasattr(layer, "w2_weight") and layer.w2_weight.ndim >= 3
-                  else "default")
-        cache_path = os.path.join(
-            cache_dir,
-            f"rank_{rank}_layer_{layer_idx}_w13_{w13_str}_w2_{w2_str}.pt")
-        return cache_dir, cache_path
 
     def _dequantize_and_pad(
         self,
@@ -530,6 +511,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             del layer.w13_bias, layer.w2_bias
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        # TODO(upstream): Extract generic on-disk quantization cache to a
+        # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
         device = layer.w13_weight.device
 
@@ -538,63 +521,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
-        cache_dir, cache_path = self._get_cache_path(layer)
-        cached = (torch.load(cache_path, map_location="cpu")
-                  if cache_path and os.path.exists(cache_path) else None)
-
-        if cached is not None:
-            logger.info(
-                "Loading pre-quantized DeepSeek-V4 MXFP4 parameters "
-                "from cache: %s", cache_path)
-            w13_weight_processed = cached["w13_weight_packed"].to(device)
-            w2_weight_processed = cached["w2_weight_packed"].to(device)
-            w13_weight_scale = cached["w13_weight_scale"].to(device)
-            w2_weight_scale = cached["w2_weight_scale"].to(device)
-            w13_bias_padded = cached.get("w13_bias_padded")
-            w13_bias_padded = (w13_bias_padded.to(device)
-                               if w13_bias_padded is not None else None)
-            w2_bias_padded = cached.get("w2_bias_padded")
-            w2_bias_padded = (w2_bias_padded.to(device)
-                              if w2_bias_padded is not None else None)
-            self._cleanup_temp_buffers(layer)
-        else:
-            (w13_weight_padded, w2_weight_padded, w13_bias_padded,
-             w2_bias_padded,
-             orig_intermediate) = self._dequantize_and_pad(layer)
-            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-             w2_weight_scale) = self._requantize_native_fp4(
-                 w13_weight_padded, w2_weight_padded, orig_intermediate,
-                 device)
-            self._cleanup_temp_buffers(layer)
-
-            if cache_path and not os.path.exists(cache_path):
-                tmp_path = f"{cache_path}.tmp_{os.getpid()}"
-                try:
-                    os.makedirs(cache_dir, exist_ok=True)
-                    torch.save(
-                        {
-                            "w13_weight_packed":
-                            w13_weight_processed.view(torch.uint8).to("cpu"),
-                            "w2_weight_packed":
-                            w2_weight_processed.view(torch.uint8).to("cpu"),
-                            "w13_weight_scale":
-                            w13_weight_scale.to("cpu"),
-                            "w2_weight_scale":
-                            w2_weight_scale.to("cpu"),
-                            "w13_bias_padded":
-                            w13_bias_padded,
-                            "w2_bias_padded":
-                            w2_bias_padded,
-                        }, tmp_path)
-                    os.replace(tmp_path, cache_path)
-                except (PermissionError, OSError) as e:
-                    logger.warning("Failed to save disk cache to %s: %s",
-                                   cache_path, e)
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
+         orig_intermediate) = self._dequantize_and_pad(layer)
+        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+         w2_weight_scale) = self._requantize_native_fp4(
+             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+        self._cleanup_temp_buffers(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
                                               requires_grad=False)
@@ -610,13 +542,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             layer.w2_bias = torch.nn.Parameter(w2_bias_padded.to(device),
                                                requires_grad=False)
 
-        if device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
-            if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
-                sync.synchronize(layer.w13_bias, wait=True)
-            if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
-                sync.synchronize(layer.w2_bias, wait=True)
+        sync.synchronize(layer.w13_weight, wait=True)
+        sync.synchronize(layer.w2_weight, wait=True)
+        if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
+            sync.synchronize(layer.w13_bias, wait=True)
+        if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
+            sync.synchronize(layer.w2_bias, wait=True)
 
         logger.info(
             "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
@@ -628,51 +559,5 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
-        )
-
-    def _forward_monolithic_tpu(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        activation_str = layer._tpu_activation_str
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            select_kwargs = {}
-            if input_ids is not None:
-                select_kwargs["input_ids"] = input_ids
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-                layer=layer,
-                **select_kwargs,
-            )
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=getattr(layer, "w13_bias", None),
-            w2_bias=getattr(layer, "w2_bias", None),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
