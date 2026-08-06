@@ -650,7 +650,6 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
 
         self._init_phased_profiling()
-        self._tpu_kv_zero_layers: list[str] = []
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -2276,42 +2275,7 @@ class TPUModelRunner(GPUModelRunner):
         # so letting the base also correct would double-count.
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
-        self._sync_kv_caches_before_step()
         return super()._update_states(scheduler_output)
-
-    def _init_kv_zero_meta(self, layer_name_to_spec: dict) -> None:
-        """Collect sliding-window layer's KV cache tensor for
-        `_sync_kv_caches_before_step`.
-        """
-        self._tpu_kv_zero_layers = [
-            layer_name for layer_name, spec in layer_name_to_spec.items()
-            if isinstance(spec, SlidingWindowSpec)
-        ]
-
-    def _sync_kv_caches_before_step(self) -> None:
-        """Unconditionally sync sliding-window attention layer's KV cache tensor
-        before each step's forward pass.
-
-        torch_tpu's `DEFER_AND_FUSE` lazy execution does not otherwise
-        guarantee a KV cache write is materialized before a later step reads
-        the same tensor after HMA reassigns a physical block to a new
-        request. Without this, sliding-window models silently corrupt
-        output once a sequence crosses the window under load (see
-        Gemma4-MoE-EP-CoreHalt-RCA.md for the full investigation, including
-        the A/B experiment establishing that the sync barrier itself is
-        what fixes this -- leaving stale block content completely untouched
-        and only syncing was equally sufficient as actually clearing it).
-        """
-        # Eagerly materialize each layer's sync before moving to the next:
-        # torch_tpu's default DEFER_AND_FUSE eager mode otherwise lets
-        # per-layer pending ops for all 30 layers pile up, spiking peak
-        # memory past the (deliberately tight, gpu_memory_utilization-sized)
-        # headroom and OOMing (seen previously with the write-based version
-        # of this fix).
-        for layer_name in self._tpu_kv_zero_layers:
-            kv_cache = self.vllm_config.compilation_config.static_forward_context[
-                layer_name].kv_cache
-            sync.synchronize(kv_cache, wait=True)
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:
@@ -5530,8 +5494,6 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
-
-        self._init_kv_zero_meta(layer_name_to_spec)
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
