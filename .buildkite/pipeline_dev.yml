@@ -18,18 +18,20 @@
 # all visible, and never initializes the TPU runtime -- on a multi-host slice
 # that would block until every peer VM joins.
 #
-# tpu_v7x_16_queue, not tpu_v7x_32_queue: the 16-chip agents are provisioned by
-# ci-infra terraform (modules/ci_v7x, instance_count 3) whose startup script
-# installs the GitHub App git credential helper plus
-# url."https://github.com/".insteadOf "git@github.com:", so they can check out
-# this private repo. The single tpu7x-32 agent is hand-built and not in that
-# terraform, so it has neither and fails checkout with "Permission denied
-# (publickey)" (vllm-torchtpu-dev builds 71-73).
+# On tpu_v7x_32_queue this doubles as the checkout test. That agent is
+# hand-built rather than provisioned by ci-infra terraform (modules/ci_v7x
+# covers tpu7x-2/8/16 only), so it was missing the GitHub App git credential
+# helper and the url."https://github.com/".insteadOf "git@github.com:" rewrite
+# that let every other agent check out this private repo -- checkout failed
+# 6/6 with "Permission denied (publickey)" (builds 71-73). The helper was
+# installed by hand on 2026-08-06; a green checkout here confirms it, since
+# the helper needs a job-scoped agent token and cannot be tested from a shell.
+# The probe itself already passed on tpu_v7x_16_queue (build 74).
 
 steps:
-  - label: ":mag: tpu7x-16 multi-host probe (read-only)"
-    key: tpu7x_16_multihost_probe
+  - label: ":mag: tpu7x-32 multi-host probe (read-only)"
+    key: tpu7x_32_multihost_probe
     agents:
-      queue: tpu_v7x_16_queue
+      queue: tpu_v7x_32_queue
     commands:
       - python3 .buildkite/scripts/multihost_probe.py
