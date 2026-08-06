@@ -77,8 +77,8 @@ def patch_cuda_stubs() -> tuple:
     torch.cuda.Event = DummyCudaEvent
 
     try:
-        from vllm.v1.attention.backends.mla.sparse_swa import (
-            DeepseekSparseSWABackend)
+        from vllm.v1.attention.backends.mla.sparse_swa import \
+            DeepseekSparseSWABackend
         if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
             DeepseekSparseSWABackend.get_min_page_size = classmethod(
                 lambda cls, vllm_config: 1)
