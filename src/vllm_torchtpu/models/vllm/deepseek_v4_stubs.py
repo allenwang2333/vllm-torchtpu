@@ -76,4 +76,13 @@ def patch_cuda_stubs() -> tuple:
     torch.cuda.Stream = DummyCudaStream
     torch.cuda.Event = DummyCudaEvent
 
+    try:
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            DeepseekSparseSWABackend)
+        if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
+            DeepseekSparseSWABackend.get_min_page_size = classmethod(
+                lambda cls, vllm_config: 1)
+    except (ImportError, AttributeError):
+        pass
+
     return _orig_get_device_capability, _orig_cuda_stream, _orig_cuda_event

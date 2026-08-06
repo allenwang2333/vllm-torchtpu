@@ -24,10 +24,14 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4 import attention as dsv4_attention
-from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowMLASpec)
+
+if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
+    DeepseekSparseSWABackend.get_min_page_size = classmethod(
+        lambda cls, vllm_config: 1)
 
 from vllm_torchtpu.kernels.deepseek_v4.mla import mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.mla_swa import \
