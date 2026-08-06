@@ -181,8 +181,8 @@ class TestMxfp4MoETPU:
 
         assert layer.w13_weight.dtype == torch.uint8
         assert layer.w2_weight.dtype == torch.uint8
-        assert layer.w13_weight_scale.dtype == torch.uint8
-        assert layer.w2_weight_scale.dtype == torch.uint8
+        assert layer.w13_weight_scale.dtype in (torch.float32, torch.bfloat16)
+        assert layer.w2_weight_scale.dtype in (torch.float32, torch.bfloat16)
 
         self._run_and_check_forward(layer, method, device)
 
