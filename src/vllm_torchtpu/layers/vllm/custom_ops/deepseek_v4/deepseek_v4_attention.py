@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
@@ -326,6 +327,14 @@ def _deepseek_v4_attention_jax(
     return res_out, res_cache
 
 
+class VllmDeepseekSparseSWABackend(DeepseekSparseSWABackend):
+    """TPU attention backend for DeepSeek-V4 SWA cache."""
+
+    @classmethod
+    def get_min_page_size(cls, vllm_config: VllmConfig) -> int:
+        return 1
+
+
 class VllmDeepseekV4SWACache(DeepseekV4SWACache):
 
     def __init__(
@@ -355,6 +364,9 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=None,
         )
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return VllmDeepseekSparseSWABackend
 
 
 _orig_ds_v4_attention_cls = getattr(
