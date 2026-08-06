@@ -151,6 +151,11 @@ cleanup() {
        sudo -n rm -rf /tmp/ray/* >/dev/null 2>&1 || true" || true
   done
 
+  if [[ -f /tmp/ray_head.log ]]; then
+    echo "===== Ray head (last 50 lines) ====="
+    tail -n 50 /tmp/ray_head.log
+  fi
+
   rm -f /tmp/vllm_serve.log
   docker cp "${CONTAINER_NAME}:${SERVE_LOG}" /tmp/vllm_serve.log >/dev/null 2>&1 || true
   if [[ -f /tmp/vllm_serve.log ]]; then
@@ -181,14 +186,14 @@ wait_for_server() {
   # builtin, so liveness checking needs nothing installed in the image.
   local pid=""
   for ((i = 0; i < 30; i++)); do
-    pid=$(docker exec "${CONTAINER_NAME}" cat "${SERVE_PID}" 2>/dev/null || true)
+    pid=$(docker exec "${CONTAINER_NAME}" bash -c "cat ${SERVE_PID}" 2>/dev/null || true)
     [[ -n "${pid}" ]] && break
     sleep 2
   done
   if [[ -z "${pid}" ]]; then
     echo "[multihost] ERROR: vllm serve never wrote ${SERVE_PID} inside container" \
          "'${CONTAINER_NAME}' — it failed before exec. Dumping ${SERVE_LOG}:" >&2
-    docker exec "${CONTAINER_NAME}" cat "${SERVE_LOG}" || true
+    docker exec "${CONTAINER_NAME}" bash -c "cat ${SERVE_LOG}" || true
     return 1
   fi
   echo "[multihost] vllm serve pid=${pid}"
@@ -200,19 +205,20 @@ wait_for_server() {
       echo "[multihost] server healthy on port ${port}"
       return 0
     fi
-    if ! docker exec "${CONTAINER_NAME}" kill -0 "${pid}" 2>/dev/null; then
+    if ! docker exec "${CONTAINER_NAME}" bash -c "kill -0 ${pid}" 2>/dev/null; then
       echo "[multihost] ERROR: vllm serve (pid ${pid}) died inside the container" \
            "before becoming healthy. Dumping ${SERVE_LOG}:" >&2
-      docker exec "${CONTAINER_NAME}" cat "${SERVE_LOG}" || true
+      docker exec "${CONTAINER_NAME}" bash -c "cat ${SERVE_LOG}" || true
       return 1
     fi
     # Fast-fail on a crashed engine that leaves the API server zombied.
     if [[ $((loop_count % 3)) -eq 0 ]]; then
-      if docker exec "${CONTAINER_NAME}" grep -q -E \
-          "EngineCore failed to start|ActorDiedError" "${SERVE_LOG}" 2>/dev/null; then
+      if docker exec "${CONTAINER_NAME}" bash -c \
+          "grep -q -E 'EngineCore failed to start|ActorDiedError' ${SERVE_LOG}" \
+          2>/dev/null; then
         echo "[multihost] ERROR: fatal vLLM engine crash detected in ${SERVE_LOG}" \
              "(EngineCore failed to start / ActorDiedError). Dumping log:" >&2
-        docker exec "${CONTAINER_NAME}" cat "${SERVE_LOG}" || true
+        docker exec "${CONTAINER_NAME}" bash -c "cat ${SERVE_LOG}" || true
         return 1
       fi
     fi
@@ -222,7 +228,7 @@ wait_for_server() {
 
   echo "[multihost] ERROR: server did not become healthy on port ${port} within" \
        "${timeout}s. Dumping ${SERVE_LOG}:" >&2
-  docker exec "${CONTAINER_NAME}" cat "${SERVE_LOG}" || true
+  docker exec "${CONTAINER_NAME}" bash -c "cat ${SERVE_LOG}" || true
   return 1
 }
 
