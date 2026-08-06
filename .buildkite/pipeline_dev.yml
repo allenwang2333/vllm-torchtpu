@@ -64,14 +64,17 @@ steps:
             --no-async-scheduling \
             --load-format runai_streamer \
             --gpu-memory-utilization 0.9" \
-          "vllm bench serve \
+          "python3 .buildkite/scripts/stage_tokenizer.py \
+             gs://tpu-commons-ci/moonshootai/kimi/linear-48b /tmp/tok \
+           && vllm bench serve \
             --host 127.0.0.1 --port 8000 \
             --model moonshotai/Kimi-Linear \
+            --tokenizer /tmp/tok \
             --trust-remote-code \
             --dataset-name random \
             --random-input-len 8192 \
             --random-output-len 1024 \
-            --random-range-ratio 0.8 \
+            --random-range-ratio 0 \
             --num-prompts 10 \
             --max-concurrency 1 \
             --ignore-eos --seed 42 \
