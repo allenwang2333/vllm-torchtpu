@@ -1,0 +1,81 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Multi-host bring-up for tt, stage 3: Kimi-K3 on the tpu7x-32 pod, 8k/1k at
+# batch size 1. Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3.yml
+# so pipeline_dev.yml stays on the cheaper stage-2 rehearsal.
+#
+# Run this only after stage 2 (Kimi-Linear-48B on tpu_v7x_16_queue) is green:
+# both go through the same tt class, so stage 2 clears the model and the
+# launcher, leaving scale as the only new variable here.
+#
+# The slice is ranlihao-v7x-32 -- someone else's pod. Coordinate before running,
+# and note its queue has been dispatch-paused before.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":rocket: tpu7x-32 multi-host Kimi-K3 8k/1k bs=1"
+    key: tpu7x_32_k3
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      # 1561 GB of checkpoint. Stage 1 measured runai_streamer at 2.1 GiB/s
+      # from GCS, which puts a clean stream near 12 min/host, but hold the
+      # 4-hour budget tpu-inference-dev build 775 used so a slow or degraded
+      # read fails with worker-side logs rather than a launcher timeout.
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # The CI image sets this to 1, making any compile at request time fatal.
+      # The bench serves shapes the warmup sweep does not cover.
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+    commands:
+      - |
+        .buildkite/scripts/run_multihost.sh \
+          "vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+            --served-model-name moonshotai/Kimi-K3 \
+            --port 8000 \
+            --tensor-parallel-size 32 \
+            --enable-expert-parallel \
+            --max-model-len 9216 \
+            --max-num-batched-tokens 512 \
+            --max-num-seqs 1 \
+            --compilation-config '{\"compile_sizes\":[16,64,256,512]}' \
+            --attention-backend CUSTOM \
+            --trust-remote-code \
+            --language-model-only \
+            --limit-mm-per-prompt '{\"image\":0,\"video\":0}' \
+            --no-enable-prefix-caching \
+            --no-async-scheduling \
+            --load-format runai_streamer \
+            --gpu-memory-utilization 0.9" \
+          "vllm bench serve \
+            --host 127.0.0.1 --port 8000 \
+            --model moonshotai/Kimi-K3 \
+            --trust-remote-code \
+            --dataset-name random \
+            --random-input-len 8192 \
+            --random-output-len 1024 \
+            --random-range-ratio 0.8 \
+            --num-prompts 10 \
+            --max-concurrency 1 \
+            --ignore-eos --seed 42 \
+            --percentile-metrics ttft,tpot,itl,e2el \
+            --metric-percentiles 50,90,99"
