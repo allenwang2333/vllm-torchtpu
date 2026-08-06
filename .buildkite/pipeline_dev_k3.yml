@@ -31,7 +31,7 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: ":rocket: tpu7x-32 multi-host Kimi-K3 8k/1k bs=1"
+  - label: ":rocket: tpu7x-32 multi-host Kimi-K3 1k/1k bs=1 (max-model-len 4096)"
     key: tpu7x_32_k3
     depends_on: build_docker
     timeout_in_minutes: 420
@@ -62,7 +62,7 @@ steps:
             --port 8000 \
             --tensor-parallel-size 32 \
             --enable-expert-parallel \
-            --max-model-len 9216 \
+            --max-model-len 4096 \
             --max-num-batched-tokens 512 \
             --max-num-seqs 1 \
             --compilation-config '{\"compile_sizes\":[16,64,256,512]}' \
@@ -83,7 +83,7 @@ steps:
             --tokenizer /tmp/tok \
             --trust-remote-code \
             --dataset-name random \
-            --random-input-len 8192 \
+            --random-input-len 1024 \
             --random-output-len 1024 \
             --random-range-ratio 0 \
             --num-prompts 10 \
