@@ -1081,12 +1081,6 @@ class TPUModelRunner(GPUModelRunner):
                 # Map compressor state cache layer name to host attention layer's k_cache.
                 host_layer_name = base + ".k_cache" if base.endswith(
                     ".indexer") else base
-            elif (layer_name.endswith(".swa_cache")
-                  or layer_name.endswith(".swa_cache_layer")
-                  or (attn_module is not None and type(attn_module).__name__
-                      in ("DeepseekV4SWACache", "VllmDeepseekV4SWACache"))):
-                host_layer_name = (layer_name.removesuffix(
-                    ".swa_cache").removesuffix(".swa_cache_layer"))
             else:
                 continue
 
