@@ -64,9 +64,16 @@ if [ "${NODE_TYPE}" != "--head" ] && [ "${NODE_TYPE}" != "--worker" ]; then
     exit 1
 fi
 
-# Set up Docker authentication for Google Container Registry.
-# Modify the hostname to accomodate your specific docker region.
-gcloud auth configure-docker us-east5-docker.pkg.dev
+# Set up Docker authentication for the registry the image actually lives in.
+# Derived from DOCKER_IMAGE rather than hardcoded: the CI image is in
+# us-central1-docker.pkg.dev, so a fixed us-east5 left the pull unauthenticated
+# on any host whose docker config did not already carry a helper for the right
+# host. Falls back to us-east5 for a bare image name with no registry host.
+DOCKER_REGISTRY_HOST="${DOCKER_IMAGE%%/*}"
+if [[ "${DOCKER_REGISTRY_HOST}" != *.* ]]; then
+    DOCKER_REGISTRY_HOST="us-east5-docker.pkg.dev"
+fi
+gcloud auth configure-docker "${DOCKER_REGISTRY_HOST}" --quiet
 
 CONTAINER_NAME="node"
 

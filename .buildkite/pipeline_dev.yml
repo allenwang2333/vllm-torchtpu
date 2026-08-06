@@ -12,26 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-host bring-up, step 1: what can a multi-host agent see of its slice?
+# Multi-host bring-up for tt, stage 2: serve a model across a whole slice.
 #
-# Runs directly on the agent (no Docker) so host processes, /dev and gcloud are
-# all visible, and never initializes the TPU runtime -- on a multi-host slice
-# that would block until every peer VM joins.
+# Kimi-Linear-48B rather than K3 on purpose. tt maps BOTH architectures to the
+# same class (`models/vllm/__init__.py`: KimiLinearForCausalLM and
+# KimiK3ForConditionalGeneration -> models/vllm/kimi_k3), so this exercises the
+# identical KDA/MoE/MLA code path K3 uses, from a 98 GB checkpoint instead of
+# 1561 GB. K3's checkpoint stream is what forces the 4-hour startup budget in
+# tpu-inference-dev build 775; keeping it out of the loop means a failure here
+# is the multi-host launcher, not the model.
 #
-# On tpu_v7x_32_queue this doubles as the checkout test. That agent is
-# hand-built rather than provisioned by ci-infra terraform (modules/ci_v7x
-# covers tpu7x-2/8/16 only), so it was missing the GitHub App git credential
-# helper and the url."https://github.com/".insteadOf "git@github.com:" rewrite
-# that let every other agent check out this private repo -- checkout failed
-# 6/6 with "Permission denied (publickey)" (builds 71-73). The helper was
-# installed by hand on 2026-08-06; a green checkout here confirms it, since
-# the helper needs a job-scoped agent token and cannot be tested from a shell.
-# The probe itself already passed on tpu_v7x_16_queue (build 74).
+# tpu_v7x_16_queue, not the 32 pod: those agents are CI-owned, whereas the
+# tpu7x-32 slice belongs to ranlihao and its queue gets paused.
 
 steps:
-  - label: ":mag: tpu7x-32 multi-host probe (read-only)"
-    key: tpu7x_32_multihost_probe
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
     agents:
-      queue: tpu_v7x_32_queue
+      queue: cpu_64_core
     commands:
-      - python3 .buildkite/scripts/multihost_probe.py
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":rocket: tpu7x-16 multi-host Kimi-Linear-48B serve + bench"
+    key: tpu7x_16_kimi_linear
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_16_queue
+    env:
+      # Weights stream from GCS at serve time; 98 GB over 2 hosts is minutes,
+      # but leave headroom so a slow read fails as a real error rather than a
+      # launcher timeout. (K3 needs 14400 here -- 1561 GB.)
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      # The CI image sets this to 1, which makes any compile at request time
+      # fatal. The bench serves shapes the warmup sweep does not cover.
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+    commands:
+      - |
+        .buildkite/scripts/run_multihost.sh \
+          "vllm serve gs://tpu-commons-ci/moonshootai/kimi/linear-48b \
+            --served-model-name moonshotai/Kimi-Linear \
+            --port 8000 \
+            --tensor-parallel-size 16 \
+            --enable-expert-parallel \
+            --max-model-len 9216 \
+            --max-num-batched-tokens 512 \
+            --max-num-seqs 1 \
+            --attention-backend CUSTOM \
+            --trust-remote-code \
+            --no-enable-prefix-caching \
+            --no-async-scheduling \
+            --load-format runai_streamer \
+            --gpu-memory-utilization 0.9" \
+          "vllm bench serve \
+            --host 127.0.0.1 --port 8000 \
+            --model moonshotai/Kimi-Linear \
+            --trust-remote-code \
+            --dataset-name random \
+            --random-input-len 8192 \
+            --random-output-len 1024 \
+            --random-range-ratio 0.8 \
+            --num-prompts 10 \
+            --max-concurrency 1 \
+            --ignore-eos --seed 42 \
+            --percentile-metrics ttft,tpot,itl,e2el \
+            --metric-percentiles 50,90,99"
