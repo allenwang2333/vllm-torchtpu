@@ -1685,6 +1685,7 @@ def test_tpu_platform_mla_block_size_override():
         model_config=SimpleNamespace(
             use_mla=True,
             is_hybrid=False,
+            architecture="DeepseekV2ForCausalLM",
         ),
     )
 
