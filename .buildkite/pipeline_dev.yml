@@ -23,5 +23,13 @@ steps:
     key: tpu7x_32_multihost_probe
     agents:
       queue: tpu_v7x_32_queue
+    env:
+      # The pipeline's repository is git@github.com:..., but the multi-host
+      # agents have no ssh key authorized for this repo, so checkout fails with
+      # "Permission denied (publickey)" before any command runs. The repo is
+      # public, so clone it anonymously over https instead. (tpu-inference's
+      # pipelines are configured with an https repository, which is why their
+      # multi-host steps work on these same agents.)
+      BUILDKITE_REPO: "https://github.com/vllm-project/vllm-torchtpu.git"
     commands:
       - python3 .buildkite/scripts/multihost_probe.py
