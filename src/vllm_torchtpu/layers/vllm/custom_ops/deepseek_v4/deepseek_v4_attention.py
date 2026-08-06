@@ -1063,23 +1063,27 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                              f"{_nz_scale}/{_nz_pad} "
                              f"b[444:452]={_b[444:452].tolist()} "
                              f"b[574:584]={_b[574:584].tolist()}")
-            logger.debug(
+            print(
                 f"[MAIN_KV_DEQUANT_DEBUG] positions={positions[:4].tolist()} "
                 f"main_kv_lens[0]={_kv_len} page0={_page0} "
-                f"k_block_size={_k_block_size} | " + " | ".join(_rows))
+                f"k_block_size={_k_block_size} | " + " | ".join(_rows),
+                flush=True,
+            )
             # `two_caches_same_buffer` is hardcoded to `not swa_only` here,
             # whereas the reference derives it (main_cache_index ==
             # swa_cache_index). When it is True the compressed-KV read is
             # redirected to `updated_sw_cache`; if the two caches are in fact
             # distinct buffers that redirect points CSA/HCA attention at the
             # wrong physical allocation entirely.
-            logger.debug(
+            print(
                 f"[CACHE_IDENTITY_DEBUG] positions={positions[:4].tolist()} "
                 f"same_tensor_obj={sw_cache is main_cache_kv} "
                 f"same_data_ptr={sw_cache.data_ptr() == main_cache_kv.data_ptr()} "
                 f"sw_ptr={sw_cache.data_ptr()} main_ptr={main_cache_kv.data_ptr()} "
                 f"sw_shape={list(sw_cache.shape)} main_shape={list(main_cache_kv.shape)} "
-                f"redirect={not swa_only}")
+                f"redirect={not swa_only}",
+                flush=True,
+            )
 
         _dump_step_now = getattr(self, "_dsv4_dump_step_current", 0)
         if topk_indices is not None:
@@ -1143,9 +1147,11 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                             _slot, :].detach().cpu().numpy().astype("uint8")
                 _rows.append(f"slot{_slot}: b[444:452]="
                              f"{_row[444:452].tolist()}")
-            logger.debug(
+            print(
                 f"[NEW_SW_CACHE_PRECOPY_DEBUG] positions={positions[:4].tolist()} "
-                f"page={_page} kv_lens={_n} | " + " | ".join(_rows))
+                f"page={_page} kv_lens={_n} | " + " | ".join(_rows),
+                flush=True,
+            )
 
         if not _is_tracing():
             has_nan = torch.isnan(output).any().item()
