@@ -29,7 +29,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowMLASpec)
-
 from vllm_torchtpu.kernels.deepseek_v4.mla import mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.mla_swa import \
     mla_sliding_window_ragged_paged_attention
@@ -986,20 +985,18 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 get_tensor_model_parallel_rank
             rank = get_tensor_model_parallel_rank()
             if rank == 0:
-                print(
-                    f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}",
-                    flush=True,
+                logger.debug(
+                    f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}"
                 )
             if rank == 0 and main_prefix in ("model.layers.0.attn",
                                              "model.layers.2.attn"):
-                print(
+                logger.debug(
                     f"[DEBUG_DECODE_STEP] prefix={main_prefix} positions={positions[:6].tolist()} "
                     f"swa_seq_lens={swa_seq_lens[:3].tolist() if swa_seq_lens is not None else None} "
                     f"main_kv_lens={main_kv_lens[:3].tolist() if main_kv_lens is not None else None} "
-                    f"swa_block_tables={swa_block_tables[:3].tolist() if swa_block_tables is not None else None} "
-                    f"main_page_indices={main_page_indices[:3].tolist() if main_page_indices is not None else None} "
-                    f"extra[:6]={(extra[:6].tolist() if extra.dim() == 1 else extra[:6].tolist())}",
-                    flush=True,
+                    f"swa_query_start_loc={swa_query_start_loc[:3].tolist() if swa_query_start_loc is not None else None} "
+                    f"main_cu_q_lens={main_cu_q_lens[:3].tolist() if main_cu_q_lens is not None else None} "
+                    f"extra[:6]={(extra[:6].tolist() if extra.dim() == 1 else extra[:6].tolist())}"
                 )
 
         # Read-side counterpart to DSV4_DEBUG_COMPRESSOR's dequant check:
@@ -1065,27 +1062,23 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                              f"{_nz_scale}/{_nz_pad} "
                              f"b[444:452]={_b[444:452].tolist()} "
                              f"b[574:584]={_b[574:584].tolist()}")
-            print(
+            logger.debug(
                 f"[MAIN_KV_DEQUANT_DEBUG] positions={positions[:4].tolist()} "
                 f"main_kv_lens[0]={_kv_len} page0={_page0} "
-                f"k_block_size={_k_block_size} | " + " | ".join(_rows),
-                flush=True,
-            )
+                f"k_block_size={_k_block_size} | " + " | ".join(_rows))
             # `two_caches_same_buffer` is hardcoded to `not swa_only` here,
             # whereas the reference derives it (main_cache_index ==
             # swa_cache_index). When it is True the compressed-KV read is
             # redirected to `updated_sw_cache`; if the two caches are in fact
             # distinct buffers that redirect points CSA/HCA attention at the
             # wrong physical allocation entirely.
-            print(
+            logger.debug(
                 f"[CACHE_IDENTITY_DEBUG] positions={positions[:4].tolist()} "
                 f"same_tensor_obj={sw_cache is main_cache_kv} "
                 f"same_data_ptr={sw_cache.data_ptr() == main_cache_kv.data_ptr()} "
                 f"sw_ptr={sw_cache.data_ptr()} main_ptr={main_cache_kv.data_ptr()} "
                 f"sw_shape={list(sw_cache.shape)} main_shape={list(main_cache_kv.shape)} "
-                f"redirect={not swa_only}",
-                flush=True,
-            )
+                f"redirect={not swa_only}")
 
         _dump_step_now = getattr(self, "_dsv4_dump_step_current", 0)
         if topk_indices is not None:
@@ -1149,11 +1142,9 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                             _slot, :].detach().cpu().numpy().astype("uint8")
                 _rows.append(f"slot{_slot}: b[444:452]="
                              f"{_row[444:452].tolist()}")
-            print(
+            logger.debug(
                 f"[NEW_SW_CACHE_PRECOPY_DEBUG] positions={positions[:4].tolist()} "
-                f"page={_page} kv_lens={_n} | " + " | ".join(_rows),
-                flush=True,
-            )
+                f"page={_page} kv_lens={_n} | " + " | ".join(_rows))
 
         if not _is_tracing():
             has_nan = torch.isnan(output).any().item()

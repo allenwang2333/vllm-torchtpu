@@ -1067,7 +1067,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _alias_ds_v4_auxiliary_caches(
             self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Point DeepSeek-V4 compressor state and SWA caches at their host's tensor."""
+        """Point DeepSeek-V4 compressor state caches at their host's tensor."""
         static_forward_context = (
             self.vllm_config.compilation_config.static_forward_context)
         state_suffix = ".compressor.state_cache"
@@ -4331,14 +4331,14 @@ class TPUModelRunner(GPUModelRunner):
             for raw in self.kv_cache_raw_tensors:
                 sync.synchronize(raw, wait=True)
 
-        print(
+        logger.info(
+            "%s",
             format_kv_cache_layout_summary(
                 kv_cache_config=kv_cache_config,
                 kv_caches=kv_caches,
                 raw_tensors=self.kv_cache_raw_tensors,
                 attn_groups=self.attn_groups,
             ),
-            flush=True,
         )
 
         self.kv_caches = []

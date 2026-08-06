@@ -45,6 +45,7 @@ scaling.
    - Returns output tensor
 """
 
+import os
 import types
 from typing import Any, Optional
 
