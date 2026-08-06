@@ -46,6 +46,7 @@ TOP_DIR="$(dirname "$(dirname "${SCRIPT_DIR}")")"
 
 CONTAINER_NAME="node"
 SERVE_LOG="/root/vllm_serve.log"
+SERVE_PID="/root/vllm_serve.pid"
 
 # ---------------------------------------------------------------------------
 # Secrets / environment
@@ -173,15 +174,20 @@ wait_for_server() {
   local timeout=${2:-3600}
 
   echo "--- [multihost] Waiting up to ${timeout}s for vllm serve on port ${port}"
+  # The pid comes from a file the launcher writes, not from pgrep: the tt image
+  # ships no procps, so `docker exec node pgrep` fails with
+  #   exec: "pgrep": executable file not found in $PATH
+  # and the failure looked like a dead server. `kill -0` below is a bash
+  # builtin, so liveness checking needs nothing installed in the image.
   local pid=""
   for ((i = 0; i < 30; i++)); do
-    pid=$(docker exec "${CONTAINER_NAME}" pgrep -n -f "vllm serve" || true)
+    pid=$(docker exec "${CONTAINER_NAME}" cat "${SERVE_PID}" 2>/dev/null || true)
     [[ -n "${pid}" ]] && break
     sleep 2
   done
   if [[ -z "${pid}" ]]; then
-    echo "[multihost] ERROR: 'vllm serve' process never appeared inside container" \
-         "'${CONTAINER_NAME}'. Dumping ${SERVE_LOG}:" >&2
+    echo "[multihost] ERROR: vllm serve never wrote ${SERVE_PID} inside container" \
+         "'${CONTAINER_NAME}' — it failed before exec. Dumping ${SERVE_LOG}:" >&2
     docker exec "${CONTAINER_NAME}" cat "${SERVE_LOG}" || true
     return 1
   fi
@@ -302,7 +308,8 @@ echo "--- [multihost] Starting vllm serve on the head node"
 echo "[multihost] serve cmd: ${VLLM_SERVE_CMD}"
 docker exec -d \
   -e HF_HOME=/root/.cache/huggingface \
-  "${CONTAINER_NAME}" bash -c "${VLLM_SERVE_CMD} > ${SERVE_LOG} 2>&1"
+  "${CONTAINER_NAME}" bash -c \
+  "echo \$\$ > ${SERVE_PID}; exec ${VLLM_SERVE_CMD} > ${SERVE_LOG} 2>&1"
 
 wait_for_server "${VLLM_PORT}" "${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
 
