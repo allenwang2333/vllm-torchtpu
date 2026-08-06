@@ -34,7 +34,7 @@ rm -rf /tmp/libtpu_lockfile* /tmp/ipc* /tmp/psm* /dev/shm/psm_* 2>/dev/null || t
     --tensor-parallel-size 8 \
     --kv-cache-dtype fp8_e4m3 \
     --block-size 1024 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.58 \
     --enable-expert-parallel \
     --max-model-len 4096 \
     --port $PORT > /home/patemotter_google_com/workspace/vllm-torchtpu/scratch/vllm_server.log 2>&1
