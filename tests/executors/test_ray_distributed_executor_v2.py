@@ -199,13 +199,15 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.util.placement_group.return_value = mock_placement_group
         mock_ray.nodes.return_value = [{
             "NodeID": "node_1",
+            "NodeManagerAddress": "10.0.0.1",
             "Resources": {
-                "TPU": 4.0
+                "TPU": 1.0
             }
         }, {
             "NodeID": "node_2",
+            "NodeManagerAddress": "10.0.0.2",
             "Resources": {
-                "TPU": 4.0
+                "TPU": 1.0
             }
         }]
 
@@ -243,7 +245,7 @@ class TestTpuRayDistributedExecutorV2:
             # Mock physical TPU ID discovery for each worker.
             mock_ray.get.side_effect = [
                 # Discover GPU/TPU IDs (Step 6)
-                [("node_1", [4]), ("node_2", [6])],
+                [("node_1", [0]), ("node_2", [0])],
                 # Initialize workers (Step 7)
                 [None, None],
                 # Collect response MQ handles (Step 8)
@@ -277,7 +279,7 @@ class TestTpuRayDistributedExecutorV2:
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
             assert "10.0.0.2:8070" in worker_env_w0[
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES"]
-            assert kwargs_w0["assigned_physical_gpu_ids"] == [4]
+            assert kwargs_w0["assigned_physical_gpu_ids"] == [0]
 
             # Worker 1 (Rank 1, Node 2)
             mock_worker_actor_2.initialize_worker.remote.assert_called_once()
@@ -292,7 +294,7 @@ class TestTpuRayDistributedExecutorV2:
             assert worker_env_w1["NODE_RANK"] == "1"
             assert worker_env_w1["MASTER_ADDR"] == "10.0.0.1"
             assert worker_env_w1["TORCH_TPU_TOPOLOGY"] == "2x2"
-            assert kwargs_w1["assigned_physical_gpu_ids"] == [6]
+            assert kwargs_w1["assigned_physical_gpu_ids"] == [0]
 
             executor.ray_worker_handles = []
 
@@ -301,15 +303,15 @@ class TestTpuRayDistributedExecutorV2:
         return_value={})
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_distributed_init_method",
-        return_value="tcp://10.0.0.2:9000")
+        return_value="tcp://10.0.0.1:9000")
     @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
     def test_init_executor_data_parallel_slice_binding(
             self, mock_mq, mock_init_method, mock_driver_env,
             mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray,
             monkeypatch):
-        # TP=2 x DP=4 over two 4-chip hosts. This engine is DP rank 1, so it
-        # owns slice ranks 2 and 3 -- partway along the first host's chips,
-        # which is where the per-engine and slice-local ranks diverge.
+        # TP=2 x DP=4 over two 4-chip hosts. This engine is DP rank 1 and Ray
+        # gave it chips 2 and 3 of the first host, so its slice position comes
+        # from those chip ids rather than from any cross-engine agreement.
         monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
         monkeypatch.delenv("TORCH_TPU_DP_MASTER_PORT", raising=False)
         monkeypatch.delenv("TORCH_TPU_BASE_PORT", raising=False)
@@ -317,11 +319,23 @@ class TestTpuRayDistributedExecutorV2:
         mock_platform.ray_device_key = "TPU"
         mock_ray.is_initialized.return_value = True
         mock_placement_group = MagicMock()
-        mock_placement_group.bundle_specs = [{"TPU": 1.0}] * 8
-        mock_ray.util.get_placement_group.return_value = mock_placement_group
+        mock_placement_group.bundle_specs = [{"TPU": 1.0}] * 2
+        mock_ray.nodes.return_value = [{
+            "NodeID": "node_1",
+            "NodeManagerAddress": "10.0.0.1",
+            "Resources": {
+                "TPU": 4.0
+            }
+        }, {
+            "NodeID": "node_2",
+            "NodeManagerAddress": "10.0.0.2",
+            "Resources": {
+                "TPU": 4.0
+            }
+        }]
 
-        bundle_to_node = [(i, "node_1", "10.0.0.1") for i in range(4)]
-        bundle_to_node += [(i, "node_2", "10.0.0.2") for i in range(4, 8)]
+        # This engine's placement group holds only its own two bundles.
+        bundle_to_node = [(0, "node_1", "10.0.0.1"), (1, "node_1", "10.0.0.1")]
 
         with patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node", return_value=bundle_to_node), \
              patch("vllm_torchtpu.executors.ray_distributed_executor_v2.TPU_MULTIHOST_TOPOLOGY_MAP", {8: "1,2,2,2"}):
@@ -358,12 +372,6 @@ class TestTpuRayDistributedExecutorV2:
 
             executor._init_executor()
 
-            # Only this engine's two bundles are claimed, not the whole slice.
-            bundle_indices = [
-                call.kwargs["scheduling_strategy"].placement_group_bundle_index
-                for call in mock_remote_class.options.call_args_list
-            ]
-            assert bundle_indices == [2, 3]
             actor_names = [
                 call.kwargs["name"]
                 for call in mock_remote_class.options.call_args_list
@@ -373,7 +381,7 @@ class TestTpuRayDistributedExecutorV2:
 
             # vLLM slots workers into a list sized world_size, so the
             # local_rank it is handed must stay inside this engine even though
-            # both workers sit further along the host's chips.
+            # the chips it got sit further along the host.
             assert [
                 call[0][0] for call in
                 [a.initialize_worker.remote.call_args for a in actors]
@@ -382,8 +390,8 @@ class TestTpuRayDistributedExecutorV2:
             env_w0 = actors[0].initialize_worker.remote.call_args[0][1]
             env_w1 = actors[1].initialize_worker.remote.call_args[0][1]
 
-            # TorchTPU binds by the slice-local rank, which here is 2 and 3 --
-            # deliberately different from the per-engine 0 and 1 above.
+            # Chips 2 and 3 of the first host: slice-local 2 and 3, and the
+            # same slice-global ranks since this host starts the slice.
             assert env_w0["TORCH_TPU_SLICE_RANK"] == "2"
             assert env_w0["TORCH_TPU_SLICE_LOCAL_RANK"] == "2"
             assert env_w1["TORCH_TPU_SLICE_RANK"] == "3"
@@ -394,13 +402,12 @@ class TestTpuRayDistributedExecutorV2:
                 assert env["LOCAL_WORLD_SIZE"] == "4"
                 assert env["NNODES"] == "2"
                 assert env["NODE_RANK"] == "0"
-                # Topology covers the whole DP*TP slice, not this engine.
+                # Topology and slicebuilder list cover the whole DP*TP slice,
+                # derived from the cluster rather than this engine's bundles.
                 assert env["TORCH_TPU_TOPOLOGY"] == "1,2,2,2"
                 assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
                     "10.0.0.1:8070,10.0.0.1:8071,10.0.0.1:8072,10.0.0.1:8073,"
                     "10.0.0.2:8070,10.0.0.2:8071,10.0.0.2:8072,10.0.0.2:8073")
-                # One rendezvous shared by every DP engine, derived without a
-                # side channel: first port past the slicebuilder range.
                 assert env["TORCH_TPU_DP_SIZE"] == "4"
                 assert env["TORCH_TPU_DP_MASTER_ADDR"] == "10.0.0.1"
                 assert env["TORCH_TPU_DP_MASTER_PORT"] == "8074"
@@ -409,110 +416,81 @@ class TestTpuRayDistributedExecutorV2:
 
             executor.ray_worker_handles = []
 
-    def test_data_parallel_attaches_to_shared_placement_group(
+    def test_data_parallel_requests_only_this_engines_bundles(
             self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
             mock_ray):
+        # Sizing the group by the cluster instead of by world_size is what
+        # made every DP engine ask for every chip; only one could ever be
+        # scheduled and the rest waited forever.
         mock_platform.ray_device_key = "TPU"
         mock_platform.device_name = "tpu"
         mock_ray.is_initialized.return_value = True
         mock_ray.nodes.return_value = [{
             "NodeID": "node_1",
+            "NodeManagerAddress": "10.0.0.1",
             "Resources": {
-                "TPU": 2
+                "TPU": 8.0
             }
         }, {
             "NodeID": "node_2",
+            "NodeManagerAddress": "10.0.0.2",
             "Resources": {
-                "TPU": 2
+                "TPU": 8.0
             }
         }]
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = \
             "node_1"
-
-        existing_pg = MagicMock()
-        existing_pg.bundle_specs = [{"TPU": 1.0}] * 4
-        mock_ray.util.get_placement_group.return_value = existing_pg
-
-        self.parallel_config.world_size = 2
-        self.parallel_config.data_parallel_size = 2
-        self.parallel_config.data_parallel_index = 1
-
-        executor = RayDistributedExecutorV2(self.vllm_config)
-        executor.vllm_config = self.vllm_config
-        executor.parallel_config = self.parallel_config
-        executor._initialize_ray_cluster()
-
-        # A peer engine already published the slice group; attach, never
-        # create a second one that would double-claim the cluster's chips.
-        mock_ray.util.placement_group.assert_not_called()
-        assert executor.parallel_config.placement_group is existing_pg
-        assert executor._created_slice_pg is False
-
-    def test_data_parallel_creates_shared_placement_group_when_absent(
-            self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
-            mock_ray):
-        mock_platform.ray_device_key = "TPU"
-        mock_platform.device_name = "tpu"
-        mock_ray.is_initialized.return_value = True
-        mock_ray.nodes.return_value = [{
-            "NodeID": "node_1",
-            "Resources": {
-                "TPU": 2
-            }
-        }, {
-            "NodeID": "node_2",
-            "Resources": {
-                "TPU": 2
-            }
-        }]
-        mock_ray.get_runtime_context.return_value.get_node_id.return_value = \
-            "node_1"
-        mock_ray.util.get_placement_group.side_effect = ValueError("missing")
         created_pg = MagicMock()
         mock_ray.util.placement_group.return_value = created_pg
 
         self.parallel_config.world_size = 2
-        self.parallel_config.data_parallel_size = 2
-        self.parallel_config.data_parallel_index = 0
-        self.parallel_config.data_parallel_master_port = 29500
+        self.parallel_config.data_parallel_size = 8
+        self.parallel_config.data_parallel_index = 3
 
         executor = RayDistributedExecutorV2(self.vllm_config)
         executor.vllm_config = self.vllm_config
         executor.parallel_config = self.parallel_config
         executor._initialize_ray_cluster()
 
+        # Two bundles for this engine, and no node pin: pinning would crowd
+        # every DP engine onto the head node and split their TP groups.
+        mock_ray.util.placement_group.assert_called_once_with(
+            [{
+                "TPU": 1.0
+            }, {
+                "TPU": 1.0
+            }], strategy="PACK")
         assert executor.parallel_config.placement_group is created_pg
-        assert executor._created_slice_pg is True
-        kwargs = mock_ray.util.placement_group.call_args.kwargs
-        assert kwargs["name"] == "vllm-tpu-slice-127.0.0.1-29500"
-        assert kwargs["lifetime"] == "detached"
 
-    def test_stale_shared_placement_group_is_rejected(
+    def test_slice_host_layout_orders_hosts_by_address(
             self, mock_wait_until_pg_ready, mock_get_ip, mock_platform,
             mock_ray):
-        mock_platform.ray_device_key = "TPU"
-        mock_platform.device_name = "tpu"
-        mock_ray.is_initialized.return_value = True
+        # Every engine derives the slice-wide view independently, so the
+        # ordering has to be a function of the cluster alone.
         mock_ray.nodes.return_value = [{
-            "NodeID": "node_1",
+            "NodeID": "node_2",
+            "NodeManagerAddress": "10.0.0.2",
             "Resources": {
-                "TPU": 2
+                "TPU": 4.0
+            }
+        }, {
+            "NodeID": "node_1",
+            "NodeManagerAddress": "10.0.0.1",
+            "Resources": {
+                "TPU": 4.0
+            }
+        }, {
+            "NodeID": "node_3",
+            "NodeManagerAddress": "10.0.0.3",
+            "Resources": {
+                "CPU": 8.0
             }
         }]
-        mock_ray.get_runtime_context.return_value.get_node_id.return_value = \
-            "node_1"
-
-        stale_pg = MagicMock()
-        stale_pg.bundle_specs = [{"TPU": 1.0}] * 8
-        mock_ray.util.get_placement_group.return_value = stale_pg
-
-        self.parallel_config.world_size = 1
-        self.parallel_config.data_parallel_size = 2
-        self.parallel_config.data_parallel_index = 0
 
         executor = RayDistributedExecutorV2(self.vllm_config)
-        executor.vllm_config = self.vllm_config
         executor.parallel_config = self.parallel_config
 
-        with pytest.raises(RuntimeError, match="leftover"):
-            executor._initialize_ray_cluster()
+        host_order, chips_per_host = executor._slice_host_layout("TPU")
+
+        assert host_order == ["10.0.0.1", "10.0.0.2"]
+        assert chips_per_host == {"10.0.0.1": 4, "10.0.0.2": 4}
