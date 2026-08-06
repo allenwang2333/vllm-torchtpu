@@ -441,6 +441,19 @@ def _cn_w1w2_fused_token_kernel_fp8(
     NBUF = max(NBUF_W1_, NBUF_W2_)  # same in practice
     MAX_DEPTH = NBUF - 1  # how far ahead we look
 
+    if not SKIP_ZERO_WEIGHT_:
+        # ---- Seed phase: prefetch the first NBUF experts (scalar-prefetch only) ----
+        gj0 = pl.multiple_of(ids_ref[0], 1)
+        _start_all_dma(gj0, jnp.int32(0), jnp.int32(0), **all_dma_kw)
+        for d in range(1, NBUF):
+            seed_gj = seed_experts_ref[d]
+            buf_d_w1 = jnp.int32(d % NBUF_W1_)
+            buf_d_w2 = jnp.int32(d % NBUF_W2_)
+
+            @pl.when(seed_gj >= 0)
+            def _(sgj=seed_gj, bw1=buf_d_w1, bw2=buf_d_w2):
+                _start_all_dma(pl.multiple_of(sgj, 1), bw1, bw2, **all_dma_kw)
+
     # ---- DMA lhs from HBM -> 2D VMEM landing pad (shape-matched) ----
     full_lhs_copy = pltpu.make_async_copy(
         lhs_ref.at[pl.ds(0, C_PAD), pl.ds(0, K)], full_lhs_2d_ref,
@@ -499,25 +512,6 @@ def _cn_w1w2_fused_token_kernel_fp8(
             else:
                 prev_gj = ids_ref[slot - 1]
                 is_new_expert = (gj != prev_gj)
-
-            # ============================================================
-            #  SLOT 0 — SEED PHASE: fill all NBUF buffers from
-            #  precomputed seed_experts_ref (O(1) SMEM reads).
-            # ============================================================
-            if slot == 0:
-                # Buffer 0: current expert
-                _start_all_dma(gj, jnp.int32(0), jnp.int32(0), **all_dma_kw)
-
-                # Buffers 1..NBUF-1: precomputed seed experts
-                for d in range(1, NBUF):
-                    seed_gj = seed_experts_ref[d]
-                    buf_d_w1 = jnp.int32(d % NBUF_W1_)
-                    buf_d_w2 = jnp.int32(d % NBUF_W2_)
-
-                    @pl.when(seed_gj >= 0)
-                    def _(sgj=seed_gj, bw1=buf_d_w1, bw2=buf_d_w2):
-                        _start_all_dma(pl.multiple_of(sgj, 1), bw1, bw2,
-                                       **all_dma_kw)
 
             # ============================================================
             #  SLOT > 0 — STEADY STATE: rotate + one prefetch from
@@ -740,9 +734,7 @@ def cn_gemv_w1w2_fused_mb_fp8(lhs,
     NBUF_W2 = max(_CN_NBUF, NUM_I_setup)
     NBUF_EFF = max(NBUF_W1, NBUF_W2)
 
-    # ---- Forward-fill IDs (zero-weight → last real expert). Applies to
-    # both EP (non-local-expert masking) and TP (padding rows, once padded
-    # rows carry zero weight upstream) -- a no-op when no weight is zero.
+    # Forward-fill zero-weight slots (EP masking / TP padding) to last real id.
     effective_ids = _forward_fill_ids(sorted_ids, sorted_weights)
 
     # ---- Precompute lookahead tables (host-side, O(N_SLOTS)) ----
