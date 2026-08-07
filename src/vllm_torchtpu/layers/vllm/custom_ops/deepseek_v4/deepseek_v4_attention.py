@@ -551,7 +551,6 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         swa_only = (self.compress_ratio <= 1
                     or os.getenv("DSV4_FORCE_SWA_ONLY") == "1")
         is_csa = self.compress_ratio == 4
-        two_caches_same_buffer = False
         swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
         if swa_cache is None:
             # Never guess: a wrong logical page size silently misaddresses
@@ -574,6 +573,24 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"{self.custom_prefix}: SWA logical page size is "
                 f"{logical_page_size}; expected `get_kv_cache_spec` to have "
                 "set it before the first forward.")
+
+        # Derived from real tensor identity, matching the reference's
+        # `two_caches_same_buffer = (main_cache_index == swa_cache_index)`
+        # (`tpu_inference/.../deepseek_v4_attention.py:344`). When the runner
+        # overlays this layer's SWA cache onto its compressed-KV array, the
+        # compressed-KV read must see the buffer *after* the SWA kernel's write
+        # in this same pass (`updated_sw_cache`), not the stale pre-write
+        # snapshot. When they are distinct arrays it must not be redirected.
+        #
+        # Only correct because `attn_op` is built lazily on first forward: at
+        # construction time both are `torch.tensor([])` placeholders and would
+        # compare equal-ish for all the wrong reasons.
+        main_cache = getattr(self.mla_attn, "kv_cache", None)
+        swa_tensor = getattr(swa_cache, "kv_cache", None)
+        two_caches_same_buffer = bool(
+            not swa_only and main_cache is not None and swa_tensor is not None
+            and main_cache.numel() > 0 and swa_tensor.numel() > 0
+            and main_cache.data_ptr() == swa_tensor.data_ptr())
 
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (getattr(self.mla_attn, "scale", None)
@@ -600,7 +617,14 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
-        op_name = f"pallas::deepseek_v4_attention_{op_type}_v2"
+        # `two_caches_same_buffer` is baked into the traced op, and it is NOT a
+        # function of op_type: the SWA overlay maps only as many sliding-window
+        # caches as there are compatible compressed-KV arrays, so two CSA layers
+        # can legitimately disagree (one overlaid, one with its own array).
+        # Keying the cache on op_type alone would hand the second layer the
+        # first one's op.
+        op_name = (f"pallas::deepseek_v4_attention_{op_type}_v2"
+                   f"{'_aliased' if two_caches_same_buffer else ''}")
 
         global _attn_op_cache
         if op_name in _attn_op_cache:

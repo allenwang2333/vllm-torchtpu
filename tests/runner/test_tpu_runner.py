@@ -1641,6 +1641,84 @@ class TestCompactMambaSlotPool:
         assert slots == {1, 2, 3, 4}
 
 
+def test_dsv4_swa_overlay_plan():
+    """SWA caches overlay compatible compressed-KV arrays, positionally.
+
+    Mirrors the reference (`tpu_inference/runner/kv_cache_manager.py:1155-1178`):
+    a CSA page (256 rows) can host a 128-row SWA logical page; an HCA page
+    (8 rows) cannot. Layers of one group must land on *distinct* hosts because
+    they share a block table, and any overflow beyond the available hosts stays
+    unmapped so it gets its own array.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+
+    def mla(compress_ratio, head_size=640):
+        return MLAAttentionSpec(block_size=1024,
+                                num_kv_heads=1,
+                                head_size=head_size,
+                                dtype=torch.uint8,
+                                compress_ratio=compress_ratio,
+                                alignment=None)
+
+    def swa():
+        return SlidingWindowMLASpec(block_size=128,
+                                    num_kv_heads=1,
+                                    head_size=640,
+                                    dtype=torch.uint8,
+                                    sliding_window=128,
+                                    alignment=None)
+
+    specs = {
+        "m.layers.0.attn": mla(4),  # CSA host, 256 rows
+        "m.layers.1.attn": mla(4),  # CSA host, 256 rows
+        "m.layers.2.attn": mla(128),  # HCA, 8 rows -> too small
+        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),  # too narrow
+        "m.layers.0.attn.swa_cache": swa(),
+        "m.layers.1.attn.swa_cache": swa(),
+        "m.layers.2.attn.swa_cache": swa(),  # overflow: only 2 hosts fit
+    }
+
+    mla_group = SimpleNamespace(layer_names=[
+        "m.layers.0.attn", "m.layers.1.attn", "m.layers.2.attn",
+        "m.layers.0.attn.indexer.k_cache"
+    ])
+    swa_group = SimpleNamespace(layer_names=[
+        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache",
+        "m.layers.2.attn.swa_cache"
+    ])
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[mla_group, swa_group])
+
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
+
+    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
+        runner,
+        kv_cache_config,
+        specs.__getitem__,
+        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+            10,
+            spec.storage_block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+            head_size_is_packed_width=True),
+    )
+
+    # Two CSA hosts available -> first two SWA layers map, third overflows.
+    assert set(overlay) == {
+        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
+    }
+    # Distinct hosts: same-group layers share a block table.
+    assert len(set(overlay.values())) == 2
+    # Never the HCA array (too few rows) or the indexer (too narrow).
+    assert "m.layers.2.attn" not in overlay.values()
+    assert "m.layers.0.attn.indexer.k_cache" not in overlay.values()
+    assert set(overlay.values()) <= {"m.layers.0.attn", "m.layers.1.attn"}
+
+
 def test_dsv4_specs_are_exempt_from_tpu_normalization():
     """DSv4 specs must reach vLLM verbatim.
 

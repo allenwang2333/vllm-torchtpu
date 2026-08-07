@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -1120,6 +1120,88 @@ class TPUModelRunner(GPUModelRunner):
                     f"cache={layer_name!r}, expected KV layer {host_layer_name!r}, "
                     f"known layers={sorted(kv_caches.keys())}")
             kv_caches[layer_name] = kv_caches[host_layer_name]
+
+    @staticmethod
+    def _is_ds_v4_swa_layer(layer_name: str, spec: KVCacheSpec) -> bool:
+        """A DSv4 sliding-window cache (not a compressor state cache).
+
+        Both declare `SlidingWindowMLASpec`, so the name is what separates
+        them -- matching the reference's `"swa_cache" in layer_name` test
+        (`tpu_inference/runner/kv_cache_manager.py:1133`).
+        """
+        return isinstance(spec,
+                          SlidingWindowMLASpec) and "swa_cache" in layer_name
+
+    def _plan_ds_v4_swa_overlay(
+        self,
+        kv_cache_config: KVCacheConfig,
+        per_layer_spec: Callable[[str], KVCacheSpec],
+        cache_shape_of: Callable[[KVCacheSpec], tuple[int, ...]],
+    ) -> dict[str, str]:
+        """Map each DSv4 SWA cache onto a compatible compressed-KV layer.
+
+        vLLM's block manager allocates page indices assuming the compressed-KV,
+        SWA and compressor-state caches share one physical allocation (see
+        `vllm/v1/attention/backends/mla/sparse_swa.py:72-77`). CUDA gets that
+        for free with byte-offset views into one slab; JAX/TPU arrays cannot be
+        byte views, so the overlay has to be rebuilt here from the specs -- the
+        same thing the reference does in `_initialize_ds_v4_kv_cache`.
+
+        Mirrors that function's rules: hosts are the `MLAAttentionSpec` arrays,
+        an SWA cache may overlay one whose page is at least as wide and holds at
+        least as many entries as the SWA logical page, and assignment is
+        *positional within a cache group* so no two layers of one group (which
+        share a block table) land on the same array. Groups with more SWA layers
+        than there are compatible hosts leave the remainder unmapped; those get
+        their own arrays. On DSv4-Flash that is the documented ~21-of-43 split:
+        a 128-row SWA page fits a 256-row CSA page and cannot fit an 8-row HCA
+        page.
+
+        Returns `{swa_layer_name: host_layer_name}` for the layers that overlay.
+        """
+        mla_layers: list[str] = []
+        swa_groups: list[list[str]] = []
+        for group in kv_cache_config.kv_cache_groups:
+            swa_in_group: list[str] = []
+            for layer_name in group.layer_names:
+                if layer_name in self.shared_kv_cache_layers:
+                    continue
+                spec = per_layer_spec(layer_name)
+                if isinstance(spec, MLAAttentionSpec):
+                    mla_layers.append(layer_name)
+                elif self._is_ds_v4_swa_layer(layer_name, spec):
+                    swa_in_group.append(layer_name)
+            if swa_in_group:
+                swa_groups.append(swa_in_group)
+
+        if not swa_groups:
+            return {}
+        if not mla_layers:
+            raise ValueError(
+                "DeepSeek-V4 model has SWA caches but no MLAAttentionSpec "
+                "layers to overlay them onto: swa_layers="
+                f"{[n for g in swa_groups for n in g]}")
+
+        overlay: dict[str, str] = {}
+        for swa_layers in swa_groups:
+            swa_spec = per_layer_spec(swa_layers[0])
+            swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
+                               swa_spec.dtype.itemsize)
+            hosts: list[str] = []
+            for host_name in mla_layers:
+                shape = cache_shape_of(per_layer_spec(host_name))
+                # 4-D packed MLA layout: (pages, rows/packing, packing, width).
+                page_entries = shape[1] * shape[2]
+                entry_width_bytes = shape[-1] * per_layer_spec(
+                    host_name).dtype.itemsize
+                if (per_layer_spec(host_name).dtype == swa_spec.dtype
+                        and entry_width_bytes >= swa_entry_bytes
+                        and page_entries >= swa_spec.storage_block_size):
+                    hosts.append(host_name)
+            for position, layer_name in enumerate(swa_layers):
+                if position < len(hosts):
+                    overlay[layer_name] = hosts[position]
+        return overlay
 
     def _update_attention_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -4487,6 +4569,23 @@ class TPUModelRunner(GPUModelRunner):
                 return spec.kv_cache_specs[layer_name]
             return spec
 
+        # Resolve the DSv4 SWA overlay *before* allocating: a layer that
+        # overlays a host must never get an array of its own, or the memory
+        # vLLM's `num_blocks` budget assumes is shared gets spent twice and the
+        # orphan is left to the allocator to reclaim.
+        ds_v4_swa_overlay = self._plan_ds_v4_swa_overlay(
+            kv_cache_config,
+            _per_layer_spec,
+            lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+                kv_cache_config.num_blocks,
+                spec.storage_block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+                head_size_is_packed_width=True,
+            ),
+        )
+
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # If the KV cache tensor is shared by multiple layers, then we
             # duplicate cache for each layer and `num_blocks` is calculated
@@ -4530,6 +4629,10 @@ class TPUModelRunner(GPUModelRunner):
                 num_blocks = kv_cache_config.num_blocks
 
             for layer_name in shared_by:
+                if layer_name in ds_v4_swa_overlay:
+                    # Overlays a compressed-KV array; aliased after this loop
+                    # once every host exists.
+                    continue
                 kv_cache_spec = _per_layer_spec(layer_name)
 
                 if isinstance(kv_cache_spec, MambaSpec):
@@ -4614,6 +4717,21 @@ class TPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
+        for swa_layer_name, host_layer_name in ds_v4_swa_overlay.items():
+            if host_layer_name not in kv_caches:
+                raise ValueError(
+                    "DeepSeek-V4 SWA cache has no host KV layer to overlay: "
+                    f"swa_cache={swa_layer_name!r}, expected KV layer "
+                    f"{host_layer_name!r}, known layers="
+                    f"{sorted(kv_caches.keys())}")
+            kv_caches[swa_layer_name] = kv_caches[host_layer_name]
+        if ds_v4_swa_overlay:
+            logger.info(
+                "DeepSeek-V4 SWA cache overlay: %d of %d sliding-window "
+                "caches share a compressed-KV array; the rest have their own.",
+                len(ds_v4_swa_overlay),
+                sum(1 for name in kv_caches
+                    if self._is_ds_v4_swa_layer(name, _per_layer_spec(name))))
 
         self._alias_ds_v4_auxiliary_caches(kv_caches)
         self._add_shared_kv_cache_aliases(kv_caches)
