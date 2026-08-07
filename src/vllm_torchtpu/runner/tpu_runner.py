@@ -159,6 +159,16 @@ def _substitute_placeholder_token(
 
 logger = init_logger(__name__)
 
+# Source block for seed-copy padding entries. NOT the null block: the pool
+# copy kernel runs with `input_output_aliases`, so input and output are the
+# same buffer, and a padding pair of `(0, 0)` makes a grid step read and write
+# the *same* block of it. Mosaic double-buffers the input and output windows
+# on the assumption that they are distinct, so a same-address pair is a DMA
+# hazard rather than a free no-op. Padding the source with a different block
+# keeps every grid step a genuine block-to-block copy; the destination stays
+# the null block, which no request ever reads, so the copy remains inert.
+_SEED_COPY_PAD_SRC = 1
+
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
                                            "__dataclass_fields__", {}))
@@ -1829,15 +1839,17 @@ class TPUModelRunner(GPUModelRunner):
                 (dst_t, ), self.mamba_slot_read_offsets[src_t])
 
         for raw, srcs_dev, dsts_dev in per_raw_dev.values():
-            src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev))
-            dst_t = self._pad_dev_to_bucket(torch.cat(dsts_dev))
+            src_t = self._pad_dev_to_bucket(torch.cat(srcs_dev),
+                                            pad=_SEED_COPY_PAD_SRC)
+            dst_t = self._pad_dev_to_bucket(torch.cat(dsts_dev), pad=0)
             self._pending_mamba_state_copies.append((raw, src_t, dst_t))
 
         for raw, srcs, dsts in per_raw.values():
-            src_t = torch.tensor(self._pad_to_bucket(srcs),
+            src_t = torch.tensor(self._pad_to_bucket(
+                srcs, pad=_SEED_COPY_PAD_SRC),
                                  dtype=torch.int32).to(self.device,
                                                        non_blocking=True)
-            dst_t = torch.tensor(self._pad_to_bucket(dsts),
+            dst_t = torch.tensor(self._pad_to_bucket(dsts, pad=0),
                                  dtype=torch.int32).to(self.device,
                                                        non_blocking=True)
             self._pending_mamba_state_copies.append((raw, src_t, dst_t))
@@ -1854,12 +1866,13 @@ class TPUModelRunner(GPUModelRunner):
     def _pad_to_bucket(cls, values: list, pad=0) -> list:
         """Pad a CPU pair/id list up to the seed-copy bucket ladder.
 
-        Pads are the null block, i.e. `(0, 0)` self-copies that move no
-        live state.
+        Destination pads are the null block, which no request reads.
+        Source pads are `_SEED_COPY_PAD_SRC`, deliberately NOT the null
+        block — see that constant.
         """
         return values + [pad] * (cls._bucket_len(len(values)) - len(values))
 
-    def _pad_dev_to_bucket(self, ids: torch.Tensor) -> torch.Tensor:
+    def _pad_dev_to_bucket(self, ids: torch.Tensor, pad: int = 0):
         """`_pad_to_bucket` for an already-on-device id tensor."""
         n = int(ids.shape[0])
         padded = self._bucket_len(n)
@@ -1867,7 +1880,8 @@ class TPUModelRunner(GPUModelRunner):
             return ids
         return torch.cat([
             ids,
-            torch.zeros(padded - n, dtype=ids.dtype, device=ids.device),
+            torch.full((padded - n, ), pad, dtype=ids.dtype,
+                       device=ids.device),
         ])
 
     def _expand_pool_split(
