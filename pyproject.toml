@@ -26,13 +26,13 @@ dependencies = [
     "pathwaysutils",
     # vllm==0.26.0 is officially pinned to torch 2.11, hence pinning to a commit compatible with torch 2.13
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.26.1rc0",
-    "torch==2.13.0",
+    "torch==2.11.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. We must explicitly pin torchvision statically
     # matching our torch==2.13.0 constraint to prevent the CI Docker base image
     # from leaking structurally incompatible pre-compiled nms operators!
-    "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260804130134",
+    "torchvision==0.26.0",
+    "torch-tpu==0.1.1.dev20260728090214",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
