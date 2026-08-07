@@ -12,15 +12,19 @@ import importlib.util
 import json
 import os
 import pickle
+import threading
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
 
+import cdk
 import torch
 import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.compile.experimental import (
+    AsyncCompilationSubmitted, resolve_compilations)
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 
@@ -248,6 +252,7 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        self._compile_events = {}
 
     def initialize_cache(self,
                          cache_dir: str,
@@ -271,6 +276,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
         return compute_tpu_compilation_hash(vllm_config)
 
+    @cdk.trace.trace_func()
     def compile(
         self,
         graph: fx.GraphModule,
@@ -311,7 +317,33 @@ class TpuCompilerAdaptor(CompilerInterface):
         tracing_ctx = (torch._guards.TracingContext(fake_mode)
                        if fake_mode is not None else None)
         with torch._guards.tracing(tracing_ctx):
-            compiled_fn = _tpu_backend(graph, example_inputs)
+            with cdk.trace.trace_me("_tpu_backend"):
+                tpu_backend_compiled_fn = _tpu_backend(
+                    graph,
+                    example_inputs,
+                    options={"experimental_async_compile": True},
+                )
+
+        @cdk.trace.trace_func()
+        def _compiled_fn(*args, **kwargs):
+            with cdk.trace.trace_me("wait_for_compilation"):
+                # Wait for compiled_fn to be ready.
+                artifacts = []
+                try:
+                    tpu_backend_compiled_fn(*args, **kwargs)
+                except AsyncCompilationSubmitted as e:
+                    if e.artifact is not None:
+                        artifacts.append(e.artifact)
+
+                with cdk.trace.trace_me("resolve_compilations:{}".format(
+                        len(artifacts))):
+                    resolve_compilations(artifacts)
+
+            with cdk.trace.trace_me("run_compiled_function"):
+                # Run compiled function
+                return tpu_backend_compiled_fn(*args, **kwargs)
+
+        compiled_fn = _compiled_fn
 
         if was_wrapped:
             inner_fn = compiled_fn
@@ -330,25 +362,37 @@ class TpuCompilerAdaptor(CompilerInterface):
         # unpicklable closures).
         handle = None
         if (key is not None and self.cache_dir is not None
-                and not self._disable_cache
-                and _tpu_backend._compiled_executables):
-            try:
+                and not self._disable_cache):
+            save_path = os.path.join(self.cache_dir, key)
+            handle = (key, save_path, was_wrapped)
+
+            if handle not in self._compile_events:
+                self._compile_events[handle] = threading.Event()
+
+            @cdk.trace.trace_func()
+            def save_check_point():
                 inner_exe = _tpu_backend._compiled_executables[-1]
-                save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 with open(save_path, "wb") as f:
                     pickle.dump(inner_exe, f)
-                handle = (key, save_path, was_wrapped)
                 logger.info(
                     "[TpuCompilerAdaptor] Saved compiled executable to %s",
                     save_path,
                 )
-            except Exception as e:
-                logger.warning(
-                    "[TpuCompilerAdaptor] Failed to save executable: %s", e)
+                self._compile_events[handle].set()
+
+            t = threading.Thread(target=save_check_point)
+            t.start()
+
+            # try:
+            #     save_check_point()
+            # except Exception as e:
+            #     logger.warning(
+            #         "[TpuCompilerAdaptor] Failed to save executable: %s", e)
 
         return compiled_fn, handle
 
+    @cdk.trace.trace_func()
     def load(
         self,
         handle: Any,
@@ -365,6 +409,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         aot_autograd runtime wrapper that handles input mutations.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
+
+        with cdk.trace.trace_me("wait_for_compile"):
+            self._compile_events[handle].wait()
+
         key, path, was_wrapped = handle
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)

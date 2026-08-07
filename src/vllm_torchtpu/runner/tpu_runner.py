@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import cdk
 import bisect
 import contextlib
 import copy
@@ -3843,6 +3844,7 @@ class TPUModelRunner(GPUModelRunner):
                     initialized_count)
         self._attention_kernels_initialized = True
 
+    @cdk.trace.trace_func()
     @torch.no_grad()
     def _dummy_run(self,
                    num_tokens: int,
