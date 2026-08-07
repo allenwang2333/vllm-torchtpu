@@ -950,7 +950,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                            and _state_bt.block_tables is not None and bool(
                                torch.equal(_main_bt.block_tables,
                                            _state_bt.block_tables)))
-                logger.debug(
+                logger.info(
                     f"[MAIN_META_DEBUG] positions={positions[:6].tolist()} "
                     f"main_layer_name={main_layer_name!r} "
                     f"compressor_state_prefix={compressor_state_prefix!r} "
@@ -1055,21 +1055,29 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
 
         if is_csa:
             assert topk_indices is not None
-            fill_pad = torch.full((positions.shape[0], topk_indices.shape[1]),
-                                  -1,
-                                  dtype=topk_indices.dtype,
-                                  device=topk_indices.device)
-            topk_indices = torch.cat([topk_indices, fill_pad],
-                                     dim=0)[:positions.shape[0]]
-            # Compressed slot i covers positions [4i, 4i+4); a query at pos p may
-            # attend slot i only when i < (p+1)//4 (matches the reference
-            # topk_len = (pos+1)//COMPRESS_RATIO — no clamp, so early tokens
-            # attend via SWA only instead of reading unwritten slot 0).
-            max_valid_kv = ((positions + 1).to(torch.int32) //
-                            self.compress_ratio).unsqueeze(1)
-            extra = torch.where(
-                (topk_indices >= 0) & (topk_indices < max_valid_kv),
-                topk_indices, torch.full_like(topk_indices, -1))
+            # DSV4_CSA_FILTER=1 restores the local row-padding + max_valid_kv
+            # filter. It is OFF by default because the reference does none of
+            # it -- `tpu_inference/.../deepseek_v4_attention.py:322-323` is
+            # simply `extra = jax_view(topk_indices)`. The filter can only
+            # *remove* rows (every rejected index becomes -1), so if it rejects
+            # too many the long-range branch attends nothing while the cache,
+            # metadata and kernels all remain correct. The removed comment
+            # claimed it matched the reference; it did not.
+            if os.getenv("DSV4_CSA_FILTER") == "1":
+                fill_pad = torch.full(
+                    (positions.shape[0], topk_indices.shape[1]),
+                    -1,
+                    dtype=topk_indices.dtype,
+                    device=topk_indices.device)
+                topk_indices = torch.cat([topk_indices, fill_pad],
+                                         dim=0)[:positions.shape[0]]
+                max_valid_kv = ((positions + 1).to(torch.int32) //
+                                self.compress_ratio).unsqueeze(1)
+                extra = torch.where(
+                    (topk_indices >= 0) & (topk_indices < max_valid_kv),
+                    topk_indices, torch.full_like(topk_indices, -1))
+            else:
+                extra = topk_indices
         else:
             extra = (positions + 1).to(torch.int32) // self.compress_ratio
 
@@ -1155,7 +1163,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                              f"{_nz_scale}/{_nz_pad} "
                              f"b[444:452]={_b[444:452].tolist()} "
                              f"b[574:584]={_b[574:584].tolist()}")
-            logger.debug(
+            logger.info(
                 f"[MAIN_KV_DEQUANT_DEBUG] positions={positions[:4].tolist()} "
                 f"main_kv_lens[0]={_kv_len} page0={_page0} "
                 f"k_block_size={_k_block_size} | " + " | ".join(_rows))
@@ -1165,7 +1173,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             # redirected to `updated_sw_cache`; if the two caches are in fact
             # distinct buffers that redirect points CSA/HCA attention at the
             # wrong physical allocation entirely.
-            logger.debug(
+            logger.info(
                 f"[CACHE_IDENTITY_DEBUG] positions={positions[:4].tolist()} "
                 f"same_tensor_obj={sw_cache is main_cache_kv} "
                 f"same_data_ptr={sw_cache.data_ptr() == main_cache_kv.data_ptr()} "
@@ -1348,7 +1356,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                         f"scale_max={_s.max():.4g} "
                         f"b[444:452]={_b[444:452].tolist()} "
                         f"b[574:584]={_b[574:584].tolist()}")
-                logger.debug(
+                logger.info(
                     f"[MAIN_KV_POST_COPY_DEBUG] positions={positions[:4].tolist()} "
                     f"main_kv_lens[0]={_kv_len} page0={_page0} "
                     f"k_block_size={_k_block_size} | " +

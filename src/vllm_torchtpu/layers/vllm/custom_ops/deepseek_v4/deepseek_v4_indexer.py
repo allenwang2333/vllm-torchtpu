@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Optional
 
 import jax
@@ -36,6 +37,15 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
 
 logger = init_logger(__name__)
+
+
+def _is_tracing() -> bool:
+    if hasattr(torch, "_dynamo") and torch._dynamo.is_compiling():
+        return True
+    if hasattr(torch, "compiler") and torch.compiler.is_compiling():
+        return True
+    return False
+
 
 _indexer_op_cache = {}
 
@@ -307,5 +317,31 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                               device=topk_indices.device)
         topk_indices = torch.cat([topk_indices, fill_pad],
                                  dim=0)[:positions.shape[0]]
+
+        # `DSV4_DEBUG_TOPK_RANKS=1` prints each rank's selection for the last
+        # query token. The indexer's `shard_map` shards q/indexer_weights on
+        # the head axis (`P(None, "model")`, deepseek_v4_indexer.py:146-147)
+        # while declaring `topk_indices` replicated (`P(None, None)`, :154) --
+        # and there is no psum/all-gather in this file. Since the kernel
+        # returns [tokens, k] with no head dimension, it must reduce over heads
+        # internally, so each rank would be ranking rows on its 1/8 of the
+        # index heads. The reference instead shards the TOKEN axis
+        # (`P(ShardingAxisName.ATTN_DATA)`,
+        # tpu_inference/.../deepseek_v4_indexer.py:167-178), keeping all heads
+        # per shard. If the ranks below disagree, that inference is confirmed.
+        if os.getenv("DSV4_DEBUG_TOPK_RANKS") == "1" and not _is_tracing():
+            try:
+                from vllm.distributed.parallel_state import \
+                    get_tensor_model_parallel_rank
+                _rank = get_tensor_model_parallel_rank()
+                _last = int(topk_indices.shape[0]) - 1
+                _row = topk_indices[_last, :12].tolist()
+                logger.info(
+                    "[TOPK_RANK_DEBUG] rank=%s prefix=%s rows=%s "
+                    "last_row_first12=%s", _rank,
+                    getattr(getattr(self, "k_cache", None), "prefix", None),
+                    tuple(topk_indices.shape), _row)
+            except Exception as exc:  # debug only: never fail a run
+                logger.info("[TOPK_RANK_DEBUG] unavailable: %s", exc)
 
         return topk_indices

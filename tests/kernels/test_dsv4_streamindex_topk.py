@@ -278,6 +278,45 @@ def test_streamindex_topk_shape(
                 10, 17, 8, 15, 19, 12
             ]],
         ),
+        # 8/9. SELECTION IS LOAD-BEARING.
+        #
+        # Every case above passes `k=1024` against at most 384 candidate rows,
+        # so top-k returns *everything* and the kernel is never asked which
+        # rows matter -- the one thing this kernel exists to decide. These two
+        # use k << candidates, at long context, over a fragmented block table,
+        # so a kernel that selected the wrong rows (or the right count of wrong
+        # rows) fails here and only here.
+        (
+            1,
+            [4],
+            [384],
+            16,
+            4,
+            1,
+            16,
+            32,  # k=32 of 384 candidates
+            1,
+            8,
+            8,
+            [[
+                13, 2, 21, 7, 0, 18, 5, 11, 23, 1, 9, 16, 3, 20, 6, 14, 22, 4,
+                10, 17, 8, 15, 19, 12
+            ]],
+        ),
+        (
+            1,
+            [4],
+            [256],
+            16,
+            4,
+            1,
+            16,
+            16,  # k=16 of 64 compressed candidates (compress_ratio=4)
+            4,
+            8,
+            8,
+            [[9, 2, 14, 5, 0, 11, 7, 3, 15, 1, 12, 6, 10, 4, 13, 8]],
+        ),
     ],
 )
 def test_streamindex_topk_numerical_correctness(

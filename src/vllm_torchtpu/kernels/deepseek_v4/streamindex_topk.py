@@ -782,8 +782,22 @@ def streamindex_topk(
     # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax, but
     # direct VMEM streaming will allow SC to beat TensorCore performance.
 
-    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
-    # but faster.
+    # WARNING (measured 2026-08-07, not assumed): this is NOT equivalent to
+    # jax.lax.top_k. With `k` smaller than the number of candidate rows it
+    # returns the first k indices in order, identical for every query row --
+    # the scores are ignored. Reproduced against the NumPy ground truth by two
+    # cases in tests/kernels/test_dsv4_streamindex_topk.py (k=32 of 384, and
+    # k=16 of 64 at compress_ratio=4); every pre-existing case used k=1024
+    # against <=384 candidates, where "return everything" is accidentally
+    # correct, so the suite could not catch it.
+    #
+    # Dormant below ~2048 tokens of context (`index_topk=512` exceeds the
+    # candidate count), but active at the reference benchmark's
+    # max_model_len=9216, where each CSA layer has 2304 candidates.
+    #
+    # The reference does top-k *inside* the Pallas kernel and has no
+    # equivalent of this call; the split into a scores kernel + approx_max_k
+    # arrived with PR #214 (788cdf15), which left the tests' k=1024 untouched.
     top_vals, top_idxs = jax.lax.approx_max_k(scores,
                                               k,
                                               reduction_dimension=-1,

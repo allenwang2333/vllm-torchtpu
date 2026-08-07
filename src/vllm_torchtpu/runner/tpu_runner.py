@@ -1158,7 +1158,21 @@ class TPUModelRunner(GPUModelRunner):
         page.
 
         Returns `{swa_layer_name: host_layer_name}` for the layers that overlay.
+
+        `DSV4_DISABLE_SWA_OVERLAY=1` returns an empty plan, so every SWA cache
+        gets its own array. Bisection aid: the overlay is the one change in the
+        compressed-KV read path, and turning it off is the controlled way to ask
+        whether it is responsible for a correctness symptom. Note the overlay
+        and `two_caches_same_buffer` stay consistent either way -- the flag is
+        derived from `data_ptr()` identity, so it follows this switch.
         """
+        if os.getenv("DSV4_DISABLE_SWA_OVERLAY") == "1":
+            logger.warning(
+                "DeepSeek-V4 SWA cache overlay DISABLED by "
+                "DSV4_DISABLE_SWA_OVERLAY=1; every sliding-window cache gets "
+                "its own array. This costs KV capacity and is for debugging.")
+            return {}
+
         mla_layers: list[str] = []
         swa_groups: list[list[str]] = []
         for group in kv_cache_config.kv_cache_groups:
@@ -1186,6 +1200,13 @@ class TPUModelRunner(GPUModelRunner):
         # Each host backs at most ONE sliding-window cache. Within a group that
         # is required: its layers share a block table, so two of them on one
         # array would be handed the same block id and overwrite each other.
+        # UNVERIFIED (2026-08-07): the next clause asserts cross-group block-id
+        # disjointness, but nothing in this repo checks it and this planner
+        # never consults `KVCacheTensor.shared_by` -- it pairs layers purely by
+        # shape compatibility. Disabling the overlay entirely
+        # (DSV4_DISABLE_SWA_OVERLAY=1) produced byte-identical output, so it is
+        # not the cause of the long-range failure, but the invariant is still
+        # an assumption rather than a checked property.
         # Across groups vLLM's block ids are disjoint so sharing would be safe
         # in principle, but it would spend capacity `num_blocks` already
         # accounted for, so stay strict and let the overflow have its own array.
@@ -4629,6 +4650,17 @@ class TPUModelRunner(GPUModelRunner):
             # based on the total size of the shared cache.
             # Otherwise, `num_blocks` is calculated based on the size of the
             # single layer's KV cache spec.
+            #
+            # DIVERGENCE FROM THE REFERENCE (measured 2026-08-07): duplicating
+            # per layer costs ~2x. Summing the 169 DSv4 specs gives 12.66
+            # MiB/block actually allocated against the 6.09 MiB/block vLLM used
+            # to size `num_blocks`, so gpu_memory_utilization=0.7 overcommits
+            # HBM and dies in `initialize_kv_cache`; 0.45 is the working cap.
+            # `tpu_inference/runner/kv_cache_manager.py:914` allocates ONE array
+            # per KVCacheTensor (`if j == 0 or duplicate_shared_layers`) and
+            # points the other shared layers at it; there, per-layer
+            # duplication is a Mamba-only workaround. Fixing this is what makes
+            # a >2048-token context testable here.
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
             if len(shared_by) > 1 and any(
