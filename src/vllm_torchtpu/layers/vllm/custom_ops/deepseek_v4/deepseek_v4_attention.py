@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
                                         SlidingWindowMLASpec)
+
 from vllm_torchtpu.kernels.deepseek_v4.mla import mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.mla_swa import \
     mla_sliding_window_ragged_paged_attention
@@ -341,15 +342,43 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         cache_config,
     ) -> None:
         super().__init__(head_dim, window_size, dtype, prefix, cache_config)
-        compressed_kv_cache_bz = cache_config.block_size
+        # NOTE: `cache_config.block_size` is NOT final here. The platform's
+        # `update_block_size_for_backend` override has not reached this config
+        # object yet at model-construction time -- measured 16 (vLLM's default)
+        # while the real value is 1024. `_swa_block_size` recomputes from the
+        # final config; this is only a provisional value so the attribute
+        # always exists.
+        self.block_size = self._swa_block_size(cache_config.block_size)
+
+    @staticmethod
+    def _swa_block_size(compressed_kv_cache_bz: int) -> int:
+        """SWA page size, which must equal the CSA main cache's page size.
+
+        vLLM states the constraint directly
+        (`vllm/v1/attention/backends/mla/sparse_swa.py:72-77`): the SWA cache
+        and the compressed-KV cache share one physical tensor, so "they must
+        use the same page size". A CSA layer's main cache stores
+        `block_size // 4` compressed rows per page (`compress_ratio == 4`), so
+        the SWA cache uses the same divisor.
+
+        The reference additionally clamps this to `window_size`
+        (`tpu_inference/.../deepseek_v4_attention.py:73`). That clamp is inert
+        in its configuration (`block_size=512` -> `min(128, 128)`), but bites
+        at our `block_size=1024` (`min(256, 128)` = 128 against a 256-row host
+        page), breaking the equality above. We therefore omit it -- a knowing
+        deviation, with the shared-tensor invariant as the reason. The cost is
+        a 2x-larger SWA page than the 128-token window strictly needs, which is
+        wasted capacity only, never incorrect.
+        """
         csa_compression_ratio = 4
-        if window_size is None:
-            self.block_size = compressed_kv_cache_bz // csa_compression_ratio
-        else:
-            self.block_size = min(
-                compressed_kv_cache_bz // csa_compression_ratio, window_size)
+        return compressed_kv_cache_bz // csa_compression_ratio
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # Recompute from the final, post-override block size and write it back:
+        # `_build_attn_op` reads this same attribute as the kernel's
+        # `logical_page_size`, so the spec and the kernel must not disagree.
+        self.block_size = self._swa_block_size(
+            vllm_config.cache_config.block_size)
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
