@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+import time
+
 import torch
 
 from vllm_torchtpu.runner.tpu_runner_async_output import (
-    INVALID_TOKEN_ID, assemble_spec_next_tokens, compute_num_rejected,
-    extract_draft_token_ids, subtract_num_rejected_tokens)
+    INVALID_TOKEN_ID, AsyncTPUCopyState, assemble_spec_next_tokens,
+    compute_num_rejected, extract_draft_token_ids,
+    subtract_num_rejected_tokens)
 
 
 def test_assemble_spec_next_tokens(device):
@@ -141,3 +145,117 @@ def test_compute_num_rejected_variable_draft(device):
     out = compute_num_rejected(next_tokens, num_draft)
 
     assert out.tolist() == [0, 1]
+
+
+class _ParkedEvent:
+    """Stands in for `torch.tpu.Event`: `synchronize` parks until released."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def synchronize(self):
+        self.calls += 1
+        self.entered.set()
+        assert self.release.wait(timeout=10), "event was never released"
+
+
+class _DoneEvent:
+
+    def synchronize(self):
+        return None
+
+
+def test_wait_never_holds_its_lock_across_the_device_wait():
+    """Both owners must be able to sit in `synchronize()` at the same time.
+
+    The runner hands the same `AsyncTPUCopyState` to `AsyncPreResults` (drained
+    on the engine thread by `_modify_prev_results`) and to
+    `AsyncTPUModelRunnerOutput` (drained on the executor's output thread).
+    The teardown must run once, but the lock that guarantees that has to cover
+    the state transition ONLY: `synchronize()` blocks until the runtime drains
+    the copy, and the other owner making progress is part of how that happens,
+    so a mutex spanning it deadlocks the pair outright. Guarding the whole
+    body is a far worse failure than the race it closes, and this pins it.
+
+    Neither owner may drop `chunks_tpu` while a transfer is still in flight —
+    those are the device buffers the copy reads from.
+    """
+    event = _ParkedEvent()
+    state = AsyncTPUCopyState(
+        chunks_cpu=[torch.zeros((2, 1), dtype=torch.int32)],
+        chunk_real_lens=[2],
+        copy_ready_event=event,
+        chunks_tpu=[object()],
+    )
+
+    first = threading.Thread(target=state.wait)
+    first.start()
+    assert event.entered.wait(timeout=10)
+
+    # The second owner arrives while the copy is still in flight. It must
+    # reach the device wait too, not block behind the first owner's lock.
+    second = threading.Thread(target=state.wait)
+    second.start()
+    for _ in range(100):
+        if event.calls == 2:
+            break
+        time.sleep(0.01)
+    assert event.calls == 2, (
+        "second owner never reached synchronize -- the lock spans the device "
+        "wait, which deadlocks the pair")
+    assert state.chunks_tpu is not None, "copy sources freed mid-transfer"
+
+    event.release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert state.completed
+    assert state.chunks_tpu is None
+
+
+def test_wait_after_completion_is_a_cheap_no_op():
+    event = _ParkedEvent()
+    event.release.set()
+    state = AsyncTPUCopyState(
+        chunks_cpu=[torch.zeros((1, 1), dtype=torch.int32)],
+        chunk_real_lens=[1],
+        copy_ready_event=event,
+        chunks_tpu=[object()],
+    )
+
+    state.wait()
+    state.wait()
+
+    assert event.calls == 1
+    assert state.completed
+
+
+def test_sampled_token_ids_cpu_is_trimmed_and_computed_once():
+    state = AsyncTPUCopyState(
+        chunks_cpu=[
+            torch.tensor([[1], [2], [99]], dtype=torch.int32),
+            torch.tensor([[3], [99]], dtype=torch.int32),
+        ],
+        chunk_real_lens=[2, 1],
+        copy_ready_event=_DoneEvent(),
+    )
+    state.wait()
+
+    results: list[torch.Tensor] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(
+            state.sampled_token_ids_cpu)) for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(results) == 4
+    # One concat, shared by every reader.
+    assert all(r is results[0] for r in results)
+    # Each bucketed chunk trimmed to its real length, then concatenated.
+    assert torch.equal(results[0],
+                       torch.tensor([[1], [2], [3]], dtype=torch.int32))
