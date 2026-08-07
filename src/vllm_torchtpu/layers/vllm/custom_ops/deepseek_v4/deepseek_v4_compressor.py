@@ -343,9 +343,33 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             super().__init__(*args, **kwargs)
         finally:
             dsv4_compressor.CompressorStateCache = orig_state_cache
-        self.compressor_op = self._build_compressor_op()
+        # NOTE: `compressor_op` is deliberately NOT built here -- see the
+        # property below.
         self.num_layers = get_current_vllm_config(
         ).model_config.hf_config.num_hidden_layers
+
+    @property
+    def compressor_op(self):
+        """Built on first use, not in `__init__`.
+
+        `_build_compressor_op` bakes `state_block_size` into the traced op as a
+        static constant. At construction time that attribute still holds the
+        base `CompressorStateCache.__init__` value (4 for CSA / 8 for HCA),
+        which is derived from the CUDA layout and assumes a 64-row host page;
+        `VllmCompressorStateCache.get_kv_cache_spec` only replaces it with the
+        value this host page can actually take (16 / 1) later, during KV cache
+        initialization.
+
+        Baking the stale 8 in gave `state row needs 4096B but cache width is
+        640B` on HCA layers -- with the correct 1 the same packing needs 512B
+        and fits. Same failure mode, same fix as
+        `VllmDeepseekV4MLAAttention.attn_op`.
+        """
+        op = self.__dict__.get("_compressor_op_instance")
+        if op is None:
+            op = self._build_compressor_op()
+            object.__setattr__(self, "_compressor_op_instance", op)
+        return op
 
     def _build_compressor_op(self):
         vllm_context = get_vllm_model_wrapper_context()
