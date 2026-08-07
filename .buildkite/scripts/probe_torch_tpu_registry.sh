@@ -50,7 +50,7 @@ echo "--- torch-tpu wheel filenames (loose match)"
 grep -oiE 'torch[_-]tpu-[0-9][^<">#]*' /tmp/tt_index.html | sort -u | tail -40 || true
 
 echo "--- per-nightly torch requirement (PEP 658 metadata)"
-for v in $(grep -oE '0\.1\.1\.dev20260[78][0-9]{9,}' /tmp/tt_index.html | sort -u); do
+for v in $(grep -oE '0\.1\.1\.dev20260[78][0-9]{8}' /tmp/tt_index.html | sort -u); do
   url=$(grep -oE "href=\"[^\"]*torch_tpu-${v}[^\"]*\.whl[^\"]*\"" /tmp/tt_index.html \
         | head -1 | sed -e 's/^href="//' -e 's/"$//' -e 's/#.*//')
   if [ -z "${url}" ]; then
