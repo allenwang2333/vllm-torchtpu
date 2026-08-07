@@ -34,9 +34,20 @@ echo "--- torch versions in registry"
 curl -su "oauth2accesstoken:${TOKEN}" "${REG}/torch/" \
   | grep -oE 'torch-[0-9][^<"#]*\.whl' | sort -u | tail -30 || true
 
-echo "--- torch-tpu wheel filenames (dev202607xx onward)"
+echo "--- torch-tpu index: size / anchor count / first+last anchors"
 curl -su "oauth2accesstoken:${TOKEN}" "${REG}/torch-tpu/" > /tmp/tt_index.html
-grep -oE 'torch_tpu-0\.1\.1\.dev20260[78][0-9]{9,}[^<"#]*\.whl' /tmp/tt_index.html | sort -u || true
+wc -c /tmp/tt_index.html
+tr '<' '\n' < /tmp/tt_index.html | grep -c '^a ' || true
+tr '<' '\n' < /tmp/tt_index.html | grep '^a ' | head -3 || true
+tr '<' '\n' < /tmp/tt_index.html | grep '^a ' | tail -8 || true
+
+echo "--- torch-tpu versions via pip index"
+python3 -m pip index versions torch-tpu \
+  --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+  2>&1 | head -6 || true
+
+echo "--- torch-tpu wheel filenames (loose match)"
+grep -oiE 'torch[_-]tpu-[0-9][^<">#]*' /tmp/tt_index.html | sort -u | tail -40 || true
 
 echo "--- per-nightly torch requirement (PEP 658 metadata)"
 for v in $(grep -oE '0\.1\.1\.dev20260[78][0-9]{9,}' /tmp/tt_index.html | sort -u); do
