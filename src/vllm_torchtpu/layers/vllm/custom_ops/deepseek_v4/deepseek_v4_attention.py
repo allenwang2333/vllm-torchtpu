@@ -468,7 +468,9 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                            hf_config.num_attention_heads * hf_config.head_dim)
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.n_groups = self.n_local_groups * self.tp_size
-        object.__setattr__(self, "attn_op", self._build_attn_op())
+        # NOTE: `attn_op` is deliberately NOT built here -- see the `attn_op`
+        # property below. Model construction is too early to read the geometry
+        # the kernel needs to be specialized on.
         self.num_layers = vllm_config.model_config.hf_config.num_hidden_layers
         compilation_config = vllm_config.compilation_config
         if compilation_config is not None:
@@ -508,6 +510,30 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             alignment=None,
         )
         return spec
+
+    @property
+    def attn_op(self):
+        """The Pallas attention op, built on first use rather than in `__init__`.
+
+        Building at construction time reads state that is not final yet:
+
+        - `cache_config.block_size` is still vLLM's default 16 during model
+          construction (the platform's `update_block_size_for_backend` override
+          is not visible on any config object reachable from here), so the SWA
+          logical page size came out 4 instead of 256.
+        - the KV caches are still `torch.tensor([])` placeholders, so nothing
+          about real tensor identity or geometry can be observed.
+
+        By first forward both are settled, and the model-wrapper context is
+        active (`tpu_runner.py:2713`), so `_build_attn_op` can read what it
+        needs. The op is memoized per instance, and `_attn_op_cache` still
+        dedupes the underlying jax op across layers.
+        """
+        op = self.__dict__.get("_attn_op_instance")
+        if op is None:
+            op = self._build_attn_op()
+            object.__setattr__(self, "_attn_op_instance", op)
+        return op
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
