@@ -83,6 +83,8 @@ from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.qwen3_5_microbatch import (
+    Qwen3_5TwoMicrobatchModelAdapter, TwoMicrobatchAttentionMetadata)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
@@ -177,6 +179,21 @@ def _snapshot_microbatch_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_snapshot_microbatch_value(item) for item in value)
     return value
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _forward_qwen3_5_two_microbatches(
+    model: Any,
+    input_ids0: torch.Tensor,
+    input_ids1: torch.Tensor,
+    positions0: torch.Tensor,
+    positions1: torch.Tensor,
+    communicator: Any,
+):
+    """One fixed-shape graph containing both request-independent prefills."""
+    return Qwen3_5TwoMicrobatchModelAdapter.forward(
+        model, (input_ids0, input_ids1), (positions0, positions1),
+        communicator)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -3116,36 +3133,42 @@ class TPUModelRunner(GPUModelRunner):
                                           field="input_ids")
         return num_tokens
 
-    def _run_one_staged_microbatch(
-            self, bundle: PreparedPrefillMicrobatch,
-            num_tokens: int) -> torch.Tensor:
-        """Run a single staged bundle through the ordinary prefill forward.
+    # Warmup reaches this through capture_model, which is not itself guarded --
+    # the ordinary path gets its guard from _dummy_run. Without the same guard
+    # here, AOTAutograd traces the staged graph on its training path and fails
+    # on the first op with no backward formula (pallas.fused_moe_kernel).
+    @torch.no_grad()
+    def _run_two_microbatch_forward(
+        self, bundles: tuple[PreparedPrefillMicrobatch,
+                             PreparedPrefillMicrobatch]
+    ) -> tuple[torch.Tensor, ...]:
+        """Install both metadata sets and dispatch the one staged graph.
 
-        The staged step is defined by its admission and padding rules, not by
-        how the microbatches are executed. Running them one at a time through
-        the normal forward makes the dispatch observable and correct on its
-        own; overlapping them is a separate change that swaps out only this
-        step.
+        Both microbatches go into a single compiled graph so one's expert
+        compute can be issued while the other's expert-parallel collectives
+        are still in flight. TwoMicrobatchAttentionMetadata keeps each slot's
+        own attention metadata addressable from inside that shared graph.
         """
+        from vllm.distributed.parallel_state import get_dp_group
+
+        communicator = get_dp_group().device_communicator
+        if communicator is None:
+            raise RuntimeError("TPU EP device communicator is not initialized")
+        metadata = TwoMicrobatchAttentionMetadata(
+            bundles[0].attention_metadata, bundles[1].attention_metadata)
+        num_tokens = self._staged_forward_num_tokens(bundles)
         with set_forward_context(
-                bundle.attention_metadata,
+                metadata,
                 self.vllm_config,
                 num_tokens=num_tokens,
                 num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
         ), set_vllm_model_wrapper_context(mesh=self.mesh,
                                           vllm_config=self.vllm_config):
-            hidden_states, _ = self.forward_model(bundle.input_ids,
-                                                  bundle.position_ids)
-        return hidden_states
-
-    def _run_two_microbatch_forward(
-        self, bundles: tuple[PreparedPrefillMicrobatch,
-                             PreparedPrefillMicrobatch]
-    ) -> tuple[torch.Tensor, ...]:
-        """Run every staged microbatch and return their hidden states."""
-        num_tokens = self._staged_forward_num_tokens(bundles)
-        return tuple(self._run_one_staged_microbatch(bundle, num_tokens)
-                     for bundle in bundles)
+            output = _forward_qwen3_5_two_microbatches(
+                self.model, bundles[0].input_ids, bundles[1].input_ids,
+                bundles[0].position_ids, bundles[1].position_ids,
+                communicator)
+        return output.hidden_states0, output.hidden_states1
 
     def _staged_microbatch_logits(
             self, hidden_state: torch.Tensor,

@@ -494,32 +494,96 @@ def test_staged_step_runs_every_microbatch_through_the_forward():
     assert forwarded == list(bundles)
 
 
-def test_serial_staged_forward_gives_each_microbatch_its_own_context():
-    """Each microbatch carries independent attention metadata.
+def test_staged_forward_dispatches_one_graph_with_both_metadata_sets(
+        monkeypatch):
+    """Both microbatches enter a single graph carrying their own metadata.
 
-    Running them one at a time is only correct if the forward context is
-    rebuilt per microbatch; reusing one context would give the second slot the
-    first slot's block tables and slot mappings.
+    Overlap depends on both being visible to one trace, and correctness
+    depends on each slot still reaching its own block tables and slot
+    mappings -- which is what TwoMicrobatchAttentionMetadata carries in.
     """
+    import contextlib
+
     import torch
+    import vllm.distributed.parallel_state as parallel_state
 
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-    observed = []
+    communicator = object()
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group",
+        lambda: SimpleNamespace(device_communicator=communicator))
+    observed = {}
+
+    @contextlib.contextmanager
+    def fake_forward_context(metadata, config, num_tokens,
+                             num_tokens_across_dp):
+        observed["metadata"] = metadata
+        observed["num_tokens"] = num_tokens
+        yield
+
+    @contextlib.contextmanager
+    def fake_wrapper_context(**kwargs):
+        yield
+
+    def fake_forward(model, ids0, ids1, pos0, pos1, comm):
+        observed["dispatch"] = (ids0, ids1, pos0, pos1, comm)
+        return SimpleNamespace(hidden_states0=torch.tensor([1]),
+                               hidden_states1=torch.tensor([2]))
+
+    monkeypatch.setattr("vllm_torchtpu.runner.tpu_runner.set_forward_context",
+                        fake_forward_context)
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
+        fake_wrapper_context)
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner."
+        "_forward_qwen3_5_two_microbatches", fake_forward)
+
+    bundles = tuple(
+        SimpleNamespace(attention_metadata={"layer": f"mb{index}"},
+                        input_ids=torch.zeros(PREFILL_MICROBATCH_TOKENS),
+                        position_ids=torch.full((PREFILL_MICROBATCH_TOKENS, ),
+                                                index))
+        for index in range(2))
 
     class FakeRunner:
-        def _staged_forward_num_tokens(self, bundles):
-            return PREFILL_MICROBATCH_TOKENS
+        model = object()
+        mesh = None
+        vllm_config = None
+        _staged_forward_num_tokens = (
+            TPUModelRunner._staged_forward_num_tokens)
 
-        def _run_one_staged_microbatch(self, bundle, num_tokens):
-            observed.append((bundle.attention_metadata, num_tokens))
-            return torch.tensor([len(observed)])
-
-    bundles = (SimpleNamespace(attention_metadata="mb0"),
-               SimpleNamespace(attention_metadata="mb1"))
+        def _dp_num_tokens_across_dp(self, num_tokens):
+            return None
 
     hidden = TPUModelRunner._run_two_microbatch_forward(FakeRunner(), bundles)
 
-    assert observed == [("mb0", PREFILL_MICROBATCH_TOKENS),
-                        ("mb1", PREFILL_MICROBATCH_TOKENS)]
+    assert observed["num_tokens"] == PREFILL_MICROBATCH_TOKENS
+    # One graph, but each slot still resolves to its own metadata.
+    assert observed["metadata"]["layer"] == "mb0"
+    assert observed["dispatch"][4] is communicator
+    assert observed["dispatch"][2][0].item() == 0
+    assert observed["dispatch"][3][0].item() == 1
     assert [item.item() for item in hidden] == [1, 2]
+
+
+def test_staged_forward_requires_an_initialized_communicator():
+    """The staged graph cannot launch EP collectives without one."""
+    import torch
+    import vllm.distributed.parallel_state as parallel_state
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    original = parallel_state.get_dp_group
+    parallel_state.get_dp_group = (
+        lambda: SimpleNamespace(device_communicator=None))
+    try:
+        bundles = (SimpleNamespace(
+            attention_metadata={},
+            input_ids=torch.zeros(PREFILL_MICROBATCH_TOKENS)), ) * 2
+        with pytest.raises(RuntimeError, match="device communicator"):
+            TPUModelRunner._run_two_microbatch_forward(SimpleNamespace(),
+                                                       bundles)
+    finally:
+        parallel_state.get_dp_group = original
