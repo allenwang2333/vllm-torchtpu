@@ -348,37 +348,41 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         # while the real value is 1024. `_swa_block_size` recomputes from the
         # final config; this is only a provisional value so the attribute
         # always exists.
-        self.block_size = self._swa_block_size(cache_config.block_size)
+        self.block_size = self._swa_block_size(cache_config.block_size,
+                                               window_size)
 
     @staticmethod
-    def _swa_block_size(compressed_kv_cache_bz: int) -> int:
-        """SWA page size, which must equal the CSA main cache's page size.
+    def _swa_block_size(compressed_kv_cache_bz: int,
+                        window_size: int | None) -> int:
+        """SWA page size, sized to fit inside a CSA main cache page.
 
-        vLLM states the constraint directly
-        (`vllm/v1/attention/backends/mla/sparse_swa.py:72-77`): the SWA cache
-        and the compressed-KV cache share one physical tensor, so "they must
-        use the same page size". A CSA layer's main cache stores
-        `block_size // 4` compressed rows per page (`compress_ratio == 4`), so
-        the SWA cache uses the same divisor.
+        A CSA layer's main cache stores `block_size // 4` compressed rows per
+        page (`compress_ratio == 4`), so the SWA cache uses the same divisor,
+        then clamps to the window it actually has to hold. Identical to the
+        reference (`tpu_inference/.../deepseek_v4_attention.py:73`), which
+        runs at the same `block_size=1024` we do
+        (`tpu_inference/layers/vllm/backends/flash_attn_mla.py:46`).
 
-        The reference additionally clamps this to `window_size`
-        (`tpu_inference/.../deepseek_v4_attention.py:73`). That clamp is inert
-        in its configuration (`block_size=512` -> `min(128, 128)`), but bites
-        at our `block_size=1024` (`min(256, 128)` = 128 against a 256-row host
-        page), breaking the equality above. We therefore omit it -- a knowing
-        deviation, with the shared-tensor invariant as the reason. The cost is
-        a 2x-larger SWA page than the 128-token window strictly needs, which is
-        wasted capacity only, never incorrect.
+        The clamp is load-bearing at 1024: `min(256, 128)` = 128 against a
+        256-row host page. The overlay does not require equality, only that
+        the host page is large enough -- the reference's compatibility test is
+        `physical_page_entries >= swa_spec.storage_block_size`
+        (`tpu_inference/runner/kv_cache_manager.py:1171`). So a 128-row SWA
+        page inside a 256-row CSA page is the intended arrangement, and
+        dropping the clamp would only waste half of it.
         """
         csa_compression_ratio = 4
-        return compressed_kv_cache_bz // csa_compression_ratio
+        block_size = compressed_kv_cache_bz // csa_compression_ratio
+        if window_size is None:
+            return block_size
+        return min(block_size, window_size)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Recompute from the final, post-override block size and write it back:
         # `_build_attn_op` reads this same attribute as the kernel's
         # `logical_page_size`, so the spec and the kernel must not disagree.
         self.block_size = self._swa_block_size(
-            vllm_config.cache_config.block_size)
+            vllm_config.cache_config.block_size, self.window_size)
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -558,20 +562,18 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"{self.custom_prefix}: swa_cache_layer unavailable at "
                 "attention-op build time; refusing to guess the SWA cache "
                 "logical page size.")
-        # Derive from the config in hand rather than reading
-        # `swa_cache.block_size`. This method runs *before*
-        # `VllmDeepseekV4SWACache.get_kv_cache_spec`, so that attribute still
-        # holds the provisional value computed from the pre-override
-        # `cache_config.block_size` (measured 16, giving a 4-row page against a
-        # real 256). Both sites use `_swa_block_size` over a final config, so
-        # the kernel's logical page size and the allocated spec agree.
-        logical_page_size = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size)
+        # Safe to read directly, matching the reference
+        # (`tpu_inference/.../deepseek_v4_attention.py:397` passes
+        # `logical_page_size=self.swa_cache_layer.block_size`): this op is
+        # built lazily on first forward (see the `attn_op` property), by which
+        # point `get_kv_cache_spec` has run and replaced the provisional
+        # construction-time value with one derived from the final block size.
+        logical_page_size = swa_cache.block_size
         if logical_page_size <= 0:
             raise RuntimeError(
-                f"{self.custom_prefix}: computed a non-positive SWA logical "
-                f"page size ({logical_page_size}) from cache block size "
-                f"{vllm_context.vllm_config.cache_config.block_size}.")
+                f"{self.custom_prefix}: SWA logical page size is "
+                f"{logical_page_size}; expected `get_kv_cache_spec` to have "
+                "set it before the first forward.")
 
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (getattr(self.mla_attn, "scale", None)

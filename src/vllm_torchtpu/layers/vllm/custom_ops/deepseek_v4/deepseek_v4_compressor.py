@@ -249,24 +249,52 @@ class VllmCompressorStateCache(CompressorStateCache):
             compress_ratio,
             prefix,
         )
-        # NOTE: don't recompute self.block_size here. The base
-        # CompressorStateCache.__init__ (vllm.models.deepseek_v4.compressor)
-        # already sets it correctly (4 for CSA/compress_ratio=4, 8 for
-        # HCA/compress_ratio=128), derived from the exact packed-cache row
-        # geometry (see its comment: KV block shape [64, 584] -> block_size
-        # 4/8). An earlier override here recomputed it from
-        # cache_config.block_size and produced 1 for both CSA and HCA, which
-        # makes one compressor-state token span an entire physical page
-        # (page_size // 1 rows) instead of the intended 16 (CSA) / 8 (HCA)
-        # rows -- since compressor state and the shared MLA cache buffer
-        # overlay the same physical pages, every state write was clobbering
-        # all 64 rows of whatever page it landed on, wiping real KV and
-        # compressed-KV bytes living on the same page. This value (4/8) is
-        # what makes the overlay design (see ``get_kv_cache_spec`` below)
-        # safe -- keep it even though the dedicated-buffer approach that
-        # used to sit on top of this fix has since been reverted.
         coff = 1 + (compress_ratio == 4)
         self.head_dim = state_dim // 2 // coff
+        # The state cache is byte-packed into the page of the compressed-KV
+        # cache it overlays, so its block size is a function of that host
+        # page's size -- not a constant.
+        #
+        # The base `CompressorStateCache.__init__` sets 4 (CSA) / 8 (HCA) from
+        # the CUDA layout, assuming a host page of `256 // 4 = 64` rows (see
+        # its comment: "KV block shape [256//4, head_dim] = [64, 584]"). Our
+        # host pages are `cache_config.block_size // compress_ratio` rows, so
+        # that constant does not transfer: at `block_size=1024` an HCA page is
+        # 8 rows, and packing an 8-row state block into it needs 4096 B per
+        # row against a 640 B cache width -- which is exactly the
+        # `state row needs 4096B but cache width is 640B` failure.
+        #
+        # Recompute the way the reference does
+        # (`tpu_inference/.../deepseek_v4_compressor.py:60-70`). An earlier
+        # override here was reverted for producing 1 for both CSA and HCA and
+        # clobbering neighbouring rows; that version divided
+        # `cache_config.block_size` directly, missing the `// compress_ratio`
+        # step. With it, this yields 16 (CSA) and 1 (HCA) at `block_size=1024`,
+        # and both pack to 512 B per row inside the 640 B width.
+        # Left provisional here and recomputed in `get_kv_cache_spec`, which
+        # receives the authoritative config: at construction time the reachable
+        # `cache_config.block_size` is still vLLM's default 16 (measured), and
+        # 16 // 128 floors to a zero-sized HCA page.
+        self.compress_ratio = compress_ratio
+        self._state_coff = coff
+
+    def _state_block_size(self, cache_block_size: int) -> int:
+        """Rows of compressor state packed into one host compressed-KV page."""
+        compressed_kv_cache_bz = cache_block_size // self.compress_ratio
+        # 4: bytes per f32. 2: kv-dim + score-dim.
+        block_size = compressed_kv_cache_bz // 4 // 2 // self._state_coff
+        if block_size <= 0:
+            # Degenerates below block_size=1024: at 512 an HCA host page is 4
+            # rows and this floors to 0. Fail loudly rather than emit a
+            # zero-sized page.
+            raise ValueError(
+                f"DeepSeek-V4 compressor state cache {self.prefix!r} computed "
+                f"a non-positive block size ({block_size}) from cache block "
+                f"size {cache_block_size} and compress_ratio "
+                f"{self.compress_ratio}: the compressed-KV host page "
+                f"({compressed_kv_cache_bz} rows) is too small to pack this "
+                "layer's compressor state into.")
+        return block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Declare this as a raw-uint8, self-managed-layout buffer (matching
@@ -293,6 +321,8 @@ class VllmCompressorStateCache(CompressorStateCache):
         # (`runner/tpu_runner.py`), a post-allocation step that swaps this
         # layer's tensor for its host's, after this spec's own group/
         # metadata machinery has already run normally.
+        self.block_size = self._state_block_size(
+            vllm_config.cache_config.block_size)
         bytes_per_row = self.state_dim * 4
         return SlidingWindowMLASpec(
             block_size=self.block_size,
