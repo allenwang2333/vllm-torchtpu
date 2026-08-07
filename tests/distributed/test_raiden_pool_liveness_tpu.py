@@ -334,7 +334,37 @@ def _run_pool_bytes_live_in_both_directions():
                 "region-granular")
 
 
-@pytest.mark.skip(reason="fails on tpu7x with the pinned tpu-raiden-torch "
-                  "wheel; see vllm-torchtpu#358")
+def _run_raiden_abi_preflight():
+    """Fails with a precise diagnosis when the raiden extension variant was
+    not built against the running torch (#358). Such a variant loads cleanly
+    but misreads TensorImpl fields, so every manager construction rejects
+    valid TPU tensors long before any byte moves; without this preflight that
+    condition surfaces as an opaque byte-liveness failure."""
+    _require_tpu_and_raiden()
+    import torch
+    from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+
+    probe = torch.zeros((2, 128), dtype=torch.uint8, device="tpu")
+    try:
+        KVCacheManager(
+            kv_caches=[probe],
+            node_id=0,
+            local_control_port=-1,
+            max_blocks=1,
+            num_slots=1,
+            unsafe_skip_buffer_lock=True,
+        )
+    except ValueError as exc:
+        if "private use space" in str(exc) and probe.device.type == "tpu":
+            raise AssertionError(
+                "raiden rejected a tensor that torch reports as a 'tpu' "
+                "(renamed PrivateUse1) device tensor: the installed "
+                "tpu-raiden-torch wheel's extension variant is not "
+                f"ABI-compatible with the running torch {torch.__version__} "
+                "(see vllm-torchtpu#358)") from exc
+        raise
+
+
 def test_pool_bytes_live_in_both_directions():
+    run_in_isolated_process(_run_raiden_abi_preflight)
     run_in_isolated_process(_run_pool_bytes_live_in_both_directions)
