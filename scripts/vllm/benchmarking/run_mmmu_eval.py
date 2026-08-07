@@ -15,7 +15,6 @@ Technical Motivation:
 import argparse
 import ast
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import io
 import json
@@ -24,9 +23,10 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PIL import Image
 import requests
+from PIL import Image
 
 
 def parse_args():
@@ -236,8 +236,6 @@ def load_mmmu_samples(
                     options_raw = item.get("options", [])
                     if isinstance(options_raw, str):
                         try:
-                            import ast
-
                             options = ast.literal_eval(options_raw)
                         except Exception:  # noqa: BLE001
                             options = []
@@ -279,8 +277,6 @@ def load_mmmu_samples(
         print(
             "Falling back to synthetic multimodal benchmark suite (--allow-synthetic set)..."
         )
-        from PIL import Image
-
         samples = []
         choices = ["A", "B", "C", "D"]
         colors = ["red", "blue", "green", "yellow"]

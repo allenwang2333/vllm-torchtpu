@@ -2,15 +2,18 @@ import argparse
 import os
 import time
 
-# Ensure multiprocessing method is set to spawn
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_XLA_CACHE_PATH"] = "/tmp/vllm_xla_cache"
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+from vllm import LLM, SamplingParams
 
 try:
     import vllm_torchtpu  # noqa: F401
 except ImportError:
     pass
-from vllm import LLM, SamplingParams
+
+# Ensure multiprocessing method is set to spawn
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_XLA_CACHE_PATH"] = "/tmp/vllm_xla_cache"
 
 MODEL_ID = "google/gemma-4-31B-it"
 
@@ -49,9 +52,6 @@ def main():
     )
 
     if args.multimodal:
-        from PIL import Image
-        from transformers import AutoProcessor
-
         print(f"Loading processor for {MODEL_ID}...")
         processor = AutoProcessor.from_pretrained(MODEL_ID,
                                                   trust_remote_code=True)
@@ -116,8 +116,6 @@ def main():
         outputs = llm.generate(inputs, sampling_params=sampling_params)
         t_gen_end = time.time()
     else:
-        from transformers import AutoTokenizer
-
         print(f"Loading tokenizer for {MODEL_ID}...")
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID,
                                                   trust_remote_code=True)
