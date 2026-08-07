@@ -1183,24 +1183,38 @@ class TPUModelRunner(GPUModelRunner):
                 f"{[n for g in swa_groups for n in g]}")
 
         overlay: dict[str, str] = {}
+        # Each host backs at most ONE sliding-window cache. Within a group that
+        # is required: its layers share a block table, so two of them on one
+        # array would be handed the same block id and overwrite each other.
+        # Across groups vLLM's block ids are disjoint so sharing would be safe
+        # in principle, but it would spend capacity `num_blocks` already
+        # accounted for, so stay strict and let the overflow have its own array.
+        #
+        # Tracked globally, not per group. Resetting per group makes every group
+        # restart at hosts[0] -- which silently mapped all 43 SWA caches onto a
+        # handful of arrays when the SWA layers turned out to be spread across
+        # many groups rather than collected in one.
+        taken: set[str] = set()
         for swa_layers in swa_groups:
             swa_spec = per_layer_spec(swa_layers[0])
             swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
                                swa_spec.dtype.itemsize)
-            hosts: list[str] = []
-            for host_name in mla_layers:
-                shape = cache_shape_of(per_layer_spec(host_name))
-                # 4-D packed MLA layout: (pages, rows/packing, packing, width).
-                page_entries = shape[1] * shape[2]
-                entry_width_bytes = shape[-1] * per_layer_spec(
-                    host_name).dtype.itemsize
-                if (per_layer_spec(host_name).dtype == swa_spec.dtype
-                        and entry_width_bytes >= swa_entry_bytes
-                        and page_entries >= swa_spec.storage_block_size):
-                    hosts.append(host_name)
-            for position, layer_name in enumerate(swa_layers):
-                if position < len(hosts):
-                    overlay[layer_name] = hosts[position]
+            for layer_name in swa_layers:
+                for host_name in mla_layers:
+                    if host_name in taken:
+                        continue
+                    host_spec = per_layer_spec(host_name)
+                    shape = cache_shape_of(host_spec)
+                    # 4-D packed MLA layout:
+                    # (pages, rows/packing, packing, width).
+                    page_entries = shape[1] * shape[2]
+                    entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
+                    if (host_spec.dtype == swa_spec.dtype
+                            and entry_width_bytes >= swa_entry_bytes
+                            and page_entries >= swa_spec.storage_block_size):
+                        overlay[layer_name] = host_name
+                        taken.add(host_name)
+                        break
         return overlay
 
     def _update_attention_page_size_padded(
@@ -4569,6 +4583,29 @@ class TPUModelRunner(GPUModelRunner):
                 return spec.kv_cache_specs[layer_name]
             return spec
 
+        # `DSV4_DUMP_KV_PLAN=1` prints the per-layer spec geometry and, after
+        # allocation below, every array's shape and what it aliases. DSv4's
+        # caches are only correct when four numbers agree -- the spec's
+        # `storage_block_size`, the allocated rows/page, the kernel's
+        # `logical_page_size` and the block table's stride -- and none of them
+        # is visible from a stack trace when they don't. This dump is how the
+        # 128x HCA over-allocation and the SWA overlay's host collision were
+        # both found; keep it.
+        if os.getenv("DSV4_DUMP_KV_PLAN") == "1":
+            logger.info("[DSV4_KVPLAN_DEBUG] num_blocks=%s cache_bs=%s",
+                        kv_cache_config.num_blocks,
+                        self.cache_config.block_size)
+            for _name in sorted(layer_name_to_spec):
+                _s2 = _per_layer_spec(_name)
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] spec %s type=%s block_size=%s "
+                    "storage=%s ratio=%s head=%s dtype=%s", _name,
+                    type(_s2).__name__, getattr(_s2, "block_size", None),
+                    getattr(_s2, "storage_block_size", None),
+                    getattr(_s2, "compress_ratio", None),
+                    getattr(_s2, "head_size", None),
+                    getattr(_s2, "dtype", None))
+
         # Resolve the DSv4 SWA overlay *before* allocating: a layer that
         # overlays a host must never get an array of its own, or the memory
         # vLLM's `num_blocks` budget assumes is shared gets spent twice and the
@@ -4732,6 +4769,23 @@ class TPUModelRunner(GPUModelRunner):
                 len(ds_v4_swa_overlay),
                 sum(1 for name in kv_caches
                     if self._is_ds_v4_swa_layer(name, _per_layer_spec(name))))
+
+        if os.getenv("DSV4_DUMP_KV_PLAN") == "1":
+            _seen, _total = {}, 0
+            for _name in sorted(kv_caches):
+                _c = kv_caches[_name]
+                if not isinstance(_c, torch.Tensor):
+                    continue
+                _ptr = _c.data_ptr()
+                if _ptr not in _seen:
+                    _total += _c.numel() * _c.element_size()
+                    _seen[_ptr] = _name
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] alloc %s shape=%s aliased_to=%s",
+                    _name, list(_c.shape),
+                    _seen[_ptr] if _seen[_ptr] != _name else "-")
+            logger.info("[DSV4_KVPLAN_DEBUG] unique KV bytes=%d (%.2f GiB)",
+                        _total, _total / (1 << 30))
 
         self._alias_ds_v4_auxiliary_caches(kv_caches)
         self._add_shared_kv_cache_aliases(kv_caches)

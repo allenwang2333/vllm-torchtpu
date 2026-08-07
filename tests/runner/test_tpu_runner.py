@@ -1707,16 +1707,71 @@ def test_dsv4_swa_overlay_plan():
             head_size_is_packed_width=True),
     )
 
-    # Two CSA hosts available -> first two SWA layers map, third overflows.
-    assert set(overlay) == {
-        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
-    }
-    # Distinct hosts: same-group layers share a block table.
+    # Two CSA hosts available -> two SWA layers map, third overflows.
+    assert len(overlay) == 2
+    # Distinct hosts: same-group layers share a block table, so two SWA caches
+    # on one array would be handed the same block id.
     assert len(set(overlay.values())) == 2
     # Never the HCA array (too few rows) or the indexer (too narrow).
     assert "m.layers.2.attn" not in overlay.values()
     assert "m.layers.0.attn.indexer.k_cache" not in overlay.values()
     assert set(overlay.values()) <= {"m.layers.0.attn", "m.layers.1.attn"}
+
+
+def test_dsv4_swa_overlay_hosts_are_distinct_across_groups():
+    """A host must back at most one SWA cache, even across cache groups.
+
+    Regression test: assigning positionally *within* each group restarts at
+    hosts[0] for every group, so when the SWA layers are spread across many
+    groups (which is what vLLM actually produces here, not one group holding
+    all of them) every group piles onto the same array.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+
+    specs = {}
+    groups = []
+    for i in range(3):
+        specs[f"m.layers.{i}.attn"] = MLAAttentionSpec(block_size=1024,
+                                                       num_kv_heads=1,
+                                                       head_size=640,
+                                                       dtype=torch.uint8,
+                                                       compress_ratio=4,
+                                                       alignment=None)
+        specs[f"m.layers.{i}.attn.swa_cache"] = SlidingWindowMLASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None)
+        # One SWA layer per group -- the layout that exposed the bug.
+        groups.append(
+            SimpleNamespace(layer_names=[
+                f"m.layers.{i}.attn", f"m.layers.{i}.attn.swa_cache"
+            ]))
+
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
+
+    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
+        runner,
+        SimpleNamespace(kv_cache_groups=groups),
+        specs.__getitem__,
+        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+            10,
+            spec.storage_block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+            head_size_is_packed_width=True),
+    )
+
+    assert len(overlay) == 3, overlay
+    assert len(set(
+        overlay.values())) == 3, (f"hosts reused across groups: {overlay}")
 
 
 def test_dsv4_specs_are_exempt_from_tpu_normalization():
