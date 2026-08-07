@@ -595,16 +595,27 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                  w13_weight_padded, w2_weight_padded, orig_intermediate,
                  device)
             if cache_path is not None:
-                # Write via a temp file so a killed run can't leave a
-                # truncated cache entry that a later run would happily load.
+                # Write via a temp file so a killed run can't leave a truncated
+                # entry for a later run to load. Failures here must never take
+                # the run down -- a full disk is ordinary (the entries are
+                # hundreds of MB per layer per rank, and pointing this at a
+                # tmpfs will exhaust it), and the cache is a convenience, not a
+                # source of truth.
                 tmp = cache_path.with_suffix(".pt.tmp")
-                torch.save([
-                    w13_weight_processed.cpu(),
-                    w2_weight_processed.cpu(),
-                    w13_weight_scale.cpu(),
-                    w2_weight_scale.cpu(),
-                ], tmp)
-                tmp.rename(cache_path)
+                try:
+                    torch.save([
+                        w13_weight_processed.cpu(),
+                        w2_weight_processed.cpu(),
+                        w13_weight_scale.cpu(),
+                        w2_weight_scale.cpu(),
+                    ], tmp)
+                    tmp.rename(cache_path)
+                except Exception as exc:
+                    logger.warning_once(
+                        "Could not write FP4 cache to %s (%s); continuing "
+                        "without it. Point VLLM_FP4_CACHE_DIR at a disk with "
+                        "room for ~1GB per layer per rank.", cache_path, exc)
+                    tmp.unlink(missing_ok=True)
 
         self._cleanup_temp_buffers(layer)
 
