@@ -66,6 +66,11 @@ if [ -z "$CONFIG_NAME" ]; then
     exit 1
 fi
 
+if [ -f "scripts/vllm/benchmarking/configs/${CONFIG_NAME}.sh" ]; then
+    # shellcheck disable=SC1090
+    source "scripts/vllm/benchmarking/configs/${CONFIG_NAME}.sh"
+fi
+
 # If running in Buildkite CI, only upload to Spanner/BigQuery if on main branch and not a PR.
 if [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; then
     echo "Running on PR or non-main branch in Buildkite. Skipping database upload."

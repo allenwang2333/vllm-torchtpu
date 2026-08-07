@@ -449,6 +449,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "mm_eval_limit": ${MM_EVAL_LIMIT:-4},
+    "mmmu_limit": ${MMMU_LIMIT:-100},
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }
