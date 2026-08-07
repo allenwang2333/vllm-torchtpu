@@ -22,12 +22,20 @@
 # 2024's halt was attributed to (torch.rand_like(logits) over the padded
 # [batch, 262144] logits in tpu_runner.sample_tokens).
 #
-# Variants:
-#   A greedy:  BENCHMARK_TEMPERATURE=0, all else identical. If this passes,
-#              the sampling/RNG path is the trigger.
-#   B kv-auto: KV_CACHE_DTYPE=auto, sampling stays on. Tests the fp8-kv
-#              numerics angle.
-#   C mns128:  --max-num-seqs=128, c512 only, sampling stays on. Load bisect.
+# Round 1 results (build 110): A greedy HALTED at c1024 (sampling ruled out),
+# B kv-auto HALTED (kv fp8 ruled out), C mns128 c512 PASSED. The halt tracks
+# per-rank batch crossing ~128->256, i.e. vocab-sized (262144) per-step
+# tensors crossing the 64MiB SC-offload min-size threshold that
+# env_override.py sets for AR/AG (PR #370) - collectives >= threshold are
+# still offloaded to SparseCore.
+#
+# Round 2 variants (unmodified benchmark config, full c512/1024/2048 sweep):
+#   D sc-thresh-16g: SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES=17179869184 -
+#       AR/AG never SC-offloaded. Passing pins the halt on an SC-offloaded
+#       all-reduce/all-gather.
+#   E sc-coll-off: LIBTPU_INIT_ARGS force-disables every SC collective
+#       offload type. Passing (with D failing) points at a2a/reduce-scatter;
+#       both failing rules collectives out entirely.
 
 steps:
 
@@ -38,8 +46,8 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "gemma4 SC-halt A: greedy (BENCHMARK_TEMPERATURE=0)"
-    key: gemma_sc_halt_greedy
+  - label: "gemma4 SC-halt D: AR/AG SC-offload threshold 16GiB"
+    key: gemma_sc_halt_thresh16g
     depends_on: build_docker
     agents:
       queue: tpu_v7x_8_queue
@@ -50,14 +58,15 @@ steps:
     commands:
       - |
         bash .buildkite/scripts/run_in_docker.sh bash -c '
-          BENCHMARK_TEMPERATURE=0 bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
+          SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES=17179869184 \
+          bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
             --config gemma-4-26b-fp8-dp4-tp2-ep-text \
-            --results-dir /perf_eval_results/gemma-A-greedy'
+            --results-dir /perf_eval_results/gemma-D-thresh16g'
     artifact_paths:
       - "perf_eval_results/**/*"
 
-  - label: "gemma4 SC-halt B: kv-cache-dtype=auto (sampling on)"
-    key: gemma_sc_halt_kv_auto
+  - label: "gemma4 SC-halt E: all SC collective offload disabled"
+    key: gemma_sc_halt_coll_off
     depends_on: build_docker
     agents:
       queue: tpu_v7x_8_queue
@@ -68,26 +77,9 @@ steps:
     commands:
       - |
         bash .buildkite/scripts/run_in_docker.sh bash -c '
-          KV_CACHE_DTYPE=auto bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
+          LIBTPU_INIT_ARGS="--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_enable_sparse_core_collective_offload_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_2d_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_3d_all_gather=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=false --xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all=false --xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=false" \
+          bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
             --config gemma-4-26b-fp8-dp4-tp2-ep-text \
-            --results-dir /perf_eval_results/gemma-B-kv-auto'
-    artifact_paths:
-      - "perf_eval_results/**/*"
-
-  - label: "gemma4 SC-halt C: max-num-seqs=128, c512 (sampling on)"
-    key: gemma_sc_halt_mns128
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_8_queue
-    env:
-      TPU_ACCELERATOR_TYPE: "tpu7x"
-      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-      BENCHMARK_WARMUP_RUNS: "1"
-    commands:
-      - |
-        bash .buildkite/scripts/run_in_docker.sh bash \
-          ./scripts/vllm/benchmarking/run_eval_flow.sh \
-          --config gemma-4-26b-fp8-dp4-tp2-ep-text-mns128 \
-          --results-dir /perf_eval_results/gemma-C-mns128
+            --results-dir /perf_eval_results/gemma-E-coll-off'
     artifact_paths:
       - "perf_eval_results/**/*"
