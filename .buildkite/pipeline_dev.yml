@@ -44,34 +44,7 @@ steps:
     agents:
       queue: cpu_64_core
     commands:
-      - |
-        bash -c '
-          set -euo pipefail
-          if command -v gcloud >/dev/null 2>&1; then
-            TOKEN="$(gcloud auth print-access-token)"
-          else
-            TOKEN="$(curl -s -H "Metadata-Flavor: Google" \
-              "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-              | sed -nE "s/.*\"access_token\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/p")"
-          fi
-          REG="https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
-          echo "--- torch versions in registry"
-          curl -su "oauth2accesstoken:${TOKEN}" "${REG}/torch/" \
-            | grep -oE "torch-[0-9][^<\"#]*\.whl" | sort -u | tail -30
-          echo "--- torch-tpu versions in registry (dev202607xx onward)"
-          curl -su "oauth2accesstoken:${TOKEN}" "${REG}/torch-tpu/" > /tmp/tt_index.html
-          grep -oE "0\.1\.1\.dev20260[78][0-9]{9,}" /tmp/tt_index.html | sort -u
-          echo "--- per-nightly torch requirement (PEP 658 metadata)"
-          for v in $(grep -oE "0\.1\.1\.dev20260[78][0-9]{9,}" /tmp/tt_index.html | sort -u); do
-            url=$(grep -oE "href=\"[^\"]*torch_tpu-${v}[^\"]*\.whl[^\"]*\"" /tmp/tt_index.html \
-                  | head -1 | sed -e "s/^href=\"//" -e "s/\"$//" -e "s/#.*//")
-            [ -z "${url}" ] && continue
-            case "${url}" in http*) full="${url}";; *) full="${REG}/torch-tpu/${url}";; esac
-            req=$(curl -sfu "oauth2accesstoken:${TOKEN}" "${full}.metadata" 2>/dev/null \
-                  | grep -iE "^Requires-Dist: torch([ =<>!~]|$)" | head -2 | tr "\n" ";" || true)
-            echo "${v} -> ${req:-METADATA-UNAVAILABLE (${full})}"
-          done
-        '
+      - bash .buildkite/scripts/probe_torch_tpu_registry.sh
 
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
