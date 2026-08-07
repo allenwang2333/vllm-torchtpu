@@ -66,9 +66,10 @@ steps:
       BENCHMARK_WARMUP_RUNS: "1"
     commands:
       - |
-        bash .buildkite/scripts/run_in_docker.sh bash \
-          ./scripts/vllm/benchmarking/run_eval_flow.sh \
-          --config gemma-4-26b-fp8-dp4-tp2-ep-text-c1024 \
-          --results-dir /perf_eval_results/gemma-repro-c1024
+        bash .buildkite/scripts/run_in_docker.sh bash -c '
+          LIBTPU_INIT_ARGS="--xla_tpu_num_sparse_cores_for_gather_offloading=0 --xla_tpu_num_sparse_cores_for_scatter_offloading=0 --xla_tpu_num_sparse_cores_for_sort_offloading=0" \
+          bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
+            --config gemma-4-26b-fp8-dp4-tp2-ep-text-c1024 \
+            --results-dir /perf_eval_results/gemma-repro-c1024'
     artifact_paths:
       - "perf_eval_results/**/*"
