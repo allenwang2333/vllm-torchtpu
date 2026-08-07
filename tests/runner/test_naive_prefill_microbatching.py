@@ -1,0 +1,525 @@
+from types import SimpleNamespace
+
+import pytest
+
+from vllm_torchtpu.runner.naive_prefill_microbatching import (
+    PREFILL_MICROBATCH_TOKENS, PrefillStepMode, build_two_microbatch_plan,
+    coordinated_step_mode, local_step_mode, staged_token_bucket,
+    validate_feature_config, validate_staged_microbatch_tokens)
+
+# ----- Planning: which local work is eligible for the staged path -----
+
+
+def test_plan_has_two_independent_fixed_request_ranges():
+    plan = build_two_microbatch_plan(["b", "a"], {"a": 1024, "b": 1024},
+                                     {"a": 0, "b": 0})
+    assert plan is not None
+    assert plan.request_ids == ("b", "a")
+    assert [(m.input_start, m.input_end) for m in plan.microbatches] == [
+        (0, 1024), (1024, 2048)]
+    assert plan.restore_output_order(["b-logits", "a-logits"]) == [
+        "b-logits", "a-logits"]
+
+
+@pytest.mark.parametrize(("request_ids", "scheduled", "computed"), [
+    (["a"], {"a": 512}, [0]),
+    (["a", "b"], {"a": 4096, "b": 1024}, [0, 0]),
+    (["a", "b"], {"a": 1024, "b": 1024}, [1, 0]),
+    (["a", "a"], {"a": 1024}, [0, 0]),
+])
+def test_plan_rejects_mixed_chunked_resumed_or_duplicate_requests(
+        request_ids, scheduled, computed):
+    assert build_two_microbatch_plan(request_ids, scheduled, computed) is None
+
+
+def test_plan_accepts_one_real_request_for_dummy_padding():
+    plan = build_two_microbatch_plan(["a"], {"a": 1024}, [0])
+    assert plan is not None
+    assert plan.request_ids == ("a",)
+    assert plan.num_real_microbatches == 1
+    assert plan.restore_output_order(["a-logits"]) == ["a-logits"]
+
+
+def test_local_step_modes_follow_scheduler_work():
+    plan = build_two_microbatch_plan(["a", "b"],
+                                     {"a": 1024, "b": 1024}, [0, 0])
+    assert local_step_mode(0, None) == PrefillStepMode.IDLE
+    assert local_step_mode(2048, plan) == PrefillStepMode.TWO_MICROBATCH
+    assert local_step_mode(1, None) == PrefillStepMode.SERIAL
+
+
+# ----- Coordination: every rank must choose the same graph -----
+
+
+def test_dp_coordination_idle_rank_supplies_dummies():
+    assert coordinated_step_mode([
+        PrefillStepMode.TWO_MICROBATCH, PrefillStepMode.IDLE,
+        PrefillStepMode.TWO_MICROBATCH
+    ]) == PrefillStepMode.TWO_MICROBATCH
+
+
+def test_dp_coordination_ineligible_busy_rank_forces_serial():
+    assert coordinated_step_mode([
+        PrefillStepMode.TWO_MICROBATCH, PrefillStepMode.SERIAL,
+        PrefillStepMode.IDLE
+    ]) == PrefillStepMode.SERIAL
+
+
+def test_busy_and_idle_paths_use_one_unified_coordination_payload(monkeypatch):
+    """Both entry points must issue the same payload at the same position.
+
+    execute_model and execute_dummy_batch reach this collective from different
+    call stacks; if their payloads differed in length or order the reduction
+    would silently mean different things on different ranks.
+    """
+    import torch
+    import vllm.distributed.parallel_state as parallel_state
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.envs."
+        "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING", True)
+
+    group = object()
+    monkeypatch.setattr(parallel_state, "get_dp_group",
+                        lambda: SimpleNamespace(cpu_group=group))
+    payloads = []
+
+    def all_reduce(tensor, op, group):
+        payloads.append(tensor.tolist())
+        tensor.copy_(torch.tensor([1024, 1, 1]))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    class FakeRunner:
+        num_tokens_paddings = [16, 32, 64, 128, 256, 512, 1024, 2048]
+
+        def _dp_lockstep_enabled(self):
+            return True
+
+    busy = TPUModelRunner._dp_coordinated_step(
+        FakeRunner(), 1024, 1, PrefillStepMode.TWO_MICROBATCH)
+    idle = TPUModelRunner._dp_coordinated_step(
+        FakeRunner(), 0, 0, PrefillStepMode.IDLE)
+
+    assert payloads == [[1024, 1, 1], [0, 0, 0]]
+    assert busy == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
+    assert idle == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
+
+
+def test_coordination_payload_omits_the_mode_when_the_feature_is_off(
+        monkeypatch):
+    """The reduction must keep its original shape for unrelated runs."""
+    import torch
+    import vllm.distributed.parallel_state as parallel_state
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.envs."
+        "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING", False)
+
+    group = object()
+    monkeypatch.setattr(parallel_state, "get_dp_group",
+                        lambda: SimpleNamespace(cpu_group=group))
+    payloads = []
+
+    def all_reduce(tensor, op, group):
+        payloads.append(tensor.tolist())
+        tensor.copy_(torch.tensor([2048, 2]))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    class FakeRunner:
+        num_tokens_paddings = [16, 32, 64, 128, 256, 512, 1024, 2048]
+
+        def _dp_lockstep_enabled(self):
+            return True
+
+    result = TPUModelRunner._dp_coordinated_step(FakeRunner(), 2048, 2)
+
+    assert payloads == [[2048, 2]]
+    assert result == (2048, 2, PrefillStepMode.SERIAL)
+
+
+def test_zero_token_step_issues_no_dp_coordination(monkeypatch):
+    """A zero-token step must stay off the DP group, feature on or off.
+
+    gloo pairs reductions in issue order, not by step, so one extra reduction
+    here offsets this rank against its peers permanently: from then on its Nth
+    reduction meets their (N+1)th, every later step resolves its token bucket
+    and chunk count from mismatched operands, and the ranks eventually launch
+    differently shaped programs whose in-graph EP collectives never rendezvous.
+
+    Idle pairing belongs in execute_dummy_batch, which the engine calls after a
+    step that executed nothing -- that path coordinates and runs the paired
+    dummy bundles.
+
+    Regression test for the 2026-08-07 hardware wedge: with the reduction
+    hoisted above this early return, isl1024/osl1024/c16 completed 14/16 and
+    stalled 300s; with it removed, 16/16 in 40s.
+    """
+    import numpy as np
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.envs."
+        "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING", True)
+    monkeypatch.setattr("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+                        lambda: False)
+
+    calls = []
+
+    class FakeRunner:
+        execute_model_state = None
+        input_batch = SimpleNamespace(num_reqs=0,
+                                      req_ids=[],
+                                      num_computed_tokens_cpu=np.zeros(0))
+        scheduler_config = SimpleNamespace(async_scheduling=True)
+        _two_microbatch_plan = None
+        _naive_prefill_step_mode = PrefillStepMode.IDLE
+        _last_logged_naive_prefill_mode = PrefillStepMode.IDLE
+
+        _build_local_naive_prefill_plan = (
+            TPUModelRunner._build_local_naive_prefill_plan)
+
+        def _update_states(self, scheduler_output):
+            calls.append("update_states")
+
+        def _flush_disjoint_async_results(self):
+            calls.append("flush")
+
+        def _dp_coordinated_step(self, *args, **kwargs):
+            calls.append("coordinate")
+            raise AssertionError(
+                "a zero-token step must not join the DP reduction")
+
+        def _count_input_chunks(self, scheduler_output):
+            calls.append("count_chunks")
+            return 0
+
+        def _run_idle_two_microbatch_prefill(self):
+            calls.append("idle_staged")
+
+    runner = FakeRunner()
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0,
+                                       num_scheduled_tokens={})
+
+    TPUModelRunner.execute_model(runner, scheduler_output)
+
+    assert calls == ["update_states", "flush"]
+    assert runner._naive_prefill_step_mode is PrefillStepMode.IDLE
+
+
+# ----- Padding: the lengths every rank's staged forwards must use -----
+
+
+def test_staged_bucket_is_per_microbatch_not_per_step():
+    assert staged_token_bucket(PrefillStepMode.TWO_MICROBATCH,
+                               2048) == PREFILL_MICROBATCH_TOKENS
+    # One real microbatch used to make this agree by coincidence.
+    assert staged_token_bucket(PrefillStepMode.TWO_MICROBATCH,
+                               1024) == PREFILL_MICROBATCH_TOKENS
+
+
+def test_serial_modes_keep_the_reduced_step_bucket():
+    assert staged_token_bucket(PrefillStepMode.SERIAL, 2048) == 2048
+    assert staged_token_bucket(PrefillStepMode.IDLE, 512) == 512
+    assert staged_token_bucket(PrefillStepMode.SERIAL, None) is None
+
+
+def test_staged_bundle_length_is_validated():
+    validate_staged_microbatch_tokens(PREFILL_MICROBATCH_TOKENS, role="real",
+                                      index=0, field="input_ids")
+    with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
+        validate_staged_microbatch_tokens(2048, role="real", index=1,
+                                          field="input_ids")
+
+
+def test_staged_forward_rejects_equal_but_wrong_lengths():
+    """Equal shapes are necessary but not sufficient.
+
+    Peers pad to the fixed staged constant, not to whatever this rank chose,
+    so two microbatches that agree with each other at the wrong length still
+    disagree with every other rank.
+    """
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    def bundle(num_tokens):
+        return SimpleNamespace(input_ids=torch.zeros(num_tokens))
+
+    runner = SimpleNamespace()
+    assert TPUModelRunner._staged_forward_num_tokens(
+        runner, (bundle(1024), bundle(1024))) == 1024
+    with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
+        TPUModelRunner._staged_forward_num_tokens(
+            runner, (bundle(2048), bundle(2048)))
+    with pytest.raises(RuntimeError, match="equal shapes"):
+        TPUModelRunner._staged_forward_num_tokens(
+            runner, (bundle(1024), bundle(2048)))
+
+
+# ----- Configuration envelope -----
+
+
+def _config(**overrides):
+    values = dict(dp=8, tp=1, ep=True, tokens=2048, seqs=2,
+                  model_len=2048, prefix=False, speculative=None)
+    values.update(overrides)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5MoeForConditionalGeneration"]),
+            max_model_len=values["model_len"]),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=values["dp"],
+            tensor_parallel_size=values["tp"],
+            enable_expert_parallel=values["ep"]),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=values["tokens"],
+            max_num_seqs=values["seqs"]),
+        cache_config=SimpleNamespace(enable_prefix_caching=values["prefix"]),
+        speculative_config=values["speculative"])
+
+
+def test_fixed_feature_config_is_accepted():
+    validate_feature_config(_config())
+
+
+@pytest.mark.parametrize("override", [
+    {"dp": 4}, {"tp": 2}, {"ep": False}, {"tokens": 4096}, {"seqs": 4},
+    {"model_len": 1024}, {"prefix": True}, {"speculative": object()},
+])
+def test_unsupported_feature_config_is_rejected(override):
+    with pytest.raises(ValueError, match="NAIVE_PREFILL_MICROBATCHING"):
+        validate_feature_config(_config(**override))
+
+
+# ----- Bundle preparation -----
+
+
+def test_staged_prepare_call_matches_the_real_prepare_inputs_signature():
+    """The bundle test's fake must not diverge from the method it stands in for.
+
+    ``_prepare_two_microbatch_inputs`` passes ``max_chunk_reqs=1`` so each
+    microbatch consumes exactly one request. The fake below accepted that
+    keyword before the real ``_prepare_inputs`` did, so every unit test passed
+    while the first live staged step died with a TypeError. Bind the fake to
+    the real signature so that gap cannot reopen.
+    """
+    import inspect
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    signature = inspect.signature(TPUModelRunner._prepare_inputs)
+    assert "max_chunk_reqs" in signature.parameters
+    # Optional, so unrelated callers keep working unchanged.
+    assert signature.parameters["max_chunk_reqs"].default is None
+
+
+def test_prepared_bundles_do_not_alias_runner_staging():
+    """Two bundles are live at once, so each needs its own copy.
+
+    _prepare_inputs writes into shared staging buffers that the next call
+    overwrites; without snapshots the first microbatch would silently execute
+    the second one's inputs.
+    """
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    plan = build_two_microbatch_plan(["a", "b"],
+                                     {"a": 1024, "b": 1024}, [0, 0])
+    assert plan is not None
+
+    class FakeRunner:
+        _two_microbatch_plan = plan
+        input_batch = SimpleNamespace(req_ids=["a", "b"])
+        input_ids = torch.zeros(1024, dtype=torch.int32)
+        position_ids = torch.zeros(1024, dtype=torch.int32)
+        logits = torch.zeros(1, dtype=torch.int32)
+
+        def _prepare_inputs(self, scheduler_output, start_index,
+                            num_decode_reqs, max_chunk_reqs=None):
+            assert max_chunk_reqs == 1
+            self.input_ids.fill_(start_index + 1)
+            self.position_ids.fill_(start_index + 10)
+            self.logits.fill_(start_index + 20)
+            self._last_sequence_layout_plan = SimpleNamespace(
+                request=torch.tensor(start_index),
+                global_padded_num_tokens=1024,
+                local_padded_num_tokens=1024)
+            self._attn_metadata_builder_ctx = {
+                "state": torch.tensor(start_index)
+            }
+            metadata = {"blocks": torch.tensor([start_index])}
+            return (metadata, self.logits, 1, 1, start_index + 1,
+                    torch.tensor([start_index]), torch.tensor([start_index]),
+                    None)
+
+        def _apply_async_token_substitution(self, input_ids, *unused):
+            return input_ids
+
+    bundles = TPUModelRunner._prepare_two_microbatch_inputs(
+        FakeRunner(), SimpleNamespace())
+    assert [bundle.request_id for bundle in bundles] == ["a", "b"]
+    assert [bundle.output_index for bundle in bundles] == [0, 1]
+    assert bundles[0].input_ids[0].item() == 1
+    assert bundles[1].input_ids[0].item() == 2
+    assert bundles[0].position_ids[0].item() == 10
+    assert bundles[0].attention_metadata["blocks"].item() == 0
+    assert bundles[0].logits_indices.item() == 20
+    assert bundles[0].layout_plan.request.item() == 0
+
+
+def test_snapshot_preserves_absent_init_false_metadata_fields():
+    import torch
+
+    from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.runner.tpu_runner import _snapshot_microbatch_value
+
+    metadata = AttentionMetadata(input_positions=torch.tensor([1, 2]))
+    assert not hasattr(metadata, "query_start_loc_cpu")
+    assert not hasattr(metadata, "seq_lens_cpu")
+
+    snapshot = _snapshot_microbatch_value(metadata)
+
+    assert snapshot is not metadata
+    assert snapshot.input_positions is not metadata.input_positions
+    assert torch.equal(snapshot.input_positions, metadata.input_positions)
+    assert not hasattr(snapshot, "query_start_loc_cpu")
+    assert not hasattr(snapshot, "seq_lens_cpu")
+
+
+# ----- Dispatch -----
+
+
+def _dispatch_runner(bundles, plan, forwarded=None):
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    class Planner:
+        def maybe_select_logits_hidden_states(self, hidden, layout, indices):
+            return hidden + (10 if layout == "real" else 100)
+
+    class FakeRunner:
+        _two_microbatch_plan = plan
+        sequence_layout_planner = Planner()
+        _token_padding_state = SimpleNamespace(update=lambda *args: None)
+        # Exercise the real logits selection against the fake planner rather
+        # than stubbing it out: which hidden state each microbatch selects
+        # from is exactly what this dispatch has to get right.
+        _staged_microbatch_logits = TPUModelRunner._staged_microbatch_logits
+
+        def _prepare_two_microbatch_inputs(self, scheduler_output):
+            return bundles
+
+        def _flush_mamba_state_seed_copies(self):
+            pass
+
+        def _run_two_microbatch_forward(self, prepared):
+            if forwarded is not None:
+                forwarded.extend(prepared)
+            return tuple(torch.tensor([index + 1])
+                         for index in range(len(prepared)))
+
+        def compute_logits_from_hidden_states(self, hidden):
+            return hidden
+
+    return FakeRunner()
+
+
+def test_one_real_microbatch_discards_dummy_logits():
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    plan = build_two_microbatch_plan(["a"], {"a": 1024}, [0])
+    assert plan is not None
+    bundles = (
+        SimpleNamespace(layout_plan="real", logits_indices=torch.tensor([0])),
+        SimpleNamespace(layout_plan="dummy", logits_indices=torch.tensor([0])),
+    )
+
+    logits, counts, spec = TPUModelRunner._execute_two_microbatch_prefill(
+        _dispatch_runner(bundles, plan), SimpleNamespace())
+
+    assert [item.item() for item in logits] == [11]
+    assert counts == [1]
+    assert spec == [None]
+
+
+def test_two_microbatch_execute_restores_scheduler_order():
+    """Slot order is the plan's; the scheduler's order is what must come back."""
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    # "b" is scheduled first, so it occupies slot 0 and output_index 0.
+    plan = build_two_microbatch_plan(["b", "a"], {"a": 1024, "b": 1024},
+                                     [0, 0])
+    assert plan is not None
+    bundles = (
+        SimpleNamespace(layout_plan="real", logits_indices=torch.tensor([0])),
+        SimpleNamespace(layout_plan="real", logits_indices=torch.tensor([0])),
+    )
+
+    logits, counts, spec = TPUModelRunner._execute_two_microbatch_prefill(
+        _dispatch_runner(bundles, plan), SimpleNamespace())
+
+    assert [item.item() for item in logits] == [11, 12]
+    assert counts == [1, 1]
+    assert spec == [None, None]
+
+
+def test_staged_step_runs_every_microbatch_through_the_forward():
+    """Both physical slots execute even when only one holds a real request."""
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    plan = build_two_microbatch_plan(["a"], {"a": 1024}, [0])
+    assert plan is not None
+    bundles = (
+        SimpleNamespace(layout_plan="real", logits_indices=torch.tensor([0])),
+        SimpleNamespace(layout_plan="dummy", logits_indices=torch.tensor([0])),
+    )
+    forwarded: list = []
+
+    TPUModelRunner._execute_two_microbatch_prefill(
+        _dispatch_runner(bundles, plan, forwarded), SimpleNamespace())
+
+    assert forwarded == list(bundles)
+
+
+def test_serial_staged_forward_gives_each_microbatch_its_own_context():
+    """Each microbatch carries independent attention metadata.
+
+    Running them one at a time is only correct if the forward context is
+    rebuilt per microbatch; reusing one context would give the second slot the
+    first slot's block tables and slot mappings.
+    """
+    import torch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    observed = []
+
+    class FakeRunner:
+        def _staged_forward_num_tokens(self, bundles):
+            return PREFILL_MICROBATCH_TOKENS
+
+        def _run_one_staged_microbatch(self, bundle, num_tokens):
+            observed.append((bundle.attention_metadata, num_tokens))
+            return torch.tensor([len(observed)])
+
+    bundles = (SimpleNamespace(attention_metadata="mb0"),
+               SimpleNamespace(attention_metadata="mb1"))
+
+    hidden = TPUModelRunner._run_two_microbatch_forward(FakeRunner(), bundles)
+
+    assert observed == [("mb0", PREFILL_MICROBATCH_TOKENS),
+                        ("mb1", PREFILL_MICROBATCH_TOKENS)]
+    assert [item.item() for item in hidden] == [1, 2]

@@ -30,6 +30,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.naive_prefill_microbatching import PrefillStepMode
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -437,7 +438,15 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
-        bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
+        bucket, target_num_chunks, coordinated_mode = (
+            runner._dp_coordinated_step(0, 0,
+                                        local_mode=PrefillStepMode.IDLE))
+        runner._set_coordinated_naive_prefill_mode(coordinated_mode)
+        if coordinated_mode == PrefillStepMode.TWO_MICROBATCH:
+            # A busy peer is running the staged graph, so this rank has to emit
+            # the same collective stream from all-dummy bundles.
+            runner._run_idle_two_microbatch_prefill()
+            return
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.

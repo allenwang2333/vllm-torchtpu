@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_NAIVE_PREFILL_MICROBATCHING: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -283,6 +284,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Experimental fixed [1024] + [1024] Qwen3.5-MoE prefill graph. Off by
+    # default; see runner/naive_prefill_microbatching.validate_feature_config
+    # for the configuration envelope it requires.
+    "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING":
+    env_bool("VLLM_TPU_NAIVE_PREFILL_MICROBATCHING"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

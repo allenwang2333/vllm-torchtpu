@@ -15,6 +15,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -300,3 +301,41 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     worker = TPUWorker.__new__(TPUWorker)
 
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
+
+
+class TestExecuteDummyBatchStagedDispatch:
+    """An idle rank must join whatever graph its busy peers coordinated on."""
+
+    @staticmethod
+    def _worker(mode, calls):
+        runner = SimpleNamespace(
+            _dp_coordinated_step=lambda *args, **kwargs: (1024, 1, mode),
+            _set_coordinated_naive_prefill_mode=lambda value: calls.append(
+                ("mode", value)),
+            _run_idle_two_microbatch_prefill=lambda: calls.append(("staged", )),
+            _run_dp_idle_pairing=lambda bucket, chunks: calls.append(
+                ("serial", bucket, chunks)),
+        )
+        worker = TPUWorker.__new__(TPUWorker)
+        worker.model_runner = runner
+        return worker
+
+    def test_two_microbatch_mode_runs_the_staged_idle_step(self):
+        from vllm_torchtpu.runner.naive_prefill_microbatching import \
+            PrefillStepMode
+
+        calls: list = []
+        self._worker(PrefillStepMode.TWO_MICROBATCH, calls).execute_dummy_batch()
+
+        assert ("staged", ) in calls
+        assert not any(call[0] == "serial" for call in calls)
+
+    def test_serial_mode_keeps_the_existing_dp_pairing(self):
+        from vllm_torchtpu.runner.naive_prefill_microbatching import \
+            PrefillStepMode
+
+        calls: list = []
+        self._worker(PrefillStepMode.SERIAL, calls).execute_dummy_batch()
+
+        assert ("serial", 1024, 1) in calls
+        assert not any(call[0] == "staged" for call in calls)
