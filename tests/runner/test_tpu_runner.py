@@ -1641,6 +1641,77 @@ class TestCompactMambaSlotPool:
         assert slots == {1, 2, 3, 4}
 
 
+def test_dsv4_specs_are_exempt_from_tpu_normalization():
+    """DSv4 specs must reach vLLM verbatim.
+
+    `tpu-inference` short-circuits them (`kv_cache_manager.py:627-632`); ours
+    would otherwise stamp a `page_size_padded` derived from the logical
+    1024-token `block_size` rather than `storage_block_size`, and rewrite the
+    packed-layout `uint8` dtype to the model's kv cache dtype.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.kv_cache_spec_normalizer import \
+        normalize_kv_cache_specs_for_tpu
+
+    # A DSv4-shaped compressed main-latent spec: 1024-token logical block
+    # compressed 4:1, packed as uint8.
+    ds_v4_spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        alignment=None,
+    )
+    ds_v4_swa_spec = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        sliding_window=128,
+        alignment=None,
+    )
+    specs = {
+        "model.layers.0.attn": ds_v4_spec,
+        "model.layers.0.attn.swa_cache": ds_v4_swa_spec,
+    }
+
+    out = normalize_kv_cache_specs_for_tpu(
+        specs,
+        torch.float8_e4m3fn,
+        exempt_layers=set(specs),
+    )
+
+    for name, original in specs.items():
+        assert out[name] is original, f"{name} was normalized"
+        assert out[name].dtype == torch.uint8
+        assert out[name].page_size_padded is None
+
+    # Without the exemption the same specs are rewritten -- guards against the
+    # exemption silently becoming a no-op.
+    unexempt = normalize_kv_cache_specs_for_tpu(specs, torch.float8_e4m3fn)
+    assert unexempt["model.layers.0.attn"].page_size_padded is not None
+    assert unexempt["model.layers.0.attn"].dtype == torch.float8_e4m3fn
+
+
+def test_dsv4_is_cache_for_ds_v4_predicate():
+    """The exemption must cover all four DSv4 cache-owning module types."""
+    from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
+                                                   DeepseekV4IndexerCache)
+    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    from vllm_torchtpu.runner.tpu_runner import is_cache_for_ds_v4
+
+    for cls in (DeepseekV4Attention, DeepseekV4SWACache,
+                DeepseekV4IndexerCache, CompressorStateCache):
+        assert is_cache_for_ds_v4(MagicMock(spec=cls)), cls.__name__
+
+    assert not is_cache_for_ds_v4(MagicMock(spec=Attention))
+    assert not is_cache_for_ds_v4(MagicMock(spec=MLAAttention))
+
+
 def test_dsv4_compressor_state_cache_aliasing():
     """Verify _alias_ds_v4_auxiliary_caches aliases compressor state caches to host k_cache."""
     from vllm.models.deepseek_v4.compressor import CompressorStateCache

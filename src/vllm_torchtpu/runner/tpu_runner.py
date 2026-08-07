@@ -38,11 +38,14 @@ from vllm.model_executor.layers.attention import (Attention,
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
+                                               DeepseekV4IndexerCache)
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec,
@@ -152,6 +155,26 @@ logger = init_logger(__name__)
 _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP = (
     "invalid_block_group_index" in getattr(KVConnectorOutput,
                                            "__dataclass_fields__", {}))
+
+
+def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
+    """Whether this module owns one of DeepSeek-V4's custom KV caches.
+
+    Mirrors `tpu_inference`'s predicate of the same name
+    (`runner/kv_cache_manager.py:63`). DSv4 modules build their own KV cache
+    specs, already expressed in the TPU's packed layout, so those specs must be
+    used verbatim -- the reference short-circuits them at
+    `kv_cache_manager.py:627-632` and never normalizes them.
+
+    `normalize_kv_cache_specs_for_tpu` would otherwise stamp a
+    `page_size_padded` derived from `spec.block_size` (the logical 1024-token
+    block) instead of `spec.storage_block_size` (the compressed rows actually
+    stored), and route `SlidingWindowMLASpec` through the non-MLA backend
+    because it subclasses `SlidingWindowSpec`. Both are wrong for DSv4.
+    """
+    return isinstance(attn_module,
+                      (DeepseekV4Attention, DeepseekV4SWACache,
+                       DeepseekV4IndexerCache, CompressorStateCache))
 
 
 def _build_kv_connector_output(
@@ -828,7 +851,12 @@ class TPUModelRunner(GPUModelRunner):
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        # DSv4 layers whose specs must reach vLLM verbatim; see
+        # `is_cache_for_ds_v4`.
+        ds_v4_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
+            if is_cache_for_ds_v4(attn_module):
+                ds_v4_layers.add(layer_name)
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
                 spec = attn_module.get_kv_cache_spec(self.vllm_config)
@@ -950,6 +978,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
+            exempt_layers=ds_v4_layers,
         )
 
     @staticmethod
