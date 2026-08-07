@@ -4581,6 +4581,10 @@ class TPUModelRunner(GPUModelRunner):
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         kv_cache_spec.dtype,
+                        # KV cache specs carry the packed byte width as
+                        # `head_size` (DSv4 declares 640 = the packed record),
+                        # so the packed-layout arithmetic must not run again.
+                        head_size_is_packed_width=True,
                     )
                     dtype = kv_cache_spec.dtype
                     tpu_kv_cache = torch.zeros(kv_cache_shape,

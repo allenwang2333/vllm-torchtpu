@@ -928,17 +928,35 @@ class PallasMLAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
+        *,
+        head_size_is_packed_width: bool = False,
     ) -> tuple[int, ...]:
+        """Shape of one MLA KV cache tensor.
+
+        `head_size_is_packed_width` says `head_size` is already the packed
+        byte width per token, so the packed-layout arithmetic below must not
+        be applied a second time. DeepSeek-V4's KV cache specs declare
+        `head_size = align_to(448 + 64*2 + 7, 128) = 640` -- the packed width
+        itself, matching the reference (`tpu_inference`'s specs declare the
+        same, and its shape function is a plain `align_to(kv_dim, 128)`
+        passthrough: `kernels/mla/v1/kernel.py:32-44`). Callers that pass the
+        *semantic* latent width instead (512, i.e. `kv_lora_rank`) leave this
+        False and get the packing applied for them -- 512 packs to the same
+        640.
+        """
         if (isinstance(cache_dtype_str, str)
                 and cache_dtype_str.lower().strip() == "auto"):
             return (num_blocks, block_size, 1, cdiv(head_size, 128) * 128)
         if PallasMLAttentionBackend._is_ds_mla_packed_cache(cache_dtype_str):
             # Packed layout is [nope fp8 | rope bf16 | UE8M0 scales] padded to 128-aligned minor dim.
-            rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
-            quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
-            nope_dim = head_size - rope_head_dim
-            packed_width = sparse_packed_width(nope_dim, rope_head_dim,
-                                               quant_block)
+            if head_size_is_packed_width:
+                packed_width = head_size
+            else:
+                rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
+                quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
+                nope_dim = head_size - rope_head_dim
+                packed_width = sparse_packed_width(nope_dim, rope_head_dim,
+                                                   quant_block)
             kv_packing = get_dtype_packing(torch.uint8)
             return mla_v2_kernel.get_kv_cache_shape(
                 total_num_pages=num_blocks,

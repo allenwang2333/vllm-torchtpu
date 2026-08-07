@@ -523,17 +523,29 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         is_csa = self.compress_ratio == 4
         two_caches_same_buffer = False
         swa_cache = getattr(self.mla_attn, "swa_cache_layer", None)
-        if swa_cache is not None and getattr(swa_cache, "block_size", 0) > 0:
-            logical_page_size = swa_cache.block_size
-        else:
-            # Never guess: a wrong logical page size (e.g. 16 vs the real 64)
-            # silently misaddresses every SWA cache slot. Missing block_size
-            # here usually means the layer was constructed by tpu_inference
-            # instead of vllm_torchtpu — fix plugin isolation instead.
+        if swa_cache is None:
+            # Never guess: a wrong logical page size silently misaddresses
+            # every SWA cache slot. A missing swa_cache_layer usually means the
+            # layer was constructed by tpu_inference instead of vllm_torchtpu —
+            # fix plugin isolation instead.
             raise RuntimeError(
-                f"{self.custom_prefix}: swa_cache_layer.block_size unavailable "
-                "at attention-op build time; refusing to guess the SWA cache "
+                f"{self.custom_prefix}: swa_cache_layer unavailable at "
+                "attention-op build time; refusing to guess the SWA cache "
                 "logical page size.")
+        # Derive from the config in hand rather than reading
+        # `swa_cache.block_size`. This method runs *before*
+        # `VllmDeepseekV4SWACache.get_kv_cache_spec`, so that attribute still
+        # holds the provisional value computed from the pre-override
+        # `cache_config.block_size` (measured 16, giving a 4-row page against a
+        # real 256). Both sites use `_swa_block_size` over a final config, so
+        # the kernel's logical page size and the allocated spec agree.
+        logical_page_size = VllmDeepseekV4SWACache._swa_block_size(
+            vllm_context.vllm_config.cache_config.block_size)
+        if logical_page_size <= 0:
+            raise RuntimeError(
+                f"{self.custom_prefix}: computed a non-positive SWA logical "
+                f"page size ({logical_page_size}) from cache block size "
+                f"{vllm_context.vllm_config.cache_config.block_size}.")
 
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (getattr(self.mla_attn, "scale", None)
