@@ -48,7 +48,8 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
-                                        MLAAttentionSpec, SlidingWindowSpec,
+                                        MLAAttentionSpec, SlidingWindowMLASpec,
+                                        SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
@@ -4548,16 +4549,35 @@ class TPUModelRunner(GPUModelRunner):
                             torch.zeros(cache_shape,
                                         dtype=dtype).to(self.device))
                     kv_caches[layer_name] = tuple(mamba_states)
-                elif isinstance(kv_cache_spec, MLAAttentionSpec):
+                elif isinstance(kv_cache_spec,
+                                (MLAAttentionSpec, SlidingWindowMLASpec)):
                     # SPMD Cache Invariance Details for Multi-Head Latent Attention (MLA):
                     # Because MLA maps all attention heads onto a single joint compressed latent key-value
                     # representation (`num_kv_heads=1`), the physical KV cache dimension never splits
                     # across tensor parallel ranks (`tp_size`) during SPMD graph execution (`self.use_spmd`).
                     # Each device partition consistently retains a complete, unsliced replication of the
                     # compressed latent cache structure across multi-chip execution loops.
+                    #
+                    # `storage_block_size`, not `block_size`: a page holds the
+                    # compressed rows a logical block reduces to
+                    # (`block_size // compress_ratio`), not one row per token.
+                    # For DSv4 that is 4x fewer rows on a CSA layer and 128x
+                    # fewer on an HCA layer; for uncompressed MLA models
+                    # (`compress_ratio == 1`) the two are equal and this is a
+                    # no-op. Matches the reference's `_create_cache`
+                    # (`tpu_inference/runner/kv_cache_manager.py:1099`).
+                    #
+                    # `SlidingWindowMLASpec` (DSv4's SWA and compressor-state
+                    # caches) is routed here rather than to the generic
+                    # attention branch below: it subclasses `SlidingWindowSpec`,
+                    # so `isinstance` would otherwise send an MLA-layout cache
+                    # through `PallasAttentionBackend` and produce a 5-D array
+                    # that cannot share a layout -- let alone a buffer -- with
+                    # the 4-D compressed-KV cache it overlays. The reference
+                    # passes `use_mla=True` for every DSv4 cache.
                     kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
                         num_blocks,
-                        kv_cache_spec.block_size,
+                        kv_cache_spec.storage_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         kv_cache_spec.dtype,
