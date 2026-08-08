@@ -912,3 +912,39 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
         )
+
+
+def _patch_vllm_block_pool_lifo_free() -> None:
+    """Prepend all freed blocks when prefix caching is off (pre-#48017 order).
+
+    Minimal form of the LIFO restore: with caching disabled every block is
+    hashless, so the hash partition is pointless - decrement refs, collect,
+    and prepend_n the lot (immediate LIFO reuse). With caching enabled the
+    original method runs unchanged. See
+    docs/sc2-sparsecore-halt-2026-08.md (branch
+    mhhua/sc2-sparsecore-halt-evidence): the post-#48017 append/FIFO order
+    trips an E0200 SparseCore halt on TPU v7x under sustained load.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
+        return
+
+    _orig_free_blocks = BlockPool.free_blocks
+
+    def free_blocks(self, ordered_blocks) -> None:
+        if self.enable_caching:
+            return _orig_free_blocks(self, ordered_blocks)
+        freed = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                freed.append(block)
+        self.free_block_queue.prepend_n(freed)
+
+    BlockPool.free_blocks = free_blocks
+    BlockPool._tpu_lifo_free_patch = True
+    from vllm_torchtpu.logger import init_logger
+    init_logger(__name__).info(
+        "Applied prepend-all LIFO free-block patch (pre-vllm#48017 order)")
+
