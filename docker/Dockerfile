@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # alone cures the E0200 SparseCore halt.
 COPY docker/patches/vllm-51482-free-blocks-lifo.patch /tmp/vllm-51482.patch
 RUN set -eu; \
-    SITE="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"; \
+    SITE="$(python3 -c 'import importlib.util, os; print(os.path.dirname(os.path.dirname(importlib.util.find_spec("vllm").origin)))')"; \
     patch -p1 -d "${SITE}" < /tmp/vllm-51482.patch; \
     grep -n "keeping the set of" "${SITE}/vllm/v1/core/block_pool.py" >/dev/null
 
