@@ -120,12 +120,17 @@ the halt (build 135).
 
 ## Actions
 
-1. **Workaround (validated in build 146 if green): plugin-side patch**
-   restoring pre-#48017 LIFO free order when prefix caching is off — branch
-   `mhhua/sc-halt-workaround-lifo-free`, a `BlockPool.free_blocks` monkeypatch
-   in `vllm_torchtpu.platforms.register_tpu_platform`. Unblocks the gemma
-   General-suite re-add (pipeline_perf.yml TODO) and protects GKE disagg,
-   with no dependency rollback.
+1. **Workaround VALIDATED (build 147): plugin-side patch** restoring
+   pre-#48017 LIFO free order — branch `mhhua/sc-halt-workaround-lifo-free`,
+   a `BlockPool.free_blocks` monkeypatch wired into `apply_tpu_patches()`
+   (runs in every process; emits "Applied LIFO free-block patch" to
+   server.log for verification — 17 processes in the validation run). On the
+   otherwise-halting rc0 stack the c1024 reproducer completed with **zero
+   E0200**. (Build 146 was an earlier attempt that patched during platform
+   registration, where a silently-swallowed circular import left the patch
+   inactive — it halted, and is not evidence against the mechanism.)
+   Unblocks the gemma General-suite re-add (pipeline_perf.yml TODO) and
+   protects GKE disagg, with no dependency rollback.
 2. **torch-tpu bug**: SparseCore-side trap on paged-KV block indices under
    FIFO block reuse; repro = any TPU v7x serving load with
    `--no-enable-prefix-caching` on vllm >= a82f1b38, or directly via the
