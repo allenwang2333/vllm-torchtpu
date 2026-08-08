@@ -385,12 +385,16 @@ def fused_moe_func(
                         f"threshold={low_conc_threshold}).")
         # topk_ids are already local (experts_start remap happened above).
         # For EP, zero-weight entries are already masked above.
+        cn_topk_ids = topk_ids
+        if skip_padded_tokens:
+            # Also zero padding rows' ids so they route to expert 0.
+            cn_topk_ids = jnp.where(topk_weights == 0.0, 0, topk_ids)
         out = cn_moe_full(hidden_states,
                           w1,
                           w1_scale,
                           w2,
                           w2_scale,
-                          topk_ids,
+                          cn_topk_ids,
                           topk_weights,
                           use_ep=use_ep)
         return out[:num_tokens, :hidden_size]
