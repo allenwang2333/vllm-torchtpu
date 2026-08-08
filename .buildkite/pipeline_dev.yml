@@ -66,9 +66,14 @@ steps:
       BENCHMARK_WARMUP_RUNS: "1"
     commands:
       - |
-        bash .buildkite/scripts/run_in_docker.sh bash \
-          ./scripts/vllm/benchmarking/run_eval_flow.sh \
-          --config gemma-4-26b-fp8-dp4-tp2-ep-text-c1024 \
-          --results-dir /perf_eval_results/gemma-repro-c1024
+        bash .buildkite/scripts/run_in_docker.sh bash -c '
+          XLA_FLAGS="--xla_dump_to=/perf_eval_results/gemma-repro-c1024/xla_dump --xla_dump_hlo_as_text" \
+          bash ./scripts/vllm/benchmarking/run_eval_flow.sh \
+            --config gemma-4-26b-fp8-dp4-tp2-ep-text-c1024 \
+            --results-dir /perf_eval_results/gemma-repro-c1024
+          rc=$?
+          cd /perf_eval_results/gemma-repro-c1024 && \
+            tar czf xla_dump.tgz xla_dump && rm -rf xla_dump
+          exit $rc'
     artifact_paths:
       - "perf_eval_results/**/*"
