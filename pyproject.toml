@@ -25,7 +25,7 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # vllm==0.26.0 is officially pinned to torch 2.11, hence pinning to a commit compatible with torch 2.13
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.26.1rc0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@70009fb9344d2a7ba642e68369e0a64a6252e8bc",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. We must explicitly pin torchvision statically
