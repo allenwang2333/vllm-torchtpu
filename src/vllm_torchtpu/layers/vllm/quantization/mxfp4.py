@@ -279,12 +279,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Step 1: Routing
         custom_routing_fn = layer.custom_routing_function
-        if os.getenv("DSV4_DEBUG_MOE_ROUTING") == "1":
-            logger.info(
-                "[MOE_APPLY] custom_routing_fn=%s layer=%s input_ids=%s "
-                "rsf_attr=%s", custom_routing_fn is not None,
-                type(layer).__name__, input_ids is not None,
-                getattr(layer, "routed_scaling_factor", "<MISSING>"))
         if custom_routing_fn is not None:
             # custom_routing_fn bypasses select_experts, so apply the
             # random-routing profiling override here too (a no-op by default).
@@ -584,25 +578,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         #   w1_temp (E, I, P) + w3_temp (E, I, P) == w13_weight (E, 2I, P)
         #   w2_temp                               == w2_weight
         # which is also how the scales are already sliced just above.
-        # LAYOUT: contiguous halves vs interleaved. The other dequantize path
-        # in this file (see `w13_weight[:, ::2, :]` / `[:, 1::2, :]`) uses
-        # INTERLEAVED, while the scale slicing just above uses contiguous
-        # halves -- but that slicing was only ever paired with the empty
-        # w*_temp buffers, so it was never actually exercised and cannot be
-        # taken as evidence. DSV4_MXFP4_INTERLEAVED=1 selects interleaved for
-        # BOTH weights and scales so the two layouts can be A/B'd against the
-        # reference dumps (pass: L0/05_post_ffn cos -> ~1.0, relL2 -> ~0).
+        # w13 packs w1 and w3 as CONTIGUOUS halves along dim 1, matching the
+        # contiguous scale slicing above. Verified against tpu-inference
+        # activations: contiguous cos=0.98609 vs interleaved 0.62263
+        # (the interleaved `::2`/`1::2` layout used by the other dequant
+        # path in this file is wrong here).
         w13_packed = layer.w13_weight.data.to("cpu")
         w2_packed = layer.w2_weight.data.to("cpu")
-        if os.getenv("DSV4_MXFP4_INTERLEAVED") == "1":
-            w1_packed = w13_packed[:, ::2, :]
-            w3_packed = w13_packed[:, 1::2, :]
-            _full_scale = layer.w13_weight_scale.data.to("cpu")
-            w1_scale = _full_scale[:, ::2, :]
-            w3_scale = _full_scale[:, 1::2, :]
-        else:
-            w1_packed = w13_packed[:, :self.intermediate_size, :]
-            w3_packed = w13_packed[:, self.intermediate_size:, :]
+        w1_packed = w13_packed[:, :self.intermediate_size, :]
+        w3_packed = w13_packed[:, self.intermediate_size:, :]
 
         w1_dequant = dequantize_mxfp4_packed(w1_packed,
                                              w1_scale,

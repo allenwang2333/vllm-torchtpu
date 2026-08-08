@@ -362,55 +362,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                                        "hash_indices_table",
                                                        tid2eid)
 
-                        # `routed_scaling_factor` must be wired onto the SAME
-                        # object for the same reason, and was not.
-                        #
-                        # moe_routing.select_experts reads it as
-                        # `getattr(layer, "routed_scaling_factor", 1.0)`
-                        # (moe_routing.py:122). Nothing in the DeepSeek-V4 path
-                        # ever set it, so the getattr silently returned 1.0 and
-                        # every routed-expert contribution was missing its
-                        # x1.5 (config.routed_scaling_factor for DSv4-Flash).
-                        # The reference passes it explicitly into FusedMoE with
-                        # apply_routed_scale_to_output=True
-                        # (tpu_inference/.../deepseek_v4.py:180-186).
-                        #
-                        # Measured signature this explains, layer 0 vs the
-                        # reference: MoE input matches (per-token norm ratio
-                        # 1.0017) while MoE output is systematically SMALL --
-                        # ratio median 0.82, max 0.99, min 0.019, never above
-                        # 1. With output = shared + routed instead of
-                        # shared + 1.5*routed, the ratio is ~1 where the routed
-                        # term is negligible, ~0.667 where it dominates, and
-                        # collapses toward 0 for tokens where the two terms
-                        # partially cancel.
-                        # DSV4_FORCE_RSF overrides the config value. Used as a
-                        # sensitivity probe: if scaling every routed gate weight
-                        # by an absurd factor leaves the output bit-identical,
-                        # the gate weights are not modulating expert output at
-                        # all -- i.e. fused_moe_gmm is ignoring topk_weights.
-                        _cfg = (getattr(self, "config", None)
-                                or getattr(self.model, "config", None))
-                        _rsf = getattr(_cfg, "routed_scaling_factor",
-                                       None) if _cfg is not None else None
-                        if os.getenv("DSV4_FORCE_RSF"):
-                            _rsf = float(os.environ["DSV4_FORCE_RSF"])
-                        if _rsf is not None:
-                            runner = l.ffn.experts
-                            for tgt in (runner,
-                                        getattr(runner, "routed_experts",
-                                                None)):
-                                if tgt is not None:
-                                    object.__setattr__(
-                                        tgt, "routed_scaling_factor",
-                                        float(_rsf))
-                                    if (os.getenv("DSV4_DEBUG_MOE_ROUTING")
-                                            == "1" and idx == 0):
-                                        logger.info(
-                                            "[MOE_RSF_WIRE] layer0 set "
-                                            "routed_scaling_factor=%s on %s",
-                                            float(_rsf),
-                                            type(tgt).__name__)
             from vllm.models.deepseek_v4.amd.model import \
                 _make_deepseek_v4_weights_mapper
             quant_config = getattr(vllm_config, "quant_config", None)
