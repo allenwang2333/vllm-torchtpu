@@ -118,6 +118,24 @@ SparseCore is active in these graphs (build 133's compile error proves it),
 though disabling `xla_tpu_offload_gather_to_sparsecore` alone did not avoid
 the halt (build 135).
 
+## HLO dump comparison (builds 149 halting / 150 patched)
+
+Full XLA dumps (`--xla_dump_to`) were captured from a halting run and a
+patched (passing) run under identical config. Result: the compiled programs
+are **structurally identical** — same module set, and all matched
+decode-graph compile variants carry identical SparseCore-offload op counts
+(30 all-gathers + 30 reduce-scatters on physical SC 0 via
+`use_single_sparse_core`, 60 `sc_ragged_*` MoE custom-calls) and identical
+`AssumeGatherIndicesInBound` (63) / `GatherScatterIndicesBitpacked` (30)
+annotation counts per variant. The block-reuse patch changes zero device
+code; the halt is therefore **purely data-dependent**: the same SparseCore
+programs trap or don't based solely on the runtime contents of the
+block-derived index tensors. Note also the decode graph carries
+compiler-assumed-in-bounds gathers (e.g. an `index_select` of
+`bf16[8192,2816]` rows with `s32[8192]` indices wrapped in
+`AssumeGatherIndicesInBound`). Dumps available from the build artifacts
+(`xla_dump.tgz`, ~4.6 GB each).
+
 ## Actions
 
 1. **Workaround VALIDATED (build 147): plugin-side patch** restoring
