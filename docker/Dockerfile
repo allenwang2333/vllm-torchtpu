@@ -36,6 +36,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index-strategy unsafe-best-match \
       -r pyproject.toml
 
+# Test-only: apply the upstream vllm fix from
+# https://github.com/vllm-project/vllm/pull/51482 (restore prepend/LIFO
+# free-block order when prefix caching is off) directly onto the installed
+# vllm, with no plugin-side monkeypatch, to confirm the upstream change
+# alone cures the E0200 SparseCore halt.
+COPY docker/patches/vllm-51482-free-blocks-lifo.patch /tmp/vllm-51482.patch
+RUN set -eu; \
+    SITE="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"; \
+    patch -p1 -d "${SITE}" < /tmp/vllm-51482.patch; \
+    grep -n "keeping the set of" "${SITE}/vllm/v1/core/block_pool.py" >/dev/null
+
 
 # Variant 2: The CI Environment (CI/CD Variant)
 # This variant builds on top of the runtime base, installing additional packages
