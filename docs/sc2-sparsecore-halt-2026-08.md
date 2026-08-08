@@ -85,15 +85,52 @@ pd-disagg build 59 uploaded benchmark results to BigQuery after the halt/restart
 (the c8/c16/c32 result JSONs are visibly truncated vs build 58's). Aug-7 `GKE_DISAGG`
 rows should be treated as suspect.
 
-## Suggested actions
+## RESOLVED: dependency bisect (vllm-torchtpu-dev builds 110-146)
 
-1. torch-tpu runtime team: diff SparseCore-touching changes
-   `0.1.1.dev20260728090214 → 0.1.1.dev20260804130134` (torch 2.13 ABI variant);
-   the always-SC2 placement and recurring sequencer PCs (`0x3/0xa3/0xb3/0x133`)
-   should identify the program. All server.logs above are attached evidence.
-2. Repo side until fixed: keep gemma config out of the General suite (PR #347 TODO);
-   consider pinning the GKE disagg manifests to image 23's digest
-   (`torchtpu-vllm-prod@sha256:a335f817...`) so nightly disagg data stays clean.
-3. Cheap forward-fix probe: rerun the deterministic gemma reproducer
-   (dev pipeline, branch `mhhua/gemma-sc-halt-bisect`) against any newer
-   torch-tpu nightly before deciding on a #288 revert.
+A per-dependency isolation matrix (one pin change per dev build, all against a
+c1024-only gemma reproducer, verdicts from server.log E0200 counts — job state
+is unreliable because a halted DP rank leaves the other ranks serving) found:
+
+- **torch / torch-tpu exonerated**: the halt reproduces on torch 2.11 +
+  torch-tpu dev20260728 (the pre-#288 runtime that was green for weeks) and on
+  every torch-2.13 nightly through dev20260807160217 (builds 124, 126-129).
+- **Plugin commits exonerated**: current vllm-torchtpu main + full old dep
+  stack + vllm 0.26.0 is clean (build 134); pre-#288 tree + only vllm→rc0
+  halts (build 132). Perfect 2x2 with vllm as the only discriminator.
+- **vllm still broken at v0.27.0rc1** (build 140) — no forward fix upstream.
+- **Commit bisect over the 300 commits v0.26.0..v0.26.1rc0** (builds 136-145,
+  quartiles → 60 → 30 → 7 → 1):
+  clean at 60/120/180/195, halt at 198/202/210/216/240/300.
+
+**First bad commit: vllm `a82f1b38` — "[Perf][V1] Skip LRU hash-split in
+free_blocks when prefix caching is off" (#48017).** With prefix caching
+disabled (all our serving configs), freed KV blocks switch from prepend
+(LIFO reuse of a small hot set of block ids) to append (FIFO cycling through
+the entire block-id space). Under sustained load the block tables then
+reference the full physical block-id range, and an indexed
+SparseCore-offloaded op on the paged-KV path traps (E0200, UserFatal, always
+SC2, tile sequencers at PC 0x3fff). This explains the minutes-in timing (time
+to first cycle through the pool), the load threshold, the apparent
+model-specificity (block count x churn rate), and the GKE disagg decode halt
+(fast block churn from KV transfers). The underlying index-handling bug is in
+the TPU stack and is merely exposed by the vllm change — gather offload to
+SparseCore is active in these graphs (build 133's compile error proves it),
+though disabling `xla_tpu_offload_gather_to_sparsecore` alone did not avoid
+the halt (build 135).
+
+## Actions
+
+1. **Workaround (validated in build 146 if green): plugin-side patch**
+   restoring pre-#48017 LIFO free order when prefix caching is off — branch
+   `mhhua/sc-halt-workaround-lifo-free`, a `BlockPool.free_blocks` monkeypatch
+   in `vllm_torchtpu.platforms.register_tpu_platform`. Unblocks the gemma
+   General-suite re-add (pipeline_perf.yml TODO) and protects GKE disagg,
+   with no dependency rollback.
+2. **torch-tpu bug**: SparseCore-side trap on paged-KV block indices under
+   FIFO block reuse; repro = any TPU v7x serving load with
+   `--no-enable-prefix-caching` on vllm >= a82f1b38, or directly via the
+   gemma c1024 reproducer on branch `mhhua/gemma-sc-halt-bisect`.
+3. **vllm upstream**: report that #48017's cache-locality heuristic is
+   actively harmful on TPU (and gate it per-platform), independent of the
+   TPU trap being fixed.
+4. Aug-7 `GKE_DISAGG` BigQuery rows remain suspect (see data-integrity note).
