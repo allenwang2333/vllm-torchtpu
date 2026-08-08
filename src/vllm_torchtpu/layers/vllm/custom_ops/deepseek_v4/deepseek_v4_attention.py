@@ -47,6 +47,22 @@ from vllm.model_executor.layers.attention_layer_base import (  # isort: skip
 logger = init_logger(__name__)
 
 
+def _DEBUG_LAYER_PREFIX():
+    """Which layer the content/metadata probes read. Default layer 2 (CSA).
+
+    Every probe in this file was hardcoded to `model.layers.2.attn`, so every
+    "the cache is correct / addressing is correct / selection is correct"
+    result in this investigation was measured on a CSA layer. Layer 3 is the
+    first HCA layer (compress_ratio 128) and had never been read. Set
+    DSV4_DEBUG_LAYER=3 to point the same probes at it.
+    """
+    return f"model.layers.{os.getenv('DSV4_DEBUG_LAYER', '2')}.attn"
+
+
+def _DEBUG_LAYER_INFIX():
+    return f"layers.{os.getenv('DSV4_DEBUG_LAYER', '2')}."
+
+
 def _is_tracing() -> bool:
     if hasattr(torch, "_dynamo") and torch._dynamo.is_compiling():
         return True
@@ -940,7 +956,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             main_attn_metadata = attn_ctx.get(main_layer_name) or attn_ctx.get(
                 compressor_state_prefix) or swa_attn_metadata
             if (os.getenv("DSV4_DEBUG_MAIN_META") == "1"
-                    and "layers.2." in str(main_layer_name)
+                    and _DEBUG_LAYER_INFIX() in str(main_layer_name)
                     and not _is_tracing()):
                 _main_bt = attn_ctx.get(main_layer_name)
                 _state_bt = attn_ctx.get(compressor_state_prefix)
@@ -950,16 +966,86 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                            and _state_bt.block_tables is not None and bool(
                                torch.equal(_main_bt.block_tables,
                                            _state_bt.block_tables)))
+
+                # Print SHAPES and full contents, not a `[:8]` slice. That
+                # slice previously produced `state_bt=[4, 5, 6, 7, 8, 9, 0, 0]`,
+                # which was misread as "the block table is 8 wide" and led to
+                # two wrong conclusions about where a modulo wrap would fire.
+                # The width is what matters and it was never printed.
+                def _bt(md, n=96):
+                    if md is None or getattr(md, "block_tables", None) is None:
+                        return "None"
+                    bt = md.block_tables
+                    return (f"shape={tuple(bt.shape)} dtype={bt.dtype} "
+                            f"vals[:{n}]={bt.flatten()[:n].tolist()}")
+
+                def _same_ip(md, pos):
+                    """Is this layer's input_positions the model positions?"""
+                    ip = getattr(md, "input_positions",
+                                 None) if md is not None else None
+                    if ip is None:
+                        return "input_positions=None"
+                    try:
+                        if ip.shape != pos.shape:
+                            return f"shape_differs {tuple(ip.shape)} vs {tuple(pos.shape)}"
+                        return bool(torch.equal(ip, pos))
+                    except Exception as exc:
+                        return f"<{exc}>"
+
+                def _fld(md, name, n=48):
+                    v = getattr(md, name, None) if md is not None else None
+                    if v is None:
+                        return "None"
+                    try:
+                        return (f"shape={tuple(v.shape)} "
+                                f"vals[:{n}]={v.flatten()[:n].tolist()}")
+                    except Exception:
+                        return str(v)
+
                 logger.info(
-                    f"[MAIN_META_DEBUG] positions={positions[:6].tolist()} "
-                    f"main_layer_name={main_layer_name!r} "
-                    f"compressor_state_prefix={compressor_state_prefix!r} "
-                    f"same_metadata_object={same_obj} same_block_tables={same_bt} "
-                    f"main_bt_present={_main_bt is not None} state_bt_present={_state_bt is not None} "
-                    f"chosen_is_main={main_attn_metadata is _main_bt} "
-                    f"main_bt={_main_bt.block_tables[:8].tolist() if _main_bt is not None and _main_bt.block_tables is not None else None} "
-                    f"state_bt={_state_bt.block_tables[:8].tolist() if _state_bt is not None and _state_bt.block_tables is not None else None}"
-                )
+                    "[MAIN_META_DEBUG] layer=%s state_prefix=%s\n"
+                    "  positions: shape=%s min=%s max=%s first8=%s\n"
+                    "  same_metadata_object=%s same_block_tables=%s "
+                    "chosen_is_main=%s\n"
+                    "  main_bt:  %s\n"
+                    "  state_bt: %s\n"
+                    "  main.seq_lens: %s\n"
+                    "  main.query_start_loc: %s\n"
+                    "  main.request_distribution: %s\n"
+                    "  state.seq_lens: %s\n"
+                    # The reference derives each slot mapping from that
+                    # layer's OWN metadata (`state_metadata.input_positions`
+                    # for the state map, `k_cache_metadata.input_positions`
+                    # for the k map, `positions` only for RoPE --
+                    # tpu_inference/.../deepseek_v4_compressor.py:240-246).
+                    # We pass the model `positions` to all three, and our
+                    # AttentionMetadata sets input_positions=None for
+                    # attention layers (attention.py:121). These three lines
+                    # show whether that distinction would have mattered.
+                    "  main.input_positions: %s\n"
+                    "  state.input_positions: %s\n"
+                    "  positions_vs_state_input_equal=%s\n"
+                    "  compress_ratio=%s window_size=%s",
+                    main_layer_name,
+                    compressor_state_prefix,
+                    tuple(positions.shape),
+                    int(positions.min()) if positions.numel() else -1,
+                    int(positions.max()) if positions.numel() else -1,
+                    positions[:8].tolist(),
+                    same_obj,
+                    same_bt,
+                    main_attn_metadata is _main_bt,
+                    _bt(_main_bt),
+                    _bt(_state_bt),
+                    _fld(_main_bt, "seq_lens"),
+                    _fld(_main_bt, "query_start_loc"),
+                    _fld(_main_bt, "request_distribution"),
+                    _fld(_state_bt, "seq_lens"),
+                    _fld(_main_bt, "input_positions"),
+                    _fld(_state_bt, "input_positions"),
+                    _same_ip(_state_bt, positions),
+                    getattr(self, "compress_ratio", None),
+                    getattr(self, "window_size", None))
         else:
             swa_attn_metadata = attn_ctx
             main_attn_metadata = attn_ctx
@@ -1055,15 +1141,40 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
 
         if is_csa:
             assert topk_indices is not None
-            # DSV4_CSA_FILTER=1 restores the local row-padding + max_valid_kv
-            # filter. It is OFF by default because the reference does none of
-            # it -- `tpu_inference/.../deepseek_v4_attention.py:322-323` is
-            # simply `extra = jax_view(topk_indices)`. The filter can only
-            # *remove* rows (every rejected index becomes -1), so if it rejects
-            # too many the long-range branch attends nothing while the cache,
-            # metadata and kernels all remain correct. The removed comment
-            # claimed it matched the reference; it did not.
-            if os.getenv("DSV4_CSA_FILTER") == "1":
+            # The max_valid_kv filter is ON by default, and is LOAD-BEARING --
+            # do not drop it again to match the reference without replacing
+            # what it protects against.
+            #
+            # The reference has no such filter
+            # (`tpu_inference/.../deepseek_v4_attention.py:322-323` is simply
+            # `extra = jax_view(topk_indices)`), and it looks redundant here
+            # too: our score kernel already masks non-causal and out-of-range
+            # candidates to -inf (`streamindex_topk.py:350-353`) and maps any
+            # -inf winner to -1 (`:805`). On that reasoning it was defaulted
+            # OFF in b79202e0 -- a static-comparison argument, never measured.
+            #
+            # Measured 2026-08-08, A/B on this flag alone (runA vs runB in
+            # scratchpad/, same commit, same prompts):
+            #   filter OFF: 81-token needle FAILS (" to the code's. The...")
+            #   filter ON:  81-token needle PASSES (7391-QUARTZ verbatim)
+            # The needle at 81 tokens sits inside the 128-token sliding window,
+            # so this breaks even the short-range path.
+            #
+            # Why the -1 masking is not enough: `streamindex_topk` selects via
+            # `jax.lax.approx_max_k`, which is confirmed NOT equivalent to
+            # top_k here (see the WARNING in that file) -- with k >= the
+            # candidate count it returns indices positionally rather than by
+            # score, so `top_vals` no longer correspond to `top_idxs` and the
+            # `where(top_vals == -inf, -1, top_idxs)` guard at :805 masks the
+            # wrong entries. Invalid rows then reach the MLA kernel, whose CSA
+            # branch applies no causal or kv_len mask of its own (`mla.py:185-195`
+            # masks purely by membership in topk_indices) and attends them.
+            #
+            # The right end state is to fix approx_max_k selection and then
+            # retire this filter; until then it is the only thing enforcing
+            # causality on the CSA path. DSV4_CSA_FILTER=0 disables it for
+            # bisection.
+            if os.getenv("DSV4_CSA_FILTER", "1") == "1":
                 fill_pad = torch.full(
                     (positions.shape[0], topk_indices.shape[1]),
                     -1,
@@ -1081,6 +1192,72 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         else:
             extra = (positions + 1).to(torch.int32) // self.compress_ratio
 
+        # DSV4_ABLATE_MAIN=1 empties the long-range branch's selection while
+        # leaving everything else -- kernel, merge, sinks, SWA path, shapes,
+        # dtypes -- bit-for-bit unchanged. CSA attends no compressed rows
+        # (all -1); HCA attends zero compressed keys (kv_lens_to_attend=0).
+        #
+        # This is the ablation `DSV4_FORCE_SWA_ONLY` was mistaken for. That
+        # switch reroutes the layer to a different code path entirely and was
+        # correctly written off as "a lobotomy, not an ablation"; this one
+        # changes only the values of `extra`.
+        #
+        # Reading it: if output is byte-identical to a normal run, the main
+        # branch is already contributing nothing and the fault is in the
+        # merge/weighting, not in the compressed data or its addressing. If
+        # output changes, the main branch does contribute and the fault is in
+        # what it contributes.
+        # NOT gated on `_is_tracing()`, deliberately. Every other probe in this
+        # file is, because they only log. This one changes a *value*: if it
+        # were skipped under tracing it would silently become a no-op, and a
+        # no-op ablation yields byte-identical output -- precisely the reading
+        # that would be taken as "the main branch contributes nothing". The
+        # failure mode would confirm the hypothesis it was built to test.
+        # Values: "1"/"all" (both layer types), "csa", "hca".
+        #
+        # The selective modes break a confound that has sat under this whole
+        # investigation unexamined. 128 is BOTH the SWA window size AND the HCA
+        # compress_ratio, so `main_kv_lens = seq_len // 128` means the HCA
+        # long-range branch holds ZERO rows below 128 tokens and switches on at
+        # exactly the length where retrieval starts failing:
+        #
+        #   81 tokens (PASSES): HCA rows = 0  -- path is a complete no-op
+        #   162 tokens (FAILS): HCA rows = 1
+        #   256 tokens (FAILS): HCA rows = 2
+        #
+        # "the needle left the sliding window" and "the HCA path switched on"
+        # are therefore perfectly confounded, and NO prompt length can separate
+        # them: if total length < 128 the needle distance is < 128 too, so it is
+        # inside the window by construction. The documented "sharp cliff at the
+        # sliding-window boundary" assumes the first explanation without ever
+        # testing the second.
+        #
+        # Ablating one layer type at a fixed 256 tokens separates them:
+        #   DSV4_ABLATE_MAIN=hca restores 81-token HCA behaviour (no rows) while
+        #     leaving CSA live. Retrieval returns -> HCA is the bug.
+        #   DSV4_ABLATE_MAIN=csa is the complement and brackets the result.
+        # NOTE the `not swa_only` guard on the hca arm. SWA-only layers (0, 1,
+        # 42) also report is_csa=False, so a bare `not is_csa` would ablate them
+        # too -- and those are precisely the layers carrying the 81-token
+        # success. That would reintroduce the confound this switch exists to
+        # remove, and turn the arm back into the lobotomy DSV4_FORCE_SWA_ONLY
+        # already was. Their `extra` is inert anyway (the swa_only branch never
+        # reads it for real math), but ablating them would still be sloppy.
+        _ablate = os.getenv("DSV4_ABLATE_MAIN", "")
+        _ablate_this = (_ablate in ("1", "all")
+                        or (_ablate == "csa" and is_csa)
+                        or (_ablate == "hca" and not is_csa and not swa_only))
+        if _ablate_this:
+            extra = (torch.full_like(extra, -1)
+                     if is_csa else torch.zeros_like(extra))
+            if not _is_tracing():
+                # Positive control that it actually fired, per layer per step.
+                logger.info(
+                    "[ABLATE_MAIN] mode=%s layer=%s is_csa=%s extra_shape=%s "
+                    "extra_first8=%s", _ablate, getattr(self, "prefix", "?"),
+                    is_csa, tuple(extra.shape),
+                    extra.flatten()[:8].tolist())
+
         if os.getenv("DSV4_DEBUG_MAIN_META") == "1" and not _is_tracing():
             from vllm.distributed.parallel_state import \
                 get_tensor_model_parallel_rank
@@ -1090,7 +1267,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                     f"[DEBUG_FORWARD_MQA_CACHES] prefix={main_prefix} sw_cache.shape={sw_cache.shape if sw_cache is not None else None} sw_cache.dtype={sw_cache.dtype if sw_cache is not None else None} main_cache_kv.shape={main_cache_kv.shape if main_cache_kv is not None else None} main_cache_kv.dtype={main_cache_kv.dtype if main_cache_kv is not None else None}"
                 )
             if rank == 0 and main_prefix in ("model.layers.0.attn",
-                                             "model.layers.2.attn"):
+                                             _DEBUG_LAYER_PREFIX()):
                 logger.debug(
                     f"[DEBUG_DECODE_STEP] prefix={main_prefix} positions={positions[:6].tolist()} "
                     f"swa_seq_lens={swa_seq_lens[:3].tolist() if swa_seq_lens is not None else None} "
@@ -1113,7 +1290,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # branch. Host-side only: no kernel-body change, so it does not by
         # itself require a compile-cache clear.
         if (os.getenv("DSV4_DEBUG_MAIN_KV") == "1" and not _is_tracing()
-                and rank == 0 and main_prefix == "model.layers.2.attn"
+                and rank == 0 and main_prefix == _DEBUG_LAYER_PREFIX()
                 and not swa_only and main_cache_kv is not None
                 and main_cache_kv.numel() > 0 and main_page_indices is not None
                 and main_kv_lens is not None):
@@ -1167,19 +1344,30 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"[MAIN_KV_DEQUANT_DEBUG] positions={positions[:4].tolist()} "
                 f"main_kv_lens[0]={_kv_len} page0={_page0} "
                 f"k_block_size={_k_block_size} | " + " | ".join(_rows))
-            # `two_caches_same_buffer` is hardcoded to `not swa_only` here,
-            # whereas the reference derives it (main_cache_index ==
-            # swa_cache_index). When it is True the compressed-KV read is
-            # redirected to `updated_sw_cache`; if the two caches are in fact
-            # distinct buffers that redirect points CSA/HCA attention at the
-            # wrong physical allocation entirely.
+            # `two_caches_same_buffer` decides whether the compressed-KV read
+            # is redirected to `updated_sw_cache` (the post-SWA-write view of
+            # the shared buffer). It is derived from real tensor identity in
+            # `_build_attn_op` (see the `main_cache.data_ptr() ==
+            # swa_tensor.data_ptr()` expression there), matching the
+            # reference's `main_cache_index == swa_cache_index`.
+            #
+            # This field used to print `not swa_only` under the name
+            # `redirect=`, together with a comment claiming the flag was
+            # hardcoded to that. Both were stale -- the hardcoding was already
+            # gone. A `redirect=True` line therefore meant only "this is not an
+            # SWA-only layer", not "the buffer was redirected", which reads as
+            # a serious bug on a layer whose two caches are distinct. Print the
+            # quantity the kernel actually branches on.
+            _redirect = (not swa_only
+                         and sw_cache.data_ptr() == main_cache_kv.data_ptr())
             logger.info(
                 f"[CACHE_IDENTITY_DEBUG] positions={positions[:4].tolist()} "
                 f"same_tensor_obj={sw_cache is main_cache_kv} "
                 f"same_data_ptr={sw_cache.data_ptr() == main_cache_kv.data_ptr()} "
                 f"sw_ptr={sw_cache.data_ptr()} main_ptr={main_cache_kv.data_ptr()} "
                 f"sw_shape={list(sw_cache.shape)} main_shape={list(main_cache_kv.shape)} "
-                f"redirect={not swa_only}")
+                f"not_swa_only={not swa_only} two_caches_same_buffer={_redirect}"
+            )
 
         _dump_step_now = getattr(self, "_dsv4_dump_step_current", 0)
         if topk_indices is not None:
@@ -1229,7 +1417,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # read, no host callback needed -- see
         # docs/dsv4/CURRENT_STATUS_20260801.md sec 6 item 0.
         if (os.getenv("DSV4_DEBUG_MAIN_KV") == "1" and not _is_tracing()
-                and rank == 0 and main_prefix == "model.layers.2.attn"
+                and rank == 0 and main_prefix == _DEBUG_LAYER_PREFIX()
                 and not swa_only and main_page_indices is not None
                 and main_kv_lens is not None and new_sw_cache is not None):
             _nsc = new_sw_cache
@@ -1324,7 +1512,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             # upstream. Reuses _page0/_k_block_size/_kv_len/_probe_slots
             # computed above -- only runs when that block ran.
             if (os.getenv("DSV4_DEBUG_MAIN_KV") == "1" and not _is_tracing()
-                    and rank == 0 and main_prefix == "model.layers.2.attn"
+                    and rank == 0 and main_prefix == _DEBUG_LAYER_PREFIX()
                     and not swa_only and main_cache_kv is not None
                     and main_cache_kv.numel() > 0
                     and main_page_indices is not None

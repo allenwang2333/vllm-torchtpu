@@ -782,25 +782,35 @@ def streamindex_topk(
     # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax, but
     # direct VMEM streaming will allow SC to beat TensorCore performance.
 
-    # WARNING (measured 2026-08-07, not assumed): this is NOT equivalent to
-    # jax.lax.top_k. With `k` smaller than the number of candidate rows it
-    # returns the first k indices in order, identical for every query row --
-    # the scores are ignored. Reproduced against the NumPy ground truth by two
-    # cases in tests/kernels/test_dsv4_streamindex_topk.py (k=32 of 384, and
-    # k=16 of 64 at compress_ratio=4); every pre-existing case used k=1024
-    # against <=384 candidates, where "return everything" is accidentally
-    # correct, so the suite could not catch it.
+    # Use jax.lax.top_k, NOT jax.lax.approx_max_k.
     #
-    # Dormant below ~2048 tokens of context (`index_topk=512` exceeds the
-    # candidate count), but active at the reference benchmark's
-    # max_model_len=9216, where each CSA layer has 2304 candidates.
+    # This was `approx_max_k(..., recall_target=1.0)` on the assumption that it
+    # is an exact-but-faster top_k. Measured 2026-08-07, it is not: with `k`
+    # smaller than the number of candidate rows it returns the first k indices
+    # in order, identical for every query row -- the scores are ignored
+    # entirely. Two cases in tests/kernels/test_dsv4_streamindex_topk.py
+    # (k=32 of 384, and k=16 of 64 at compress_ratio=4) reproduce it against a
+    # NumPy ground truth. Every pre-existing case used k=1024 against <=384
+    # candidates, where "return everything" is accidentally correct, so the
+    # suite could not catch it.
     #
-    # The reference does top-k *inside* the Pallas kernel and has no
-    # equivalent of this call; the split into a scores kernel + approx_max_k
-    # arrived with PR #214 (788cdf15), which left the tests' k=1024 untouched.
-    top_vals, top_idxs = jax.lax.approx_max_k(scores,
-                                              k,
-                                              reduction_dimension=-1,
-                                              recall_target=1.0)
+    # Two distinct consequences, both real:
+    #  1. At long context (>~2048 tokens; the reference benchmark runs 9216,
+    #     giving a CSA layer 2304 candidates against index_topk=512) every CSA
+    #     layer attends the earliest 512 compressed rows regardless of
+    #     relevance.
+    #  2. At ANY context length, the `-1` guard below is defeated. It pairs
+    #     `top_vals[i]` with `top_idxs[i]` to mask invalid/non-causal rows
+    #     (scored -inf at :350-353); when selection is positional rather than
+    #     by score that pairing breaks, and invalid rows survive as non--1.
+    #     Nothing downstream re-checks them -- the MLA kernel's CSA branch
+    #     masks purely by membership in topk_indices (mla.py:185-195) -- so
+    #     they get attended. This is why the max_valid_kv filter in
+    #     deepseek_v4_attention.py is load-bearing; see its comment.
+    #
+    # The reference does top-k *inside* the Pallas kernel and has no equivalent
+    # of this call; the split into a scores kernel + approx_max_k arrived with
+    # PR #214 (788cdf15), which left the tests' k=1024 untouched.
+    top_vals, top_idxs = jax.lax.top_k(scores, k)
     topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
     return topk_idxs[:q.shape[0], :k]

@@ -279,6 +279,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Step 1: Routing
         custom_routing_fn = layer.custom_routing_function
+        if os.getenv("DSV4_DEBUG_MOE_ROUTING") == "1":
+            logger.info(
+                "[MOE_APPLY] custom_routing_fn=%s layer=%s input_ids=%s "
+                "rsf_attr=%s", custom_routing_fn is not None,
+                type(layer).__name__, input_ids is not None,
+                getattr(layer, "routed_scaling_factor", "<MISSING>"))
         if custom_routing_fn is not None:
             # custom_routing_fn bypasses select_experts, so apply the
             # random-routing profiling override here too (a no-op by default).
@@ -305,7 +311,62 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        return fused_moe_gmm(
+        # DSV4_DEBUG_MOE_FULL=1 dumps EVERY quantity needed to localize a MoE
+        # divergence in ONE run, rather than one hypothesis per 15-minute
+        # cycle: routing outputs, the EP local-expert window and how many of
+        # this rank's routed slots actually fall inside it, and the norm of the
+        # routed result this method returns (vLLM's FusedMoE adds the shared
+        # expert on top, so `05_post_ffn` minus this is the shared part).
+        _dbg = os.getenv("DSV4_DEBUG_MOE_FULL") == "1"
+        if _dbg:
+            import torch as _t
+            _es = moe_routing.get_experts_start(layer)
+            _nloc = getattr(layer, "local_num_experts", None) or getattr(
+                layer.moe_config, "num_local_experts", -1)
+            _in_win = None
+            if _es is not None and _nloc and _nloc > 0:
+                _in_win = int(
+                    ((topk_ids >= _es) & (topk_ids < _es + _nloc)).sum())
+            logger.info(
+                "[MOE_FULL] L%s x_norm=%.4f x_absmax=%.4f | topk_ids "
+                "shape=%s min=%s max=%s | topk_w sum_mean=%.4f min=%.4g "
+                "max=%.4g zero_frac=%.4f | experts_start=%s n_local=%s "
+                "slots_in_window=%s/%s", getattr(layer, "layer_idx", -1),
+                float(_t.linalg.vector_norm(x)), float(x.abs().max()),
+                tuple(topk_ids.shape), int(topk_ids.min()),
+                int(topk_ids.max()), float(topk_weights.sum(-1).mean()),
+                float(topk_weights.min()), float(topk_weights.max()),
+                float((topk_weights == 0).float().mean()), _es, _nloc, _in_win,
+                int(topk_ids.numel()))
+
+        if _dbg:
+            import torch as _t
+            _w1, _w2 = layer.w13_weight, layer.w2_weight
+            _esb = getattr(layer, "_experts_start", None)
+            logger.info(
+                "[MOE_GMM_IN] L%s w13.shape=%s w13.dtype=%s w13_absmax=%s "
+                "w2.shape=%s w2_absmax=%s | _experts_start=%s (%s) "
+                "use_ep=%s local_num_experts=%s | remap_bound=w1.shape[0]=%s",
+                getattr(layer, "layer_idx", -1), tuple(_w1.shape), _w1.dtype,
+                float(_w1.float().abs().max()) if _w1.numel() else "empty",
+                tuple(_w2.shape),
+                float(_w2.float().abs().max()) if _w2.numel() else "empty",
+                (int(_esb) if _esb is not None else None),
+                type(_esb).__name__,
+                layer.moe_config.moe_parallel_config.use_ep,
+                getattr(layer, "local_num_experts", None), _w1.shape[0])
+            # How many routed slots survive the kernel's OWN remap rule
+            # (topk_ids - experts_start, bounded by w1.shape[0]) -- as opposed
+            # to the config's local_num_experts, which is what the earlier
+            # probe used. If these disagree, everything is masked to zero.
+            if _esb is not None:
+                _li = topk_ids - int(_esb)
+                _v = ((_li >= 0) & (_li < _w1.shape[0])).sum()
+                logger.info(
+                    "[MOE_GMM_IN] L%s slots_valid_by_KERNEL_rule=%s/%s",
+                    getattr(layer, "layer_idx", -1), int(_v),
+                    int(topk_ids.numel()))
+        _routed = fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -320,6 +381,34 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             activation=activation_str,
             rhs_quant_dtype=self.rhs_quant_dtype,
         )
+        if _dbg:
+            import torch as _t
+            logger.info(
+                "[MOE_FULL] L%s ROUTED-OUT norm=%.4f absmax=%.4f "
+                "zero_row_frac=%.4f shape=%s", getattr(layer, "layer_idx", -1),
+                float(_t.linalg.vector_norm(_routed)),
+                float(_routed.abs().max()),
+                float((_routed.abs().sum(-1) == 0).float().mean()),
+                tuple(_routed.shape))
+            _d = os.getenv(
+                "DSV4_MOE_DUMP_DIR",
+                "/home/patemotter_google_com/workspace/scratch/moe_dumps")
+            try:
+                import numpy as _np
+                os.makedirs(_d, exist_ok=True)
+                _li = getattr(layer, "layer_idx", -1)
+                _st = getattr(layer, "_moe_dump_step", 0)
+                layer._moe_dump_step = _st + 1
+                _tag = f"L{_li:02d}_step{_st:03d}"
+                for _nm, _v in (("topk_ids", topk_ids), ("topk_weights",
+                                                         topk_weights),
+                                ("routed_out", _routed), ("x", x),
+                                ("router_logits", router_logits)):
+                    _np.save(f"{_d}/{_nm}_{_tag}.npy",
+                             _v.detach().cpu().float().numpy())
+            except Exception as _e:
+                logger.warning("[MOE_FULL] dump failed: %s", _e)
+        return _routed
 
 
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
@@ -476,15 +565,54 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             "cpu")[:, self.intermediate_size:, :]
         w2_scale = layer.w2_weight_scale.data.to("cpu")
 
-        w1_dequant = dequantize_mxfp4_packed(layer.w1_temp.data.to("cpu"),
+        # Dequantize from the LOADED parameters, not the w*_temp staging
+        # buffers.
+        #
+        # The weight loader fills `w13_weight` / `w2_weight`; nothing ever
+        # writes `w1_temp` / `w3_temp` / `w2_temp`. Measured 2026-08-08 on a
+        # real run, all 43 layers, every rank:
+        #     w13_weight  absmax=255.0            (populated)
+        #     w1/w2/w3_temp absmax=0.0 nonzero_frac=0.0000  (EMPTY)
+        # so every expert weight dequantized to zero, the GMM multiplied by
+        # zero, and the routed MoE contribution was exactly 0.0 at every layer
+        # -- the model ran as shared-expert-only. This is the first divergence
+        # from tpu-inference in the whole stack (L0/05_post_ffn cos 0.66 while
+        # L0 attention matched at 0.9992) and it invalidated every prior DSv4
+        # correctness measurement in this repo.
+        #
+        # The staging split maps onto the loaded params exactly:
+        #   w1_temp (E, I, P) + w3_temp (E, I, P) == w13_weight (E, 2I, P)
+        #   w2_temp                               == w2_weight
+        # which is also how the scales are already sliced just above.
+        # LAYOUT: contiguous halves vs interleaved. The other dequantize path
+        # in this file (see `w13_weight[:, ::2, :]` / `[:, 1::2, :]`) uses
+        # INTERLEAVED, while the scale slicing just above uses contiguous
+        # halves -- but that slicing was only ever paired with the empty
+        # w*_temp buffers, so it was never actually exercised and cannot be
+        # taken as evidence. DSV4_MXFP4_INTERLEAVED=1 selects interleaved for
+        # BOTH weights and scales so the two layouts can be A/B'd against the
+        # reference dumps (pass: L0/05_post_ffn cos -> ~1.0, relL2 -> ~0).
+        w13_packed = layer.w13_weight.data.to("cpu")
+        w2_packed = layer.w2_weight.data.to("cpu")
+        if os.getenv("DSV4_MXFP4_INTERLEAVED") == "1":
+            w1_packed = w13_packed[:, ::2, :]
+            w3_packed = w13_packed[:, 1::2, :]
+            _full_scale = layer.w13_weight_scale.data.to("cpu")
+            w1_scale = _full_scale[:, ::2, :]
+            w3_scale = _full_scale[:, 1::2, :]
+        else:
+            w1_packed = w13_packed[:, :self.intermediate_size, :]
+            w3_packed = w13_packed[:, self.intermediate_size:, :]
+
+        w1_dequant = dequantize_mxfp4_packed(w1_packed,
                                              w1_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
-        w3_dequant = dequantize_mxfp4_packed(layer.w3_temp.data.to("cpu"),
+        w3_dequant = dequantize_mxfp4_packed(w3_packed,
                                              w3_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
-        w2_dequant = dequantize_mxfp4_packed(layer.w2_temp.data.to("cpu"),
+        w2_dequant = dequantize_mxfp4_packed(w2_packed,
                                              w2_scale,
                                              axis=2,
                                              out_dtype=torch.bfloat16)
@@ -571,8 +699,56 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
+        # Stage-by-stage weight magnitudes. The GMM was measured returning
+        # exactly zero on every rank and layer with w13/w2 absmax == 0.0, so
+        # this splits "the checkpoint weights never arrived" from "processing
+        # zeroed them".
+        _wdbg = os.getenv("DSV4_DEBUG_MOE_WEIGHTS") == "1"
+        if _wdbg:
+            logger.info(
+                "[MOE_W] L%s PRE-process w13.shape=%s dtype=%s absmax=%s | "
+                "w2.shape=%s absmax=%s", getattr(layer, "layer_idx", -1),
+                tuple(layer.w13_weight.shape), layer.w13_weight.dtype,
+                float(layer.w13_weight.float().abs().max()),
+                tuple(layer.w2_weight.shape),
+                float(layer.w2_weight.float().abs().max()))
+            # The SCALES are the prime suspect: MXFP4 dequant is
+            # packed * 2^(e8m0 - 127), so an all-zero e8m0 byte yields
+            # 2^-127 = 5.877e-39 and the product underflows to zero.
+            # THE ACTUAL DEQUANT SOURCE. _dequantize_and_pad reads
+            # w1_temp/w3_temp/w2_temp, NOT w13_weight -- so w13_weight being
+            # healthy (absmax 255) says nothing about what gets dequantized.
+            for _tn in ("w1_temp", "w3_temp", "w2_temp"):
+                _tv = getattr(layer, _tn, None)
+                if _tv is None:
+                    logger.info("[MOE_W]   %s = MISSING", _tn)
+                    continue
+                _tf = _tv.float()
+                logger.info(
+                    "[MOE_W]   %s shape=%s dtype=%s absmax=%s "
+                    "nonzero_frac=%.4f", _tn, tuple(_tv.shape), _tv.dtype,
+                    float(_tf.abs().max()), float((_tf != 0).float().mean()))
+            for _sn in ("w13_weight_scale", "w2_weight_scale"):
+                _sv = getattr(layer, _sn, None)
+                if _sv is None:
+                    logger.info("[MOE_W]   %s = MISSING", _sn)
+                    continue
+                _sf = _sv.float()
+                logger.info(
+                    "[MOE_W]   %s shape=%s dtype=%s absmax=%s min=%s "
+                    "nonzero_frac=%.4f uniq<=5=%s", _sn, tuple(_sv.shape),
+                    _sv.dtype, float(_sf.abs().max()), float(_sf.min()),
+                    float((_sf != 0).float().mean()),
+                    _sf.flatten()[:5].tolist())
+
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
+        if _wdbg:
+            logger.info(
+                "[MOE_W] L%s POST-dequant/pad w13_padded absmax=%s "
+                "w2_padded absmax=%s", getattr(layer, "layer_idx", -1),
+                float(w13_weight_padded.float().abs().max()),
+                float(w2_weight_padded.float().abs().max()))
 
         cache_path = _fp4_cache_path(layer, w13_weight_padded.shape,
                                      w2_weight_padded.shape, orig_intermediate,
@@ -616,6 +792,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                         "without it. Point VLLM_FP4_CACHE_DIR at a disk with "
                         "room for ~1GB per layer per rank.", cache_path, exc)
                     tmp.unlink(missing_ok=True)
+
+        if _wdbg:
+            logger.info(
+                "[MOE_W] L%s POST-requant w13_processed absmax=%s "
+                "w2_processed absmax=%s w13_scale absmax=%s",
+                getattr(layer, "layer_idx", -1),
+                float(w13_weight_processed.float().abs().max()),
+                float(w2_weight_processed.float().abs().max()),
+                float(w13_weight_scale.float().abs().max()))
 
         self._cleanup_temp_buffers(layer)
 

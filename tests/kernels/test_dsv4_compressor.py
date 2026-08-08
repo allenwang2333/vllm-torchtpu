@@ -333,6 +333,16 @@ _CASES = [
     (4, True, 12, 3, 2),
     (128, False, 256, 0, 3),
     (128, False, 200, 4, 4),
+    # CSA (compress_ratio=4) had only been tested at seq_len 8 and 12 -- 2-3
+    # compressed rows, all inside the first 16-row state block and far inside
+    # the 128-token sliding window. Those cases cannot detect a wrong
+    # token->row mapping deeper into the sequence, which is exactly where
+    # long-range retrieval fails end to end. 256 tokens -> 64 compressed rows
+    # spanning 16 state blocks; 512 -> 128 rows over 32 blocks, so the state
+    # block table is actually walked.
+    (4, True, 256, 0, 5),
+    (4, True, 512, 0, 6),
+    (4, True, 260, 3, 7),
 ]
 
 

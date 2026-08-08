@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _padding_state: "TokenPaddingState | None" = None
 
@@ -71,6 +75,30 @@ def zero_routing_weights_for_padding(
         is_padding = gathered_padding.ne(0)
     else:
         is_padding = _padding_state.get_local_padding_mask(num_tokens)
+    # DSV4_DEBUG_MOE_PADDING=1 reports how many tokens get their gate zeroed.
+    #
+    # Motivation (2026-08-08): the layer-0 MoE output diverges from the
+    # reference with a very specific signature -- per-token norm ratio
+    # ours/ref median 0.82, min 0.019, max 0.99, i.e. systematically SMALLER,
+    # never larger, and token-dependent. Zeroing a real token's gate here
+    # produces exactly that: the token keeps its expert ids but contributes
+    # nothing. If this mask over-covers (stale from a previous forward, wrong
+    # length, or built for the padded warmup shape), real tokens are silently
+    # dropped from the MoE.
+    #
+    # `docs/old_attempts.md` 2.2 records the ancestor of this mechanism: `-1`
+    # routing sentinels were replaced by `0` and made harmless by forcing their
+    # gate to 0.0. Its correctness depends entirely on the zeroed set being
+    # exactly the padding set -- which has never been asserted anywhere.
+    if os.getenv("DSV4_DEBUG_MOE_PADDING") == "1":
+        _n_pad = int(is_padding.sum())
+        logger.info(
+            "[MOE_PADDING] num_tokens=%d zeroed=%d (%.1f%%) mask_len=%d "
+            "dp_size=%d first16=%s",
+            num_tokens, _n_pad, 100.0 * _n_pad / max(num_tokens, 1),
+            int(is_padding.numel()), dp_size,
+            is_padding[:16].to(torch.int8).tolist())
+
     topk_weights = torch.where(is_padding[:, None],
                                torch.zeros_like(topk_weights), topk_weights)
     return topk_ids, topk_weights

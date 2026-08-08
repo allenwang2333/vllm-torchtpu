@@ -556,6 +556,82 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                  and getattr(self, "head_dim", None) == 512
                  and orig_cache.numel() > 0)
 
+        # `DSV4_DEBUG_GEOM=1` dumps every geometry input to the compressor,
+        # including values we believe we already know. The state-cache slot
+        # mapping wraps (`(positions // state_block_size) %
+        # max_num_state_blocks_per_req`, see the jax path in this file), and
+        # whether that wrap ever fires is a function of numbers none of which
+        # have been measured -- they have only been derived from source. Print
+        # them rather than infer them.
+        if os.getenv("DSV4_DEBUG_GEOM") == "1" and not _is_tracing():
+
+            def _t(x, n=96):
+                if x is None:
+                    return "None"
+                try:
+                    flat = x.flatten()
+                    return (f"shape={tuple(x.shape)} dtype={x.dtype} "
+                            f"vals[:{n}]={flat[:n].tolist()}")
+                except Exception as exc:
+                    return f"<unprintable: {exc}>"
+
+            try:
+                _mns = None
+                for _obj in (getattr(self, "cache_config", None),
+                             getattr(self.state_cache, "cache_config", None)):
+                    _mns = getattr(_obj, "max_num_seqs", None) or _mns
+                if _mns is None:
+                    from vllm.config import get_current_vllm_config
+                    _mns = get_current_vllm_config().scheduler_config.\
+                        max_num_seqs
+                _sbs = getattr(self, "state_block_size", None)
+                _nblk = (state_block_tables.shape[0] // _mns
+                         if state_block_tables is not None and _mns else None)
+                _thresh = (_nblk * _sbs if _nblk and _sbs else None)
+                _pmax = int(positions.max()) if positions.numel() else -1
+                logger.info(
+                    "[DSV4_GEOM] layer=%s\n"
+                    "  positions: %s min=%s max=%s\n"
+                    "  state_block_tables: %s\n"
+                    "  k_block_tables: %s\n"
+                    "  state_seq_lens: %s\n"
+                    "  state_q_start_loc: %s\n"
+                    "  state_req_dist: %s\n"
+                    "  state_block_size=%s k_block_size=%s compress_ratio=%s "
+                    "head_dim=%s max_num_seqs=%s\n"
+                    "  max_num_state_blocks_per_req=%s  WRAP_THRESHOLD=%s  "
+                    "positions.max=%s  WRAPS=%s\n"
+                    "  orig_cache: %s\n"
+                    "  state_cache_tensor: %s  same_ptr=%s",
+                    k_cache_prefix_key,
+                    _t(positions),
+                    int(positions.min()) if positions.numel() else -1,
+                    _pmax,
+                    _t(state_block_tables),
+                    _t(k_block_tables),
+                    _t(state_seq_lens),
+                    _t(state_q_start_loc),
+                    _t(state_req_dist),
+                    _sbs,
+                    getattr(self, "k_block_size", None),
+                    getattr(self, "compress_ratio", None),
+                    getattr(self, "head_dim", None),
+                    _mns,
+                    _nblk,
+                    _thresh,
+                    _pmax,
+                    (_thresh is not None and _pmax >= _thresh),
+                    (f"shape={tuple(orig_cache.shape)} dtype={orig_cache.dtype}"
+                     if orig_cache is not None else "None"),
+                    (f"shape={tuple(state_cache_tensor.shape)}"
+                     if state_cache_tensor is not None else "None"),
+                    (orig_cache is not None and state_cache_tensor is not None
+                     and orig_cache.data_ptr()
+                     == state_cache_tensor.data_ptr()),
+                )
+            except Exception as exc:  # debug only: never fail a run
+                logger.info("[DSV4_GEOM] dump failed: %s", exc)
+
         updated_cache = self.compressor_op(
             kv_score,
             self.ape.clone(),

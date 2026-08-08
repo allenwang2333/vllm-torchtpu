@@ -361,6 +361,56 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                     object.__setattr__(tgt,
                                                        "hash_indices_table",
                                                        tid2eid)
+
+                        # `routed_scaling_factor` must be wired onto the SAME
+                        # object for the same reason, and was not.
+                        #
+                        # moe_routing.select_experts reads it as
+                        # `getattr(layer, "routed_scaling_factor", 1.0)`
+                        # (moe_routing.py:122). Nothing in the DeepSeek-V4 path
+                        # ever set it, so the getattr silently returned 1.0 and
+                        # every routed-expert contribution was missing its
+                        # x1.5 (config.routed_scaling_factor for DSv4-Flash).
+                        # The reference passes it explicitly into FusedMoE with
+                        # apply_routed_scale_to_output=True
+                        # (tpu_inference/.../deepseek_v4.py:180-186).
+                        #
+                        # Measured signature this explains, layer 0 vs the
+                        # reference: MoE input matches (per-token norm ratio
+                        # 1.0017) while MoE output is systematically SMALL --
+                        # ratio median 0.82, max 0.99, min 0.019, never above
+                        # 1. With output = shared + routed instead of
+                        # shared + 1.5*routed, the ratio is ~1 where the routed
+                        # term is negligible, ~0.667 where it dominates, and
+                        # collapses toward 0 for tokens where the two terms
+                        # partially cancel.
+                        # DSV4_FORCE_RSF overrides the config value. Used as a
+                        # sensitivity probe: if scaling every routed gate weight
+                        # by an absurd factor leaves the output bit-identical,
+                        # the gate weights are not modulating expert output at
+                        # all -- i.e. fused_moe_gmm is ignoring topk_weights.
+                        _cfg = (getattr(self, "config", None)
+                                or getattr(self.model, "config", None))
+                        _rsf = getattr(_cfg, "routed_scaling_factor",
+                                       None) if _cfg is not None else None
+                        if os.getenv("DSV4_FORCE_RSF"):
+                            _rsf = float(os.environ["DSV4_FORCE_RSF"])
+                        if _rsf is not None:
+                            runner = l.ffn.experts
+                            for tgt in (runner,
+                                        getattr(runner, "routed_experts",
+                                                None)):
+                                if tgt is not None:
+                                    object.__setattr__(
+                                        tgt, "routed_scaling_factor",
+                                        float(_rsf))
+                                    if (os.getenv("DSV4_DEBUG_MOE_ROUTING")
+                                            == "1" and idx == 0):
+                                        logger.info(
+                                            "[MOE_RSF_WIRE] layer0 set "
+                                            "routed_scaling_factor=%s on %s",
+                                            float(_rsf),
+                                            type(tgt).__name__)
             from vllm.models.deepseek_v4.amd.model import \
                 _make_deepseek_v4_weights_mapper
             quant_config = getattr(vllm_config, "quant_config", None)
@@ -986,8 +1036,20 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         # layer 1's and layer 2's output (see bisection_progress_report.md
         # Iteration 7) -- historically also a recurring trouble spot per
         # earlier sessions' notes.
-        dump = (os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1"
-                and layer_idx in (0, 1, 2) and not is_compiling)
+        # Layers 0-1 are SWA-only (compress_ratio 0) and act as known-good
+        # controls; 2 is the first CSA layer and 3 the first HCA layer. Layer 3
+        # was added 2026-08-08 to match the reference dumper's (0,1,2,3), so the
+        # two trees' dumps diff file-for-file with no gaps.
+        # DSV4_DUMP_LAYERS: "all" (default) or a comma list like "0,1,2,3".
+        # Disk is cheap (~1 GB/tree/step for all 43 layers at 256 tokens) and a
+        # TPU run is ~15 min, so dumping everything once beats rediscovering
+        # which layer mattered one run at a time.
+        _sel = os.getenv("DSV4_DUMP_LAYERS", "all")
+        _want = (True if _sel == "all" else layer_idx
+                 in {int(v)
+                     for v in _sel.split(",") if v.strip()})
+        dump = (os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1" and _want
+                and not is_compiling)
         if not dump:
             return _orig_forward_unfused_post_pre(self, x, positions,
                                                   input_ids, post_mix, res_mix,
@@ -1000,9 +1062,21 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                                                   input_ids, post_mix, res_mix,
                                                   residual)
 
-        if not hasattr(self, "_step_idx"):
-            self._step_idx = 0
-        step = self._step_idx
+        # Dedicated counter, NOT the shared `_step_idx`.
+        #
+        # This dump must advance once per forward pass, or every pass
+        # overwrites step000 and the directory ends up holding only the LAST
+        # decode step -- while the reference's dumper does increment and writes
+        # step000=prefill, step001=decode. Diffing `step000` across the trees
+        # would then compare our decode step against the reference's prefill.
+        #
+        # But `_step_idx` is already owned and incremented by the whole-layer
+        # dump path above (the `layer{NN}_step{NNN}.npy` writer), which also
+        # runs for these layers. Incrementing it here too advanced it twice per
+        # pass, producing steps 000/002/004 against the reference's 000/001.
+        # step000 still lines up (both prefill), but nothing after it does.
+        step = getattr(self, "_sub_dump_step", 0)
+        self._sub_dump_step = step + 1
 
         import numpy as np
         outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"

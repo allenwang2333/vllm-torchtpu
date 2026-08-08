@@ -13,6 +13,8 @@
 # limitations under the License.
 """Routing helpers for TPU local MoE kernels."""
 
+import os
+
 import torch
 
 import vllm_torchtpu.envs as envs
@@ -120,6 +122,12 @@ def select_experts(
     if hash_indices_table is not None and input_ids is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits.float())
         routed_scaling_factor = getattr(layer, "routed_scaling_factor", 1.0)
+        if os.getenv("DSV4_DEBUG_MOE_ROUTING") == "1":
+            logger.info(
+                "[MOE_ROUTE] hash path: layer=%s routed_scaling_factor=%s "
+                "has_attr=%s renormalize=%s",
+                type(layer).__name__, routed_scaling_factor,
+                hasattr(layer, "routed_scaling_factor"), renormalize)
         topk_weights, topk_ids = _hash_moe_select(
             scores,
             hash_indices_table,
