@@ -30,6 +30,10 @@ steps:
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
           - |
+            # NOTE(load-balancing): run_eval_configs.sh splits configs across
+            # parallel workers using modulo math (index % parallelism == job_index).
+            # Heavy 30B+ or multimodal configs MUST be interleaved across indices
+            # (e.g. index 0, 1, 2) to ensure even distribution across all workers.
             bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
               gemma-4-31b-it \
               qwen3-coder-30b-tp8-ep \

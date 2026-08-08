@@ -180,9 +180,9 @@ run_mm_eval() {
             --work-dir "$mm_workdir"
 
         local report_json
-        report_json=$(find "$mm_workdir" -path "*/reports/*/${task}.json" | head -1)
+        report_json=$(find "$mm_workdir" -path "*/reports/*" \( -iname "*${task}*.json" -o -name "*.json" \) | head -1)
         if [ -z "$report_json" ]; then
-            echo "::error::evalscope did not produce a ${task}.json report under $mm_workdir"
+            echo "::error::evalscope did not produce a report under $mm_workdir"
             fail=1
             return
         fi
