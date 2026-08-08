@@ -141,7 +141,7 @@ spec:
                     grep -q "is running" /tmp/raiden_controller.log || { echo "raiden controller failed to start"; cat /tmp/raiden_controller.log; exit 1; }
                     export TPU_RAIDEN_CONTROLLER_ADDRESS="${POD_IP}:27000"
                     export VLLM_HOST_IP="${POD_IP}"
-                    exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=32768 --long-prefill-token-threshold=32768 --max-num-seqs=8 --num-gpu-blocks-override=64 --prefill-context-parallel-size=8 --cp-kv-cache-interleave-size=256 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096,4352],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
+                    exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=32768 --long-prefill-token-threshold=32768 --max-num-seqs=8 --num-gpu-blocks-override=64 --prefill-context-parallel-size=8 --cp-kv-cache-interleave-size=256 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096,5120],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
                 env:
                 - name: POD_IP
                   valueFrom:
@@ -500,7 +500,17 @@ spec:
                       --decoder-port 8000 &
 
                     echo "Waiting for prefill (vllm-service-prefill:8000) and decode (vllm-service-decode:8000) servers..."
+                    # Bounded wait: a server whose engine dies during startup
+                    # can leave its API process (and /health) hanging forever
+                    # (build 63 burned 9h against a zombie prefill). Cold
+                    # compiles finish well inside 3h.
+                    health_tries=0
                     until curl -s http://vllm-service-prefill:8000/health && curl -s http://vllm-service-decode:8000/health; do
+                      health_tries=$((health_tries+1))
+                      if [ "$health_tries" -gt 1080 ]; then
+                        echo "ERROR: servers not healthy after 3h; failing the benchmark."
+                        exit 1
+                      fi
                       echo "Waiting for prefill and decode health checks..."
                       sleep 10
                     done
