@@ -161,58 +161,23 @@ run_mm_eval() {
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
     local mm_limit="${MMMU_LIMIT:-${MM_EVAL_LIMIT:-100}}"
     local mm_concurrency="${MMMU_CONCURRENCY:-1}"
-    local mm_batch_size="${MM_EVAL_BATCH_SIZE:-1}"
 
-    if command -v evalscope &>/dev/null; then
-        local mm_workdir="${RESULTS_DIR}/${task}_evalscope"
-        local evalscope_limit="${MM_EVAL_LIMIT:-4}"
-        echo "Running evalscope for task: $task (limit=$evalscope_limit/subset, eval-batch-size=$mm_batch_size)..."
-        rm -rf "$mm_workdir"
-        evalscope eval \
-            --model "$MODEL" \
-            --eval-type openai_api \
-            --api-url "http://$HOST:$PORT/v1/chat/completions" \
-            --api-key EMPTY \
-            --datasets "$task" \
-            --limit "$evalscope_limit" \
-            --eval-batch-size "$mm_batch_size" \
-            --no-timestamp \
-            --work-dir "$mm_workdir"
+    # NOTE: evalscope is currently bypassed in favor of native run_mmmu_eval.py
+    # to ensure proper multimodal CoT prompt formatting and answer extraction.
+    # Evalscope can be made default in a follow-up PR once its templates/parsers are updated.
+    echo "Running run_mmmu_eval.py for task: $task (limit=$mm_limit, concurrency=$mm_concurrency)..."
+    python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
+        --host "$HOST" \
+        --port "$PORT" \
+        --model "$MODEL" \
+        --dataset "MMMU/MMMU_Pro" \
+        --config "standard (4 options)" \
+        --limit "$mm_limit" \
+        --concurrency "$mm_concurrency" \
+        --allow-synthetic \
+        --results-dir "$RESULTS_DIR"
 
-        local report_json
-        report_json=$(find "$mm_workdir" -path "*/reports/*" \( -iname "*${task}*.json" -o -name "*.json" \) | head -1)
-        if [ -z "$report_json" ]; then
-            echo "::error::evalscope did not produce a report under $mm_workdir"
-            fail=1
-            return
-        fi
-
-        # Translate evalscope's report into check_regression.py's lm-eval-style
-        # results_*.json schema ({"results": {task: {"acc,none": score}}}) so the
-        # existing eval regression/calibrate machinery works unmodified.
-        python3 -c "
-import json
-with open('$report_json') as f:
-    report = json.load(f)
-out = {'results': {'$task': {'acc,none': report['score']}}}
-with open('$RESULTS_DIR/results_${task}.json', 'w') as f:
-    json.dump(out, f, indent=2)
-print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + ')')
-"
-    else
-        echo "Running run_mmmu_eval.py for task: $task (limit=$mm_limit, concurrency=$mm_concurrency)..."
-        python3 scripts/vllm/benchmarking/run_mmmu_eval.py \
-            --host "$HOST" \
-            --port "$PORT" \
-            --model "$MODEL" \
-            --dataset "MMMU/MMMU_Pro" \
-            --config "standard (4 options)" \
-            --limit "$mm_limit" \
-            --concurrency "$mm_concurrency" \
-            --allow-synthetic \
-            --results-dir "$RESULTS_DIR"
-
-        python3 -c "
+    python3 -c "
 import json
 with open('$RESULTS_DIR/mmmu_eval_results.json') as f:
     report = json.load(f)
@@ -223,7 +188,6 @@ with open('$RESULTS_DIR/results_${task}.json', 'w') as f:
     json.dump(out, f, indent=2)
 print('$task: score=' + str(acc_ratio) + ' (samples=' + str(report.get('samples', 0)) + ')')
 "
-    fi
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
