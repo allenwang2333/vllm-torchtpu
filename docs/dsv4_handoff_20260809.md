@@ -55,8 +55,39 @@ Reading: batch 1→32 is nearly free (23x throughput for 39% more wall), so the
 `max_num_seqs`**, not a per-step kernel cost. It saturates after ~32 (32→128
 buys 1.36x for 3x the wall), so past that the model is genuinely compute-bound.
 
-**Whether 22 tok/s is good is unknown** — the reference comparison had not
-finished at handoff time. See §4.
+### Reference comparison (2026-08-09)
+
+`tpu-inference/perf_offline_ref.py`, identical parameters, same node:
+
+| batch | ours decode tok/s | reference decode tok/s | gap |
+|---|---|---|---|
+| 1 | 0.71 | 1.24 | 1.75x |
+| 8 | 5.25 | 9.95 | 1.90x |
+| 32 | 16.29 | 34.48 | 2.12x |
+| 128 | 22.18 | 92.20 | **4.16x** |
+| scaling b1 -> b128 | 31.3x | **74.2x** | — |
+
+Total throughput at batch 128: **200 tok/s ours vs 830 tok/s reference**.
+Reference wall time barely moves (51.5 s at batch 1 -> 88.9 s at 128); ours
+grows 4x (90 s -> 369 s).
+
+**The gap is a scaling failure, not a constant factor.** ~1.8x at batch 1 looks
+like fixed per-step overhead, but the reference keeps scaling to 128 while we
+flatten after ~32. Something in our path grows with batch where theirs does
+not. That is the thing to profile next, and it is worth more than any of the
+remaining correctness items for a production story.
+
+**Confound, and it cannot be removed:** the reference refuses to run MLA
+without DP attention (hard config validation -- see §4.2), so this is
+ours-TP-only against theirs-DP-on. DP attention plausibly explains part of the
+scaling difference (with `num_kv_heads=1`, TP cannot shard KV, so every rank of
+ours holds the whole KV while each of theirs holds ~1/8), but nothing here
+proves that, and a profile could just as easily land on the MoE/GMM path.
+Do not quote "4x" as a clean like-for-like result.
+
+Both numbers include a low-batch artifact: at batch 1 *both* implementations
+are ~1 tok/s, because a graph compiled for `max_num_seqs` runs one real
+sequence. That is not a defect unique to this repo.
 
 ## 3. Verified vs not
 
@@ -72,29 +103,44 @@ worthless here.
 
 ## 4. Open items, in priority order
 
-1. **MMLU-Pro accuracy.** `scripts/dsv4/run_mmlu_pro.sh` works end-to-end
-   (requests answered, harness preflighted). The reference ran a **10% subset**
+1. **MMLU-Pro accuracy.** The original ask, still unanswered.
+   `scripts/dsv4/run_mmlu_pro.sh` works end to end (requests answered, harness
+   preflighted). The reference ran a **10% subset**
    (`ds_v4_flash_mmlu_pro_10pct_fixed`), so use `LIMIT=0.1` for comparability:
    ~1,200 questions, ~3 h at current throughput. The full 12,032 would be ~30 h.
-2. **Reference perf comparison.** `tpu-inference/perf_offline_ref.py` mirrors
-   ours exactly. NOTE: the reference **refuses to run MLA without DP
-   attention** (hard config validation), so there is no TP-only reference row —
-   every ours-vs-theirs comparison is confounded by DP attention. Say so
-   whenever quoting one.
+   Run the needle control at *this* config alongside it, or the number cannot
+   be interpreted (§3).
+
+2. **Profile the batch-128 scaling gap.** We flatten after batch ~32 while the
+   reference scales to 128 — 4.16x apart at 128 (§2). For a production story
+   this outranks everything below, and it decides item 4: profile one decode
+   step at batch 128 and find whether the time sits in attention (KV-bound, so
+   DP attention would help) or in the MoE/GMM path (it would not).
+
 3. **Residual over-allocation.** We still plan 54.48 GiB against vLLM's
    44.28 GiB budget (1.23x). It fits in physical HBM so it serves, but the
    accounting still disagrees and headroom is thinner than the config implies.
-4. **vLLM's DSv4 KV budget check over-estimates ~62x** (`_max_memory_usage_bytes_from_groups`,
-   the `UniformTypeKVCacheSpecs` branch: every group billed the *global* max
-   layer-tuple count). Measured at two context lengths. This forces
-   `gpu_memory_utilization=0.67` where the reference uses 0.4. Worth an upstream
-   report; details in `dsv4_mmlu_pro_bringup.md` Finding 1.
-5. **DP attention.** Not implemented here (`dp_attention` appears nowhere in
+   The `DSV4_DUMP_KV_PLAN=1` PLAN lines report this ratio directly.
+
+4. **DP attention.** Not implemented here (`dp_attention` appears nowhere in
    `src/`). Estimate: ~1 week for a correctness prototype, 2–4 weeks
    production, with the risk concentrated in DSv4's custom caches (SWA overlay,
-   compressor aliasing) which all assume replicated KV. **Profile a decode step
-   before committing to this** — it only helps if the batch-32 saturation is
-   KV-memory bound rather than MoE/GMM bound.
+   compressor aliasing) which all assume replicated KV. **Do item 2 first** —
+   this only pays off if the saturation is KV-bound.
+
+5. **vLLM's DSv4 KV budget check over-estimates ~62x**
+   (`_max_memory_usage_bytes_from_groups`, the `UniformTypeKVCacheSpecs`
+   branch: every group billed the *global* max layer-tuple count). Measured at
+   two context lengths. Forces `gpu_memory_utilization=0.67` where the
+   reference uses 0.4. Worth an upstream report; details in
+   `dsv4_mmlu_pro_bringup.md` Finding 1.
+
+6. **Consider a CPU-only parity test against the reference's allocation plan.**
+   Three bugs now (this one, the `is_unused` cache-spec bug, the SWA overlay)
+   were silent divergences from `tpu_inference/runner/kv_cache_manager.py`.
+   Their spec/shape/alias decisions and ours can be computed and diffed without
+   a TPU, turning that whole class from "a 14-minute run dies" into a failing
+   unit test.
 
 ## 5. How to run
 
