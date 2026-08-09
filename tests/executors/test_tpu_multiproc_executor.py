@@ -121,3 +121,46 @@ def test_no_override_when_workers_return_none(mock_super):
 
     assert specs is _SPECS
     assert executor.vllm_config.cache_config.num_gpu_blocks_override is None
+
+
+def _make_ray_executor(engine_override, worker_overrides):
+    """Same shape as _make_executor but for the Ray multi-host executor."""
+    from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
+        RayDistributedExecutorV2
+    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    executor.vllm_config = MagicMock()
+    executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
+    executor.vllm_config.cache_config.num_gpu_blocks_override = engine_override
+    executor.collective_rpc = MagicMock(return_value=worker_overrides)
+    return executor
+
+
+def test_ray_executor_tolerates_measurement_jitter():
+    """Regression for dev build 155: the Ray multi-host executor demanded
+    EXACT agreement (assert len(set(overrides)) == 1) while the multiproc
+    executor already tolerated jitter. Kimi-K3 at TP=32 landed 6456..6459
+    (~14 MiB blocks, a 3-block spread from per-worker HBM measurement) and
+    the whole engine start died on the bare assert."""
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+    observed = [6459, 6456] * 16
+    executor = _make_ray_executor(engine_override=None,
+                                  worker_overrides=observed)
+    with patch.object(RayExecutorV2, "get_kv_cache_specs",
+                      return_value=_SPECS):
+        specs = executor.get_kv_cache_specs()
+
+    assert specs is _SPECS
+    # Smallest budget wins, so no worker is asked for more than it measured.
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 6456
+
+
+def test_ray_executor_raises_on_real_disagreement():
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+    executor = _make_ray_executor(engine_override=None,
+                                  worker_overrides=[6456, 8000] * 16)
+    with patch.object(RayExecutorV2, "get_kv_cache_specs",
+                      return_value=_SPECS):
+        with pytest.raises(ValueError, match="workers disagree"):
+            executor.get_kv_cache_specs()
