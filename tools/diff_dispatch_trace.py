@@ -78,16 +78,30 @@ def main():
         print(f"No divergence in the first {shortest} events "
               "(traces agree up to the shortest rank).")
         lengths = {n: len(r) for n, r in traces.items()}
-        if len(set(lengths.values())) > 1:
-            print("\nBut the traces are DIFFERENT LENGTHS — the short ranks "
-                  "stopped dispatching first:")
-            for n, ln in sorted(lengths.items(), key=lambda kv: kv[1]):
-                print(f"  {n}: {ln}")
-            print(f"\nLast events after position {shortest - 1}:")
-            for n, rows in traces.items():
-                if len(rows) > shortest:
-                    nxt = rows[shortest]
-                    print(f"  {n}: {nxt[2]}  {nxt[3]}")
+        if len(set(lengths.values())) == 1:
+            return
+
+        print("\nBut the traces are DIFFERENT LENGTHS — the short ranks "
+              "stopped dispatching first:")
+        for n, ln in sorted(lengths.items(), key=lambda kv: kv[1]):
+            print(f"  {n}: {ln}")
+
+        # The last events the SHORT ranks managed to dispatch. This is the
+        # point they stalled at, and with an identical prefix it is the only
+        # thing the trace can still tell us about where they died — so print
+        # it rather than only the events the long ranks went on to make.
+        print(f"\nLast {args.context} common events "
+              f"(where the short ranks stopped):")
+        for i in range(max(0, shortest - args.context), shortest):
+            print(f"  [{i}] {base[i][2]:<28} {base[i][3]}")
+
+        print(f"\nEvents only the long ranks reached "
+              f"(from position {shortest}):")
+        for n, rows in traces.items():
+            if len(rows) > shortest:
+                extra = " | ".join(f"{r[2]} {r[3]}".strip()
+                                   for r in rows[shortest:])
+                print(f"  {n}: {extra}")
         return
 
     lo = max(0, diverged_at - args.context)
