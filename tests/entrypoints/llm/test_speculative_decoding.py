@@ -131,7 +131,7 @@ def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
 
 def _make_sampling_config(temperature: float = 0) -> SamplingParams:
     return SamplingParams(temperature=temperature,
-                          max_tokens=16,
+                          max_tokens=200,
                           ignore_eos=True,
                           repetition_penalty=1,
                           frequency_penalty=0,
