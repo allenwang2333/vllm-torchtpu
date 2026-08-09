@@ -73,12 +73,20 @@ def main():
         f"gen_tokens={GEN_TOKENS} max_num_seqs={MAX_SEQS}",
         flush=True)
 
-    print("[PERF] warmup (excluded from results)", flush=True)
-    llm.generate([prompt], params)
-
     rows = []
     for batch in BATCHES:
         prompts = [prompt] * batch
+        # Warm up EVERY batch size, not just the first. A single batch-1 warmup
+        # leaves each later size paying its own one-time costs inside the timed
+        # region. Both this stack and tpu-inference happen to compile their
+        # shape buckets at startup (verified: zero compile events after warmup
+        # in either log), so this was not corrupting results -- but that is a
+        # property of the current `compile_sizes`, not of the measurement, and
+        # a benchmark should not depend on it.
+        print(f"[PERF] warmup batch={batch} (excluded from results)",
+              flush=True)
+        llm.generate(prompts, params)
+
         t0 = time.perf_counter()
         outs = llm.generate(prompts, params)
         elapsed = time.perf_counter() - t0
