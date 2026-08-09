@@ -59,15 +59,24 @@ buys 1.36x for 3x the wall), so past that the model is genuinely compute-bound.
 
 `tpu-inference/perf_offline_ref.py`, identical parameters, same node:
 
-| batch | ours decode tok/s | reference decode tok/s | gap |
-|---|---|---|---|
-| 1 | 0.71 | 1.24 | 1.75x |
-| 8 | 5.25 | 9.95 | 1.90x |
-| 32 | 16.29 | 34.48 | 2.12x |
-| 128 | 22.18 | 92.20 | **4.16x** |
-| scaling b1 -> b128 | 31.3x | **74.2x** | — |
+| batch | ours (first) | ours (after sync fix) | reference | gap now |
+|---|---|---|---|---|
+| 1 | 0.71 | 0.98 | 1.24 | 1.27x |
+| 8 | 5.25 | 6.85 | 9.95 | 1.45x |
+| 32 | 16.29 | 20.35 | 34.48 | 1.69x |
+| 128 | 22.18 | 27.59 | 92.20 | **3.34x** |
+| scaling b1 -> b128 | 31.3x | 28.3x | **74.2x** | — |
 
-Total throughput at batch 128: **200 tok/s ours vs 830 tok/s reference**.
+The "after" column is commit `36edb800`, which removed two per-step host
+syncs (an ungated NaN `.item()` on all 43 attention layers and a `data_ptr()`
+assert on all 41 compressor layers). Worth ~1.24-1.37x across the board. The
+saving is not fixed overhead -- ~0.39 s/step at batches 1-32 but ~1.13 s/step
+at 128 -- because a sync makes the host wait on the entire pending graph, so
+lost pipelining grows with work in flight.
+
+**It did not fix the scaling failure**, which is the point below.
+
+Total throughput at batch 128: **248 tok/s ours vs 830 tok/s reference** (200 before the sync fix).
 Reference wall time barely moves (51.5 s at batch 1 -> 88.9 s at 128); ours
 grows 4x (90 s -> 369 s).
 
@@ -112,7 +121,7 @@ worthless here.
    be interpreted (§3).
 
 2. **Profile the batch-128 scaling gap.** We flatten after batch ~32 while the
-   reference scales to 128 — 4.16x apart at 128 (§2). For a production story
+   reference scales to 128 — 3.34x apart at 128 (§2). For a production story
    this outranks everything below, and it decides item 4: profile one decode
    step at batch 128 and find whether the time sits in attention (KV-bound, so
    DP attention would help) or in the MoE/GMM path (it would not).
