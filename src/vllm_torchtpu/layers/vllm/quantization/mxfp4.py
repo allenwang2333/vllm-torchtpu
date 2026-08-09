@@ -69,6 +69,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.common import quant_weight_cache
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
@@ -306,6 +307,53 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
                           if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
 
+# --- Development-only on-disk requantization cache -------------------------
+#
+# Re-quantizing the MoE weights costs ~10 minutes of every run, which dominates
+# iteration time when bringing a model up. The mechanism is generic and lives
+# in `layers/common/quant_weight_cache.py`; this only supplies the key. Unset
+# `VLLM_QUANT_WEIGHT_CACHE_DIR` (the default) and it is inert, so production
+# and CI behave exactly as before.
+#
+# The KEY is the important part. An earlier version keyed only on rank and
+# tensor shapes, so a cache built under one requantization config was silently
+# reused by a run expecting another -- a documented cause of garbage output
+# (`docs/dsv4_handoff_20260806.md` section 7c). Every input that changes the
+# produced weights goes into the key below.
+
+_FP4_CACHE_NAMESPACE = "dsv4_mxfp4"
+
+
+def _fp4_cache_key(layer, w13_shape, w2_shape, orig_intermediate: int,
+                   activation_str: str, rhs_quant_dtype) -> dict:
+    try:
+        rank = torch.distributed.get_rank(
+        ) if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = 0
+    return {
+        "layer":
+        getattr(layer, "layer_name", None) or "unknown",
+        "rank":
+        rank,
+        "w13_shape":
+        tuple(w13_shape),
+        "w2_shape":
+        tuple(w2_shape),
+        "orig_intermediate":
+        orig_intermediate,
+        "w13_block_size":
+        REQUANTIZED_BLOCK_SIZE,
+        "w2_block_size":
+        min(REQUANTIZED_BLOCK_SIZE, orig_intermediate),
+        "weight_dtype": (envs.MOE_REQUANTIZE_WEIGHT_DTYPE if hasattr(
+            envs, "MOE_REQUANTIZE_WEIGHT_DTYPE") else None),
+        "activation":
+        activation_str,
+        "rhs_quant_dtype":
+        str(rhs_quant_dtype),
+    }
+
 
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
@@ -447,9 +495,29 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
-        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-         w2_weight_scale) = self._requantize_native_fp4(
-             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+
+        cache_key = _fp4_cache_key(layer, w13_weight_padded.shape,
+                                   w2_weight_padded.shape, orig_intermediate,
+                                   activation_str, self.rhs_quant_dtype)
+        cache_file = quant_weight_cache.cache_path(_FP4_CACHE_NAMESPACE,
+                                                   cache_key)
+        cached = quant_weight_cache.load(cache_file, cache_key, device=device)
+
+        if cached is not None:
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale) = cached
+        else:
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale) = self._requantize_native_fp4(
+                 w13_weight_padded, w2_weight_padded, orig_intermediate,
+                 device)
+            quant_weight_cache.save(cache_file, cache_key, [
+                w13_weight_processed,
+                w2_weight_processed,
+                w13_weight_scale,
+                w2_weight_scale,
+            ])
+
         self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
