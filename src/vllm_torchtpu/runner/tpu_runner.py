@@ -4553,6 +4553,15 @@ class TPUModelRunner(GPUModelRunner):
                 }
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
+                # Debug: drain the device queue every warmup step. The hang
+                # wedges the device with all host threads futex-parked in
+                # AwaitBuffer; draining per step bounds the queue to one
+                # step's programs, so the step that wedges is the step the
+                # sync hangs in — or, if the wedge needs cross-step queue
+                # depth to trigger, the hang disappears, which is itself the
+                # answer (fusion-grouping divergence across ranks).
+                if os.environ.get("VLLM_TPU_WARMUP_STEP_SYNC") == "1":
+                    torch.tpu.synchronize()
                 d = self.take_draft_token_ids()
                 if d and d.draft_token_ids:
                     cur = d.draft_token_ids[0]
