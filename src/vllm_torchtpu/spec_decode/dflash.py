@@ -85,6 +85,13 @@ class DFlashProposer:
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[int, tuple[torch.Tensor,
                                                          torch.Tensor]] = {}
+        # Shape keys the fused update-KV-and-propose program was precompiled
+        # for: (aux_hidden_len, draft_padded_len, kv_md_num_reqs,
+        # kv_md_block_table_len). propose() only takes the fused path on a
+        # registered key, so a shape the precompile never saw falls back to
+        # the split programs instead of compiling mid-serving.
+        self._fused_propose_shapes: set[tuple[int, int, int, int]] = set()
+        self._fused_miss_logged: set[tuple[int, int, int, int]] = set()
 
     def _get_static_attn_tensors(
             self, padded_num_reqs: int,
@@ -317,17 +324,13 @@ class DFlashProposer:
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
-    def _update_draft_kv_cache_from_target(self, chunk) -> None:
-        """
-        Projects the target model's hidden states into the draft model's KV cache.
-
-        This allows the draft model to maintain context without needing to run a full
-        forward pass on the tokens that were just verified by the target model.
-        It applies RoPE to the target's hidden states and scatters the tokens directly
-        into the draft KV cache.
-        """
+    def _prepare_kv_update_inputs(
+        self, chunk
+    ) -> tuple[torch.Tensor | tuple | list, torch.Tensor, tuple] | None:
+        """Host-side inputs for the draft KV update, or None without aux
+        hidden states: (target_hidden, positions, draft_md_tuple)."""
         if chunk.aux_hidden_states is None:
-            return
+            return None
 
         target_hidden = chunk.aux_hidden_states
         aux_hidden = target_hidden[0] if isinstance(target_hidden,
@@ -340,6 +343,24 @@ class DFlashProposer:
             positions = positions[0]
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
+        return target_hidden, positions, draft_md_tuple
+
+    def _update_draft_kv_cache_from_target(self, chunk) -> None:
+        """
+        Projects the target model's hidden states into the draft model's KV cache.
+
+        This allows the draft model to maintain context without needing to run a full
+        forward pass on the tokens that were just verified by the target model.
+        It applies RoPE to the target's hidden states and scatters the tokens directly
+        into the draft KV cache.
+
+        Split-path only: the propose loop fuses this into
+        `_tpu_update_kv_and_propose` whenever the chunk's shape allows.
+        """
+        kv_inputs = self._prepare_kv_update_inputs(chunk)
+        if kv_inputs is None:
+            return
+        target_hidden, positions, draft_md_tuple = kv_inputs
 
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             self._tpu_precompute_and_update_kv_cache(target_hidden, positions,
@@ -378,12 +399,17 @@ class DFlashProposer:
         K = self.speculative_config.num_speculative_tokens
         block_size = K + 1
 
-        # 1. Hoist all KV cache updates across chunks to the top of propose
-        for chunk in chunks:
-            with set_vllm_model_wrapper_context(mesh=None):
-                self._update_draft_kv_cache_from_target(chunk)
-
-        # 2. Process each chunk
+        # Per chunk: draft KV update + draft forward, in ONE compiled program
+        # whenever the chunk's shape allows (see _tpu_update_kv_and_propose —
+        # every additional program aliasing the unified pool adds ownership
+        # hand-offs to the runtime's deferred-execution bookkeeping, which is
+        # where the observed hangs live). A verify chunk's aux hidden states
+        # carry the same token bucket as the draft input, so the fused
+        # program serves the whole decode steady state; prefill/mixed chunks
+        # (target bucket != draft bucket) fall back to the split programs,
+        # which stay precompiled. Chunks cover disjoint requests, so
+        # interleaving update_i/forward_i is equivalent to the old
+        # hoist-all-updates-first order.
         draft_logits_per_chunk = []
         for i, chunk in enumerate(chunks):
             next_tokens_device = next_tokens_per_chunk[
@@ -396,13 +422,40 @@ class DFlashProposer:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 chunk, padded_len, seq_lens)
 
+            kv_inputs = self._prepare_kv_update_inputs(chunk)
+            use_fused = False
+            if kv_inputs is not None:
+                aux = (kv_inputs[0][0] if isinstance(kv_inputs[0],
+                                                     (list, tuple)) else
+                       kv_inputs[0])
+                md0 = kv_inputs[2][0]
+                key = (int(aux.shape[0]), padded_len,
+                       int(md0.seq_lens.shape[0]),
+                       int(md0.block_tables.shape[0]))
+                use_fused = key in self._fused_propose_shapes
+                if not use_fused and key not in self._fused_miss_logged:
+                    self._fused_miss_logged.add(key)
+                    logger.info(
+                        "DFlash fused propose miss for shape %s "
+                        "(aux_len, draft_len, md_reqs, md_bt_len); "
+                        "using split programs for it.", key)
+
             with (
                     set_forward_context(draft_attn_metadata, self.vllm_config,
                                         0),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size)
+                if use_fused:
+                    draft_tokens_chunk, _ = self._tpu_update_kv_and_propose(
+                        kv_inputs[0], kv_inputs[1], kv_inputs[2], input_ids,
+                        positions, block_size)
+                else:
+                    # Split fallback: precompiled programs, previous behavior.
+                    if kv_inputs is not None:
+                        self._tpu_precompute_and_update_kv_cache(
+                            kv_inputs[0], kv_inputs[1], kv_inputs[2])
+                    draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                        input_ids, positions, block_size)
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
 
@@ -474,13 +527,61 @@ class DFlashProposer:
                         use_max_model_len=False,
                     )
 
-    def _dummy_precompute_and_update_kv_cache(
+        # Fused update-KV-and-propose warms, for the decode steady state.
+        # A verify chunk with R real requests produces: aux hidden states at
+        # the token bucket of R*block_size (same _get_padded_len ladder), a
+        # draft input at that same bucket, and a KV metadata built at the
+        # target's request bucket for R. Enumerate R and warm each distinct
+        # combination so propose() never compiles the fused program
+        # mid-serving; any live shape outside this set (prefill/mixed
+        # chunks) falls back to the split programs warmed above.
+        with runner._precompile_timed("drafter fused propose"):
+            seen: set[tuple[int, int]] = set()
+            for r in range(1, runner.num_reqs_max_model_len + 1):
+                t = self._get_padded_len(r * block_size)
+                if t > max_draft_tokens:
+                    break
+                q = min(
+                    (p for p in runner.num_reqs_paddings if p >= r),
+                    default=runner.num_reqs_max_model_len)
+                if (t, q) in seen:
+                    continue
+                seen.add((t, q))
+                self._dummy_draft_forward(
+                    num_tokens=t,
+                    num_reqs=runner.num_reqs_max_model_len,
+                    use_max_model_len=True,
+                    kv_inputs=self._build_dummy_kv_update_inputs(
+                        num_tokens=t,
+                        hidden_dim=hidden_dim,
+                        dtype=dtype,
+                        num_reqs=q,
+                    ),
+                )
+                if runner.most_model_len is not None:
+                    self._dummy_draft_forward(
+                        num_tokens=t,
+                        num_reqs=runner.num_reqs_most_model_len,
+                        use_max_model_len=False,
+                        kv_inputs=self._build_dummy_kv_update_inputs(
+                            num_tokens=t,
+                            hidden_dim=hidden_dim,
+                            dtype=dtype,
+                            num_reqs=q,
+                            num_blocks=runner.num_blocks_per_most_len_req,
+                        ),
+                    )
+
+    def _build_dummy_kv_update_inputs(
         self,
         num_tokens: int,
         hidden_dim: int,
         dtype: torch.dtype,
         num_reqs: int,
-    ) -> None:
+        num_blocks: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
+        """Dummy (hidden, positions, md_tuple) matching the live KV-update
+        shapes for `num_tokens`, shared by the split and fused precompiles."""
         runner = self.runner
         dummy_hidden = torch.zeros((num_tokens, hidden_dim),
                                    dtype=dtype,
@@ -490,7 +591,8 @@ class DFlashProposer:
                                       device=runner.device)
 
         # Build a safe dummy AttentionMetadata matching the exact padded_num_reqs shape
-        num_blocks = runner.max_num_blocks_per_req
+        if num_blocks is None:
+            num_blocks = runner.max_num_blocks_per_req
         block_tables = torch.zeros((num_reqs * num_blocks, ),
                                    dtype=torch.int32,
                                    device=runner.device)
@@ -515,12 +617,24 @@ class DFlashProposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
+        md_tuple = tuple([dummy_attn_metadata] *
+                         len(self.draft_model.model.layers))
+        return dummy_hidden, dummy_positions, md_tuple
 
+    def _dummy_precompute_and_update_kv_cache(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        num_reqs: int,
+    ) -> None:
+        runner = self.runner
+        dummy_hidden, dummy_positions, md_tuple = (
+            self._build_dummy_kv_update_inputs(num_tokens, hidden_dim, dtype,
+                                               num_reqs))
         with set_vllm_model_wrapper_context(mesh=runner.mesh):
             out = self._tpu_precompute_and_update_kv_cache(
-                dummy_hidden, dummy_positions,
-                tuple([dummy_attn_metadata] *
-                      len(self.draft_model.model.layers)))
+                dummy_hidden, dummy_positions, md_tuple)
             sync.synchronize(out, wait=True)
 
     def _dummy_draft_forward(
@@ -528,6 +642,7 @@ class DFlashProposer:
         num_tokens: int,
         num_reqs: int,
         use_max_model_len: bool,
+        kv_inputs: tuple | None = None,
     ) -> None:
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
@@ -602,15 +717,29 @@ class DFlashProposer:
                                         self.vllm_config, 0),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh, ),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size)
-                sync.synchronize(draft_tokens_chunk, wait=True)
+                if kv_inputs is not None:
+                    # Fused update-KV-and-propose program, same call the
+                    # live propose path makes for verify chunks. Register
+                    # the pair only after the compile lands, so propose
+                    # never routes a shape to a program that wasn't built.
+                    dummy_hidden, dummy_kv_positions, md_tuple = kv_inputs
+                    draft_tokens_chunk, _ = self._tpu_update_kv_and_propose(
+                        dummy_hidden, dummy_kv_positions, md_tuple, input_ids,
+                        positions, block_size)
+                    sync.synchronize(draft_tokens_chunk, wait=True)
+                    self._fused_propose_shapes.add(
+                        (int(dummy_hidden.shape[0]), num_tokens,
+                         int(md_tuple[0].seq_lens.shape[0]),
+                         int(md_tuple[0].block_tables.shape[0])))
+                else:
+                    draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                        input_ids, positions, block_size)
+                    sync.synchronize(draft_tokens_chunk, wait=True)
 
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _tpu_precompute_and_update_kv_cache(
+    def _update_kv_cache_body(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
         | torch.Tensor,
@@ -704,13 +833,61 @@ class DFlashProposer:
         return hidden_states
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _tpu_precompute_and_update_kv_cache(
+        self,
+        hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
+        | torch.Tensor,
+        positions: torch.Tensor,
+        draft_md_tuple: tuple["AttentionMetadata", ...],
+    ) -> torch.Tensor:
+        """Split-path KV update. Kept for chunks the fused program cannot
+        serve (prefill/mixed chunks, whose target-bucket size differs from
+        the draft bucket) and for their precompile."""
+        return self._update_kv_cache_body(hidden_states, positions,
+                                          draft_md_tuple)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _tpu_update_kv_and_propose(
+        self,
+        hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor]
+        | torch.Tensor,
+        kv_positions: torch.Tensor,
+        draft_md_tuple: tuple["AttentionMetadata", ...],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One compiled program: draft KV update + draft forward + sampling.
+
+        Fusing the two halves matters beyond fusion wins: the KV update and
+        the draft forward each mutate the same raw unified-pool buffers the
+        target's graph mutates, and every additional independently-compiled
+        program aliasing that pool adds ownership hand-offs to the runtime's
+        deferred-execution bookkeeping. Observed hangs (all ranks
+        futex-parked in AwaitBuffer at 0% CPU) anchor at the boundary
+        between these two programs; one program means one hand-off.
+        """
+        self._update_kv_cache_body(hidden_states, kv_positions,
+                                   draft_md_tuple)
+        return self._forward_and_sample_body(input_ids, positions, block_size)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compiled XLA graph for DFlash backbone forward pass and greedy sampling.
+        """Split-path draft forward; see `_tpu_update_kv_and_propose`."""
+        return self._forward_and_sample_body(input_ids, positions, block_size)
+
+    def _forward_and_sample_body(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DFlash backbone forward pass and greedy sampling.
 
         Performs:
           1. Backbone model forward pass on input_ids and positions.

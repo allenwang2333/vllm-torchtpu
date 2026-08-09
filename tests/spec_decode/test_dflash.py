@@ -332,7 +332,8 @@ def test_propose_unit(device):
         return_value=(torch.zeros(8, dtype=torch.int32, device=device),
                       torch.zeros(8, dtype=torch.int32, device=device),
                       torch.zeros(2, dtype=torch.int32, device=device)))
-    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    # No aux hidden states -> propose takes the split forward-only path.
+    proposer._prepare_kv_update_inputs = mock.MagicMock(return_value=None)
 
     logits = torch.zeros((8, 1000), dtype=torch.float32, device=device)
     logits[1, 500] = 100.0
@@ -359,7 +360,7 @@ def test_propose_unit(device):
 
     assert draft_tokens == [[500, 501, 502], [600, 601, 602]]
     proposer._prepare_dflash_inputs.assert_called_once()
-    proposer._update_draft_kv_cache_from_target.assert_called_once()
+    proposer._prepare_kv_update_inputs.assert_called_once()
     proposer._dflash_forward_and_sample.assert_called_once()
 
 
