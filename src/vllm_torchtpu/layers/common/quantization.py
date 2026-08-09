@@ -265,8 +265,9 @@ def quantize_tensor(
         # trusting it. An all-zero block gives log2(0) = -inf: exp2(-inf) == 0
         # is not < 0, so it falls through to the clamp, which pins it to the
         # smallest representable exponent.
-        scale_exp = torch.where(torch.exp2(scale_exp) < scale, scale_exp + 1,
-                                scale_exp).clamp(E8M0_MIN_EXP, E8M0_MAX_EXP)
+        scale_exp = torch.where(
+            torch.exp2(scale_exp) < scale, scale_exp + 1,
+            scale_exp).clamp(E8M0_MIN_EXP, E8M0_MAX_EXP)
         scale = torch.exp2(scale_exp)
         # Keep the biased exponent byte, not the power of two itself. This is
         # the exact inverse of `e8m0_to_fp32`, and the clamp above already

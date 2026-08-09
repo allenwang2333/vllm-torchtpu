@@ -13,7 +13,6 @@
 # limitations under the License.
 """Tests for the UE8M0 (power-of-two) block scales in `quantize_tensor`."""
 
-import pytest
 import torch
 
 from vllm_torchtpu.layers.common.quantization import (e8m0_to_fp32,
@@ -51,8 +50,8 @@ def test_dequantized_values_are_close(device):
     tensor = torch.randn(16, 512, device=device, dtype=torch.bfloat16) * 3.0
 
     quantized, scale = _quantize_ue8m0(tensor, block_size=128)
-    dequantized = quantized.float().reshape(16, 4, 128) * e8m0_to_fp32(
-        scale).unsqueeze(-1)
+    dequantized = quantized.float().reshape(
+        16, 4, 128) * e8m0_to_fp32(scale).unsqueeze(-1)
     dequantized = dequantized.reshape(16, 512)
 
     # A ue8m0 scale wastes up to one octave of fp8 range, so the relative

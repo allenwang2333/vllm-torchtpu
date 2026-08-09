@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from vllm_torchtpu.layers.common import attention_interface
+from vllm_torchtpu.layers.common import attention_interface, utils
 
 LKV_DIM = 512
 ROPE_DIM = 64
@@ -292,7 +292,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         self._check(output, expected, valid)
 
 
-class UpdateKvCacheSlotsTest(parameterized.TestCase):
+class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
     """Insert-layout unit test; pure jnp scatter, runs on CPU too."""
 
     def test_rows_land_at_page_slot(self):
@@ -307,7 +307,7 @@ class UpdateKvCacheSlotsTest(parameterized.TestCase):
         block_tables[0, :2] = [5, 2]
         block_tables[1, 0] = 9
 
-        cache = attention_interface._update_sparse_mla_kv_cache(
+        cache = utils.update_sparse_mla_kv_cache(
             jnp.zeros((TOTAL_PAGES, PAGE_SIZE // 4, 4, 640),
                       jnp.float8_e4m3fn), kv_c, k_pe,
             jnp.asarray(seq_lens, jnp.int32),
@@ -328,3 +328,41 @@ class UpdateKvCacheSlotsTest(parameterized.TestCase):
                                           expected[token])
             touched[page, slot] = True
         self.assertEqual(int(np.count_nonzero(rows[~touched])), 0)
+
+
+class RepackSparseMlaCacheTest(parameterized.TestCase):
+    """Repack-layout unit test; pure jnp bitcasts, runs on CPU too."""
+
+    @parameterized.parameters(1.0, 1.5)
+    def test_nope_bytes_and_rope_planes(self, dequant_scale):
+        pages, page_size, padded_row = 3, 8, 640
+        rng = np.random.default_rng(0)
+        cache = jnp.asarray(
+            rng.standard_normal((pages, page_size // 4, 4, padded_row)),
+            jnp.float8_e4m3fn)
+
+        nope_u8, rope_u8 = utils.repack_sparse_mla_cache(
+            cache, LKV_DIM, ROPE_DIM, dequant_scale)
+
+        # Shapes carry the (4, 128) tiling contract csa_gather asserts.
+        self.assertEqual(nope_u8.shape, (pages, page_size, 4, 128))
+        self.assertEqual(rope_u8.shape, (pages, page_size // 4, 4, 128))
+
+        flat = cache.reshape(pages, page_size, padded_row)
+
+        # Nope must be a byte-exact bitcast of the fp8 latents.
+        np.testing.assert_array_equal(
+            np.asarray(nope_u8).reshape(pages, page_size, LKV_DIM),
+            np.asarray(
+                jax.lax.bitcast_convert_type(flat[..., :LKV_DIM], jnp.uint8)))
+
+        # Rope: decoding the hi/lo byte planes must bitwise-reproduce
+        # fp8 -> bf16 dequant (the transport encoding is lossless).
+        rope_flat = np.asarray(rope_u8).reshape(pages, page_size, 128)
+        decoded_u16 = ((rope_flat[..., :ROPE_DIM].astype(np.uint16) << 8)
+                       | rope_flat[..., ROPE_DIM:].astype(np.uint16))
+        expected = flat[..., LKV_DIM:LKV_DIM + ROPE_DIM].astype(
+            jnp.bfloat16) * jnp.bfloat16(dequant_scale)
+        np.testing.assert_array_equal(
+            decoded_u16,
+            np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)))

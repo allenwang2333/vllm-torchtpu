@@ -59,8 +59,9 @@ STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
 
 
 def _per_token_group_quant_fp8(
-    x: torch.Tensor, group_size: int = 128, use_ue8m0: bool = True
-) -> tuple[torch.Tensor, torch.Tensor]:
+        x: torch.Tensor,
+        group_size: int = 128,
+        use_ue8m0: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """Block fp8 quantization of `x` over its last axis.
 
     Thin wrapper over the shared reference quantizer. With `use_ue8m0` the
@@ -79,6 +80,7 @@ def _per_token_group_quant_fp8(
 
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
@@ -89,21 +91,23 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         topk = self.topk_tokens
 
         def _streamidx_topk_jax(
-            q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
-            weights: jax.Array,  # [num_tokens, H]
-            cache_kv: jax.Array,  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim] where lkv_dim = D + 1 padded to a 128 multiple
-            k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
-            seq_lens: jax.Array,  # i32 [num_seqs]
-            page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
-            cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
-            distribution: jax.Array,  # i32 [3]
+                q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
+                weights: jax.Array,  # [num_tokens, H]
+                cache_kv: jax.
+            Array,  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim] where lkv_dim = D + 1 padded to a 128 multiple
+                k_packed: jax.
+            Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
+                seq_lens: jax.Array,  # i32 [num_seqs]
+                page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
+                cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
+                distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
             _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
             block_size = block_size_per_kv_packing * kv_packing
             # Cache rows are padded to the 128-lane HBM width; pad the packed
             # fp8+scale rows to match before scattering.
-            k_packed = jnp.pad(
-                k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+            k_packed = jnp.pad(k_packed,
+                               ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
             # Fused insert (TPU metadata has no slot_mapping): same position
             # formula and OOB-drop contract as _update_kv_cache_slots.
@@ -112,10 +116,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                                       side="right").astype(jnp.int32)
             q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
             pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(tok < cu_q_lens[-1],
-                             page_indices.reshape(seq_lens.shape[0],
-                                                  -1)[seq_id, pos // block_size],
-                             jnp.int32(2**30))
+            page = jnp.where(
+                tok < cu_q_lens[-1],
+                page_indices.reshape(seq_lens.shape[0], -1)[seq_id,
+                                                            pos // block_size],
+                jnp.int32(2**30))
             slot = pos % block_size
             cache_kv = cache_kv.at[page, slot // kv_packing,
                                    slot % kv_packing].set(k_packed)
@@ -137,13 +142,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             return cache_kv, topk_indices
 
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        jax_op = pallas.jax_op(op_name, _streamidx_topk_jax,
+        jax_op = pallas.jax_op(op_name,
+                               _streamidx_topk_jax,
                                donate_argnums=(2, ))
 
         def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
             return torch.empty_like(cache_kv), torch.empty(
-                (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
-            )
+                (q_bytes.shape[0], topk),
+                dtype=torch.int32,
+                device=q_bytes.device)
 
         jax_op.register_fake(_fake)
 
@@ -163,16 +170,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         assert q_values.dtype == torch.float8_e4m3fn, (
-            f"streamindex_topk expects fp8 q, got {q_values.dtype}"
-        )
+            f"streamindex_topk expects fp8 q, got {q_values.dtype}")
 
-        k_quant, k_scale = _per_token_group_quant_fp8(
-            k, self.quant_block_size, use_ue8m0=True
-        )
+        k_quant, k_scale = _per_token_group_quant_fp8(k,
+                                                      self.quant_block_size,
+                                                      use_ue8m0=True)
         # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
         # layout the TPU kernel unpacks (head_dim value bytes + 1 scale byte).
         # cat requires a single dtype, so view the fp8 values as raw bytes.
-        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale],
+                                   dim=-1)
 
         attn_metadata = get_forward_context().attn_metadata
         metadata = None
@@ -202,11 +209,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution,
         )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
+        self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        self.topk_indices_buffer[:num_out, : self.topk_tokens] = topk_indices[
-            :num_out
-        ]
+        self.topk_indices_buffer[:num_out, :self.
+                                 topk_tokens] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
@@ -262,10 +268,11 @@ class VllmTPUIndexer(Indexer):
         self.topk_indices_buffer = topk_indices_buffer
 
         # NOTE: (lenscloth) we use fp8 naive cache,
-        #  where we store value in fp8 and scale in fp8 since we use ue8m0 format, 
+        #  where we store value in fp8 and scale in fp8 since we use ue8m0 format,
         #  so we need to store 1 extra scale value per self.quant_block_size element
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 1,
+            head_dim=self.head_dim +
+            self.head_dim // self.quant_block_size * 1,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
@@ -288,23 +295,20 @@ class VllmTPUIndexer(Indexer):
         )
         self.is_inplace_rope = is_inplace_rope
 
-    def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
+                rotary_emb) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        weights = kw[:, self.head_dim :]
+        k = kw[:, :self.head_dim]
+        weights = kw[:, self.head_dim:]
 
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         # Note: RoPE (NeoX) can introduce extra leading dimensions during
@@ -323,7 +327,8 @@ class VllmTPUIndexer(Indexer):
         q_fp8, q_scale = _per_token_group_quant_fp8(
             q,
             self.quant_block_size,
-            use_ue8m0=False, # Disable ue8m0 for q quantization since we don't need to store scale for q
+            use_ue8m0=
+            False,  # Disable ue8m0 for q quantization since we don't need to store scale for q
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
@@ -331,9 +336,8 @@ class VllmTPUIndexer(Indexer):
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
-        )
+        weights = (weights.unsqueeze(-1) * q_scale * self.softmax_scale *
+                   self.n_head**-0.5)
         weights = weights.squeeze(-1).to(weights_dtype)
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
@@ -613,7 +617,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.is_sparse:
             if self.indexer is not None and not self.skip_topk:
                 topk_index = self.indexer(hidden_states, q_c, positions,
-                                        self.indexer_rope_emb)
+                                          self.indexer_rope_emb)
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer

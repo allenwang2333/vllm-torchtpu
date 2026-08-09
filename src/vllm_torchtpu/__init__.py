@@ -478,6 +478,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 def _patch_deepseek_v2_indexer() -> None:
     """Replace vLLM Indexer with VllmTPUIndexer for TPU execution."""
     from vllm.model_executor.models import deepseek_v2
+
     from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
         VllmTPUIndexer
 

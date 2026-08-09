@@ -190,7 +190,7 @@ def _attention_kernel(
         # not enough -- a zeroed key still scores 0 and inflates the softmax
         # denominator whenever kv_len << topk.
         kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(s.dtype).min)
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -302,8 +302,9 @@ def _attention_kernel(
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
-        # Pad kv (576) to q's 128-aligned head_dim (640); the padded dims are
-        # no-ops in the einsums since q's padded dims are also zero.
+        # Pad kv to match q's 128-aligned head_dim(refer to `prepare_q_inputs`).
+        # The padded dims are no-ops in the einsums since q's padded dims are
+        # also zero.
         if bkv.shape[-1] < head_dim:
             bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
 

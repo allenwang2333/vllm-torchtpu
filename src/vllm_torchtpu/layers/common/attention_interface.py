@@ -19,10 +19,11 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla.sparse import csa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.common.utils import (repack_sparse_mla_cache,
+                                               update_sparse_mla_kv_cache)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -589,47 +590,6 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
-def _update_sparse_mla_kv_cache(kv_cache, kv_c_normed, k_pe, seq_lens,
-                                block_tables, query_start_loc) -> jax.Array:
-    """Scatter this step's new MLA latents into the paged fp8 KV cache.
-
-    Args:
-      kv_cache: Paged MLA latent cache (`[num_blocks, block_size // kv_packing, kv_packing, padded_row]`).
-      kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
-      k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
-      block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
-      query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
-
-    Returns:
-      The updated cache, same shape/dtype as `kv_cache`.
-    """
-    num_tokens = kv_c_normed.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
-                              side="right").astype(jnp.int32)
-    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
-    local = tok - query_start_loc[seq_id]
-    pos = seq_lens[seq_id] - q_len + local
-    valid = tok < query_start_loc[-1]
-
-    num_seqs = seq_lens.shape[0]
-    block_tables_2d = block_tables.reshape(num_seqs, -1)
-
-    # page index for padded tokens, XLA drops out-of-bounds scatter writes.
-    OOB_PAGE = jnp.int32(2**30)
-    kv_packing = kv_cache.shape[2]
-    page_size = kv_cache.shape[1] * kv_packing
-    page = jnp.where(valid, block_tables_2d[seq_id, pos // page_size],
-                     OOB_PAGE)
-    slot = pos % page_size
-
-    new_kv_cache_rows = jnp.concatenate([kv_c_normed, k_pe], axis=-1)
-    return kv_cache.at[page, slot // kv_packing,
-                       slot % kv_packing, :new_kv_cache_rows.shape[-1]].set(
-                           new_kv_cache_rows)
-
-
 def sparse_mla_attention(
         ql_nope: jax.Array,
         q_pe: jax.Array,
@@ -696,51 +656,19 @@ def sparse_mla_attention(
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
 
-    def _sparse_mla_ragged_paged_attention(q, q_rope, kv_c_normed, k_pe,
+    def _sparse_mla_ragged_paged_attention(ql_nope, q_pe, kv_c_normed, k_pe,
                                            kv_cache, topk_idx, seq_lens_,
                                            block_tables_, query_start_loc_,
                                            request_distribution_):
-        lkv_dim = q.shape[-1]
-        rope_dim = q_rope.shape[-1]
-        q = jnp.concatenate([q, q_rope], axis=-1)
+        kv_cache = update_sparse_mla_kv_cache(kv_cache, kv_c_normed, k_pe,
+                                              seq_lens_, block_tables_,
+                                              query_start_loc_)
 
-        kv_cache = _update_sparse_mla_kv_cache(kv_cache, kv_c_normed, k_pe,
-                                               seq_lens_, block_tables_,
-                                               query_start_loc_)
-
-        # Repack the fp8 cache (pages x page_size x padded_row) into the
-        # tiled uint8 pair csa_gather requires; see the layout contract
-        # constants (TILE_SUBROWS, TILE_LANE_BYTES) in csa_gather.py.
-        assert kv_cache.dtype == jnp.float8_e4m3fn, (
-            "sparse MLA kernel requires --kv-cache-dtype fp8 (got "
-            f"{kv_cache.dtype}); the nope conversion is a pure bitcast.")
-        # 512 + 64 is demanded by sparse_mla_ragged_paged_attention (576-wide
-        # output, dequant layout), not by the gather: csa_gather derives its
-        # output widths from the tiling and asserts the tiling itself.
-        assert lkv_dim == 512 and rope_dim == 64, (
-            "sparse_mla_ragged_paged_attention is specialized for a 512+64 "
-            f"latent (kv_lora_rank + rope), got {lkv_dim}+{rope_dim}")
-        tile_subrows = csa_gather.TILE_SUBROWS
-        lane_bytes = csa_gather.TILE_LANE_BYTES
-        pages = kv_cache.shape[0]
-        page_size = kv_cache.shape[1] * kv_cache.shape[2]
-        flat = kv_cache.reshape(pages, page_size, kv_cache.shape[-1])
-
-        nope_u8 = jax.lax.bitcast_convert_type(flat[..., :lkv_dim],
-                                               jnp.uint8).reshape(
-                                                   pages, page_size,
-                                                   lkv_dim // lane_bytes,
-                                                   lane_bytes)
-
-        rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
-        if dequant_scale != 1.0:
-            rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
-        rope_u16 = jax.lax.bitcast_convert_type(rope_bf16, jnp.uint16)
-        rope_u8 = jnp.concatenate([(rope_u16 >> 8).astype(jnp.uint8),
-                                   (rope_u16 & 0xFF).astype(jnp.uint8)],
-                                  axis=-1).reshape(pages,
-                                                   page_size // tile_subrows,
-                                                   tile_subrows, lane_bytes)
+        lkv_dim = ql_nope.shape[-1]
+        rope_dim = q_pe.shape[-1]
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        nope_u8, rope_u8 = repack_sparse_mla_cache(kv_cache, lkv_dim, rope_dim,
+                                                   dequant_scale)
 
         output = sparse_mla_ragged_paged_attention(
             q,
@@ -753,12 +681,9 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
         )
-        # The kernel attends over concatenated (nope + rope) keys, so its
-        # per-head output is lkv_dim + rope_dim (576) wide: [..., :512] is
-        # P @ latent -- the MLA value output -- while [..., 512:] is
-        # attention-weighted ROPE keys, which are not part of the value.
-        # Slice to the latent so the shape matches the registered fake
-        # (T, N, kv_lora_rank) and the downstream W_UV projection.
+        # The kernel's output is lkv_dim + rope_dim wide because it attends
+        # over concatenated (nope + rope) keys. Only the nope part is the MLA
+        # value (P @ latent); drop the rope tail before the W_UV projection.
         return output[..., :lkv_dim], kv_cache
 
     output, updated_kv_cache = jax.jit(
