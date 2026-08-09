@@ -347,6 +347,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # property below.
         self.num_layers = get_current_vllm_config(
         ).model_config.hf_config.num_hidden_layers
+        # The state-cache/compressed-KV alias is checked on this layer's first
+        # forward only; see `forward()`. It is decided at
+        # `initialize_kv_cache` and cannot change per step, and the check
+        # itself costs a host sync.
+        self._alias_checked = False
 
     @property
     def compressor_op(self):
@@ -542,8 +547,18 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # took effect for this layer rather than assuming it, mirroring
         # tpu-inference's own unconditional `assert state_cache_index ==
         # cache_index` in its compressor forward().
-        if (orig_cache is not None and state_cache_tensor is not None
-                and orig_cache.numel() > 0 and not _is_tracing()):
+        #
+        # Checked ONCE per layer, not per step. `.data_ptr()` materializes a
+        # lazy tensor and so costs a host sync, and this ran on all 41
+        # compressor layers of every decode step. The aliasing it guards is
+        # decided once, at `initialize_kv_cache`, and cannot change between
+        # steps -- so a per-step check bought nothing and cut the lazy graph 41
+        # times a step. Deleting it outright was the other option and is worse:
+        # this invariant has silently corrupted state here before.
+        if (not self._alias_checked and orig_cache is not None
+                and state_cache_tensor is not None and orig_cache.numel() > 0
+                and not _is_tracing()):
+            self._alias_checked = True
             assert orig_cache.data_ptr() == state_cache_tensor.data_ptr(), (
                 "compressor state cache and compressed-KV cache did not "
                 "land on the same physical tensor -- the runner-level DSV4 "

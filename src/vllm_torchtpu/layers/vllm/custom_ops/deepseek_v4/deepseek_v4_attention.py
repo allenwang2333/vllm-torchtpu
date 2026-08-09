@@ -1435,7 +1435,13 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"[NEW_SW_CACHE_PRECOPY_DEBUG] positions={positions[:4].tolist()} "
                 f"page={_page} kv_lens={_n} | " + " | ".join(_rows))
 
-        if not _is_tracing():
+        # `.item()` here is a device->host sync on every attention layer of
+        # every step -- 43 per decode step, each one cutting the lazy graph and
+        # blocking the host on the device. Gated behind the same
+        # `VLLM_CHECK_NAN` flag as `check_nan()` above rather than a second
+        # convention. Unset (the default) this whole block is skipped, which is
+        # what a perf or production run wants; set it when hunting NaNs.
+        if os.getenv("VLLM_CHECK_NAN") == "1" and not _is_tracing():
             has_nan = torch.isnan(output).any().item()
             if has_nan:
                 rank = os.getenv("RANK", "0")
