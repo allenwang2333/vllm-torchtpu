@@ -85,6 +85,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
+from vllm_torchtpu.runner import dispatch_probe
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -1920,9 +1921,14 @@ class TPUModelRunner(GPUModelRunner):
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
     def _flush_mamba_state_seed_copies(self) -> None:
+        dispatch_probe.probe("seed_copy.flush",
+                             n=len(self._pending_mamba_state_copies))
         if not self._pending_mamba_state_copies:
             return
         for raw, src_t, dst_t in self._pending_mamba_state_copies:
+            dispatch_probe.probe("seed_copy.launch",
+                                 src=tuple(src_t.shape),
+                                 dst=tuple(dst_t.shape))
             copy_mamba_state_blocks(raw, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
@@ -2047,6 +2053,9 @@ class TPUModelRunner(GPUModelRunner):
             token_in_tpu_cur_input_indices: np.ndarray,
             token_in_tpu_pre_next_tokens_indices: np.ndarray) -> torch.Tensor:
         """Apply async token substitution if needed."""
+        dispatch_probe.probe("async_subst",
+                             n=len(token_in_tpu_cur_input_indices),
+                             launched=len(token_in_tpu_cur_input_indices) > 0)
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
@@ -2899,6 +2908,12 @@ class TPUModelRunner(GPUModelRunner):
         # and the coordinated chunk count from this one all-reduce is the shared
         # bound — no additional draft-side collective is needed.
         self._dp_step_num_chunks = target_num_chunks
+        dispatch_probe.new_step()
+        dispatch_probe.probe("execute_model.chunks",
+                             local=local_num_chunks,
+                             target=target_num_chunks,
+                             num_reqs=self.input_batch.num_reqs,
+                             tokens=scheduler_output.total_num_scheduled_tokens)
 
         start_index = 0
         chunk_index = 0
@@ -2926,9 +2941,13 @@ class TPUModelRunner(GPUModelRunner):
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
+                dispatch_probe.probe("chunk.dummy", i=chunk_index)
                 self._run_dp_dummy_chunk(self._dp_target_bucket)
                 chunk_index += 1
                 continue
+            dispatch_probe.probe("chunk.real",
+                                 i=chunk_index,
+                                 start=start_index)
 
             (attn_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,

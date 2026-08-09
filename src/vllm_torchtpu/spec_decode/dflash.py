@@ -22,6 +22,7 @@ from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.runner import dispatch_probe
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
@@ -336,6 +337,13 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
+        # Prime suspect for lockstep divergence: `aux_hidden_states` is
+        # produced by the target forward rather than copied from the
+        # scheduler output, so unlike the other early returns on this path it
+        # has a plausible route to differing per rank — and skipping it skips
+        # the whole `_tpu_precompute_and_update_kv_cache` launch.
+        dispatch_probe.probe("draft.kv_update",
+                             launched=chunk.aux_hidden_states is not None)
         if chunk.aux_hidden_states is None:
             return
 
@@ -377,6 +385,14 @@ class DFlashProposer:
         """
         runner = self.runner
         num_reqs = runner.input_batch.num_reqs
+        # `draft_chunks` is the locally captured list, not the DP-coordinated
+        # `_dp_step_num_chunks`, so its length is what actually drives the
+        # number of draft launches below.
+        dispatch_probe.probe("propose.enter",
+                             num_reqs=num_reqs,
+                             chunks=len(self.draft_chunks),
+                             dp_chunks=getattr(runner, "_dp_step_num_chunks",
+                                               None))
         if num_reqs == 0:
             return []
 
