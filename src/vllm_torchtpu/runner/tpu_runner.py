@@ -3772,7 +3772,21 @@ class TPUModelRunner(GPUModelRunner):
                     num_rejected_tokens_np=None,
                     scheduler_output=scheduler_output)
 
+            # See the drain before the async return below.
+            if os.environ.get("VLLM_TPU_STEP_SYNC") == "1":
+                torch.tpu.synchronize()
             return final_output
+
+        # Workaround: drain the device queue once per step. Every captured
+        # hang has all ranks futex-parked in AwaitBuffer with 0% CPU while
+        # materializing the draft KV-update program — device queues wedged on
+        # events that never fire, with identical per-rank dispatch sequences
+        # (see tools/diff_dispatch_trace.py). Bounding the queue to one
+        # step's programs avoids whatever cross-step interleaving wedges the
+        # runtime, at the cost of the async pipeline overlap. Remove once the
+        # underlying torch-tpu issue is fixed.
+        if os.environ.get("VLLM_TPU_STEP_SYNC") == "1":
+            torch.tpu.synchronize()
 
         return async_output
 
