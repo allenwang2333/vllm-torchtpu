@@ -40,7 +40,8 @@ Fixes, both in `runner/tpu_runner.py`:
 
 ## 2. Numbers
 
-Offline throughput, `scripts/dsv4/perf_offline.py`, 512-token prompts,
+Offline throughput (FIRST measurement, before the host-sync fix -- see the
+comparison table below for current numbers), `scripts/dsv4/perf_offline.py`, 512-token prompts,
 64 generated tokens, `ignore_eos`, TP=8/EP=8, `max_model_len=4096`:
 
 | batch | wall | decode tok/s | total tok/s | vs b1 |
@@ -76,23 +77,23 @@ lost pipelining grows with work in flight.
 
 **It did not fix the scaling failure**, which is the point below.
 
-Total throughput at batch 128: **248 tok/s ours vs 830 tok/s reference** (200 before the sync fix).
-Reference wall time barely moves (51.5 s at batch 1 -> 88.9 s at 128); ours
-grows 4x (90 s -> 369 s).
+Total throughput at batch 128: **248 tok/s ours vs 830 tok/s reference**
+(200 tok/s before the sync fix).
 
-**The gap is a scaling failure, not a constant factor.** ~1.8x at batch 1 looks
-like fixed per-step overhead, but the reference keeps scaling to 128 while we
-flatten after ~32. Something in our path grows with batch where theirs does
-not. That is the thing to profile next, and it is worth more than any of the
-remaining correctness items for a production story.
+**The remaining gap is a scaling failure, not a constant factor.** 1.27x at
+batch 1 is now close; the reference keeps scaling to 128 (wall 51.5 s ->
+88.9 s) while we flatten after ~32 (wall 65.6 s -> 296.9 s). Something in our
+path grows with batch where theirs does not. Removing the per-step host syncs
+narrowed the gap but did not change that shape, which is why profiling a
+decode step is the top perf item.
 
 **Confound, and it cannot be removed:** the reference refuses to run MLA
-without DP attention (hard config validation -- see §4.2), so this is
+without DP attention (hard config validation -- see §4.4), so this is
 ours-TP-only against theirs-DP-on. DP attention plausibly explains part of the
 scaling difference (with `num_kv_heads=1`, TP cannot shard KV, so every rank of
 ours holds the whole KV while each of theirs holds ~1/8), but nothing here
 proves that, and a profile could just as easily land on the MoE/GMM path.
-Do not quote "4x" as a clean like-for-like result.
+Do not quote "3.34x" as a clean like-for-like result.
 
 Both numbers include a low-batch artifact: at batch 1 *both* implementations
 are ~1 tok/s, because a graph compiled for `max_num_seqs` runs one real
