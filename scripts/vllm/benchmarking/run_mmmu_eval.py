@@ -85,46 +85,43 @@ def encode_image_base64(image) -> str:
 
 def extract_answer(response_text: str,
                    options: list[str] | None = None) -> str:
-    """Extract choice letter (A-J) from generated CoT text."""
+    """Extract choice letter (A-J) from generated response text."""
     if not response_text:
         return "UNKNOWN"
 
-    # 1. Match explicit CoT conclusion phrases anywhere in the text
+    clean = response_text.strip()
+    direct_match = re.match(r"^(?:option|answer)?\s*\(?([A-J])\)?\.?\s*$",
+                            clean, re.IGNORECASE)
+    if direct_match:
+        return direct_match.group(1).upper()
+
+    # 1. Match explicit conclusion phrases anywhere in the text
     cot_patterns = [
-        r"therefore,?\s*(?:the)?\s*(?:correct)?\s*answer\s*is\s*\(?([A-J])\)?",
-        r"the\s*correct\s*option\s*is\s*\(?([A-J])\)?",
-        r"answer\s*:\s*\(?([A-J])\)?",
-        r"\boption\s*\(?([A-J])\)?\s*is\s*correct",
-        r"\b(?:answer|option|choice|is|result)\b[^\w\n]*\(?([A-J])\)?\b",
+        r"(?:therefore|thus|hence|so),?\s*(?:the)?\s*(?:correct)?\s*(?:answer|option|choice)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
+        r"\b(?:the)?\s*(?:correct)?\s*(?:answer|option|choice)\s*(?:is|=|:)\s*\(?([A-J])\)?\b",
+        r"\b(?:answer|option|choice)\s*:\s*\(?([A-J])\)?\b",
+        r"\boption\s*\(?([A-J])\)?\s*is\s*correct\b",
+        r"\b(?:boxed|answer)\{([A-J])\}",
     ]
     for pattern in cot_patterns:
         match = re.search(pattern, response_text, re.IGNORECASE)
         if match:
             return match.group(1).upper()
 
-    # 2. Inspect the final 300 characters for enclosed or standalone option letters
+    # 2. Inspect the final 300 characters for enclosed option letters e.g. (A)
     tail_text = response_text[-300:]
-    match = re.search(r"(?:\(|\[|^|\s)([A-J])(?:\)|\]|\.|\b)", tail_text)
+    match = re.search(r"\(?([A-J])\)", tail_text)
     if match:
         return match.group(1).upper()
 
     # 3. VLMEvalKit Fallback: Substring match against candidate option texts
     if options and isinstance(options, list):
-        clean_resp = response_text.strip().lower()
-        best_match_idx = -1
-        best_match_len = 0
+        clean_resp = response_text.lower()
         for idx, opt in enumerate(options):
-            if not opt or not isinstance(opt, str):
-                continue
-            opt_clean = opt.strip().lower()
-            if opt_clean and opt_clean in clean_resp and len(
-                    opt_clean) > best_match_len:
-                best_match_len = len(opt_clean)
-                best_match_idx = idx
-        if best_match_idx >= 0:
-            return chr(65 + best_match_idx)
+            if opt and str(opt).strip().lower() in clean_resp:
+                return chr(65 + idx)
 
-    # 4. Fallback: isolated uppercase single letter
+    # 4. Fallback: isolated uppercase single letter in the tail
     match = re.search(r"\b([A-J])\b", tail_text)
     if match:
         return match.group(1).upper()
@@ -159,10 +156,14 @@ def load_mmmu_samples(
                 if limit > 0 and len(samples) >= limit:
                     break
                 ds = None
-                for split_name in ["validation", "test", "dev"]:
+                for split_name in ["test", "validation"]:
                     try:
-                        ds = load_dataset(target_ds, config, split=split_name)
-                        break
+                        loaded_ds = load_dataset(target_ds,
+                                                 config,
+                                                 split=split_name)
+                        if loaded_ds:
+                            ds = loaded_ds
+                            break
                     except Exception:  # noqa: BLE001
                         continue
                 if ds is None:
@@ -332,9 +333,8 @@ def evaluate_sample(sample: dict, host: str, port: int,
             f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nPlease analyze the image and question carefully. "
-        "Provide your step-by-step reasoning first, and conclude your answer with "
-        "'Therefore, the correct option is (X)' where X is the option letter of your choice."
+        "\n\nPlease think step-by-step and provide a detailed explanation. "
+        "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
     )
 
     payload = {
@@ -357,7 +357,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             ],
         }],
         "max_tokens":
-        1024,
+        2048,
         "temperature":
         0.0,
     }
@@ -375,6 +375,9 @@ def evaluate_sample(sample: dict, host: str, port: int,
                 predicted = extract_answer(generated_text,
                                            options=sample.get("options"))
                 is_correct = predicted == sample["answer"]
+                print(
+                    f"Sample {sample.get('id')}: Pred={predicted}, Truth={sample['answer']}, Match={is_correct}"
+                )
                 del img_b64, payload, res_json
                 gc.collect()
                 return is_correct, predicted, sample["answer"]
