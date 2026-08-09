@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -398,6 +399,15 @@ class DFlashProposer:
         for chunk in chunks:
             with set_vllm_model_wrapper_context(mesh=None):
                 self._update_draft_kv_cache_from_target(chunk)
+            # Debug: bracket the draft KV-update program — the anchor of
+            # every captured hang. It is the only program that mutates the
+            # same raw pool buffers the target's graph mutates, from a
+            # second compiled graph, via module-captured aliased buffers.
+            # If the hang survives a full drain right here, the wedge is
+            # inside this program itself rather than in cross-program
+            # interleaving of the deferred queue.
+            if os.environ.get("VLLM_TPU_DFLASH_KV_SYNC") == "1":
+                torch.tpu.synchronize()
 
         # 2. Process each chunk
         draft_logits_per_chunk = []

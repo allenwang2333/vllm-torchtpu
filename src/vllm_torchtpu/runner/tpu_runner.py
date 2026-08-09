@@ -4596,6 +4596,11 @@ class TPUModelRunner(GPUModelRunner):
             so.total_num_scheduled_tokens = P
             assert self.execute_model(so) is None
             self.sample_tokens(None)
+            # Same gated drain as the decode loop below: the prefill step's
+            # sample_tokens also runs propose and the draft KV update, and a
+            # hang here would land before the first decode-step drain.
+            if os.environ.get("VLLM_TPU_WARMUP_STEP_SYNC") == "1":
+                torch.tpu.synchronize()
             d = self.take_draft_token_ids()
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
