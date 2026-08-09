@@ -39,6 +39,7 @@ strictly per local expert (see ``compressed_tensors_moe/utils.py``), and at
 here like the packed weights.
 """
 
+import os
 from collections.abc import Generator
 from typing import Optional
 
@@ -186,18 +187,41 @@ def _sharded_runai_weights_iterator(
                         device="cpu",
                         is_distributed=False)
 
+        # Under torch-tpu's deferred eager mode, weight_loader's device
+        # copies queue up and keep their HOST source tensors referenced
+        # until the graph flushes. Left alone, every kept tensor's host
+        # clone stays resident for the whole load (~all dense bytes per
+        # rank; the pod died at 8 ranks x ~110 GB within 2 minutes of
+        # streaming). This iterator runs on the same thread that consumes
+        # the tensors, so a periodic device sync here releases the queued
+        # copies' host sources and bounds resident memory to a window.
+        sync_every = int(os.getenv("TPU_SHARDED_LOAD_SYNC_EVERY", "512"))
+
+        def _device_sync() -> None:
+            try:
+                torch.tpu.synchronize()
+            except Exception:
+                logger.warning_once(
+                    "[sharded-ep-load] torch.tpu.synchronize() unavailable "
+                    "during load; host memory may accumulate.")
+
         progress = tqdm(total=kept,
                         desc="Loading safetensors (EP-sharded Run:AI)",
                         disable=not enable_tqdm(use_tqdm_on_load),
                         mininterval=2)
         try:
-            for request_id, chunk_index, buffer in fs.get_chunks():
+            for yielded, (request_id, chunk_index,
+                          buffer) in enumerate(fs.get_chunks(), start=1):
                 tensor_meta = tensors_by_request[request_id][chunk_index]
                 yield tensor_meta.name, sp.create_torch_tensor(
                     buffer, tensor_meta).clone()
                 progress.update(1)
+                if sync_every and yielded % sync_every == 0:
+                    _device_sync()
         finally:
             progress.close()
+        if sync_every:
+            _device_sync()
 
 
 def patch_runai_sharded_expert_streaming() -> None:
