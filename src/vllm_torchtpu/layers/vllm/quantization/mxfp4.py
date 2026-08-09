@@ -45,10 +45,8 @@ scaling.
    - Returns output tensor
 """
 
-import hashlib
 import os
 import types
-from pathlib import Path
 from typing import Any, Optional
 
 import jax.numpy as jnp
@@ -73,6 +71,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.common import quant_weight_cache
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
@@ -411,49 +410,49 @@ REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
 # --- Development-only on-disk requantization cache -------------------------
 #
 # Re-quantizing the MoE weights costs ~10 minutes of every run, which dominates
-# iteration time when bringing a model up. Setting `VLLM_FP4_CACHE_DIR` caches
-# the result on disk. Unset (the default) this is inert, so production and CI
-# behave exactly as before.
+# iteration time when bringing a model up. The mechanism is generic and lives
+# in `layers/common/quant_weight_cache.py`; this only supplies the key. Unset
+# `VLLM_QUANT_WEIGHT_CACHE_DIR` (the default) and it is inert, so production
+# and CI behave exactly as before.
 #
-# The cache KEY is the important part. An earlier version of this cache keyed
-# only on rank and tensor shapes, so a cache built under one requantization
-# config was silently reused by a run expecting another -- a documented cause
-# of garbage output (`docs/dsv4_handoff_20260806.md` section 7c). Every input
-# that changes the produced weights therefore goes into the key, and a
-# mismatch simply yields a different filename (a miss) rather than a bad hit.
-#
-# See also the TODO in `process_weights_after_loading`: this wants to become a
-# generic on-disk quantization cache in its own PR.
+# The KEY is the important part. An earlier version keyed only on rank and
+# tensor shapes, so a cache built under one requantization config was silently
+# reused by a run expecting another -- a documented cause of garbage output
+# (`docs/dsv4_handoff_20260806.md` section 7c). Every input that changes the
+# produced weights goes into the key below.
+
+_FP4_CACHE_NAMESPACE = "dsv4_mxfp4"
 
 
-def _fp4_cache_path(layer, w13_shape, w2_shape, orig_intermediate: int,
-                    activation_str: str, rhs_quant_dtype) -> Path | None:
-    cache_dir = os.environ.get("VLLM_FP4_CACHE_DIR")
-    if not cache_dir:
-        return None
+def _fp4_cache_key(layer, w13_shape, w2_shape, orig_intermediate: int,
+                   activation_str: str, rhs_quant_dtype) -> dict:
     try:
         rank = torch.distributed.get_rank(
         ) if torch.distributed.is_initialized() else 0
     except Exception:
         rank = 0
-    key = "|".join(
-        str(x) for x in (
-            getattr(layer, "layer_name", None) or "unknown",
-            rank,
-            tuple(w13_shape),
-            tuple(w2_shape),
-            orig_intermediate,
-            REQUANTIZED_BLOCK_SIZE,
-            min(REQUANTIZED_BLOCK_SIZE, orig_intermediate),
-            envs.MOE_REQUANTIZE_WEIGHT_DTYPE if hasattr(
-                envs, "MOE_REQUANTIZE_WEIGHT_DTYPE") else None,
-            activation_str,
-            rhs_quant_dtype,
-        ))
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    path = Path(cache_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"fp4_{digest}.pt"
+    return {
+        "layer":
+        getattr(layer, "layer_name", None) or "unknown",
+        "rank":
+        rank,
+        "w13_shape":
+        tuple(w13_shape),
+        "w2_shape":
+        tuple(w2_shape),
+        "orig_intermediate":
+        orig_intermediate,
+        "w13_block_size":
+        REQUANTIZED_BLOCK_SIZE,
+        "w2_block_size":
+        min(REQUANTIZED_BLOCK_SIZE, orig_intermediate),
+        "weight_dtype": (envs.MOE_REQUANTIZE_WEIGHT_DTYPE if hasattr(
+            envs, "MOE_REQUANTIZE_WEIGHT_DTYPE") else None),
+        "activation":
+        activation_str,
+        "rhs_quant_dtype":
+        str(rhs_quant_dtype),
+    }
 
 
 def _dsv4_weight_loader(self,
@@ -734,48 +733,27 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 float(w13_weight_padded.float().abs().max()),
                 float(w2_weight_padded.float().abs().max()))
 
-        cache_path = _fp4_cache_path(layer, w13_weight_padded.shape,
-                                     w2_weight_padded.shape, orig_intermediate,
-                                     activation_str, self.rhs_quant_dtype)
-        cached = None
-        if cache_path is not None and cache_path.exists():
-            try:
-                cached = torch.load(cache_path, map_location="cpu")
-            except Exception as exc:  # dev cache: never fail the run over it
-                logger.warning("Ignoring unreadable FP4 cache %s: %s",
-                               cache_path, exc)
-                cached = None
+        cache_key = _fp4_cache_key(layer, w13_weight_padded.shape,
+                                   w2_weight_padded.shape, orig_intermediate,
+                                   activation_str, self.rhs_quant_dtype)
+        cache_file = quant_weight_cache.cache_path(_FP4_CACHE_NAMESPACE,
+                                                   cache_key)
+        cached = quant_weight_cache.load(cache_file, cache_key, device=device)
 
         if cached is not None:
             (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-             w2_weight_scale) = (t.to(device) for t in cached)
+             w2_weight_scale) = cached
         else:
             (w13_weight_processed, w2_weight_processed, w13_weight_scale,
              w2_weight_scale) = self._requantize_native_fp4(
                  w13_weight_padded, w2_weight_padded, orig_intermediate,
                  device)
-            if cache_path is not None:
-                # Write via a temp file so a killed run can't leave a truncated
-                # entry for a later run to load. Failures here must never take
-                # the run down -- a full disk is ordinary (the entries are
-                # hundreds of MB per layer per rank, and pointing this at a
-                # tmpfs will exhaust it), and the cache is a convenience, not a
-                # source of truth.
-                tmp = cache_path.with_suffix(".pt.tmp")
-                try:
-                    torch.save([
-                        w13_weight_processed.cpu(),
-                        w2_weight_processed.cpu(),
-                        w13_weight_scale.cpu(),
-                        w2_weight_scale.cpu(),
-                    ], tmp)
-                    tmp.rename(cache_path)
-                except Exception as exc:
-                    logger.warning_once(
-                        "Could not write FP4 cache to %s (%s); continuing "
-                        "without it. Point VLLM_FP4_CACHE_DIR at a disk with "
-                        "room for ~1GB per layer per rank.", cache_path, exc)
-                    tmp.unlink(missing_ok=True)
+            quant_weight_cache.save(cache_file, cache_key, [
+                w13_weight_processed,
+                w2_weight_processed,
+                w13_weight_scale,
+                w2_weight_scale,
+            ])
 
         if _wdbg:
             logger.info(
