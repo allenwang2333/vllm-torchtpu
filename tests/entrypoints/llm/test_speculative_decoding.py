@@ -14,9 +14,19 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import random
+import socket
 import string
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from vllm import LLM, SamplingParams
@@ -66,6 +76,14 @@ def get_dflash_test_prompts():
     ]
 
 
+def get_mtp_test_prompts():
+    num_prompts = 10
+    return [
+        "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8"
+        for _ in range(num_prompts)
+    ]
+
+
 def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
@@ -74,7 +92,41 @@ def get_test_prompts(speculative_config: dict):
         return get_eagle3_test_prompts()
     if method == "dflash":
         return get_dflash_test_prompts()
+    if method == "mtp":
+        return get_mtp_test_prompts()
     raise NotImplementedError(f"{method} is not supported yet.")
+
+
+# Qwen3.5 ships its MTP head inside the target checkpoint, so the speculative
+# config carries no separate draft `model`: vLLM resolves the draft to the
+# target model itself (SpeculativeConfig, method="mtp"). Qwen3.5-4B declares
+# `mtp_num_hidden_layers: 1`, i.e. one MTP decoder layer; K > 1 re-runs that
+# same layer per draft step.
+QWEN35_MTP_MODEL = "Qwen/Qwen3.5-4B"
+
+# Engine kwargs every Qwen3.5 run in this file needs, on top of the shared
+# ones the helpers set.
+QWEN35_KWARGS = {
+    # Qwen3.5 declares a vision modality; run it text-only so vLLM takes the
+    # language-model-only path (see TpuPlatform.check_and_update_config).
+    "language_model_only": True,
+    "limit_mm_per_prompt": {
+        "image": 0,
+        "video": 0
+    },
+    # Qwen3.5 is hybrid (GDN linear attention + full attention). TpuPlatform
+    # rejects prefix caching together with speculative decoding on hybrid
+    # Mamba models, so keep it off on both the reference and the spec engine
+    # (the reference must match the spec run's cache behaviour anyway).
+    "enable_prefix_caching": False,
+}
+
+
+def _qwen35_mtp_speculative_config(num_speculative_tokens: int = 1) -> dict:
+    return {
+        "method": "mtp",
+        "num_speculative_tokens": num_speculative_tokens,
+    }
 
 
 def _make_sampling_config(temperature: float = 0) -> SamplingParams:
@@ -232,6 +284,62 @@ def test_dflash_correctness_greedy(
     )
 
 
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
+def test_qwen35_mtp_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """Qwen3.5 MTP must not change greedy output vs a no-spec reference.
+
+    This is the hybrid-model spec-decode path: between the target's verify
+    forward and the draft's propose the runner has to roll the GDN recurrent
+    state back over the rejected tokens. A broken rollback shows up here as a
+    text mismatch (the target decodes from contaminated state), which the
+    acceptance-rate check in test_qwen35_mtp_performance_greedy cannot see.
+    """
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_MODEL,
+        _qwen35_mtp_speculative_config(),
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        extra_kwargs=QWEN35_KWARGS,
+    )
+
+
+@pytest.mark.timeout(1800)
+def test_qwen35_mtp_correctness_greedy_multi_step(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Same correctness guarantee with K=2 draft tokens per step.
+
+    Qwen3.5-4B has a single MTP layer, so K=2 runs that layer twice per step
+    and exercises the drafter's multi-step loop (per-step draft attention
+    metadata, GDN state advance/rollback across >1 speculated token) that the
+    K=1 configuration never reaches.
+    """
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_MODEL,
+        _qwen35_mtp_speculative_config(num_speculative_tokens=2),
+        max_num_seqs=4,
+        async_scheduling=False,
+        extra_kwargs=QWEN35_KWARGS,
+    )
+
+
 def _test_performance_helper(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -380,6 +488,40 @@ def test_dflash_performance_greedy(
         model_name="Qwen/Qwen3-4B",
         async_scheduling=async_scheduling,
         extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(4, id="bs4")])
+def test_qwen35_mtp_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """Qwen3.5 MTP proposes and gets drafts accepted at a useful rate.
+
+    The floor is a collapse guard: it catches a drafter that silently stops
+    proposing, or one whose accepted tokens fall because the GDN state handed
+    to the draft is wrong. The prompt is a trivially predictable sequence and
+    K=1, so a healthy v7x/TP2 run accepts every draft — all four
+    configurations measure 80/80 = 100%.
+    """
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _qwen35_mtp_speculative_config(),
+        min_acceptance_rate=0.9,
+        max_num_seqs=max_num_seqs,
+        model_name=QWEN35_MTP_MODEL,
+        async_scheduling=async_scheduling,
+        extra_kwargs=QWEN35_KWARGS,
     )
 
 
@@ -644,3 +786,278 @@ def test_eagle3_sharded_draft(
         spec_llm.llm_engine.engine_core.shutdown()
         del spec_llm
         cleanup_dist_env_and_memory()
+
+
+# ---------------------------------------------------------------------------
+# Data-parallel MTP
+#
+# These tests drive an out-of-process `vllm serve` instead of LLM(...) like
+# everything above. That is forced, not stylistic: vLLM rejects
+# LLM(data_parallel_size>1) for single-process use unless
+# `current_platform.is_tpu()`, and this plugin registers TpuPlatform with
+# `_enum = PlatformEnum.OOT`, so the TPU exemption never applies and the
+# constructor raises. Serving is also how DP actually ships here (see
+# scripts/vllm/benchmarking/configs/*.sh).
+#
+# They are marked `multichip` because DP_SIZE * TP chips are needed; the
+# 2-chip spec-decode CI step runs them too (it applies no -m filter), where
+# _require_chips_for_dp skips them.
+# ---------------------------------------------------------------------------
+
+DP_SIZE = 2
+
+# Cold TPU compilation of a DP engine pair takes minutes, and an idle DP
+# engine whose peer is still compiling can trip an RPC timeout, so give
+# startup room and always drive every engine with concurrent load.
+DP_SERVER_STARTUP_TIMEOUT_S = 1800
+DP_REQUEST_TIMEOUT_S = 1500
+DP_EXECUTE_MODEL_TIMEOUT_S = 1800
+
+_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens_total"
+_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens_total"
+
+
+def _get_local_tpu_chip_count() -> int:
+    try:
+        from tpu_info import device as tpu_device
+
+        _, num_chips = tpu_device.get_local_chips()
+        return num_chips
+    except Exception as e:  # noqa: BLE001 - detection failure is a skip
+        pytest.skip(f"Unable to detect local TPU chip count: {e}")
+
+
+def _require_chips_for_dp() -> None:
+    tp = _get_tensor_parallel_size()
+    needed = DP_SIZE * tp
+    available = _get_local_tpu_chip_count()
+    if available < needed:
+        pytest.skip(f"DP spec decode needs {needed} chips (dp={DP_SIZE} x "
+                    f"tp={tp}), found {available}")
+
+
+def _pick_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+@contextlib.contextmanager
+def _serve_dp(speculative_config: dict | None):
+    """Run `vllm serve` with data parallelism; yield the base URL."""
+    port = _pick_free_port()
+    cmd = [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        QWEN35_MTP_MODEL,
+        "--data-parallel-size",
+        str(DP_SIZE),
+        "--tensor-parallel-size",
+        str(_get_tensor_parallel_size()),
+        "--max-model-len",
+        "256",
+        "--max-num-seqs",
+        "4",
+        "--no-enable-prefix-caching",
+        "--no-async-scheduling",
+        "--language-model-only",
+        "--limit-mm-per-prompt",
+        json.dumps({
+            "image": 0,
+            "video": 0
+        }),
+        "--port",
+        str(port),
+    ]
+    if speculative_config is not None:
+        cmd += ["--speculative-config", json.dumps(speculative_config)]
+
+    base = f"http://localhost:{port}"
+
+    # Log to a file rather than a pipe. vLLM startup writes far more than a
+    # pipe buffer holds, and nothing here drains it, so PIPE would block the
+    # server mid-startup and the health poll would never succeed.
+    log = tempfile.NamedTemporaryFile(mode="w+",
+                                      suffix=".log",
+                                      prefix="vllm_serve_dp_",
+                                      delete=False)
+
+    def _fail(message: str) -> RuntimeError:
+        log.flush()
+        with open(log.name) as fh:
+            tail = fh.read()[-4000:]
+        return RuntimeError(f"{message}\n--- {log.name} (tail) ---\n{tail}")
+
+    # The first request against a fresh engine pair compiles the runtime
+    # shapes inside sample_tokens, and on TPU that outruns vLLM's 300s default
+    # worker-RPC deadline -- the engine is torn down mid-compile and every
+    # request 500s. Raise the deadline past the compile.
+    env = dict(
+        os.environ,
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=str(DP_EXECUTE_MODEL_TIMEOUT_S))
+
+    server = subprocess.Popen(cmd,
+                              stdout=log,
+                              stderr=subprocess.STDOUT,
+                              env=env,
+                              text=True)
+    try:
+        deadline = time.time() + DP_SERVER_STARTUP_TIMEOUT_S
+        while True:
+            if server.poll() is not None:
+                raise _fail(
+                    f"vllm serve exited with {server.returncode} during "
+                    "startup")
+            try:
+                urllib.request.urlopen(f"{base}/health", timeout=10).close()
+                break
+            except (urllib.error.URLError, OSError):
+                pass
+            if time.time() > deadline:
+                raise _fail("vllm serve did not become healthy within "
+                            f"{DP_SERVER_STARTUP_TIMEOUT_S}s")
+            time.sleep(10)
+        print(f"vllm serve (dp={DP_SIZE}) ready at {base}; log: {log.name}")
+        yield base
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=60)
+        log.close()
+        # Waiting for TPUs to be fully released before the next engine starts.
+        time.sleep(15)
+
+
+def _dp_completions(base: str, num_prompts: int = 20) -> list[str]:
+    """Send greedy completions concurrently and return their texts.
+
+    Concurrency is required, not incidental: vLLM's DP load balancer only
+    spreads work over both engines when several requests are in flight, and a
+    DP engine left idle while its peer compiles can time out its own RPC.
+    """
+    prompt = get_mtp_test_prompts()[0]
+
+    def one(_: int) -> str:
+        payload = json.dumps({
+            "model": QWEN35_MTP_MODEL,
+            "prompt": prompt,
+            "max_tokens": 16,
+            "temperature": 0,
+        }).encode()
+        request = urllib.request.Request(
+            f"{base}/v1/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(request,
+                                    timeout=DP_REQUEST_TIMEOUT_S) as response:
+            return json.loads(response.read().decode())["choices"][0]["text"]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(one, range(num_prompts)))
+
+
+def _dp_spec_counters(base: str) -> tuple[float, float, dict[str, float]]:
+    """Sum the spec-decode counters, and keep the per-engine draft counts.
+
+    Each DP engine exports its own series (`engine="0"`, `engine="1"`, ...).
+    The per-engine breakdown matters because one engine that never drafts is
+    invisible in the summed acceptance rate.
+
+    Matching on `name{` stops `..._num_accepted_tokens_total` from also
+    swallowing `..._num_accepted_tokens_per_pos_total`, which shares a prefix.
+    """
+    with urllib.request.urlopen(f"{base}/metrics", timeout=60) as response:
+        body = response.read().decode()
+
+    totals = {_DRAFT_METRIC: 0.0, _ACCEPTED_METRIC: 0.0}
+    per_engine: dict[str, float] = {}
+    for line in body.splitlines():
+        if line.startswith("#"):
+            continue
+        for name in totals:
+            if not (line.startswith(name + "{")
+                    or line.startswith(name + " ")):
+                continue
+            try:
+                value = float(line.rsplit(" ", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            totals[name] += value
+            if name == _DRAFT_METRIC and 'engine="' in line:
+                engine = line.split('engine="', 1)[1].split('"', 1)[0]
+                per_engine[engine] = per_engine.get(engine, 0.0) + value
+    return totals[_DRAFT_METRIC], totals[_ACCEPTED_METRIC], per_engine
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_qwen35_mtp_dp_correctness_greedy():
+    """MTP under data parallelism must not change greedy output.
+
+    Reference and speculative runs are separate servers with identical config
+    apart from --speculative-config, so a text difference is speculation and
+    nothing else. Each DP engine drafts over its own share of the requests, so
+    this also catches per-engine drafter state that is wrong on one rank only.
+    """
+    _require_chips_for_dp()
+
+    with _serve_dp(None) as base:
+        ref_texts = _dp_completions(base)
+        ref_drafted, _, _ = _dp_spec_counters(base)
+    assert ref_drafted == 0, \
+        "reference server reported draft tokens; it was not a no-spec baseline"
+
+    with _serve_dp(_qwen35_mtp_speculative_config()) as base:
+        spec_texts = _dp_completions(base)
+        drafted, accepted, per_engine = _dp_spec_counters(base)
+
+    assert len(ref_texts) == len(spec_texts)
+    misses = 0
+    for ref, spec in zip(ref_texts, spec_texts):
+        if ref != spec:
+            misses += 1
+            print(f"ref:  {ref!r}")
+            print(f"spec: {spec!r}")
+    assert misses == 0
+
+    print(f"dp mtp: accepted={accepted} drafted={drafted} "
+          f"per_engine={per_engine}")
+    assert drafted > 0, "no draft tokens produced under DP"
+    assert accepted > 0, "no draft tokens accepted under DP"
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_qwen35_mtp_dp_performance_greedy():
+    """Every DP engine drafts, and the drafts are accepted at a useful rate.
+
+    The floor is the same collapse guard as the single-engine performance
+    test. The per-engine assertion is the DP-specific half: a drafter that
+    failed to load on one engine leaves the summed rate looking healthy.
+    """
+    _require_chips_for_dp()
+
+    with _serve_dp(_qwen35_mtp_speculative_config()) as base:
+        texts = _dp_completions(base)
+        drafted, accepted, per_engine = _dp_spec_counters(base)
+
+    for i, text in enumerate(texts):
+        assert text, f"DP spec decode produced empty output for request {i}"
+
+    assert drafted > 0, "no draft tokens produced under DP"
+    rate = accepted / drafted
+    print(f"dp mtp acceptance: {accepted}/{drafted} = {rate:.2%} "
+          f"per_engine={per_engine}")
+
+    assert len(per_engine) == DP_SIZE, \
+        f"expected {DP_SIZE} engines to report draft counters, got {per_engine}"
+    idle = sorted(e for e, n in per_engine.items() if n <= 0)
+    assert not idle, f"engine(s) {idle} produced no draft tokens"
+
+    assert rate >= 0.9, f"acceptance {rate:.2%} below floor 90%"
