@@ -16,12 +16,26 @@
 # batch size 1. Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3.yml
 # so pipeline_dev.yml stays on the cheaper stage-2 rehearsal.
 #
-# Run this only after stage 2 (Kimi-Linear-48B on tpu_v7x_16_queue) is green:
-# both go through the same tt class, so stage 2 clears the model and the
-# launcher, leaving scale as the only new variable here.
-#
 # The slice is ranlihao-v7x-32 -- someone else's pod. Coordinate before running,
 # and note its queue has been dispatch-paused before.
+#
+# WHY THE LOCAL DISK: streaming the 1561 GB checkpoint from GCS with
+# runai_streamer stages bytes in anonymous host memory and Ray OOM-killed the
+# load at 44/58/73% of the stream with the node at ~898/944 GB (builds
+# 82/85/83) -- tt has no sharded-read equivalent of tpu-inference's
+# K3_SHARDED_EXPERT_STREAMING, so every host resides far more than its own
+# shard. The pod carries the checkpoint on a 2 TB hyperdisk-ml attached
+# READ_ONLY to all four hosts (google-persistent-disk-1, 96 safetensors,
+# 1560.9 GB at Kimi-K3/). Serving from that local path uses the default
+# loader: safetensors are mmap'd, resident pages are reclaimable page cache,
+# and the load fits. This is the exact recipe of the successful manual run
+# on this pod (vllm serve /root/.cache/huggingface/Kimi-K3 at
+# --gpu-memory-utilization 0.7).
+#
+# The mount does not survive host maintenance (no fstab entry -- the
+# 2026-08-09 04:13Z maintenance reboot silently unmounted it on all four
+# hosts), so the job re-mounts it read-only, idempotently, on every host
+# before bringing the cluster up.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -31,66 +45,49 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: ":rocket: tpu7x-32 multi-host Kimi-K3 1k/1k bs=1 (max-model-len 4096)"
+  - label: ":rocket: tpu7x-32 multi-host Kimi-K3 8k/1k bs=1 (local disk)"
     key: tpu7x_32_k3
     depends_on: build_docker
     timeout_in_minutes: 420
     agents:
       queue: tpu_v7x_32_queue
     env:
-      # 1561 GB of checkpoint, and runai_streamer defaults to
-      # MemoryCapMode.unlimited -- it sizes its host buffer as the SUM of all
-      # chunks, i.e. the whole checkpoint. On the pod that hit a Ray OOM kill at
-      # 44% of the stream, head node at 898/944 GB (build 82). The serve command
-      # therefore pins RUNAI_STREAMER_MEMORY_LIMIT to 16 GiB per worker via
-      # --model-loader-extra-config; 8 workers per host is ~128 GiB of buffer
-      # rather than everything.
-      #
-      # Each worker still READS the whole checkpoint and keeps only its shard --
-      # tt has no sharded-read equivalent of tpu-inference's
-      # K3_SHARDED_EXPERT_STREAMING -- so the cap trades load time for fitting in
-      # RAM. Hence the 4-hour budget, same as tpu-inference-dev build 775.
+      # Generous budget kept from the streamer era; the local mmap load is
+      # expected to be far faster, but a cold XLA compile still follows it.
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       # The CI image sets this to 1, making any compile at request time fatal.
       # The bench serves shapes the warmup sweep does not cover.
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-      # Ray killed workers at ~898/944 GB at three different stream positions
-      # (44%, 58%, 73% in builds 82/85/83). That variance points at reclaimable
-      # page cache being counted as used rather than a deterministic
-      # allocation, so let the kernel reclaim instead of Ray killing. If the
-      # memory is genuinely anonymous this just moves the failure to the kernel
-      # OOM killer, which is no worse and tells us the same thing.
-      RAY_MEMORY_MONITOR_REFRESH_MS: "0"
+      # Bind the checkpoint disk (read-only) into every node container at the
+      # same path, head and workers alike.
+      EXTRA_RO_MOUNT: "/mnt/disks/jiries-disk_data"
     commands:
+      - bash .buildkite/scripts/mount_k3_disk.sh
       - |
         .buildkite/scripts/run_multihost.sh \
-          "vllm serve gs://tpu-commons-ci/moonshootai/kimi/k3 \
+          "vllm serve /mnt/disks/jiries-disk_data/Kimi-K3 \
             --served-model-name moonshotai/Kimi-K3 \
             --port 8000 \
             --tensor-parallel-size 32 \
             --enable-expert-parallel \
-            --max-model-len 4096 \
+            --max-model-len 9216 \
             --max-num-batched-tokens 512 \
             --max-num-seqs 1 \
             --compilation-config '{\"compile_sizes\":[16,64,256,512]}' \
-            --model-loader-extra-config '{\"memory_limit\":17179869184}' \
             --attention-backend CUSTOM \
             --trust-remote-code \
             --language-model-only \
             --limit-mm-per-prompt '{\"image\":0,\"video\":0}' \
             --no-enable-prefix-caching \
             --no-async-scheduling \
-            --load-format runai_streamer \
-            --gpu-memory-utilization 0.9" \
-          "python3 .buildkite/scripts/stage_tokenizer.py \
-             gs://tpu-commons-ci/moonshootai/kimi/k3 /tmp/tok \
-           && vllm bench serve \
+            --gpu-memory-utilization 0.7" \
+          "vllm bench serve \
             --host 127.0.0.1 --port 8000 \
             --model moonshotai/Kimi-K3 \
-            --tokenizer /tmp/tok \
+            --tokenizer /mnt/disks/jiries-disk_data/Kimi-K3 \
             --trust-remote-code \
             --dataset-name random \
-            --random-input-len 1024 \
+            --random-input-len 8192 \
             --random-output-len 1024 \
             --random-range-ratio 0 \
             --num-prompts 10 \

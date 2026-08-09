@@ -146,6 +146,7 @@ cleanup() {
       tail -n 50 "/tmp/worker_${worker_ip}.log"
       rm -f "/tmp/worker_${worker_ip}.log"
     fi
+    # shellcheck disable=SC2029  # client-side expansion intended
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
       "docker rm -f ${CONTAINER_NAME} >/dev/null 2>&1 || true; \
        sudo -n rm -rf /tmp/ray/* >/dev/null 2>&1 || true" || true
@@ -271,6 +272,12 @@ CLUSTER_ENV_ARGS=(
   # let the kernel reclaim instead. Default 250 is Ray's own default.
   -e "RAY_memory_monitor_refresh_ms=${RAY_MEMORY_MONITOR_REFRESH_MS:-250}"
 )
+# Optional read-only bind of a host path (e.g. the staged-checkpoint disk)
+# into every node container at the same path -- head and workers alike, since
+# each Ray worker loads its own weight shard.
+if [[ -n "${EXTRA_RO_MOUNT:-}" ]]; then
+  CLUSTER_ENV_ARGS+=(-v "${EXTRA_RO_MOUNT}:${EXTRA_RO_MOUNT}:ro")
+fi
 eval "declare -a EXTRA_DOCKER_ARGS_ARRAY=(${EXTRA_DOCKER_ARGS:-})"
 
 echo "--- [multihost] Starting Ray head locally"
@@ -292,6 +299,7 @@ sleep 60
 for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   echo "--- [multihost] Starting Ray worker on ${worker_ip}"
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "docker system prune -a --volumes -f" || true
+  # shellcheck disable=SC2029  # client-side expansion intended
   ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
     "mkdir -p ~/vllm-torchtpu/scripts/multihost && mkdir -p ${HOST_HF_HOME}" || true
   base64 < "${TOP_DIR}/scripts/multihost/run_cluster.sh" | \
