@@ -1511,14 +1511,15 @@ class TPUModelRunner(GPUModelRunner):
         if avail <= 0:
             return
 
-        # +1 reserves slot 0 as the null/sentinel block (never handed to a
-        # request); padded tail positions in `mamba_state_indices` also point
-        # here, so their writes can never corrupt an active request's state.
-        # With speculative decoding each request owns a *group* of
-        # `num_spec + 1` consecutive slots so the GDN kernel can checkpoint
-        # the state after every speculative window position (see
-        # `_init_mamba_slot_pool` for the rollback scheme).
-        mamba_num_blocks = self.max_num_reqs * self._mamba_slot_stride + 1
+        # One null/sentinel group plus one group per request, each
+        # `stride = num_spec + 1` slots wide (see `_init_mamba_slot_pool`
+        # for the rollback scheme). The null reservation must be a full
+        # group, not a single slot: under spec decoding the GDN kernel
+        # writes one state checkpoint per verify-window position at
+        # `base + t` — for padded batch rows too, which carry the null
+        # base — so a one-slot null would land padding's checkpoint writes
+        # inside the first request's group and silently corrupt its state.
+        mamba_num_blocks = (self.max_num_reqs + 1) * self._mamba_slot_stride
 
         avail_per_tensor = avail // group_size
         mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
@@ -1565,10 +1566,15 @@ class TPUModelRunner(GPUModelRunner):
     def _init_mamba_slot_pool(self, mamba_num_blocks: int) -> None:
         """(Re)initialize the per-request mamba recurrent-slot allocator.
 
-        Slot 0 is the null/sentinel block (used for padded persistent-batch
-        positions and never handed to a request). Usable slots are
-        `[1, mamba_num_blocks)`, popped from the high end so the first request
-        gets slot 1 (stable pool ordering for easier debugging).
+        Slots `[0, stride)` are the null/sentinel group (padded
+        persistent-batch positions carry base slot 0 and are never handed to
+        a request). The null reservation is a full group, not one slot: the
+        GDN kernel writes a checkpoint per verify-window position at
+        `base + t` for every batch row, padded rows included, so a one-slot
+        null would put padding's checkpoint writes inside the first
+        request's group. Usable groups start at `stride`, popped from the
+        high end so the first request gets the lowest base (stable pool
+        ordering for easier debugging).
         Called once after KV cache allocation, when the true mamba block count
         is known. The mapping itself is keyed on req_id and rebuilt lazily in
         `_build_mamba_state_indices`, so re-init only resets the free pool.
@@ -1583,10 +1589,10 @@ class TPUModelRunner(GPUModelRunner):
         original layout.
         """
         stride = self._mamba_slot_stride
-        num_groups = (mamba_num_blocks - 1) // stride
+        num_groups = (mamba_num_blocks - stride) // stride
         self._mamba_slot_by_req_id = {}
         self._free_mamba_slots = [
-            1 + g * stride for g in reversed(range(num_groups))
+            stride * (g + 1) for g in reversed(range(num_groups))
         ]
         self._has_mamba_state = True
 
@@ -4509,6 +4515,18 @@ class TPUModelRunner(GPUModelRunner):
         for group in self.kv_cache_config.kv_cache_groups:
             gbs = int(group.kv_cache_spec.block_size)
             g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
+            if (isinstance(group.kv_cache_spec, MambaSpec)
+                    and not self._unified_kv_layout):
+                # Compact/per-layer layout: mamba state is addressed through
+                # the slot pool, never through block-table values, and the
+                # mamba tensor physically has only `_mamba_num_blocks` rows
+                # (far fewer than the attention pool's `num_blocks`).
+                # Top-of-pool ids here are out of physical range for any
+                # consumer, so hand the group null rows instead. The unified
+                # pool keeps real ids: there the state genuinely lives in
+                # the named pool blocks.
+                block_ids_per_group.append([0] * g_nblk)
+                continue
             block_ids_per_group.append(list(range(top - g_nblk, top)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:

@@ -1622,6 +1622,38 @@ class TestCompactMambaSlotPool:
         # Padded tail points at the null slot (0).
         assert idx[2] == 0 and idx[3] == 0
 
+    def test_spec_null_group_is_disjoint_from_request_checkpoints(self):
+        """With spec decoding the null reservation is a full K+1 group.
+
+        The GDN kernel writes one state checkpoint per verify-window
+        position at `base + t` for every batch row — padded rows included,
+        and those carry base slot 0. A one-slot null therefore put
+        padding's checkpoint writes at slots 1..K, inside the FIRST
+        request's group, silently stomping its state every verify step.
+        Request bases must start at `stride`, leaving `[0, stride)` to the
+        null group.
+        """
+        stride = 3  # K = 2
+        mamba_num_blocks = (4 + 1) * stride  # null group + 4 request groups
+        runner = self._make_runner(max_num_reqs=4,
+                                   mamba_num_blocks=mamba_num_blocks,
+                                   slot_stride=stride)
+        runner._init_mamba_slot_pool(mamba_num_blocks)
+
+        # Full capacity survives the wider null reservation.
+        assert len(runner._free_mamba_slots) == 4
+        for base in runner._free_mamba_slots:
+            # Every checkpoint of every group clears the null group...
+            assert base >= stride
+            # ...and stays inside the allocated pool.
+            assert base + stride <= mamba_num_blocks
+
+        # The first request gets the lowest base — one full group above
+        # null, so even its checkpoint at t = stride - 1 is its own.
+        self._set_batch(runner, ["a"])
+        idx = runner._build_mamba_state_indices(0, 1, 4).cpu()
+        assert int(idx[0]) == stride
+
     def test_idle_dp_rank_gets_all_null_slots(self):
         """An idle DP rank asks for the coordinated shape with an empty batch.
 
