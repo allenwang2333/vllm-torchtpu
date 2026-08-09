@@ -158,15 +158,15 @@ def load_mmmu_samples(
             for config in configs:
                 if limit > 0 and len(samples) >= limit:
                     break
-                try:
-                    ds = load_dataset(target_ds, config, split="test")
-                except Exception:  # noqa: BLE001
+                ds = None
+                for split_name in ["validation", "test", "dev"]:
                     try:
-                        ds = load_dataset(target_ds,
-                                          config,
-                                          split="validation")
-                    except Exception:  # noqa: BLE001, S112
+                        ds = load_dataset(target_ds, config, split=split_name)
+                        break
+                    except Exception:  # noqa: BLE001
                         continue
+                if ds is None:
+                    continue
                 for item in ds:
                     if limit > 0 and len(samples) >= limit:
                         break
@@ -191,6 +191,8 @@ def load_mmmu_samples(
                         options = []
 
                     answer = str(item.get("answer", "")).strip().upper()
+                    if not answer or answer in ("NONE", "UNKNOWN"):
+                        continue
                     samples.append({
                         "id":
                         item.get("id", f"mmmu_pro_{len(samples)}"),
@@ -205,6 +207,16 @@ def load_mmmu_samples(
                         "image":
                         images[0],
                     })
+
+            # If MMMU_Pro has no labeled split with answers, fall back to MMMU/MMMU validation split
+            if not samples:
+                print(
+                    "MMMU_Pro contains no labeled samples with answers; falling back to MMMU/MMMU validation split..."
+                )
+                return load_mmmu_samples("MMMU/MMMU",
+                                         limit=limit,
+                                         allow_synthetic=allow_synthetic,
+                                         config_name=config_name)
         else:
             # Standard MMMU multi-domain dataset loading
             target_ds = "MMMU/MMMU"
@@ -245,6 +257,8 @@ def load_mmmu_samples(
                         options = []
 
                     answer = str(item.get("answer", "")).strip().upper()
+                    if not answer or answer in ("NONE", "UNKNOWN"):
+                        continue
 
                     samples.append({
                         "id":
@@ -260,7 +274,7 @@ def load_mmmu_samples(
                     })
         if not samples:
             raise RuntimeError(
-                f"No valid samples loaded from HuggingFace {dataset_name} dataset."
+                f"No valid samples with answers loaded from HuggingFace {dataset_name} dataset."
             )
         print(
             f"Successfully loaded {len(samples)} HuggingFace {dataset_name} samples."
@@ -281,8 +295,8 @@ def load_mmmu_samples(
         choices = ["A", "B", "C", "D"]
         colors = ["red", "blue", "green", "yellow"]
         for i in range(min(limit, 20)):
-            color = colors[i % 4]
-            img = Image.new("RGB", (224, 224), color=color)
+            color = choices[i % 4]
+            img = Image.new("RGB", (224, 224), color=colors[i % 4])
             samples.append({
                 "id":
                 f"synthetic_{i}",
@@ -291,7 +305,7 @@ def load_mmmu_samples(
                  " Red\n(B) Blue\n(C) Green\n(D) Yellow"),
                 "options": ["Red", "Blue", "Green", "Yellow"],
                 "answer":
-                choices[i % 4],
+                color,
                 "image":
                 img,
             })
@@ -302,6 +316,10 @@ def evaluate_sample(sample: dict, host: str, port: int,
                     model: str) -> tuple[bool, str, str]:
     """Send a single multimodal request to vLLM /v1/chat/completions."""
     url = f"http://{host}:{port}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer EMPTY",
+    }
     img_b64 = encode_image_base64(sample["image"])
 
     question_clean = re.sub(r"<image \d+>", "", sample["question"]).strip()
@@ -347,7 +365,10 @@ def evaluate_sample(sample: dict, host: str, port: int,
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(url, json=payload, timeout=600)
+            resp = requests.post(url,
+                                 headers=headers,
+                                 json=payload,
+                                 timeout=600)
             if resp.status_code == 200:
                 res_json = resp.json()
                 generated_text = res_json["choices"][0]["message"]["content"]
