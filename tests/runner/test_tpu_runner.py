@@ -1846,7 +1846,12 @@ def test_dsv4_is_cache_for_ds_v4_predicate():
 
 
 def test_dsv4_compressor_state_cache_aliasing():
-    """Verify _alias_ds_v4_auxiliary_caches aliases compressor state caches to host k_cache."""
+    """Verify compressor state caches are planned as overlays and aliased.
+
+    The overlay must be planned from layer NAMES alone, before any allocation:
+    an overlaid cache that gets its own array still costs its HBM at peak, even
+    though the alias frees it immediately afterwards.
+    """
     from vllm.models.deepseek_v4.compressor import CompressorStateCache
 
     mock_runner = MagicMock()
@@ -1859,14 +1864,29 @@ def test_dsv4_compressor_state_cache_aliasing():
     mock_runner.vllm_config.compilation_config.static_forward_context[
         layer_name] = compressor_mock
 
-    host_tensor = torch.zeros(10, 512)
-    kv_caches = {
-        layer_name: torch.ones(10, 512),
-        host_name: host_tensor,
-    }
+    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
+        mock_runner, [layer_name, host_name])
+    assert overlay == {layer_name: host_name}
 
-    TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner, kv_caches)
+    host_tensor = torch.zeros(10, 512)
+    kv_caches = {host_name: host_tensor}
+
+    TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner, kv_caches,
+                                                 overlay)
     assert kv_caches[layer_name] is host_tensor
+
+
+def test_dsv4_indexer_state_cache_overlay_targets_k_cache():
+    """An indexer's compressor state cache overlays the indexer's k_cache."""
+    mock_runner = MagicMock()
+    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+
+    layer_name = "model.layers.0.attn.indexer.compressor.state_cache"
+    host_name = "model.layers.0.attn.indexer.k_cache"
+
+    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
+        mock_runner, [layer_name, host_name])
+    assert overlay == {layer_name: host_name}
 
 
 def test_tpu_platform_mla_block_size_override():

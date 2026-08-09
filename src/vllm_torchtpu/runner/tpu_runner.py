@@ -8,12 +8,13 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import math
 import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
-from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -975,12 +976,50 @@ class TPUModelRunner(GPUModelRunner):
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        return normalize_kv_cache_specs_for_tpu(
+        normalized_spec = normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
         )
+        # Dump here, not only in `initialize_kv_cache`: vLLM's startup budget
+        # check (`_check_enough_kv_cache_memory`) runs between the two, so on
+        # the configs that matter most -- the ones that fail to start -- the
+        # later dump never executes and the specs stay invisible.
+        if os.getenv("DSV4_DUMP_KV_PLAN") == "1":
+            self._log_kv_spec_budget(normalized_spec, ds_v4_layers)
+        return normalized_spec
+
+    def _log_kv_spec_budget(self, specs: dict[str, KVCacheSpec],
+                            ds_v4_layers: set[str]) -> None:
+        """Log what vLLM will bill each spec for one max-length request."""
+        total = 0
+        for name in sorted(specs):
+            spec = specs[name]
+            try:
+                billed = spec.max_memory_usage_bytes(self.vllm_config)
+            except Exception as exc:  # pragma: no cover - debug path only
+                billed_str: object = f"ERR({exc})"
+            else:
+                total += billed
+                billed_str = billed
+            logger.info(
+                "[DSV4_KVPLAN_DEBUG] prealloc %s type=%s exempt=%s "
+                "block_size=%s storage=%s head=%s head_v=%s window=%s "
+                "page=%s padded=%s max_mem=%s", name,
+                type(spec).__name__, name in ds_v4_layers,
+                getattr(spec, "block_size", None),
+                getattr(spec, "storage_block_size", None),
+                getattr(spec, "head_size", None),
+                getattr(spec, "head_size_v", None),
+                getattr(spec, "sliding_window", None),
+                getattr(spec, "page_size_bytes", None),
+                getattr(spec, "page_size_padded", None), billed_str)
+        logger.info(
+            "[DSV4_KVPLAN_DEBUG] prealloc billed total=%d (%.2f GiB) at "
+            "max_model_len=%s max_in_flight_tokens=%s", total,
+            total / (1 << 30), self.vllm_config.model_config.max_model_len,
+            getattr(self.vllm_config, "max_in_flight_tokens", None))
 
     @staticmethod
     def _validate_shared_kv_cache_layout(
@@ -1095,13 +1134,24 @@ class TPUModelRunner(GPUModelRunner):
                     "allocated.")
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-    def _alias_ds_v4_auxiliary_caches(
-            self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Point DeepSeek-V4 compressor state caches at their host's tensor."""
+    def _plan_ds_v4_auxiliary_overlay(
+            self, layer_names: Iterable[str]) -> dict[str, str]:
+        """Map each DSv4 compressor state cache to the layer it overlays.
+
+        Planned BEFORE allocation, like the SWA overlay, because an overlaid
+        cache must never get an array of its own. Allocating one and aliasing
+        it afterwards still pays for it: every array in the allocation loop is
+        live simultaneously, so peak HBM includes the orphans even though they
+        are freed a moment later. Measured: the state caches are ~3.77 MiB of
+        a ~9.5 MiB per-block peak against the 6.09 MiB/block vLLM used to size
+        `num_blocks` -- i.e. the difference between fitting and dying in
+        `initialize_kv_cache` at long contexts.
+        """
         static_forward_context = (
             self.vllm_config.compilation_config.static_forward_context)
         state_suffix = ".compressor.state_cache"
-        for layer_name in list(kv_caches.keys()):
+        overlay: dict[str, str] = {}
+        for layer_name in layer_names:
             attn_module = static_forward_context.get(layer_name)
             if isinstance(
                     attn_module,
@@ -1109,11 +1159,14 @@ class TPUModelRunner(GPUModelRunner):
                 assert layer_name.endswith(state_suffix), layer_name
                 base = layer_name[:-len(state_suffix)]
                 # Map compressor state cache layer name to host attention layer's k_cache.
-                host_layer_name = base + ".k_cache" if base.endswith(
-                    ".indexer") else base
-            else:
-                continue
+                overlay[layer_name] = (base + ".k_cache"
+                                       if base.endswith(".indexer") else base)
+        return overlay
 
+    def _alias_ds_v4_auxiliary_caches(self, kv_caches: dict[str, torch.Tensor],
+                                      overlay: dict[str, str]) -> None:
+        """Point DeepSeek-V4 compressor state caches at their host's tensor."""
+        for layer_name, host_layer_name in overlay.items():
             if host_layer_name not in kv_caches:
                 raise ValueError(
                     "DeepSeek-V4 auxiliary cache has no host KV layer to overlay: "
@@ -4616,21 +4669,75 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("[DSV4_KVPLAN_DEBUG] num_blocks=%s cache_bs=%s",
                         kv_cache_config.num_blocks,
                         self.cache_config.block_size)
+            # Group structure drives vLLM's startup budget estimate far more
+            # than the per-spec geometry does: `_max_memory_usage_bytes_from_groups`
+            # takes an exact-sum branch for a single uniform group, but a
+            # multiplicative one for several (each group billed for the GLOBAL
+            # max layer-tuple count times the summed page sizes). That is the
+            # whole ~62x over-estimate, so the group count and per-group tuple
+            # counts are the numbers to look at first.
+            _groups = getattr(kv_cache_config, "kv_cache_groups", []) or []
+            logger.info("[DSV4_KVPLAN_DEBUG] num_kv_cache_groups=%d",
+                        len(_groups))
+            for _gi, _g in enumerate(_groups):
+                _gs = getattr(_g, "kv_cache_spec", None)
+                _tuples = None
+                if hasattr(_gs, "get_num_layer_tuples"):
+                    try:
+                        _tuples = _gs.get_num_layer_tuples()
+                    except Exception:  # pragma: no cover - debug path only
+                        _tuples = "ERR"
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] group %d spec_type=%s layers=%d "
+                    "layer_tuples=%s", _gi,
+                    type(_gs).__name__, len(getattr(_g, "layer_names", [])),
+                    _tuples)
+            # `max_mem` is what vLLM's startup budget check actually bills this
+            # spec for one max-length request (`_check_enough_kv_cache_memory`).
+            # It is the number that decides whether the engine starts at all,
+            # and it is not derivable from the geometry above by eye:
+            # SlidingWindowSpec bills `block_size` rows (not
+            # `storage_block_size`) and counts `head_size + head_size_v`, so a
+            # small-`block_size` spec is billed per token, not per page.
+            _total_max_mem = 0
             for _name in sorted(layer_name_to_spec):
                 _s2 = _per_layer_spec(_name)
+                try:
+                    _max_mem = _s2.max_memory_usage_bytes(self.vllm_config)
+                except Exception as _e:  # pragma: no cover - debug path only
+                    _max_mem = f"ERR({_e})"
+                else:
+                    _total_max_mem += _max_mem
                 logger.info(
                     "[DSV4_KVPLAN_DEBUG] spec %s type=%s block_size=%s "
-                    "storage=%s ratio=%s head=%s dtype=%s", _name,
+                    "storage=%s ratio=%s head=%s head_v=%s window=%s dtype=%s "
+                    "page=%s padded=%s max_mem=%s", _name,
                     type(_s2).__name__, getattr(_s2, "block_size", None),
                     getattr(_s2, "storage_block_size", None),
                     getattr(_s2, "compress_ratio", None),
                     getattr(_s2, "head_size", None),
-                    getattr(_s2, "dtype", None))
+                    getattr(_s2, "head_size_v", None),
+                    getattr(_s2, "sliding_window", None),
+                    getattr(_s2, "dtype", None),
+                    getattr(_s2, "page_size_bytes", None),
+                    getattr(_s2, "page_size_padded", None), _max_mem)
+            logger.info(
+                "[DSV4_KVPLAN_DEBUG] billed max_memory_usage_bytes total=%d "
+                "(%.2f GiB) at max_model_len=%s", _total_max_mem,
+                _total_max_mem / (1 << 30),
+                self.vllm_config.model_config.max_model_len)
 
         # Resolve the DSv4 SWA overlay *before* allocating: a layer that
         # overlays a host must never get an array of its own, or the memory
         # vLLM's `num_blocks` budget assumes is shared gets spent twice and the
         # orphan is left to the allocator to reclaim.
+        # Compressor/indexer state caches overlay a host array too. Planned
+        # here so the allocation loop can SKIP them: allocating and aliasing
+        # afterwards still spends their HBM at peak (see
+        # `_plan_ds_v4_auxiliary_overlay`).
+        ds_v4_aux_overlay = self._plan_ds_v4_auxiliary_overlay(
+            layer_name_to_spec.keys())
+
         ds_v4_swa_overlay = self._plan_ds_v4_swa_overlay(
             kv_cache_config,
             _per_layer_spec,
@@ -4643,6 +4750,62 @@ class TPUModelRunner(GPUModelRunner):
                 head_size_is_packed_width=True,
             ),
         )
+
+        # PLAN THE ALLOCATION BEFORE MAKING IT. Every byte below is knowable
+        # without touching the device, and when the totals disagree the run
+        # dies mid-allocation with an error that names only the one buffer that
+        # happened to be last ("Attempting to allocate 1.13G"), never the
+        # mismatch. Post-allocation logging cannot report this: it never runs.
+        if os.getenv("DSV4_DUMP_KV_PLAN") == "1":
+            _plan_total = 0
+            _budget_total = 0
+            _n_tensors = 0
+            _shared_hist: dict[int, int] = {}
+            for _t in kv_cache_config.kv_cache_tensors:
+                _n_tensors += 1
+                _shared = getattr(_t, "shared_by", []) or []
+                _shared_hist[len(_shared)] = _shared_hist.get(len(_shared),
+                                                              0) + 1
+                _budget_total += getattr(_t, "size", 0) or 0
+                _seen_shapes: set[tuple] = set()
+                for _n in _shared:
+                    if _n in ds_v4_swa_overlay or _n in ds_v4_aux_overlay:
+                        continue  # aliased onto a host array, allocates nothing
+                    _sp = _per_layer_spec(_n)
+                    if isinstance(_sp, MambaSpec):
+                        continue
+                    if isinstance(_sp,
+                                  (MLAAttentionSpec, SlidingWindowMLASpec)):
+                        _shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks,
+                            _sp.storage_block_size,
+                            _sp.num_kv_heads,
+                            _sp.head_size,
+                            _sp.dtype,
+                            head_size_is_packed_width=True)
+                    elif isinstance(_sp, AttentionSpec):
+                        _shape = PallasAttentionBackend.get_kv_cache_shape(
+                            kv_cache_config.num_blocks, _sp.block_size,
+                            _sp.num_kv_heads, _sp.head_size, _sp.dtype)
+                    else:
+                        continue
+                    if tuple(_shape) in _seen_shapes:
+                        continue  # shares the array made for this tensor
+                    _seen_shapes.add(tuple(_shape))
+                    _nbytes = math.prod(_shape) * torch.empty(
+                        (), dtype=_sp.dtype).element_size()
+                    _plan_total += _nbytes
+            logger.info(
+                "[DSV4_KVPLAN_DEBUG] PLAN: %d kv_cache_tensors, shared_by "
+                "histogram=%s, num_blocks=%d", _n_tensors,
+                sorted(_shared_hist.items()), kv_cache_config.num_blocks)
+            logger.info(
+                "[DSV4_KVPLAN_DEBUG] PLAN: will allocate %.2f GiB against a "
+                "%.2f GiB budget = %.2fx %s", _plan_total / (1 << 30),
+                _budget_total / (1 << 30),
+                (_plan_total /
+                 _budget_total) if _budget_total else float("nan"),
+                "OK" if _plan_total <= _budget_total else "OVER-ALLOCATING")
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # If the KV cache tensor is shared by multiple layers, then we
@@ -4697,8 +4860,42 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 num_blocks = kv_cache_config.num_blocks
 
+            # ONE array per KVCacheTensor, shared by every layer in
+            # `shared_by` -- matching the reference
+            # (`tpu_inference/runner/kv_cache_manager.py:914`, `if j == 0 or
+            # duplicate_shared_layers`). vLLM sized `num_blocks` from
+            # `kv_cache_tensor.size`, which budgets ONE array for the whole
+            # `shared_by` set; giving each layer its own spends that budget
+            # once per layer. Measured 12.66 MiB/block allocated against the
+            # 6.09 MiB/block vLLM assumed (~2.08x), which overcommits HBM and
+            # dies right here at long contexts.
+            #
+            # Mamba keeps per-layer duplication: its states are per-layer by
+            # construction, and the `num_blocks` above was already derived from
+            # the summed group page size for that case.
+            _duplicate_shared = (len(shared_by) > 1 and any(
+                isinstance(layer_name_to_spec[name], MambaSpec)
+                for name in shared_by))
+            _shared_arrays: dict[tuple, torch.Tensor] = {}
+
+            def _alloc_or_share(shape, dtype, _cache=_shared_arrays):
+                """Allocate, or reuse the array already made for this tensor.
+
+                Keyed on (shape, dtype): layers sharing a KVCacheTensor are
+                expected to agree on geometry, and a mismatch means they cannot
+                share one array -- so it allocates rather than silently
+                aliasing incompatible layouts.
+                """
+                key = (tuple(shape), dtype)
+                if not _duplicate_shared and key in _cache:
+                    return _cache[key]
+                arr = torch.zeros(shape, dtype=dtype).to(self.device)
+                _cache[key] = arr
+                return arr
+
             for layer_name in shared_by:
-                if layer_name in ds_v4_swa_overlay:
+                if (layer_name in ds_v4_swa_overlay
+                        or layer_name in ds_v4_aux_overlay):
                     # Overlays a compressed-KV array; aliased after this loop
                     # once every host exists.
                     continue
@@ -4759,8 +4956,7 @@ class TPUModelRunner(GPUModelRunner):
                         head_size_is_packed_width=True,
                     )
                     dtype = kv_cache_spec.dtype
-                    tpu_kv_cache = torch.zeros(kv_cache_shape,
-                                               dtype=dtype).to(self.device)
+                    tpu_kv_cache = _alloc_or_share(kv_cache_shape, dtype)
 
                     kv_caches[layer_name] = tpu_kv_cache
                 elif isinstance(kv_cache_spec, AttentionSpec):
@@ -4780,8 +4976,7 @@ class TPUModelRunner(GPUModelRunner):
                         kv_cache_spec.dtype,
                     )
                     dtype = kv_cache_spec.dtype
-                    tpu_kv_cache = torch.zeros(kv_cache_shape,
-                                               dtype=dtype).to(self.device)
+                    tpu_kv_cache = _alloc_or_share(kv_cache_shape, dtype)
 
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
@@ -4818,8 +5013,75 @@ class TPUModelRunner(GPUModelRunner):
                     _seen[_ptr] if _seen[_ptr] != _name else "-")
             logger.info("[DSV4_KVPLAN_DEBUG] unique KV bytes=%d (%.2f GiB)",
                         _total, _total / (1 << 30))
+            # THE comparison. What we actually allocated, against what vLLM's
+            # block budget assumed we would. These must agree; when they do not,
+            # vLLM sizes `num_blocks` to fill available memory, we allocate the
+            # ratio more, and startup dies in an allocation whose own error
+            # message ("Attempting to allocate 910.62M") says nothing about why.
+            #
+            # This was observable and ignored for an entire debugging session:
+            # 68.50 GiB allocated against a 37.64 GiB budget, printed in the
+            # same log, while the theory under test was that the pool was
+            # merely a little too large. Log the ratio, not the two numbers.
+            # vLLM states the byte size it intends for each tensor in
+            # `kv_cache_config.kv_cache_tensors`; that is the authoritative
+            # budget, and `num_blocks` was derived to make it fit in HBM.
+            _budget = 0
+            for _t in getattr(kv_cache_config, "kv_cache_tensors", []) or []:
+                _budget += getattr(_t, "size", 0) or 0
+            if _budget:
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] allocated/budget = %.2f GiB / "
+                    "%.2f GiB = %.2fx %s", _total / (1 << 30),
+                    _budget / (1 << 30), _total / _budget,
+                    "OK" if _total <= _budget else "OVER-ALLOCATING")
+            else:
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] allocated=%.2f GiB, no "
+                    "kv_cache_tensors budget to compare against",
+                    _total / (1 << 30))
 
-        self._alias_ds_v4_auxiliary_caches(kv_caches)
+            # Attribution: WHY we are over the budget, not just that we are.
+            # vLLM budgets one tensor per `KVCacheTensor`, shared by every layer
+            # in `shared_by`. DSv4 shares tensors two ways (the SWA overlay and
+            # compressor-state aliasing), so a layer that was supposed to reuse
+            # its host's array but got its own spends shared memory twice.
+            # Report, per tensor: what vLLM budgeted, what those layers actually
+            # hold, and how many distinct arrays they turned into (>1 means the
+            # sharing did not happen).
+            _by_kind: dict[str, list[int]] = {}
+            for _t in getattr(kv_cache_config, "kv_cache_tensors", []) or []:
+                _names = [
+                    n for n in (getattr(_t, "shared_by", []) or [])
+                    if isinstance(kv_caches.get(n), torch.Tensor)
+                ]
+                if not _names:
+                    continue
+                _ptrs = {kv_caches[n].data_ptr() for n in _names}
+                _alloc = sum(
+                    kv_caches[n].numel() * kv_caches[n].element_size()
+                    for n in {kv_caches[n].data_ptr(): n
+                              for n in _names}.values())
+                _want = getattr(_t, "size", 0) or 0
+                _kind = type(_per_layer_spec(_names[0])).__name__
+                _by_kind.setdefault(_kind, [0, 0, 0])
+                _by_kind[_kind][0] += _want
+                _by_kind[_kind][1] += _alloc
+                _by_kind[_kind][2] += len(_ptrs)
+                if _want and _alloc > _want:
+                    logger.info(
+                        "[DSV4_KVPLAN_DEBUG] OVER tensor shared_by=%d "
+                        "distinct_arrays=%d budget=%d alloc=%d (%.2fx) "
+                        "first=%s", len(_names), len(_ptrs), _want, _alloc,
+                        _alloc / _want, _names[0])
+            for _kind, (_w, _a, _arrays) in sorted(_by_kind.items()):
+                logger.info(
+                    "[DSV4_KVPLAN_DEBUG] by-spec %s budget=%.2f GiB "
+                    "alloc=%.2f GiB ratio=%s distinct_arrays=%d", _kind,
+                    _w / (1 << 30), _a / (1 << 30),
+                    f"{_a / _w:.2f}x" if _w else "n/a", _arrays)
+
+        self._alias_ds_v4_auxiliary_caches(kv_caches, ds_v4_aux_overlay)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         # Mark KV cache buffers as donation candidates outside torch.compile
