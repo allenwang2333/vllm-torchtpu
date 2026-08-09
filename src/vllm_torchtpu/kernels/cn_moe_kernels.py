@@ -452,11 +452,11 @@ def _cn_w1w2_fused_token_kernel_fp8(
 
     # ---- Seed phase: prefetch the first NBUF experts (scalar-prefetch only) ----
     gj0 = pl.multiple_of(ids_ref[0], 1)
-    _start_all_dma(gj0, jnp.int32(0), jnp.int32(0), **all_dma_kw)
+    _start_all_dma(gj0, 0, 0, **all_dma_kw)
     for d in range(1, NBUF):
         seed_gj = seed_experts_ref[d]
-        buf_d_w1 = jnp.int32(d % NBUF_W1_)
-        buf_d_w2 = jnp.int32(d % NBUF_W2_)
+        buf_d_w1 = d % NBUF_W1_
+        buf_d_w2 = d % NBUF_W2_
 
         @pl.when(seed_gj >= 0)
         def _(sgj=seed_gj, bw1=buf_d_w1, bw2=buf_d_w2):
