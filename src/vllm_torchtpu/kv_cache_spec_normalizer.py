@@ -35,9 +35,11 @@ def _normalize_one_spec(
         return spec
 
     if isinstance(spec, MLAAttentionSpec) and not spec.dtype.is_floating_point:
-        # Byte-typed MLA caches (DSA indexer K rows) keep their declared
-        # dtype; the fp8/bf16 KV normalization does not apply. Regular
-        # attention specs marked uint8 (vLLM's fp8-KV convention) still
+        # An integer-typed MLA cache is a packed layout: quantized float KV
+        # values and their scale factors share one byte row (DSA indexer K
+        # rows). That layout is fixed by the kernel reading it, so the fp8/bf16
+        # KV normalization must not retype it -- keep the declared dtype.
+        # Regular attention specs marked uint8 (vLLM's fp8-KV convention) still
         # normalize to the TPU fp8 dtype below.
         kv_cache_dtype = spec.dtype
 

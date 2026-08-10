@@ -39,9 +39,12 @@ import pytest
 import torch
 import vllm.model_executor.custom_op as custom_op_mod
 import vllm.model_executor.layers.linear as linear_mod
+import vllm.model_executor.models.deepseek_v2 as deepseek_v2
 import vllm.model_executor.parameter as parameter_mod
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.models.deepseek_v2 import (DeepseekV32IndexerCache,
+                                                    Indexer)
 
 from vllm_torchtpu.layers.vllm.custom_ops import mla_attention_op
 
@@ -58,10 +61,16 @@ MAX_MODEL_LEN = 256
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
 
 
-class _StubIndexerCache:
-    """Stands in for `DeepseekV32IndexerCache` (needs a real KV cache config)."""
+class _StubIndexerCache(DeepseekV32IndexerCache):
+    """Stands in for `DeepseekV32IndexerCache` (needs a real KV cache config).
+
+    Subclasses the real cache so `VllmTPUIndexer.rebind` can retype it --
+    `__class__` assignment requires a compatible instance layout -- but skips
+    its `__init__`, which registers into `static_forward_context`.
+    """
 
     def __init__(self, head_dim, dtype, prefix, cache_config):
+        torch.nn.Module.__init__(self)
         self.head_dim = head_dim
         self.dtype = dtype
         self.prefix = prefix
@@ -116,9 +125,13 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
                                      -1,
                                      dtype=torch.int32)
 
-    with patch.object(mla_attention_op, "DeepseekV32IndexerCache",
+    # `VllmTPUIndexer` has no `__init__`: it is a retype of an in-tree `Indexer`
+    # that `DeepseekV2MLAAttention` has already built. So build the in-tree
+    # layer -- stubbing the collaborators where *it* looks them up -- and then
+    # rebind, exactly as `VllmTPUMultiHeadLatentAttentionWrapper` does.
+    with patch.object(deepseek_v2, "DeepseekV32IndexerCache",
                       _StubIndexerCache), \
-         patch.object(mla_attention_op, "VllmTPUSparseAttnIndexer",
+         patch.object(deepseek_v2, "SparseAttnIndexer",
                       _RecordingIndexerOp), \
          patch.object(linear_mod, "get_tensor_model_parallel_rank",
                       lambda: 0), \
@@ -129,7 +142,7 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
          patch.object(parameter_mod, "get_tensor_model_parallel_world_size",
                       lambda: 1), \
          _default_dtype(dtype):
-        return mla_attention_op.VllmTPUIndexer(
+        indexer = Indexer(
             vllm_config=vllm_config,
             config=config,
             hidden_size=HIDDEN_SIZE,
@@ -139,6 +152,7 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
             topk_indices_buffer=topk_indices_buffer,
             prefix="model.layers.0.self_attn.indexer",
         )
+        return mla_attention_op.VllmTPUIndexer.rebind(indexer)
 
 
 def _randomize(layer, seed=0):

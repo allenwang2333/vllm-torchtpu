@@ -13,7 +13,7 @@
 # limitations under the License.
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
-from typing import Any
+from typing import cast, Any
 
 import jax
 import jax.numpy as jnp
@@ -42,40 +42,21 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import (DeepseekV32IndexerCache,
                                                     Indexer)
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
-from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
+from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
+                                                 VllmTPUDeepseekV32IndexerBackend)
 
-# streamindex_topk block-tuning knobs; bkv pages/block must keep
-# page_size * bkv_p a multiple of 128 (TPU DMA constraint).
-# bq is capped at 16: with k=2048 and 128 index heads the in-kernel top-k
-# merge spills ~2.8M of registers per query row, so bq=32 needs ~93M of
-# vmem (> 64M) while bq=16 fits.
+# streamindex_topk block-tuning knobs. NOT tuned: these are the first values
+# found to fit, not the result of a sweep -- benchmark before reading anything
+# into the kernel's throughput.
 STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
 STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
 
-
-def _per_token_group_quant_fp8(
-        x: torch.Tensor,
-        group_size: int = 128,
-        use_ue8m0: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """Block fp8 quantization of `x` over its last axis.
-
-    Thin wrapper over the shared reference quantizer. With `use_ue8m0` the
-    scale is a power of two returned as its e8m0 bit pattern (biased exponent,
-    1 byte/group), so it can be packed next to the fp8 values and bitcast to
-    float8_e8m0fnu inside the TPU kernel; otherwise it is an fp32 scale.
-    """
-    return quantize_tensor(
-        x,
-        torch.float8_e4m3fn,
-        axis=-1,
-        block_size=group_size,
-        use_ue8m0=use_ue8m0,
-    )
 
 
 @SparseAttnIndexer.register_oot
@@ -109,8 +90,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             k_packed = jnp.pad(k_packed,
                                ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
-            # Fused insert (TPU metadata has no slot_mapping): same position
-            # formula and OOB-drop contract as _update_kv_cache_slots.
+            # Insert this step's K rows into the KV cache.
             tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
             seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
                                       side="right").astype(jnp.int32)
@@ -172,9 +152,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}")
 
-        k_quant, k_scale = _per_token_group_quant_fp8(k,
-                                                      self.quant_block_size,
-                                                      use_ue8m0=True)
+        k_quant, k_scale = quantize_tensor(
+            k,
+            torch.float8_e4m3fn,
+            axis=-1,
+            use_ue8m0=True,
+        )
         # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
         # layout the TPU kernel unpacks (head_dim value bytes + 1 scale byte).
         # cat requires a single dtype, so view the fp8 values as raw bytes.
@@ -216,84 +199,41 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return self.topk_indices_buffer
 
 
+class VllmTPUIndexerCache(DeepseekV32IndexerCache):
+    """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
+
+    def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
+        return VllmTPUDeepseekV32IndexerBackend
+
+
 class VllmTPUIndexer(Indexer):
-    """TPU-optimized out-of-tree wrapper for Indexer."""
+    """TPU-optimized out-of-tree wrapper for Indexer.
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        config: DeepseekV2Config | DeepseekV3Config,
-        hidden_size: int,
-        q_lora_rank: int,
-        quant_config: QuantizationConfig | None,
-        cache_config: CacheConfig | None,
-        topk_indices_buffer: torch.Tensor | None,
-        prefix: str = "",
-        is_inplace_rope: bool = False,
-    ):
-        super(Indexer, self).__init__()
-        self.vllm_config = vllm_config
-        self.config = config
-        self.quant_config = quant_config
-        self.topk_tokens = config.index_topk
-        self.n_head = config.index_n_heads  # 64
-        self.head_dim = config.index_head_dim  # 128
-        self.rope_dim = config.qk_rope_head_dim  # 64
-        self.q_lora_rank = q_lora_rank  # 1536
-        # no tensor parallel, just replicated
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.head_dim * self.n_head,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wq_b",
-        )
-        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].
-        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.head_dim, self.n_head],
-            bias=False,
-            quant_config=None,
-            disable_tp=True,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
-        self.softmax_scale = self.head_dim**-0.5
+    Never constructed directly. `Indexer` is neither a `CustomOp` nor a
+    `PluggableLayer`, so it has no `register_oot` hook, and
+    `DeepseekV2MLAAttention` builds it before this plugin sees it. `rebind`
+    retypes the finished instance in place: state is preserved, method lookup
+    moves to this class.
+    """
 
-        self.scale_fmt = "ue8m0"
-
-        # streamindex_topk kernel limitaiton quant_block_size must be same with head_dim
-        self.quant_block_size = self.head_dim  # TODO: get from config
-        self.topk_indices_buffer = topk_indices_buffer
-
-        # NOTE: (lenscloth) we use fp8 naive cache,
-        #  where we store value in fp8 and scale in fp8 since we use ue8m0 format,
-        #  so we need to store 1 extra scale value per self.quant_block_size element
-        self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim +
-            self.head_dim // self.quant_block_size * 1,
-            dtype=torch.uint8,
-            prefix=f"{prefix}.k_cache",
-            cache_config=cache_config,
-        )
-        self.max_model_len = vllm_config.model_config.max_model_len
-        self.prefix = prefix
-        from vllm.v1.attention.backends.mla.indexer import \
-            get_max_prefill_buffer_size
-
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        self.indexer_op = VllmTPUSparseAttnIndexer(
-            self.k_cache,
-            self.quant_block_size,
-            self.scale_fmt,
-            self.topk_tokens,
-            self.head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
-            self.topk_indices_buffer,
-        )
-        self.is_inplace_rope = is_inplace_rope
+    @classmethod
+    def rebind(cls, indexer: Indexer) -> "VllmTPUIndexer":
+        """Retype an in-tree `Indexer`, and its K cache, onto the TPU path."""
+        if isinstance(indexer, cls):
+            return indexer
+        assert indexer.quant_block_size == indexer.head_dim, (
+            "streamindex_topk requires quant_block_size == head_dim, got "
+            f"{indexer.quant_block_size} != {indexer.head_dim}")
+        indexer.__class__ = cls
+        indexer.k_cache.__class__ = VllmTPUIndexerCache
+        # ue8m0 keeps one scale byte per quant block; upstream sizes the row for
+        # a 4-byte fp32 scale. Resize in place rather than rebuilding: the cache
+        # is already registered in `static_forward_context` under its prefix and
+        # a second instance would be rejected as a duplicate. `get_kv_cache_spec`
+        # reads `head_dim` lazily, so this lands before the runner collects specs.
+        indexer.k_cache.head_dim = (
+            indexer.head_dim + indexer.head_dim // indexer.quant_block_size)
+        return indexer
 
     def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
                 rotary_emb) -> torch.Tensor:
@@ -324,11 +264,8 @@ class VllmTPUIndexer(Indexer):
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = _per_token_group_quant_fp8(
-            q,
-            self.quant_block_size,
-            use_ue8m0=
-            False,  # Disable ue8m0 for q quantization since we don't need to store scale for q
+        q_fp8, q_scale = quantize_tensor(
+            q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
@@ -530,7 +467,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
         self.g_proj = getattr(mla_modules, "g_proj", None)
-        self.indexer = mla_modules.indexer
+        # `Indexer` has no `register_oot` hook and is fully built by
+        # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
+        # place. The mutation is visible through every reference to the object,
+        # including `DeepseekV2MLAAttention.indexer`.
+        indexer = mla_modules.indexer
+        if indexer is not None:
+            indexer = VllmTPUIndexer.rebind(indexer)
+        self.indexer = indexer
+
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk

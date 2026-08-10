@@ -12,6 +12,7 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
                                        MLAAttentionImpl)
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
@@ -1021,6 +1022,38 @@ class PallasMLAttentionBackend(AttentionBackend):
         if include_num_layers_dimension:
             return (1, 0, 2, 3, 4)
         return (0, 1, 2, 3)
+
+
+class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
+    """Indexer backend for TPU.
+
+    `get_kv_cache_shape` and `get_kv_cache_stride_order` are deliberately
+    inherited unchanged: `make_attention_cache_tensor` allocates the indexer K
+    cache from them, and the streamindex path is built against the current
+    3-D `(num_blocks, block_size, head_size)` layout. Change them only
+    together with the kernel's cache view.
+
+    The page size hooks below delegate to `PallasMLAttentionBackend`. They are
+    not the indexer's own page size: `cache_config.block_size` is global across
+    KV cache groups, and `update_block_size_for_backend` consults whichever
+    backend `Platform._find_non_ssm_backend` returns first. An indexer cache
+    registers before its `mla_attn` sibling, so on a sparse-MLA model these are
+    the hooks that decide the block size for the MLA latent cache too --
+    hardcoding a second copy of the constant would let the two drift, and the
+    effective value would silently depend on layer registration order.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "TPU_STREAMINDEX_INDEXER"
+
+    @staticmethod
+    def get_page_size(vllm_config: VllmConfig) -> int:
+        return PallasMLAttentionBackend.get_page_size(vllm_config)
+
+    @staticmethod
+    def get_min_page_size(vllm_config: VllmConfig) -> int:
+        return PallasMLAttentionBackend.get_min_page_size(vllm_config)
 
 
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
