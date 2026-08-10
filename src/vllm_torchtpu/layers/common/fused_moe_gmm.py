@@ -17,9 +17,19 @@ import functools
 import jax
 from jax import numpy as jnp
 
+import os as _os
+
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.cn_moe_kernels import TOP_K as CN_MOE_TOP_K
+from vllm_torchtpu.kernels.cn_moe_kernels import _CN_I_TILE, _CN_K_TILE
 from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
+from vllm_torchtpu.kernels.cn_moe_kernels_pipelined import \
+    cn_moe_full_pipelined
+
+# Experimental emit_pipeline-based CN kernel (see cn_moe_kernels_pipelined.py)
+# -- unvalidated on real hardware, NUM_K=NUM_I=1 only. Off by default; opt in
+# per-run to A/B test against the working kernel.
+_USE_PIPELINED_CN = _os.getenv("MOE_CN_USE_PIPELINED", "0") == "1"
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
@@ -389,14 +399,25 @@ def fused_moe_func(
         if skip_padded_tokens:
             # Also zero padding rows' ids so they route to expert 0.
             cn_topk_ids = jnp.where(topk_weights == 0.0, 0, topk_ids)
-        out = cn_moe_full(hidden_states,
-                          w1,
-                          w1_scale,
-                          w2,
-                          w2_scale,
-                          cn_topk_ids,
-                          topk_weights,
-                          use_ep=use_ep)
+        # Pipelined path only supports a single K/I tile (NUM_K=NUM_I=1);
+        # fall back to the working kernel outside that shape regardless of
+        # the opt-in flag, so an unsupported shape can't silently break
+        # correctness.
+        k_dim = w1.shape[1]
+        id_dim = w1.shape[2] // 2
+        use_pipelined = (_USE_PIPELINED_CN and k_dim <= _CN_K_TILE
+                        and id_dim <= _CN_I_TILE)
+        cn_fn = cn_moe_full_pipelined if use_pipelined else cn_moe_full
+        _lc_logger.info(
+            f"CN kernel variant: {'pipelined' if use_pipelined else 'original'}")
+        out = cn_fn(hidden_states,
+                    w1,
+                    w1_scale,
+                    w2,
+                    w2_scale,
+                    cn_topk_ids,
+                    topk_weights,
+                    use_ep=use_ep)
         return out[:num_tokens, :hidden_size]
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
