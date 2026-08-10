@@ -104,6 +104,19 @@ def get_test_prompts(speculative_config: dict):
 # same layer per draft step.
 QWEN35_MTP_MODEL = "Qwen/Qwen3.5-4B"
 
+# The data-parallel tests run the MoE sibling rather than the dense 4B, and the
+# choice is load-bearing. TorchTPU runs ONE chip slice across every DP engine,
+# so a forward's collectives pair mesh-wide: an engine that stops issuing
+# forwards strands the engines still running, which block in the device program
+# on a peer that never arrives. The idle-rank pairing that prevents that
+# (TPUModelRunner._run_dp_idle_pairing) is gated on expert parallelism, and
+# vLLM refuses `--enable-expert-parallel` for a dense model ("Number of experts
+# in the model must be greater than 0 when expert parallelism is enabled"), so
+# dense DP deadlocks as soon as the engines drain unevenly. A3B keeps the
+# active parameter count small; the MTP head and method="mtp" are identical to
+# the 4B, so these tests still exercise the same speculative path.
+QWEN35_MTP_DP_MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
+
 # Engine kwargs every Qwen3.5 run in this file needs, on top of the shared
 # ones the helpers set.
 QWEN35_KWARGS = {
@@ -902,6 +915,7 @@ _SERVE_TRANSLATED_KEYS = {
     "language_model_only",
     "limit_mm_per_prompt",
     "disable_log_stats",
+    "enable_expert_parallel",
 }
 
 
@@ -933,6 +947,8 @@ def _serve_args(kwargs: dict) -> list[str]:
 
     if kwargs.get("language_model_only"):
         args.append("--language-model-only")
+    if kwargs.get("enable_expert_parallel"):
+        args.append("--enable-expert-parallel")
     if kwargs.get("limit_mm_per_prompt") is not None:
         args += [
             "--limit-mm-per-prompt",
@@ -1111,7 +1127,13 @@ def _serve(model_name: str, speculative_config: dict | None, kwargs: dict):
 
 
 def _qwen35_dp_kwargs() -> dict:
-    return {**QWEN35_KWARGS, "data_parallel_size": DP_SIZE}
+    return {
+        **QWEN35_KWARGS,
+        "data_parallel_size": DP_SIZE,
+        # Required, not incidental -- see QWEN35_MTP_DP_MODEL: without it the
+        # DP engines deadlock once they drain unevenly.
+        "enable_expert_parallel": True,
+    }
 
 
 @pytest.mark.multichip
@@ -1131,7 +1153,7 @@ def test_qwen35_mtp_dp_correctness_greedy(
     _test_correctness_helper(
         monkeypatch,
         sampling_config,
-        QWEN35_MTP_MODEL,
+        QWEN35_MTP_DP_MODEL,
         _qwen35_mtp_speculative_config(),
         async_scheduling=False,
         extra_kwargs=_qwen35_dp_kwargs(),
@@ -1156,7 +1178,7 @@ def test_qwen35_mtp_dp_performance_greedy(
         sampling_config,
         _qwen35_mtp_speculative_config(),
         min_acceptance_rate=0.9,
-        model_name=QWEN35_MTP_MODEL,
+        model_name=QWEN35_MTP_DP_MODEL,
         async_scheduling=False,
         extra_kwargs=_qwen35_dp_kwargs(),
     )
