@@ -89,42 +89,52 @@ def extract_answer(response_text: str,
     if not response_text:
         return "UNKNOWN"
 
-    clean = response_text.strip()
-    direct_match = re.match(r"^(?:option|answer)?\s*\(?([A-J])\)?\.?\s*$",
-                            clean, re.IGNORECASE)
-    if direct_match:
-        return direct_match.group(1).upper()
+    clean_text = response_text.replace("**", "").replace("__", "").strip()
 
-    # 1. Match explicit conclusion phrases anywhere in the text
-    cot_patterns = [
-        r"(?:therefore|thus|hence|so),?\s*(?:the)?\s*(?:correct)?\s*(?:answer|option|choice)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
-        r"\b(?:the)?\s*(?:correct)?\s*(?:answer|option|choice)\s*(?:is|=|:)\s*\(?([A-J])\)?\b",
-        r"\b(?:answer|option|choice)\s*:\s*\(?([A-J])\)?\b",
-        r"\boption\s*\(?([A-J])\)?\s*is\s*correct\b",
-        r"\b(?:boxed|answer)\{([A-J])\}",
+    # 1. Check if the entire response or the last non-empty line is just a choice letter
+    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+    if lines:
+        last_line = lines[-1]
+        direct_line_match = re.match(
+            r"^(?:(?:the\s+)?(?:correct\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*)?\(?([A-J])\)?[\.\:\s]*$",
+            last_line,
+            re.IGNORECASE,
+        )
+        if direct_line_match:
+            return direct_line_match.group(1).upper()
+
+    # 2. Strict conclusion regexes (searched across entire text, taking the LAST match)
+    conclusion_patterns = [
+        r"(?:therefore|thus|hence|so|consequently|in summary|in conclusion),?\s*(?:the)?\s*(?:correct)?\s*(?:answer|option|choice|solution)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
+        r"\b(?:final\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*\(?([A-J])\)?\b",
+        r"\b(?:the\s+)?correct\s+(?:answer|option|choice|solution)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
+        r"\boption\s*\(?([A-J])\)?\s*is\s*(?:the\s+)?(?:correct|right)\b",
+        r"\\boxed\{([A-J])\}",
     ]
-    for pattern in cot_patterns:
-        match = re.search(pattern, response_text, re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
+    for pattern in conclusion_patterns:
+        matches = list(re.finditer(pattern, clean_text, re.IGNORECASE))
+        if matches:
+            return matches[-1].group(1).upper()
 
-    # 2. Inspect the final 300 characters for enclosed option letters e.g. (A)
-    tail_text = response_text[-300:]
-    match = re.search(r"\(?([A-J])\)", tail_text)
-    if match:
-        return match.group(1).upper()
+    # 3. Look at the last 300 characters: find the LAST explicitly formatted option like (A) or Option A
+    tail_text = clean_text[-300:]
+    enclosed_matches = list(
+        re.finditer(r"(?:\boption\s+|\()([A-J])(?:\)|\.|\b)", tail_text,
+                    re.IGNORECASE))
+    if enclosed_matches:
+        return enclosed_matches[-1].group(1).upper()
 
-    # 3. VLMEvalKit Fallback: Substring match against candidate option texts
+    # 4. Fallback to candidate option text matching against options
     if options and isinstance(options, list):
-        clean_resp = response_text.lower()
+        clean_resp = clean_text.lower()
         for idx, opt in enumerate(options):
             if opt and str(opt).strip().lower() in clean_resp:
                 return chr(65 + idx)
 
-    # 4. Fallback: isolated uppercase single letter in the tail
-    match = re.search(r"\b([A-J])\b", tail_text)
-    if match:
-        return match.group(1).upper()
+    # 5. Last standalone letter in the tail
+    letter_matches = list(re.finditer(r"\b([A-J])\b", tail_text))
+    if letter_matches:
+        return letter_matches[-1].group(1).upper()
 
     return "UNKNOWN"
 
@@ -321,8 +331,6 @@ def evaluate_sample(sample: dict, host: str, port: int,
         "Content-Type": "application/json",
         "Authorization": "Bearer EMPTY",
     }
-    img_b64 = encode_image_base64(sample["image"])
-
     question_clean = re.sub(r"<image \d+>", "", sample["question"]).strip()
     prompt_text = question_clean
 
@@ -337,29 +345,29 @@ def evaluate_sample(sample: dict, host: str, port: int,
         "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
     )
 
+    content = []
+    images = sample.get("images") or [sample["image"]]
+    for img in images:
+        img_b64 = encode_image_base64(img)
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{img_b64}"
+            },
+        })
+    content.append({
+        "type": "text",
+        "text": prompt_text,
+    })
+
     payload = {
-        "model":
-        model,
+        "model": model,
         "messages": [{
-            "role":
-            "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{img_b64}"
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": prompt_text
-                },
-            ],
+            "role": "user",
+            "content": content,
         }],
-        "max_tokens":
-        2048,
-        "temperature":
-        0.0,
+        "max_tokens": 2048,
+        "temperature": 0.0,
     }
 
     max_retries = 3
