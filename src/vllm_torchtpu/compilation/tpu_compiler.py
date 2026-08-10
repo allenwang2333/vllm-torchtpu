@@ -204,11 +204,33 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     return hash_obj.hexdigest()[:10]
 
 
-def _graph_signature(graph: fx.GraphModule) -> str:
-    """Compute a lightweight structural signature for an FX graph."""
+def _graph_signature(graph: fx.GraphModule,
+                     example_inputs: list[Any] | None = None) -> str:
+    """Compute a signature for an FX graph.
+
+    Structurally-identical decoder-layer variants (e.g. DeepSeek-V4's SWA vs
+    CSA/HCA attention layers) trace to the same op/target/arg-count sequence
+    but close over differently-shaped buffers (compressed-KV cache pages).
+    Since every layer instance shares one on-disk cache slot (`compile_prefix`
+    is always "" for non-encoder support_torch_compile), a structural-only
+    signature lets one layer type's compiled executable get silently reused
+    for another with an incompatible buffer size -- surfacing at runtime as
+    e0102 RuntimeProgramInputMismatch instead of at compile time. Folding in
+    each placeholder's concrete shape/dtype forces a distinct signature (and
+    therefore a distinct cache file) whenever any input tensor differs in
+    shape, regardless of whether the op sequence is identical.
+    """
     nodes_sig = [(n.op, str(n.target), len(n.args), len(n.users))
                  for n in graph.graph.nodes]
-    return hashlib.sha256(repr(nodes_sig).encode("utf-8")).hexdigest()[:16]
+    shapes_sig = []
+    if example_inputs is not None:
+        for arg in example_inputs:
+            if isinstance(arg, torch.Tensor):
+                shapes_sig.append((tuple(arg.shape), str(arg.dtype)))
+            else:
+                shapes_sig.append(repr(arg))
+    return hashlib.sha256(repr(
+        (nodes_sig, shapes_sig)).encode("utf-8")).hexdigest()[:16]
 
 
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
@@ -294,7 +316,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
-        graph_sig = _graph_signature(graph)
+        graph_sig = _graph_signature(graph, example_inputs)
 
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
@@ -377,7 +399,7 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         if len(handle) == 4:
             key, path, was_wrapped, expected_sig = handle
-            current_sig = _graph_signature(graph)
+            current_sig = _graph_signature(graph, example_inputs)
             if current_sig != expected_sig:
                 logger.info(
                     "[TpuCompilerAdaptor] Graph signature mismatch for %s "
