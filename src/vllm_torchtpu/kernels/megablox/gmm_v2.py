@@ -1344,7 +1344,8 @@ def gmm_v2(
     size_m = lhs.shape[0]
     size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
     padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
+    needs_padding = (padded_size_m != size_m)
+    if needs_padding:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
 
     if group_offset is None:
@@ -1429,7 +1430,7 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1452,4 +1453,10 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, :cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights)
+
+    if needs_padding:
+        out = out[:size_m, :cfgs.out_size_n]
+    else:
+        out = out[:, :cfgs.out_size_n]
+    return out
