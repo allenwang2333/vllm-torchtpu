@@ -251,6 +251,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            fuse_router_scoring=(layer.custom_routing_function is None),
+            scoring_fn=layer.scoring_func,
+            renormalize=layer.renormalize,
+            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
         )
 
     def get_fused_moe_quant_config(
@@ -264,7 +268,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=getattr(layer, "w2_bias", None),
         )
 
-    rhs_quant_dtype: Any = None
+    rhs_quant_dtype: Any = jnp.float4_e2m1fn
 
     def _forward_monolithic_tpu(
         self,
@@ -275,9 +279,28 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         activation_str = layer._tpu_activation_str
-
-        # Step 1: Routing
         custom_routing_fn = layer.custom_routing_function
+        _dbg = os.getenv("DSV4_DEBUG_MOE_FULL") == "1"
+        if custom_routing_fn is None and not _dbg:
+            return moe_routing.fused_select_and_moe(
+                hidden_states=x,
+                router_logits=router_logits,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=layer.scoring_func,
+                activation=activation_str,
+                layer=layer,
+                input_ids=input_ids,
+                rhs_quant_dtype=self.rhs_quant_dtype or jnp.float4_e2m1fn,
+            )
+
         if custom_routing_fn is not None:
             # custom_routing_fn bypasses select_experts, so apply the
             # random-routing profiling override here too (a no-op by default).
@@ -304,13 +327,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        # DSV4_DEBUG_MOE_FULL=1 dumps EVERY quantity needed to localize a MoE
-        # divergence in ONE run, rather than one hypothesis per 15-minute
-        # cycle: routing outputs, the EP local-expert window and how many of
-        # this rank's routed slots actually fall inside it, and the norm of the
-        # routed result this method returns (vLLM's FusedMoE adds the shared
-        # expert on top, so `05_post_ffn` minus this is the shared part).
-        _dbg = os.getenv("DSV4_DEBUG_MOE_FULL") == "1"
         if _dbg:
             import torch as _t
             _es = moe_routing.get_experts_start(layer)
@@ -348,10 +364,6 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 type(_esb).__name__,
                 layer.moe_config.moe_parallel_config.use_ep,
                 getattr(layer, "local_num_experts", None), _w1.shape[0])
-            # How many routed slots survive the kernel's OWN remap rule
-            # (topk_ids - experts_start, bounded by w1.shape[0]) -- as opposed
-            # to the config's local_num_experts, which is what the earlier
-            # probe used. If these disagree, everything is masked to zero.
             if _esb is not None:
                 _li = topk_ids - int(_esb)
                 _v = ((_li >= 0) & (_li < _w1.shape[0])).sum()
@@ -799,4 +811,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
+            fuse_router_scoring=(layer.custom_routing_function is None),
+            scoring_fn=layer.scoring_func,
+            renormalize=layer.renormalize,
+            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
         )

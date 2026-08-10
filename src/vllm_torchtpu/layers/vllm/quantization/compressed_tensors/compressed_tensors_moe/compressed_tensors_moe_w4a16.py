@@ -175,6 +175,26 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         # Handle custom routing function if present
         custom_routing_fn = getattr(layer, "custom_routing_function", None)
+        if custom_routing_fn is None:
+            return moe_routing.fused_select_and_moe(
+                hidden_states=x,
+                router_logits=router_logits,
+                w1=layer.w13_weight_packed,
+                w2=layer.w2_weight_packed,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=None,
+                w2_bias=None,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=getattr(layer, "scoring_func", "softmax"),
+                activation=activation_str,
+                layer=layer,
+                input_ids=input_ids,
+                rhs_quant_dtype=jnp.int4,
+            )
+
         if custom_routing_fn is not None:
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,

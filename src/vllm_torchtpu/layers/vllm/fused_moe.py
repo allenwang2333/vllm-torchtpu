@@ -106,6 +106,10 @@ def _build_fused_moe_custom_op(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
+    fuse_router_scoring: bool = False,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -128,7 +132,12 @@ def _build_fused_moe_custom_op(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=envs.ONEHOT_MOE_PERMUTE_THRESHOLD,
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS)
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        fuse_router_scoring=fuse_router_scoring,
+        scoring_fn=scoring_fn,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+    )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -139,7 +148,16 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        fuse_router_scoring,
+        scoring_fn,
+        renormalize,
+        routed_scaling_factor,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -150,8 +168,21 @@ def _get_fused_moe_custom_op(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
+    fuse_router_scoring: bool = False,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
 ):
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        fuse_router_scoring,
+        scoring_fn,
+        renormalize,
+        routed_scaling_factor,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -160,6 +191,10 @@ def _get_fused_moe_custom_op(
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
+        fuse_router_scoring=fuse_router_scoring,
+        scoring_fn=scoring_fn,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -169,14 +204,23 @@ def prebuild_fused_moe_kernel(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
+    fuse_router_scoring: bool = False,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
-    _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    """Prebuild and cache fused MoE custom ops outside compile-time tracing."""
+    for fuse_scoring in (True, False):
+        _get_fused_moe_custom_op(
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            fuse_router_scoring=fuse_scoring,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
 
 def fused_moe_gmm(
@@ -187,14 +231,19 @@ def fused_moe_gmm(
     w2_scale: Optional[torch.Tensor],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    experts_start: Optional[torch.Tensor],
-    topk: int,
-    activation: str,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    experts_start: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    activation: str = "silu",
     rhs_quant_dtype=None,
+    router_logits: Optional[torch.Tensor] = None,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused MoE forward pass with precomputed routing.
+    """Fused MoE forward pass with precomputed routing or fused router scoring.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -207,11 +256,17 @@ def fused_moe_gmm(
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
+    fuse_router_scoring = router_logits is not None
+
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
+        fuse_router_scoring=fuse_router_scoring,
+        scoring_fn=scoring_fn,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -220,6 +275,17 @@ def fused_moe_gmm(
         experts_start = torch.zeros((),
                                     dtype=torch.int32,
                                     device=hidden_states.device)
+
+    if fuse_router_scoring:
+        if topk_weights is None:
+            topk_weights = torch.empty((hidden_states.shape[0], topk),
+                                       dtype=hidden_states.dtype,
+                                       device=hidden_states.device)
+        if topk_ids is None:
+            topk_ids = torch.empty((hidden_states.shape[0], topk),
+                                   dtype=torch.int32,
+                                   device=hidden_states.device)
+
     return fused_moe(
         hidden_states,
         w1,
@@ -231,4 +297,6 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        router_logits,
+        e_score_correction_bias,
     )

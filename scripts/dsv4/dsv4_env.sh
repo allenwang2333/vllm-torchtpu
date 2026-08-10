@@ -31,6 +31,8 @@ export HF_HOME="${HF_HOME:-$WORKSPACE/hf_cache}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export TORCH_DIST_TIMEOUT="${TORCH_DIST_TIMEOUT:-1200}"
 export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1200000}"
+export VLLM_SHM_BROADCAST_TIMEOUT_S="${VLLM_SHM_BROADCAST_TIMEOUT_S:-1200}"
+export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-1200}"
 
 # Requantized-FP4 weight cache. The cache key encodes block size and dtype
 # (mxfp4.py `_fp4_cache_path`), so a cache built under a different

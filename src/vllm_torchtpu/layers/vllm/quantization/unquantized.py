@@ -228,6 +228,10 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            fuse_router_scoring=(layer.custom_routing_function is None),
+            scoring_fn=layer.scoring_func,
+            renormalize=layer.renormalize,
+            routed_scaling_factor=getattr(layer, "routed_scaling_factor", 1.0),
         )
 
     def _forward_monolithic_tpu(
@@ -239,11 +243,26 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
-        # Step 1: Routing
         custom_routing_fn = layer.custom_routing_function
+        if custom_routing_fn is None:
+            return moe_routing.fused_select_and_moe(
+                hidden_states=x,
+                router_logits=router_logits,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=getattr(layer, 'w13_bias', None),
+                w2_bias=getattr(layer, 'w2_bias', None),
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                scoring_fn=layer.scoring_func,
+                activation=activation_str,
+                layer=layer,
+            )
+
         if custom_routing_fn is not None:
-            # custom_routing_fn bypasses select_experts, so apply the
-            # random-routing profiling override here too (a no-op by default).
             topk_weights, topk_ids = custom_routing_fn(
                 hidden_states=x,
                 gating_output=moe_routing.maybe_force_random_routing(

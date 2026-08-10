@@ -251,32 +251,12 @@ class VllmCompressorStateCache(CompressorStateCache):
         )
         coff = 1 + (compress_ratio == 4)
         self.head_dim = state_dim // 2 // coff
-        # The state cache is byte-packed into the page of the compressed-KV
-        # cache it overlays, so its block size is a function of that host
-        # page's size -- not a constant.
-        #
-        # The base `CompressorStateCache.__init__` sets 4 (CSA) / 8 (HCA) from
-        # the CUDA layout, assuming a host page of `256 // 4 = 64` rows (see
-        # its comment: "KV block shape [256//4, head_dim] = [64, 584]"). Our
-        # host pages are `cache_config.block_size // compress_ratio` rows, so
-        # that constant does not transfer: at `block_size=1024` an HCA page is
-        # 8 rows, and packing an 8-row state block into it needs 4096 B per
-        # row against a 640 B cache width -- which is exactly the
-        # `state row needs 4096B but cache width is 640B` failure.
-        #
-        # Recompute the way the reference does
-        # (`tpu_inference/.../deepseek_v4_compressor.py:60-70`). An earlier
-        # override here was reverted for producing 1 for both CSA and HCA and
-        # clobbering neighbouring rows; that version divided
-        # `cache_config.block_size` directly, missing the `// compress_ratio`
-        # step. With it, this yields 16 (CSA) and 1 (HCA) at `block_size=1024`,
-        # and both pack to 512 B per row inside the 640 B width.
-        # Left provisional here and recomputed in `get_kv_cache_spec`, which
-        # receives the authoritative config: at construction time the reachable
-        # `cache_config.block_size` is still vLLM's default 16 (measured), and
-        # 16 // 128 floors to a zero-sized HCA page.
         self.compress_ratio = compress_ratio
         self._state_coff = coff
+        # On TPU, cache_block_size is always 1024. Initialize self.block_size
+        # directly at construction time so self.compressor_op can be pre-built
+        # cleanly before profile_run / determine_available_memory.
+        self.block_size = self._state_block_size(1024)
 
     def _state_block_size(self, cache_block_size: int) -> int:
         """Rows of compressor state packed into one host compressed-KV page."""
@@ -739,4 +719,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 f"scale_min={float(np.asarray(scale).min())} scale_max={float(np.asarray(scale).max())}"
             )
 
-        orig_cache.copy_(updated_cache)
+        if (orig_cache is not None and updated_cache is not None
+                and updated_cache.numel() > 0
+                and orig_cache.shape == updated_cache.shape):
+            orig_cache.copy_(updated_cache)

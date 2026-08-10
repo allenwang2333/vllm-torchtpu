@@ -169,6 +169,86 @@ def select_experts(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
+def fused_select_and_moe(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    experts_start: torch.Tensor | None,
+    *,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    activation: str,
+    layer=None,
+    input_ids: torch.Tensor | None = None,
+    rhs_quant_dtype=None,
+) -> torch.Tensor:
+    """Run fused routing + MoE execution in a single JAX custom op dispatch when possible."""
+    from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
+
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
+                                    1.0) if layer is not None else 1.0
+    e_score_correction_bias = getattr(layer, "e_score_correction_bias",
+                                      None) if layer is not None else None
+
+    # Check if layer requires custom non-fused routing (e.g. hash routing or grouped topk)
+    hash_indices_table = getattr(layer, "hash_indices_table",
+                                 None) if layer is not None else None
+    if (hash_indices_table is not None and input_ids is not None) or (
+            layer is not None and layer.use_grouped_topk):
+        topk_weights, topk_ids = select_experts(
+            hidden_states,
+            router_logits,
+            topk=topk,
+            renormalize=renormalize,
+            scoring_fn=scoring_fn,
+            layer=layer,
+            input_ids=input_ids,
+        )
+        return fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=experts_start,
+            topk=topk,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    return fused_moe_gmm(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        experts_start=experts_start,
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        router_logits=router_logits,
+        scoring_fn=scoring_fn,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=e_score_correction_bias,
+    )
+
+
 def get_experts_start(layer) -> int | None:
     """Return the first global expert id owned by this shard, or None for non-EP.
 

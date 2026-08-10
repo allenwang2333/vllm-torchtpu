@@ -288,6 +288,41 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def apply_scoring_fn(scoring_fn: str, router_logits: jax.Array) -> jax.Array:
+    scores = router_logits.astype(jnp.float32)
+    if scoring_fn == "softmax":
+        return jax.nn.softmax(scores, axis=-1)
+    elif scoring_fn == "sigmoid":
+        return jax.nn.sigmoid(scores)
+    elif scoring_fn == "sqrtsoftplus":
+        return jnp.sqrt(jax.nn.softplus(scores))
+    raise NotImplementedError(
+        f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
+
+
+def compute_topk_routing(
+    router_logits: jax.Array,
+    topk: int,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    scores = apply_scoring_fn(scoring_fn, router_logits)
+    if e_score_correction_bias is not None:
+        scores_for_choice = scores + e_score_correction_bias
+        _, topk_ids = jax.lax.top_k(scores_for_choice, k=topk)
+        topk_weights = jnp.take_along_axis(scores, topk_ids, axis=-1)
+    else:
+        topk_weights, topk_ids = jax.lax.top_k(scores, k=topk)
+    if renormalize:
+        topk_weights = topk_weights / jnp.maximum(
+            topk_weights.sum(axis=-1, keepdims=True), 1e-20)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_ids
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -298,6 +333,10 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "fuse_router_scoring",
+        "scoring_fn",
+        "renormalize",
+        "routed_scaling_factor",
     ),
 )
 def fused_moe_func(
@@ -308,9 +347,11 @@ def fused_moe_func(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
+    topk_weights: jax.Array | None = None,
+    topk_ids: jax.Array | None = None,
     experts_start: jax.Array | None = None,
+    router_logits: jax.Array | None = None,
+    e_score_correction_bias: jax.Array | None = None,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
@@ -318,8 +359,12 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    fuse_router_scoring: bool = False,
+    scoring_fn: str = "sqrtsoftplus",
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
 ) -> jax.Array:
-    """Run MoE with precomputed expert ids and weights.
+    """Run MoE with precomputed expert ids and weights, or fused router scoring.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -353,8 +398,18 @@ def fused_moe_func(
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
 
-    assert topk_weights.shape == (num_tokens, topk)
-    assert topk_ids.shape == (num_tokens, topk)
+    if fuse_router_scoring and router_logits is not None:
+        topk_weights, topk_ids = compute_topk_routing(
+            router_logits,
+            topk=topk,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+    assert topk_weights is not None and topk_weights.shape == (num_tokens, topk)
+    assert topk_ids is not None and topk_ids.shape == (num_tokens, topk)
 
     # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
     # reduce, and `where` propagate in BF16 — some custom_routing_fn

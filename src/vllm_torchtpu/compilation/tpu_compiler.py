@@ -204,8 +204,15 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     return hash_obj.hexdigest()[:10]
 
 
-# TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
-# once our local vLLM checkout exposes that helper.
+def _graph_signature(graph: fx.GraphModule) -> str:
+    """Compute a lightweight structural signature for an FX graph."""
+    nodes_sig = [
+        (n.op, str(n.target), len(n.args), len(n.users))
+        for n in graph.graph.nodes
+    ]
+    return hashlib.sha256(repr(nodes_sig).encode("utf-8")).hexdigest()[:16]
+
+
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
@@ -289,6 +296,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
+        graph_sig = _graph_signature(graph)
+
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
@@ -334,14 +343,15 @@ class TpuCompilerAdaptor(CompilerInterface):
                 and _tpu_backend._compiled_executables):
             try:
                 inner_exe = _tpu_backend._compiled_executables[-1]
-                save_path = os.path.join(self.cache_dir, key)
+                save_path = os.path.join(self.cache_dir, f"{key}_{graph_sig}")
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 with open(save_path, "wb") as f:
                     pickle.dump(inner_exe, f)
-                handle = (key, save_path, was_wrapped)
+                handle = (key, save_path, was_wrapped, graph_sig)
                 logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable to %s",
+                    "[TpuCompilerAdaptor] Saved compiled executable to %s (graph_sig=%s)",
                     save_path,
+                    graph_sig,
                 )
             except Exception as e:
                 logger.warning(
@@ -356,7 +366,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         example_inputs: list[Any],
         graph_index: int,
         compile_range: Range,
-    ) -> Callable[..., Any]:
+    ) -> Callable[..., Any] | None:
         """Load a compiled executable from disk.
 
         Unpickles the _TorchTpuCompiledExecutable, then wraps it with
@@ -364,46 +374,83 @@ class TpuCompilerAdaptor(CompilerInterface):
         callable. This skips FX->MLIR->compile but still sets up the
         aot_autograd runtime wrapper that handles input mutations.
         """
-        assert isinstance(handle, tuple) and len(handle) == 3
-        key, path, was_wrapped = handle
+        if not isinstance(handle, tuple):
+            return None
+
+        if len(handle) == 4:
+            key, path, was_wrapped, expected_sig = handle
+            current_sig = _graph_signature(graph)
+            if current_sig != expected_sig:
+                logger.info(
+                    "[TpuCompilerAdaptor] Graph signature mismatch for %s "
+                    "(cached=%s, current=%s); recompiling graph",
+                    key,
+                    expected_sig,
+                    current_sig,
+                )
+                return None
+        elif len(handle) == 3:
+            key, path, was_wrapped = handle
+        else:
+            return None
+
+        if not os.path.exists(path):
+            return None
+
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
-        with open(path, "rb") as f:
-            inner_exe = pickle.load(f)
+        try:
+            with open(path, "rb") as f:
+                inner_exe = pickle.load(f)
 
-        # Re-create the aot_autograd wrapper around the cached executable.
-        # The current torch_tpu executable already handles non-tensor argument
-        # filtering internally, so the load path can return the unpickled
-        # executable directly.
-        from torch._dynamo.backends.common import aot_autograd
+            from torch._dynamo.backends.common import aot_autograd
 
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
 
-        def _cached_compiler(*_args, **_kwargs):
-            return inner_exe
+            def _cached_compiler(*_args, **_kwargs):
+                return inner_exe
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+            with torch._guards.tracing(None):
+                compiled_fn = aot_autograd(
+                    fw_compiler=_cached_compiler,
+                    keep_inference_input_mutations=False,
+                )(graph, example_inputs)
 
-        if was_wrapped:
-            inner_fn = compiled_fn
+            if was_wrapped:
+                inner_fn = compiled_fn
 
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
+                def unwrap_fn(*args, **kwargs):
+                    result = inner_fn(*args, **kwargs)
+                    if isinstance(result, (tuple, list)) and len(result) == 1:
+                        return result[0]
+                    return result
 
-            compiled_fn = unwrap_fn
+                compiled_fn = unwrap_fn
 
-        return compiled_fn
+            return compiled_fn
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Failed to load compiled executable from %s: %s; falling back to compile",
+                path, e)
+            return None
+
+
+try:
+    import vllm.compilation.backends as _backends
+
+    _orig_cm_load = _backends.CompilerManager.load
+
+    def _patched_cm_load(self, graph, example_inputs, graph_index, compile_range):
+        res = _orig_cm_load(self, graph, example_inputs, graph_index, compile_range)
+        if res is None:
+            for k in list(self.loaded_artifacts.keys()):
+                if self.loaded_artifacts[k] is None:
+                    del self.loaded_artifacts[k]
+        return res
+
+    _backends.CompilerManager.load = _patched_cm_load
+except Exception as e:
+    logger.warning("[TpuCompilerAdaptor] Could not patch CompilerManager.load: %s", e)
+

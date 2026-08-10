@@ -3531,13 +3531,9 @@ class TPUModelRunner(GPUModelRunner):
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 
-    def _initialize_attention_kernels(self) -> None:
-        """Pre-build Pallas RPA attention kernels before torch.compile.
-
-        Must be called after model weights are loaded and before the first
-        forward_model() call (which triggers torch.compile tracing).
-        """
-        if self._attention_kernels_initialized:
+    def _initialize_attention_kernels(self, force: bool = False) -> None:
+        """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
+        if self._attention_kernels_initialized and not force:
             return
         from vllm_torchtpu.layers.vllm.attention import (
             _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
@@ -3573,7 +3569,22 @@ class TPUModelRunner(GPUModelRunner):
                             _DRAFT_KV_BLOCK_CAP)
                     attn_layer.impl.initialize_kernel(attn_layer)
                     initialized_count += 1
-        logger.info("Pre-built RPA kernels for %d attention layers.",
+
+            # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
+            if hasattr(self, "model") and self.model is not None:
+                for module in self.model.modules():
+                    if hasattr(module, "_build_attn_op") and hasattr(module, "attn_op"):
+                        module.__dict__.pop("_attn_op_instance", None)
+                        _ = module.attn_op
+                        initialized_count += 1
+                    if hasattr(module, "_build_compressor_op") and hasattr(module, "compressor_op"):
+                        module.__dict__.pop("_compressor_op_instance", None)
+                        _ = module.compressor_op
+                        initialized_count += 1
+                    if hasattr(module, "_build_indexer_op") and hasattr(module, "indexer_op"):
+                        _ = module.indexer_op
+                        initialized_count += 1
+        logger.info("Pre-built attention/indexing kernels for %d layers/modules.",
                     initialized_count)
         self._attention_kernels_initialized = True
 
@@ -4362,9 +4373,7 @@ class TPUModelRunner(GPUModelRunner):
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
-            compiled = (self.model.get_language_model().model if hasattr(
-                self.model, "get_language_model") else self.model.model)
-            reset_compile_wrapper(compiled)
+            reset_compile_wrapper(self.model)
             # reset_compile_wrapper wipes cache_dir; restore so
             # capture_model can read/write the persistent cache.
             cc.cache_dir, cc.local_cache_dir = saved_cache
@@ -5126,7 +5135,8 @@ class TPUModelRunner(GPUModelRunner):
             self._init_mamba_slot_pool(allocated_mamba_num_blocks)
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
-        # the same HBM pressure as runtime.
+        # the same HBM pressure as runtime, and custom ops have final block sizes.
+        self._initialize_attention_kernels(force=True)
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
