@@ -21,6 +21,8 @@ safetensors metadata. No TPU, no network: the Run:AI streamer is faked.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from vllm_torchtpu.model_loader_patches import (
     _sharded_runai_weights_iterator, _should_skip)
 
@@ -92,6 +94,8 @@ def test_request_plan_groups_contiguous_kept_runs():
     """Kept tensors separated by a skipped one become separate byte-range
     requests, offsets account for the skipped bytes, and skipped tensors are
     never part of any request."""
+    # The Run:AI streamer ships with PR #331; skip until it is in the image.
+    pytest.importorskip("runai_model_streamer")
     e = "m.layers.0.experts"
     file_meta = _fake_file_meta(
         offset=1000,
@@ -155,6 +159,8 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
     one at the head of its queue aborts the remaining stream). It is
     yielded as an empty tensor instead, and it must not break the
     contiguity of the surrounding run."""
+    # The Run:AI streamer ships with PR #331; skip until it is in the image.
+    pytest.importorskip("runai_model_streamer")
     file_meta = _fake_file_meta(
         offset=100,
         names_and_sizes=[
@@ -218,6 +224,8 @@ def test_streamer_split_preserves_chunk_index_mapping():
     RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
     FileChunks across several sub-requests, get_global_file_and_chunk must
     keep reporting (our request id, index within OUR chunk list)."""
+    # The Run:AI streamer ships with PR #331; skip until it is in the image.
+    pytest.importorskip("runai_model_streamer")
     from runai_model_streamer.file_streamer.requests_iterator import (
         FileChunks, FilesRequestsIterator)
 
