@@ -140,32 +140,45 @@ def _sharded_runai_weights_iterator(
         fs = streamer.file_streamer
         metas = sp.SafetensorsMetadata.from_files(fs, hf_weights_files, None)
 
+        # Requests are indexed by their position: FileChunks.id == list index,
+        # and tensors_by_request[id] lists the metadata of that run's chunks
+        # in order.
         requests: list[FileChunks] = []
-        tensors_by_request: dict[int, list] = {}
+        tensors_by_request: list[list] = []
+        # Kept tensors that occupy zero bytes never enter the fetch plan: the
+        # streamer's request iterator silently drops a zero-byte chunk group
+        # (and a zero-byte group at the head of its queue aborts the whole
+        # remaining stream). They are yielded directly as empty tensors.
+        zero_size_tensors: list = []
         kept = skipped = 0
         kept_bytes = skipped_bytes = 0
 
+        run_start: Optional[int] = None
+        run_sizes: list[int] = []
+        run_tensors: list = []
+
+        def _flush(path: str) -> None:
+            nonlocal run_start, run_sizes, run_tensors
+            if run_sizes:
+                requests.append(
+                    FileChunks(len(requests), path, run_start, run_sizes))
+                tensors_by_request.append(run_tensors)
+            run_start, run_sizes, run_tensors = None, [], []
+
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
-            run_start: Optional[int] = None
-            run_sizes: list[int] = []
-            run_tensors: list = []
-
-            def _flush() -> None:
-                nonlocal run_start, run_sizes, run_tensors
-                if run_sizes:
-                    request_id = len(requests)
-                    requests.append(
-                        FileChunks(request_id, path, run_start, run_sizes))
-                    tensors_by_request[request_id] = run_tensors
-                run_start, run_sizes, run_tensors = None, [], []
-
             for tensor_meta, size in zip(meta.tensors_metadata,
                                          meta.read_sizes):
                 if _should_skip(tensor_meta.name, local_expert_ids):
                     skipped += 1
                     skipped_bytes += size
-                    _flush()
+                    # A zero-byte skip leaves the byte stream contiguous, so
+                    # the current run may continue through it.
+                    if size:
+                        _flush(path)
+                elif size == 0:
+                    kept += 1
+                    zero_size_tensors.append(tensor_meta)
                 else:
                     kept += 1
                     kept_bytes += size
@@ -174,7 +187,7 @@ def _sharded_runai_weights_iterator(
                     run_sizes.append(size)
                     run_tensors.append(tensor_meta)
                 pos += size
-            _flush()
+            _flush(path)
 
         logger.info(
             "[sharded-ep-load] fetching %d tensors (%.1f GB) in %d ranges; "
@@ -210,6 +223,12 @@ def _sharded_runai_weights_iterator(
                         disable=not enable_tqdm(use_tqdm_on_load),
                         mininterval=2)
         try:
+            for tensor_meta in zero_size_tensors:
+                # create_torch_tensor returns torch.empty for zero-element
+                # metadata without touching the buffer.
+                yield tensor_meta.name, sp.create_torch_tensor(
+                    memoryview(b""), tensor_meta)
+                progress.update(1)
             for yielded, (request_id, chunk_index,
                           buffer) in enumerate(fs.get_chunks(), start=1):
                 tensor_meta = tensors_by_request[request_id][chunk_index]
@@ -242,6 +261,13 @@ def patch_runai_sharded_expert_streaming() -> None:
                               revision: Optional[str]):
         try:
             local_expert_ids = _compute_local_expert_ids()
+        except AttributeError:
+            # A vLLM without the EP weight filter (no
+            # enable_ep_weight_filter / expert_placement_strategy fields).
+            logger.info_once(
+                "[sharded-ep-load] this vLLM has no EP weight filter; "
+                "using stock full-checkpoint streaming.")
+            local_expert_ids = None
         except Exception:
             logger.exception(
                 "[sharded-ep-load] filter setup failed; falling back to "
@@ -249,6 +275,14 @@ def patch_runai_sharded_expert_streaming() -> None:
             local_expert_ids = None
         if local_expert_ids is None:
             return original_get_iterator(self, model_or_path, revision)
+        if getattr(self, "_is_distributed", False):
+            # Per-rank fetch plans differ, so the streamer's cross-rank
+            # broadcast mode would corrupt the chunk-id maps. Sharded
+            # streaming already de-duplicates the heavy reads per rank.
+            logger.info_once(
+                "[sharded-ep-load] ignoring model_loader_extra_config "
+                "'distributed': incompatible with per-rank sharded fetch "
+                "plans; streaming per rank instead.")
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
             hf_weights_files, local_expert_ids,

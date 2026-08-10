@@ -147,3 +147,116 @@ def test_request_plan_groups_contiguous_kept_runs():
     ]
     total_requested = sum(sum(r.chunks) for r in requests)
     assert total_requested == 19  # 31 bytes in file, 12 skipped
+
+
+def test_zero_size_kept_tensor_bypasses_fetch_plan():
+    """A kept zero-byte tensor must never enter the fetch plan (the
+    streamer's request iterator silently drops a zero-byte chunk group, and
+    one at the head of its queue aborts the remaining stream). It is
+    yielded as an empty tensor instead, and it must not break the
+    contiguity of the surrounding run."""
+    file_meta = _fake_file_meta(
+        offset=100,
+        names_and_sizes=[
+            ("m.layers.0.dense_a.weight", 8),  # kept @100
+            ("m.layers.0.empty.weight", 0),  # kept, zero bytes
+            ("m.layers.0.dense_b.weight", 4),  # kept @108 -- same run
+        ],
+    )
+    # Give the zero-size tensor real metadata so create_torch_tensor takes
+    # its empty-tensor path.
+    file_meta.tensors_metadata[1].get_item_count = lambda: 0
+    file_meta.tensors_metadata[1].shape = [0]
+    file_meta.tensors_metadata[1].get_torch_dtype = lambda: None
+
+    captured = {}
+
+    class FakeStreamer:
+
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, requests, credentials, device, is_distributed):
+            captured["requests"] = requests
+
+        def get_chunks(self):
+            return iter(())
+
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    fake_metadata = MagicMock()
+    fake_metadata.from_files.return_value = [file_meta]
+    fake_create = MagicMock(return_value=MagicMock())
+
+    with patch.object(safetensors_streamer, "SafetensorsStreamer",
+                      FakeStreamer), \
+         patch.object(sp, "SafetensorsMetadata", fake_metadata), \
+         patch.object(sp, "create_torch_tensor", fake_create):
+        yielded = [
+            name for name, _ in _sharded_runai_weights_iterator(
+                ["gs://bucket/file0.safetensors"],
+                local_expert_ids=set(),
+                use_tqdm_on_load=False)
+        ]
+
+    requests = captured["requests"]
+    # One contiguous run through the zero-byte tensor; no 0-length chunk.
+    assert [(r.offset, r.chunks) for r in requests] == [(100, [8, 4])]
+    # The zero-size tensor is still yielded (as an empty tensor).
+    assert "m.layers.0.empty.weight" in yielded
+
+
+def test_streamer_split_preserves_chunk_index_mapping():
+    """Pin the library contract this loader depends on: when
+    RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
+    FileChunks across several sub-requests, get_global_file_and_chunk must
+    keep reporting (our request id, index within OUR chunk list)."""
+    from runai_model_streamer.file_streamer.requests_iterator import (
+        FileChunks, FilesRequestsIterator)
+
+    # One request of 5 chunks, memory limit 6 -> split into [3,3],[3,3],[3]
+    chunks = [3, 3, 3, 3, 3]
+    it = FilesRequestsIterator(6, [FileChunks(7, "/f", 100, list(chunks))])
+
+    seen = []
+    while True:
+        req = it.next_request()
+        if req is None:
+            break
+        for local_file_idx, fc in enumerate(req.files):
+            for local_chunk_idx in range(len(fc.chunks)):
+                file_id, global_idx = it.get_global_file_and_chunk(
+                    local_file_idx, local_chunk_idx)
+                seen.append((file_id, global_idx))
+    assert seen == [(7, i) for i in range(len(chunks))]
+
+
+def test_patch_falls_back_when_filter_inactive():
+    """With no local ids (flag off / old vLLM), the patched method must
+    delegate to the original iterator; the patch must not double-apply."""
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    original = MagicMock(name="original_get_weights_iterator")
+
+    class FakeLoader:
+        _get_weights_iterator = original
+
+    with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
+        mlp.patch_runai_sharded_expert_streaming()
+        patched_once = FakeLoader._get_weights_iterator
+        mlp.patch_runai_sharded_expert_streaming()  # idempotent
+        assert FakeLoader._get_weights_iterator is patched_once
+
+        with patch.object(mlp, "_compute_local_expert_ids", return_value=None):
+            loader = FakeLoader()
+            FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
+        original.assert_called_once_with(loader, "gs://b/m", None)
