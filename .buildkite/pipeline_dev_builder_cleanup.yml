@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reclaim disk on the cpu_64_core image builders. Select with
+# DEV_PIPELINE_FILE=.buildkite/pipeline_dev_builder_cleanup.yml.
+#
+# cleanup_docker.sh (run at the start of every image build) removes only the
+# tagged vllm-torchtpu images. The BuildKit build cache and interrupted-export
+# ingest debris live in the containerd content store and are never reclaimed,
+# so a builder eventually fills up and every image export on it fails with
+# "no space left on device" (dev build 157's docker step, twice, on the same
+# host). A disk-full abort itself leaves a fresh stale ingest behind, making
+# the condition self-reinforcing.
+#
+# The matrix fans one job out per idle builder (agents run one job at a time,
+# so a cleanup job can never overlap a build on the same host). Jobs that
+# land on an already-clean builder are harmless no-ops.
+
+steps:
+  - label: ":broom: builder disk cleanup ({{matrix}})"
+    key: builder_cleanup
+    agents:
+      queue: cpu_64_core
+    matrix: ["1", "2", "3", "4", "5", "6", "7"]
+    commands:
+      - |
+        echo "--- host and disk before"
+        hostname
+        df -h / | tail -1
+        echo "--- docker accounting before"
+        docker system df || true
+        echo "--- prune BuildKit build cache (the accumulator)"
+        docker builder prune -a -f || true
+        echo "--- prune unused images/containers/volumes"
+        docker system prune -a --volumes -f || true
+        echo "--- remove stale containerd ingests older than 60 min"
+        sudo -n find /var/lib/containerd/io.containerd.content.v1.content/ingest \
+          -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null \
+          || echo "(no sudo or nothing stale)"
+        echo "--- disk after"
+        df -h / | tail -1
