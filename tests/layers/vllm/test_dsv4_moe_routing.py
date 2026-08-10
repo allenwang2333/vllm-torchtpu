@@ -167,3 +167,36 @@ def test_non_grouped_plain_path_matches_manual_topk():
                                         dim=-1)
     assert torch.equal(ids, expected_i.to(torch.int32))
     torch.testing.assert_close(weights, expected_w.to(weights.dtype))
+
+
+def test_fused_select_and_moe_dispatches_properly():
+    """fused_select_and_moe must delegate directly to fused_moe_gmm with router_logits."""
+    from vllm_torchtpu.layers.vllm.moe_routing import fused_select_and_moe
+
+    hidden = torch.randn(2, 4)
+    logits = torch.randn(2, 8)
+    w1 = torch.randn(8, 4, 8)
+    w2 = torch.randn(8, 4, 4)
+
+    with patch("vllm_torchtpu.layers.vllm.fused_moe.fused_moe_gmm",
+               return_value=torch.randn(2, 4)) as mock_gmm:
+        out = fused_select_and_moe(
+            hidden_states=hidden,
+            router_logits=logits,
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            experts_start=None,
+            topk=2,
+            renormalize=True,
+            scoring_fn="sqrtsoftplus",
+            activation="silu",
+        )
+        mock_gmm.assert_called_once()
+        assert mock_gmm.call_args.kwargs["router_logits"] is not None
+        assert mock_gmm.call_args.kwargs["scoring_fn"] == "sqrtsoftplus"
+        assert mock_gmm.call_args.kwargs["renormalize"] is True
+

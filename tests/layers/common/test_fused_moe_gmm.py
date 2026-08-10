@@ -397,3 +397,71 @@ def test_fused_moe_func_int4_packed_matches_reference():
                                np.asarray(expected),
                                atol=8.0,
                                rtol=3e-1)
+
+
+def test_fused_moe_with_fused_router_scoring_matches_precomputed():
+    """Fused router scoring inside fused_moe_func must match precomputed routing."""
+    _require_tpu()
+    num_tokens = 4
+    hidden_size = 2048
+    padded_hidden_size = 2048
+    intermediate_size = 768
+    num_experts = 16
+    topk = 8
+    key = jax.random.key(42)
+    hk, w1k, w2k, rk = jax.random.split(key, 4)
+
+    hidden_states = (jax.random.normal(hk, (num_tokens, hidden_size),
+                                       dtype=jnp.float32) / 10).astype(
+                                           jnp.bfloat16)
+    w1 = (jax.random.normal(
+        w1k, (num_experts, padded_hidden_size, intermediate_size * 2),
+        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    w2 = (
+        jax.random.normal(w2k,
+                          (num_experts, intermediate_size, padded_hidden_size),
+                          dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    router_logits = jax.random.normal(rk, (num_tokens, num_experts),
+                                      dtype=jnp.float32)
+
+    # Precomputed reference using apply_scoring_fn + top_k
+    from vllm_torchtpu.layers.common.fused_moe_gmm import compute_topk_routing
+    topk_weights, topk_ids = compute_topk_routing(router_logits,
+                                                  topk=topk,
+                                                  scoring_fn="sqrtsoftplus")
+
+    expected = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        topk=topk,
+        activation="silu",
+    )
+
+    actual = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        topk=topk,
+        activation="silu",
+        router_logits=router_logits,
+        fuse_router_scoring=True,
+        scoring_fn="sqrtsoftplus",
+    )
+
+    assert actual.dtype == hidden_states.dtype
+    np.testing.assert_allclose(np.asarray(actual),
+                               np.asarray(expected),
+                               atol=1e-3,
+                               rtol=1e-3)
+

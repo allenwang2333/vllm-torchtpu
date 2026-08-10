@@ -809,25 +809,6 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     DeepseekV4DecoderLayer.__init__ = patched_decoder_layer_init
 
-    # Apply support_torch_compile to enable VLLM_COMPILE per-decoder-layer graph mode
-    try:
-        from vllm.compilation.decorators import support_torch_compile
-        if not hasattr(DeepseekV4DecoderLayer, "__vllm_torch_compile__"):
-            support_torch_compile(
-                DeepseekV4DecoderLayer,
-                dynamic_arg_dims={
-                    "x": 0,
-                    "positions": 0,
-                    "input_ids": 0,
-                    "post_mix": 0,
-                    "res_mix": 0,
-                    "residual": 0,
-                },
-            )
-    except Exception as e:
-        logger.warning(
-            f"Could not apply support_torch_compile to DeepseekV4DecoderLayer: {e}")
-
     def patched_model_init(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs):
         import torch.nn as nn
         from vllm.model_executor.layers.layernorm import RMSNorm
@@ -890,6 +871,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         from vllm.model_executor.layers.mhc import HCHeadOp
         self.hc_head_op = HCHeadOp()
         self.vllm_config = vllm_config
+        self.aux_hidden_state_layers = tuple(
+            getattr(config, "aux_hidden_state_layers", ()))
         self._mtp_hidden_buffer = None
 
     def patched_model_forward(
@@ -916,6 +899,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states = []
         final_aux_recon = None
+        layer = None
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -970,6 +954,22 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
     DeepseekV4Model.__init__ = patched_model_init
     DeepseekV4Model.forward = patched_model_forward
+
+    # Apply support_torch_compile to enable VLLM_COMPILE whole-model graph mode
+    try:
+        from vllm.compilation.decorators import support_torch_compile
+        if not hasattr(DeepseekV4Model, "__vllm_torch_compile__"):
+            support_torch_compile(
+                DeepseekV4Model,
+                dynamic_arg_dims={
+                    "input_ids": 0,
+                    "positions": 0,
+                    "inputs_embeds": 0,
+                },
+            )
+    except Exception as e:
+        logger.warning(
+            f"Could not apply support_torch_compile to DeepseekV4Model: {e}")
 
     from vllm.models.deepseek_v4.amd.model import DeepseekV4DecoderLayer
     _orig_layer_forward = DeepseekV4DecoderLayer.forward
