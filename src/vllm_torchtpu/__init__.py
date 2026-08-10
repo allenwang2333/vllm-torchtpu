@@ -938,7 +938,7 @@ def _patch_vllm_block_pool_lifo_free() -> None:
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None:
+                if block.block_hash is None or not self.enable_caching:
                     blocks_without_hash.append(block)
                 else:
                     blocks_with_hash.append(block)
