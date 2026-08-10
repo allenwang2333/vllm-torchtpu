@@ -354,7 +354,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nPlease think step-by-step and output your final choice at the end in the format: 'Answer: (X)' where X is the correct option letter."
+        "\n\nProvide a concise analysis (under 100 words), then conclude your response with: 'Answer: (X)' where X is the correct option letter."
     )
 
     content = []
@@ -378,7 +378,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             "role": "user",
             "content": content,
         }],
-        "max_tokens": 512,
+        "max_tokens": 1024,
         "temperature": 0.0,
     }
 
@@ -399,7 +399,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
                     f"Sample {sample.get('id')}: Pred={predicted}, Truth={sample['answer']}, Match={is_correct}"
                 )
                 gc.collect()
-                return is_correct, predicted, sample["answer"]
+                return is_correct, predicted, sample["answer"], generated_text
             print(
                 f"[ERROR-HTTP-{resp.status_code}] Sample {sample.get('id', 'unknown')} attempt {attempt}: {resp.text[:200]}"
             )
@@ -449,9 +449,9 @@ def main():
 
     def eval_worker(sample_tuple):
         seq_id, sample = sample_tuple
-        is_correct, pred, target = evaluate_sample(sample, args.host,
-                                                   args.port, args.model)
-        return seq_id, sample["id"], is_correct, pred, target
+        is_correct, pred, target, gen_text = evaluate_sample(
+            sample, args.host, args.port, args.model)
+        return seq_id, sample["id"], is_correct, pred, target, gen_text
 
     indexed_samples = list(enumerate(samples, 1))
 
@@ -460,7 +460,8 @@ def main():
             executor.submit(eval_worker, item) for item in indexed_samples
         ]
         for future in as_completed(futures):
-            _seq_id, sample_id, is_correct, pred, target = future.result()
+            _seq_id, sample_id, is_correct, pred, target, gen_text = future.result(
+            )
             with lock:
                 completed_idx += 1
                 if is_correct:
@@ -470,6 +471,7 @@ def main():
                     "predicted": pred,
                     "ground_truth": target,
                     "is_correct": is_correct,
+                    "generated_text": gen_text,
                 })
 
                 if completed_idx % 10 == 0 or completed_idx == total_count:
