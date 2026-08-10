@@ -874,6 +874,60 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         self.aux_hidden_state_layers = tuple(
             getattr(config, "aux_hidden_state_layers", ()))
         self._mtp_hidden_buffer = None
+        self.head = DeepseekV4Head(
+            self.hc_head_op,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm,
+            self.rms_norm_eps,
+            self.hc_eps,
+        )
+
+    class DeepseekV4Head(nn.Module):
+        def __init__(
+            self,
+            hc_head_op,
+            hc_head_fn,
+            hc_head_scale,
+            hc_head_base,
+            norm,
+            rms_norm_eps: float,
+            hc_eps: float,
+        ):
+            super().__init__()
+            self.hc_head_op = hc_head_op
+            self.hc_head_fn = hc_head_fn
+            self.hc_head_scale = hc_head_scale
+            self.hc_head_base = hc_head_base
+            self.norm = norm
+            self.rms_norm_eps = rms_norm_eps
+            self.hc_eps = hc_eps
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None = None,
+            post_mix: torch.Tensor | None = None,
+            res_mix: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            if residual is not None and post_mix is not None and res_mix is not None:
+                mixed_residual = torch.einsum(
+                    "...ij,...ih->...jh",
+                    res_mix.to(torch.float32),
+                    residual.to(torch.float32),
+                )
+                post_term = post_mix.to(torch.float32) * hidden_states.unsqueeze(-2).to(torch.float32)
+                hidden_states = (mixed_residual + post_term).to(residual.dtype)
+            hidden_states = self.hc_head_op(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            return self.norm(hidden_states)
 
     def patched_model_forward(
         self,
@@ -927,10 +981,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 and self.end_layer in self.aux_hidden_state_layers
             ):
                 hidden_states = final_aux_recon
-            else:
-                hidden_states = layer.hc_post(
-                    hidden_states, residual, post_mix, res_mix
-                )
+            # Note: non-aux final hc_post is handled inside self.head in a compiled graph
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -939,15 +990,12 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = self.hc_head_op(
+        hidden_states = self.head(
             hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
+            residual,
+            post_mix,
+            res_mix,
         )
-        hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -955,21 +1003,34 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     DeepseekV4Model.__init__ = patched_model_init
     DeepseekV4Model.forward = patched_model_forward
 
-    # Apply support_torch_compile to enable VLLM_COMPILE whole-model graph mode
+    # Apply support_torch_compile to enable layer-level and head graph mode
     try:
         from vllm.compilation.decorators import support_torch_compile
-        if not hasattr(DeepseekV4Model, "__vllm_torch_compile__"):
+        if not hasattr(DeepseekV4DecoderLayer, "__vllm_torch_compile__"):
             support_torch_compile(
-                DeepseekV4Model,
+                DeepseekV4DecoderLayer,
                 dynamic_arg_dims={
-                    "input_ids": 0,
+                    "x": 0,
                     "positions": 0,
-                    "inputs_embeds": 0,
+                    "residual": 0,
+                    "post_mix": 0,
+                    "res_mix": 0,
+                    "input_ids": 0,
+                },
+            )
+        if not hasattr(DeepseekV4Head, "__vllm_torch_compile__"):
+            support_torch_compile(
+                DeepseekV4Head,
+                dynamic_arg_dims={
+                    "hidden_states": 0,
+                    "residual": 0,
+                    "post_mix": 0,
+                    "res_mix": 0,
                 },
             )
     except Exception as e:
         logger.warning(
-            f"Could not apply support_torch_compile to DeepseekV4Model: {e}")
+            f"Could not apply support_torch_compile to DeepseekV4DecoderLayer/Head: {e}")
 
     from vllm.models.deepseek_v4.amd.model import DeepseekV4DecoderLayer
     _orig_layer_forward = DeepseekV4DecoderLayer.forward
@@ -1137,7 +1198,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         res = _new
         return res
 
-    DeepseekV4DecoderLayer.forward = patched_layer_forward
+    if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1" or os.getenv("DSV4_SUBSTITUTE_LAYER") is not None:
+        DeepseekV4DecoderLayer.forward = patched_layer_forward
 
     # 1.6. Sub-layer instrumentation (layer 0 only): dump hidden states at
     # each of the 6 checkpoints inside _forward_unfused_post_pre, to localize
