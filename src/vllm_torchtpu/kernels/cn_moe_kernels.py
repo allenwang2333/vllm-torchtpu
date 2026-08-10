@@ -44,24 +44,16 @@ _CN_NBUF = max(2, int(_os.getenv("MOE_CN_NBUF", "4")))
 #  Buffer selection
 # =====================================================================
 def _select_buf(ref, cur_buf, nbuf, tile_start=None, tile_size=None):
-    """Read buffer slot `cur_buf` from ref[nbuf, ...].
-
-    Uses a jnp.where chain — each ref[i] is a static-int index that
-    Mosaic handles correctly.  Faster than lax.switch in practice.
+    """Read buffer slot `cur_buf` from ref[nbuf, ...] via a direct dynamic
+    index (single read, no nbuf-way jnp.where chain).
 
     tile_start/tile_size (static) select one tile within the slot, so
     multiple K/I-tiles can share a buffer without aliasing.
     """
-
-    def _read(i):
-        if tile_start is None:
-            return ref[i]
-        return ref[i, pl.ds(tile_start, tile_size)]
-
-    result = _read(0)
-    for i in range(1, nbuf):
-        result = jnp.where(cur_buf == i, _read(i), result)
-    return result
+    del nbuf
+    if tile_start is None:
+        return ref[cur_buf]
+    return ref[cur_buf, pl.ds(tile_start, tile_size)]
 
 
 # =====================================================================
