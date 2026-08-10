@@ -91,46 +91,58 @@ def extract_answer(response_text: str,
 
     clean_text = response_text.replace("**", "").replace("__", "").strip()
 
-    # 1. Check if the entire response or the first/last non-empty line is just a choice letter
+    # 1. Direct single-line answer
     lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
     if lines:
         for line in [lines[-1], lines[0]]:
-            direct_line_match = re.match(
-                r"^(?:(?:the\s+)?(?:correct\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*)?\(?([A-J])\)?[\.\:\s]*$",
+            direct_match = re.match(
+                r"^(?:(?:the\s+)?(?:correct\s+)?(?:answer|option|choice|solution|statement)\s*(?:is|=|:)\s*)?(?:statement\s+|option\s+|choice\s+)?\(?([A-D])\)?[\.\:\s]*$",
                 line,
                 re.IGNORECASE,
             )
-            if direct_line_match:
-                return direct_line_match.group(1).upper()
+            if direct_match:
+                return direct_match.group(1).upper()
 
-    # 2. Strict conclusion regexes (searched across entire text, taking the LAST match)
+    # 2. Strict conclusion patterns across the text (taking the LAST match)
     conclusion_patterns = [
-        r"(?:therefore|thus|hence|so|consequently|in summary|in conclusion),?\s*(?:the)?\s*(?:correct)?\s*(?:answer|option|choice|solution)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
-        r"\b(?:final\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*\(?([A-J])\)?\b",
-        r"\b(?:the\s+)?correct\s+(?:answer|option|choice|solution)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
-        r"\boption\s*\(?([A-J])\)?\s*is\s*(?:the\s+)?(?:correct|right)\b",
-        r"\\boxed\{([A-J])\}",
-        r"\(?([A-J])\)\s*is\s*(?:the\s+)?(?:correct|right)",
+        r"(?:therefore|thus|hence|so|consequently|in summary|in conclusion),?\s*(?:the)?\s*(?:correct)?\s*(?:answer|option|choice|solution|statement)\s*(?:is|=|:)?\s*(?:statement\s+|option\s+|choice\s+)?\(?([A-D])\)?\b",
+        r"\b(?:final\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*(?:statement\s+|option\s+|choice\s+)?\(?([A-D])\)?\b",
+        r"\b(?:the\s+)?correct\s+(?:answer|option|choice|solution|statement)\s*(?:is|=|:)?\s*(?:statement\s+|option\s+|choice\s+)?\(?([A-D])\)?\b",
+        r"\boption\s*\(?([A-D])\)?\s*is\s*(?:the\s+)?(?:correct|right)\b",
+        r"\\boxed\{([A-D])\}",
+        r"\(?([A-D])\)\s*is\s*(?:the\s+)?(?:correct|right)",
     ]
     for pattern in conclusion_patterns:
         matches = list(re.finditer(pattern, clean_text, re.IGNORECASE))
         if matches:
             return matches[-1].group(1).upper()
 
-    # 3. Look at the last 300 characters: find the LAST explicitly formatted option like (A) or Option A
+    # 3. Last enclosed option e.g. (A) or Option A or Statement A in the last 300 chars
     tail_text = clean_text[-300:]
     enclosed_matches = list(
-        re.finditer(r"(?:\boption\s+|\()([A-J])(?:\)|\.|\b)", tail_text,
-                    re.IGNORECASE))
+        re.finditer(
+            r"(?:\b(?:option|statement|choice)\s+|\()([A-D])(?:\)|\.|\b)",
+            tail_text,
+            re.IGNORECASE,
+        ))
     if enclosed_matches:
         return enclosed_matches[-1].group(1).upper()
 
-    # 4. Fallback to candidate option text matching against options
+    # 4. Fallback to candidate option text matching against options (only for descriptive option texts >= 3 chars)
     if options and isinstance(options, list):
         clean_resp = clean_text.lower()
         for idx, opt in enumerate(options):
-            if opt and str(opt).strip().lower() in clean_resp:
-                return chr(65 + idx)
+            if not opt or not isinstance(opt, str):
+                continue
+            opt_clean = opt.strip().lower()
+            if len(opt_clean) >= 3 and opt_clean not in (
+                    "option a",
+                    "option b",
+                    "option c",
+                    "option d",
+            ):
+                if re.search(r"\b" + re.escape(opt_clean) + r"\b", clean_resp):
+                    return chr(65 + idx)
 
     # 5. Last standalone letter in the tail
     letter_matches = list(re.finditer(r"\b([A-D])\b", tail_text))
