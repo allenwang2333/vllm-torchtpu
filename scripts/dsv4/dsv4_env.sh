@@ -75,6 +75,24 @@ export VLLM_ENFORCE_EAGER
 # Opt back out so the per-layer/head compile path actually engages.
 export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 
+# vLLM auto-enables VLLM_USE_AOT_COMPILE (torch>=2.10, envs.use_aot_compile())
+# unless told otherwise. Its cache key (decorators.py _model_hash_key /
+# aot_compile_hash_factors) hashes only vllm.__version__, forward.__qualname__
+# and forward.__code__.co_firstlineno -- none of it instance-specific. Every
+# DeepseekV4DecoderLayer instance shares one class, so layer 0's AOT artifact
+# gets silently reused by layers 1..N via _try_load_aot_compiled_fn, closing
+# over layer 0's swa_cache shape and crashing (e0102 RuntimeProgramInputMismatch)
+# the moment a layer with a different overlay shape actually runs. This
+# bypasses TorchCompileWithNoGuardsWrapper.__call__ entirely (and therefore
+# the per-instance compile_prefix isolation in
+# _patch_vllm_compile_prefix_isolation), so that patch can't fix it -- confirmed
+# via DSV4_DEBUG_CACHE_SHAPES=1 showing zero calls to __call__ and the log
+# alternating "saved AOT compiled function" / "Directly load AOT compilation
+# from path" on the same hash across different layers. Disable AOT compile so
+# per-layer/head compilation actually goes through the (already
+# instance-isolated) TorchCompileWithNoGuardsWrapper path.
+export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-0}"
+
 # Kill leftover servers/workers WITHOUT killing ourselves.
 #
 # A plain `pkill -f "vllm serve"` is a live grenade here: the caller's own

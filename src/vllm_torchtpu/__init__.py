@@ -970,6 +970,83 @@ def _patch_vllm_piecewise_backend() -> None:
         "Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
 
 
+def _patch_vllm_compile_prefix_isolation() -> None:
+    """Give each support_torch_compile'd instance its own compile-artifact
+    cache identity instead of the shared "" prefix vLLM uses for non-encoder
+    classes.
+
+    vLLM's generated __init__ (vllm/compilation/decorators.py) always passes
+    compile_prefix="" to TorchCompileWithNoGuardsWrapper for non-encoder
+    classes, so every instance of a decorated class shares one on-disk
+    compile-artifact cache directory. TorchCompileWithNoGuardsWrapper compiles
+    once per instance and drops all shape guards after first trace, so this
+    is silently correct only when every instance closes over identically-
+    shaped buffers.
+
+    DeepSeek-V4's KV-cache overlay (_alias_ds_v4_auxiliary_caches in
+    tpu_runner.py) breaks that assumption on purpose: different
+    DeepseekV4DecoderLayer instances point their swa_cache at different host
+    layers' compressed-KV arrays, which have genuinely different shapes.
+    Under compile, whichever shape was live at a layer's first trace bakes
+    into that layer's executable, and because the cache doesn't key on layer
+    identity, one layer's compiled executable can get silently reused by a
+    different, differently-shaped layer instance -- surfacing as an XLA
+    e0102 RuntimeProgramInputMismatch deep in execution.
+
+    Fix: key the compile prefix off self.prefix (vLLM's own per-instance
+    module path, e.g. "model.layers.5.self_attn"), which is already set by
+    the model's own __init__ before this wrapper __init__ runs. This is a
+    no-op for any model whose instances are already shape-uniform -- the
+    resulting cache directories differ, but every instance still compiles
+    and loads correctly, since nothing else depends on the prefix being "".
+    """
+    import itertools
+    import os
+
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_init = TorchCompileWithNoGuardsWrapper.__init__
+    if getattr(original_init, "_tpu_compile_prefix_isolation_patch", False):
+        return
+
+    counter = itertools.count()
+
+    def patched_init(self,
+                     compile_prefix: str = "",
+                     is_encoder: bool = False) -> None:
+        if not compile_prefix and not is_encoder:
+            prefix = getattr(self, "prefix", None)
+            if prefix:
+                compile_prefix = prefix
+            else:
+                # No self.prefix on this class: fall back to a counter.
+                # Deterministic within a process, NOT across restarts, so
+                # the on-disk compile cache for this class is effectively
+                # write-only per run rather than persistent.
+                compile_prefix = f"_tpu_instance_{next(counter)}"
+                logger.warning(
+                    "compile_prefix isolation: %s has no self.prefix; using "
+                    "non-deterministic fallback %s (its on-disk compile "
+                    "cache will not persist across restarts).",
+                    type(self).__name__, compile_prefix)
+        if os.getenv("DSV4_DEBUG_CACHE_SHAPES") == "1":
+            logger.info(
+                "[DSV4_COMPILE_PREFIX] class=%s module=%s id(self)=%s "
+                "raw_self.prefix=%r resolved_prefix=%s",
+                type(self).__name__,
+                type(self).__module__, id(self),
+                getattr(self, "prefix", "<MISSING-ATTR>"), compile_prefix)
+        original_init(self,
+                      compile_prefix=compile_prefix,
+                      is_encoder=is_encoder)
+
+    patched_init._tpu_compile_prefix_isolation_patch = True
+    TorchCompileWithNoGuardsWrapper.__init__ = patched_init
+    logger.info(
+        "Applied TPU patch: per-instance compile-artifact cache isolation "
+        "(compile_prefix keyed off self.prefix).")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
