@@ -342,8 +342,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nBased on the image, please answer the question. "
-        "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
+        "\n\nPlease think step-by-step and output your final choice at the end in the format: 'Answer: (X)' where X is the correct option letter."
     )
 
     content = []
