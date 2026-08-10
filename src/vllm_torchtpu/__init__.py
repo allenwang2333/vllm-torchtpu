@@ -933,6 +933,21 @@ def _patch_vllm_block_pool_lifo_free() -> None:
         return
 
     def free_blocks(self, ordered_blocks) -> None:
+        if not self.enable_caching:
+            # Without prefix caching no block ever carries a hash, so the
+            # LRU hash-split below would be a no-op partition. Skip it and
+            # return freed blocks to the head of the free queue: allocation
+            # pops from the head, so the next request immediately reuses
+            # the most recently freed blocks (LIFO), keeping the set of
+            # live block ids small and dense.
+            freed = []
+            for block in ordered_blocks:
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0 and not block.is_null:
+                    freed.append(block)
+            self.free_block_queue.prepend_n(freed)
+            return
+
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:

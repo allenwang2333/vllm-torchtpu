@@ -93,12 +93,6 @@ echo "--- Starting Buildkite Bootstrap"
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"
 
-echo "Uploading Integration Tests Pipeline"
-upload_with_priority .buildkite/pipeline_integration.yml "$JOB_PRIORITY"
-
-echo "Uploading Unit Tests Pipeline"
-upload_with_priority .buildkite/pipeline_tests.yml "$JOB_PRIORITY"
-
 echo "Uploading Build Pipeline"
 upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
 
