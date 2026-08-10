@@ -91,17 +91,17 @@ def extract_answer(response_text: str,
 
     clean_text = response_text.replace("**", "").replace("__", "").strip()
 
-    # 1. Check if the entire response or the last non-empty line is just a choice letter
+    # 1. Check if the entire response or the first/last non-empty line is just a choice letter
     lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
     if lines:
-        last_line = lines[-1]
-        direct_line_match = re.match(
-            r"^(?:(?:the\s+)?(?:correct\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*)?\(?([A-J])\)?[\.\:\s]*$",
-            last_line,
-            re.IGNORECASE,
-        )
-        if direct_line_match:
-            return direct_line_match.group(1).upper()
+        for line in [lines[-1], lines[0]]:
+            direct_line_match = re.match(
+                r"^(?:(?:the\s+)?(?:correct\s+)?(?:answer|option|choice|solution)\s*(?:is|=|:)\s*)?\(?([A-J])\)?[\.\:\s]*$",
+                line,
+                re.IGNORECASE,
+            )
+            if direct_line_match:
+                return direct_line_match.group(1).upper()
 
     # 2. Strict conclusion regexes (searched across entire text, taking the LAST match)
     conclusion_patterns = [
@@ -110,6 +110,7 @@ def extract_answer(response_text: str,
         r"\b(?:the\s+)?correct\s+(?:answer|option|choice|solution)\s*(?:is|=|:)?\s*\(?([A-J])\)?\b",
         r"\boption\s*\(?([A-J])\)?\s*is\s*(?:the\s+)?(?:correct|right)\b",
         r"\\boxed\{([A-J])\}",
+        r"\(?([A-J])\)\s*is\s*(?:the\s+)?(?:correct|right)",
     ]
     for pattern in conclusion_patterns:
         matches = list(re.finditer(pattern, clean_text, re.IGNORECASE))
@@ -132,7 +133,7 @@ def extract_answer(response_text: str,
                 return chr(65 + idx)
 
     # 5. Last standalone letter in the tail
-    letter_matches = list(re.finditer(r"\b([A-J])\b", tail_text))
+    letter_matches = list(re.finditer(r"\b([A-D])\b", tail_text))
     if letter_matches:
         return letter_matches[-1].group(1).upper()
 
@@ -341,7 +342,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             f"({chr(65+idx)}) {opt}" for idx, opt in enumerate(options))
 
     prompt_text += (
-        "\n\nPlease think step-by-step and provide a detailed explanation. "
+        "\n\nBased on the image, please answer the question. "
         "Conclude your response with: 'Therefore, the correct answer is (X)' where X is the option letter."
     )
 
@@ -366,7 +367,7 @@ def evaluate_sample(sample: dict, host: str, port: int,
             "role": "user",
             "content": content,
         }],
-        "max_tokens": 2048,
+        "max_tokens": 512,
         "temperature": 0.0,
     }
 
