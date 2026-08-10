@@ -1,3 +1,4 @@
+# Copyright 2026 Google LLC
 """
 Implementation that uses emit_pipeline instead of hand-rolled version.
 """
