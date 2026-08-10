@@ -190,7 +190,7 @@ After the PR is merged into `main`:
 
 ### Question: How do I skip CI and merge a PR when necessary?
 
-Running CI checks before merging is strongly recommended. If you encounter bugs or issues with the CI/CD pipeline, please file a ticket and add it to the issue hotlist https://buganizer.corp.google.com/hotlists/8498253
+Running CI checks before merging is strongly recommended. If you encounter bugs or issues with the CI/CD pipeline, please file an issue on [GitHub Issues](https://github.com/vllm-project/vllm-torchtpu/issues/new?assignees=maxwillzq) (assigned to @maxwillzq) or add it to the internal issue hotlist https://buganizer.corp.google.com/hotlists/8498253.
 
 In urgent situations where you must unblock yourself immediately:
 - Prefix your PR title with `[skip-ci]`. So our automation daily email will know that and not flag it.
