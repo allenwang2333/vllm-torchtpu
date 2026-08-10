@@ -5097,6 +5097,12 @@ class TPUModelRunner(GPUModelRunner):
         self._alias_ds_v4_auxiliary_caches(kv_caches, ds_v4_aux_overlay)
         self._add_shared_kv_cache_aliases(kv_caches)
 
+        if os.getenv("DSV4_DEBUG_CACHE_SHAPES") == "1":
+            for _name, _t in sorted(kv_caches.items()):
+                logger.info(
+                    "[DSV4_CACHE_SHAPES] %s shape=%s dtype=%s "
+                    "ptr=%s", _name, tuple(_t.shape), _t.dtype, _t.data_ptr())
+
         # Mark KV cache buffers as donation candidates outside torch.compile
         # regions to avoid Dynamo tracing through pybind calls.
         # TODO(geyuhao): Comment out for now as TorchTPU does not support this right now
