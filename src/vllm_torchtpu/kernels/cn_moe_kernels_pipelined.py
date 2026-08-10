@@ -49,8 +49,8 @@ def _inner_kernel(
     ids_ref,
     toks_ref,
     weights_ref,
-    lhs_full_ref,  # [C_PAD, K] -- fully VMEM-resident, staged once upfront
-    acc_ref,  # [N_TOKENS_, H] fp32 -- fully VMEM-resident accumulator
+    lhs_full_ref,  # [C_PAD, 1, K] -- 3D so `tok` indexes a leading dim
+    acc_ref,  # [N_TOKENS_, 1, H] fp32 -- likewise
     ID,
     DTYPE_LHS,
 ):
@@ -60,7 +60,10 @@ def _inner_kernel(
 
     @pl.when(weight != 0.0)
     def _():
-        lhs_row = lhs_full_ref[pl.ds(tok, 1)]  # [1, K]
+        K_lhs = lhs_full_ref.shape[2]
+        lhs_row = lhs_full_ref[pl.ds(tok, 1),
+                               pl.ds(0, 1),
+                               pl.ds(0, K_lhs)].reshape(1, K_lhs)
 
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
@@ -94,8 +97,11 @@ def _inner_kernel(
                              preferred_element_type=jnp.float32)
             down = down + blk * s2[b].reshape(1, H)
 
-        current = acc_ref[pl.ds(tok, 1)]
-        acc_ref[pl.ds(tok, 1)] = current + down * weight
+        H_acc = acc_ref.shape[2]
+        current = acc_ref[pl.ds(tok, 1), pl.ds(0, 1), pl.ds(0, H_acc)]
+        acc_ref[pl.ds(tok, 1), pl.ds(0, 1),
+                pl.ds(0, H_acc)] = current + (down * weight).reshape(
+                    1, 1, H_acc)
 
 
 def _outer_kernel(
@@ -108,6 +114,7 @@ def _outer_kernel(
     w2_ref,
     w2_scale_ref,
     o_ref,
+    full_lhs_2d_ref,
     lhs_full_ref,
     acc_ref,
     out_vmem_ref,
@@ -124,15 +131,20 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
-    C_PAD = lhs_full_ref.shape[0]
+    C_PAD = full_lhs_2d_ref.shape[0]
 
-    # ---- Stage the full LHS into VMEM once (same as the existing kernel) --
+    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
     full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
-                                          lhs_full_ref, sem_ref.at[0])
+                                          full_lhs_2d_ref, sem_ref.at[0])
     full_lhs_copy.start()
     full_lhs_copy.wait()
 
-    acc_ref[...] = jnp.zeros((N_TOKENS_, H), dtype=jnp.float32)
+    for t in range(C_PAD):
+        row = full_lhs_2d_ref[pl.ds(t, 1), pl.ds(0, K)]
+        lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
+            row.reshape(1, 1, K)
+
+    acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
 
     def w1_index_map(slot):
         return (ids_ref[slot], 0, 0)
@@ -176,7 +188,10 @@ def _outer_kernel(
     )
     pipeline_fn(w1_ref, w1_scale_ref, w2_ref, w2_scale_ref)
 
-    out_vmem_ref[...] = acc_ref[...].astype(DTYPE_OUT)
+    for t in range(N_TOKENS_):
+        r = acc_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, H)]
+        out_vmem_ref[pl.ds(t, 1),
+                     pl.ds(0, H)] = r.reshape(1, H).astype(DTYPE_OUT)
     out_copy = pltpu.make_async_copy(out_vmem_ref, o_ref.at[pl.ds(0, N_TOKENS_)],
                                      sem_ref.at[0])
     out_copy.start()
@@ -220,9 +235,10 @@ def cn_gemv_w1w2_fused_pipelined(
         out_specs=any_spec,
         grid=(1, ),
         scratch_shapes=[
-            pltpu.VMEM((C_PAD, K), lhs.dtype),
-            pltpu.VMEM((n_tokens, H), jnp.float32),
-            pltpu.VMEM((n_tokens, H), jnp.bfloat16),
+            pltpu.VMEM((C_PAD, K), lhs.dtype),  # full_lhs_2d (DMA pad)
+            pltpu.VMEM((C_PAD, 1, K), lhs.dtype),  # full_lhs (3D)
+            pltpu.VMEM((n_tokens, 1, H), jnp.float32),  # acc (3D)
+            pltpu.VMEM((n_tokens, H), jnp.bfloat16),  # out_2d (DMA pad)
             pltpu.SemaphoreType.DMA((1, )),
         ],
     )
