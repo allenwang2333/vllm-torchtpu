@@ -881,6 +881,91 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     "block sizes.")
 
 
+def _patch_vllm_reset_compile_wrapper() -> None:
+    """Allow reset_compile_wrapper to recursively reset per-layer TorchCompileWithNoGuardsWrapper modules."""
+    import torch
+    import vllm.compilation.wrapper as wrapper_mod
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_reset = wrapper_mod.reset_compile_wrapper
+    if getattr(original_reset, "_tpu_reset_compile_wrapper_patch", False):
+        return
+
+    def reset_compile_wrapper_tpu(model: torch.nn.Module) -> None:
+        if model is None:
+            return
+        if isinstance(model, TorchCompileWithNoGuardsWrapper):
+            original_reset(model)
+            return
+
+        found_wrapper = False
+        for m in model.modules():
+            if isinstance(m, TorchCompileWithNoGuardsWrapper):
+                found_wrapper = True
+                original_reset(m)
+
+        if not found_wrapper:
+            original_reset(model)
+
+    reset_compile_wrapper_tpu._tpu_reset_compile_wrapper_patch = True
+    wrapper_mod.reset_compile_wrapper = reset_compile_wrapper_tpu
+    logger.info("Applied TPU patch: recursive reset_compile_wrapper for per-layer compilation.")
+
+
+def _patch_vllm_piecewise_backend() -> None:
+    """Allow PiecewiseBackend to resolve runtime bucket shapes from tensor dim 0 when sym_shape_indices is empty."""
+    import torch
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    original_call = PiecewiseBackend.__call__
+    if getattr(original_call, "_tpu_piecewise_backend_patch", False):
+        return
+
+    def patched_call(self, *args, **kwargs):
+        if self.sym_shape_indices:
+            runtime_shape = args[self.sym_shape_indices[0]]
+            range_entry = self._find_range_for_shape(runtime_shape)
+            assert range_entry is not None, (
+                f"Shape: {runtime_shape} out of considered ranges: "
+                f"{self.compile_ranges}"
+            )
+        elif len(self.range_entries) > 1 or (self.compile_sizes and len(self.compile_sizes) > 1):
+            # Dynamic token count from tensor dimension 0
+            first_tensor = next((x for x in args if isinstance(x, torch.Tensor)), None)
+            if first_tensor is not None:
+                runtime_shape = first_tensor.shape[0]
+                range_entry = self._find_range_for_shape(runtime_shape)
+                assert range_entry is not None, (
+                    f"Shape: {runtime_shape} out of considered ranges: "
+                    f"{self.compile_ranges}"
+                )
+            else:
+                compiled_entries = [re for re in self.range_entries.values() if re.compiled]
+                assert len(compiled_entries) == 1, (
+                    f"Expected exactly one compiled range_entry for static shape "
+                    f"compilation, but found {len(compiled_entries)}"
+                )
+                range_entry = compiled_entries[0]
+        else:
+            compiled_entries = [re for re in self.range_entries.values() if re.compiled]
+            assert len(compiled_entries) == 1, (
+                f"Expected exactly one compiled range_entry for static shape "
+                f"compilation, but found {len(compiled_entries)}"
+            )
+            range_entry = compiled_entries[0]
+
+        assert range_entry.compiled, (
+            "All ranges should be compiled or loaded up front in "
+            "PiecewiseBackend.__init__. "
+            f"range_entry={range_entry.compile_range}"
+        )
+        return range_entry.runnable(*args, **kwargs)
+
+    patched_call._tpu_piecewise_backend_patch = True
+    PiecewiseBackend.__call__ = patched_call
+    logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
