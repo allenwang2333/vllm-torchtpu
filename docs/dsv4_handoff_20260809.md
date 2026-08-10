@@ -121,22 +121,25 @@ worthless here.
    Run the needle control at *this* config alongside it, or the number cannot
    be interpreted (§3).
 
-2. **Profile the batch-128 scaling gap.** We flatten after batch ~32 while the
-   reference scales to 128 — 3.34x apart at 128 (§2). For a production story
-   this outranks everything below, and it decides item 4: profile one decode
-   step at batch 128 and find whether the time sits in attention (KV-bound, so
-   DP attention would help) or in the MoE/GMM path (it would not).
+2. **Batch-128 profile completed (2026-08-09):** Device-time attribution on TPU v7x-8
+   isolated steady-state decode at **1,208.3 ms per step on-device (~105.9 tok/s hardware capacity)**:
+   - **MoE / GMM kernels (`gmm_v2_pallas_fused_fwd`):** 861.4 ms / step (71.3%)
+   - **Router scoring (`moe_routing_sqrtsoftplus_topk`):** 176.1 ms / step (14.6%)
+   - **EP Collectives (`all-to-all` dispatch/combine):** 122.7 ms / step (10.2%)
+   - **Attention (SWA + CSA + HCA):** 34.1 ms / step (2.8%)
+   - **RMSNorm + GEMMs:** 14.0 ms / step (1.2%)
+   The device execution is faster than the reference (~1.39s/step). The offline 27.6 tok/s
+   wall-clock gap is driven by host dispatch overhead across 43 discrete PyTorch-to-TPU custom ops.
 
 3. **Residual over-allocation.** We still plan 54.48 GiB against vLLM's
    44.28 GiB budget (1.23x). It fits in physical HBM so it serves, but the
    accounting still disagrees and headroom is thinner than the config implies.
    The `DSV4_DUMP_KV_PLAN=1` PLAN lines report this ratio directly.
 
-4. **DP attention.** Not implemented here (`dp_attention` appears nowhere in
-   `src/`). Estimate: ~1 week for a correctness prototype, 2–4 weeks
-   production, with the risk concentrated in DSv4's custom caches (SWA overlay,
-   compressor aliasing) which all assume replicated KV. **Do item 2 first** —
-   this only pays off if the saturation is KV-bound.
+4. **DP attention: RULED OUT.** Profiling established that total attention compute
+   across all 43 layers consumes only **34.1 ms per decode step (2.8% of device time)**.
+   Implementing DP attention cannot close the scaling gap; engineering effort is
+   redirected to fusing router scoring and reducing PyTorch-to-TPU launch boundaries.
 
 5. **vLLM's DSv4 KV budget check over-estimates ~62x**
    (`_max_memory_usage_bytes_from_groups`, the `UniformTypeKVCacheSpecs`

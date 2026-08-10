@@ -781,21 +781,267 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
 
         _AmdDeepseekV4ForCausalLM.compute_logits = patched_compute_logits
 
-    # 1.5. Patch DeepseekV4Model to ensure _mtp_hidden_buffer is always allocated (prevents NoneType subscriptable errors in Dynamo)
-    from vllm.models.deepseek_v4.amd.model import DeepseekV4Model
-    _orig_model_init = DeepseekV4Model.__init__
+    # 1.5. Patch DeepseekV4DecoderLayer and DeepseekV4Model __init__ for clean support_torch_compile wrapping
+    import torch.nn as nn
+    from vllm.distributed.parallel_state import get_pp_group
+    from vllm.model_executor.layers.vocab_parallel_embedding import \
+        VocabParallelEmbedding
+    from vllm.model_executor.models.utils import PPMissingLayer, make_layers
+    from vllm.models.deepseek_v4.amd.model import (DeepseekV4DecoderLayer,
+                                                   DeepseekV4Model)
+    from vllm.platforms import current_platform
 
-    def patched_model_init(self, *args, **kwargs):
-        _orig_model_init(self, *args, **kwargs)
-        if self._mtp_hidden_buffer is None:
-            self._mtp_hidden_buffer = torch.empty(
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
-                self.hc_dim,
-                dtype=self.vllm_config.model_config.dtype,
-                device=self.device,
+    _orig_decoder_layer_init = DeepseekV4DecoderLayer.__init__
+
+    def patched_decoder_layer_init(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
+        aux_stream_list: list | None = None,
+        **kwargs,
+    ):
+        _orig_decoder_layer_init(
+            self,
+            vllm_config,
+            prefix=prefix,
+            topk_indices_buffer=topk_indices_buffer,
+            aux_stream_list=aux_stream_list,
+        )
+
+    DeepseekV4DecoderLayer.__init__ = patched_decoder_layer_init
+
+    def patched_model_init(self,
+                           *,
+                           vllm_config: VllmConfig,
+                           prefix: str = "",
+                           **kwargs):
+        import torch.nn as nn
+        from vllm.model_executor.layers.layernorm import RMSNorm
+        nn.Module.__init__(self)
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.hc_eps = config.hc_eps
+        self.hc_mult = config.hc_mult
+        self.hc_dim = self.hc_mult * config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
+        aux_stream_list = None
+        self.device = current_platform.device_type
+        self.topk_indices_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            config.index_topk,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
             )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: DeepseekV4DecoderLayer(
+                vllm_config=vllm_config,
+                prefix=prefix,
+                topk_indices_buffer=self.topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
+            ),
+            prefix=f"{prefix}.layers",
+        )
+
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+
+        self.hc_head_fn = nn.Parameter(
+            torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_head_base = nn.Parameter(
+            torch.empty(self.hc_mult, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_head_scale = nn.Parameter(
+            torch.empty(1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        from vllm.model_executor.layers.mhc import HCHeadOp
+        self.hc_head_op = HCHeadOp()
+        self.vllm_config = vllm_config
+        self.aux_hidden_state_layers = tuple(
+            getattr(config, "aux_hidden_state_layers", ()))
+        self._mtp_hidden_buffer = None
+        self.head = DeepseekV4Head(
+            self.hc_head_op,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.norm,
+            self.rms_norm_eps,
+            self.hc_eps,
+        )
+
+    class DeepseekV4Head(nn.Module):
+
+        def __init__(
+            self,
+            hc_head_op,
+            hc_head_fn,
+            hc_head_scale,
+            hc_head_base,
+            norm,
+            rms_norm_eps: float,
+            hc_eps: float,
+        ):
+            super().__init__()
+            self.hc_head_op = hc_head_op
+            self.hc_head_fn = hc_head_fn
+            self.hc_head_scale = hc_head_scale
+            self.hc_head_base = hc_head_base
+            self.norm = norm
+            self.rms_norm_eps = rms_norm_eps
+            self.hc_eps = hc_eps
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None = None,
+            post_mix: torch.Tensor | None = None,
+            res_mix: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            if residual is not None and post_mix is not None and res_mix is not None:
+                mixed_residual = torch.einsum(
+                    "...ij,...ih->...jh",
+                    res_mix.to(torch.float32),
+                    residual.to(torch.float32),
+                )
+                post_term = post_mix.to(
+                    torch.float32) * hidden_states.unsqueeze(-2).to(
+                        torch.float32)
+                hidden_states = (mixed_residual + post_term).to(residual.dtype)
+            hidden_states = self.hc_head_op(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            return self.norm(hidden_states)
+
+    def patched_model_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+    ):
+        from itertools import islice
+
+        from vllm.distributed.parallel_state import get_pp_group
+        from vllm.sequence import IntermediateTensors
+
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.unsqueeze(-2).repeat(
+                1, self.hc_mult, 1)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+
+        residual, post_mix, res_mix = None, None, None
+        aux_hidden_states = []
+        final_aux_recon = None
+        layer = None
+        for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+        ):
+            hidden_states, residual, post_mix, res_mix = layer(
+                hidden_states,
+                positions,
+                input_ids,
+                post_mix,
+                res_mix,
+                residual,
+            )
+            if (idx + 1) in self.aux_hidden_state_layers:
+                if layer.use_fused_mhc:
+                    aux_recon = layer.hc_post(hidden_states, residual,
+                                              post_mix, res_mix)
+                    final_aux_recon = aux_recon
+                else:
+                    aux_recon = hidden_states
+                aux_hidden_states.append(aux_recon.mean(dim=1))
+        if layer is not None and layer.use_fused_mhc:
+            if (final_aux_recon is not None
+                    and self.end_layer in self.aux_hidden_state_layers):
+                hidden_states = final_aux_recon
+            # Note: non-aux final hc_post is handled inside self.head in a compiled graph
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
+
+        if self._mtp_hidden_buffer is not None:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(
+                hidden_states.flatten(1))
+
+        hidden_states = self.head(
+            hidden_states,
+            residual,
+            post_mix,
+            res_mix,
+        )
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
     DeepseekV4Model.__init__ = patched_model_init
+    DeepseekV4Model.forward = patched_model_forward
+
+    # Apply support_torch_compile to enable layer-level and head graph mode
+    try:
+        from vllm.compilation.decorators import support_torch_compile
+        if not hasattr(DeepseekV4DecoderLayer, "__vllm_torch_compile__"):
+            support_torch_compile(
+                DeepseekV4DecoderLayer,
+                dynamic_arg_dims={
+                    "x": 0,
+                    "positions": 0,
+                    "residual": 0,
+                    "post_mix": 0,
+                    "res_mix": 0,
+                    "input_ids": 0,
+                },
+            )
+        if not hasattr(DeepseekV4Head, "__vllm_torch_compile__"):
+            support_torch_compile(
+                DeepseekV4Head,
+                dynamic_arg_dims={
+                    "hidden_states": 0,
+                    "residual": 0,
+                    "post_mix": 0,
+                    "res_mix": 0,
+                },
+            )
+    except Exception as e:
+        logger.warning(
+            f"Could not apply support_torch_compile to DeepseekV4DecoderLayer/Head: {e}"
+        )
 
     from vllm.models.deepseek_v4.amd.model import DeepseekV4DecoderLayer
     _orig_layer_forward = DeepseekV4DecoderLayer.forward
@@ -963,7 +1209,9 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         res = _new
         return res
 
-    DeepseekV4DecoderLayer.forward = patched_layer_forward
+    if os.getenv("DSV4_DUMP_HIDDEN_STATES") == "1" or os.getenv(
+            "DSV4_SUBSTITUTE_LAYER") is not None:
+        DeepseekV4DecoderLayer.forward = patched_layer_forward
 
     # 1.6. Sub-layer instrumentation (layer 0 only): dump hidden states at
     # each of the 6 checkpoints inside _forward_unfused_post_pre, to localize
@@ -1077,7 +1325,93 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
     _orig_get_device_capability, _orig_cuda_stream, _orig_cuda_event = (
         patch_cuda_stubs())
 
-    # 5. Patch HCHeadOp forward_native with a pure PyTorch implementation.
+    # 5. Patch MHC pre/post kernels and HCHeadOp forward_native with pure PyTorch implementations.
+    def patched_mhc_pre_torch(
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hc_mult = residual.shape[-2]
+        hidden_size = residual.shape[-1]
+        outer_shape = residual.shape[:-2]
+
+        residual_flat = residual.view(-1, hc_mult, hidden_size)
+        num_tokens = residual_flat.shape[0]
+        fn_flat = fn
+
+        x = residual_flat.view(num_tokens,
+                               hc_mult * hidden_size).to(torch.float32)
+        mixes = torch.matmul(x, fn_flat.t())
+        sqrsum = x.square().sum(dim=-1, keepdim=True)
+        mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+
+        pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+
+        post_logits = (mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] +
+                       hc_base[hc_mult:2 * hc_mult])
+        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+
+        comb_logits = mixes[:, 2 * hc_mult:].view(
+            num_tokens, hc_mult,
+            hc_mult) * hc_scale[2] + hc_base[2 * hc_mult:].view(
+                1, hc_mult, hc_mult)
+        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) +
+                               hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) +
+                                   hc_sinkhorn_eps)
+            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) +
+                                   hc_sinkhorn_eps)
+
+        layer_input = torch.sum(pre_mix.unsqueeze(-1) *
+                                residual_flat.to(torch.float32),
+                                dim=1).to(torch.bfloat16)
+        return (
+            post_mix.view(*outer_shape, hc_mult, 1),
+            comb_mix.view(*outer_shape, hc_mult, hc_mult),
+            layer_input.view(*outer_shape, hidden_size),
+        )
+
+    def patched_mhc_post_torch(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        mixed_residual = torch.einsum(
+            "...ij,...ih->...jh",
+            comb_res_mix.to(torch.float32),
+            residual.to(torch.float32),
+        )
+        post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(
+            torch.float32)
+        return (mixed_residual + post_term).to(residual.dtype)
+
+    try:
+        import vllm.model_executor.kernels.mhc as mhc_kernels
+        import vllm.model_executor.kernels.mhc.torch as mhc_torch
+        import vllm.model_executor.layers.mhc as mhc_layers
+
+        mhc_kernels.mhc_pre_torch = patched_mhc_pre_torch
+        mhc_torch.mhc_pre_torch = patched_mhc_pre_torch
+        mhc_kernels.mhc_post_torch = patched_mhc_post_torch
+        mhc_torch.mhc_post_torch = patched_mhc_post_torch
+        mhc_layers.mhc_kernels.mhc_pre_torch = patched_mhc_pre_torch
+        mhc_layers.mhc_kernels.mhc_post_torch = patched_mhc_post_torch
+    except Exception as e:
+        logger.warning(f"Failed to patch MHC kernels: {e}")
+
     from vllm.model_executor.layers.mhc import HCHeadOp
 
     def mhc_hc_head_native(

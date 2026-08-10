@@ -31,6 +31,8 @@ export HF_HOME="${HF_HOME:-$WORKSPACE/hf_cache}"
 export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
 export TORCH_DIST_TIMEOUT="${TORCH_DIST_TIMEOUT:-1200}"
 export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1200000}"
+export VLLM_SHM_BROADCAST_TIMEOUT_S="${VLLM_SHM_BROADCAST_TIMEOUT_S:-1200}"
+export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-1200}"
 
 # Requantized-FP4 weight cache. The cache key encodes block size and dtype
 # (mxfp4.py `_fp4_cache_path`), so a cache built under a different
@@ -65,6 +67,13 @@ export VLLM_FP4_CACHE_DIR="${VLLM_FP4_CACHE_DIR:-/dev/shm/dsv4-fp4-fp4x512}"
 : "${ASYNC_SCHEDULING:=1}"   # 1 => pass --async-scheduling
 : "${VLLM_ENFORCE_EAGER:=0}" # 1 => --enforce-eager (slow; only verified path)
 export VLLM_ENFORCE_EAGER
+
+# vLLM auto-sets VLLM_USE_BREAKABLE_CUDAGRAPH=1 for DeepseekV4ForCausalLM
+# (vllm/config/vllm.py), which forces compilation_config.mode=NONE and
+# silently no-ops every @support_torch_compile decoration in
+# deepseek_v4_patch.py -- the model runs eager regardless of enforce_eager.
+# Opt back out so the per-layer/head compile path actually engages.
+export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 
 # Kill leftover servers/workers WITHOUT killing ourselves.
 #
