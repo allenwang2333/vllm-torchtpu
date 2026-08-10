@@ -40,10 +40,11 @@ def _forward_fill_ids(sorted_ids, sorted_weights):
 
 
 def _inner_kernel(
-    w1_tile_ref,  # [K, 2ID]  -- staged by the pipeline for this slot's expert
-    w1_scale_tile_ref,  # [K_BLOCKS, 1, 2ID]
-    w2_tile_ref,  # [ID, H]
-    w2_scale_tile_ref,  # [I_BLOCKS, 1, H]
+    # Leading expert dim kept at 1 (not squeezed) for Mosaic layout.
+    w1_tile_ref,  # [1, K, 2ID]
+    w1_scale_tile_ref,  # [1, K_BLOCKS, 1, 2ID]
+    w2_tile_ref,  # [1, ID, H]
+    w2_scale_tile_ref,  # [1, I_BLOCKS, 1, H]
     *,
     ids_ref,
     toks_ref,
@@ -61,12 +62,12 @@ def _inner_kernel(
     def _():
         lhs_row = lhs_full_ref[pl.ds(tok, 1)]  # [1, K]
 
-        K, TWO_ID = w1_tile_ref.shape
-        K_BLOCKS = w1_scale_tile_ref.shape[0]
+        _, K, TWO_ID = w1_tile_ref.shape
+        K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
         w1_fp32 = w1_tile_ref[...].astype(jnp.float32).reshape(
             K_BLOCKS, QB, TWO_ID)
-        s1 = w1_scale_tile_ref[...]  # [K_BLOCKS, 1, 2ID]
+        s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
         w1_dequant = (w1_fp32 * s1).reshape(K, TWO_ID).astype(DTYPE_LHS)
         gate_up = jnp.matmul(lhs_row,
                              w1_dequant,
@@ -76,12 +77,12 @@ def _inner_kernel(
         up = gate_up[:, ID:]
         intermediate = (gate * jax.nn.sigmoid(gate) * up).astype(DTYPE_LHS)
 
-        ID_, H = w2_tile_ref.shape
-        I_BLOCKS = w2_scale_tile_ref.shape[0]
+        _, ID_, H = w2_tile_ref.shape
+        I_BLOCKS = w2_scale_tile_ref.shape[1]
         IB = ID_ // I_BLOCKS
         w2_fp32 = w2_tile_ref[...].astype(jnp.float32).reshape(
             I_BLOCKS, IB, H)
-        s2 = w2_scale_tile_ref[...]  # [I_BLOCKS, 1, H]
+        s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
         w2_dequant = (w2_fp32 * s2).reshape(ID_, H).astype(DTYPE_LHS)
         down = jnp.matmul(intermediate,
                           w2_dequant,
@@ -152,16 +153,16 @@ def _outer_kernel(
         ),
         grid=(N_SLOTS, ),
         in_specs=(
-            pl.BlockSpec((None, K, 2 * ID),
+            pl.BlockSpec((1, K, 2 * ID),
                         w1_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
-            pl.BlockSpec((None, K_BLOCKS, 1, 2 * ID),
+            pl.BlockSpec((1, K_BLOCKS, 1, 2 * ID),
                         w1_scale_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
-            pl.BlockSpec((None, ID, H),
+            pl.BlockSpec((1, ID, H),
                         w2_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
-            pl.BlockSpec((None, I_BLOCKS, 1, H),
+            pl.BlockSpec((1, I_BLOCKS, 1, H),
                         w2_scale_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
         ),

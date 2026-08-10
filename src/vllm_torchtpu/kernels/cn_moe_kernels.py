@@ -163,6 +163,7 @@ def _expert_body(
     weight,
     tok,
     lhs_scratch_ref,
+    inter_scratch_ref,
     w1_ref,
     w1_scale_ref,
     w2_ref,
@@ -265,12 +266,17 @@ def _expert_body(
                     jnp.float32)
                 gate_up_acc = gate_up_acc + block_acc
             else:
-                w1_fp32 = w1_fp8.astype(jnp.float32).reshape(
-                    KB_TILE, QB_eff, 2 * ID)
-                w1_dequant = (w1_fp32 * s1).reshape(K_TILE,
-                                                    2 * ID).astype(DTYPE_LHS)
-                gate_up_acc = gate_up_acc + jnp.matmul(
-                    lhs_tile, w1_dequant, preferred_element_type=jnp.float32)
+                # Per quant-block matmul, scale the [1, 2ID] output (as
+                # gmm_v2 does) -- no full-tile fp32 dequant materialized.
+                w1_cast = w1_fp8.astype(DTYPE_LHS)
+                for b in range(KB_TILE):
+                    ks = b * QB_eff
+                    blk = jnp.matmul(
+                        lhs_tile[:, ks:ks + QB_eff],
+                        w1_cast[ks:ks + QB_eff, :],
+                        preferred_element_type=jnp.float32)
+                    gate_up_acc = gate_up_acc + blk * s1[b].reshape(
+                        1, 2 * ID).astype(jnp.float32)
 
         # ---- SwiGLU ----
         gate = gate_up_acc[:, :ID]
@@ -305,12 +311,16 @@ def _expert_body(
                     jnp.float32)
                 down_acc = down_acc + block_acc
             else:
-                w2_fp32 = w2_fp8.astype(jnp.float32).reshape(
-                    IB_TILE, min(I_TILE, IB), H)
-                w2_dequant = (w2_fp32 * s2).reshape(I_TILE,
-                                                    H).astype(DTYPE_LHS)
-                down_acc = down_acc + jnp.matmul(
-                    inter_tile, w2_dequant, preferred_element_type=jnp.float32)
+                w2_cast = w2_fp8.astype(DTYPE_LHS)
+                IB_eff_ = min(I_TILE, IB)
+                for b in range(IB_TILE):
+                    is_ = b * IB_eff_
+                    blk = jnp.matmul(
+                        inter_tile[:, is_:is_ + IB_eff_],
+                        w2_cast[is_:is_ + IB_eff_, :],
+                        preferred_element_type=jnp.float32)
+                    down_acc = down_acc + blk * s2[b].reshape(
+                        1, H).astype(jnp.float32)
 
         # ---- Accumulate weighted expert contribution to this token's row ----
         result = (down_acc * weight).reshape(1, 1, H)
@@ -341,6 +351,7 @@ def _cn_w1w2_fused_token_kernel_fp8(
     full_lhs_2d_ref,  # [C_PAD, K]         — 2D DMA landing pad
     full_lhs_scratch_ref,  # [C_PAD, 1, K]      — 3D for dynamic indexing
     lhs_scratch_ref,  # [M_PAD, K]
+    inter_scratch_ref,  # [M_PAD, ID]
     w1_bufs_ref,  # [NBUF_W1, K, 2ID]
     w1_s_bufs_ref,  # [NBUF_W1, K_BLOCKS, 1, 2ID] fp32
     w2_bufs_ref,  # [NBUF_W2, ID, H]
@@ -407,6 +418,7 @@ def _cn_w1w2_fused_token_kernel_fp8(
     # Compute-body kwargs
     body_kw = dict(
         lhs_scratch_ref=lhs_scratch_ref,
+        inter_scratch_ref=inter_scratch_ref,
         w1_ref=w1_ref,
         w1_scale_ref=w1_scale_ref,
         w2_ref=w2_ref,
@@ -705,10 +717,8 @@ def cn_gemv_w1w2_fused_mb_fp8(lhs,
     IB_eff = min(I_TILE, IB)
     IB_TILE = I_TILE // IB_eff
 
-    NUM_K_setup = K // K_TILE
-    NUM_I_setup = ID // I_TILE
-    NBUF_W1 = max(_CN_NBUF, NUM_K_setup)
-    NBUF_W2 = max(_CN_NBUF, NUM_I_setup)
+    NBUF_W1 = _CN_NBUF
+    NBUF_W2 = _CN_NBUF
     NBUF_EFF = max(NBUF_W1, NBUF_W2)
 
     # Forward-fill zero-weight slots (EP masking / TP padding) to last real id.
@@ -729,6 +739,7 @@ def cn_gemv_w1w2_fused_mb_fp8(lhs,
             pltpu.VMEM((C_PAD, K), lhs.dtype),  # full_lhs_2d (DMA pad)
             pltpu.VMEM((C_PAD, 1, K), lhs.dtype),  # full_lhs_scratch (3D)
             pltpu.VMEM((M_PAD, K), lhs.dtype),  # lhs_scratch
+            pltpu.VMEM((M_PAD, ID), lhs.dtype),  # inter_scratch
             pltpu.VMEM((NBUF_W1, K, N1), w1.dtype),
             pltpu.VMEM((NBUF_W1, K_BLOCKS, 1, N1), w1_scale.dtype),
             pltpu.VMEM((NBUF_W2, ID, H), w2.dtype),
