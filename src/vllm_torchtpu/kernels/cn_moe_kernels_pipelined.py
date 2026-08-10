@@ -1,17 +1,5 @@
-"""EXPERIMENTAL: emit_pipeline-based rewrite of the CN kernel's weight-fetch
-path. Replaces the hand-rolled NBUF-way buffer rotation + manual DMA/
-semaphore code (_select_buf, _start_w1_dma/_wait_w1_dma, seed phase,
-lookahead tables) with Mosaic's native pl.Buffered pipelining -- the same
-mechanism cn_moe_kernels.py's mainline neighbor (megablox/gmm_v2.py) uses.
-
-UNVALIDATED ON REAL HARDWARE. Only interpret-mode correctness has been
-checked here; emit_pipeline's actual lowering/performance on real Mosaic is
-unverified. Kept as a separate file from the working cn_moe_kernels.py so
-nothing about the existing, validated kernel is disturbed.
-
-Only handles NUM_K = NUM_I = 1 (the real production shape) for now --
-multi-tile K/I support would need the grid extended to (N_SLOTS, NUM_K) /
-a second pipeline for w2, not attempted here.
+"""
+Implementation that uses emit_pipeline instead of hand-rolled version.
 """
 import functools
 
