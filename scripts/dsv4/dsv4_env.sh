@@ -39,6 +39,17 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-1200}
 # MOE_REQUANTIZE_* config is no longer silently reused. Leave empty to disable.
 export VLLM_FP4_CACHE_DIR="${VLLM_FP4_CACHE_DIR:-/dev/shm/dsv4-fp4-fp4x512}"
 
+# vLLM's compile-artifact caches (VLLM_CACHE_ROOT, VLLM_XLA_CACHE_PATH) default
+# to ~/.cache/vllm, which lives on the small root disk (/dev/root, ~145GiB)
+# rather than the workspace disk (/dev/nvme1n1, ~2TiB, mounted at $WORKSPACE).
+# The per-instance compile-cache isolation fix (compile_prefix keyed per
+# layer) multiplies the number of on-disk cache directories -- 43 real layers
+# x several bucket sizes x 8 ranks -- so this needs headroom. Root-disk-full
+# has already taken down tpu-runtime.service once (its Docker overlay2 layer
+# got wiped); keep compile caches off that disk entirely.
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$WORKSPACE/vllm_cache}"
+export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-$VLLM_CACHE_ROOT/xla_cache}"
+
 # Do NOT set LIBTPU_INIT_ARGS here. env_override.py computes the chip-correct
 # sparse-core offload thresholds only when the user has not already supplied
 # those flags; hardcoding them silently disables that logic.
