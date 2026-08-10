@@ -65,13 +65,17 @@ def _inner_kernel(
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
-        w1_fp32 = w1_tile_ref[...].astype(jnp.float32).reshape(
-            K_BLOCKS, QB, TWO_ID)
+        # Per quant-block matmul, scale the [1, TWO_ID] output (as gmm_v2
+        # does) -- no full-tile fp32 dequant materialized.
+        w1_cast = w1_tile_ref[...].reshape(K, TWO_ID).astype(DTYPE_LHS)
         s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
-        w1_dequant = (w1_fp32 * s1).reshape(K, TWO_ID).astype(DTYPE_LHS)
-        gate_up = jnp.matmul(lhs_row,
-                             w1_dequant,
+        gate_up = jnp.zeros((1, TWO_ID), dtype=jnp.float32)
+        for b in range(K_BLOCKS):
+            ks = b * QB
+            blk = jnp.matmul(lhs_row[:, ks:ks + QB],
+                             w1_cast[ks:ks + QB, :],
                              preferred_element_type=jnp.float32)
+            gate_up = gate_up + blk * s1[b].reshape(1, TWO_ID)
 
         gate = gate_up[:, :ID]
         up = gate_up[:, ID:]
@@ -80,13 +84,15 @@ def _inner_kernel(
         _, ID_, H = w2_tile_ref.shape
         I_BLOCKS = w2_scale_tile_ref.shape[1]
         IB = ID_ // I_BLOCKS
-        w2_fp32 = w2_tile_ref[...].astype(jnp.float32).reshape(
-            I_BLOCKS, IB, H)
+        w2_cast = w2_tile_ref[...].reshape(ID_, H).astype(DTYPE_LHS)
         s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
-        w2_dequant = (w2_fp32 * s2).reshape(ID_, H).astype(DTYPE_LHS)
-        down = jnp.matmul(intermediate,
-                          w2_dequant,
-                          preferred_element_type=jnp.float32)
+        down = jnp.zeros((1, H), dtype=jnp.float32)
+        for b in range(I_BLOCKS):
+            is_ = b * IB
+            blk = jnp.matmul(intermediate[:, is_:is_ + IB],
+                             w2_cast[is_:is_ + IB, :],
+                             preferred_element_type=jnp.float32)
+            down = down + blk * s2[b].reshape(1, H)
 
         current = acc_ref[pl.ds(tok, 1)]
         acc_ref[pl.ds(tok, 1)] = current + down * weight
