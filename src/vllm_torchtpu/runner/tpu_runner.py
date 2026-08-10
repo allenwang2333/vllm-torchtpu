@@ -5094,13 +5094,19 @@ class TPUModelRunner(GPUModelRunner):
                     _w / (1 << 30), _a / (1 << 30),
                     f"{_a / _w:.2f}x" if _w else "n/a", _arrays)
 
+        if os.getenv("DSV4_DEBUG_CACHE_SHAPES") == "1":
+            for _name, _t in sorted(kv_caches.items()):
+                logger.info(
+                    "[DSV4_CACHE_SHAPES pre-alias] %s shape=%s dtype=%s "
+                    "ptr=%s", _name, tuple(_t.shape), _t.dtype, _t.data_ptr())
+
         self._alias_ds_v4_auxiliary_caches(kv_caches, ds_v4_aux_overlay)
         self._add_shared_kv_cache_aliases(kv_caches)
 
         if os.getenv("DSV4_DEBUG_CACHE_SHAPES") == "1":
             for _name, _t in sorted(kv_caches.items()):
                 logger.info(
-                    "[DSV4_CACHE_SHAPES] %s shape=%s dtype=%s "
+                    "[DSV4_CACHE_SHAPES post-alias] %s shape=%s dtype=%s "
                     "ptr=%s", _name, tuple(_t.shape), _t.dtype, _t.data_ptr())
 
         # Mark KV cache buffers as donation candidates outside torch.compile
@@ -5147,6 +5153,17 @@ class TPUModelRunner(GPUModelRunner):
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime, and custom ops have final block sizes.
         self._initialize_attention_kernels(force=True)
+
+        if os.getenv("DSV4_DEBUG_CACHE_SHAPES") == "1":
+            fwd_ctx = self.vllm_config.compilation_config.static_forward_context
+            for _name in sorted(kv_caches.keys()):
+                _t = getattr(fwd_ctx.get(_name), "kv_cache", None)
+                if isinstance(_t, torch.Tensor):
+                    logger.info(
+                        "[DSV4_CACHE_SHAPES post-attn-init] %s shape=%s "
+                        "dtype=%s ptr=%s", _name, tuple(_t.shape), _t.dtype,
+                        _t.data_ptr())
+
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
