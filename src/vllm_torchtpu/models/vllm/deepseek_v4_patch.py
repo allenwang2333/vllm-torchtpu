@@ -782,6 +782,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         _AmdDeepseekV4ForCausalLM.compute_logits = patched_compute_logits
 
     # 1.5. Patch DeepseekV4DecoderLayer and DeepseekV4Model __init__ for clean support_torch_compile wrapping
+    import torch.nn as nn
     from vllm.models.deepseek_v4.amd.model import DeepseekV4DecoderLayer, DeepseekV4Model
     from vllm.model_executor.models.utils import make_layers, PPMissingLayer
     from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
