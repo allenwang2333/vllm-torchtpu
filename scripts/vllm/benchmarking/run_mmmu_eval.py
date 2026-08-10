@@ -386,7 +386,6 @@ def evaluate_sample(sample: dict, host: str, port: int,
                 print(
                     f"Sample {sample.get('id')}: Pred={predicted}, Truth={sample['answer']}, Match={is_correct}"
                 )
-                del img_b64, payload, res_json
                 gc.collect()
                 return is_correct, predicted, sample["answer"]
             print(
@@ -406,7 +405,6 @@ def evaluate_sample(sample: dict, host: str, port: int,
                 ) from e
         time.sleep(2 * attempt)
 
-    del img_b64, payload
     gc.collect()
     raise RuntimeError(
         f"Evaluation failed for sample {sample.get('id', 'unknown')} after {max_retries} attempts."
