@@ -50,3 +50,8 @@ steps:
           || echo "(no sudo or nothing stale)"
         echo "--- disk after"
         df -h / | tail -1
+        # Hold the agent briefly so one fast agent cannot consume several
+        # matrix entries while a slow-polling one gets none: with jobs
+        # pinned for longer than dispatch latency, every idle agent in the
+        # queue takes exactly one.
+        sleep 90
