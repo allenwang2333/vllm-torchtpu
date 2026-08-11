@@ -236,7 +236,7 @@ def _expert_body(
             _wait_w2_dma(gj, cur_w2_buf, m, **dma_kw_w2)
 
     # ---- Compute: skip entirely for masked/padding slots (weight == 0) ----
-    @pl.when(weight != 0.0)
+    @pl.when(weight.astype(jnp.float32) != 0.0)
     def _():
         # ---- Phase 1: K-tiled gate+up matmul ----
         gate_up_acc = jnp.zeros((M_PAD, 2 * ID), dtype=jnp.float32)
@@ -256,8 +256,9 @@ def _expert_body(
             lhs_tile = lhs_scratch_ref[pl.ds(0, M_PAD),
                                        pl.ds(k * K_TILE, K_TILE)]
 
+            # MXU has no bf16xfp8 mode; the cast itself is exact.
+            w1_cast = w1_fp8.astype(DTYPE_LHS)
             if DEQUANT_W1_AFTER_:
-                w1_cast = w1_fp8.astype(DTYPE_LHS)
                 block_acc = jnp.matmul(lhs_tile,
                                        w1_cast,
                                        preferred_element_type=jnp.float32)
@@ -266,9 +267,6 @@ def _expert_body(
                     jnp.float32)
                 gate_up_acc = gate_up_acc + block_acc
             else:
-                # Per quant-block matmul, scale the [1, 2ID] output (as
-                # gmm_v2 does) -- no full-tile fp32 dequant materialized.
-                w1_cast = w1_fp8.astype(DTYPE_LHS)
                 for b in range(KB_TILE):
                     ks = b * QB_eff
                     blk = jnp.matmul(
@@ -301,8 +299,8 @@ def _expert_body(
                              tile_size=IB_TILE)
             inter_tile = intermediate[:, m * I_TILE:(m + 1) * I_TILE]
 
+            w2_cast = w2_fp8.astype(DTYPE_LHS)
             if DEQUANT_W2_AFTER_:
-                w2_cast = w2_fp8.astype(DTYPE_LHS)
                 block_acc = jnp.matmul(inter_tile,
                                        w2_cast,
                                        preferred_element_type=jnp.float32)
@@ -311,7 +309,6 @@ def _expert_body(
                     jnp.float32)
                 down_acc = down_acc + block_acc
             else:
-                w2_cast = w2_fp8.astype(DTYPE_LHS)
                 IB_eff_ = min(I_TILE, IB)
                 for b in range(IB_TILE):
                     is_ = b * IB_eff_
@@ -574,7 +571,7 @@ def _forward_fill_ids(sorted_ids, sorted_weights):
     Returns:
         effective_ids  [N]: forward-filled expert indices.
     """
-    valid = (sorted_weights != 0.0)
+    valid = (sorted_weights.astype(jnp.float32) != 0.0)
 
     def _fill_op(a, b):
         a_id, a_v = a
