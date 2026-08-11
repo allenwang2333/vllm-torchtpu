@@ -187,7 +187,22 @@ def main():
     # (tpu_runner.py hardcodes prompt_logprobs_dict=None), hence the
     # growing-prefix loop. Requires prefix caching OFF or every call after the
     # first would reuse decode-era blocks and measure nothing.
+    #
+    # DSV4_TF_AFTER_PROMPTS=1 runs the normal DSV4_PROMPT_FILES generation
+    # loop FIRST and then the TF scoring, in the same process -- one model
+    # load produces both the decode-built and the prefill-built data for a
+    # differential (e.g. with DSV4_DUMP_PAGES=1).
     tf_files = [p for p in os.getenv("DSV4_TF_FILES", "").split(",") if p]
+    if tf_files and os.getenv("DSV4_TF_AFTER_PROMPTS") == "1":
+        print("=== Prompt generation pass (before TF scoring) ===")
+        for label, prompt_text in prompt_texts:
+            print(f"[SWEEP] ===== prompt: {label} =====")
+            outputs = llm.generate([prompt_text], sampling_params)
+            for output in outputs:
+                print(f"[SWEEP] {label}: prompt_tokens="
+                      f"{len(output.prompt_token_ids)} "
+                      f"generated={output.outputs[0].text!r}")
+            _report(outputs)
     if tf_files:
         import json
 
