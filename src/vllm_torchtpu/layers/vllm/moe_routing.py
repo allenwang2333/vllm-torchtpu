@@ -198,6 +198,71 @@ def _hash_moe_select(
     return topk_weights, topk_ids
 
 
+def _apply_capacity_aware_routing(
+    scores: torch.Tensor,
+    scores_for_choice: torch.Tensor,
+    topk: int,
+    ep_size: int,
+    global_num_experts: int,
+    capacity_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply capacity-aware balanced routing across EP ranks."""
+    num_tokens = scores.shape[0]
+    if num_tokens <= 0 or ep_size <= 1:
+        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
+        return scores.gather(-1, topk_ids), topk_ids.to(torch.int32)
+
+    base = global_num_experts // ep_size
+    remainder = global_num_experts % ep_size
+
+    # Compute per-rank capacity limit
+    ideal_capacity = (num_tokens * topk + ep_size - 1) // ep_size
+    max_capacity = max(topk, int(ideal_capacity * capacity_factor) + 1)
+
+    # Fetch extra candidate experts per token
+    num_candidates = min(global_num_experts, topk * 2)
+    _, cand_ids = torch.topk(scores_for_choice, k=num_candidates, dim=-1)
+
+    # Map global expert IDs to their owning EP rank under linear placement
+    if remainder == 0:
+        cand_ranks = cand_ids // base
+    else:
+        rank_lookup = torch.empty(
+            global_num_experts, dtype=torch.long, device=scores.device)
+        for r in range(ep_size):
+            start = r * base + min(r, remainder)
+            count = base + (1 if r < remainder else 0)
+            rank_lookup[start:start + count] = r
+        cand_ranks = rank_lookup[cand_ids]
+
+    selected_ids = torch.empty((num_tokens, topk),
+                               dtype=torch.int32,
+                               device=scores.device)
+    rank_counts = torch.zeros(ep_size,
+                              dtype=torch.int32,
+                              device=scores.device)
+
+    for i in range(num_tokens):
+        chosen = 0
+        for j in range(num_candidates):
+            cid = cand_ids[i, j]
+            crank = cand_ranks[i, j]
+            if rank_counts[crank] < max_capacity or (num_candidates - j
+                                                     <= topk - chosen):
+                selected_ids[i, chosen] = cid.to(torch.int32)
+                rank_counts[crank] += 1
+                chosen += 1
+                if chosen == topk:
+                    break
+        while chosen < topk:
+            cid = cand_ids[i, chosen]
+            selected_ids[i, chosen] = cid.to(torch.int32)
+            chosen += 1
+
+    topk_weights = scores.gather(-1, selected_ids.long())
+    return topk_weights, selected_ids
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -217,7 +282,7 @@ def select_experts(
     2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
        config actually requires grouped selection).
     3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for DeepSeek-V4)
-       and optional `e_score_correction_bias`.
+       and optional `e_score_correction_bias` / capacity-aware routing / local affinity.
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.
@@ -262,14 +327,63 @@ def select_experts(
     e_score_correction_bias = getattr(layer, "e_score_correction_bias",
                                       None) if layer is not None else None
 
+    scores_for_choice = scores
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
+        scores_for_choice = scores_for_choice + bias
+
+    # Apply local expert affinity epsilon if enabled and in EP mode
+    if envs.MOE_LOCAL_EXPERT_AFFINITY_EPSILON > 0 and layer is not None:
+        moe_config = getattr(layer, "moe_config", None)
+        if moe_config is not None:
+            parallel_config = getattr(moe_config, "moe_parallel_config", None)
+            if parallel_config is not None and getattr(
+                    parallel_config, "use_ep", False):
+                ep_rank = getattr(moe_config, "ep_rank", 0)
+                ep_size = getattr(moe_config, "ep_size", 1)
+                global_experts = getattr(layer, "global_num_experts",
+                                         scores.shape[-1])
+                base = global_experts // ep_size
+                remainder = global_experts % ep_size
+                start = ep_rank * base + min(ep_rank, remainder)
+                count = base + (1 if ep_rank < remainder else 0)
+                local_mask = torch.zeros(scores.shape[-1],
+                                         dtype=torch.bool,
+                                         device=scores.device)
+                local_mask[start:start + count] = True
+                scores_for_choice = (
+                    scores_for_choice + local_mask.float() *
+                    envs.MOE_LOCAL_EXPERT_AFFINITY_EPSILON)
+
+    capacity_factor = envs.MOE_ROUTING_CAPACITY_FACTOR
+    use_ep = False
+    ep_size = 1
+    global_experts = scores.shape[-1]
+    if layer is not None:
+        moe_config = getattr(layer, "moe_config", None)
+        if moe_config is not None:
+            parallel_config = getattr(moe_config, "moe_parallel_config", None)
+            if parallel_config is not None and getattr(
+                    parallel_config, "use_ep", False):
+                use_ep = True
+                ep_size = getattr(moe_config, "ep_size", 1)
+                global_experts = getattr(layer, "global_num_experts",
+                                         scores.shape[-1])
+
+    if (capacity_factor is not None and capacity_factor > 0 and use_ep
+            and ep_size > 1):
+        topk_weights, topk_ids = _apply_capacity_aware_routing(
+            scores=scores,
+            scores_for_choice=scores_for_choice,
+            topk=topk,
+            ep_size=ep_size,
+            global_num_experts=global_experts,
+            capacity_factor=capacity_factor,
+        )
+    else:
         _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
         topk_weights = scores.gather(-1, topk_ids)
-    else:
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(

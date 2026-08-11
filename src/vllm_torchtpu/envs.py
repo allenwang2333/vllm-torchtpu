@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    MOE_ROUTING_CAPACITY_FACTOR: float | None = None
+    MOE_LOCAL_EXPERT_AFFINITY_EPSILON: float = 0.0
 
 
 def env_with_choices(
@@ -312,6 +314,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Capacity multiplier for capacity-aware MoE balanced routing across EP ranks (e.g. 1.25).
+    # When set > 0, bounds per-rank token capacity to prevent straggler tail latency.
+    "MOE_ROUTING_CAPACITY_FACTOR":
+    lambda: float(factor)
+    if (factor := os.getenv("MOE_ROUTING_CAPACITY_FACTOR")) is not None else None,
+    # Local expert affinity bias added to routing logits of experts on the local EP rank.
+    "MOE_LOCAL_EXPERT_AFFINITY_EPSILON":
+    lambda: float(os.getenv("MOE_LOCAL_EXPERT_AFFINITY_EPSILON", "0.0")),
 }
 
 
