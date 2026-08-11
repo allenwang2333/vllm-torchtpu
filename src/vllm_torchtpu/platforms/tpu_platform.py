@@ -42,11 +42,65 @@ else:
 
 logger = init_logger(__name__)
 
-# TODO(ranlihao): add more flexible topology map
-TPU_MULTIHOST_TOPOLOGY_MAP = {
-    16: "2,2,2,2",
-    32: "2,2,4,2",
+# Multi-host TPU slice mesh topologies for 2D Torus architectures.
+TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
+    4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
 }
+
+# Multi-host TPU slice mesh topologies for 3D Torus architectures.
+TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
+    8: "2,2,2,2",
+    16: "2,2,4,2",
+    32: "2,4,4,2",
+    64: "4,4,4,2",
+    128: "4,4,8,2",
+    256: "4,8,8,2",
+}
+
+# TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
+# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
+_TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
+
+
+def get_tpu_multihost_topology(
+    world_size: int,
+    device_name: Optional[str] = None,
+) -> str:
+    """Return the multi-host mesh topology string for a TPU cluster.
+
+    Resolution order:
+    1. `TORCH_TPU_TOPOLOGY` environment variable (set by GKE).
+    2. Fallback map for environments without TORCH_TPU_TOPOLOGY set.
+    """
+    env_val = os.environ.get("TORCH_TPU_TOPOLOGY")
+    if env_val:
+        # Automatically normalize standard 'AxBxC' syntax to PyTorch/XLA 'A,B,C'
+        return env_val.replace("x", ",")
+
+    if device_name is None:
+        try:
+            device_name = TpuPlatform.get_device_name()
+        except Exception:
+            device_name = ""
+
+    is_2d_torus = any(gen in device_name.lower()
+                      for gen in _TPU_2D_TORUS_GENERATIONS)
+    topo_map = (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+                if is_2d_torus else TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP)
+
+    topo = topo_map.get(world_size)
+    if topo is None:
+        raise ValueError(
+            f"Cannot find topology for {world_size} chips in {topo_map}. "
+            "Please export TORCH_TPU_TOPOLOGY in your environment.")
+    return topo
+
 
 # ---------------------------------------------------------------------------
 # Modules/attrs whose @torch.compile(dynamic=True) wrappers must be removed.
@@ -229,10 +283,14 @@ def apply_tpu_patches() -> None:
     _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
+    tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    from vllm_torchtpu.model_loader_patches import \
+        patch_runai_sharded_expert_streaming
+    patch_runai_sharded_expert_streaming()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -689,8 +747,7 @@ class TpuPlatform(Platform):
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=8,
                 max_token_size=scheduler_config.max_num_batched_tokens,
-                linear_until=envs.TPU_TOKEN_BUCKET_LINEAR_UNTIL,
-                linear_interval=envs.TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
+                extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -723,8 +780,7 @@ class TpuPlatform(Platform):
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # align-mode mamba state seeding (MambaApcStateCopier on the
-        # typed-view layout, or the pool's seed copies); other cache modes
+        # the pool's align-mode mamba state seed copies; other cache modes
         # and speculative decoding must be rejected up front instead of
         # failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
@@ -737,6 +793,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     "Speculative decoding is not yet supported with hybrid "
                     "Mamba prefix caching (mamba_cache_mode='align').")
+            if not unified_kv_layout_enabled(vllm_config):
+                # Seed copies live on the pooled path only, so the per-layer
+                # layout restores no Mamba state on a prefix-cache hit and
+                # would silently generate from an unrelated slot.
+                raise NotImplementedError(
+                    "Prefix caching on hybrid Mamba models requires the "
+                    "unified KV pool; remove "
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = \
@@ -856,13 +920,13 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 raise ValueError("TPUConnectorV2 requires "
                                  "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
                                     == "OffloadingConnector" and is_hybrid)
             if (is_hybrid_offloading
-                    and not envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL):
+                    and not unified_kv_layout_enabled(vllm_config)):
                 # Hybrid CPU offloading transfers whole pool rows; the
                 # typed-view layout has no uniform per-block row to copy.
                 raise ValueError(
@@ -972,39 +1036,25 @@ def _get_exponential_token_paddings(min_token_size: int,
     return paddings
 
 
-def _get_linear_then_exponential_token_paddings(
-        min_token_size: int, max_token_size: int, linear_until: int,
-        linear_interval: int) -> list[int]:
-    """Sizes stepping by ``linear_interval`` to ``linear_until``, doubling
-    after, capped exactly at max_token_size (see _get_exponential_token_paddings)."""
-    linear_end = min(linear_until, max_token_size)
-    paddings = sorted(
-        {min_token_size}
-        | set(range(linear_interval, linear_end + 1, linear_interval)))
-    while paddings[-1] * 2 < max_token_size:
-        paddings.append(paddings[-1] * 2)
-    if paddings[-1] < max_token_size:
-        paddings.append(max_token_size)
-    return paddings
-
-
-def _get_token_paddings(min_token_size: int,
-                        max_token_size: int,
-                        linear_until: int = 0,
-                        linear_interval: int = 16) -> list[int]:
+def _get_token_paddings(
+        min_token_size: int,
+        max_token_size: int,
+        extra_bucket_sizes: list[int] | None = None) -> list[int]:
     """Generate a list of padding size, starting from min_token_size,
     ending with a number that can cover max_token_size.
+
+    ``extra_bucket_sizes`` are merged into the list.
     """
     # assert min_token_size is power of 2
     assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
 
-    if linear_until:
-        # Linear padding sizes up to linear_until, then exponential doubling after that.
-        paddings = _get_linear_then_exponential_token_paddings(
-            min_token_size, max_token_size, linear_until, linear_interval)
-    else:
-        # Double sizes from min_token_size until max_token_size is covered.
-        paddings = _get_exponential_token_paddings(min_token_size,
-                                                   max_token_size)
+    paddings = _get_exponential_token_paddings(min_token_size, max_token_size)
+    if extra_bucket_sizes:
+        paddings = sorted(
+            set(paddings)
+            | {
+                size
+                for size in extra_bucket_sizes if 0 < size <= max_token_size
+            })
     logger.info("Using token paddings: %s", paddings)
     return paddings

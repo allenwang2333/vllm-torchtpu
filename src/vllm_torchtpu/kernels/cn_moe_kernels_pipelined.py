@@ -122,7 +122,6 @@ def _outer_kernel(
     w2_ref,
     w2_scale_ref,
     o_ref,
-    full_lhs_2d_ref,
     lhs_full_ref,
     acc_ref,
     out_vmem_ref,
@@ -139,16 +138,11 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
-    C_PAD = full_lhs_2d_ref.shape[0]
+    C_PAD = lhs_ref.shape[0]
 
-    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
-    full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
-                                          full_lhs_2d_ref, sem_ref.at[0])
-    full_lhs_copy.start()
-    full_lhs_copy.wait()
-
+    # ---- lhs is already in VMEM; reshape 2D -> 3D on chip ----
     for t in range(C_PAD):
-        row = full_lhs_2d_ref[pl.ds(t, 1), pl.ds(0, K)]
+        row = lhs_ref[pl.ds(t, 1), pl.ds(0, K)]
         lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
             row.reshape(1, 1, K)
 
@@ -236,15 +230,19 @@ def cn_gemv_w1w2_fused_pipelined(
     effective_ids = (_forward_fill_ids(sorted_ids, sorted_weights)
                      if use_ep else sorted_ids)
 
+    # Hint XLA to keep lhs in VMEM — small enough (<=8 tokens * H) to avoid
+    # the HBM write+DMA read round-trip from the preceding layer output.
+    lhs = pltpu.with_memory_space_constraint(lhs, pltpu.VMEM)
+
     C_PAD = lhs.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,  # ids, toks, weights
-        in_specs=[any_spec] * 5,
+        in_specs=[vmem_spec] + [any_spec] * 4,  # lhs in VMEM; weights in ANY
         out_specs=any_spec,
         grid=(1, ),
         scratch_shapes=[
-            pltpu.VMEM((C_PAD, K), lhs.dtype),  # full_lhs_2d (DMA pad)
             pltpu.VMEM((C_PAD, 1, K), lhs.dtype),  # full_lhs (3D)
             pltpu.VMEM((n_tokens, 1, H), jnp.float32),  # acc (3D)
             pltpu.VMEM((n_tokens, H), jnp.bfloat16),  # out_2d (DMA pad)

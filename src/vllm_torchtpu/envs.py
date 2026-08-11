@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
-    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool = False
+    TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
@@ -34,18 +34,19 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
     MOE_LOW_CONC_THRESHOLD: int = 16
-    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
-    TPU_TOKEN_BUCKET_LINEAR_UNTIL: int = 0
-    TPU_TOKEN_BUCKET_LINEAR_INTERVAL: int = 16
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_ROPE_CACHE_TRUNCATE: bool = False
 
 
 def env_with_choices(
@@ -114,6 +115,37 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
     return _get_bool_env
 
 
+def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
+    """
+    Same parsing as ``env_bool``, but an unset variable reads as ``None`` so
+    callers can tell "explicitly disabled" from "not configured".
+    """
+    parse_bool = env_bool(env_name)
+
+    def _get_optional_bool_env() -> bool | None:
+        if not os.getenv(env_name):
+            return None
+        return parse_bool()
+
+    return _get_optional_bool_env
+
+
+def env_optional_int(env_name: str) -> Callable[[], int | None]:
+    """
+    Integer parsing where, like ``env_optional_bool``, an unset or empty
+    variable reads as ``None`` so callers can tell "explicitly set" from
+    "not configured".
+    """
+
+    def _get_optional_int_env() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    return _get_optional_int_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
@@ -176,10 +208,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
-    # Experimental TPU unified block-pool cache layout. Disabled by default to
-    # preserve the compact-mamba allocation/indexing path.
+    # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
+    # wins; unset defers to
+    # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
+    # the pool for the hybrid models that ship a pooled state path and keeps
+    # everything else on the per-layer KV caches.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL":
-    env_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
+    env_optional_bool("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
     # page boundaries at registration time. 0 means unset.
@@ -218,22 +253,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output -- for profiling only, never serving. Disabled by default.
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
+<<<<<<< HEAD
     "MOE_LOW_CONC_THRESHOLD":
     lambda: int(os.getenv("MOE_LOW_CONC_THRESHOLD", "16")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
+=======
+    # Use one-hot matmuls for MoE permute and unpermute when the routed row
+    # count (num_tokens * topk) is <= this threshold. Unset or empty means
+    # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
+    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
+    # size on the SparseCore path; a positive value forces that
+    # threshold. The knob and its row-count semantics come from
+    # tpu-inference PR #2674.
+>>>>>>> origin/main
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
-    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
+    env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
     env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
     # SparseCore MoE gather-reduce (combine) kernel version used by
-    # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
-    # ragged_gather_reduce.
+    # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
+    # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION":
-    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
+    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
@@ -257,15 +302,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
-    # Pad token sizes linearly up to this size with step
-    # TPU_TOKEN_BUCKET_LINEAR_INTERVAL, then double after it. For example,
-    # if set to 64, the padding sizes will be 16, 32, 48, 64, 128, 256, etc.
-    # If set to 0, it will just double sizes(16, 32, 64, 128, ...).
-    "TPU_TOKEN_BUCKET_LINEAR_UNTIL":
-    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_UNTIL") or "0"),
-    # Step for the linear range above.
-    "TPU_TOKEN_BUCKET_LINEAR_INTERVAL":
-    lambda: int(os.getenv("TPU_TOKEN_BUCKET_LINEAR_INTERVAL") or "16"),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
@@ -282,6 +318,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunked kernel.
     "VLLM_TPU_USE_NAIVE_KDA":
     env_bool("VLLM_TPU_USE_NAIVE_KDA"),
+    # Slice the rotary cos_sin caches to max model len at load to
+    # minimize xla layout data copy overhead. Text-only.
+    "TPU_ROPE_CACHE_TRUNCATE":
+    env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    # Extra token buckets added to the default list of buckets.
+    "TPU_TOKEN_BUCKET_EXTRA":
+    lambda: [
+        int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
+        if v.strip()
+    ],
 }
 
 

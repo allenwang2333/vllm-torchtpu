@@ -11,7 +11,7 @@ logger = init_logger(__name__)
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Require a common local prefix hit on a hybrid KV producer.
 
-    vLLM 0.26.0 lets a hybrid model with any KV connector resume from the
+    vLLM 0.26.1rc0 lets a hybrid model with any KV connector resume from the
     deepest per-group local hit. That is valid on a consumer when the connector
     transfers the missing groups, but a producer has no external state to fill
     the gap. In particular, FA can have a cached page where Mamba has no state
@@ -752,8 +752,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         connector_enabled = vllm_config.kv_transfer_config is not None
         if not (cache_config.enable_prefix_caching or connector_enabled):
             hash_block_size = scheduler_block_size
-        elif (not hasattr(cache_config, "prefix_match_unit")
-              or cache_config.prefix_match_unit is None):
+        elif cache_config.prefix_match_unit is None:
             hash_block_size = math.gcd(*group_block_sizes)
         else:
             hash_block_size = cache_config.prefix_match_unit
@@ -913,3 +912,41 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
         )
+
+
+def _patch_vllm_block_pool_lifo_free() -> None:
+    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
+
+    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
+    of a small hot set of block ids) to append (FIFO) when prefix caching
+    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
+    space under sustained load and an indexed SparseCore-offloaded op on
+    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
+    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
+    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
+    Behavior with prefix caching enabled is unchanged. Remove once the
+    SparseCore index handling is fixed in the TPU runtime.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
+        return
+
+    def free_blocks(self, ordered_blocks) -> None:
+        blocks_with_hash = []
+        blocks_without_hash = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.block_hash is None:
+                    blocks_without_hash.append(block)
+                else:
+                    blocks_with_hash.append(block)
+        self.free_block_queue.prepend_n(blocks_without_hash)
+        self.free_block_queue.append_n(blocks_with_hash)
+
+    BlockPool.free_blocks = free_blocks
+    BlockPool._tpu_lifo_free_patch = True
+    from vllm_torchtpu.logger import init_logger
+    init_logger(__name__).info(
+        "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")

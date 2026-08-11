@@ -16,6 +16,7 @@ import functools
 
 import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 import os as _os
 
@@ -26,14 +27,65 @@ from vllm_torchtpu.kernels.cn_moe_kernels import cn_moe_full
 from vllm_torchtpu.kernels.cn_moe_kernels_pipelined import \
     cn_moe_full_pipelined
 
-# Experimental emit_pipeline-based CN kernel (see cn_moe_kernels_pipelined.py)
-# -- unvalidated on real hardware, NUM_K=NUM_I=1 only. Off by default; opt in
-# per-run to A/B test against the working kernel.
 _USE_PIPELINED_CN = _os.getenv("MOE_CN_USE_PIPELINED", "0") == "1"
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import \
+    ragged_gather_reduce as ragged_gather_reduce_v1
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+    ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+
+def _select_ragged_gather_reduce(version: str):
+    return {
+        "v1": ragged_gather_reduce_v1,
+        "v2": ragged_gather_reduce_v2,
+        "v3": ragged_gather_reduce_v3,
+    }[version]
+
+
+# The server sets its environment before importing model code, so the selected
+# implementation remains fixed for the process lifetime. The default is v2;
+# set RAGGED_GATHER_REDUCE_VERSION=v3 to enable the destination-major kernel.
+ragged_gather_reduce = _select_ragged_gather_reduce(
+    envs.RAGGED_GATHER_REDUCE_VERSION)
+
+# One-hot permute/combine cost grows O(routed_rows * num_tokens * hidden), so
+# auto mode never enables it above this many routed rows, even where the
+# SparseCore block is larger. TODO(xutingl): raise the cap after benchmarks.
+_ONEHOT_AUTO_CAP = 64
+
+
+def resolve_onehot_permute_threshold() -> int:
+    """Routed-row count at/below which MoE permute+combine run as TensorCore
+    one-hot matmuls instead of the SparseCore gather/reduce kernels.
+
+    Below one SparseCore block ``ragged_gather_v2`` pads to a whole block and
+    does the same SparseCore work regardless of occupancy, so auto routes such
+    small batches to the one-hot path, capped at ``_ONEHOT_AUTO_CAP``.
+
+    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` overrides auto: 0 disables the one-hot
+    path (kill switch), a positive value forces that threshold, and
+    unset/empty/negative selects auto. Auto resolves to 0 on hosts without a
+    SparseCore, leaving those paths unchanged.
+    """
+    explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
+    if explicit is not None and explicit >= 0:
+        return explicit
+    try:
+        sc_info = pltpu.get_tpu_info().sparse_core
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return 0
+    if sc_info is None:
+        return 0
+    block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
+    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
+
+    return threshold
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -280,10 +332,18 @@ def moe_gmm(
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
                                     dtype=gmm2_res.dtype)
+            # revert_indices is a permutation, so each routed row lands in
+            # exactly one (token, k) slot: the products and the sum over k
+            # never round, and `combine` holds the topk weights exactly. Only
+            # the row reduction below accumulates; pin it to f32 to match the
+            # SparseCore combine kernels and their fallback.
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
-            return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce_v2(
+            return jnp.matmul(combine,
+                              gmm2_res,
+                              preferred_element_type=jnp.float32).astype(
+                                  x.dtype)
+        return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,

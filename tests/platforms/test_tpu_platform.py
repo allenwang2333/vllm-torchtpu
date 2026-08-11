@@ -25,7 +25,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
-    TpuPlatform, _validate_phased_profiling_config)
+    TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
 
@@ -179,8 +179,8 @@ class TestTpuPlatform:
                                                        mock_apply_patches,
                                                        vllm_config):
         vllm_config.model_config.is_hybrid = True
-        # kv-transfer deployments run the split layout (the pool is opt-in
-        # via the env and never engages for kv-transfer).
+        # A hybrid architecture with no pooled state path runs the split
+        # layout, kv-transfer or not.
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "TPUConnector"
         vllm_config.cache_config.block_size = 123  # already set
@@ -192,8 +192,8 @@ class TestTpuPlatform:
                    "update_tpu_block_size_and_slot_config") as mock_update:
             TpuPlatform.update_block_size_for_backend(vllm_config)
 
-        # Without the unified-layout env the split-layout path must not run
-        # the block-size derivation helper.
+        # The split-layout path must not run the block-size derivation
+        # helper.
         mock_update.assert_not_called()
         # Verify block_size wasn't overridden by get_page_size
         assert vllm_config.cache_config.block_size == 123
@@ -222,21 +222,37 @@ class TestTpuPlatform:
         # test_tpu_block_size_utils.py).
         mock_update.assert_called_once_with(vllm_config, mock_pallas)
 
-    def test_unified_kv_layout_enablement_contract(self, vllm_config):
+    def test_unified_kv_layout_enablement_contract(self, vllm_config,
+                                                   monkeypatch):
         from vllm_torchtpu.platforms.tpu_block_size_utils import \
             unified_kv_layout_enabled
+        monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+        pooled_arch = "Qwen3_5ForConditionalGeneration"
+        unpooled_arch = "KimiLinearForCausalLM"
         vllm_config.model_config.is_hybrid = True
-
-        # No env: ordinary non-unified allocation remains selected.
         vllm_config.kv_transfer_config = None
+
+        # A hybrid architecture without a pooled state path keeps the
+        # per-layer caches: its layers unpack a separate conv/ssm pair.
+        vllm_config.model_config.architecture = unpooled_arch
         assert not unified_kv_layout_enabled(vllm_config)
 
+        # A pooled GDN architecture selects the pool with no env set.
+        vllm_config.model_config.architecture = pooled_arch
+        assert unified_kv_layout_enabled(vllm_config)
+
+        # An explicit setting wins in either direction.
+        with patch.dict("os.environ",
+                        {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}):
+            assert not unified_kv_layout_enabled(vllm_config)
+
+        vllm_config.model_config.architecture = unpooled_arch
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"}):
-            # The same env selects the pooled layout for local and transfer
-            # deployments.
             assert unified_kv_layout_enabled(vllm_config)
 
+            # The pooled layout is selected for local and transfer
+            # deployments alike.
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
 
@@ -257,6 +273,8 @@ class TestTpuPlatform:
             self, mock_prepare_env, mock_apply_patches, vllm_config,
             mamba_cache_mode, speculative_config, async_scheduling, message):
         vllm_config.model_config.is_hybrid = True
+        # A pooled GDN architecture: hybrid prefix caching needs the pool.
+        vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.enable_prefix_caching = True
         vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
@@ -274,6 +292,24 @@ class TestTpuPlatform:
         else:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_hybrid_apc_without_pool(
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
+        # Opting out of the pool leaves align mode with no seed copies, so a
+        # prefix-cache hit would restore no Mamba state at all.
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        vllm_config.cache_config.block_size = 256
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = "align"
+
+        with pytest.raises(NotImplementedError, match="unified KV pool"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         "connector_name",
@@ -329,7 +365,8 @@ class TestTpuPlatform:
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.cache_dtype = "auto"
         if is_hybrid:
-            vllm_config.cache_config.enable_prefix_caching = True
+            # Prefix caching stays off: hybrid APC without the pool is
+            # rejected earlier, by its own gate, and would mask this one.
             vllm_config.cache_config.mamba_cache_mode = "align"
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = "OffloadingConnector"
@@ -379,6 +416,41 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+    def test_get_tpu_multihost_topology(self, monkeypatch):
+        # Test env override via TORCH_TPU_TOPOLOGY
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,1")
+        assert get_tpu_multihost_topology(16) == "4,4,1"
+        monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+
+        # Test syntax normalization ('AxBxC' -> 'A,B,C')
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4x4x1")
+        assert get_tpu_multihost_topology(16) == "4,4,1"
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "8x16x1")
+        assert get_tpu_multihost_topology(128) == "8,16,1"
+        monkeypatch.delenv("TORCH_TPU_TOPOLOGY", raising=False)
+
+        # Test 2D torus fallback map lookup (v6e / v5e)
+        assert get_tpu_multihost_topology(16, device_name="TPU v6e") == "4,4,1"
+        assert get_tpu_multihost_topology(32, device_name="TPU v5e") == "4,8,1"
+        assert get_tpu_multihost_topology(64, device_name="TPU v6e") == "8,8,1"
+
+        # Test 3D torus fallback map lookup (v4 / v5p)
+        assert get_tpu_multihost_topology(16,
+                                          device_name="TPU v4") == "2,2,4,2"
+        assert get_tpu_multihost_topology(32,
+                                          device_name="TPU v5p") == "2,4,4,2"
+        assert get_tpu_multihost_topology(64,
+                                          device_name="TPU v4") == "4,4,4,2"
+        assert get_tpu_multihost_topology(128,
+                                          device_name="TPU v5p") == "4,4,8,2"
+        assert get_tpu_multihost_topology(256,
+                                          device_name="TPU v4") == "4,8,8,2"
+
+        # Test ValueError on unsupported chip counts
+        with pytest.raises(ValueError,
+                           match="Cannot find topology for 10 chips"):
+            get_tpu_multihost_topology(10, device_name="TPU v6e")
 
 
 class TestPhasedProfilingConfigValidation:
