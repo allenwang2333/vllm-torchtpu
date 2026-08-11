@@ -139,7 +139,8 @@ def _make_inputs(q_lens,
         assert seq_len // comp_ratio <= pages_per_seq * page_size, (
             "page table too small for the compressed sequence")
 
-    q = rng.standard_normal((num_tokens, num_heads, head_dim), dtype=np.float32)
+    q = rng.standard_normal((num_tokens, num_heads, head_dim),
+                            dtype=np.float32)
     lo, hi = (-1.5, 1.5) if signed_weights else (0.25, 1.75)
     weights = rng.uniform(lo, hi, (num_tokens, num_heads)).astype(np.float32)
 
@@ -176,7 +177,10 @@ def _make_inputs(q_lens,
 def _run(inputs, k, comp_ratio, bkv_p, bq_sz):
     """Invoke the kernel; returns the jax array so callers can inspect it."""
     return streamindex_topk(
-        **{name: jnp.asarray(value) for name, value in inputs.items()},
+        **{
+            name: jnp.asarray(value)
+            for name, value in inputs.items()
+        },
         k=k,
         compression_ratio=comp_ratio,
         num_kv_pages_per_block=bkv_p,
@@ -208,9 +212,10 @@ def _assert_topk(actual, scores, k):
 
         assert np.all(row[:n_kept] >= 0) and np.all(row[n_kept:] < 0), (
             f"token {token}: -1 padding is not a suffix: {row}")
-        assert n_kept == min(k, n_visible), (
-            f"token {token}: kept {n_kept} positions, expected "
-            f"{min(k, n_visible)}")
+        assert n_kept == min(
+            k,
+            n_visible), (f"token {token}: kept {n_kept} positions, expected "
+                         f"{min(k, n_visible)}")
         if n_kept == 0:
             continue
 
@@ -244,8 +249,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
     @parameterized.named_parameters(
         # Single decode step; k covers every visible position.
         dict(testcase_name="_decode",
-             q_lens=(1,),
-             seq_lens=(512,),
+             q_lens=(1, ),
+             seq_lens=(512, ),
              comp_ratio=4,
              page_size=128,
              pages_per_seq=4,
@@ -272,8 +277,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
         # Prefill with two query blocks, and k well under the number of visible
         # positions so the running Top-K actually has to discard candidates.
         dict(testcase_name="_prefill",
-             q_lens=(8,),
-             seq_lens=(1024,),
+             q_lens=(8, ),
+             seq_lens=(1024, ),
              comp_ratio=4,
              page_size=64,
              pages_per_seq=8,
@@ -311,8 +316,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
         # head_dim below one lane group: the kernel zero-pads the query to 128
         # and the packed record keeps the scale byte at the padded offset.
         dict(testcase_name="_narrow_head_dim",
-             q_lens=(4,),
-             seq_lens=(512,),
+             q_lens=(4, ),
+             seq_lens=(512, ),
              comp_ratio=2,
              page_size=32,
              pages_per_seq=8,
@@ -323,8 +328,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
              bq_sz=2),
         # Single head, no compression, one query per block.
         dict(testcase_name="_single_head",
-             q_lens=(3,),
-             seq_lens=(256,),
+             q_lens=(3, ),
+             seq_lens=(256, ),
              comp_ratio=1,
              page_size=32,
              pages_per_seq=8,
@@ -370,8 +375,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
         unchanged. This is what a paged KV cache guarantees and what a mistake
         in the page walk breaks.
         """
-        kwargs = dict(q_lens=(4,),
-                      seq_lens=(512,),
+        kwargs = dict(q_lens=(4, ),
+                      seq_lens=(512, ),
                       comp_ratio=2,
                       page_size=64,
                       pages_per_seq=4,
@@ -379,8 +384,8 @@ class StreamIndexTopKTest(parameterized.TestCase):
                       head_dim=128,
                       seed=3)
         inputs, scores = _make_inputs(**kwargs)
-        baseline = np.asarray(_run(inputs, k=64, comp_ratio=2, bkv_p=2,
-                                   bq_sz=4))
+        baseline = np.asarray(
+            _run(inputs, k=64, comp_ratio=2, bkv_p=2, bq_sz=4))
 
         # Move every logical block to a different physical page, carrying its
         # contents along, and re-run.
@@ -396,7 +401,7 @@ class StreamIndexTopKTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
         dict(testcase_name="_decode", q_lens=(1, 1, 1), k=2048),
-        dict(testcase_name="_prefill", q_lens=(6,), k=512),
+        dict(testcase_name="_prefill", q_lens=(6, ), k=512),
     )
     def test_lowering_shape(self, q_lens, k):
         """Trace-only check: the kernel is never executed, so no TPU needed."""
@@ -414,8 +419,10 @@ class StreamIndexTopKTest(parameterized.TestCase):
                                num_kv_pages_per_block=2,
                                num_queries_per_block=4)
         out = jax.eval_shape(
-            fn, **{name: jnp.asarray(v)
-                   for name, v in inputs.items()})
+            fn, **{
+                name: jnp.asarray(v)
+                for name, v in inputs.items()
+            })
 
         self.assertEqual(out.shape, (sum(q_lens), k))
         self.assertEqual(out.dtype, jnp.int32)

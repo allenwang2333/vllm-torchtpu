@@ -13,24 +13,20 @@
 # limitations under the License.
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
-from typing import cast, Any
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas, sync
-from transformers import DeepseekV2Config, DeepseekV3Config
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import \
     get_attention_context
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-from vllm.model_executor.layers.layernorm import LayerNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
-                                               ReplicatedLinear)
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -48,15 +44,14 @@ from vllm.v1.attention.backends.mla.prefill import selector
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
-from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.vllm.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 
 # streamindex_topk block-tuning knobs. NOT tuned: these are the first values
 # found to fit, not the result of a sweep -- benchmark before reading anything
 # into the kernel's throughput.
 STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
 STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
-
 
 
 @SparseAttnIndexer.register_oot
@@ -264,9 +259,10 @@ class VllmTPUIndexer(Indexer):
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = quantize_tensor(
-            q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
-        )
+        q_fp8, q_scale = quantize_tensor(q,
+                                         torch.float8_e4m3fn,
+                                         axis=-1,
+                                         use_ue8m0=False)
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
