@@ -3,7 +3,26 @@
 Read `dsv4_status.md` first for background. This file is only the things that
 were still moving at the end of the day.
 
-## 1. There is an UNVERIFIED fix in the working tree
+## 0. RESULT (2026-08-11, late): the compressor fix is a NO-OP
+
+Tested on the XLA prompt. Output is **byte-identical** to the pre-fix run
+(same md5 over the generated text). So `state_metadata.input_positions` and
+`k_cache_metadata.input_positions` already carry the same values as the
+model-level `positions` in our stack, and threading them through changes
+nothing.
+
+The divergence from the reference is real *structurally* -- the reference
+addresses each cache with its own metadata, we used one vector for both -- but
+it is not the cause of the generation bug. Keep the change (it matches the
+reference and costs nothing) but do not count it as a fix.
+
+**Next target: the attention module's metadata construction**
+(`deepseek_v4_attention.py`, 1705 lines, no reference test). The kernels are
+proven equivalent, so if the kernels are right and the output is wrong, what
+they are being *fed* is where the bug is. Worth checking first: the attention
+sinks, and how the SWA/main split and page indices are built per decode step.
+
+## 1. The fix that was in the working tree (now known inert)
 
 `src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/deepseek_v4_compressor.py`
 is modified and deliberately **not committed**. A copy is saved at

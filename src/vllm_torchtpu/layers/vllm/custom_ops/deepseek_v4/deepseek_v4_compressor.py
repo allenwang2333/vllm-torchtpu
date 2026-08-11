@@ -85,7 +85,9 @@ def _deepseek_v4_compressor_jax(
     request_distribution: jax.Array,
     query_start_loc: jax.Array,
     seq_lens: jax.Array,
+    state_input_positions: jax.Array,
     state_block_tables: jax.Array,
+    k_input_positions: jax.Array,
     k_block_tables: jax.Array,
     cache: jax.Array,
     *,
@@ -105,7 +107,8 @@ def _deepseek_v4_compressor_jax(
 
     def _compressor_local(kv_score, ape, norm_weight, cos_sin_cache, positions,
                           request_distribution, query_start_loc, seq_lens,
-                          state_block_tables, k_block_tables, cache):
+                          state_input_positions, state_block_tables,
+                          k_input_positions, k_block_tables, cache):
         num_valid_reqs = request_distribution[2]
         num_tokens = kv_score.shape[0]
         num_valid_tokens = query_start_loc[num_valid_reqs]
@@ -130,15 +133,28 @@ def _deepseek_v4_compressor_jax(
         assert state_block_tables.shape[0] % max_num_seqs == 0
         max_num_state_blocks_per_req = (state_block_tables.shape[0] //
                                         max_num_seqs)
-        # Wrap within this request's own state-block allocation (a
-        # circular/sliding-window buffer, per SlidingWindowMLASpec) --
-        # without the modulo, any position beyond
-        # max_num_state_blocks_per_req * state_block_size aliases into the
-        # *next* request's block-table slice.
+        # Address each cache with ITS OWN metadata's `input_positions`, not the
+        # model-level `positions`. The state cache and the compressed-KV cache
+        # are separate kv-cache groups with separate block tables, and -- under
+        # a sliding-window spec -- separate position numbering. Using one
+        # `positions` for both writes state to whatever slot that arithmetic
+        # happens to land on, and the error grows with position, which matches
+        # the observed degradation tracking generated-token count.
+        #
+        # The reference threads both through for exactly this reason
+        # (`deepseek_v4_compressor.py`: `state_metadata.input_positions` and
+        # `k_cache_metadata.input_positions`). The same argument is already
+        # made in this file for `k_block_tables`; it applies to positions too.
+        #
+        # The modulo stays as a guard: it is a no-op when the metadata already
+        # numbers positions within the request's own allocation (the reference
+        # has no modulo because its positions always are), and it still stops a
+        # stray absolute position from aliasing into the next request's slice.
         state_cache_block_num = (
-            positions // state_block_size) % max_num_state_blocks_per_req + (
+            state_input_positions //
+            state_block_size) % max_num_state_blocks_per_req + (
                 token_to_req_indices * max_num_state_blocks_per_req)
-        state_cache_block_offset = positions % state_block_size
+        state_cache_block_offset = state_input_positions % state_block_size
         slot_mapping = (
             state_block_tables[state_cache_block_num] * state_block_size +
             state_cache_block_offset)
@@ -149,10 +165,11 @@ def _deepseek_v4_compressor_jax(
         max_num_k_blocks_per_req = k_block_tables.shape[0] // max_num_seqs
         k_block_size = cache.shape[1] * cache.shape[2]
         k_cache_block_num = (
-            (positions // compress_ratio) //
+            (k_input_positions // compress_ratio) //
             k_block_size) % max_num_k_blocks_per_req + (
                 token_to_req_indices * max_num_k_blocks_per_req)
-        k_cache_block_offset = (positions // compress_ratio) % k_block_size
+        k_cache_block_offset = ((k_input_positions // compress_ratio) %
+                                k_block_size)
         kv_slot_mapping = (k_block_tables[k_cache_block_num] * k_block_size +
                            k_cache_block_offset)
         kv_slot_mapping = jnp.where(
@@ -199,7 +216,9 @@ def _deepseek_v4_compressor_jax(
         P(),  # request_distribution
         P(),  # query_start_loc
         data_spec,  # seq_lens
+        data_spec,  # state_input_positions
         data_spec,  # state_block_tables
+        data_spec,  # k_input_positions
         data_spec,  # k_block_tables
         P(),  # cache
     )
@@ -226,8 +245,8 @@ def _deepseek_v4_compressor_jax(
         out_specs=out_specs,
         check_vma=False,
     )(kv_score, ape, norm_weight, cos_sin_cache, positions,
-      request_distribution, query_start_loc, seq_lens, state_block_tables,
-      k_block_tables, cache)
+      request_distribution, query_start_loc, seq_lens, state_input_positions,
+      state_block_tables, k_input_positions, k_block_tables, cache)
 
     if cache_was_5d:
         updated_cache = jnp.expand_dims(updated_cache, axis=2)
@@ -418,7 +437,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 P(),  # request_distribution
                 P(),  # query_start_loc
                 get_valid_spec(mesh, batch_axis),  # seq_lens
+                get_valid_spec(mesh, attn_data_axis),  # state_input_positions
                 get_valid_spec(mesh, batch_axis),  # state_block_tables
+                get_valid_spec(mesh, attn_data_axis),  # k_input_positions
                 get_valid_spec(mesh, batch_axis),  # k_block_tables
                 P(),  # cache
             ),
@@ -426,8 +447,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         def _fake_compressor(kv_score, ape, norm_weight, cos_sin_cache,
                              positions, request_distribution, query_start_loc,
-                             seq_lens, state_block_tables, k_block_tables,
-                             cache, *args, **kwargs):
+                             seq_lens, state_input_positions,
+                             state_block_tables, k_input_positions,
+                             k_block_tables, cache, *args, **kwargs):
             return torch.empty_like(cache)
 
         compressor_jax_op.register_fake(_fake_compressor)
@@ -475,8 +497,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             state_block_tables = state_metadata.block_tables
             if state_block_tables is not None:
                 state_block_tables = state_block_tables.flatten()
+            # Fall back to the model-level positions only if this metadata has
+            # none; that is the old behaviour and is wrong when the two caches
+            # number positions differently.
+            state_input_positions = getattr(state_metadata, "input_positions",
+                                            None)
+            if state_input_positions is None:
+                state_input_positions = positions
         else:
             state_req_dist = state_q_start_loc = state_seq_lens = state_block_tables = None
+            state_input_positions = positions
 
         if (os.getenv("DSV4_DEBUG_COMPRESSOR") == "1" and not _is_tracing()
                 and isinstance(attn_ctx, dict) and prefix_key is not None
@@ -501,8 +531,13 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             k_block_tables = k_cache_metadata.block_tables
             if k_block_tables is not None:
                 k_block_tables = k_block_tables.flatten()
+            k_input_positions = getattr(k_cache_metadata, "input_positions",
+                                        None)
+            if k_input_positions is None:
+                k_input_positions = positions
         else:
             k_block_tables = None
+            k_input_positions = positions
 
         # During the pre-allocation profiling/dummy forward pass, no KV cache
         # has been bound to k_cache yet; there is nothing to compress/store.
@@ -656,7 +691,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             state_req_dist,
             state_q_start_loc,
             state_seq_lens,
+            state_input_positions,
             state_block_tables,
+            k_input_positions,
             k_block_tables,
             orig_cache,
         )
