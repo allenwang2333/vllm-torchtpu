@@ -769,7 +769,15 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"
         os.makedirs(outdir, exist_ok=True)
         if isinstance(tensor, torch.Tensor):
-            arr = tensor.detach().cpu().to(torch.float32).numpy()
+            # Materialize the lazy TPU tensor before the host read; a bare
+            # `.cpu()` is not ordered against the deferred graph and copies
+            # unmaterialized bytes. See `_dump_to_numpy` in
+            # models/vllm/deepseek_v4_patch.py for the full account (it
+            # manufactured a 2.884e38 "blowup" that did not exist in the real
+            # computation).
+            from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                _dump_to_numpy
+            arr = _dump_to_numpy(tensor)
         else:
             arr = np.asarray(tensor)
         np.save(f"{outdir}/sub_{name}_step{step:03d}.npy", arr)

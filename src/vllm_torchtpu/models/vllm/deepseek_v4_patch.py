@@ -50,6 +50,43 @@ from vllm_torchtpu.models.vllm.deepseek_v4_requant import \
     attention_requantizer_generator  # noqa: E402
 
 
+def _dump_to_numpy(t: torch.Tensor):
+    """Materialize a (possibly lazy) TPU tensor, then read it to numpy fp32.
+
+    `t.detach().cpu()` on a lazy torch_tpu tensor is NOT ordered with respect
+    to the deferred op graph: it copies whatever bytes are currently at that
+    address, which need not be the computed result. Every activation dump in
+    this repo used to do exactly that, and it manufactured a spectacular false
+    finding -- layer 42 appearing to "blow up" to 2.884e38 (and `inf` in the
+    whole-layer dump) while the real computation was finite. Controlled
+    comparison, same prompt and commit:
+
+        reference post_ffn absmax   1.997e4
+        ours WITHOUT dumping        1.856e4   (ratio 0.93 -- agrees)
+        ours WITH dumping           2.884e38
+
+    The tell was in the bits: 95.1% of the "corrupt" values were exact powers
+    of two with zero mantissas (vs 1.2% in a magnitude-matched control), i.e.
+    reinterpreted bytes rather than computed numbers.
+
+    tpu-inference hits the same hazard from the JAX side and fixes it with
+    `jax.debug.callback` -- per its own comment, "ordered with respect to the
+    computation and receives materialized values". We are torch_tpu rather
+    than torchax, so the equivalent is `sync.synchronize(t, wait=True)`.
+
+    Failures here are logged, never raised: instrumentation must not kill a
+    15-minute TPU run.
+    """
+    from torch_tpu._internal import sync as _sync
+    t = t.detach()
+    try:
+        if t.device.type == "tpu":
+            _sync.synchronize(t, wait=True)
+    except Exception as e:
+        logger.warning("[DUMP] synchronize failed: %s", e)
+    return t.cpu().to(torch.float32).numpy()
+
+
 def patched_decoder_load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     import typing
@@ -1055,9 +1092,18 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                 if any(r is None for r in res):
                     x_post = res[0]
                 else:
+                    # mhc_post_torch is not part of the real forward path
+                    # here (use_fused_mhc keeps the 4 hyper-connection
+                    # streams separate until they're actually needed
+                    # downstream) -- this call exists only to produce a
+                    # debug dump. Clone the inputs so this extra,
+                    # dump-only invocation cannot mutate the live streams
+                    # the rest of the model still depends on if the kernel
+                    # has any in-place semantics.
                     import vllm.model_executor.kernels.mhc as mhc_kernels
                     x_post = mhc_kernels.mhc_post_torch(
-                        res[0], res[1], res[2], res[3])
+                        res[0].clone(), res[1].clone(), res[2].clone(),
+                        res[3].clone())
             else:
                 x_post = x
 
@@ -1068,8 +1114,13 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     if not hasattr(self, "_step_idx"):
                         self._step_idx = 0
                     import numpy as np
-                    tensor_cpu = x_post.detach().cpu().to(
-                        torch.float32).numpy()
+
+                    # Same materialization hazard as the sublayer `save()`
+                    # below: a lazy torch_tpu tensor must be synchronized
+                    # before a host read, or `.cpu()` copies unmaterialized
+                    # bytes. This path is what produced `layer42_*.npy` with
+                    # absmax=inf while the real computation was finite.
+                    tensor_cpu = _dump_to_numpy(x_post)
                     os.makedirs(
                         "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
                         exist_ok=True)
@@ -1080,8 +1131,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                         in_x = args[0] if len(args) > 0 else kwargs.get(
                             "hidden_states", None)
                         if isinstance(in_x, torch.Tensor):
-                            in_cpu = in_x.detach().cpu().to(
-                                torch.float32).numpy()
+                            in_cpu = _dump_to_numpy(in_x)
                             in_filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/input_step{self._step_idx:03d}.npy"
                             np.save(in_filepath, in_cpu)
 
@@ -1213,6 +1263,158 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
             "DSV4_SUBSTITUTE_LAYER") is not None:
         DeepseekV4DecoderLayer.forward = patched_layer_forward
 
+    # 1.5b. Shared-expert MLP stage probe (DSV4_DEBUG_MLP_STAGES=1).
+    #
+    # The full-stack diff put a 34-order-of-magnitude blowup inside ONE
+    # sublayer: L42/05_post_ffn reaches 2.884e38 (fp32 max 3.403e38) while
+    # tpu-inference stays at 1.997e04, and L42/04_hc_pre_ffn (its input) is
+    # healthy and matched. Every checkpoint weight and loaded scale feeding
+    # L42 was measured healthy, so the corruption is created at RUNTIME.
+    #
+    # This reports the magnitude after each of the three MLP stages so the
+    # blowup is attributed to gate_up_proj, the clamped activation, or
+    # down_proj -- rather than inferred. Compare L42 against L40 (also an
+    # indexer/compressor layer, so a like-for-like control; L41 is odd and
+    # has no compressor).
+    from vllm.models.deepseek_v4.amd.model import DeepseekV4MLP
+    _orig_mlp_forward = DeepseekV4MLP.forward
+
+    def patched_mlp_forward(self, x):
+        if os.getenv("DSV4_DEBUG_MLP_STAGES") != "1":
+            return _orig_mlp_forward(self, x)
+        _is_compiling = (hasattr(torch, "compiler")
+                         and torch.compiler.is_compiling())
+        if _is_compiling:
+            return _orig_mlp_forward(self, x)
+        _p = getattr(self, "_tpu_mlp_prefix", "?")
+        gate_up, _ = self.gate_up_proj(x)
+        act = self.act_fn(gate_up)
+        out, _ = self.down_proj(act)
+        logger.info("[MLP_STAGE] %s x=%.4g gate_up=%.4g act=%.4g out=%.4g", _p,
+                    float(x.detach().float().abs().max()),
+                    float(gate_up.detach().float().abs().max()),
+                    float(act.detach().float().abs().max()),
+                    float(out.detach().float().abs().max()))
+        return out
+
+    # 1.5c. MoE combine probe (DSV4_DEBUG_MOE_COMBINE=1).
+    #
+    # Established by measurement: on the 8 affected rows at L42 the sum of ALL
+    # ranks' routed contributions is <= 345 and the shared-expert MLP output is
+    # <= 330 on every rank, yet `self.ffn`'s output (captured by forward hook on
+    # the single real execution) reaches 2.884e38. So ~1e38 is produced INSIDE
+    # DeepseekV4MoE.forward from inputs bounded by ~350.
+    #
+    # This logs every tensor in the runner's combine sequence
+    # (moe_runner.py:706-729) so the amplification lands on a specific step:
+    # shared reduce -> routed scale -> shared+fused add -> final all-reduce.
+    if os.getenv("DSV4_DEBUG_MOE_COMBINE") == "1":
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
+            MoERunner
+
+        def _mag(t):
+            if t is None:
+                return "None"
+            try:
+                return f"{float(t.detach().float().abs().max()):.6g}"
+            except Exception:
+                return "?"
+
+        _orig_reduce_shared = MoERunner._maybe_reduce_shared_expert_output
+        _orig_apply_scale = MoERunner._maybe_apply_routed_scale_to_output
+        _orig_reduce_final = MoERunner._maybe_reduce_final_output
+
+        def _tag(self):
+            return getattr(self, "layer_name", "?")
+
+        def p_reduce_shared(self, shared_output, *a, **kw):
+            out = _orig_reduce_shared(self, shared_output, *a, **kw)
+            logger.info("[COMBINE] %s reduce_shared: in=%s out=%s", _tag(self),
+                        _mag(shared_output), _mag(out))
+            return out
+
+        def p_apply_scale(self, shared_output, fused_output, *a, **kw):
+            so, fo = _orig_apply_scale(self, shared_output, fused_output, *a,
+                                       **kw)
+            logger.info(
+                "[COMBINE] %s routed_scale(rsf=%s): shared %s->%s fused %s->%s",
+                _tag(self), getattr(self, "routed_scaling_factor", "?"),
+                _mag(shared_output), _mag(so), _mag(fused_output), _mag(fo))
+            return so, fo
+
+        def p_reduce_final(self, states, trunc_size, *a, **kw):
+            out = _orig_reduce_final(self, states, trunc_size, *a, **kw)
+            logger.info(
+                "[COMBINE] %s reduce_final: in=%s out=%s trunc=%s "
+                "fused_reduced=%s", _tag(self), _mag(states), _mag(out),
+                trunc_size, self._fused_output_is_reduced)
+            return out
+
+        MoERunner._maybe_reduce_shared_expert_output = p_reduce_shared
+        MoERunner._maybe_apply_routed_scale_to_output = p_apply_scale
+        MoERunner._maybe_reduce_final_output = p_reduce_final
+
+        # Straddle the ONE operation left between the runner's (finite) output
+        # and the ffn module's (corrupt) output:
+        #     return final_hidden_states.view(org_shape)
+        # Measured across runs: reduce_final out = 18560 on all 8 ranks, while
+        # the hooked ffn output is 2.884e38 whose values are 95.1% exact powers
+        # of two with zero mantissas -- i.e. reinterpreted bytes, not
+        # arithmetic. Those two numbers came from DIFFERENT runs, so this logs
+        # both sides within a SINGLE forward, plus the storage facts that decide
+        # whether `.view()` can alias: dtype, contiguity, shape and data_ptr.
+        from vllm.models.deepseek_v4.amd.model import DeepseekV4MoE
+        _orig_moe_forward = DeepseekV4MoE.forward
+
+        def p_moe_forward(self, hidden_states, input_ids=None):
+            org_shape = hidden_states.shape
+            if self.gate.tid2eid is not None and input_ids is None:
+                raise ValueError(
+                    "DeepSeek V4 hash MoE routing requires input_ids.")
+            if self.experts.is_internal_router:
+                fhs = self.experts(hidden_states=hidden_states,
+                                   router_logits=hidden_states,
+                                   input_ids=input_ids)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                fhs = self.experts(hidden_states=hidden_states,
+                                   router_logits=router_logits,
+                                   input_ids=input_ids)
+            pre = _mag(fhs)
+            try:
+                ptr_pre = fhs.data_ptr()
+            except Exception:
+                ptr_pre = -1
+            out = fhs.view(org_shape)
+            try:
+                ptr_post = out.data_ptr()
+            except Exception:
+                ptr_post = -1
+            logger.info(
+                "[VIEW] %s pre=%s post=%s | in_shape=%s out_shape=%s "
+                "org_shape=%s | dtype=%s contig=%s | ptr_pre=0x%x "
+                "ptr_post=0x%x", getattr(self, "prefix", "?"), pre, _mag(out),
+                tuple(fhs.shape), tuple(out.shape), tuple(org_shape),
+                fhs.dtype, fhs.is_contiguous(), ptr_pre & 0xffffffff,
+                ptr_post & 0xffffffff)
+            return out
+
+        DeepseekV4MoE.forward = p_moe_forward
+        logger.info("DSV4_DEBUG_MOE_COMBINE: MoERunner + .view() probe "
+                    "installed")
+
+    if os.getenv("DSV4_DEBUG_MLP_STAGES") == "1":
+        # DeepseekV4MLP takes `prefix` but does not retain it, so capture it
+        # at construction; without it every probe line is unattributable.
+        _orig_mlp_init = DeepseekV4MLP.__init__
+
+        def patched_mlp_init(self, *a, **kw):
+            _orig_mlp_init(self, *a, **kw)
+            self._tpu_mlp_prefix = kw.get("prefix", "?")
+
+        DeepseekV4MLP.__init__ = patched_mlp_init
+        DeepseekV4MLP.forward = patched_mlp_forward
+
     # 1.6. Sub-layer instrumentation (layer 0 only): dump hidden states at
     # each of the 6 checkpoints inside _forward_unfused_post_pre, to localize
     # the Layer-0 divergence found by the corrected hidden-state bisection
@@ -1283,29 +1485,77 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         layer_suffix = f"_L{layer_idx}" if layer_idx != 0 else ""
 
         def save(name, t):
+            # Materialize before the host read -- see `_dump_to_numpy`.
             np.save(f"{outdir}/sub_{name}{layer_suffix}_step{step:03d}.npy",
-                    t.detach().cpu().to(torch.float32).numpy())
+                    _dump_to_numpy(t))
 
-        residual_ = x
-        x1, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale,
-                                     self.hc_attn_base)
-        save("01_hc_pre_attn", x1)
-        x2 = self.attn_norm(x1)
-        x3 = self.attn(positions, x2, None)
-        save("02_post_attn", x3)
-        x4 = self.hc_post(x3, residual_, post, comb)
-        save("03_hc_post_attn", x4)
+        # CAPTURE VIA HOOKS -- DO NOT RE-EXECUTE THE LAYER BODY.
+        #
+        # This function used to reimplement the layer body (hc_pre -> attn_norm
+        # -> attn -> hc_post -> ...) inline and save each intermediate. The math
+        # matched upstream line-for-line, but running the body a second time
+        # ALSO ran `self.attn(...)` a second time, and attention WRITES THE KV
+        # CACHE. The duplicate write corrupted the cache, and the dumped tensors
+        # diverged from what the real forward pass computed:
+        #
+        #   real MoE call (moe_dumps/):  x_L42 absmax 5.75, routed_out 1.77e4
+        #   dumper re-execution:         sub_05_post_ffn_L42 2.884e38, layer42 inf
+        #
+        # Every rank's routed contribution summed to <=345 on the affected rows
+        # and the shared-expert MLP maxed at 330, so the 1e38 could not come
+        # from the real computation -- and the model in fact emitted the correct
+        # token. The whole "L42 blows up / poisons the KV cache" finding was an
+        # artifact of this dumper. Hooks observe the single real execution
+        # instead, so the cache is written exactly once.
+        handles = []
 
-        residual_ = x4
-        x5, post2, comb2 = self.hc_pre(x4, self.hc_ffn_fn, self.hc_ffn_scale,
-                                       self.hc_ffn_base)
-        save("04_hc_pre_ffn", x5)
-        x6 = self.ffn_norm(x5)
-        x7 = self.ffn(x6, input_ids)
-        save("05_post_ffn", x7)
-        x8 = self.hc_post(x7, residual_, post2, comb2)
-        save("06_hc_post_ffn", x8)
-        return x8, None, None, None
+        def _hook(name):
+
+            def fn(_mod, _inp, out):
+                t = out[0] if isinstance(out, tuple) else out
+                if isinstance(t, torch.Tensor):
+                    save(name, t)
+
+            return fn
+
+        def _pre_hook(name):
+            """Capture a module's INPUT (its arg 0)."""
+
+            def fn(_mod, inp):
+                if inp and isinstance(inp[0], torch.Tensor):
+                    save(name, inp[0])
+
+            return fn
+
+        # hc_pre/hc_post are plain methods, not submodules, so they cannot be
+        # hooked directly. But attn_norm/ffn_norm consume exactly the hc_pre
+        # outputs, so their INPUTS are the 01/04 checkpoints -- byte-identical
+        # to what the old inline dump saved, with no re-execution.
+        handles.append(
+            self.attn_norm.register_forward_pre_hook(
+                _pre_hook("01_hc_pre_attn")))
+        handles.append(self.attn.register_forward_hook(_hook("02_post_attn")))
+        handles.append(
+            self.ffn_norm.register_forward_pre_hook(
+                _pre_hook("04_hc_pre_ffn")))
+        handles.append(self.ffn.register_forward_hook(_hook("05_post_ffn")))
+        try:
+            res = _orig_forward_unfused_post_pre(self, x, positions, input_ids,
+                                                 post_mix, res_mix, residual)
+        finally:
+            for h in handles:
+                h.remove()
+        # NOTE: `03_hc_post_attn` is no longer captured. It is a pure
+        # intermediate (hc_post's return, consumed directly by the next hc_pre)
+        # with no module boundary to hook, and recovering it would require
+        # re-running hc_post -- the exact re-execution this rewrite removes.
+        # hc_post is cheap elementwise mixing and was never a divergence site;
+        # 01/02/04/05/06 still bracket both attention and the FFN.
+        # 06_hc_post_ffn is the layer's own output.
+        out0 = res[0] if isinstance(res, (tuple, list)) else res
+        if isinstance(out0, torch.Tensor):
+            save("06_hc_post_ffn", out0)
+        return res
 
     DeepseekV4DecoderLayer._forward_unfused_post_pre = patched_forward_unfused_post_pre
 
