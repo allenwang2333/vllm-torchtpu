@@ -37,6 +37,7 @@ ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
 the blockwise Pallas kernel path instead.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -925,6 +926,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             DEEPSEEK_V4_FP8
         is_routed_expert = bool(prefix and ("experts" in prefix)
                                 and ("shared_experts" not in prefix))
+        self._tpu_dbg_prefix = prefix
         if is_dsv4 and not is_routed_expert:
             # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
             self.weight_block_size = None
@@ -989,6 +991,32 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert dense linear checkpoint weights to runtime FP8."""
+        # DSV4_DEBUG_LINEAR_SCALES=1: record the ACTUAL scale state as loaded,
+        # before any processing. The L42 shared-expert output was measured
+        # reaching 2.884e38 (fp32 max is 3.403e38) while the reference stayed
+        # at 1.997e4; this reports whether a scale still holds the
+        # finfo(float32).min sentinel that create_weights initializes, and
+        # which quantization mode this layer actually resolved to.
+        if os.getenv("DSV4_DEBUG_LINEAR_SCALES") == "1":
+            _sent = torch.finfo(torch.float32).min
+            for _n in ("weight_scale", "weight_scale_inv"):
+                _v = getattr(layer, _n, None)
+                if _v is None:
+                    continue
+                _f = _v.data.float()
+                _ns = int((_f == _sent).sum())
+                logger.info(
+                    "[LIN_SCALE] %s %s shape=%s dtype=%s min=%.4g max=%.4g "
+                    "sentinel_elems=%d/%d block_quant=%s wbs=%s",
+                    getattr(self, "_tpu_dbg_prefix", "?"),
+                    _n, tuple(_v.shape), _v.dtype, float(_f.min()),
+                    float(_f.max()), _ns, _f.numel(), self.block_quant,
+                    self.weight_block_size)
+            _w = getattr(layer, "weight", None)
+            if _w is not None:
+                logger.info("[LIN_SCALE] %s weight shape=%s dtype=%s",
+                            getattr(self, "_tpu_dbg_prefix", "?"),
+                            tuple(_w.shape), _w.dtype)
         if self.quant_config.is_checkpoint_fp8_serialized:
             weight, weight_scale, requant_dtype_name, requant_block_size = (
                 _process_fp8_linear_weights(

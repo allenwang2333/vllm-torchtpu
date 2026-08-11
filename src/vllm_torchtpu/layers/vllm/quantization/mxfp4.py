@@ -374,6 +374,25 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             activation=activation_str,
             rhs_quant_dtype=self.rhs_quant_dtype,
         )
+        # DSV4_DEBUG_MOE_ROWS: per-row detail for the rows the full-stack diff
+        # flagged at L42 (post_ffn reaching 2.884e38 while every layer 0-41
+        # matches tpu-inference within 1.5%). Routing inputs on those rows were
+        # measured healthy (topk weights sum to 1.5, x absmax ~2.2), so this
+        # reports what THIS rank's routed GMM produced for them, to find which
+        # rank contributes the garbage to the all-reduce.
+        if os.getenv("DSV4_DEBUG_MOE_ROWS") == "1":
+            import torch as _t
+            _li = getattr(layer, "layer_idx", -1)
+            if _li in (40, 41, 42) and _routed.shape[0] >= 147:
+                _rows = [128, 130, 134, 136, 138, 140, 142, 146, 255]
+                _rn = _t.linalg.vector_norm(_routed.float(), dim=-1)
+                _xn = _t.linalg.vector_norm(x.float(), dim=-1)
+                logger.info(
+                    "[MOE_ROWS] L%s routed_rownorm=%s | x_rownorm=%s | "
+                    "routed_absmax=%.6g", _li,
+                    [round(float(_rn[i]), 3) for i in _rows],
+                    [round(float(_xn[i]), 3) for i in _rows],
+                    float(_routed.abs().max()))
         if _dbg:
             import torch as _t
             logger.info(
