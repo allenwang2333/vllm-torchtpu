@@ -1,8 +1,10 @@
 # DeepSeek-V4 on vllm-torchtpu — status
 
 Last updated 2026-08-11. This is the current state of the DeepSeek-V4 bring-up
-on TPU; where older DSv4 docs in this repo disagree with it, this one is
-right.
+on TPU, and the only status doc — earlier handoffs and investigation logs were
+folded in here and removed, so there's one place to look rather than five that
+disagree. `docs/tpu_kv_cache_sharing.md` goes deeper on one specific topic;
+`tools/dsv4_debug/README.md` covers the debugging tools.
 
 ## Start here
 
@@ -225,6 +227,13 @@ Known-good shape is 9216 context, `max_num_batched_tokens=1024`,
 `max_num_seqs=128`, TP=8/EP=8, fp8 KV, prefix caching off, non-eager. That is
 the reference's shape, which matters if you intend to compare numbers.
 
+What "known-good" covers: it serves, the DSv4 runner unit tests pass, and the
+weight-cache tests pass. What it does **not** cover is that output is correct
+at this configuration. The needle test that validated the MoE fix ran at
+`max_model_len=1024`, eager, offline, single-sequence — this shape changes all
+four. Any accuracy claim from a served run needs the needle control passing at
+*that same* shape first, or it's measuring an unknown.
+
 **Accuracy (MMLU-Pro).** Brings the server up, runs `lm_eval`, tears it down:
 
 ```bash
@@ -257,6 +266,23 @@ it was the artifact — don't read batch-1 numbers as throughput.
 **Finding a serving config.** `scripts/dsv4/search_serving_config.sh` sweeps
 context/utilisation combinations to find ones that fit in HBM, which is worth
 running before assuming a shape is unreachable.
+
+Two things about memory that will otherwise cost you an afternoon:
+
+*vLLM's DSv4 KV budget check over-estimates by ~62x.* `--max-model-len=9216`
+is refused with "42.86 GiB KV cache is needed, larger than the available 37.64
+GiB". Summing what vLLM bills each spec for one max-length request
+(`spec.max_memory_usage_bytes`) gives 0.69 GiB — a constant 62.1x multiplier,
+at 1024 context as well as 9216. Only the context length moves it across the
+available-memory line, which is why 1024 starts and 9216 doesn't. This is a
+faulty check, not real memory pressure; `GPU_MEM_UTIL` is raised to get past
+it.
+
+*`GPU_MEM_UTIL=0.67` is a floor, not a preference.* Below it there isn't
+enough HBM left for compile and activation buffers and you get
+`RuntimeBufferAllocationFailure`. 0.67 clears it with ~31 GiB spare. If the
+weights or context change, recompute the floor rather than nudging the
+number.
 
 ## 6. What works
 

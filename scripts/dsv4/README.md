@@ -38,7 +38,7 @@ Identical here: the four env vars, `--max-model-len`, `--max-num-batched-tokens`
 | Reference | Here | Why |
 |---|---|---|
 | `--kv-cache-dtype=fp8` | `fp8_e4m3` | Same dtype; vLLM's TPU path wants the explicit name. |
-| `--gpu-memory-utilization=0.4` | `0.75` (`GPU_MEM_UTIL`) | Not real memory pressure: vLLM's DSv4-specific KV budget check over-estimates the per-request requirement by ~62x, and the engine refuses to start. Real need at 9216 is 0.69 GiB. See `docs/dsv4_mmlu_pro_bringup.md` Finding 1. |
+| `--gpu-memory-utilization=0.4` | `0.75` (`GPU_MEM_UTIL`) | Not real memory pressure: vLLM's DSv4-specific KV budget check over-estimates the per-request requirement by ~62x, and the engine refuses to start. Real need at 9216 is 0.69 GiB. See `docs/dsv4_status.md`, "Larger runs". |
 | `--download_dir=/mnt/pd` | local snapshot path | Weights are already on this node under `hf_cache`; nothing is downloaded. |
 | `--async-scheduling` | same (on) | vLLM 0.26 enables async scheduling by default on this path -- the server log reports "Asynchronous scheduling is enabled" regardless of the flag. Passed explicitly to match the reference. |
 | `enable_dp_attention: true` | **no equivalent** | That `additional_config.sharding` block is a JAX/tpu-inference sharding-strategy option. vllm-torchtpu has no DP-attention implementation at all (no `dp_attention` anywhere in `src/`), so attention runs TP-only. This is the one genuine non-1:1 difference in the serving config, and it is a parallelism strategy, not a numerics change. |

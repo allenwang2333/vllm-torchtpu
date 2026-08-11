@@ -66,7 +66,7 @@ export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-$VLLM_CACHE_ROOT/xla_cache}"
 # available with KV blocks, so 0.75 allocated a 52 GiB pool and left too little
 # HBM for compile/activation buffers (RuntimeBufferAllocationFailure).
 # 0.67 clears the floor with ~31 GiB left over. If weights or context change,
-# recompute the floor rather than nudging this. See docs/dsv4_mmlu_pro_bringup.md.
+# recompute the floor rather than nudging this. See docs/dsv4_status.md ("Larger runs").
 : "${GPU_MEM_UTIL:=0.67}"
 : "${TP_SIZE:=8}"
 : "${PORT:=8000}"
