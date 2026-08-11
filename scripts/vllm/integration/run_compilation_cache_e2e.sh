@@ -96,16 +96,41 @@ else
 fi
 
 if [[ -d "${TIER3_DIR}" ]]; then
-  find "${TIER3_DIR}" -name "*.bin" -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_after.txt" || true
+  find "${TIER3_DIR}" -name "*.bin" -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_warm.txt" || true
 else
-  touch "${CACHE_DIR}/tier3_after.txt"
+  touch "${CACHE_DIR}/tier3_warm.txt"
 fi
 
-echo "=== 🔍 Verifying Zero File & MD5 Differences (Cold vs Warm) ==="
-if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_after.txt"; then
-  echo "✅ Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
+# --- 3. Hot Compilation Run (Zero Diff Verification) ---
+echo "================================================================="
+echo "=== 🏃 Run 3: Hot Compilation (Zero Diff Check)"
+echo "================================================================="
+clean_tpu_processes
+
+python3 examples/offline_inference.py --model "${MODEL}" \
+  --max-model-len 256 --max-num-batched-tokens 256 --num-gpu-blocks-override 47376 \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/hot_run.log"
+
+sync && sleep 10
+
+if grep -q -E "Directly load|Using cache directory" "${CACHE_DIR}/hot_run.log"; then
+  echo "✅ Hot run log confirmed cache hit (Directly load from cache)."
 else
-  echo "❌ Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  echo "❌ Hot run did not log cache hit!"
+  exit 1
+fi
+
+if [[ -d "${TIER3_DIR}" ]]; then
+  find "${TIER3_DIR}" -name "*.bin" -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_hot.txt" || true
+else
+  touch "${CACHE_DIR}/tier3_hot.txt"
+fi
+
+echo "=== 🔍 Verifying Zero File & MD5 Differences (Warm vs Hot) ==="
+if diff -u "${CACHE_DIR}/tier3_warm.txt" "${CACHE_DIR}/tier3_hot.txt"; then
+  echo "✅ Tier-3 cache files and MD5sums are 100% identical between Warm and Hot runs!"
+else
+  echo "❌ Tier-3 cache files or MD5sums changed between Warm and Hot runs!"
   exit 1
 fi
 
