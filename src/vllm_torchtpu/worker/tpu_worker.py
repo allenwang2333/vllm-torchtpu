@@ -5,8 +5,9 @@
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
+import re
 import time
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 from urllib.parse import urlparse
 
 import torch
@@ -62,6 +63,65 @@ def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+_STANDARD_KEYS = frozenset({
+    "host_tracer_level",
+    "device_tracer_level",
+    "python_tracer_level",
+})
+
+_ALLOWED_VALUE_CHARS = re.compile(r'^[a-zA-Z0-9_./,:\-\s]*$')
+_OPTION_PATTERN = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$')
+
+
+def _parse_option_value(key: str, val: str) -> Any:
+    val_lower = val.lower()
+    if val_lower == "true":
+        return True
+    if val_lower == "false":
+        return False
+    try:
+        return int(val)
+    except ValueError:
+        if not _ALLOWED_VALUE_CHARS.match(val):
+            raise ValueError(f"Invalid characters in option value '{val}' "
+                             f"for key '{key}'")
+        return val
+
+
+def _parse_profile_options(
+        profile_prefix: str | None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not profile_prefix or not profile_prefix.strip():
+        return {}, {}
+
+    if not profile_prefix.isascii():
+        raise ValueError("profile_prefix contains non-ASCII characters")
+
+    standard_opts = {}
+    advanced_opts = {}
+
+    parts = profile_prefix.split(';')
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        match = _OPTION_PATTERN.match(part)
+        if not match:
+            raise ValueError(f"Invalid profile option format in '{part}'. "
+                             "Expected 'key:value' format.")
+        key = match.group(1)
+        val = match.group(2)
+
+        parsed_val = _parse_option_value(key, val)
+
+        if key in _STANDARD_KEYS:
+            standard_opts[key] = parsed_val
+        else:
+            advanced_opts[key] = parsed_val
+
+    return standard_opts, advanced_opts
 
 
 class TPUWorker(WorkerBase):
@@ -440,15 +500,22 @@ class TPUWorker(WorkerBase):
             logger.warning("Profile directory is not set. Skipping profiling.")
             return
 
+        profile_dir = self.profile_dir
+        standard_opts, advanced_opts = {}, {}
+
+        if profile_prefix:
+            if ":" in profile_prefix or ";" in profile_prefix:
+                standard_opts, advanced_opts = _parse_profile_options(
+                    profile_prefix)
+            else:
+                profile_dir = os.path.join(profile_dir, profile_prefix)
+                os.makedirs(profile_dir, exist_ok=True)
+
         if is_start:
             if self.profile_context is not None:
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
-            profile_dir = self.profile_dir
-            if profile_prefix:
-                profile_dir = os.path.join(profile_dir, profile_prefix)
-            os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
             self.profile_run_dir = profile_dir
@@ -465,11 +532,19 @@ class TPUWorker(WorkerBase):
                         self.profile_capture_dir)
             handler = torch.profiler.tensorboard_trace_handler(
                 dir_name=self.profile_capture_dir, use_gzip=True)
+
+            check_experimental = advanced_opts.pop(
+                "check_experimental_options", True)
+
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
+                host_tracer_level=standard_opts.get("host_tracer_level", 1),
+                device_tracer_level=standard_opts.get("device_tracer_level",
+                                                      1),
+                python_tracer_level=standard_opts.get("python_tracer_level",
+                                                      1),
+                experimental_options=advanced_opts if advanced_opts else None,
+                check_experimental_options=check_experimental,
             )
             self.profile_context = torch.profiler.profile(
                 activities=[
