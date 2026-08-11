@@ -82,40 +82,35 @@ def main_kernel(
     cfg: config.Config,
 ):
     # Step 1: Resolve this core's row/column partition and its column slice.
-    num_simd_lanes = cfg.sc_info.num_lanes
-
     core_id = jax.lax.axis_index((cfg.core_axis_name, cfg.subcore_axis_name))
     row_partition_id = core_id // cfg.num_column_partitions
     col_partition_id = core_id % cfg.num_column_partitions
 
-    row_start_padded = row_partition_id * cfg.row_partition_size_padded
     col_start = col_partition_id * cfg.col_size
 
-    # Step 2: Stage this partition's row count and sort permutation into VMEM.
-    recv_sem = scratch_ref.sem.at[0]
-    num_rows_dma = pltpu.make_async_copy(
-        scalar_ref.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
-        scratch_ref.num_rows_per_row_partition_vmem,
-        recv_sem,
+    refs = memory_ref.KernelRefs.create(
+        scalar_ref=scalar_ref,
+        in_hbm_ref=in_hbm_ref,
+        topk_weights_hbm_ref=topk_weights_hbm_ref,
+        out_hbm_ref=out_hbm_ref,
+        scratch_ref=scratch_ref,
     )
-    sorted_dma = pltpu.make_async_copy(
-        scalar_ref.sorted_by_validity.at[pl.ds(row_start_padded,
-                                               cfg.row_partition_size_padded)],
-        scratch_ref.sorted_by_validity_vmem,
+
+    # Step 2: Stage this partition's row count (the sort permutation is streamed
+    # one window at a time in call_kernel_pipeline, bounding the resident scratch).
+    num_simd_lanes = cfg.sc_info.num_lanes
+    recv_sem = refs.scratch.sem.at[0]
+    num_rows_dma = pltpu.make_async_copy(
+        refs.index.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
+        refs.scratch.num_rows_per_row_partition_vmem,
         recv_sem,
     )
     num_rows_dma.start()
-    sorted_dma.start()
     num_rows_dma.wait()
-    sorted_dma.wait()
 
     kernel.call_kernel_pipeline(
         row_partition_id=row_partition_id,
-        scalar_ref=scalar_ref,
-        scratch_ref=scratch_ref,
-        in_hbm_ref=in_hbm_ref,
-        out_hbm_ref=out_hbm_ref,
-        topk_weights_hbm_ref=topk_weights_hbm_ref,
+        refs=refs,
         col_start=col_start,
         cfg=cfg,
     )
@@ -141,7 +136,6 @@ def ragged_gather_reduce_v2(
   Returns:
     Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
   """
-
     # Step 1: Create config object.
     cfg = config.Config(
         input_size=indices.size,
