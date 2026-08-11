@@ -106,6 +106,18 @@ arithmetic fits (0 decode-written rows at step 0 -> clean; ~3 per CSA layer
 by step 13 -> blown). Precedent: bug #4 (07-31) was a malformed compressed
 row first read at decode step 1. Runner-up: decode-written SWA rows.
 
+**Checked and refuted before testing (do not re-chase): vLLM sliding-window
+block freeing.** The state cache is the only group whose window is small
+enough (`W = coff*compress_ratio` = 8 for CSA, blocks of 16 positions) for
+vLLM's `SlidingWindowManager` to free blocks in a 31-token run — and the
+timing even lined up (block 0 freed at nct=23 = decode step 6, first
+unsaturated drift at step 9). But the arithmetic is exactly safe:
+`get_num_skipped_tokens = nct - W + 1` frees block 0 at nct>=23, and CSA
+boundary gathers (p-7..p at p=19,23,27) stop touching block 0 from p=23.
+Two tokens of slack against scheduler off-by-ones. tpu-inference's custom
+manager vs vLLM's is still a real structural difference, but not via this
+mechanism at this length.
+
 ### In flight: teacher-forcing chain (`scratchpad/chain_teacher_forcing.sh`)
 
 Running as of this writing; ~1.5 h total. Legs:
