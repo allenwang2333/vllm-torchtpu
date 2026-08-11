@@ -176,6 +176,51 @@ def main():
                                      ignore_eos=False,
                                      logprobs=5)
 
+    # Teacher-forcing mode: score a FIXED token sequence step by step instead
+    # of free-running generation. `DSV4_TF_FILES` is a comma-separated list of
+    # JSON files, each {"label", "prompt_token_ids", "forced_token_ids"}. For
+    # every step t we prefill `prompt + forced[:t]` (token IDs, never re-
+    # tokenized text) and read the top-5 logprobs of the next token -- i.e.
+    # the model's distribution at the exact context the forced sequence had at
+    # step t, but with caches built by ONE prefill rather than t decode steps.
+    # This runner's own runner path does not support vLLM `prompt_logprobs`
+    # (tpu_runner.py hardcodes prompt_logprobs_dict=None), hence the
+    # growing-prefix loop. Requires prefix caching OFF or every call after the
+    # first would reuse decode-era blocks and measure nothing.
+    tf_files = [p for p in os.getenv("DSV4_TF_FILES", "").split(",") if p]
+    if tf_files:
+        import json
+
+        from vllm.inputs import TokensPrompt
+        assert os.getenv("DSV4_ENABLE_PREFIX_CACHING", "1") == "0", \
+            "teacher forcing needs DSV4_ENABLE_PREFIX_CACHING=0"
+        tf_params = SamplingParams(temperature=0.0,
+                                   max_tokens=1,
+                                   ignore_eos=True,
+                                   logprobs=5)
+        for path in tf_files:
+            with open(path) as f:
+                spec = json.load(f)
+            label = spec["label"]
+            prompt_ids = spec["prompt_token_ids"]
+            forced = spec["forced_token_ids"]
+            print(f"[TF] ===== {label}: prompt={len(prompt_ids)} "
+                  f"forced={len(forced)} =====")
+            for t in range(len(forced)):
+                ids = prompt_ids + forced[:t]
+                outs = llm.generate(
+                    [TokensPrompt(prompt_token_ids=ids)],
+                    tf_params,
+                    use_tqdm=False,
+                )
+                out = outs[0].outputs[0]
+                lp = out.logprobs[0] if out.logprobs else {}
+                print(
+                    f"[TF_LOGPROBS] file={label} step={t} "
+                    f"forced_next={forced[t]} picked={out.token_ids[0]} {lp}",
+                    flush=True)
+        return
+
     print("=== Testing formatted prompt with llm.generate ===")
     for label, prompt_text in prompt_texts:
         print(f"[SWEEP] ===== prompt: {label} =====")
