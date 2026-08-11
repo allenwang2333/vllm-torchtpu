@@ -52,7 +52,7 @@ rm -rf "${VLLM_XLA_CACHE_PATH}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${VLLM_XLA_CACHE_PATH}" "${VLLM_CACHE_ROOT}"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 --num-gpu-blocks-override 47376 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 --num-gpu-blocks-override 47376 --seed 0 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -81,7 +81,7 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 --num-gpu-blocks-override 47376 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 --num-gpu-blocks-override 47376 --seed 0 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
 
