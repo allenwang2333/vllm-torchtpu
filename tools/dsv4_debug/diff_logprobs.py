@@ -1,37 +1,57 @@
-"""Diff per-step top-k logprobs, ours vs the JAX reference.
+"""Diff per-step top-k logprobs, ours vs the JAX reference, across a prompt pool.
 
-Why this and not activation diffing: logprobs come from the REAL generating
-path. No dumper, no re-execution, no warmup/prefill step offset, no hook. Every
-activation-level instrument in this investigation was distorted by at least one
-of those; this one cannot be.
+Why logprobs and not activation dumps: these come from the real generating
+path. No dumper, no hooks, no warmup/prefill step offset. Every activation-level
+instrument in this bring-up has been distorted by at least one of those.
 
-Reads `[STEP_LOGPROBS] step=N {tok: Logprob(logprob=..., rank=..,
-decoded_token='..'), ...}` from both logs and reports, per step, whether the
-argmax matches, how each side's top-1/top-2 margin compares, and -- the useful
-one -- our logprob for the token the reference actually picked.
+Why a pool and not one prompt: a single prompt can sit on a knife edge. On the
+XLA/LLVM prompt the two trees split at step 13, where our own top-1/top-2
+margin was 1.25 -- close to a coin flip, so it measures luck as much as
+correctness. Across several prompts, and weighting the ones where the
+*reference* was confident, you get a signal worth acting on.
 
-Read the `ours@ref` column, not the flip step. The flip is only where
-accumulated error first moves an argmax; the divergence exists before it.
+Reads both logs, groups by prompt (`[SWEEP] ===== prompt: LABEL =====`), and
+per prompt reports the first token where the argmax flips plus how sure each
+side was there.
+
+`ours@ref` is our logprob for the token the reference actually chose. Unlike
+the flip location -- which is just where accumulated error first moved an
+argmax -- it is meaningful at every step, including before any flip.
+
+Usage:
+    python diff_logprobs.py <ours.log> <ref.log>
 """
 import os
 import re
 import sys
 
+SWEEP = re.compile(r"\[SWEEP\] =====\s*prompt:\s*(\S+)")
 LP = re.compile(r"\[STEP_LOGPROBS\] step=(\d+) (\{.*\})\s*$")
 ENTRY = re.compile(
     r"(\d+): Logprob\(logprob=([-\d.einf]+), rank=(\d+), "
     r"decoded_token=('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\)")
 
+# A flip only means something if the reference was sure. Below this margin both
+# models found the step ambiguous, so the flip says little.
+CONFIDENT = 5.0
+
 
 def parse(path):
-    steps = {}
+    """-> {prompt_label: {step: [(token_id, logprob, rank, decoded), ...]}}"""
+    out, cur = {}, "(unlabeled)"
     with open(path, errors="replace") as f:
         for line in f:
+            m = SWEEP.search(line)
+            if m:
+                cur = m.group(1)
+                out.setdefault(cur, {})
+                continue
             m = LP.search(line.rstrip("\n"))
             if not m:
                 continue
             step = int(m.group(1))
-            if step in steps:  # keep the first occurrence (rank 0 / first seq)
+            steps = out.setdefault(cur, {})
+            if step in steps:  # first occurrence = rank 0 / first sequence
                 continue
             entries = []
             for tok, lp, rank, dec in ENTRY.findall(m.group(2)):
@@ -40,10 +60,24 @@ def parse(path):
                 except ValueError:
                     val = float("-inf")
                 entries.append((int(tok), val, int(rank), dec))
-            entries.sort(key=lambda e: e[2])  # by rank
+            entries.sort(key=lambda e: e[2])
             if entries:
                 steps[step] = entries
-    return steps
+    return {k: v for k, v in out.items() if v}
+
+
+def first_flip(o_steps, r_steps):
+    common = sorted(set(o_steps) & set(r_steps))
+    for s in common:
+        oe, re_ = o_steps[s], r_steps[s]
+        if oe[0][0] == re_[0][0]:
+            continue
+        rgap = (re_[0][1] - re_[1][1]) if len(re_) > 1 else float("nan")
+        ours_at_ref = next((e[1] for e in oe if e[0] == re_[0][0]),
+                           float("nan"))
+        return dict(step=s, ours=oe[0][3], ref=re_[0][3], rgap=rgap,
+                    ours_at_ref=ours_at_ref, n=len(common))
+    return dict(step=None, n=len(common))
 
 
 def main(ours_path, ref_path):
@@ -52,60 +86,56 @@ def main(ours_path, ref_path):
         sys.exit(f"FATAL: no [STEP_LOGPROBS] in {ours_path}")
     if not r:
         sys.exit(f"FATAL: no [STEP_LOGPROBS] in {ref_path}")
-    common = sorted(set(o) & set(r))
-    print(f"ours steps={len(o)} ref steps={len(r)} common={len(common)}\n")
-    print(f"{'step':>4} {'ours top1':>16} {'ref top1':>16} {'match':>6} "
-          f"{'ours gap':>9} {'ref gap':>9} {'ours@ref':>9}")
-    print("-" * 80)
-    first_flip = None
-    for s in common:
-        oe, re_ = o[s], r[s]
-        ot, rt = oe[0], re_[0]
-        match = ot[0] == rt[0]
-        ogap = (oe[0][1] - oe[1][1]) if len(oe) > 1 else float("nan")
-        rgap = (re_[0][1] - re_[1][1]) if len(re_) > 1 else float("nan")
-        # Cross-tree error: OUR logprob for the token the REFERENCE picked.
-        # This is the column that matters. The flip step is only a threshold
-        # crossing -- the numeric difference exists from step 0 and merely
-        # takes until the flip to move an argmax -- so the flip location says
-        # nothing about where the error starts. This measure works at every
-        # step *before* any flip, while both trees still agree on the token.
-        #   smooth decay  -> error accumulating over generation
-        #   sharp cliff   -> check the step index against structural
-        #                    boundaries (sliding window 128, CSA ratio 4,
-        #                    page/packing 64); a boundary-correlated cliff is
-        #                    the most localizing signal available here.
-        # nan means the reference's pick fell outside our top-k, i.e. our
-        # disagreement is already larger than the captured window.
-        ours_at_ref = next((e[1] for e in oe if e[0] == rt[0]), float("nan"))
-        if not match and first_flip is None:
-            first_flip = s
-        flag = "" if match else "   <== FLIP"
-        # print every step up to the flip, then a few after
-        if first_flip is None or s <= first_flip + 5:
-            print(f"{s:>4} {ot[3][:14]:>16} {rt[3][:14]:>16} "
-                  f"{str(match):>6} {ogap:>9.3f} {rgap:>9.3f} "
-                  f"{ours_at_ref:>9.3f}{flag}")
+    prompts = sorted(set(o) & set(r))
+    if not prompts:
+        sys.exit(f"FATAL: no prompt labels in common.\n  ours: {sorted(o)}\n"
+                 f"  ref:  {sorted(r)}")
+
+    print(f"{len(prompts)} prompts in common\n")
+    print(f"{'prompt':<26} {'steps':>5} {'flip':>5} {'ours':>13} "
+          f"{'ref':>13} {'ref gap':>8} {'ours@ref':>9}")
+    print("-" * 92)
+
+    rows = []
+    for p in prompts:
+        a = first_flip(o[p], r[p])
+        if a["step"] is None:
+            print(f"{p[:25]:<26} {a['n']:>5} {'--':>5}   agrees throughout")
+        else:
+            print(f"{p[:25]:<26} {a['n']:>5} {a['step']:>5} "
+                  f"{a['ours'][:11]:>13} {a['ref'][:11]:>13} "
+                  f"{a['rgap']:>8.2f} {a['ours_at_ref']:>9.2f}")
+        rows.append((p, a["step"], a.get("rgap", float("nan"))))
+
+    strong = [(p, s, g) for p, s, g in rows
+              if s is not None and g == g and g >= CONFIDENT]
+    weak = [(p, s, g) for p, s, g in rows
+            if s is not None and g == g and g < CONFIDENT]
+    clean = [p for p, s, _ in rows if s is None]
+
     print()
-    if first_flip is None:
-        print("NO ARGMAX FLIP in the common steps -- the two trees agree on "
-              "every generated token here.")
-    else:
-        print(f"FIRST ARGMAX FLIP: step {first_flip}")
-        print(f"  ours top-5: {[(e[3], round(e[1], 3)) for e in o[first_flip]]}")
-        print(f"  ref  top-5: {[(e[3], round(e[1], 3)) for e in r[first_flip]]}")
-        print()
-        print("Reading the flip -- the two directions are NOT symmetric:")
-        print("  ref gap LARGE and we disagree: our distribution differs by at "
-              "least that margin. A real lower bound on the error.")
-        print("  ref gap SMALL: uninformative. The model was uncertain there, "
-              "so any perturbation flips it -- this does NOT imply the error "
-              "is small.")
-        print("  The flip is a threshold crossing, not an origin. Read the "
-              "ours@ref column across ALL steps instead.")
+    print(f"agree all the way through   : {len(clean)}")
+    print(f"flip where ref was UNSURE   : {len(weak)}"
+          f"   (ref gap < {CONFIDENT}; could be luck)")
+    print(f"flip where ref was CONFIDENT: {len(strong)}"
+          f"   (ref gap >= {CONFIDENT}; real divergence)")
+
+    if strong:
+        print("\nLocalize with these -- the reference was sure and we still "
+              "disagreed:")
+        for p, s, g in sorted(strong, key=lambda t: -t[2]):
+            print(f"    {p:<28} step {s:<4} ref gap {g:.2f}")
+    elif weak:
+        print("\nNo confident divergence. Every flip landed on a step the "
+              "reference also found ambiguous,\nwhich fits small numeric error "
+              "rather than a structural bug.")
+    elif clean:
+        print("\nNo divergence at all on this pool. Either the bug needs "
+              "longer generation than this,\nor it is prompt-specific -- check "
+              "the generated text before concluding anything.")
 
 
 if __name__ == "__main__":
     SP = os.environ.get("DSV4_LOG_DIR", ".")
-    main(sys.argv[1] if len(sys.argv) > 1 else f"{SP}/runAI_ours_real.log",
-         sys.argv[2] if len(sys.argv) > 2 else f"{SP}/runAJ_ref_real.log")
+    main(sys.argv[1] if len(sys.argv) > 1 else f"{SP}/pool_ours.log",
+         sys.argv[2] if len(sys.argv) > 2 else f"{SP}/pool_ref.log")

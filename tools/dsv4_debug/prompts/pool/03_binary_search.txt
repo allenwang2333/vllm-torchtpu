@@ -1,0 +1,1 @@
+Write a Python function that performs binary search on a sorted list and returns the index of the target, or -1 if not found.
