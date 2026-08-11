@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     export CXX=g++; \
     export CC=gcc; \
-    export VLLM_TARGET_DEVICE=empty; \
+    export VLLM_TARGET_DEVICE=empty; uv pip install --system --index-url https://pypi.org/simple setproctitle==1.3.7; \
     uv pip install --system \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
