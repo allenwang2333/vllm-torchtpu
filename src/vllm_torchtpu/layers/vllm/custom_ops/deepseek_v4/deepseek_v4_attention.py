@@ -766,6 +766,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         if get_tensor_model_parallel_rank() != 0:
             return
         import numpy as np
+
         from vllm_torchtpu.models.vllm.deepseek_v4_patch import _dump_root
         outdir = _dump_root("hidden_states", "vllm_torchtpu")
         os.makedirs(outdir, exist_ok=True)
@@ -1378,6 +1379,60 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"not_swa_only={not swa_only} two_caches_same_buffer={_redirect}"
             )
 
+        # SWA-side probe, mirror of MAIN_KV_DEQUANT_DEBUG for the sliding
+        # window cache. Reads the rows the SWA branch serves for the EARLY
+        # positions (the prompt) plus one unwritten control row, per step.
+        # Indexing mirrors the kernel's contract exactly (mla_swa.py:312):
+        # a vLLM page id addresses a full PHYSICAL page
+        # (`page_indices_ref[i] * physical_page_size_per_kv_packing`), and only
+        # the first `logical_page_size` rows of it are used, so position p in
+        # logical block b=p//logical_page_size lives at flat row
+        # `page_id*physical_rows + (p % logical_page_size)`. SWA rows are the
+        # same 640-byte packed record as the main cache.
+        if (os.getenv("DSV4_DEBUG_SWA_KV") == "1" and not _is_tracing()
+                and rank == 0 and main_prefix == _DEBUG_LAYER_PREFIX()
+                and sw_cache is not None and sw_cache.numel() > 0
+                and swa_block_tables is not None and swa_seq_lens is not None):
+            import jax.numpy as jnp
+            import numpy as np
+
+            from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+                unpack_sparse_kv_cache
+            _sc = sw_cache
+            if _sc.ndim == 5:
+                _sc = _sc.squeeze(2)
+            _phys_rows = _sc.shape[1] * _sc.shape[2]
+            _lp = getattr(getattr(self.mla_attn, "swa_cache_layer", None),
+                          "block_size", None) or _phys_rows
+            _width = _sc.shape[-1]
+            _sflat = _sc.reshape(-1, _width)
+            _sbt = swa_block_tables.flatten()
+            _slen = int(swa_seq_lens.flatten()[0].item())
+            _probe_pos = list(range(min(_slen,
+                                        13))) + [min(_lp, _phys_rows) - 8]
+            _rows = []
+            for _p in _probe_pos:
+                _blk = _p // _lp
+                _page = int(_sbt[_blk].item())
+                _row_idx = _page * _phys_rows + (_p % _lp)
+                _row = _sflat[_row_idx:_row_idx + 1].detach().cpu().numpy()
+                _nope, _rope, _scale = unpack_sparse_kv_cache(
+                    jnp.asarray(_row), 448, 64, 64)
+                _n = np.asarray(_nope.astype(jnp.float32))
+                _r = np.asarray(_rope.astype(jnp.float32))
+                _b = _row.reshape(-1).astype(np.uint8)
+                _rows.append(f"pos{_p}(row{_row_idx}): "
+                             f"nope_absmax={np.nanmax(np.abs(_n)):.4g} "
+                             f"rope_absmax={np.nanmax(np.abs(_r)):.4g} "
+                             f"nz[nope/rope]="
+                             f"{int(np.count_nonzero(_b[:448]))}/"
+                             f"{int(np.count_nonzero(_b[448:576]))} "
+                             f"b[444:452]={_b[444:452].tolist()}")
+            logger.info(
+                f"[SWA_KV_DEQUANT_DEBUG] positions={positions[:2].tolist()} "
+                f"swa_seq_len={_slen} logical_page={_lp} phys_rows={_phys_rows} "
+                f"swa_bt[:8]={_sbt[:8].tolist()} | " + " | ".join(_rows))
+
         _dump_step_now = getattr(self, "_dsv4_dump_step_current", 0)
         if topk_indices is not None:
             self._maybe_dump_sublayer("02_topk_indices", topk_indices,
@@ -1465,8 +1520,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                         f"[PYTORCH_DEBUG_NAN] Rank={rank} output is 100% NaN!")
                 from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
                     _dump_root
-                dump_path = _dump_root(
-                    f"nan_dump_{main_prefix}_rank{rank}.pt")
+                dump_path = _dump_root(f"nan_dump_{main_prefix}_rank{rank}.pt")
                 logger.debug(
                     f"[NAN_DETECTION] NaN detected in output! Dumping all inputs to {dump_path} ..."
                 )
