@@ -224,16 +224,25 @@ if __name__ == "__main__":
             env["USE_PHASED_PROFILER"] = "1"
 
         logger.info("Starting isolated OFFLINE vLLM script...")
-        proc = subprocess.run(["python", script_path],
-                              env=env,
-                              capture_output=True,
-                              text=True)
-        if proc.returncode != 0:
-            logger.error("OFFLINE SCRIPT FAILED!")
-            logger.error(f"STDOUT:\n{proc.stdout}")
-            logger.error(f"STDERR:\n{proc.stderr}")
-            raise RuntimeError(
-                f"Offline script failed with exit code {proc.returncode}")
+        try:
+            proc = subprocess.run(["python", script_path],
+                                  env=env,
+                                  timeout=600)
+            if proc.returncode != 0:
+                logger.error("OFFLINE SCRIPT FAILED!")
+                raise RuntimeError(
+                    f"Offline script failed with exit code {proc.returncode}")
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "OFFLINE SCRIPT TIMED OUT AFTER 600s! VFIO lock may be lingering."
+            )
+            raise
+
+        logger.info(
+            "Sleeping for 15s to allow kernel to gracefully reclaim TPU VFIO locks..."
+        )
+        import time
+        time.sleep(15)
 
         logger.info(
             "Offline script completed successfully. Verifying generated traces..."
