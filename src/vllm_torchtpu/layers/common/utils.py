@@ -201,6 +201,10 @@ def repack_sparse_mla_cache(
         flat[..., :lkv_dim],
         jnp.uint8).reshape(pages, page_size, lkv_dim // lane_bytes, lane_bytes)
 
+    # TODO(gxd3): if GLM 5.2 keeps rope in fp8 like nope, both sides get cheaper:
+    # this repack becomes a plain bitcast, and csa_gather's `process_rope` drops
+    # the per-element shift/mask/or that rebuilds (1, 128) uint8 into (1, 64)
+    # bf16, leaving the SparseCore to just move bytes.
     rope_bf16 = flat[..., lkv_dim:lkv_dim + rope_dim].astype(jnp.bfloat16)
     if dequant_scale != 1.0:
         rope_bf16 = rope_bf16 * jnp.bfloat16(dequant_scale)
