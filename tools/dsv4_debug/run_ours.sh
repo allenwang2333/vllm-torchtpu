@@ -7,6 +7,10 @@
 
 set -u
 LOG="$1"; shift
+# Resolve the log path before cd'ing: a relative path would otherwise land in
+# the repo we switch to, or fail outright if the directory isn't writable.
+case "$LOG" in /*) ;; *) LOG="$PWD/$LOG" ;; esac
+mkdir -p "$(dirname "$LOG")"
 cd ${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}
 
 env \
