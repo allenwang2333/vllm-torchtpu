@@ -86,6 +86,26 @@ exonerated. The corruption is introduced by decode steps, either the rows
 they write (SWA / compressed / state / indexer caches) or the decode-step
 read metadata. The bisect chain above separates those.
 
+### Leg 3 (pool rerun): the divergence is systematic and early
+
+`diff_logprobs.py fix_pool.log pool_ref.log`: 9/10 prompts flip within the
+first 13 decode steps (median ~6); only the 8-token capital run survives.
+`05_water_cycle.txt` flips at step 8 with the reference at gap 6.25
+(confident) — use it alongside XLA step 13 as a verification instrument.
+On planets/recursion the ref's pick is outside our top-5 at the flip, the
+same multi-logit signature. All consistent with corruption that grows with
+decode-written rows from the very first steps.
+
+### Working hypothesis for the writer (to be settled by the byte probes)
+
+The compressor's decode path: compressed rows assembled from state-cache
+contents accumulated across 4 separate decode steps (prefill assembles the
+same rows from in-batch tokens — structurally different code path, and the
+only decode-vs-prefill structural difference in the stack). Growth
+arithmetic fits (0 decode-written rows at step 0 -> clean; ~3 per CSA layer
+by step 13 -> blown). Precedent: bug #4 (07-31) was a malformed compressed
+row first read at decode step 1. Runner-up: decode-written SWA rows.
+
 ### In flight: teacher-forcing chain (`scratchpad/chain_teacher_forcing.sh`)
 
 Running as of this writing; ~1.5 h total. Legs:
