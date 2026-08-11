@@ -271,3 +271,18 @@ def tpu_bind_kv_cache(
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
+
+
+def synchronize_device() -> None:
+    """Synchronize the TPU hardware execution stream."""
+    torch.tpu.synchronize()
+
+
+def synchronize_tensors(
+    tensors: Union[torch.Tensor, List[torch.Tensor], None] = None,
+    wait: bool = True,
+) -> None:
+    """Synchronize TPU execution and force materialization of deferred tensors."""
+    from torch_tpu._internal import sync
+
+    sync.synchronize(tensors=tensors, wait=wait)
