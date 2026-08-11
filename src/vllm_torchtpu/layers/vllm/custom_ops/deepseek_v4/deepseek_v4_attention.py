@@ -1433,6 +1433,72 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 f"swa_seq_len={_slen} logical_page={_lp} phys_rows={_phys_rows} "
                 f"swa_bt[:8]={_sbt[:8].tolist()} | " + " | ".join(_rows))
 
+        # Full page-level dump (DSV4_DUMP_PAGES=1): everything the attention
+        # of the debug layer consumes, per call, to .npy -- both caches'
+        # request-relevant PHYSICAL PAGES (not 8-byte keyholes), all metadata,
+        # q/kv/extra, and the kernel-returned SWA buffer after the call is
+        # handled below. Request-scale pages are tiny (640B x 1024 rows), so a
+        # 150-step run costs ~300MB, and one decode run + one prefill control
+        # answers every remaining content question offline in a single pass.
+        # Uses the same direct host reads the byte probes use (proven via bug
+        # #4), NOT the DSV4_DUMP_HIDDEN_STATES layer-forward replacement.
+        _dump_pages = (os.getenv("DSV4_DUMP_PAGES") == "1"
+                       and not _is_tracing() and rank == 0
+                       and main_prefix == _DEBUG_LAYER_PREFIX())
+        if _dump_pages:
+            import numpy as np
+            _step = getattr(self, "_dsv4_page_dump_step", 0)
+            self._dsv4_page_dump_step = _step + 1
+            _root = os.path.join(
+                os.getenv("DSV4_DUMP_ROOT",
+                          os.path.expanduser("~/workspace/scratch")),
+                "page_dumps", os.getenv("DSV4_DUMP_LABEL", "run"))
+            os.makedirs(_root, exist_ok=True)
+
+            def _np(t):
+                if t is None:
+                    return None
+                if isinstance(t, torch.Tensor):
+                    tt = t
+                    if tt.dtype not in (torch.uint8, torch.int32, torch.int64,
+                                        torch.float32):
+                        tt = tt.to(torch.float32)
+                    return tt.detach().cpu().numpy()
+                return np.asarray(t)
+
+            _bundle = {
+                "positions": _np(positions),
+                "q": _np(q),
+                "kv": _np(kv),
+                "extra": _np(extra),
+                "swa_seq_lens": _np(swa_seq_lens),
+                "swa_block_tables": _np(swa_block_tables),
+                "swa_query_start_loc": _np(swa_query_start_loc),
+                "swa_request_distribution": _np(swa_request_distribution),
+                "main_kv_lens": _np(main_kv_lens),
+                "main_page_indices": _np(main_page_indices),
+                "main_cu_q_lens": _np(main_cu_q_lens),
+                "main_distribution": _np(main_distribution),
+            }
+            # First 8 physical pages of the main/compressed buffer cover the
+            # request's compressed page, the state pages, and page 0; first 2
+            # SWA pages cover the whole window at this length.
+            _mc = main_cache_kv
+            if _mc is not None and _mc.numel() > 0:
+                if _mc.ndim == 5:
+                    _mc = _mc.squeeze(2)
+                _bundle["main_pages"] = _np(_mc[:8])
+            _sc = sw_cache
+            if _sc is not None and _sc.numel() > 0:
+                if _sc.ndim == 5:
+                    _sc = _sc.squeeze(2)
+                _bundle["sw_pages"] = _np(_sc[:2])
+            np.savez_compressed(
+                os.path.join(_root, f"attn_step{_step:03d}.npz"), **{
+                    k: v
+                    for k, v in _bundle.items() if v is not None
+                })
+
         _dump_step_now = getattr(self, "_dsv4_dump_step_current", 0)
         if topk_indices is not None:
             self._maybe_dump_sublayer("02_topk_indices", topk_indices,
@@ -1472,6 +1538,18 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
 
         self._maybe_dump_sublayer("02b_post_kernel_output", output,
                                   getattr(self, "_dsv4_dump_step_current", 0))
+
+        if _dump_pages and new_sw_cache is not None and new_sw_cache.numel(
+        ) > 0:
+            import numpy as np
+            _nsc = new_sw_cache
+            if _nsc.ndim == 5:
+                _nsc = _nsc.squeeze(2)
+            _step_done = self._dsv4_page_dump_step - 1
+            np.savez_compressed(os.path.join(
+                _root, f"attn_step{_step_done:03d}_post.npz"),
+                                sw_pages_post=_np(_nsc[:2]),
+                                attn_output=_np(output))
 
         # Discriminator: is new_sw_cache (the torch tensor returned by
         # self.attn_op, before the write-back copy_ a few lines below) already
