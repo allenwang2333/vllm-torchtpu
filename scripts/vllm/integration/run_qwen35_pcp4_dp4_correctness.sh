@@ -197,16 +197,30 @@ PY
   fi
 }
 
-for command in python curl tpu-info setsid timeout; do
+for command in python curl setsid timeout; do
   command -v "${command}" >/dev/null 2>&1 ||
     die "Required command is not available on PATH: ${command}"
 done
 
-mapfile -t TPU_DEVICE_PATHS < <(
-  tpu-info 2>/dev/null |
-    grep -oE '/dev/vfio/[0-9]+' |
-    sort -Vu
-)
+# `tpu-info` is installed in some development environments but is not part of
+# every CI image.  The numeric VFIO device nodes are the source of truth inside
+# the privileged container, so discover them directly and use `tpu-info` only
+# as a compatibility fallback for environments that hide /dev/vfio listings.
+TPU_DEVICE_PATHS=()
+if [[ -d /dev/vfio ]]; then
+  mapfile -t TPU_DEVICE_PATHS < <(
+    find /dev/vfio -maxdepth 1 -type c -regextype posix-extended \
+      -regex '/dev/vfio/[0-9]+' -print 2>/dev/null |
+      sort -Vu
+  )
+fi
+if ((${#TPU_DEVICE_PATHS[@]} == 0)) && command -v tpu-info >/dev/null 2>&1; then
+  mapfile -t TPU_DEVICE_PATHS < <(
+    tpu-info 2>/dev/null |
+      grep -oE '/dev/vfio/[0-9]+' |
+      sort -Vu
+  )
+fi
 AVAILABLE_CHIPS="${#TPU_DEVICE_PATHS[@]}"
 if ((AVAILABLE_CHIPS < REQUIRED_CHIPS)); then
   die "This test requires ${REQUIRED_CHIPS} TPU chips, but only ${AVAILABLE_CHIPS} were found"
