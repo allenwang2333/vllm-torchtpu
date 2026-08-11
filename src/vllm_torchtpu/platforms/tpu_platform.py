@@ -579,7 +579,7 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_K3_FUSED_MOE_COMBINE"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

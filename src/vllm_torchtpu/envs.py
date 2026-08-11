@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_K3_FUSED_MOE_COMBINE: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -254,6 +255,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Fuse each K3 MoE layer's two TP all-reduces (pre-norm latent reduction
+    # and shared/routed combine) into one concatenated all-reduce, saving a
+    # latency-bound collective launch per MoE layer. Disabled by default.
+    "TPU_K3_FUSED_MOE_COMBINE":
+    env_bool("TPU_K3_FUSED_MOE_COMBINE", default=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
