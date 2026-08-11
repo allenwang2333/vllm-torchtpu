@@ -64,6 +64,28 @@ DSV4_DEBUG_MAIN_META / DSV4_DEBUG_MAIN_KV probes, and settles whether padded
 batch slots are inert at real decode (request_distribution should be
 [1,1,1]).
 
+Legs 1b and 2 completed the triangle (full tables: `python3
+scratchpad/analyze_tf.py`):
+
+- **Ours prefill == reference, at all 59 steps** of the ref sequence
+  (within reporting quantization; even the EOS scores 0.0 at step 58).
+- **Instrument control passes**: the reference's prefill-scored logprobs
+  match its own decode logprobs within ~0.01-0.3 everywhere. Healthy stacks
+  show no prefill-vs-decode disparity, so ours having one is the defect.
+- **The reference rates our step-13 pick ' language' at -18.25**, and our
+  other early degenerate picks at -4..-13. Our own prefill state agrees
+  with the reference about that implausibility. Only our decode state
+  likes them.
+- Deep in the loop (steps ~61+) decode and prefill agree at ~0.000 —
+  expected, the loop is self-sustaining for any state including healthy
+  ones; corruption does its damage in roughly the first 20-50 decode
+  steps.
+
+So: model, weights, kernels, prefill metadata, quantization — all
+exonerated. The corruption is introduced by decode steps, either the rows
+they write (SWA / compressed / state / indexer caches) or the decode-step
+read metadata. The bisect chain above separates those.
+
 ### In flight: teacher-forcing chain (`scratchpad/chain_teacher_forcing.sh`)
 
 Running as of this writing; ~1.5 h total. Legs:
