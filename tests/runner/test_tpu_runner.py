@@ -310,6 +310,8 @@ class TestStartStopPhasedProfiling:
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
+            standard_opts={},
+            advanced_opts={},
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
 

@@ -678,8 +678,17 @@ class TPUModelRunner(GPUModelRunner):
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
         profile_dir = self.phased_profiling_dir
+        standard_opts, advanced_opts = {}, {}
+
         if profile_prefix:
-            profile_dir = os.path.join(profile_dir, profile_prefix)
+            if ":" in profile_prefix or ";" in profile_prefix:
+                from vllm_torchtpu.profiler_options import \
+                    parse_profile_options
+                standard_opts, advanced_opts = parse_profile_options(
+                    profile_prefix)
+            else:
+                profile_dir = os.path.join(profile_dir, profile_prefix)
+
         # Deliberately not read from parallel_config: its rank is TPxPP-scoped,
         # so every DP replica would call itself rank 0 and their traces would
         # overwrite each other on merge. The worker resolves the slice-global
@@ -696,6 +705,8 @@ class TPUModelRunner(GPUModelRunner):
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
+            standard_opts=standard_opts,
+            advanced_opts=advanced_opts,
         )
 
     def stop_phased_profiling(self) -> None:
