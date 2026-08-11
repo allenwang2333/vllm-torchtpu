@@ -26,7 +26,7 @@ _CN_NBUF = 4
 
 
 def _forward_fill_ids(sorted_ids, sorted_weights):
-    valid = (sorted_weights != 0.0)
+    valid = (sorted_weights.astype(jnp.float32) != 0.0)
 
     def _fill_op(a, b):
         a_id, a_v = a
@@ -58,7 +58,7 @@ def _inner_kernel(
     tok = toks_ref[slot]
     weight = weights_ref[slot]
 
-    @pl.when(weight != 0.0)
+    @pl.when(weight.astype(jnp.float32) != 0.0)
     def _():
         K_lhs = lhs_full_ref.shape[2]
         lhs_row = lhs_full_ref[pl.ds(tok, 1),
@@ -225,7 +225,7 @@ def cn_gemv_w1w2_fused_pipelined(
     N_SLOTS = TOPK_TOTAL
     NBUF = min(_CN_NBUF, G)
 
-    effective_ids = _forward_fill_ids(sorted_ids, sorted_weights)
+    effective_ids = sorted_ids  # sort removed; invalid IDs already clamped to 0
 
     C_PAD = lhs.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
@@ -282,10 +282,12 @@ def cn_moe_full_pipelined(hidden_state,
     C = hidden_state.shape[0]
     flat_ids = active_ids.reshape(C * TOP_K)
     flat_weights = topk_weights.reshape(C * TOP_K)
-    sort_order = jnp.argsort(flat_ids, stable=True)
-    sorted_ids = flat_ids[sort_order]
-    sorted_toks = (sort_order // TOP_K).astype(jnp.int32)
-    sorted_weights = flat_weights[sort_order]
+    # Skip the argsort permutation — slots stay in natural token-major order.
+    # Clamp invalid (zero-weight) expert IDs to 0 so weight DMA stays valid;
+    # the @pl.when(weight != 0) guard in _inner_kernel skips the computation.
+    sorted_ids = jnp.where(flat_weights.astype(jnp.float32) != 0.0, flat_ids, 0)
+    sorted_toks = jnp.arange(C * TOP_K, dtype=jnp.int32) // TOP_K
+    sorted_weights = flat_weights
 
     fused_out = cn_gemv_w1w2_fused_pipelined(hidden_state,
                                              w1,
