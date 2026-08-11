@@ -43,6 +43,27 @@ Two more observations from the same logs:
   with error growing as decode-written rows accumulate: 0.02 at step 0,
   0.35 at step 9, blown at step 13.
 
+### VERDICT (leg 1, step 13): decode-built cache state is the bug
+
+    ours, prefill-built caches, step-13 context:
+        ' compiler' 0.0 (rank 1), ',' -10.25 (rank 2)   <- matches the ref
+    ours, decode-built caches, same context (fix_test.log):
+        ' language' -0.25 (rank 1), ' compiler' -1.5 (rank 2)
+
+Same weights, same kernels, same 30-token context; the only variable is
+whether the KV state was built by one prefill or by 13 decode steps. Our
+prefill path is healthy to within reporting quantization of the reference.
+**The corruption is introduced by the decode-time cache write/metadata
+path.** Proven within-tree — the DP-vs-TP confound is irrelevant to it.
+
+Follow-up staged: `scratchpad/chain_decode_write_bisect.sh` (launch only
+after the TF chain fully finishes — its wait_for_tpu would otherwise fire
+in the gap between legs). It watches finalized compressed-KV slots
+byte-by-byte across decode steps at layers 2 and 3 with the existing
+DSV4_DEBUG_MAIN_META / DSV4_DEBUG_MAIN_KV probes, and settles whether padded
+batch slots are inert at real decode (request_distribution should be
+[1,1,1]).
+
 ### In flight: teacher-forcing chain (`scratchpad/chain_teacher_forcing.sh`)
 
 Running as of this writing; ~1.5 h total. Legs:
