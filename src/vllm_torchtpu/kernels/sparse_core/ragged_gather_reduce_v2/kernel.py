@@ -205,12 +205,7 @@ def _row_kernel(
         # TODO(kyuyeunk): Convert DMA destination into a continuous data to avoid
         # the performance and memory overhead of ldst.
         refs.scratch.src_indices_vmem[sub] = src_indices_refs[s][...]
-        tw = topk_weights_refs[s][...]
-        if cfg.topk_dtype == jnp.bfloat16:
-            tw_f32 = plsc.bitcast(jnp.bitwise_left_shift(tw, 16), jnp.float32)
-        else:
-            tw_f32 = plsc.bitcast(tw, jnp.float32)
-        refs.scratch.tw_f32_vmem[sub] = tw_f32
+        refs.scratch.tw_f32_vmem[sub] = topk_weights_refs[s][...]
 
     # For each sub-chunk, the destination of the row just before it -- the
     # seed for the segmented reduction's "same group as previous row" test.

@@ -2,10 +2,10 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels.sparse_core import core_map_helper
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
     config, kernel, memory_ref)
 
@@ -98,10 +98,9 @@ def main_kernel(
 
     # Step 2: Stage this partition's row count (the sort permutation is streamed
     # one window at a time in call_kernel_pipeline, bounding the resident scratch).
-    num_simd_lanes = cfg.sc_info.num_lanes
     recv_sem = refs.scratch.sem.at[0]
     num_rows_dma = pltpu.make_async_copy(
-        refs.index.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
+        refs.index.num_src_rows_per_row_partition,
         refs.scratch.num_rows_per_row_partition_vmem,
         recv_sem,
     )
@@ -140,8 +139,8 @@ def ragged_gather_reduce_v2(
     cfg = config.Config(
         input_size=indices.size,
         hidden_size=x.shape[-1],
+        source_rows=x.shape[0],
         reduce_group_size=reduce_group_size,
-        topk_dtype=topk_weights.dtype,
         in_dtype=x.dtype,
         core_axis_name="core",
         subcore_axis_name="subcore",
@@ -154,14 +153,8 @@ def ragged_gather_reduce_v2(
                                         valid_rows_mask, reduce_group_size)
 
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
-    # The kernel gathers x through a uint32 reinterpretation; carry the weights
-    # the same way so they can be bitcast back to float32 on SparseCore.
-    if topk_weights.dtype == jnp.bfloat16:
-        topk_weights_u32 = jax.lax.bitcast_convert_type(
-            topk_weights, jnp.uint16).astype(jnp.uint32)
-    else:
-        topk_weights_u32 = jax.lax.bitcast_convert_type(
-            topk_weights, jnp.uint32)
+    # Simplify topk gather by using fp32 and ensure data is always word aligned.
+    topk_weights_f32 = topk_weights.astype(jnp.float32)
 
     # Pad the input so each row partition holds a whole number of reduce
     # groups; no group is then split across two physical cores.
@@ -182,7 +175,7 @@ def ragged_gather_reduce_v2(
     )
 
     # The output gets one extra row: the kernel's garbage scatter destination.
-    out = pl.kernel(
+    out = core_map_helper.kernel(
         functools.partial(main_kernel, cfg=cfg),
         out_type=jax.ShapeDtypeStruct(
             (
@@ -199,7 +192,7 @@ def ragged_gather_reduce_v2(
         scratch_types=(memory_ref.ScratchRef.create_scratch_types(cfg), ),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce_v2",
-    )(scalar, x, topk_weights_u32)
+    )(scalar, x, topk_weights_f32)
 
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
     out = out[:cfg.output_size, :cfg.hidden_size]
