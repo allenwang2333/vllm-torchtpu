@@ -82,7 +82,7 @@ no-op when positions are already request-local.
 |---|---|
 | XLA prompt, 150 tok | unchanged, byte-identical md5 -- still loops |
 | needle, 16 tok | `7391-QUARTZ-4408` -- intact, no regression |
-| 10-prompt pool, 120 tok | pending |
+| 10-prompt pool, 120 tok | byte-identical to pre-fix (md5 53a4376c35bd both) -- inert across all 10 |
 
 Original decision table, kept for reference:
 
