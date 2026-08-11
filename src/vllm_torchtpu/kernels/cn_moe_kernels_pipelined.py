@@ -12,7 +12,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 TOP_K = 10
 M_PAD = 1
-_CN_NBUF = 4
+_CN_NBUF = max(2, int(os.getenv("MOE_CN_NBUF", "4")))
 
 _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = float(jnp.finfo(_FP8).max)
@@ -233,7 +233,8 @@ def cn_gemv_w1w2_fused_pipelined(
     N_SLOTS = TOPK_TOTAL
     NBUF = min(_CN_NBUF, G)
 
-    effective_ids = sorted_ids  # sort removed; invalid IDs already clamped to 0
+    effective_ids = (_forward_fill_ids(sorted_ids, sorted_weights)
+                     if use_ep else sorted_ids)
 
     C_PAD = lhs.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
