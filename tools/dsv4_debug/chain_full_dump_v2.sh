@@ -15,7 +15,7 @@
 set -u
 SP=${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/scratchpad
 HS=${DSV4_SCRATCH:-$HOME/workspace/scratch}/hidden_states
-PROMPT=$SP/needle_250.txt
+PROMPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/needle_250.txt"
 
 wait_for_tpu() {
   for _ in $(seq 1 400); do pgrep -f "^VLLM::" >/dev/null 2>&1 || break; sleep 15; done
@@ -32,7 +32,7 @@ rm -rf "$HS/vllm_torchtpu" "$HS/tpu_inference" \
 
 echo "########## OURS: all 43 layers + MoE internals ##########"
 date
-bash "$SP/run_ours_needle.sh" "$SP/runAB_ours_full.log" \
+bash "$SP/run_ours.sh" "$SP/runAB_ours_full.log" \
   DSV4_DUMP_HIDDEN_STATES=1 DSV4_DUMP_LAYERS=all DSV4_DEBUG_MOE_FULL=1 \
   DSV4_MAX_TOKENS=2 \
   DSV4_PROMPT_FILES="$PROMPT"
@@ -40,7 +40,7 @@ bash "$SP/run_ours_needle.sh" "$SP/runAB_ours_full.log" \
 echo "########## REFERENCE: all 43 layers ##########"
 date
 wait_for_tpu
-bash "$SP/run_ref_needle.sh" "$SP/runAC_ref_full.log" \
+bash "$SP/run_ref.sh" "$SP/runAC_ref_full.log" \
   DSV4_DUMP_HIDDEN_STATES=1 DSV4_DUMP_LAYERS=all \
   DSV4_MAX_TOKENS=2 \
   DSV4_PROMPT_FILES="$PROMPT"

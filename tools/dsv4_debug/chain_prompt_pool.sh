@@ -28,13 +28,13 @@ wait_for_tpu() {
 wait_for_tpu
 echo "########## OURS ##########"
 date
-bash "$HERE/run_ours_needle.sh" "$OUT/pool_ours.log" \
+bash "$HERE/run_ours.sh" "$OUT/pool_ours.log" \
   DSV4_MAX_TOKENS="$MAX_TOKENS" DSV4_PROMPT_FILES="$PROMPTS"
 
 wait_for_tpu
 echo "########## REFERENCE ##########"
 date
-bash "$HERE/run_ref_needle.sh" "$OUT/pool_ref.log" \
+bash "$HERE/run_ref.sh" "$OUT/pool_ref.log" \
   DSV4_MAX_TOKENS="$MAX_TOKENS" DSV4_PROMPT_FILES="$PROMPTS"
 
 echo "########## GENERATED TEXT ##########"

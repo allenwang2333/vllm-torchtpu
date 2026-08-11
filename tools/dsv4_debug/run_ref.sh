@@ -1,7 +1,9 @@
 #!/bin/bash
-# tpu-inference reference needle sweep, in its own venv.
-# Usage: run_ref_needle.sh <logfile> [extra env assignments...]
-#   e.g. run_ref_needle.sh runC.log DSV4_REF_DP_ATTENTION=0
+# Run DSv4 on tpu-inference (the JAX reference), in its own venv.
+# Same prompts and sampling config as run_ours.sh so the two are comparable.
+#
+# Usage: run_ref.sh <logfile> [VAR=value ...]
+
 set -u
 LOG="$1"; shift
 cd ${TPU_INFERENCE_ROOT:-$HOME/workspace/tpu-inference}
@@ -23,7 +25,7 @@ env \
   PYTHONPATH=${TPU_INFERENCE_ROOT:-$HOME/workspace/tpu-inference} \
   HF_HOME=${WORKSPACE:-$HOME/workspace}/hf_cache \
   DSV4_MODEL_PATH="${WORKSPACE:-$HOME/workspace}/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1" \
-  DSV4_PROMPT_FILES="${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/scratchpad/short.txt,${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/scratchpad/needle_250.txt" \
+  DSV4_PROMPT_FILES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/short.txt" \
   "$@" \
   ${WORKSPACE:-$HOME/workspace}/tpu_inference_venv_setup/vllm_env/bin/python3 \
   run_dsv4_needle_ref.py > "$LOG" 2>&1

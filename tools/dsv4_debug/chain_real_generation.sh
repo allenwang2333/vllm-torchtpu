@@ -33,14 +33,14 @@ git -C ${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu} log --oneline -1
 wait_for_tpu
 echo "########## OURS (no dumping, no probes) ##########"
 date
-bash "$SP/run_ours_needle.sh" "$SP/runAI_ours_real.log" \
+bash "$SP/run_ours.sh" "$SP/runAI_ours_real.log" \
   DSV4_MAX_TOKENS=150 \
   DSV4_PROMPT_FILES="$PROMPT_FILE"
 
 echo "########## REFERENCE ##########"
 date
 wait_for_tpu
-bash "$SP/run_ref_needle.sh" "$SP/runAJ_ref_real.log" \
+bash "$SP/run_ref.sh" "$SP/runAJ_ref_real.log" \
   DSV4_MAX_TOKENS=150 \
   DSV4_PROMPT_FILES="$PROMPT_FILE"
 

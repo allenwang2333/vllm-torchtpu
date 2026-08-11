@@ -1,9 +1,10 @@
 #!/bin/bash
-# vllm-torchtpu needle sweep. Same LLM(...) args as tpu-inference/run_dsv4_needle_ref.py
-# so the two runs are directly comparable.
+# Run DSv4 on vllm-torchtpu (ours). Same LLM(...) args as the tpu-inference
+# reference runner, so the two are directly comparable.
 #
-# Usage: run_ours_needle.sh <logfile> [extra env assignments...]
-#   e.g. run_ours_needle.sh runB.log DSV4_CSA_FILTER=1
+# Usage: run_ours.sh <logfile> [VAR=value ...]
+#   e.g. run_ours.sh /tmp/out.log DSV4_MAX_TOKENS=150 DSV4_PROMPT_FILES=...
+
 set -u
 LOG="$1"; shift
 cd ${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}
@@ -27,7 +28,7 @@ env \
   PYTHONPATH=${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/src \
   HF_HOME=${WORKSPACE:-$HOME/workspace}/hf_cache \
   DSV4_MODEL_PATH="${WORKSPACE:-$HOME/workspace}/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1" \
-  DSV4_PROMPT_FILES="${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/scratchpad/short.txt,${VLLM_TORCHTPU_ROOT:-$HOME/workspace/vllm-torchtpu}/scratchpad/needle_250.txt" \
+  DSV4_PROMPT_FILES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/short.txt" \
   "$@" \
   ${WORKSPACE:-$HOME/workspace}/uv_venv_dsv4/bin/python3 \
   examples/run_dsv4_inference.py > "$LOG" 2>&1

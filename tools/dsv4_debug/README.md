@@ -28,8 +28,9 @@ attention on), 150 tokens:
 Note the divergence is visible early — "language" vs "compiler" — well before
 the loop starts.
 
-At short lengths the two are **byte-identical** (2- and 16-token needle tests
-both pass), so any test with a small `max_tokens` will look green. Use
+At short lengths the two are **byte-identical** (2- and 16-token runs of the
+"needle" retrieval test — a code hidden in filler text that the model must find
+and repeat — both pass), so any test with a small `max_tokens` will look green. Use
 `DSV4_MAX_TOKENS=150` or more.
 
 ## Setup
@@ -43,7 +44,7 @@ export TPU_INFERENCE_ROOT=$WORKSPACE/tpu-inference
 export DSV4_SCRATCH=$WORKSPACE/scratch           # dumps land here
 ```
 
-`run_ours_needle.sh` and `run_ref_needle.sh` each pin their own venv and
+`run_ours.sh` and `run_ref.sh` each pin their own venv and
 checkpoint path near the top — check those match your machine before the
 first run.
 
