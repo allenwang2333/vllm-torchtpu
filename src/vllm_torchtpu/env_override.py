@@ -238,3 +238,10 @@ if vllm_xla_cache_path:
                           "tpu_tier2_cache")
     os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
+
+# Disable PyTorch AOTAutograd functional RNG state injection for inference graphs
+try:
+    import torch._functorch.config
+    torch._functorch.config.functionalize_rng_ops = False
+except Exception:
+    pass
