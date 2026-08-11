@@ -51,7 +51,9 @@ def _can_allocate_tpu_tensor() -> tuple[bool, str]:
     return True, result.stdout.strip()
 
 
-def _require_tpu_and_raiden():
+def _require_tpu_and_raiden()
+    import os
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false":
     ok, detail = _can_allocate_tpu_tensor()
     if not ok:
         pytest.skip(f"real TPU tensor allocation is unavailable: {detail}")
@@ -150,8 +152,10 @@ def _small_hybrid_materialization(device):
     return named, groups, geometry
 
 
-def _run_pool_bytes_live_in_both_directions():
+def run_in_isolated_process(_run_pool_bytes_live_in_both_directions):
     _require_tpu_and_raiden()
+    import os
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     import torch
     from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
 
@@ -334,6 +338,5 @@ def _run_pool_bytes_live_in_both_directions():
                 "region-granular")
 
 
-@pytest.mark.skip(reason="Fails with std::bad_alloc in CI due to XLA memory starvation in isolated child processes")
 def test_pool_bytes_live_in_both_directions():
     run_in_isolated_process(_run_pool_bytes_live_in_both_directions)

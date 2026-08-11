@@ -12,6 +12,14 @@ import pytest
 
 def _isolated_test_worker(target: Callable[[], None],
                           result_queue: Any) -> None:
+    import os
+    lockfile = "/tmp/libtpu_lockfile"
+    if os.path.exists(lockfile):
+        try:
+            os.remove(lockfile)
+        except OSError:
+            pass
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     try:
         target()
     except pytest.skip.Exception as exc:
