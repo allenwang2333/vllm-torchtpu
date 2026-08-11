@@ -3,7 +3,11 @@
 Read `dsv4_status.md` first for background. This file is only the things that
 were still moving at the end of the day.
 
-## 0. RESULT (2026-08-11, late): the compressor fix is a NO-OP
+## 0. RESULT (2026-08-11, late): compressor fix is a NO-OP, and safe
+
+Regression check passed: needle still returns `7391-QUARTZ-4408`, byte-identical
+to the reference. So the change is safe to keep, and it is committed
+(`6f0cc201`). It is **not** a fix -- see below.
 
 Tested on the XLA prompt. Output is **byte-identical** to the pre-fix run
 (same md5 over the generated text). So `state_metadata.input_positions` and
@@ -72,7 +76,15 @@ verified aligned at 13. Falls back to `positions` if a metadata object lacks
 `input_positions`, so it cannot hard-fail. The modulo is kept as a guard — a
 no-op when positions are already request-local.
 
-## 2. Three runs were in flight. How to read them
+## 2. Run results (resolved)
+
+| run | result |
+|---|---|
+| XLA prompt, 150 tok | unchanged, byte-identical md5 -- still loops |
+| needle, 16 tok | `7391-QUARTZ-4408` -- intact, no regression |
+| 10-prompt pool, 120 tok | pending |
+
+Original decision table, kept for reference:
 
 ```bash
 grep -E "^\[SWEEP\]" scratchpad/fix_test.log     # XLA prompt, 150 tok
