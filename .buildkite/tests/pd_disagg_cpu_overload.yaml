@@ -1,0 +1,1085 @@
+# ---------------------------------------------------------------------------
+# Qwen3.5-397B P/D disaggregation, Raiden + CPU offload.
+#
+#   prefill : PCP8 (full-attention) + TP8 (Mamba/GDN) on one 8-device tpu7x
+#             host. One mesh: --prefill-context-parallel-size 8 shards the
+#             full-attention layers, the Mamba/GDN layers shard TP8 across
+#             those same 8 devices via the unified block pool.
+#   decode  : 8DP1TP on a second 8-device tpu7x host.
+#   transfer: Raiden Stage-3 resharding (PCP8 -> DP8).
+#
+# This is the OFFLOAD leg. It is generated from recipe 1 and differs from it
+# on exactly one axis, so the pair A/Bs cleanly:
+#   - TPUMultiConnector[TPURaidenConnector, OffloadingConnector]
+#     (Raiden MUST stay first so it wins arbitration for proxied decode)
+#   - --enable-prefix-caching
+#   - VLLM_TPU_OFFLOAD_RAIDEN=1 on both servers
+#   - host pools: 256 GiB prefill (one PCP8 engine), 8 GiB x 8 decode
+#
+# Consequence of enabling prefix caching: it forces mamba_cache_mode=align,
+# whose assert is block_size <= max_num_batched_tokens. Decode therefore runs
+# chunk 8192 here, not the 4384 recipe 1 and the upstream golden script use
+# (both of which run --no-enable-prefix-caching, so align is off for them).
+#
+# KV pool sizing: --num-gpu-blocks-override is deliberately NOT set. The
+# reference offloading recipe pins tiny pools (128/262 blocks) to force
+# eviction churn for its A/B; that would throttle a throughput baseline.
+# Here the engine sizes the pool from gpu_memory_utilization=0.9.
+#
+# Benchmark: 64K input / 1K output through the disagg proxy.
+# each) and leaves headroom over 64K+1K. To run the 32K/1K shape instead,
+# set RANDOM_INPUT_LEN=32768 below; max_model_len can then drop to 65536.
+#
+# Derived from wdhongtw's verified "Resharding Transfer and Local
+# Offloading Setup" JobSet (35B), retargeted to 397B.
+# Image: built from the pinned combination below. Pinned to an immutable
+# tag on purpose -- an official baseline that changes underneath you is not
+# a baseline. To move to a newer build, replace the tag in this file.
+#   vllm 0.26.0 | vllm-torchtpu e5a886c1 | torch_tpu 9ea7493c | tpu-raiden c0981a6f4
+#   tpu-raiden c0981a6f4 includes PR497 "fix pool reshard push when a sender
+#   rank owns zero blocks for a pool group" (merged 2026-07-30T22:17Z), which
+#   every image built before 2026-07-30 22:17Z lacks.
+# ---------------------------------------------------------------------------
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: vllm-qwen35-397b-pd-pcp8-dp8-raiden-offload
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  ttlSecondsAfterFinished: 1800
+  replicatedJobs:
+    # ---------------------------------------------------------
+    # PREFILL (PCP8) + PROXY
+    # ---------------------------------------------------------
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          # Hard cap. A server that hits a fatal error can stop logging
+          # without the container exiting, so the Job never goes Failed and
+          # the JobSet waits on the bench pod. One run burned 8h28m that way
+          # after failing at 59 min. 90 min is ~3x a healthy end-to-end run.
+          activeDeadlineSeconds: 7200
+          template:
+            metadata:
+              labels:
+                app: vllm
+                role: prefill
+            spec:
+              restartPolicy: Never
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: tpu-node-setup
+                  image: busybox
+                  securityContext:
+                    privileged: true
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                        echo "Successfully increased dma_entry_limit"
+                      fi
+              containers:
+              - name: vllm-tpu-prefill
+                image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-wjess:20260804-Raiden
+                imagePullPolicy: Always
+                command: ["/bin/bash", "-c"]
+                args:
+                - |
+                  set -eo pipefail
+                  export PYTHONUNBUFFERED=1
+                  # tpu_raiden is a real pip install in site-packages in this
+                  # image, so no PYTHONPATH entry is needed. The image already
+                  # sets PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm.
+                  pip install libtpu==0.0.43
+                  export VLLM_HOST_IP="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                  NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                  export TPU_KV_TRANSFER_NAMESPACE="${NS}_prefill"
+                  export TPU_RAIDEN_JOB_NAME=prefill
+                  export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
+                  export TPU_RAIDEN_CONTROLLER_ADDRESS="${VLLM_HOST_IP}:${CONTROLLER_PORT}"
+                  # $MODEL is a gs:// URI: vLLM reads the checkpoint straight from GCS,
+                  # so there is no snapshot_download and no per-pod HF cache volume.
+                  # The old path re-downloaded 378 GiB into a fresh ephemeral PVC on
+                  # every run (~20 min per iteration, per pod).
+                  echo "===== Serving model directly from $MODEL ====="
+                  # Pre-warm the RunAI object-store cache in ONE process.
+                  # decode runs api_server_count=8 (one per DP rank) and each API
+                  # server calls ObjectStorageModel.pull_files() into the same dir
+                  # (get_cache_dir()/model_streamer/<sha256(url)[:8]>). They race:
+                  # one reads config.json while another is mid-write, giving
+                  #   JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+                  # Pulling once up front means all 8 find a warm cache.
+                  python3 - <<'PYWARM'
+                  import os
+                  from vllm.transformers_utils.runai_utils import ObjectStorageModel
+                  url = os.environ["MODEL"]
+                  m = ObjectStorageModel(url)
+                  m.pull_files(url, allow_pattern=["*.model", "*.py", "*.json"])
+                  m.pull_files(url, ignore_pattern=["*.pt", "*.safetensors", "*.bin",
+                                                    "*.tensors", "*.pth"])
+                  print("prewarmed", m.dir, sorted(os.listdir(m.dir))[:12], flush=True)
+                  PYWARM
+                  echo "===== Starting Raiden controller on :${CONTROLLER_PORT} ====="
+                  cat > /tmp/raiden_controller.py <<'PYEOF'
+                  import argparse, json, logging, os, signal, threading, time
+                  from pathlib import Path
+                  from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
+                  parser = argparse.ArgumentParser()
+                  parser.add_argument("--port", type=int, required=True)
+                  parser.add_argument("--advertise-host", required=True)
+                  parser.add_argument("--request-registry-ttl-s", type=float, default=600.0)
+                  parser.add_argument("--ready-file", type=Path, required=True)
+                  args = parser.parse_args()
+                  logging.basicConfig(level=logging.INFO,
+                                      format="%(asctime)s %(levelname)s %(message)s",
+                                      force=True)
+                  stopping = threading.Event()
+                  signal.signal(signal.SIGINT, lambda *_: stopping.set())
+                  signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+                  controller = RaidenController(port=args.port,
+                                                request_registry_ttl_s=args.request_registry_ttl_s)
+                  server = RaidenControllerServer(controller)
+                  server.start()
+                  payload = {
+                      "schema_version": 1,
+                      "event": "raiden_controller_ready",
+                      "pid": os.getpid(),
+                      "requested_port": args.port,
+                      "port": server.port,
+                      "advertise_host": args.advertise_host,
+                      "address": f"{args.advertise_host}:{server.port}",
+                      "request_registry_ttl_s": args.request_registry_ttl_s,
+                      "time_unix_s": time.time(),
+                  }
+                  args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+                  tmp = args.ready_file.with_name(f".{args.ready_file.name}.{os.getpid()}.tmp")
+                  tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+                  tmp.replace(args.ready_file)
+                  print(json.dumps(payload, sort_keys=True), flush=True)
+                  try:
+                      while not stopping.wait(1.0):
+                          pass
+                  finally:
+                      server.stop()
+                  PYEOF
+                  rm -f /tmp/controller.ready.json
+                  python3 /tmp/raiden_controller.py \
+                    --port "$CONTROLLER_PORT" \
+                    --advertise-host "$VLLM_HOST_IP" \
+                    --request-registry-ttl-s 600 \
+                    --ready-file /tmp/controller.ready.json \
+                    > "$CDK_OUTPUT_DIR/controller.log" 2>&1 &
+                  CONTROLLER_PID=$!
+                  for i in $(seq 1 200); do
+                    [ -s /tmp/controller.ready.json ] && break
+                    kill -0 "$CONTROLLER_PID" 2>/dev/null \
+                      || { echo "RESULT: FAIL (controller exited)"; cat "$CDK_OUTPUT_DIR/controller.log"; exit 1; }
+                    sleep 0.5
+                  done
+                  [ -s /tmp/controller.ready.json ] || { echo "RESULT: FAIL (controller not ready)"; exit 1; }
+                  cat /tmp/controller.ready.json
+                  # --mamba-cache-mode align asserts block_size <= max_num_batched_tokens.
+                  # 397B forces block_size 8192 (Mamba fit floor 4176 -> 4352 -> pow2 for
+                  # P/D nesting), so the chunk must be 8192 too. Weida's 35B recipe used
+                  # 4096/4096, which satisfied the same assert. compile_sizes tracks the
+                  # chunk so the compiled bucket matches the real batch shape.
+                  # prefill compile buckets must be multiples of 512.
+                  # kernels/gdn/v3/pcp_wrapper.py:1298 enforces
+                  #   local_num_tokens % projection_token_block_size == 0
+                  # with projection_token_block_size=512, and that check is
+                  # PCP-specific. The runner asked for 4352 (397B's Mamba fit
+                  # size) which is NOT a multiple of 512 (4352 % 512 = 256), so
+                  # 4608 is the smallest legal bucket that covers it.
+                  # Do NOT copy decode's [.. 4352, 4384 ..] here: decode is DP,
+                  # not PCP, so it is not subject to this constraint.
+                  COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096,4608],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                  # Raiden must remain first for load arbitration. PCP8 is one
+                  # engine, so its 256 GiB host pool is divided across workers.
+                  KV_TRANSFER_CONFIG='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TPUCPUOffloadingSpec","spec_module_path":"vllm_torchtpu.offload.cpu_tpu","cpu_bytes_to_use":274877906944}}]}}'
+                  # max-model-len 81920, not 65536. At 65536 the 64K shape
+                  # (64512 in + 1024 out = 65536) sits at exactly zero headroom
+                  # and only 1 of 32 requests ever succeeded -- at concurrency
+                  # 8, 4 AND 1, so it is not a load effect. A teammate's working
+                  # 397B setup uses 81920 for the same 64K shape. Note a single
+                  # request at exactly 65536 DOES succeed (probe returned 200 OK
+                  # on all five payload variants) and tokenization drift is zero
+                  # (HF and GCS-snapshot tokenizers agree: 64512 -> 64512), so
+                  # the mechanism is not yet explained -- this is an empirical
+                  # fix from a known-good configuration.
+                  echo "===== Starting Qwen3.5 PCP8 prefill node (disagg+offload) ====="
+                  # --limit-mm-per-prompt zeroes every modality Qwen3.5 supports
+                  # (image+video; Qwen3_5MoeProcessingInfo <- Qwen3VLProcessingInfo).
+                  # vLLM 0.26 builds a MultiModalBudget in the API server even under
+                  # --language-model-only. On decode chunked prefill is off, so
+                  # disable_chunked_mm_input is set and the budget check raises
+                  # "Chunked MM input disabled but max_tokens_per_mm_item (16384) is
+                  # larger than max_num_batched_tokens". Zeroing all modalities makes
+                  # compute_mm_encoder_budget return (0,0) before that raise.
+                  # vLLM 0.25.1 (Weida's verified stack) zeroed these implicitly.
+                  exec vllm serve \
+                    "$MODEL" \
+                    --served-model-name "$SERVED_MODEL" \
+                    --trust-remote-code \
+                    --seed 42 \
+                    --max-model-len 81920 \
+                    --enable-expert-parallel \
+                    --disable-custom-all-reduce \
+                    --gpu-memory-utilization 0.9 \
+                    --kv-cache-dtype fp8 \
+                    --language-model-only \
+                    --limit-mm-per-prompt '{"image":0,"video":0}' \
+                    --max-num-batched-tokens 32768 \
+                    --long-prefill-token-threshold 32768 \
+                    --max-num-seqs 8 \
+                    --no-disable-hybrid-kv-cache-manager \
+                    --attention-backend CUSTOM \
+                    --mamba-cache-mode align \
+                    --enable-prompt-tokens-details \
+                    --no-enable-log-requests \
+                    --compilation-config "$COMPILATION_CONFIG" \
+                    --enable-prefix-caching \
+                    --no-async-scheduling \
+                    --block-size 8192 \
+                    --num-gpu-blocks-override 64 \
+                    --tensor-parallel-size 1 \
+                    --host 0.0.0.0 \
+                    --port 8000 \
+                    --prefill-context-parallel-size 8 \
+                    --cp-kv-cache-interleave-size 256 \
+                    --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                    2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                env:
+                  - name: JS_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                  - name: MODEL
+                    value: "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+                  - name: SERVED_MODEL
+                    value: "Qwen3.5-397B-A17B-FP8"
+                  - name: CONTROLLER_PORT
+                    value: "27000"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: HF_HUB_DISABLE_XET
+                    value: "1"
+                  # --- device / topology (8 devices on one 2x2x1 tpu7x host) ---
+                  - name: JAX_PLATFORMS
+                    value: "tpu,cpu"
+                  - name: PJRT_DEVICE
+                    value: TPU
+                  - name: TPU_BACKEND_TYPE
+                    value: "jax"
+                  - name: VLLM_TARGET_DEVICE
+                    value: "tpu"
+                  - name: TPU_TOPOLOGY
+                    value: "2x2x1"
+                  - name: TPU_CHIPS_PER_HOST_BOUNDS
+                    value: "2,2,1"
+                  - name: TPU_HOST_BOUNDS
+                    value: "1,1,1"
+                  - name: TPU_LIBRARY_PATH
+                    value: ""
+                  - name: MEGASCALE_NUM_SLICES
+                    value: ""
+                  - name: MEGASCALE_SLICE_ID
+                    value: ""
+                  - name: TPU_PROCESS_ADDRESSES
+                    value: ""
+                  - name: TPU_WORKER_HOSTNAMES
+                    value: ""
+                  - name: TPU_PROCESS_PORT
+                    value: ""
+                  - name: MEGASCALE_COORDINATOR_ADDRESS
+                    value: ""
+                  - name: MEGASCALE_PORT
+                    value: ""
+                  # --- model / kernel config (from the live-pair script) ---
+                  - name: MODEL_IMPL_TYPE
+                    value: "vllm"
+                  - name: NEW_MODEL_DESIGN
+                    value: "0"
+                  - name: SKIP_JAX_PRECOMPILE
+                    value: "1"
+                  - name: VLLM_XLA_CHECK_RECOMPILATION
+                    value: "0"
+                  - name: USE_MOE_SPARSE_CORE
+                    value: "0"
+                  - name: TPUMISC_HMA_CHECKSUM_TRACE
+                    value: "0"
+                  - name: TPU_GDN_CONV_STATE_TILE_PAD
+                    value: "1"
+                  - name: XLA_PYTHON_CLIENT_PREALLOCATE
+                    value: "false"
+                  - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+                    value: "1"
+                  - name: USE_BATCHED_RPA_KERNEL
+                    value: "1"
+                  - name: RAGGED_GATED_DELTA_RULE_IMPL
+                    value: "chunked_kernel_v3_pd"
+                  - name: ONEHOT_MOE_PERMUTE_THRESHOLD
+                    value: "1024"
+                  - name: TPU_RAGGED_GATHER_REDUCE_IMPL
+                    value: "fallback"
+                  - name: TPU_RAGGED_GATHER_IMPL
+                    value: "fallback"
+                  - name: LIBTPU_INIT_ARGS
+                    value: "--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
+                  # libtpu 0.0.43 can take longer than the 120 s default to
+                  # bootstrap the PCP8 LOCAL_RANK remap probe.
+                  - name: TPU_PCP_REMAP_PROBE_TIMEOUT_S
+                    value: "600"
+                  # Include model load, KV-cache profiling, and warmup.
+                  - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                    value: "disabled"
+                  # --- Raiden KV transfer (from the live-pair script) ---
+                  - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                    value: "1"
+                  - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                    value: "1"
+                  - name: VLLM_ENGINE_READY_TIMEOUT_S
+                    value: "2700"
+                  - name: VLLM_TPU_OFFLOAD_RAIDEN
+                    value: "1"
+                  - name: TPU_RAIDEN_QWEN35_ADMISSION
+                    value: "1"
+                  - name: TPU_KV_RESHARD_TRANSPORT
+                    value: "raiden"
+                  # Producer-side Stage-3 byte-span lowering needs the
+                  # destination page geometry; it cannot read the decoder's
+                  # 397B mamba fit floor is 4176 (35B's is below 4096, which is
+                  # why the 35B reference recipe could use 4096). Backend
+                  # supports [256] -> round up to 4352; disaggregated P/D then
+                  # requires a power of two so prefill/decode geometries nest
+                  # -> 8192. Set explicitly on BOTH sides so the shared value is
+                  # deterministic rather than independently derived.
+                  - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                    value: "8"
+                  - name: TPU_ENABLE_D2H_TRANSFER
+                    value: "1"
+                  - name: TPU_HMA_D2H_COPY_IMPL
+                    value: "device_put"
+                  - name: TPU_HMA_MIN_DONE_RECVING_BATCH
+                    value: "1"
+                  - name: TPU_HMA_MAX_DONE_RECVING_BATCH
+                    value: "1"
+                  - name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS
+                    value: "1"
+                  - name: TPU_HMA_MAX_INFLIGHT_PULLS
+                    value: "8"
+                  - name: TPU_MAX_HOST_KV_BUFFER_SIZE
+                    value: "64"
+                  # Exceeds measured claim latency while bounding how long an
+                  # abandoned request can pin the prefill block pool.
+                  - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                    value: "300"
+                  - name: TPU_KV_SHM_POOL_GB
+                    value: "8"
+                  - name: TPU_KV_TRANSFER_PORT
+                    value: "9100"
+                  - name: TPU_SIDE_CHANNEL_PORT
+                    value: "9600"
+                volumeMounts:
+                  - name: hf-token-volume
+                    mountPath: /root/.cache/huggingface/token
+                    subPath: token
+                    readOnly: true
+                  - name: dshm
+                    mountPath: /dev/shm
+                securityContext:
+                  privileged: true
+                  capabilities:
+                    add:
+                    - IPC_LOCK
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "200"
+                  requests:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "200"
+                ports:
+                  - containerPort: 8000
+              - name: vllm-tpu-proxy
+                image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-wjess:20260804-Raiden
+                imagePullPolicy: Always
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                    DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
+                    python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                      --host 0.0.0.0 \
+                      --port 10000 \
+                      --prefiller-host $PREFILLER_DNS \
+                      --prefiller-port 8000 \
+                      --decoder-host $DECODER_DNS \
+                      --decoder-port 7200
+                env:
+                - name: JS_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                ports:
+                - containerPort: 10000
+                resources:
+                  requests: { cpu: "8", memory: "16Gi" }
+                  limits: { cpu: "16", memory: "32Gi" }
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-token-volume
+                secret:
+                  secretName: vllm-hf-token
+                  items:
+                  - key: HF_TOKEN
+                    path: token
+    # ---------------------------------------------------------
+    # DECODE (DP8)
+    # ---------------------------------------------------------
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          # Hard cap. A server that hits a fatal error can stop logging
+          # without the container exiting, so the Job never goes Failed and
+          # the JobSet waits on the bench pod. One run burned 8h28m that way
+          # after failing at 59 min. 90 min is ~3x a healthy end-to-end run.
+          activeDeadlineSeconds: 7200
+          template:
+            metadata:
+              labels:
+                app: vllm
+                role: decode
+            spec:
+              restartPolicy: Never
+              dnsPolicy: ClusterFirstWithHostNet
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: tpu-node-setup
+                  image: busybox
+                  securityContext:
+                    privileged: true
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                        echo "Successfully increased dma_entry_limit"
+                      fi
+              containers:
+              - name: vllm-tpu-decode
+                image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-wjess:20260804-Raiden
+                imagePullPolicy: Always
+                command: ["/bin/bash", "-c"]
+                args:
+                - |
+                  set -eo pipefail
+                  export PYTHONUNBUFFERED=1
+                  # tpu_raiden is a real pip install in site-packages in this
+                  # image, so no PYTHONPATH entry is needed. The image already
+                  # sets PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm.
+                  pip install libtpu==0.0.43
+                  export VLLM_HOST_IP="${JS_NAME}-decode-0-0.${JS_NAME}"
+                  NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                  export TPU_KV_TRANSFER_NAMESPACE="${NS}_decode"
+                  export TPU_RAIDEN_JOB_NAME=decode
+                  export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-decode-engine"
+                  export TPU_RAIDEN_CONTROLLER_ADDRESS="${VLLM_HOST_IP}:${CONTROLLER_PORT}"
+                  # $MODEL is a gs:// URI: vLLM reads the checkpoint straight from GCS,
+                  # so there is no snapshot_download and no per-pod HF cache volume.
+                  # The old path re-downloaded 378 GiB into a fresh ephemeral PVC on
+                  # every run (~20 min per iteration, per pod).
+                  echo "===== Serving model directly from $MODEL ====="
+                  # Pre-warm the RunAI object-store cache in ONE process.
+                  # decode runs api_server_count=8 (one per DP rank) and each API
+                  # server calls ObjectStorageModel.pull_files() into the same dir
+                  # (get_cache_dir()/model_streamer/<sha256(url)[:8]>). They race:
+                  # one reads config.json while another is mid-write, giving
+                  #   JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+                  # Pulling once up front means all 8 find a warm cache.
+                  python3 - <<'PYWARM'
+                  import os
+                  from vllm.transformers_utils.runai_utils import ObjectStorageModel
+                  url = os.environ["MODEL"]
+                  m = ObjectStorageModel(url)
+                  m.pull_files(url, allow_pattern=["*.model", "*.py", "*.json"])
+                  m.pull_files(url, ignore_pattern=["*.pt", "*.safetensors", "*.bin",
+                                                    "*.tensors", "*.pth"])
+                  print("prewarmed", m.dir, sorted(os.listdir(m.dir))[:12], flush=True)
+                  PYWARM
+                  echo "===== Starting Raiden controller on :${CONTROLLER_PORT} ====="
+                  cat > /tmp/raiden_controller.py <<'PYEOF'
+                  import argparse, json, logging, os, signal, threading, time
+                  from pathlib import Path
+                  from tpu_raiden.rpc.raiden_controller import RaidenController, RaidenControllerServer
+                  parser = argparse.ArgumentParser()
+                  parser.add_argument("--port", type=int, required=True)
+                  parser.add_argument("--advertise-host", required=True)
+                  parser.add_argument("--request-registry-ttl-s", type=float, default=600.0)
+                  parser.add_argument("--ready-file", type=Path, required=True)
+                  args = parser.parse_args()
+                  logging.basicConfig(level=logging.INFO,
+                                      format="%(asctime)s %(levelname)s %(message)s",
+                                      force=True)
+                  stopping = threading.Event()
+                  signal.signal(signal.SIGINT, lambda *_: stopping.set())
+                  signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+                  controller = RaidenController(port=args.port,
+                                                request_registry_ttl_s=args.request_registry_ttl_s)
+                  server = RaidenControllerServer(controller)
+                  server.start()
+                  payload = {
+                      "schema_version": 1,
+                      "event": "raiden_controller_ready",
+                      "pid": os.getpid(),
+                      "requested_port": args.port,
+                      "port": server.port,
+                      "advertise_host": args.advertise_host,
+                      "address": f"{args.advertise_host}:{server.port}",
+                      "request_registry_ttl_s": args.request_registry_ttl_s,
+                      "time_unix_s": time.time(),
+                  }
+                  args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+                  tmp = args.ready_file.with_name(f".{args.ready_file.name}.{os.getpid()}.tmp")
+                  tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+                  tmp.replace(args.ready_file)
+                  print(json.dumps(payload, sort_keys=True), flush=True)
+                  try:
+                      while not stopping.wait(1.0):
+                          pass
+                  finally:
+                      server.stop()
+                  PYEOF
+                  rm -f /tmp/controller.ready.json
+                  python3 /tmp/raiden_controller.py \
+                    --port "$CONTROLLER_PORT" \
+                    --advertise-host "$VLLM_HOST_IP" \
+                    --request-registry-ttl-s 600 \
+                    --ready-file /tmp/controller.ready.json \
+                    > "$CDK_OUTPUT_DIR/controller.log" 2>&1 &
+                  CONTROLLER_PID=$!
+                  for i in $(seq 1 200); do
+                    [ -s /tmp/controller.ready.json ] && break
+                    kill -0 "$CONTROLLER_PID" 2>/dev/null \
+                      || { echo "RESULT: FAIL (controller exited)"; cat "$CDK_OUTPUT_DIR/controller.log"; exit 1; }
+                    sleep 0.5
+                  done
+                  [ -s /tmp/controller.ready.json ] || { echo "RESULT: FAIL (controller not ready)"; exit 1; }
+                  cat /tmp/controller.ready.json
+                  # --mamba-cache-mode align asserts block_size <= max_num_batched_tokens.
+                  # 397B forces block_size 8192 (Mamba fit floor 4176 -> 4352 -> pow2 for
+                  # P/D nesting), so the chunk must be 8192 too. Weida's 35B recipe used
+                  # 4096/4096, which satisfied the same assert. compile_sizes tracks the
+                  # chunk so the compiled bucket matches the real batch shape.
+                  COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[8,16,32,4352,4384,8192],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                  KV_TRANSFER_CONFIG='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TPUCPUOffloadingSpec","spec_module_path":"vllm_torchtpu.offload.cpu_tpu","cpu_bytes_to_use":8589934592}}]}}'
+                  # The live-pair script binds decode to 127.0.0.1; here the
+                  # proxy runs in another pod, so bind 0.0.0.0.
+                  # Align-mode hybrid caching needs 16 request blocks plus
+                  # six grouping/layout blocks at max_model_len=65536.
+                  # --api-server-count 1 on decode. With DP8 vLLM spawns one API
+                  # server per rank, and each independently calls
+                  # ObjectStorageModel.pull_files() into the SAME cache dir
+                  # (get_cache_dir()/model_streamer/<sha256(url)[:8]>) when the
+                  # model is a gs:// URI. They race on config.json:
+                  #   OSError: config file ... is not a valid JSON file
+                  # Pre-warming the cache does not help -- every server re-pulls
+                  # regardless. The upstream golden script never hits this because
+                  # it serves from a local /mnt/disk snapshot rather than gs://.
+                  # One API server is ample here: the bench drives 8 concurrent
+                  # requests at 64K, so the HTTP front end is nowhere near the
+                  # bottleneck.
+                  # decode chunk must be >= block_size (8192) here. Recipe 2
+                  # enables prefix caching, which forces mamba_cache_mode=align,
+                  # whose assert is block_size <= max_num_batched_tokens. Recipe 1
+                  # disables prefix caching so align is off and 4384 is fine there.
+                  # The upstream golden script also runs --no-enable-prefix-caching,
+                  # which is why 4384 works for them.
+                  echo "===== Starting Qwen3.5 DP8 decode node (disagg+offload) ====="
+                  # --limit-mm-per-prompt zeroes every modality Qwen3.5 supports
+                  # (image+video; Qwen3_5MoeProcessingInfo <- Qwen3VLProcessingInfo).
+                  # vLLM 0.26 builds a MultiModalBudget in the API server even under
+                  # --language-model-only. On decode chunked prefill is off, so
+                  # disable_chunked_mm_input is set and the budget check raises
+                  # "Chunked MM input disabled but max_tokens_per_mm_item (16384) is
+                  # larger than max_num_batched_tokens". Zeroing all modalities makes
+                  # compute_mm_encoder_budget return (0,0) before that raise.
+                  # vLLM 0.25.1 (Weida's verified stack) zeroed these implicitly.
+                  # decode --gpu-memory-utilization is 0.85, prefill stays 0.9.
+                  # DP8 decode runs eight engine replicas on the same eight devices,
+                  # so per-device headroom for compiled-program buffers is far tighter
+                  # than PCP8 prefill (one engine across eight devices). At 0.9 the
+                  # 397B decode OOMed loading a program: "Attempting to allocate
+                  # 794.58M ... There are 792.02M free".
+                  exec vllm serve \
+                    "$MODEL" \
+                    --served-model-name "$SERVED_MODEL" \
+                    --trust-remote-code \
+                    --seed 42 \
+                    --max-model-len 81920 \
+                    --enable-expert-parallel \
+                    --disable-custom-all-reduce \
+                    --gpu-memory-utilization 0.9 \
+                    --kv-cache-dtype fp8 \
+                    --language-model-only \
+                    --limit-mm-per-prompt '{"image":0,"video":0}' \
+                    --max-num-batched-tokens 8192 \
+                    --max-num-seqs 32 \
+                    --no-disable-hybrid-kv-cache-manager \
+                    --attention-backend CUSTOM \
+                    --mamba-cache-mode align \
+                    --enable-prompt-tokens-details \
+                    --no-enable-log-requests \
+                    --compilation-config "$COMPILATION_CONFIG" \
+                    --enable-prefix-caching \
+                    --no-async-scheduling \
+                    --block-size 8192 \
+                    --num-gpu-blocks-override 64 \
+                    --tensor-parallel-size 1 \
+                    --host 0.0.0.0 \
+                    --port 7200 \
+                    --prefill-context-parallel-size 1 \
+                    --api-server-count 1 \
+                    --data-parallel-size 8 \
+                    --data-parallel-size-local 8 \
+                    --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                    2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                env:
+                  - name: JS_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                  - name: MODEL
+                    value: "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+                  - name: SERVED_MODEL
+                    value: "Qwen3.5-397B-A17B-FP8"
+                  - name: CONTROLLER_PORT
+                    value: "28000"
+                  - name: VLLM_LOGGING_LEVEL
+                    value: "INFO"
+                  - name: HF_HUB_DISABLE_XET
+                    value: "1"
+                  # --- device / topology (8 devices on one 2x2x1 tpu7x host) ---
+                  - name: JAX_PLATFORMS
+                    value: "tpu,cpu"
+                  - name: PJRT_DEVICE
+                    value: TPU
+                  - name: TPU_BACKEND_TYPE
+                    value: "jax"
+                  - name: VLLM_TARGET_DEVICE
+                    value: "tpu"
+                  - name: TPU_TOPOLOGY
+                    value: "2x2x1"
+                  - name: TPU_CHIPS_PER_HOST_BOUNDS
+                    value: "2,2,1"
+                  - name: TPU_HOST_BOUNDS
+                    value: "1,1,1"
+                  - name: TPU_LIBRARY_PATH
+                    value: ""
+                  - name: MEGASCALE_NUM_SLICES
+                    value: ""
+                  - name: MEGASCALE_SLICE_ID
+                    value: ""
+                  - name: TPU_PROCESS_ADDRESSES
+                    value: ""
+                  - name: TPU_WORKER_HOSTNAMES
+                    value: ""
+                  - name: TPU_PROCESS_PORT
+                    value: ""
+                  - name: MEGASCALE_COORDINATOR_ADDRESS
+                    value: ""
+                  - name: MEGASCALE_PORT
+                    value: ""
+                  # --- model / kernel config (from the live-pair script) ---
+                  - name: MODEL_IMPL_TYPE
+                    value: "vllm"
+                  - name: NEW_MODEL_DESIGN
+                    value: "0"
+                  - name: SKIP_JAX_PRECOMPILE
+                    value: "1"
+                  - name: VLLM_XLA_CHECK_RECOMPILATION
+                    value: "0"
+                  - name: USE_MOE_SPARSE_CORE
+                    value: "0"
+                  - name: TPUMISC_HMA_CHECKSUM_TRACE
+                    value: "0"
+                  - name: TPU_GDN_CONV_STATE_TILE_PAD
+                    value: "1"
+                  - name: XLA_PYTHON_CLIENT_PREALLOCATE
+                    value: "false"
+                  - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+                    value: "1"
+                  - name: USE_BATCHED_RPA_KERNEL
+                    value: "1"
+                  - name: RAGGED_GATED_DELTA_RULE_IMPL
+                    value: "chunked_kernel_v3_pd"
+                  - name: ONEHOT_MOE_PERMUTE_THRESHOLD
+                    value: "1024"
+                  - name: TPU_RAGGED_GATHER_REDUCE_IMPL
+                    value: "fallback"
+                  - name: TPU_RAGGED_GATHER_IMPL
+                    value: "fallback"
+                  # --xla_tpu_use_enhanced_launch_barrier=false was
+                  # dropped here: libtpu 0.0.43 defaults it to true, warns
+                  # "this can cause distributed hangs", and rewrites it to
+                  # false itself, so setting it explicitly is a no-op.
+                  - name: LIBTPU_INIT_ARGS
+                    value: "--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
+                  - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                    value: "disabled"
+                  # --- Raiden KV transfer (from the live-pair script) ---
+                  - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                    value: "1"
+                  - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                    value: "1"
+                  - name: VLLM_ENGINE_READY_TIMEOUT_S
+                    value: "2700"
+                  - name: VLLM_TPU_OFFLOAD_RAIDEN
+                    value: "1"
+                  - name: TPU_RAIDEN_QWEN35_ADMISSION
+                    value: "1"
+                  - name: TPU_KV_RESHARD_TRANSPORT
+                    value: "raiden"
+                  # Producer-side Stage-3 byte-span lowering needs the
+                  # destination page geometry; it cannot read the decoder's
+                  # 397B mamba fit floor is 4176 (35B's is below 4096, which is
+                  # why the 35B reference recipe could use 4096). Backend
+                  # supports [256] -> round up to 4352; disaggregated P/D then
+                  # requires a power of two so prefill/decode geometries nest
+                  # -> 8192. Set explicitly on BOTH sides so the shared value is
+                  # deterministic rather than independently derived.
+                  - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                    value: "8"
+                  - name: TPU_ENABLE_D2H_TRANSFER
+                    value: "1"
+                  - name: TPU_HMA_D2H_COPY_IMPL
+                    value: "device_put"
+                  - name: TPU_HMA_MIN_DONE_RECVING_BATCH
+                    value: "1"
+                  - name: TPU_HMA_MAX_DONE_RECVING_BATCH
+                    value: "1"
+                  - name: TPU_HMA_MAX_INFLIGHT_D2H_SENDS
+                    value: "1"
+                  - name: TPU_HMA_MAX_INFLIGHT_PULLS
+                    value: "8"
+                  - name: TPU_MAX_HOST_KV_BUFFER_SIZE
+                    value: "64"
+                  # Exceeds measured claim latency while bounding how long an
+                  # abandoned request can pin the small prefill block pool.
+                  - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                    value: "300"
+                  - name: TPU_KV_SHM_POOL_GB
+                    value: "8"
+                  - name: TPU_KV_TRANSFER_PORT
+                    value: "9100"
+                  - name: TPU_SIDE_CHANNEL_PORT
+                    value: "9600"
+                volumeMounts:
+                  - name: hf-token-volume
+                    mountPath: /root/.cache/huggingface/token
+                    subPath: token
+                    readOnly: true
+                  - name: dshm
+                    mountPath: /dev/shm
+                securityContext:
+                  privileged: true
+                  capabilities:
+                    add:
+                    - IPC_LOCK
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "200"
+                  requests:
+                    google.com/tpu: "4"
+                    memory: "850Gi"
+                    cpu: "200"
+                ports:
+                  - containerPort: 7200
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-token-volume
+                secret:
+                  secretName: vllm-hf-token
+                  items:
+                  - key: HF_TOKEN
+                    path: token
+    # ---------------------------------------------------------
+    # BENCHMARK -- throughput/latency baseline through the disagg proxy.
+    #
+    # Shape: 64K input / 1K output (RANDOM_INPUT_LEN below).
+    # To run the 32K/1K leg instead, set RANDOM_INPUT_LEN=32768; the
+    # baseline report compares both side by side.
+    #
+    # 64K in + 1K out = 65536 tokens, inside --max-model-len 81920.
+    # Concurrency is kept low: at 64K per request the prefill block pool
+    # is the binding constraint, and over-subscribing it makes Raiden
+    # sends queue rather than measuring steady-state transfer.
+    # ---------------------------------------------------------
+    - name: benchmark
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          # Hard cap. A server that hits a fatal error can stop logging
+          # without the container exiting, so the Job never goes Failed and
+          # the JobSet waits on the bench pod. One run burned 8h28m that way
+          # after failing at 59 min. 90 min is ~3x a healthy end-to-end run.
+          activeDeadlineSeconds: 7200
+          template:
+            spec:
+              containers:
+              - name: sidecar-bench
+                image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/bench:reneezhu
+                imagePullPolicy: Always
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -o pipefail
+                    PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                    DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
+                    export PREFILLER_DNS DECODER_DNS
+                    # ONE shared deadline for "both servers up", not two
+                    # sequential per-server waits. Sequential waits add up: two
+                    # 30-minute loops could exceed the job's activeDeadline on
+                    # their own, and a slow prefill used to consume the whole
+                    # prefill budget before decode was even polled.
+                    #
+                    # 397B startup observed at ~25 min with one prefill compile
+                    # bucket. Adding the 4608 bucket pushed it past 30 min, the
+                    # bench abandoned prefill mid-compile and then ran every
+                    # shape against a server that was never up (0/32 on both,
+                    # including the 32K shape that had passed 32/32). Budget is
+                    # now 55 min for all servers combined.
+                    SERVERS_DEADLINE=$(( $(date +%s) + SERVER_WAIT_S ))
+                    wait_up() {
+                      local name="$1" url="$2"
+                      echo "Waiting for ${name} up (shared deadline)"
+                      while [ "$(date +%s)" -lt "$SERVERS_DEADLINE" ]; do
+                        if curl -s -m 5 "$url" > /dev/null; then
+                          echo "${name} up at $(( SERVER_WAIT_S - (SERVERS_DEADLINE - $(date +%s)) ))s"
+                          return 0
+                        fi
+                        sleep 10
+                      done
+                      echo "RESULT: FAIL (${name} not healthy within ${SERVER_WAIT_S}s)"
+                      return 1
+                    }
+                    wait_up prefill "http://$PREFILLER_DNS:8000/health" || exit 1
+                    wait_up decode  "http://$DECODER_DNS:7200/health"  || exit 1
+                    echo "Waiting for proxy up"
+                    # toy_proxy_server.py exposes ONLY POST /v1/completions and
+                    # POST /v1/chat/completions -- it has no /health route, so
+                    # polling /health returns 404 forever. Any HTTP status at all
+                    # (404/405 included) proves uvicorn is listening and routing;
+                    # curl exit 000 means nothing is accepting connections yet.
+                    proxy_code() {
+                      curl -s -o /dev/null -m 5 -w '%{http_code}' \
+                        "http://$PREFILLER_DNS:10000/v1/completions" 2>/dev/null || echo 000
+                    }
+                    for i in $(seq 1 60); do
+                      [ "$(proxy_code)" != "000" ] && break
+                      sleep 10
+                    done
+                    PROXY_CODE="$(proxy_code)"
+                    echo "proxy probe http_code=$PROXY_CODE"
+                    [ "$PROXY_CODE" != "000" ] || {
+                      echo "RESULT: FAIL (proxy not accepting connections)"; exit 1; }
+                    # Raise aiohttp's per-line cap in the bench client before running.
+                    # The single failing 64K request was NOT a server rejection: it
+                    # died client-side in
+                    #   async for chunk_bytes in response.content
+                    #     -> aiohttp streams.readline -> readuntil(max_size=max_line_length)
+                    # i.e. one streamed SSE data: line exceeded aiohttp's default
+                    # 8190-byte line limit. vLLM had already accepted and served the
+                    # request, which is why no server log ever showed an error, why
+                    # 32K never hit it, and why it was independent of concurrency
+                    # (8, 4 and 1 all gave exactly one loss). The cap is NOT
+                    # max_line_size (that governs header parsing only): streams.py
+                    # readuntil does `max_size = max_size or self._high_water`, and
+                    # _high_water is 2 x read_bufsize = 2 x 65536 = 131072. So the
+                    # knob is read_bufsize; 8 MiB gives a 16 MiB line cap.
+                    sed -i 's/aiohttp.ClientSession(trust_env=True,/aiohttp.ClientSession(trust_env=True, read_bufsize=8388608,/g' \
+                      /bench_serving/backend_request_func.py
+                    echo "patched ClientSession call sites: $(grep -c 'read_bufsize=8388608' /bench_serving/backend_request_func.py)"
+                    # Warmup uses benchmark_serving's built-in --num-warmups,
+                    # not a separate invocation. It runs in-process, honours
+                    # --max-concurrency (so it warms the concurrent path the leg
+                    # actually uses) and is excluded from the reported metrics.
+                    # A separate pre-run at concurrency 1 warmed the wrong path
+                    # and still left one cold-start failure in the measured leg
+                    # (warmup 1/2, leg 31/32).
+                    run_leg() {
+                      local NAME="$1" PREFIX_LEN="$2" INPUT_LEN="$3" CONC="$4"
+                      local OUT="/tmp/leg_${NAME}.out"
+                      echo "===== LEG ${NAME} prefix=${PREFIX_LEN} input=${INPUT_LEN} output=${RANDOM_OUTPUT_LEN} conc=${CONC} ====="
+                      python3 benchmark_serving.py \
+                        --model="$SERVED_MODEL" --tokenizer="$TOKENIZER_ID" \
+                        --host="$PREFILLER_DNS" --port=10000 --backend=vllm \
+                        --dataset-name=random \
+                        --random-prefix-len="$PREFIX_LEN" \
+                        --random-input-len="$INPUT_LEN" \
+                        --random-output-len="$RANDOM_OUTPUT_LEN" \
+                        --num-prompts="$NUM_PROMPTS" --max-concurrency="$CONC" \
+                        --ignore-eos --request-rate=inf \
+                        --num-warmups="$WARMUP_PROMPTS" \
+                        --save-result --save-detailed \
+                        --result-dir /tmp --result-filename "leg_${NAME}.json" \
+                        --percentile-metrics=ttft,tpot,itl,e2el \
+                        --metadata leg="${NAME}" topology=pcp8_to_dp8 \
+                                   connector=TPURaidenConnector unified_block_pool=1 \
+                                   prefix_caching=1 offloading=1 \
+                                   concurrency="${CONC}" 2>&1 | tee "$OUT"
+                      local RC=${PIPESTATUS[0]}
+                      # benchmark_serving.py exits 0 even when every request fails, so
+                      # assert on the completed-request count as well. Without this a run
+                      # where 0/32 requests succeeded still reported the job as Succeeded.
+                      local SUCC
+                      SUCC="$(sed -nE 's/^Successful requests: *([0-9]+).*/\1/p' "$OUT" | tail -1)"
+                      SUCC="${SUCC:-0}"
+                      echo "===== LEG ${NAME} exit=${RC} successful=${SUCC}/${NUM_PROMPTS} ====="
+                      # benchmark_serving only keeps per-request "errors" when
+                      # --save-detailed is set. Print the distinct non-empty ones:
+                      # counts alone cannot tell us why a request failed, and
+                      # inferring from them has been wrong repeatedly.
+                      python3 - "$NAME" <<'PYERR' || true
+                    import json, sys, collections, glob
+                    name = sys.argv[1]
+                    for p in glob.glob(f"/tmp/leg_{name}.json") + glob.glob(f"/tmp/*leg_{name}*.json"):
+                        try: d = json.load(open(p))
+                        except Exception as e: print(f"ERRDUMP {p}: unreadable {e}"); continue
+                        errs = [e for e in (d.get("errors") or []) if e]
+                        print(f"ERRDUMP {p}: {len(errs)} failed request(s)")
+                        for msg, n in collections.Counter(errs).most_common(5):
+                            print(f"ERRDUMP   x{n}: {str(msg)[:2000]}")
+                        break
+                    PYERR
+                      if [ "$RC" != "0" ] || [ "$SUCC" -lt "$NUM_PROMPTS" ]; then
+                        echo "RESULT: FAIL (leg ${NAME}: only ${SUCC}/${NUM_PROMPTS} requests succeeded)"
+                        return 1
+                      fi
+                      return 0
+                    }
+                    # ---- one-shot diagnostic: capture the actual rejection body ----
+                    # 64512-token requests fail with 400 on /v1/completions/render
+                    # while 32768 succeeds. Nothing logs the response body, so send
+                    # one full-size request and print status + body verbatim before
+                    # the measured shapes run. Cheap (seconds) and removes guesswork.
+                    echo "===== DIAGNOSTIC: isolate the 64K rejection ====="
+                    # A 64512-token request sent as TOKEN IDS, non-streaming, no
+                    # ignore_eos returned 200 OK. The bench sends TEXT, stream=True,
+                    # ignore_eos=True. Tokenization was verified identical (64512
+                    # in, 64512 out, no special tokens), so vary the remaining
+                    # fields one at a time and print each response body.
+                    python3 - <<'PYPROBE' || echo "probe script failed (non-fatal)"
+                    import json, os, urllib.request, urllib.error
+                    host=os.environ["PREFILLER_DNS"]; model=os.environ["SERVED_MODEL"]
+                    n=int(os.environ["RANDOM_INPUT_LEN"]); out=int(os.environ["RANDOM_OUTPUT_LEN"])
+                    url=f"http://{host}:10000/v1/completions"
+                    def post(tag, body):
+                        req=urllib.request.Request(url, data=json.dumps(body).encode(),
+                                                   headers={"Content-Type":"application/json"})
+                        try:
+                            with urllib.request.urlopen(req, timeout=300) as r:
+                                d=r.read(200)
+                                print(f"PROBE[{tag}] -> {r.status} OK body[:200]={d!r}", flush=True)
+                        except urllib.error.HTTPError as e:
+                            print(f"PROBE[{tag}] -> {e.code} BODY={e.read(1500).decode('utf-8','replace')}", flush=True)
+                        except Exception as e:
+                            print(f"PROBE[{tag}] -> EXC {type(e).__name__}: {e}", flush=True)
+                    ids=[1234]*n
+                    base={"model":model,"prompt":ids,"temperature":0.0,"max_tokens":out}
+                    post("ids_plain", dict(base))
+                    post("ids_ignore_eos", dict(base, ignore_eos=True))
+                    post("ids_stream", dict(base, stream=True, stream_options={"include_usage":True}))
+                    post("ids_stream_ignore_eos", dict(base, stream=True,
+                         stream_options={"include_usage":True}, ignore_eos=True, best_of=1, logprobs=None))
+                    # exactly what the bench sends, but max_tokens reduced by 1 so
+                    # prompt+max_tokens is 65535 rather than exactly 65536
+                    post("ids_stream_eos_minus1", dict(base, max_tokens=out-1, stream=True,
+                         stream_options={"include_usage":True}, ignore_eos=True, best_of=1, logprobs=None))
+                    PYPROBE
+                    echo "===== DIAGNOSTIC END ====="
+                    FAIL=0
+                    # Baseline report shapes: 64K/1K and 32K/1K, run back to
+                    # back so they can be compared side by side. Neither uses
+                    # a shared prefix -- every prompt is unique.
+                    # Concurrency is per-shape, not global. vLLM reports
+                    #   GPU KV cache size: 381,300 tokens
+                    #   Maximum concurrency for 65,536 tokens per request: 5.82x
+                    # so 8 concurrent 64K requests cannot be admitted (we saw
+                    # 1/32 succeed). 32K needs 33,792 tokens/req -> 11.3x, so 8
+                    # is comfortable there. Server flags stay identical across
+                    # shapes; only the client load differs.
+                    run_leg "64k" 0 "$RANDOM_INPUT_LEN"  "$CONCURRENCY_64K" || FAIL=1
+                    run_leg "32k" 0 "$SECOND_INPUT_LEN"  "$MAX_CONCURRENCY" || FAIL=1
+                    # NOTE: reaching the CPU offload tier requires a shared
+                    # prefix of at least ONE PCP8 scheduler block. With
+                    # block_size 8192 that is 8192*8 = 65536 tokens, so no
+                    # 64K-total prompt can reach it -- that leg needs ~128K
+                    # total prompts and max_model_len raised to match.
+                    echo "ALL_LEGS_DONE fail=${FAIL}"
+                    exit $FAIL
+                env:
+                  - name: JS_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                  # bench sends --model as the request payload name, so it must
+                  # match the servers' --served-model-name. The tokenizer comes
+                  # separately from the HF repo id (a few MB, not the checkpoint).
+                  - name: SERVED_MODEL
+                    value: "Qwen3.5-397B-A17B-FP8"
+                  - name: TOKENIZER_ID
+                    value: "Qwen/Qwen3.5-397B-A17B-FP8"
+                  # 64K/1K primary shape; set to 32768 for the 32K/1K leg.
+                  - name: RANDOM_INPUT_LEN
+                    value: "64512"
+                  - name: RANDOM_OUTPUT_LEN
+                    value: "1024"
+                  # Second reported shape (32K/1K).
+                  - name: SECOND_INPUT_LEN
+                    value: "32768"
+                  - name: WARMUP_PROMPTS
+                    value: "4"
+                  - name: NUM_PROMPTS
+                    value: "32"
+                  - name: MAX_CONCURRENCY
+                    value: "8"
+                  # Under the 5.82x ceiling the KV pool allows at 64K.
+                  - name: CONCURRENCY_64K
+                    value: "4"
+                  # Shared budget for all servers to become healthy.
+                  - name: SERVER_WAIT_S
+                    value: "3300"
+                resources:
+                  requests: { cpu: "8", memory: "32Gi" }
+                  limits: { cpu: "16", memory: "64Gi" }
+              restartPolicy: Never
