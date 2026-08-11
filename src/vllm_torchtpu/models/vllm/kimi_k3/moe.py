@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -34,6 +35,36 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+class KimiFusedMoECombine(nn.Module):
+    """Combine shared-expert and routed-latent partials in one all-reduce.
+
+    All-reduce is linear and elementwise, so concatenating both partials,
+    reducing once, and splitting yields the same sums as the separate
+    pre-norm latent reduction and shared/routed combine it replaces.
+    """
+
+    def __init__(
+        self,
+        norm: RMSNorm,
+        up_proj: ReplicatedLinear,
+        hidden_size: int,
+        expert_hidden_size: int,
+    ) -> None:
+        super().__init__()
+        self.norm = norm
+        self.up_proj = up_proj
+        self.split_sizes = [hidden_size, expert_hidden_size]
+
+    def forward(self, shared_partial: torch.Tensor,
+                latent_partial: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([shared_partial, latent_partial], dim=-1)
+        fused = tensor_model_parallel_all_reduce(fused)
+        shared_sum, latent = fused.split(self.split_sizes, dim=-1)
+        latent = self.norm(latent)
+        routed, _ = self.up_proj(latent)
+        return shared_sum + routed
 
 
 class KimiMoE(nn.Module):
@@ -106,6 +137,29 @@ class KimiMoE(nn.Module):
                                      None),
         ) if config.num_shared_experts > 0 else None)
 
+        dp_size = 1
+        pcp_size = 1
+        if vllm_config is not None:
+            parallel_config = vllm_config.parallel_config
+            dp_size = parallel_config.data_parallel_size
+            pcp_size = parallel_config.prefill_context_parallel_size
+        # Fused single-collective combine: the latent norm forces a reduction
+        # before up_proj, and the shared experts provide the second reduction
+        # to share. Unsupported configs (DP/PCP > 1, scaled routing) keep the
+        # two-reduce path; KimiMoE never passes is_sequence_parallel, so SP
+        # cannot reach it.
+        use_fused_combine = (self.routed_expert_norm is not None
+                             and self.shared_experts is not None
+                             and self.tp_size > 1 and dp_size == 1
+                             and pcp_size == 1
+                             and config.routed_scaling_factor == 1.0)
+        self.fused_combine = (KimiFusedMoECombine(
+            self.routed_expert_norm,
+            self.routed_expert_up_proj,
+            hidden_size,
+            expert_hidden_size,
+        ) if use_fused_combine else None)
+
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
                                     "min_moe_intermediate_per_partition", 128)
@@ -119,7 +173,8 @@ class KimiMoE(nn.Module):
                                     None)
                             if config.hidden_act == "situ" else None)
         self.experts = FusedMoEFactory(
-            shared_experts=self.shared_experts,
+            shared_experts=(None if self.fused_combine is not None else
+                            self.shared_experts),
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
             hidden_size=expert_hidden_size,
@@ -137,8 +192,12 @@ class KimiMoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=config.routed_scaling_factor,
             routed_input_transform=self.routed_expert_down_proj,
-            routed_output_transform=routed_output_transform,
+            routed_output_transform=(None if self.fused_combine is not None
+                                     else routed_output_transform),
+            reduce_results=self.fused_combine is None,
         )
+        if self.fused_combine is not None:
+            assert self.experts.moe_config.skip_final_all_reduce
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
@@ -156,6 +215,15 @@ class KimiMoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
-        output = self.experts(hidden_states=hidden_states,
-                              router_logits=router_logits)
+        if self.fused_combine is not None:
+            # The MoE runner returns the un-reduced latent partial
+            # (reduce_results=False); one concatenated all-reduce combines
+            # it with the shared-expert partial.
+            shared_partial = self.shared_experts(hidden_states)
+            latent_partial = self.experts(hidden_states=hidden_states,
+                                          router_logits=router_logits)
+            output = self.fused_combine(shared_partial, latent_partial)
+        else:
+            output = self.experts(hidden_states=hidden_states,
+                                  router_logits=router_logits)
         return output.view(num_tokens, hidden_size)

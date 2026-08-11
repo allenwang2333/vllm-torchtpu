@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -250,8 +251,10 @@ def test_expert_parallelism_keeps_native_intermediate_size(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
-        enable_expert_parallel=True))
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=True,
+                                        data_parallel_size=1,
+                                        prefill_context_parallel_size=1))
     monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none",
                         lambda: vllm_config)
     monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
@@ -736,3 +739,276 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     torch.testing.assert_close(sconv_cache, torch.ones_like(sconv_cache))
     torch.testing.assert_close(recurrent_cache,
                                torch.ones_like(recurrent_cache))
+
+
+def _latent_moe_config(**overrides) -> KimiLinearConfig:
+    kwargs = dict(
+        hidden_size=16,
+        hidden_act="silu",
+        num_experts=4,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=1024,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=True,
+    )
+    kwargs.update(overrides)
+    return KimiLinearConfig(**kwargs)
+
+
+class _FakeMoEGate(nn.Module):
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+        self.output_size = kwargs.get("output_size", 1)
+
+    def forward(self, hidden_states: torch.Tensor):
+        return torch.zeros(hidden_states.shape[0], self.output_size), None
+
+
+class _FakeSharedMLP(nn.Module):
+    """Records what it was called with so tests can pin that KimiMoE.forward
+    hands shared_experts the original layer input, not some other tensor."""
+
+    def __init__(self, hidden_size, *args, **kwargs) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.forward_inputs: list[torch.Tensor] = []
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.forward_inputs.append(hidden_states)
+        return torch.full((hidden_states.shape[0], self.hidden_size), 3.0)
+
+
+class _FakeMoERunner(nn.Module):
+    """Records what it was called with; forward returns a value distinct
+    from _FakeSharedMLP's so tests can pin combine() argument order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.routed_experts = nn.Module()
+        self.moe_config = SimpleNamespace(skip_final_all_reduce=True)
+        self.forward_inputs: list[torch.Tensor] = []
+
+    def forward(self, hidden_states: torch.Tensor,
+                router_logits: torch.Tensor) -> torch.Tensor:
+        del router_logits
+        self.forward_inputs.append(hidden_states)
+        return torch.full((hidden_states.shape[0], 8), 2.0)
+
+
+class _FakeReplicatedLinear(nn.Module):
+    """Stand-in for vLLM's ReplicatedLinear.
+
+    Real ReplicatedLinear reaches into the live TP process group (via
+    get_tensor_model_parallel_rank) even when TP is never actually used, which
+    is not initialized in this CPU-only unit test. Constructing KimiMoE's
+    latent path needs *a* module here, not the genuine parallel linear.
+    """
+
+    def __init__(self, input_size, output_size, **kwargs) -> None:
+        super().__init__()
+        del kwargs
+        self.output_size = output_size
+        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+
+    def forward(self, inputs: torch.Tensor):
+        return inputs.new_zeros(inputs.shape[0], self.output_size), None
+
+
+class _FakeRMSNorm(nn.Module):
+    """Stand-in for vLLM's RMSNorm, matching its (hidden_size, eps) ctor and
+    single-tensor return so the identity checks below still hold."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        del eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
+def _build_kimi_moe(
+    monkeypatch: pytest.MonkeyPatch,
+    config: KimiLinearConfig,
+    tp_size: int = 8,
+    configure_vllm_config: Callable[[VllmConfig], None] | None = None,
+) -> tuple[nn.Module, dict]:
+    fused_moe_args: dict = {}
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_args.update(kwargs)
+        return _FakeMoERunner()
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size",
+                        lambda: tp_size)
+    monkeypatch.setattr(kimi_moe, "GateLinear", _FakeMoEGate)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", _FakeSharedMLP)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
+    # Real ReplicatedLinear/RMSNorm construction reaches into the live TP
+    # process group, which this CPU-only unit test never initializes (see
+    # _FakeReplicatedLinear docstring). Fake both; the fused_combine identity
+    # assertions below hold for fakes just as they do for the real classes.
+    monkeypatch.setattr(kimi_moe, "ReplicatedLinear", _FakeReplicatedLinear)
+    monkeypatch.setattr(kimi_moe, "RMSNorm", _FakeRMSNorm)
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    vllm_config = VllmConfig()
+    if configure_vllm_config is not None:
+        configure_vllm_config(vllm_config)
+    with set_current_vllm_config(vllm_config):
+        layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    return layer, fused_moe_args
+
+
+def test_fused_combine_single_all_reduce_matches_two_reduce_math(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(0)
+    ranks, hidden, latent_w = 4, 6, 4
+    shared_partials = [torch.randn(2, hidden) for _ in range(ranks)]
+    latent_partials = [torch.randn(2, latent_w) for _ in range(ranks)]
+
+    class LocalRmsNorm(nn.Module):
+
+        def __init__(self, size: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.rand(size) + 0.5)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+            return (x.float() * torch.rsqrt(variance + 1e-6) * self.weight).to(
+                x.dtype)
+
+    up_weight = torch.randn(hidden, latent_w)
+
+    class UpProj(nn.Module):
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            return x @ up_weight.t(), None
+
+    calls: list[torch.Size] = []
+
+    def fake_all_reduce(t: torch.Tensor) -> torch.Tensor:
+        calls.append(t.shape)
+        # Pin the concat order: shared columns first, latent columns last.
+        # With hidden == latent_w this width check alone can't tell the two
+        # apart, so an inverted torch.cat([latent, shared]) in
+        # KimiFusedMoECombine.forward would slip through unnoticed without
+        # this content check.
+        assert torch.equal(
+            t, torch.cat([shared_partials[0], latent_partials[0]], dim=-1))
+        return sum(
+            torch.cat([s, latent], dim=-1)
+            for s, latent in zip(shared_partials, latent_partials))
+
+    monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce",
+                        fake_all_reduce)
+    norm = LocalRmsNorm(latent_w)
+    combine = kimi_moe.KimiFusedMoECombine(norm, UpProj(), hidden, latent_w)
+
+    actual = combine(shared_partials[0], latent_partials[0])
+
+    # Ground truth = today's two-collective math: sum shared partials, sum
+    # latent partials, then norm + up_proj on the summed latent.
+    expected = (sum(shared_partials) + UpProj()(norm(sum(latent_partials)))[0])
+    torch.testing.assert_close(actual, expected)
+    assert calls == [torch.Size([2, hidden + latent_w])]
+
+
+def test_fused_combine_construction_toggles_fused_moe_args(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer, fused_moe_args = _build_kimi_moe(monkeypatch, _latent_moe_config())
+
+    assert layer.fused_combine is not None
+    assert fused_moe_args["shared_experts"] is None
+    assert fused_moe_args["reduce_results"] is False
+    assert fused_moe_args["routed_output_transform"] is None
+    # The combine reuses the exact module instances KimiMoE owns.
+    assert layer.fused_combine.norm is layer.routed_expert_norm
+    assert layer.fused_combine.up_proj is layer.routed_expert_up_proj
+
+
+def _set_pcp2(vllm_config: VllmConfig) -> None:
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "build_kwargs"),
+    [
+        ({
+            "routed_scaling_factor": 2.0
+        }, {}),
+        ({}, {
+            "tp_size": 1
+        }),
+        ({
+            "num_shared_experts": 0
+        }, {}),
+        ({}, {
+            "configure_vllm_config": _set_pcp2
+        }),
+    ],
+    ids=["routed-scaling", "tp1", "no-shared-experts", "pcp"],
+)
+def test_fused_combine_disabled_when_preconditions_fail(
+        monkeypatch: pytest.MonkeyPatch, config_overrides: dict,
+        build_kwargs: dict) -> None:
+    layer, fused_moe_args = _build_kimi_moe(
+        monkeypatch, _latent_moe_config(**config_overrides), **build_kwargs)
+
+    assert layer.fused_combine is None
+    assert fused_moe_args["reduce_results"] is True
+    assert fused_moe_args["shared_experts"] is layer.shared_experts
+    assert isinstance(fused_moe_args["routed_output_transform"],
+                      kimi_moe.KimiRoutedOutputTransform)
+
+
+def test_fused_combine_forward_concatenates_shared_then_latent(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drives KimiMoE.forward() through the fused_combine branch end to end,
+    pinning: (a) concat order at the forward level, (b) shared_experts
+    receiving the original layer input, and (c) fused_combine being invoked
+    as combine(shared, latent) rather than the reverse."""
+    layer, _ = _build_kimi_moe(monkeypatch, _latent_moe_config())
+    assert layer.fused_combine is not None
+
+    hidden_size, expert_hidden_size = 16, 8
+    shared_value, latent_value = 3.0, 2.0  # matches the fakes' forward()
+
+    all_reduce_inputs: list[torch.Tensor] = []
+
+    def fake_all_reduce(t: torch.Tensor) -> torch.Tensor:
+        all_reduce_inputs.append(t)
+        # (a) Concat order: shared columns first, latent columns last. An
+        # inverted torch.cat([latent, shared]) in
+        # KimiFusedMoECombine.forward, or a swapped combine(latent, shared)
+        # call in KimiMoE.forward, would put the wrong value in one of these
+        # column ranges.
+        assert t.shape == (2, hidden_size + expert_hidden_size)
+        assert torch.equal(t[:, :hidden_size],
+                           torch.full((2, hidden_size), shared_value))
+        assert torch.equal(t[:, hidden_size:],
+                           torch.full((2, expert_hidden_size), latent_value))
+        return t
+
+    monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce",
+                        fake_all_reduce)
+
+    hidden_states = torch.randn(2, hidden_size)
+    output = layer(hidden_states)
+
+    # (b) shared_experts and the routed runner both see the original layer
+    # input, not each other's output or some other intermediate.
+    assert len(layer.shared_experts.forward_inputs) == 1
+    assert torch.equal(layer.shared_experts.forward_inputs[0], hidden_states)
+    assert len(layer.experts.forward_inputs) == 1
+    assert torch.equal(layer.experts.forward_inputs[0], hidden_states)
+    assert len(all_reduce_inputs) == 1
+
+    # fused_combine.norm is the identity _FakeRMSNorm and up_proj
+    # (_FakeReplicatedLinear) returns zeros, so shared_sum + routed reduces
+    # to exactly the shared partial -- confirming the combine's output, not
+    # just its input, is wired end to end.
+    torch.testing.assert_close(output,
+                               torch.full((2, hidden_size), shared_value))
