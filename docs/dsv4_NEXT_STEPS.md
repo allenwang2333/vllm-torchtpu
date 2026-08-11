@@ -3,6 +3,88 @@
 Read `dsv4_status.md` first for background. This file is only the things that
 were still moving at the end of the day.
 
+## -1. REFRAMING (2026-08-11, late night): step 13 is NOT a near-tie
+
+The "small numerical difference meets an early coin-flip" framing in
+`dsv4_status.md` §8 is wrong. It was based only on OUR distribution at step
+13 (' language' -0.25 vs ' compiler' -1.50, gap 1.25). The reference's
+distribution at the same step was sitting unread in
+`scratchpad/runAM_ref_logprobs.log`:
+
+    ref step 13:  ' compiler' -0.0000516 (rank 1)     <- probability ~1.0
+                  ','         -11.0      (rank 2)
+    (' language' is not in the ref's top-5, i.e. below -12.9)
+
+So on an IDENTICAL 30-token context, our distribution deviates from the
+reference's by >12 logits for our picked token. That is a large, real
+distribution shift — far beyond any rounding-noise explanation. The XLA
+prompt is a fine instrument after all; nothing about this is luck.
+
+Shape of the divergence over the shared prefix (both trees generated
+identical tokens for steps 0-12; full table from
+`scratchpad/{fix_test,runAM_ref_logprobs}.log`):
+
+    steps 0-8:   |ours - ref| <= 0.02   (prefill-built state: healthy)
+    steps 9-12:  0.12 .. 0.35
+    step 13:     ' compiler' ours -1.5 vs ref -0.00005; ours puts a
+                 token the ref rates < -12.9 at -0.25
+
+Two more observations from the same logs:
+
+- Our logprobs are quantized to 0.125 steps (bf16-looking); the reference's
+  are smooth fp32-looking values. Our logits reach the sampler at lower
+  precision. Not necessarily the bug, but a real pipeline difference.
+- ' language' after "a domain-specific" is exactly what a model picks when
+  it cannot see the compiler/LLVM context — same "generic prior wins over
+  actual context" signature as the instruction-bleed failure mode across the
+  pool. At seq 31 the 128-token SWA window covers the entire sequence, so
+  the prompt rows are physically present in the SWA cache; suspicion falls
+  on decode-written cache rows (SWA and/or compressed) polluting attention,
+  with error growing as decode-written rows accumulate: 0.02 at step 0,
+  0.35 at step 9, blown at step 13.
+
+### In flight: teacher-forcing chain (`scratchpad/chain_teacher_forcing.sh`)
+
+Running as of this writing; ~1.5 h total. Legs:
+
+1. **ours, growing-prefix scoring** of the ref's 59 XLA tokens and of our
+   own degenerate 150 tokens (`tf_ours.log`). Our runner does not support
+   `prompt_logprobs` (tpu_runner.py:3430 hardcodes None), hence one prefill
+   per step. THE readout: if a fresh prefill of the step-13 context scores
+   ' compiler' ~0, our prefill path is healthy and the bug is decode-built
+   cache state — proven within-tree, no DP-vs-TP confound.
+2. **ref, prompt_logprobs scoring** of the same two sequences
+   (`tf_ref.log`). Instrument control (how much prefill-vs-decode disparity
+   is normal) + does the ref find our degenerate loop plausible.
+3. **ref 10-prompt pool rerun** (`pool_ref.log`) — the owed systematicity
+   answer.
+
+Analysis: `python3 scratchpad/analyze_tf.py` once legs finish. Harness
+support added: `DSV4_TF_FILES` in `examples/run_dsv4_inference.py` (ours,
+growing prefix) and `run_dsv4_needle_ref.py` (ref, prompt_logprobs); token
+files `scratchpad/tf_xla_{ref,ours}.json` extracted from the logs above.
+
+### Static diff of the attention module (done, mostly exonerating)
+
+`deepseek_v4_attention.py` vs the reference's, every deviation checked:
+
+- `kv_rope`/`qnorm_rope` fp32 casts: **non-deviation.**
+  `DeepseekV4ScalingRotaryEmbedding` keeps `cos_sin_cache` fp32 and
+  bf16*fp32 promotes to fp32 anyway; output cast back to bf16 either way.
+- `indexer_rotary_emb` fallback to `rotary_emb`: **non-deviation.** Upstream
+  vLLM sets `self.indexer_rotary_emb = self.rotary_emb` (attention.py:249)
+  — same object.
+- Metadata fallback chains (`attn_ctx.get(...) or ...` vs the reference's
+  hard `attn_metadata[name]`): probe shows `chosen_is_main=True` (warmup
+  only, but the dict keys are static per trace). Low suspicion.
+- `_o_proj` einsum layout ours `(g,r,d)` vs ref `(d,g,r)`: layouts differ
+  because the storage differs (our requant); byte-identical short
+  generations prove neither is scrambled. Only rounding differs (ref:
+  fp8-weight einsum with fp32 accumulate then per-channel scale; ours:
+  dequant to bf16 then bf16 einsum).
+- Remaining true deviations, all "tiny rounding" class — too small to
+  explain a >12-logit shift on their own.
+
 ## 0. RESULT (2026-08-11, late): compressor fix is a NO-OP, and safe
 
 Regression check passed: needle still returns `7391-QUARTZ-4408`, byte-identical
@@ -52,10 +134,8 @@ is modified and deliberately **not committed**. A copy is saved at
 
 The reference addresses each cache with **its own metadata's positions**:
 
-```python
-state_metadata.input_positions,     # state cache
-k_cache_metadata.input_positions,   # compressed-KV cache
-```
+    state_metadata.input_positions,     # state cache
+    k_cache_metadata.input_positions,   # compressed-KV cache
 
 We used a single model-level `positions` for both — `input_positions` appeared
 **zero times** in our compressor — and compensated with a
@@ -86,11 +166,9 @@ no-op when positions are already request-local.
 
 Original decision table, kept for reference:
 
-```bash
-grep -E "^\[SWEEP\]" scratchpad/fix_test.log     # XLA prompt, 150 tok
-grep -E "^\[SWEEP\]" scratchpad/fix_needle.log   # needle, 16 tok
-grep -E "^\[SWEEP\]" scratchpad/fix_pool.log     # 10-prompt pool, 120 tok
-```
+    grep -E "^\[SWEEP\]" scratchpad/fix_test.log     # XLA prompt, 150 tok
+    grep -E "^\[SWEEP\]" scratchpad/fix_needle.log   # needle, 16 tok
+    grep -E "^\[SWEEP\]" scratchpad/fix_pool.log     # 10-prompt pool, 120 tok
 
 | needle | XLA | verdict |
 |---|---|---|
