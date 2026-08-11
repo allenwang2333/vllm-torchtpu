@@ -17,6 +17,7 @@ import functools
 import jax
 from jax import numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
@@ -107,8 +108,25 @@ def gmm_wrapper(lhs,
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    #
+    # This guard has never fired. `rhs` arrives as the packed uint8 carrier
+    # (2 fp4 per byte) with the logical dtype in `rhs_quant_dtype`, so
+    # `rhs.dtype` is uint8 and the floating/4-bit test is always False --
+    # activations get quantized to fp8 regardless, the opposite of what the
+    # comment above describes. Test the logical dtype too.
+    #
+    # Off by default: the reference runs the same nominal format (fp4 weights,
+    # block 512, fp8-quantized activations) and produces clean output, so W4A8
+    # is demonstrably sufficient and flipping this unilaterally would be an
+    # undocumented divergence. Set DSV4_MOE_W4A16=1 to keep bf16 activations,
+    # which isolates activation quantization as a cause of the accuracy gap:
+    # if the rambling stops, our quantized-MoE implementation loses more than
+    # the reference's at equal format; if it persists, the quantized MoE is
+    # behaviorally exonerated end to end.
+    _eff_rhs_dtype = rhs_quant_dtype if rhs_quant_dtype is not None else rhs.dtype
+    is_fp4_weight = (jnp.issubdtype(_eff_rhs_dtype, jnp.floating)
+                     and jax.dtypes.itemsize_bits(_eff_rhs_dtype) == 4
+                     and envs.DSV4_MOE_W4A16)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,

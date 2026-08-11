@@ -7,8 +7,11 @@ of those; this one cannot be.
 
 Reads `[STEP_LOGPROBS] step=N {tok: Logprob(logprob=..., rank=..,
 decoded_token='..'), ...}` from both logs and reports, per step, whether the
-argmax matches and how the top-1/top-2 gap compares. The first step where the
-argmax flips is the true first divergence in generation.
+argmax matches, how each side's top-1/top-2 margin compares, and -- the useful
+one -- our logprob for the token the reference actually picked.
+
+Read the `ours@ref` column, not the flip step. The flip is only where
+accumulated error first moves an argmax; the divergence exists before it.
 """
 import os
 import re
@@ -52,8 +55,8 @@ def main(ours_path, ref_path):
     common = sorted(set(o) & set(r))
     print(f"ours steps={len(o)} ref steps={len(r)} common={len(common)}\n")
     print(f"{'step':>4} {'ours top1':>16} {'ref top1':>16} {'match':>6} "
-          f"{'ours gap':>9} {'ref gap':>9}")
-    print("-" * 70)
+          f"{'ours gap':>9} {'ref gap':>9} {'ours@ref':>9}")
+    print("-" * 80)
     first_flip = None
     for s in common:
         oe, re_ = o[s], r[s]
@@ -61,13 +64,28 @@ def main(ours_path, ref_path):
         match = ot[0] == rt[0]
         ogap = (oe[0][1] - oe[1][1]) if len(oe) > 1 else float("nan")
         rgap = (re_[0][1] - re_[1][1]) if len(re_) > 1 else float("nan")
+        # Cross-tree error: OUR logprob for the token the REFERENCE picked.
+        # This is the column that matters. The flip step is only a threshold
+        # crossing -- the numeric difference exists from step 0 and merely
+        # takes until the flip to move an argmax -- so the flip location says
+        # nothing about where the error starts. This measure works at every
+        # step *before* any flip, while both trees still agree on the token.
+        #   smooth decay  -> error accumulating over generation
+        #   sharp cliff   -> check the step index against structural
+        #                    boundaries (sliding window 128, CSA ratio 4,
+        #                    page/packing 64); a boundary-correlated cliff is
+        #                    the most localizing signal available here.
+        # nan means the reference's pick fell outside our top-k, i.e. our
+        # disagreement is already larger than the captured window.
+        ours_at_ref = next((e[1] for e in oe if e[0] == rt[0]), float("nan"))
         if not match and first_flip is None:
             first_flip = s
         flag = "" if match else "   <== FLIP"
         # print every step up to the flip, then a few after
         if first_flip is None or s <= first_flip + 5:
             print(f"{s:>4} {ot[3][:14]:>16} {rt[3][:14]:>16} "
-                  f"{str(match):>6} {ogap:>9.3f} {rgap:>9.3f}{flag}")
+                  f"{str(match):>6} {ogap:>9.3f} {rgap:>9.3f} "
+                  f"{ours_at_ref:>9.3f}{flag}")
     print()
     if first_flip is None:
         print("NO ARGMAX FLIP in the common steps -- the two trees agree on "
@@ -77,10 +95,14 @@ def main(ours_path, ref_path):
         print(f"  ours top-5: {[(e[3], round(e[1], 3)) for e in o[first_flip]]}")
         print(f"  ref  top-5: {[(e[3], round(e[1], 3)) for e in r[first_flip]]}")
         print()
-        print("Read: a flip where BOTH gaps are tiny means a near-tie broken by "
-              "small numeric error (accumulated precision). A flip where the "
-              "reference is confident (large ref gap) means our distribution is "
-              "structurally wrong at that step.")
+        print("Reading the flip -- the two directions are NOT symmetric:")
+        print("  ref gap LARGE and we disagree: our distribution differs by at "
+              "least that margin. A real lower bound on the error.")
+        print("  ref gap SMALL: uninformative. The model was uncertain there, "
+              "so any perturbation flips it -- this does NOT imply the error "
+              "is small.")
+        print("  The flip is a threshold crossing, not an origin. Read the "
+              "ours@ref column across ALL steps instead.")
 
 
 if __name__ == "__main__":
