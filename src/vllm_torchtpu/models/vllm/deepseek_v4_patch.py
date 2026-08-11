@@ -50,6 +50,20 @@ from vllm_torchtpu.models.vllm.deepseek_v4_requant import \
     attention_requantizer_generator  # noqa: E402
 
 
+def _dump_root(*parts: str) -> str:
+    """Root directory for debug dumps.
+
+    Defaults to `$WORKSPACE/scratch` (and `$HOME/workspace/scratch` if
+    WORKSPACE is unset) so a fresh checkout writes somewhere sensible instead
+    of a path that only exists on one machine. Override with DSV4_DUMP_ROOT.
+    """
+    root = os.environ.get("DSV4_DUMP_ROOT")
+    if not root:
+        ws = os.environ.get("WORKSPACE") or os.path.expanduser("~/workspace")
+        root = os.path.join(ws, "scratch")
+    return os.path.join(root, *parts)
+
+
 def _dump_to_numpy(t: torch.Tensor):
     """Materialize a (possibly lazy) TPU tensor, then read it to numpy fp32.
 
@@ -1122,9 +1136,10 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     # absmax=inf while the real computation was finite.
                     tensor_cpu = _dump_to_numpy(x_post)
                     os.makedirs(
-                        "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu",
+                        _dump_root("hidden_states", "vllm_torchtpu"),
                         exist_ok=True)
-                    filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/layer{layer_idx:02d}_step{self._step_idx:03d}.npy"
+                    filepath = _dump_root("hidden_states", "vllm_torchtpu",
+                               f"layer{layer_idx:02d}_step{self._step_idx:03d}.npy")
                     np.save(filepath, tensor_cpu)
 
                     if layer_idx == 0:
@@ -1132,7 +1147,8 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                             "hidden_states", None)
                         if isinstance(in_x, torch.Tensor):
                             in_cpu = _dump_to_numpy(in_x)
-                            in_filepath = f"/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu/input_step{self._step_idx:03d}.npy"
+                            in_filepath = _dump_root("hidden_states", "vllm_torchtpu",
+                                f"input_step{self._step_idx:03d}.npy")
                             np.save(in_filepath, in_cpu)
 
                     self._step_idx += 1
@@ -1207,8 +1223,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
                     import numpy as np
                     _dir = os.getenv(
                         "DSV4_SUBSTITUTE_DIR",
-                        "/home/patemotter_google_com/workspace/scratch/"
-                        "hidden_states/tpu_inference")
+                        _dump_root("hidden_states", "tpu_inference"))
                     _p = f"{_dir}/layer{layer_idx:02d}_step{_n:03d}.npy"
                     if os.path.exists(_p):
                         _a = np.load(_p)
@@ -1480,7 +1495,7 @@ def _maybe_patch_for_deepseek_v4(vllm_config: VllmConfig):
         self._sub_dump_step = step + 1
 
         import numpy as np
-        outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"
+        outdir = _dump_root("hidden_states", "vllm_torchtpu")
         os.makedirs(outdir, exist_ok=True)
         layer_suffix = f"_L{layer_idx}" if layer_idx != 0 else ""
 

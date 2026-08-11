@@ -10,6 +10,9 @@ Env knobs: DSV4_PERF_BATCHES (default "1,8,32,128"), DSV4_PERF_PROMPT_TOKENS
 (512), DSV4_PERF_GEN_TOKENS (64), DSV4_MAX_MODEL_LEN (4096), VLLM_TP_SIZE (8).
 """
 import os
+
+_WORKSPACE = os.environ.get(
+    "WORKSPACE", os.path.expanduser("~/workspace"))
 import time
 
 os.environ.setdefault("NEW_MODEL_DESIGN", "1")
@@ -20,12 +23,12 @@ os.environ.setdefault("MOE_REQUANTIZE_BLOCK_SIZE", "512")
 os.environ.setdefault("VLLM_PLUGINS", "torchtpu,torchtpu_general")
 os.environ.setdefault("VLLM_FP4_CACHE_DIR", "/dev/shm/dsv4-fp4-fp4x512")
 os.environ.setdefault("HF_HOME",
-                      "/home/patemotter_google_com/workspace/hf_cache")
+                      os.path.join(_WORKSPACE, "hf_cache"))
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
 MODEL = os.getenv(
-    "DSV4_MODEL_PATH", "/home/patemotter_google_com/workspace/hf_cache/hub/"
+    "DSV4_MODEL_PATH", os.path.join(_WORKSPACE, "hf_cache", "hub") + "/"
     "models--deepseek-ai--DeepSeek-V4-Flash/snapshots/"
     "60d8d70770c6776ff598c94bb586a859a38244f1")
 BATCHES = [

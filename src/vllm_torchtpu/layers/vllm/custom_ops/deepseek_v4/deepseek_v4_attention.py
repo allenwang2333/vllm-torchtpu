@@ -766,7 +766,8 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         if get_tensor_model_parallel_rank() != 0:
             return
         import numpy as np
-        outdir = "/home/patemotter_google_com/workspace/scratch/hidden_states/vllm_torchtpu"
+        from vllm_torchtpu.models.vllm.deepseek_v4_patch import _dump_root
+        outdir = _dump_root("hidden_states", "vllm_torchtpu")
         os.makedirs(outdir, exist_ok=True)
         if isinstance(tensor, torch.Tensor):
             # Materialize the lazy TPU tensor before the host read; a bare
@@ -1462,7 +1463,10 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 else:
                     logger.debug(
                         f"[PYTORCH_DEBUG_NAN] Rank={rank} output is 100% NaN!")
-                dump_path = f"/home/patemotter_google_com/workspace/vllm-torchtpu/scratch/nan_dump_{main_prefix}_rank{rank}.pt"
+                from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                    _dump_root
+                dump_path = _dump_root(
+                    f"nan_dump_{main_prefix}_rank{rank}.pt")
                 logger.debug(
                     f"[NAN_DETECTION] NaN detected in output! Dumping all inputs to {dump_path} ..."
                 )

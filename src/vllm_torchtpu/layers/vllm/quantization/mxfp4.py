@@ -402,9 +402,10 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 float(_routed.abs().max()),
                 float((_routed.abs().sum(-1) == 0).float().mean()),
                 tuple(_routed.shape))
-            _d = os.getenv(
-                "DSV4_MOE_DUMP_DIR",
-                "/home/patemotter_google_com/workspace/scratch/moe_dumps")
+            # Imported locally: this module is loaded during quant-method
+            # registration, before the model patch module is importable.
+            from vllm_torchtpu.models.vllm.deepseek_v4_patch import _dump_root
+            _d = os.getenv("DSV4_MOE_DUMP_DIR", _dump_root("moe_dumps"))
             try:
                 import numpy as _np
                 os.makedirs(_d, exist_ok=True)

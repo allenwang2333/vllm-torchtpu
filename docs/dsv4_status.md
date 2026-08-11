@@ -188,6 +188,24 @@ run **TP attention**. tpu-inference hard-rejects MLA without DP attention, so
 a DP-off reference control is impossible and *every* ours-vs-ref comparison
 carries this confound.
 
+### Paths and environment
+
+Nothing here hardcodes a home directory. Scripts and dump locations resolve
+from environment variables, with sensible defaults:
+
+| variable | default | what it's for |
+|---|---|---|
+| `WORKSPACE` | `$HOME/workspace` | holds both repos, `hf_cache`, `scratch` |
+| `VLLM_TORCHTPU_ROOT` | `$WORKSPACE/vllm-torchtpu` | this repo |
+| `TPU_INFERENCE_ROOT` | `$WORKSPACE/tpu-inference` | the reference stack |
+| `DSV4_SCRATCH` | `$WORKSPACE/scratch` | where dumps and logs land |
+| `DSV4_DUMP_ROOT` | `$WORKSPACE/scratch` | overrides just the debug dump location |
+| `VLLM_VENV` | `$HOME/uv_venv` | venv used by the benchmarking scripts |
+
+If your layout matches `$HOME/workspace/{vllm-torchtpu,tpu-inference,hf_cache}`
+you shouldn't need to set anything. Otherwise set `WORKSPACE` and the rest
+follow.
+
 ### Larger runs: serving, accuracy, throughput
 
 The single-prompt wrappers above are for debugging. For anything at scale, use

@@ -8,13 +8,18 @@ variants, Dense MLPs, and MoE routing) under TorchDynamo compilation in ~10s.
 """
 
 import os
+
+_WORKSPACE = os.environ.get(
+    "WORKSPACE", os.path.expanduser("~/workspace"))
 import time
 
 from vllm import LLM, SamplingParams
 
 MODEL = os.getenv(
     "DSV4_MODEL_PATH",
-    "/home/patemotter_google_com/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1",
+    os.path.join(_WORKSPACE, "hf_cache", "hub",
+                 "models--deepseek-ai--DeepSeek-V4-Flash", "snapshots",
+                 "60d8d70770c6776ff598c94bb586a859a38244f1"),
 )
 MAX_MODEL_LEN = int(os.getenv("DSV4_MAX_MODEL_LEN", "4096"))
 MAX_SEQS = int(os.getenv("DSV4_MAX_SEQS", "128"))

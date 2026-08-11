@@ -13,15 +13,15 @@ export MODEL_IMPL_TYPE="vllm"
 export ENABLE_QUANTIZED_MATMUL_KERNEL="1"
 export USE_MOE_SPARSE_CORE="0"
 export XLA_PYTHON_CLIENT_PREALLOCATE="false"
-export JAX_COMPILATION_CACHE_DIR="/home/patemotter_google_com/workspace/jax_cache"
-export TPU_LIBRARY_PATH="/home/patemotter_google_com/workspace/vllm-torchtpu/docker/libtpu.so"
+export JAX_COMPILATION_CACHE_DIR="${WORKSPACE:-$HOME/workspace}/jax_cache"
+export TPU_LIBRARY_PATH="${VLLM_TORCHTPU_ROOT:-${WORKSPACE:-$HOME/workspace}/vllm-torchtpu}/docker/libtpu.so"
 export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1000000000 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1000000000"
 export TORCH_DIST_TIMEOUT="1200"
 export VLLM_RPC_TIMEOUT="1200000"
 export VLLM_NO_USAGE_STATS="1"
-export PYTHONPATH="/home/patemotter_google_com/workspace/vllm-torchtpu/src"
+export PYTHONPATH="${VLLM_TORCHTPU_ROOT:-${WORKSPACE:-$HOME/workspace}/vllm-torchtpu}/src"
 
-MODEL_PATH="/home/patemotter_google_com/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
+MODEL_PATH="${WORKSPACE:-$HOME/workspace}/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
 PORT=8000
 
 # Clean up any lingering processes
@@ -30,11 +30,11 @@ pkill -9 -f "vllm serve" 2>/dev/null || true
 rm -rf /tmp/libtpu_lockfile* /tmp/ipc* /tmp/psm* /dev/shm/psm_* 2>/dev/null || true
 
 # Start native vLLM server
-/home/patemotter_google_com/uv_venv/bin/vllm serve "$MODEL_PATH" \
+${VLLM_VENV:-$HOME/uv_venv}/bin/vllm serve "$MODEL_PATH" \
     --tensor-parallel-size 8 \
     --kv-cache-dtype fp8_e4m3 \
     --block-size 1024 \
     --gpu-memory-utilization 0.58 \
     --enable-expert-parallel \
     --max-model-len 4096 \
-    --port $PORT > /home/patemotter_google_com/workspace/vllm-torchtpu/scratch/vllm_server.log 2>&1
+    --port $PORT > ${VLLM_TORCHTPU_ROOT:-${WORKSPACE:-$HOME/workspace}/vllm-torchtpu}/scratch/vllm_server.log 2>&1

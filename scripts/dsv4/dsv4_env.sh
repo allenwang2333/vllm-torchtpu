@@ -10,7 +10,7 @@
 # (MOE_REQUANTIZE_*, NEW_MODEL_DESIGN, MODEL_IMPL_TYPE) plus the plugin/TP
 # wiring that vllm-torchtpu needs and tpu-inference does not.
 
-: "${WORKSPACE:=/home/patemotter_google_com/workspace}"
+: "${WORKSPACE:=$HOME/workspace}"
 : "${REPO:=$WORKSPACE/vllm-torchtpu}"
 : "${VENV:=$WORKSPACE/uv_venv_dsv4}"
 : "${MODEL_PATH:=$WORKSPACE/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1}"

@@ -1,5 +1,7 @@
 import argparse
 import os
+
+_WS = os.environ.get("WORKSPACE", os.path.expanduser("~/workspace"))
 import shutil
 import subprocess
 import tempfile
@@ -18,12 +20,12 @@ def main():
                         help="Path to save the output JSON results")
     args = parser.parse_args()
 
-    model_path = "/home/patemotter_google_com/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
+    model_path = _WS + "/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
     port = 8000
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cmd = [
-            "/home/patemotter_google_com/uv_venv/bin/lm_eval", "--model",
+            os.environ.get("VLLM_VENV", os.path.expanduser("~/uv_venv")) + "/bin/lm_eval", "--model",
             "local-chat-completions", "--model_args",
             f"model={model_path},base_url=http://localhost:{port}/v1/chat/completions,num_concurrent=32",
             "--tasks", "mmlu_pro", "--limit",

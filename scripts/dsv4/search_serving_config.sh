@@ -14,7 +14,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-/home/patemotter_google_com/workspace/eval_results/cfgsearch_$(date +%Y%m%d_%H%M%S)}"
+OUT="${1:-${WORKSPACE:-$HOME/workspace}/eval_results/cfgsearch_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT"
 
 # util  seqs  batched_tokens   -- ordered most-desirable first (match the
