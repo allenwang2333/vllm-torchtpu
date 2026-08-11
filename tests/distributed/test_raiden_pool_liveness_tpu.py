@@ -333,6 +333,13 @@ def _run_pool_bytes_live_in_both_directions():
                 "wrote into dead pitch intervals — copies are not "
                 "region-granular")
 
+    # Explicitly tear down the KVCacheManager before python worker teardown 
+    # to avoid a known SIGSEGV (tcmalloc::ThreadCache::ReleaseToCentralCache)
+    # when XLA / gRPC C++ destructors run concurrently with Python shutdown.
+    del manager
+    import gc
+    gc.collect()
+
 
 def test_pool_bytes_live_in_both_directions():
     run_in_isolated_process(_run_pool_bytes_live_in_both_directions)

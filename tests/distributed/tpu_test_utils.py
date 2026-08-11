@@ -29,6 +29,17 @@ def _isolated_test_worker(target: Callable[[], None],
     else:
         result_queue.put(("OK", None))
 
+    # XLA/libtpu crashes with a SIGSEGV in tcmalloc::ThreadCache::ReleaseToCentralCache
+    # during teardown of Python `spawn` multiprocessing workers. We must brutally terminate
+    # the process skipping standard C++ static destructors to prevent the crash from failing the CI.
+    try:
+        result_queue.close()
+        result_queue.join_thread()
+    except Exception:
+        pass
+    import os
+    os._exit(0)
+
 
 def run_in_isolated_process(target: Callable[[], None],
                             *,
