@@ -253,13 +253,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output -- for profiling only, never serving. Disabled by default.
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
-<<<<<<< HEAD
     "MOE_LOW_CONC_THRESHOLD":
     lambda: int(os.getenv("MOE_LOW_CONC_THRESHOLD", "16")),
-    # Use Onehot+Matmul for permute and unpermute before and after moe
-    # when the batch size <= this threshold. When set to 0, this feature
-    # is effectively disabled.
-=======
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
@@ -267,7 +262,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # size on the SparseCore path; a positive value forces that
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
->>>>>>> origin/main
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
