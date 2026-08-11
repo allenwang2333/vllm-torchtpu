@@ -16,6 +16,19 @@ addresses each cache with its own metadata, we used one vector for both -- but
 it is not the cause of the generation bug. Keep the change (it matches the
 reference and costs nothing) but do not count it as a fix.
 
+### Attention sinks: checked, probably fine
+
+Ours shards `attention_sinks` on the head axis (`get_valid_spec(mesh,
+"model")`, and `attn_head_axis == "model"` so both spec sites agree); the
+reference replicates it with an explicit comment, "`attention_sinks` is
+replicated. The kernels run per-shard."
+
+That difference is explained by parallelism, not by a bug: the reference runs
+attention **DP=8** (every rank holds all heads, so replicated is correct),
+while we run attention **TP** (heads sharded, so a head-axis shard is
+correct). Worth a positive confirmation that our shard actually lines up with
+the head split each rank owns, but it is not obviously wrong.
+
 **Next target: the attention module's metadata construction**
 (`deepseek_v4_attention.py`, 1705 lines, no reference test). The kernels are
 proven equivalent, so if the kernels are right and the output is wrong, what
