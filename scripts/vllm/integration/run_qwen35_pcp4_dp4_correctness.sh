@@ -17,6 +17,10 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 PREFILL_KV_PORT_BASE="${PREFILL_KV_PORT_BASE:-9100}"
 DECODE_KV_PORT_BASE="${DECODE_KV_PORT_BASE:-9200}"
 SIDE_CHANNEL_PORT_BASE="${SIDE_CHANNEL_PORT_BASE:-9600}"
+PREFILL_RAIDEN_CONTROLLER_PORT="${PREFILL_RAIDEN_CONTROLLER_PORT:-27000}"
+DECODE_RAIDEN_CONTROLLER_PORT="${DECODE_RAIDEN_CONTROLLER_PORT:-28000}"
+RAIDEN_CONTROLLER_HOST="${RAIDEN_CONTROLLER_HOST:-127.0.0.1}"
+RAIDEN_TRANSFER_PARALLELISM="${RAIDEN_TRANSFER_PARALLELISM:-4}"
 STRIDED_PORT_OFFSET=10000
 
 # This CI topology consumes all eight chips of an 8-chip TPU host.
@@ -41,6 +45,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-1800}"
+TPU_ENGINE_INIT_TIMEOUT_S="${TPU_ENGINE_INIT_TIMEOUT_S:-300}"
 CORRECTNESS_TIMEOUT_S="${CORRECTNESS_TIMEOUT_S:-300}"
 
 die() {
@@ -83,15 +88,19 @@ cleanup() {
   stop_process_group "${RUN_DIR}/proxy.pid"
   stop_process_group "${RUN_DIR}/prefill.pid"
   stop_process_group "${RUN_DIR}/decode.pid"
+  stop_process_group "${RUN_DIR}/prefill_controller.pid"
+  stop_process_group "${RUN_DIR}/decode_controller.pid"
   sleep 2
   kill_process_group "${RUN_DIR}/proxy.pid"
   kill_process_group "${RUN_DIR}/prefill.pid"
   kill_process_group "${RUN_DIR}/decode.pid"
+  kill_process_group "${RUN_DIR}/prefill_controller.pid"
+  kill_process_group "${RUN_DIR}/decode_controller.pid"
 
   if ((exit_code != 0)) && [[ -d "${RUN_DIR}/logs" ]]; then
     echo "Test failed; showing the last 100 lines from each service log:" >&2
     local log
-    for log in proxy prefill decode; do
+    for log in proxy prefill decode prefill_controller decode_controller; do
       if [[ -f "${RUN_DIR}/logs/${log}.log" ]]; then
         echo "===== ${log}.log =====" >&2
         tail -n 100 "${RUN_DIR}/logs/${log}.log" >&2 || true
@@ -150,6 +159,18 @@ wait_for_prefill_and_decode() {
       tail -n 100 "${RUN_DIR}/logs/decode.log" >&2 || true
       return 1
     fi
+    if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+      if ! process_is_alive "${RUN_DIR}/prefill_controller.pid"; then
+        echo "Prefill Raiden controller exited before the server became ready" >&2
+        tail -n 100 "${RUN_DIR}/logs/prefill_controller.log" >&2 || true
+        return 1
+      fi
+      if ! process_is_alive "${RUN_DIR}/decode_controller.pid"; then
+        echo "Decode Raiden controller exited before the server became ready" >&2
+        tail -n 100 "${RUN_DIR}/logs/decode_controller.log" >&2 || true
+        return 1
+      fi
+    fi
 
     prefill_status="$(
       curl -sS -o /dev/null -w '%{http_code}' \
@@ -167,6 +188,34 @@ wait_for_prefill_and_decode() {
   done
 
   echo "Timed out waiting for prefill and decode servers" >&2
+  return 1
+}
+
+wait_for_tpu_workers_initialized() {
+  local name="$1"
+  local expected_workers="$2"
+  local pid_file="$3"
+  local log_file="$4"
+  local start_time="${SECONDS}"
+  local initialized_workers
+
+  echo "Waiting up to ${TPU_ENGINE_INIT_TIMEOUT_S}s for ${name} TPU workers to initialize"
+  while ((SECONDS - start_time < TPU_ENGINE_INIT_TIMEOUT_S)); do
+    if ! process_is_alive "${pid_file}"; then
+      echo "${name} exited during TPU worker initialization" >&2
+      tail -n 100 "${log_file}" >&2 || true
+      return 1
+    fi
+    initialized_workers="$(grep -c 'Loading model from scratch' "${log_file}" 2>/dev/null || true)"
+    if ((initialized_workers >= expected_workers)); then
+      echo "${name} TPU workers are initialized"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Timed out waiting for ${name} TPU workers to initialize" >&2
+  tail -n 100 "${log_file}" >&2 || true
   return 1
 }
 
@@ -197,30 +246,33 @@ PY
   fi
 }
 
-for command in python curl setsid timeout; do
+for command in python curl tpu-info setsid timeout; do
   command -v "${command}" >/dev/null 2>&1 ||
     die "Required command is not available on PATH: ${command}"
 done
 
-# `tpu-info` is installed in some development environments but is not part of
-# every CI image.  The numeric VFIO device nodes are the source of truth inside
-# the privileged container, so discover them directly and use `tpu-info` only
-# as a compatibility fallback for environments that hide /dev/vfio listings.
-TPU_DEVICE_PATHS=()
-if [[ -d /dev/vfio ]]; then
-  mapfile -t TPU_DEVICE_PATHS < <(
-    find /dev/vfio -maxdepth 1 -type c -regextype posix-extended \
-      -regex '/dev/vfio/[0-9]+' -print 2>/dev/null |
-      sort -Vu
-  )
+case "${KV_TRANSPORT}" in
+  v2 | raiden) ;;
+  *) die "KV_TRANSPORT must be 'v2' or 'raiden'; got '${KV_TRANSPORT}'" ;;
+esac
+
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  python - <<'PY' || die "Raiden Python dependencies are not available"
+from tpu_raiden.rpc.raiden_controller import RaidenController
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+    TPURaidenConnector,
+)
+
+assert RaidenController
+assert TPURaidenConnector
+PY
 fi
-if ((${#TPU_DEVICE_PATHS[@]} == 0)) && command -v tpu-info >/dev/null 2>&1; then
-  mapfile -t TPU_DEVICE_PATHS < <(
-    tpu-info 2>/dev/null |
-      grep -oE '/dev/vfio/[0-9]+' |
-      sort -Vu
-  )
-fi
+
+mapfile -t TPU_DEVICE_PATHS < <(
+  tpu-info 2>/dev/null |
+    grep -oE '/dev/vfio/[0-9]+' |
+    sort -Vu
+)
 AVAILABLE_CHIPS="${#TPU_DEVICE_PATHS[@]}"
 if ((AVAILABLE_CHIPS < REQUIRED_CHIPS)); then
   die "This test requires ${REQUIRED_CHIPS} TPU chips, but only ${AVAILABLE_CHIPS} were found"
@@ -237,6 +289,12 @@ managed_ports=(
   "${DECODE_PORT}"
   "${PROXY_PORT}"
 )
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  managed_ports+=(
+    "${PREFILL_RAIDEN_CONTROLLER_PORT}"
+    "${DECODE_RAIDEN_CONTROLLER_PORT}"
+  )
+fi
 for ((rank = 0; rank < PREFILL_CHIPS; rank++)); do
   managed_ports+=("$((PREFILL_KV_PORT_BASE + rank))")
   managed_ports+=(
@@ -257,7 +315,11 @@ cd "${repo_root}"
 
 echo "Model: ${MODEL_PATH}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
-echo "KV transport: TPUConnectorV2/ZMQ strided transfer"
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  echo "KV transport: TPURaidenConnector/Raiden device transfer"
+else
+  echo "KV transport: TPUConnectorV2/ZMQ strided transfer"
+fi
 echo "Prefill topology: TP=${PREFILL_TP} PCP=${PREFILL_PCP}"
 echo "Decode topology: TP=${DECODE_TP} DP=${DECODE_DP}"
 echo "Required TPU chips: ${REQUIRED_CHIPS}"
@@ -266,8 +328,17 @@ echo "Run directory: ${RUN_DIR}"
 
 prefill_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
 decode_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[256],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
-prefill_kv_config='{"kv_connector":"TPUConnectorV2","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector","kv_role":"kv_producer"}'
-decode_kv_config='{"kv_connector":"TPUConnectorV2","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector","kv_role":"kv_consumer"}'
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  connector_name="TPURaidenConnector"
+  connector_module="vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+  reshard_transport="raiden"
+else
+  connector_name="TPUConnectorV2"
+  connector_module="vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector"
+  reshard_transport="zmq"
+fi
+prefill_kv_config='{"kv_connector":"'"${connector_name}"'","kv_connector_module_path":"'"${connector_module}"'","kv_role":"kv_producer"}'
+decode_kv_config='{"kv_connector":"'"${connector_name}"'","kv_connector_module_path":"'"${connector_module}"'","kv_role":"kv_consumer"}'
 
 common_args=(
   --host "${SERVE_HOST}"
@@ -336,7 +407,6 @@ common_env=(
   DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0
   "TPU_SIDE_CHANNEL_PORT=${SIDE_CHANNEL_PORT_BASE}"
   TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
-  TPU_KV_RESHARD_TRANSPORT=zmq
   TPU_KV_RESHARD_DST_PAGE_TOKENS=4096
   TPU_GDN_CONV_STATE_TILE_PAD=1
 )
@@ -345,12 +415,36 @@ run_stamp="$(date +%Y%m%d_%H%M%S)_$$"
 prefill_namespace="prefill_pcp4_dp4_${run_stamp}"
 decode_namespace="decode_pcp4_dp4_${run_stamp}"
 
+prefill_role_env=()
+decode_role_env=()
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  common_env+=(
+    TPU_USE_RAIDEN_CONNECTOR=1
+    TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
+    TPU_RAIDEN_QWEN35_ADMISSION=1
+    TPU_KV_RESHARD_TRANSPORT=raiden
+    "TPU_RAIDEN_TRANSFER_PARALLELISM=${RAIDEN_TRANSFER_PARALLELISM}"
+  )
+  prefill_role_env+=(
+    TPU_RAIDEN_JOB_NAME=prefill
+    "TPU_RAIDEN_ENGINE_ID=prefill-engine-${run_stamp}"
+    "TPU_RAIDEN_CONTROLLER_ADDRESS=${RAIDEN_CONTROLLER_HOST}:${PREFILL_RAIDEN_CONTROLLER_PORT}"
+  )
+  decode_role_env+=(
+    TPU_RAIDEN_JOB_NAME=decode
+    "TPU_RAIDEN_ENGINE_ID=decode-engine-${run_stamp}"
+    "TPU_RAIDEN_CONTROLLER_ADDRESS=${RAIDEN_CONTROLLER_HOST}:${DECODE_RAIDEN_CONTROLLER_PORT}"
+  )
+else
+  common_env+=(TPU_KV_RESHARD_TRANSPORT=zmq)
+fi
+
 {
   echo "MODEL_PATH=${MODEL_PATH}"
   echo "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
-  echo "CONNECTOR=TPUConnectorV2"
-  echo "CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.v2.tpu_connector"
-  echo "TPU_KV_RESHARD_TRANSPORT=zmq"
+  echo "CONNECTOR=${connector_name}"
+  echo "CONNECTOR_MODULE=${connector_module}"
+  echo "TPU_KV_RESHARD_TRANSPORT=${reshard_transport}"
   echo "PREFILL_TP=${PREFILL_TP}"
   echo "PREFILL_PCP=${PREFILL_PCP}"
   echo "DECODE_TP=${DECODE_TP}"
@@ -363,7 +457,32 @@ decode_namespace="decode_pcp4_dp4_${run_stamp}"
   echo "PREFILL_KV_PORT_BASE=${PREFILL_KV_PORT_BASE}"
   echo "DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE}"
   echo "SIDE_CHANNEL_PORT_BASE=${SIDE_CHANNEL_PORT_BASE}"
+  if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+    echo "PREFILL_RAIDEN_CONTROLLER_PORT=${PREFILL_RAIDEN_CONTROLLER_PORT}"
+    echo "DECODE_RAIDEN_CONTROLLER_PORT=${DECODE_RAIDEN_CONTROLLER_PORT}"
+    echo "RAIDEN_TRANSFER_PARALLELISM=${RAIDEN_TRANSFER_PARALLELISM}"
+  fi
 } >"${RUN_DIR}/launch_params.txt"
+
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  echo "Starting prefill Raiden controller on ${RAIDEN_CONTROLLER_HOST}:${PREFILL_RAIDEN_CONTROLLER_PORT}"
+  setsid python -u examples/disagg/run_raiden_controller.py \
+    --port "${PREFILL_RAIDEN_CONTROLLER_PORT}" \
+    >"${RUN_DIR}/logs/prefill_controller.log" 2>&1 &
+  echo "$!" >"${RUN_DIR}/prefill_controller.pid"
+
+  echo "Starting decode Raiden controller on ${RAIDEN_CONTROLLER_HOST}:${DECODE_RAIDEN_CONTROLLER_PORT}"
+  setsid python -u examples/disagg/run_raiden_controller.py \
+    --port "${DECODE_RAIDEN_CONTROLLER_PORT}" \
+    >"${RUN_DIR}/logs/decode_controller.log" 2>&1 &
+  echo "$!" >"${RUN_DIR}/decode_controller.pid"
+
+  sleep 2
+  process_is_alive "${RUN_DIR}/prefill_controller.pid" ||
+    die "Prefill Raiden controller failed to start"
+  process_is_alive "${RUN_DIR}/decode_controller.pid" ||
+    die "Decode Raiden controller failed to start"
+fi
 
 echo "Starting prefill server on ${SERVE_HOST}:${PREFILL_PORT}"
 setsid env \
@@ -379,6 +498,7 @@ setsid env \
   -u VLLM_CACHE_ROOT \
   -u TORCHINDUCTOR_CACHE_DIR \
   "${common_env[@]}" \
+  "${prefill_role_env[@]}" \
   "DEBUG_TPU_LOCAL_RANK_OFFSET=${PREFILL_TPU_LOCAL_RANK_OFFSET}" \
   "TPU_LOCAL_RANK_OFFSET=${PREFILL_TPU_LOCAL_RANK_OFFSET}" \
   "TPU_KV_TRANSFER_NAMESPACE=${prefill_namespace}" \
@@ -386,6 +506,15 @@ setsid env \
   python -m vllm.entrypoints.openai.api_server "${prefill_args[@]}" \
   >"${RUN_DIR}/logs/prefill.log" 2>&1 &
 echo "$!" >"${RUN_DIR}/prefill.pid"
+
+# Starting both four-chip engines at exactly the same time can race while
+# libtpu creates their PJRT gRPC servers. Wait until every prefill worker has
+# initialized its TPU client before allowing the decode workers to start.
+wait_for_tpu_workers_initialized \
+  "Prefill server" \
+  "${PREFILL_CHIPS}" \
+  "${RUN_DIR}/prefill.pid" \
+  "${RUN_DIR}/logs/prefill.log"
 
 echo "Starting decode server on ${SERVE_HOST}:${DECODE_PORT}"
 setsid env \
@@ -401,6 +530,7 @@ setsid env \
   -u VLLM_CACHE_ROOT \
   -u TORCHINDUCTOR_CACHE_DIR \
   "${common_env[@]}" \
+  "${decode_role_env[@]}" \
   "DEBUG_TPU_LOCAL_RANK_OFFSET=${DECODE_TPU_LOCAL_RANK_OFFSET}" \
   "TPU_LOCAL_RANK_OFFSET=${DECODE_TPU_LOCAL_RANK_OFFSET}" \
   "TPU_KV_TRANSFER_NAMESPACE=${decode_namespace}" \
@@ -443,4 +573,8 @@ grep -Eq '"cached_tokens": [1-9][0-9]*' \
   "${RUN_DIR}/logs/correctness.log" ||
   die "The decode response did not report transferred prompt tokens"
 
-echo "PCP4_DP4_E2E_OK"
+if [[ "${KV_TRANSPORT}" == "raiden" ]]; then
+  echo "PCP4_DP4_RAIDEN_E2E_OK"
+else
+  echo "PCP4_DP4_E2E_OK"
+fi
