@@ -188,6 +188,58 @@ run **TP attention**. tpu-inference hard-rejects MLA without DP attention, so
 a DP-off reference control is impossible and *every* ours-vs-ref comparison
 carries this confound.
 
+### Larger runs: serving, accuracy, throughput
+
+The single-prompt wrappers above are for debugging. For anything at scale, use
+`scripts/dsv4/`, which shares one env file (`dsv4_env.sh`) so the settings stay
+consistent between them.
+
+**Serving.** Starts a vLLM server on this node and waits for health, then
+leaves it running:
+
+```bash
+scripts/dsv4/serve_dsv4.sh server.log
+# tunables, all overridable per run:
+MAX_MODEL_LEN=9216 GPU_MEM_UTIL=0.7 scripts/dsv4/serve_dsv4.sh
+```
+
+Known-good shape is 9216 context, `max_num_batched_tokens=1024`,
+`max_num_seqs=128`, TP=8/EP=8, fp8 KV, prefix caching off, non-eager. That is
+the reference's shape, which matters if you intend to compare numbers.
+
+**Accuracy (MMLU-Pro).** Brings the server up, runs `lm_eval`, tears it down:
+
+```bash
+scripts/dsv4/run_mmlu_pro.sh my_run
+# smoke test first -- the full benchmark is long:
+LIMIT=10 scripts/dsv4/run_mmlu_pro.sh smoke
+# knobs: NUM_CONCURRENT=128, NUM_FEWSHOT=5, GPU_MEM_UTIL, MAX_MODEL_LEN
+```
+
+Note what this does and doesn't measure. MMLU-Pro is multiple choice, so each
+question produces a short answer — it aggregates over thousands of prompts and
+will catch a *systematic* accuracy gap, but it does not exercise long
+generation and so will not reproduce the repetition failure in §8. The two are
+complementary: MMLU-Pro tells you whether we're worse on average, the prompt
+pool tells you how we fail.
+
+**Throughput.** One model load, several batch sizes:
+
+```bash
+PYTHONPATH=src python scripts/dsv4/perf_offline.py
+# DSV4_PERF_BATCHES="1,8,32,128", DSV4_PERF_PROMPT_TOKENS=512,
+# DSV4_PERF_GEN_TOKENS=64, DSV4_MAX_MODEL_LEN=4096
+```
+
+This exists because batch-1 serving showed ~1 tok/s and it wasn't obvious
+whether that was real per-step cost or an artifact of running one sequence
+through a graph compiled for `max_num_seqs=128`. It scales with batch size, so
+it was the artifact — don't read batch-1 numbers as throughput.
+
+**Finding a serving config.** `scripts/dsv4/search_serving_config.sh` sweeps
+context/utilisation combinations to find ones that fit in HBM, which is worth
+running before assuming a shape is unreachable.
+
 ## 6. What works
 
 - End-to-end generation on real weights, eager and compiled.
