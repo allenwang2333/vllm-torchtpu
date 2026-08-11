@@ -186,24 +186,16 @@ class TestTpuCompilerCache:
         assert factors == ["upstream", "tpu"]
 
     def test_env_override_mapping(self):
-        """Verify that VLLM_XLA_CACHE_PATH sets the corresponding native variables."""
+        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets TORCH_TPU_TIER2_COMPILATION_CACHE default."""
         env_mock = {
-            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
+            "/tmp/test_tier3_cache_env",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             # Reload env_override to re-execute its top-level statements
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
-            assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
-            assert os.environ.get(
-                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/tmp/test_xla_cache_env/torch_tpu_tier3"
-
-            assert os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"
-                                  ) == "tpu_tier2_cache"
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
 
