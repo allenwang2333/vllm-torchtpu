@@ -17,7 +17,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import configs
 
 
 def _stitch_decode_lane(
