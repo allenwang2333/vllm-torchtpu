@@ -162,3 +162,26 @@ All no-ops unless set. See the commit adding them for detail.
 | `DSV4_DEBUG_CACHE_SHAPES=1` | per-layer KV cache shape and `data_ptr` |
 | `DSV4_DUMP_HIDDEN_STATES=1` | per-sublayer activation dumps (see traps above) |
 | `DSV4_DUMP_LAYERS=40,41,42` | narrow dumping to specific layers |
+
+## Prefill-vs-decode differentials (added 2026-08-12)
+
+Born from the decode-corruption root cause
+(`docs/dsv4_decode_race_postmortem.md`). Run these FIRST when decode output
+looks worse than prefill-scored output — they need no instrumentation
+beliefs, only generated logprobs and cache bytes.
+
+| tool | cost | what it answers |
+|---|---|---|
+| `chain_prefill_decode.sh [prompt] [max_tokens]` | 2 model loads | does decode-built state diverge from prefill-built state, behaviorally? Prints per-step drift + verdict via `diff_teacher_forcing.py` |
+| `chain_cache_diff.sh [prompt] [max_tokens] [layer]` | 2 loads (1 harvest + 1 combined) | WHICH cache rows decode writes differently, byte-for-byte, via `diff_cache_pages.py` (prefill is bit-deterministic, so byte-equality is a valid assertion) |
+
+Underlying harness features (examples/run_dsv4_inference.py):
+`DSV4_TF_FILES` (growing-prefix teacher forcing), `DSV4_TF_AFTER_PROMPTS`
+(decode + TF scoring on one model load), `DSV4_DUMP_PAGES` +
+`DSV4_DEBUG_LAYER` + `DSV4_DUMP_LABEL` (block-table-indexed page dumps with
+synced activation reads).
+
+Rules learned the hard way (full list in the postmortem): all unsynced host
+reads of lazy tensors lie — use `_dump_to_numpy`; never characterize a
+divergence from one side's logprobs; audit any tensor whose only consumer
+is a cache write.
