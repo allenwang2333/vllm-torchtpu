@@ -703,6 +703,34 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # projections BEFORE fused_wqa_wkv captures the clean value; if
         # generation becomes prompt-faithful this is both the proof and the
         # minimal fix.
+        # DSV4_DUMP_HIDDEN_FULL=1: dump the FULL hidden tensor, synced, at
+        # the TOP of attn_gemm (before any op dispatch), plus positions --
+        # the measurement that splits the post-intervention-3 fork: is the
+        # decode hidden row for token t equal to the prefill hidden row for
+        # the same token (pollution enters later), or different (the
+        # "forward path differs" finding was right and the SWA byte-identity
+        # is the anomaly)?
+        if (os.getenv("DSV4_DUMP_HIDDEN_FULL") == "1"
+                and not _is_tracing() and _DEBUG_LAYER_INFIX() in getattr(
+                    self, "custom_prefix", "")):
+            from vllm.distributed.parallel_state import \
+                get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                import numpy as np
+
+                from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                    _dump_to_numpy
+                _step = getattr(self, "_dsv4_hf_step", 0)
+                self._dsv4_hf_step = _step + 1
+                _root = os.path.join(
+                    os.getenv("DSV4_DUMP_ROOT",
+                              os.path.expanduser("~/workspace/scratch")),
+                    "page_dumps", os.getenv("DSV4_DUMP_LABEL", "run"))
+                os.makedirs(_root, exist_ok=True)
+                np.savez_compressed(os.path.join(
+                    _root, f"hidden_step{_step:03d}.npz"),
+                                    hidden=_dump_to_numpy(hidden_states))
+
         _kvscore_first = os.getenv("DSV4_KVSCORE_FIRST") == "1"
         _pre = {}
         if _kvscore_first:
