@@ -255,3 +255,38 @@ via DSV4_DUMP_PAGES attn_output at DSV4_DEBUG_LAYER=0.
   glue in the block.
 - attn out already 0.011 => our swa_only merge/sinks/scale invocation
   deviates from the reference's despite equal inputs.
+
+## ROOT CAUSE #1 PROVEN AND FIXED BY INTERVENTION (06:45): stale padding rows
+
+DSV4_ZERO_PAD=1 (92f379ee, active-marker confirmed) — first intervention of
+four to change output at all, and it changed the diagnostic token:
+
+- xla_llvm: step 13 now ' compiler', coherent sentence; tracks the
+  reference through step 16; first flip at 17 on a token the reference
+  itself rates ambiguous (gap 2.25). diff_logprobs verdict: "no confident
+  divergence."
+- needle 81 + needle 256: retrieval intact.
+- Mechanism chain, all measured: runner reuses decode input buffers
+  without clearing (stale positions/ids visible) -> padding rows carry
+  full-magnitude stale data (junk q rows |x| 0.70 vs real 0.59) -> the
+  shared attention kernel is padding-SENSITIVE (zeroing pads changes real
+  output; suites never catch it because tests pad with zeros) -> ~50%
+  attention-output error at layer 0 -> compounds across 43 layers ->
+  context blindness by ~step 13. The reference is immune because its pads
+  are zeros (its own decode-vs-prefill curve: cos 0.9997 at L1 vs our
+  0.94).
+
+Fix tiers: (1) call-site mask = DSV4_ZERO_PAD, proven; (2) runner buffer
+hygiene at batch assembly (the real fix; covers all consumers); (3) kernel
+padding-insensitivity upstream (CPU-interpreter repro with garbage pads
+recommended for the tpu-inference bug report).
+
+## ROOT CAUSE #2 (separate, still open): water_cycle step-8 class
+
+05_water_cycle still flips at step 8 with the reference confident (gap
+6.25); ours@ref moved only -1.25 -> -1.12 with pads zeroed — the padding
+fix is irrelevant to it. Residual repetition/instruction-bleed in long
+tails likely belongs to this. ~5-logit error at a fixed 22-token context,
+reproducible, instrumented: hunt with the exact playbook that found #1
+(teacher-force this prompt, layer curve, etc.). Indexer/CSA-selection
+inert at this length, so it is none of the previously exonerated paths.
