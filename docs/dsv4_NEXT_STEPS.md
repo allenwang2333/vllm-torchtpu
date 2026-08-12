@@ -469,3 +469,42 @@ at the decode batch shape (torch-tpu matmul/stride bug) — fix by replacing
 the raw `@` with the proper linear path. Both wrong => hidden row 0 itself
 is polluted and the hunt moves to the layer/MHC wrapper (and must explain
 how fused_wqa_wkv stays byte-perfect).
+
+## ROOT CAUSE IDENTIFIED (02:30): kv_score materializes against a mutated hidden_states buffer
+
+The v4 run + an offline checkpoint-weight check closed the case:
+
+1. Batched vs single-row kv_score in the same call: **bit-identical** — the
+   matmul is honest, no row mixing in the kernel.
+2. Offline arbiter: `dumped_hidden_row0 @ W_checkpoint` reproduces the
+   polluted runtime kv_score at **cos 0.999999** — so the matmul consumed
+   exactly the (polluted) buffer contents the synced dump saw.
+3. Yet `fused_wqa_wkv(hidden_states)` — the SAME python variable, two lines
+   earlier — produces byte-perfect SWA rows.
+
+The only consistent mechanism: **the buffer backing hidden_states is
+mutated in place mid-step by an untracked write (fused-MHC stream reuse),
+and the two consumers materialize against different snapshots.** The
+attention path's output is needed by the step's logits, so the lazy engine
+materializes it early (pre-mutation). kv_score's only consumer is the
+compressor's cache write — a pure side effect nothing in the step depends
+on — so its materialization is legally deferred past the mutation. Decode's
+small graphs make the unsafe schedule the norm; prefill's schedule happens
+to be safe (hence bit-deterministic prefill and the entire TF result set).
+The reference cannot have this bug class: it is pure JAX, SSA end to end.
+
+This also retro-explains: the error growing with decode step (scheduling
+drift), the error direction being other batch rows' features (the buffer's
+subsequent content), instruction bleed across the pool (the poisoned rows
+are precisely the compressed/state rows, degrading long-range context
+first), and why every isolated kernel test passed (SSA inputs).
+
+**Intervention run in flight** (`scratchpad/run_intervention.sh`,
+DSV4_KVSCORE_SYNC=1 pins kv_score at program order): if XLA picks
+' compiler' at step 13 and stays coherent, needle x2 hold, and water_cycle
+does not flip at step 8, the mechanism is proven by intervention. The sync
+is a diagnostic fix, not the real one -- the real fix is eliminating the
+untracked in-place mutation (or giving the compressor branch a tracked
+dependency), plus auditing every other consumer whose only output is a
+cache side effect (the indexer's kv_score path in attn_gemm has the same
+shape: `hidden_states @ indexer.compressor.fused_wkv_wgate.weight.T`).
