@@ -101,3 +101,28 @@ why the pure-JAX reference (SSA, no aliasing) cannot express this bug class.
 4. Side-effect-only computations are the unique places with no natural
    ordering anchor; audit them whenever code is ported from a functional
    (JAX) reference into the mutable-lazy runtime.
+
+## Intervention log
+
+**#1 — DSV4_KVSCORE_SYNC=1 (16de88ae): FAILED, byte-inert.** Output
+byte-identical to baseline (md5 ab92f8f5). In retrospect the v4 evidence
+predicted this: the synced dump of hidden inside attn_gemm was ALREADY
+polluted, so the mutation lands before those lines run — a sync there pins
+the already-dirty value. The failure narrows the timing: the buffer is
+mutated between fused_wqa_wkv's value capture and the very next python
+line. Needle x2 unchanged (pass), as expected.
+
+**Refined mechanism:** something concurrent to the host thread mutates the
+buffer — and this stack runs vLLM **async scheduling** (the log announces
+it), which preps step s+1's inputs while step s's deferred graph branches
+are unmaterialized. Composed with a memory pool that recycles step-s
+intermediates, the deferred side-effect branch reads recycled bytes.
+
+**#2 — DSV4_ASYNC_SCHEDULING=0 (3d7ca7a0): queued.** Same four
+instruments. If clean: mechanism = async prep racing deferred reads; the
+tiered fixes in this doc still apply (the branch needs an ordering anchor
+regardless — async scheduling is a legitimate feature we want back).
+If still broken: the concurrency source is inside torch-tpu's own
+execution (allocator reuse without host-visible async), and the next probe
+is dumping kv_score computed at the TOP of attn_gemm (before
+fused_wqa_wkv's dispatch can flush anything).
