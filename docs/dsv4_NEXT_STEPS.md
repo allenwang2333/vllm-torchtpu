@@ -152,18 +152,27 @@ perturbation, or the drift partially cancels downstream. The growth of
 output damage comes from cache accumulation, not from single-step logit
 sensitivity.
 
-**In flight: the layer-0 discriminator** (`combined_L0` dumps). At decode
-step 0, layer 0's q/kv involve NO caches and NO upstream layers (embedding
--> norm -> linear -> rope, all per-token). Decode must match prefill
-essentially exactly there.
-- L0 drifts too => the decode BATCH itself is contaminated (padded rows /
-  embedding / hyper-connection streams) — audit decode batch construction.
-- L0 clean => the drift is created inside layers 0-1's cross-token ops.
-  Prime suspects: (a) fp8 activation-quantization scales computed across
-  the batch, letting junk padded rows (decode padding is STALE data —
-  positions print as [17,1,2,3...]) distort real rows' scales; prefill
-  padding is clean. (b) MoE EP capacity: 15 junk tokens routing to random
-  experts could evict the real token's expert slots at decode only.
+**Layer-0 discriminator result (00:55): BIT-EXACT.** Decode q/kv at layer
+0 match prefill's with max diff 0.0 at every step tested. The decode
+batch, embedding, hyper-connection streams and all per-token ops are
+deterministic across batch shapes — batch contamination refuted, and
+per-token linears proven bit-stable between 16- and 32-padded batches.
+(Also refuted statically: fp8 activation-quant scale contamination — the
+GMM computes scales per token row, gmm_v2.py:533.)
+
+Therefore the layer-2 drift is created ENTIRELY by layers 0-1's ATTENTION
+READS. The leading explanation is the designed asymmetry: prefill attends
+in-batch bf16 K/V, decode attends fp8-quantized cache rows of the same
+tokens. Both stacks share that design, so the open question becomes
+quantitative: is our stored-row error the normal fp8 amount (~6%/element
+worst case — benign, and the growth to a 12-logit flip must then come from
+loop amplification), or is our WRITE path lossier than fp8 allows (a real
+defect)?
+
+**In flight: `combined_L2v2`** — the page-window bug fixed (pages indexed
+by block tables), one run carrying: write-path fidelity (stored row vs the
+same call's bf16 kv), decode-written vs prefill-written SWA rows for the
+same positions, state rows, compressed rows.
 
 Also checked and refuted statically (do not re-chase):
 `pack_state_cache`/`unpack_state_cache` round-trip lossiness — both are
