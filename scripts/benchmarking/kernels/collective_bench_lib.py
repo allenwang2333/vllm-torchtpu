@@ -102,12 +102,13 @@ def device_time(fn, inputs, *, reps, warmup, save_dir=None):
             shutil.rmtree(trace_dir, ignore_errors=True)
 
 
-def run(*, make_inputs, implementations, default_n):
+def run(*, make_inputs, implementations, default_n, mesh_fn=None):
     """Sweep M for one collective and print a per-M table.
 
     make_inputs(mesh, m, k, n, dtype) -> operands; implementations maps
     name -> builder(mesh, inputs) -> callable(*inputs), first entry the
-    reference; default_n is the --n default.
+    reference; default_n is the --n default. mesh_fn overrides the device
+    order for order-sensitive collectives; it is called after device init.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--m",
@@ -132,20 +133,23 @@ def run(*, make_inputs, implementations, default_n):
     tp = jax.device_count()
     if args.n % tp != 0:
         parser.error(f"--n ({args.n}) must be divisible by {tp} devices")
-    mesh = build_mesh()
+    mesh = (mesh_fn or build_mesh)()
     dtype = jnp.dtype(args.dtype)
     names = list(implementations)
     ref = names[0]
+    # Every process runs the sweep (the collectives need them all); only the
+    # coordinator prints, so a multi-host launch yields one table.
+    emit = print if jax.process_index() == 0 else lambda *a, **k: None
 
-    print(f"devices={tp} ({jax.devices()[0].device_kind}), k={args.k}, "
-          f"n={args.n} (n/tp={args.n // tp}), dtype={dtype.name}")
+    emit(f"devices={tp} ({jax.devices()[0].device_kind}), k={args.k}, "
+         f"n={args.n} (n/tp={args.n // tp}), dtype={dtype.name}")
     cols = (["M", "TFLOP/s/c"] + [f"{n} us" for n in names] +
             [f"{n} x" for n in names[1:]])
-    print(" | ".join(f"{c:>9}" for c in cols))
+    emit(" | ".join(f"{c:>9}" for c in cols))
 
     for m in [int(v) for v in args.m.split(",")]:
         if m % tp != 0:
-            print(f"{m:>9} | (skip: not divisible by {tp} devices)")
+            emit(f"{m:>9} | (skip: not divisible by {tp} devices)")
             continue
         inputs = make_inputs(mesh, m, args.k, args.n, dtype)
         times, errs = {}, {}
@@ -178,7 +182,7 @@ def run(*, make_inputs, implementations, default_n):
         line = " | ".join(cells)
         if errs:
             line += "  " + "; ".join(f"{n}: {errs[n]}" for n in errs)
-        print(line)
+        emit(line)
 
     if args.profile_dir:
-        print(f"xprof traces kept under {args.profile_dir}")
+        emit(f"xprof traces kept under {args.profile_dir}")
