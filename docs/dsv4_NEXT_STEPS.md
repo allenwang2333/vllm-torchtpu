@@ -106,6 +106,25 @@ arithmetic fits (0 decode-written rows at step 0 -> clean; ~3 per CSA layer
 by step 13 -> blown). Precedent: bug #4 (07-31) was a malformed compressed
 row first read at decode step 1. Runner-up: decode-written SWA rows.
 
+### CONVICTED (prefill control, 2026-08-12 ~00:10): the compressor's decode path
+
+`compare_ctl_slots.py decwrite_L2.log decwrite_prefill_ctl.log`:
+
+- Slots 0-3 (prefill-written in BOTH runs): **byte-identical across runs,
+  including excerpts** — the instrument has zero noise for identical paths.
+- Slots 4-6 (decode-written vs prefill-written, same tokens): **all
+  differ.** Same record structure, ~half the excerpt bytes shifted,
+  `nope_absmax` up to 18% apart (416 vs 352). Not last-bit noise; not a
+  wrong-slot/wrong-group error either (bytes would be uncorrelated) —
+  the decode path produces different VALUES for the same token group.
+
+Remaining caveat before naming the code line: decode assembles groups from
+the state cache while prefill compresses in-batch, in both stacks, so some
+inherent difference may be tolerated by the reference. The combined
+page-dump run (running now; `analyze_pagedumps.py`) bounds the layer-2
+input drift (q/kv) at the step each slot was written: tiny q/kv drift +
+18% row difference = the state→compress path manufactures the error.
+
 **Checked and refuted before testing (do not re-chase): vLLM sliding-window
 block freeing.** The state cache is the only group whose window is small
 enough (`W = coff*compress_ratio` = 8 for CSA, blocks of 16 positions) for
