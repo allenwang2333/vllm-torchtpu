@@ -26,9 +26,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
-                                                   gmm_v2, interleave_lane,
-                                                   situ_and_mul)
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    GmmConfigs,
+    InputConfigs,
+    MetadataRef,
+    TileSizes,
+    apply_act_fn,
+    fill_metadata,
+    gmm_v2,
+    interleave_lane,
+    situ_and_mul,
+)
 
 _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"])
@@ -470,3 +479,92 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_gmm_v2_fill_metadata_static_tiles():
+    dims = Dimensions(
+        size_m=128,
+        size_k=1024,
+        size_n=2048,
+        size_group=4,
+        size_lhs_group=4,
+        size_lhs_sublane=128,
+    )
+    tiles = TileSizes(tile_m=128, tile_k=128, tile_n=128, bucket_base=128)
+    lhs_cfgs = InputConfigs(dtype=jnp.bfloat16)
+    rhs_cfgs = InputConfigs(dtype=jnp.bfloat16)
+
+    # Dynamic config: 1 tile needed for 10 tokens
+    cfgs_dyn = GmmConfigs(
+        tiles=tiles,
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        out_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        zero_init=False,
+        fuse_act=None,
+        static_gm_tiles=None,
+    )
+    max_gm = 8
+    meta_dyn = MetadataRef(
+        gm_id_to_group_id=np.zeros(max_gm, dtype=np.int32),
+        gm_id_to_m_offset=np.zeros(max_gm + 1, dtype=np.int32),
+    )
+    group_sizes = jnp.array([10, 0, 0, 0], dtype=jnp.int32)
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    num_gm_dyn = fill_metadata(group_sizes, group_offset, meta_dyn, cfgs=cfgs_dyn)
+    assert int(num_gm_dyn) == 1
+    assert meta_dyn.gm_id_to_m_offset[0] == 0
+    assert meta_dyn.gm_id_to_m_offset[1] == 10
+
+    # Static config: fixed to 4 tiles
+    cfgs_stat = GmmConfigs(
+        tiles=tiles,
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        out_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        zero_init=False,
+        fuse_act=None,
+        static_gm_tiles=4,
+    )
+    meta_stat = MetadataRef(
+        gm_id_to_group_id=np.zeros(max_gm, dtype=np.int32),
+        gm_id_to_m_offset=np.zeros(max_gm + 1, dtype=np.int32),
+    )
+    num_gm_stat = fill_metadata(group_sizes, group_offset, meta_stat, cfgs=cfgs_stat)
+    assert int(num_gm_stat) == 4
+    assert meta_stat.gm_id_to_m_offset[0] == 0
+    assert meta_stat.gm_id_to_m_offset[1] == 10
+    # Dummy padded tiles must have empty range [10, 10]
+    assert meta_stat.gm_id_to_m_offset[2] == 10
+    assert meta_stat.gm_id_to_m_offset[3] == 10
+    assert meta_stat.gm_id_to_m_offset[4] == 10
+
+
+def test_gmm_v2_static_tiled_output_correctness(monkeypatch):
+    _require_tpu()
+    key = jax.random.key(42)
+    batch_size = 32
+    in_size = 256
+    out_size = 256
+    num_groups = 4
+
+    k1, k2 = jax.random.split(key)
+    lhs = jax.random.normal(k1, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(k2, (num_groups, in_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([8, 8, 8, 8], dtype=jnp.int32)
+
+    # Baseline dynamic run
+    monkeypatch.delenv("MOE_STATIC_TILED_GMM", raising=False)
+    monkeypatch.delenv("MOE_STATIC_GMM_TILES", raising=False)
+    baseline_out = gmm_v2(lhs, rhs, group_sizes)
+
+    # Static tiled run with fixed 4 tiles
+    monkeypatch.setenv("MOE_STATIC_GMM_TILES", "4")
+    static_out = gmm_v2(lhs, rhs, group_sizes)
+
+    _assert_allclose(static_out, baseline_out, atol=1e-3, rtol=1e-3)
