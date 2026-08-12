@@ -215,8 +215,27 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     return hash_obj.hexdigest()[:10]
 
 
-# TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
-# once our local vLLM checkout exposes that helper.
+def _graph_signature(graph: fx.GraphModule,
+                     example_inputs: list[Any] | None = None) -> str:
+    """Signature over the graph's op sequence and each input's shape/dtype.
+
+    Structure alone cannot tell apart layer variants that differ only in
+    closed-over buffer shapes; a shape-blind cache hit fails at runtime
+    as e0102 RuntimeProgramInputMismatch.
+    """
+    nodes_sig = [(n.op, str(n.target), len(n.args), len(n.users))
+                 for n in graph.graph.nodes]
+    shapes_sig = []
+    if example_inputs is not None:
+        for arg in example_inputs:
+            if isinstance(arg, torch.Tensor):
+                shapes_sig.append((tuple(arg.shape), str(arg.dtype)))
+            else:
+                shapes_sig.append(repr(arg))
+    return hashlib.sha256(repr(
+        (nodes_sig, shapes_sig)).encode("utf-8")).hexdigest()[:16]
+
+
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
@@ -289,6 +308,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
+        graph_sig = _graph_signature(graph, example_inputs)
+
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
@@ -334,7 +355,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 and _tpu_backend._compiled_executables):
             try:
                 inner_exe = _tpu_backend._compiled_executables[-1]
-                save_path = os.path.join(self.cache_dir, key)
+                save_path = os.path.join(self.cache_dir, f"{key}_{graph_sig}")
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
                     handle_data = TpuCompilationHandle(
@@ -349,10 +370,12 @@ class TpuCompilerAdaptor(CompilerInterface):
                     )
                 with open(save_path, "wb") as f:
                     pickle.dump(handle_data, f)
-                handle = (key, save_path, was_wrapped)
+                handle = (key, save_path, was_wrapped, graph_sig)
                 logger.info(
-                    "[TpuCompilerAdaptor] Saved compiled executable metadata to %s",
+                    "[TpuCompilerAdaptor] Saved compiled executable metadata "
+                    "to %s (graph_sig=%s)",
                     save_path,
+                    graph_sig,
                 )
             except Exception as e:
                 logger.warning(
@@ -367,71 +390,122 @@ class TpuCompilerAdaptor(CompilerInterface):
         example_inputs: list[Any],
         graph_index: int,
         compile_range: Range,
-    ) -> Callable[..., Any]:
+    ) -> Callable[..., Any] | None:
         """Load a compiled executable from disk.
 
         Unpickles the _TorchTpuCompiledExecutable (or uses Tier-3 C++ cache),
         then wraps it with aot_autograd (using the same graph) to reconstruct
         the full callable.
         """
-        assert isinstance(handle, tuple) and len(handle) == 3
-        key, path, was_wrapped = handle
+        if not isinstance(handle, tuple):
+            return None
+
+        if len(handle) == 4:
+            key, path, was_wrapped, expected_sig = handle
+            current_sig = _graph_signature(graph, example_inputs)
+            if current_sig != expected_sig:
+                logger.info(
+                    "[TpuCompilerAdaptor] Graph signature mismatch for %s "
+                    "(cached=%s, current=%s); recompiling graph",
+                    key,
+                    expected_sig,
+                    current_sig,
+                )
+                return None
+        else:
+            # Only 4-tuple handles carry a graph signature to check against.
+            return None
+
+        if not os.path.exists(path):
+            return None
+
         logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
                     path)
 
-        with open(path, "rb") as f:
-            loaded_data = pickle.load(f)
+        try:
+            with open(path, "rb") as f:
+                loaded_data = pickle.load(f)
 
-        # Re-create the aot_autograd wrapper around the cached executable.
-        from torch._dynamo.backends.common import aot_autograd
+            # Re-create the aot_autograd wrapper around the cached executable.
+            from torch._dynamo.backends.common import aot_autograd
 
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
 
-        tier3_active = False
-        inner_exe = None
-        if isinstance(loaded_data, TpuCompilationHandle):
-            tier3_active = loaded_data.tier3_cache_active
-            inner_exe = loaded_data.executable
-        elif isinstance(loaded_data, dict):
-            tier3_active = loaded_data.get("tier3_cache_active", False)
-            inner_exe = loaded_data.get("executable")
-        else:
-            inner_exe = loaded_data
+            tier3_active = False
+            inner_exe = None
+            if isinstance(loaded_data, TpuCompilationHandle):
+                tier3_active = loaded_data.tier3_cache_active
+                inner_exe = loaded_data.executable
+            elif isinstance(loaded_data, dict):
+                tier3_active = loaded_data.get("tier3_cache_active", False)
+                inner_exe = loaded_data.get("executable")
+            else:
+                inner_exe = loaded_data
 
-        if tier3_active:
-            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
-            def _cached_compiler(g, example_inputs):
-                clean_inputs = [
-                    int(x) if isinstance(x, torch.SymInt) else x
-                    for x in example_inputs
-                ]
-                return _tpu_backend(g, clean_inputs)
-        else:
+            if tier3_active:
+                # Tier-3 C++ cache is active: _tpu_backend hits the native
+                # C++ Tier-3 binary cache (<1ms).
+                def _cached_compiler(g, example_inputs):
+                    clean_inputs = [
+                        int(x) if isinstance(x, torch.SymInt) else x
+                        for x in example_inputs
+                    ]
+                    return _tpu_backend(g, clean_inputs)
+            else:
 
-            def _cached_compiler(*_args, **_kwargs):
-                return inner_exe
+                def _cached_compiler(*_args, **_kwargs):
+                    return inner_exe
 
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+            with torch._guards.tracing(None):
+                compiled_fn = aot_autograd(
+                    fw_compiler=_cached_compiler,
+                    keep_inference_input_mutations=False,
+                )(graph, example_inputs)
 
-        if was_wrapped:
-            inner_fn = compiled_fn
+            if was_wrapped:
+                inner_fn = compiled_fn
 
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
+                def unwrap_fn(*args, **kwargs):
+                    result = inner_fn(*args, **kwargs)
+                    if isinstance(result, (tuple, list)) and len(result) == 1:
+                        return result[0]
+                    return result
 
-            compiled_fn = unwrap_fn
+                compiled_fn = unwrap_fn
 
-        return compiled_fn
+            return compiled_fn
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Failed to load compiled executable from %s: %s; falling back to compile",
+                path, e)
+            return None
+
+
+def patch_vllm_compiler_manager_load() -> None:
+    """Drop failed cache loads so CompilerManager falls back to compiling.
+
+    `load_compiled_graph` returns None on a signature mismatch or unpickle
+    failure; upstream caches that None in `loaded_artifacts` and would serve
+    it. Called from `apply_tpu_patches`.
+    """
+    import vllm.compilation.backends as _backends
+
+    _orig_cm_load = _backends.CompilerManager.load
+    if getattr(_orig_cm_load, "_tpu_cm_load_patch", False):
+        return
+
+    def _patched_cm_load(self, graph, example_inputs, graph_index,
+                         compile_range):
+        res = _orig_cm_load(self, graph, example_inputs, graph_index,
+                            compile_range)
+        if res is None:
+            for k in list(self.loaded_artifacts.keys()):
+                if self.loaded_artifacts[k] is None:
+                    del self.loaded_artifacts[k]
+        return res
+
+    _patched_cm_load._tpu_cm_load_patch = True
+    _backends.CompilerManager.load = _patched_cm_load
+    logger.info(
+        "Applied TPU patch: CompilerManager.load None-artifact cleanup.")
