@@ -392,3 +392,11 @@ exactly, so that line is not it.
   since fixed). Rerunning it gives the systematicity answer: whether the other
   nine prompts diverge at steps where the reference was confident, like the XLA
   prompt did at step 13.
+
+### Metadata layer fully exonerated (00:58)
+
+From the v1 `combined_L2` dumps: all 149 decode steps have exactly correct
+SWA-side metadata (`swa_seq_len == qpos+1`, stable block tables, second SWA
+block appearing at position 128) and main-side metadata. Every input to the
+proven-equivalent kernels is now verified except row content, which the v2
+run measures.
