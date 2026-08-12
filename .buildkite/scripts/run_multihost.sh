@@ -142,7 +142,15 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh" || true
 # Start Ray head container locally (run_cluster.sh blocks; background it)
 # ---------------------------------------------------------------------------
 # Env for the benchmark flow inside the container mirrors run_in_docker.sh.
+# Tier-3 compilation cache on GCS: persists compiled TPU executables
+# across runs so a warm server start skips the ~25-minute XLA compile.
+# Tier-2 (in-memory) is required by tier-3 (env_override.py mirrors this
+# wiring for VLLM_XLA_CACHE_PATH).
 CONTAINER_ENV=(
+  -e TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=gs://mhuua-tt-dev/glm-tier3-cache
+  -e TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=gs://mhuua-tt-dev/glm-tier3-cache
+  -e TORCH_TPU_TIER2_COMPILATION_CACHE=tpu_tier2_cache
+  -e TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=tpu_tier2_cache
   -e HF_TOKEN="${HF_TOKEN:-}"
   -e TPU_MULTIHOST_BACKEND=ray
   -e JAX_PLATFORMS=""
@@ -220,7 +228,7 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   (
     for _attempt in 1 2 3; do
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=gs://mhuua-tt-dev/glm-tier3-cache -e TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=gs://mhuua-tt-dev/glm-tier3-cache -e TORCH_TPU_TIER2_COMPILATION_CACHE=tpu_tier2_cache -e TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=tpu_tier2_cache -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
         && break
       echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
       sleep 15
