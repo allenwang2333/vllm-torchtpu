@@ -444,3 +444,28 @@ reuse across steps would also explain error growing with step). The v3 run
   boundary (buffer donation/aliasing in pallas.jax_op between steps).
 - kv_score wrong at decode => trace attn_gemm's kv_score at decode
   (upstream of the op).
+
+## v3 (01:40): kv_score is already wrong AT the op boundary — compressor fully exonerated
+
+Synced kv_score dumps (`combined_L2v3`): decode row 0 differs from the
+control's row for the same position by exactly the state-row error (pos17
+mean 0.0775 — the state write is a faithful copy of its input). Cosine
+drops to 0.56 at pos 26. So the corruption is UPSTREAM, in attn_gemm's
+`hidden_states @ fused_wkv_wgate.weight.T` at decode.
+
+Error anatomy (v3 data):
+- Direction of the error ≈ control rows 1 and 15 (cos 0.81-0.91), the SAME
+  contaminating directions at different steps — the decode row 0 is the
+  correct vector plus an admixture of other batch rows' content.
+- The decode batch's padding rows all carry near-identical BOS-like
+  vectors (cos 0.9996 with control row 0).
+- Not stale step-to-step reuse (pos26 vs pos25 cos 0.15).
+
+A per-row matmul cannot mix rows, and fused_wqa_wkv of the SAME tensor is
+byte-perfect. **v4 (in flight) splits the impossible**: dumps kv_score row
+0 computed batched vs single-row in the same call, plus the synced hidden
+row. Batched wrong + single-row right => the plain `@` lowers incorrectly
+at the decode batch shape (torch-tpu matmul/stride bug) — fix by replacing
+the raw `@` with the proper linear path. Both wrong => hidden row 0 itself
+is polluted and the hunt moves to the layer/MHC wrapper (and must explain
+how fused_wqa_wkv stays byte-perfect).
