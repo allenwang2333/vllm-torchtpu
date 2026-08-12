@@ -1680,7 +1680,11 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # zeros, and layer 0's attention output diverges ~50% from prefill
         # with bit-equal real inputs. If zeroing the pads fixes generation,
         # the kernel is padding-sensitive and stale pads are the root cause.
-        if os.getenv("DSV4_ZERO_PAD") == "1" and swa_query_start_loc is not None \
+        # Default ON since 2026-08-12: proven root cause (stale padding rows
+        # contaminate the padding-sensitive kernel; see
+        # docs/dsv4_decode_race_postmortem.md). DSV4_ZERO_PAD=0 opts out for
+        # A/B only.
+        if os.getenv("DSV4_ZERO_PAD", "1") == "1" and swa_query_start_loc is not None \
                 and swa_request_distribution is not None:
             _nvalid = swa_query_start_loc[swa_request_distribution[2]]
             _rowmask = (torch.arange(q.shape[0], device=q.device) < _nvalid)
