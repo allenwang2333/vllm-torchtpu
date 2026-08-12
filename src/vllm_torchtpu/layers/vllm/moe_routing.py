@@ -206,7 +206,12 @@ def _apply_capacity_aware_routing(
     global_num_experts: int,
     capacity_factor: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply capacity-aware balanced routing across EP ranks."""
+    """Apply vectorized capacity-aware balanced routing across EP ranks without host sync.
+
+    All operations are vectorized PyTorch tensor ops over N tokens for a fixed
+    compile-time loop of `topk` steps, eliminating Python scalar conditionals and
+    device-to-host synchronization.
+    """
     num_tokens = scores.shape[0]
     if num_tokens <= 0 or ep_size <= 1:
         _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
@@ -215,50 +220,70 @@ def _apply_capacity_aware_routing(
     base = global_num_experts // ep_size
     remainder = global_num_experts % ep_size
 
-    # Compute per-rank capacity limit
+    # Compute per-rank capacity limit from static/batch dimensions
     ideal_capacity = (num_tokens * topk + ep_size - 1) // ep_size
     max_capacity = max(topk, int(ideal_capacity * capacity_factor) + 1)
 
-    # Fetch extra candidate experts per token
-    num_candidates = min(global_num_experts, topk * 2)
-    _, cand_ids = torch.topk(scores_for_choice, k=num_candidates, dim=-1)
+    # Rank lookup tensor: [E] mapping global expert_id -> ep_rank
+    rank_lookup = torch.empty(
+        global_num_experts, dtype=torch.long, device=scores.device)
+    for r in range(ep_size):
+        start = r * base + min(r, remainder)
+        count = base + (1 if r < remainder else 0)
+        rank_lookup[start:start + count] = r
 
-    # Map global expert IDs to their owning EP rank under linear placement
-    if remainder == 0:
-        cand_ranks = cand_ids // base
-    else:
-        rank_lookup = torch.empty(
-            global_num_experts, dtype=torch.long, device=scores.device)
-        for r in range(ep_size):
-            start = r * base + min(r, remainder)
-            count = base + (1 if r < remainder else 0)
-            rank_lookup[start:start + count] = r
-        cand_ranks = rank_lookup[cand_ids]
+    # Rank-to-expert mask template: [E, ep_size]
+    rank_expert_mask = torch.nn.functional.one_hot(
+        rank_lookup, num_classes=ep_size).to(scores.device)
 
-    selected_ids = torch.empty((num_tokens, topk),
-                               dtype=torch.int32,
-                               device=scores.device)
-    rank_counts = torch.zeros(ep_size,
-                              dtype=torch.int32,
-                              device=scores.device)
+    remaining_scores = scores_for_choice.clone()
+    selected_ids_list = []
+    total_rank_counts = torch.zeros(
+        ep_size, dtype=torch.long, device=scores.device)
 
-    for i in range(num_tokens):
-        chosen = 0
-        for j in range(num_candidates):
-            cid = cand_ids[i, j]
-            crank = cand_ranks[i, j]
-            if rank_counts[crank] < max_capacity or (num_candidates - j
-                                                     <= topk - chosen):
-                selected_ids[i, chosen] = cid.to(torch.int32)
-                rank_counts[crank] += 1
-                chosen += 1
-                if chosen == topk:
-                    break
-        while chosen < topk:
-            cid = cand_ids[i, chosen]
-            selected_ids[i, chosen] = cid.to(torch.int32)
-            chosen += 1
+    # Fixed unrolled loop over topk selection steps
+    for _ in range(topk):
+        # 1. Highest scoring expert per token: [N]
+        _, step_ids = torch.max(remaining_scores, dim=-1)
+        step_ranks = rank_lookup[step_ids]
 
+        # 2. Cumulative count of tokens choosing each rank in this step: [N, ep_size]
+        one_hot = torch.nn.functional.one_hot(step_ranks, num_classes=ep_size)
+        cum_counts = torch.cumsum(one_hot, dim=0)
+
+        # 3. Running total assigned tokens to this rank up to each token
+        step_total_counts = total_rank_counts.unsqueeze(0) + cum_counts
+        token_rank_cum = step_total_counts.gather(
+            1, step_ranks.unsqueeze(1)).squeeze(1)
+
+        # 4. Overflow mask (pure device tensor: [N])
+        is_overflow = token_rank_cum > max_capacity
+
+        # 5. Mask the chosen expert so it cannot be chosen in subsequent steps
+        remaining_scores.scatter_(1, step_ids.unsqueeze(1), -1e9)
+
+        # 6. For overflow tokens, mask out ALL experts belonging to the overflow rank
+        # Unconditional tensor contraction with zero Python branches:
+        token_overflow_ranks = (
+            torch.nn.functional.one_hot(step_ranks, num_classes=ep_size).float()
+            * is_overflow.unsqueeze(1).float())
+        expert_overflow_mask = (torch.matmul(
+            token_overflow_ranks, rank_expert_mask.t().float()) > 0)
+        remaining_scores.masked_fill_(expert_overflow_mask, -1e9)
+
+        # Re-pick highest scoring candidate from non-overflow ranks
+        _, new_step_ids = torch.max(remaining_scores, dim=-1)
+        step_ids = torch.where(is_overflow, new_step_ids, step_ids)
+        step_ranks = rank_lookup[step_ids]
+        remaining_scores.scatter_(1, step_ids.unsqueeze(1), -1e9)
+
+        # 7. Accumulate finalized rank counts across all N tokens
+        final_one_hot = torch.nn.functional.one_hot(
+            step_ranks, num_classes=ep_size)
+        total_rank_counts = total_rank_counts + final_one_hot.sum(dim=0)
+        selected_ids_list.append(step_ids)
+
+    selected_ids = torch.stack(selected_ids_list, dim=1).to(torch.int32)
     topk_weights = scores.gather(-1, selected_ids.long())
     return topk_weights, selected_ids
 
