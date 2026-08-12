@@ -710,9 +710,18 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # the same token (pollution enters later), or different (the
         # "forward path differs" finding was right and the SWA byte-identity
         # is the anomaly)?
-        if (os.getenv("DSV4_DUMP_HIDDEN_FULL") == "1"
-                and not _is_tracing() and _DEBUG_LAYER_INFIX() in getattr(
-                    self, "custom_prefix", "")):
+        _hf_layers = [
+            x for x in os.getenv("DSV4_DUMP_HIDDEN_LAYERS", "").split(",") if x
+        ]
+        _hf_this = None
+        if _hf_layers and not _is_tracing():
+            for _l in _hf_layers:
+                if f"layers.{_l}." in getattr(self, "custom_prefix", ""):
+                    _hf_this = _l
+                    break
+        if ((os.getenv("DSV4_DUMP_HIDDEN_FULL") == "1" and not _is_tracing()
+             and _DEBUG_LAYER_INFIX() in getattr(self, "custom_prefix", ""))
+                or _hf_this is not None):
             from vllm.distributed.parallel_state import \
                 get_tensor_model_parallel_rank
             if get_tensor_model_parallel_rank() == 0:
@@ -728,7 +737,7 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                     "page_dumps", os.getenv("DSV4_DUMP_LABEL", "run"))
                 os.makedirs(_root, exist_ok=True)
                 np.savez_compressed(os.path.join(
-                    _root, f"hidden_step{_step:03d}.npz"),
+                    _root, f"hidden_L{_hf_this or '?'}_step{_step:03d}.npz"),
                                     hidden=_dump_to_numpy(hidden_states))
 
         _kvscore_first = os.getenv("DSV4_KVSCORE_FIRST") == "1"
