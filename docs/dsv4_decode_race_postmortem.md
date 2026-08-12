@@ -347,3 +347,24 @@ data, landing now) for the healthy per-layer baseline on this prompt;
 (2) kernel micro-repro to locate the mixer; (3) fix kernel or extend
 masking to make pad contribution EXACTLY zero; (4) pool sweep; (5) staged
 phase-3 MMLU chain.
+
+## Kernel exonerated in isolation (08:15) — the defect sits in the jax_op bridge layer
+
+`scratchpad/kernel_micro_repro.py`: the SWA kernel called DIRECTLY with the
+exact dumped tensors of the break step (qpos 23) is padding-CLEAN —
+randomizing or zeroing junk rows changes row 0's output by zero bits and
+zero cache bytes. Yet masking those rows in the model provably changes
+generation. Therefore the padding influence enters between the model's
+tensors and the kernel: the pallas.jax_op bridge — which in this harness is
+HOT-PATCHED at startup (src/vllm_torchtpu/patches/pallas_patched.py swapped
+over torch_tpu._internal.pallas in examples/run_dsv4_inference.py). It
+marshals every kernel call, has no test coverage, and the reference does
+not use it (torchax + jax.shard_map directly).
+
+Next measurement: reproduce the pad sensitivity one level up — call the
+model's actual attn_op (jax_op-wrapped) with the same dumped inputs and
+toggle pad contents. Sensitivity there = the bridge is the defect site;
+then diff pallas_patched.py against stock and audit its buffer marshaling
+for the batch dimension. This also plausibly re-explains defect #1's
+mechanism (the kernel itself was never padding-sensitive; the bridge is),
+unifying #1 and #2 as one bridge defect with two symptom sizes.
