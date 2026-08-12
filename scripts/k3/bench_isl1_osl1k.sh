@@ -2,15 +2,21 @@
 # Benchmark ISL=1 / OSL=1000 against an existing vLLM server using the
 # benchmark client bundled with the repository's upstream vLLM installation.
 #
-# Override any parameter below through the environment. Extra command-line
-# arguments are forwarded to `vllm bench serve`.
+# Pass the server IP as the only command-line argument. Override benchmark
+# parameters through the environment.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 MODEL="${MODEL:-moonshotai/Kimi-K3}"
-BASE_URL="${BASE_URL:-http://localhost:8000}"
+if (( $# != 1 )); then
+  echo "Usage: $0 SERVER_IP" >&2
+  exit 2
+fi
+SERVER_IP="$1"
+SERVER_PORT="${SERVER_PORT:-8000}"
+BASE_URL="http://${SERVER_IP}:${SERVER_PORT}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/results/perf_isl1_osl1k}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-4}"
@@ -18,9 +24,8 @@ NUM_WARMUPS="${NUM_WARMUPS:-$((2 * MAX_CONCURRENCY))}"
 SEED="${SEED:-42}"
 VLLM="${VLLM:-$REPO_ROOT/.venv/bin/vllm}"
 
-# Slurm injects HF_HUB_CACHE=/mnt/scratch/hf-hub on K3 nodes, while the
-# repository cache used by the server and benchmark tokenizer is its hub/
-# child. Kimi-specific overrides keep the client standalone and deterministic.
+# Use the K3 model cache by default. Kimi-specific environment overrides keep
+# the client standalone and deterministic.
 export HF_HOME="${KIMI_K3_HF_HOME:-/mnt/scratch/hf-hub}"
 export HF_HUB_CACHE="${KIMI_K3_HF_HUB_CACHE:-${HF_HOME}/hub}"
 export HF_MODULES_CACHE="${KIMI_K3_HF_MODULES_CACHE:-${HF_HOME}/modules}"
@@ -57,5 +62,4 @@ echo "Result: ${OUTPUT_DIR}/${result_filename}"
   --save-result \
   --result-dir "$OUTPUT_DIR" \
   --result-filename "$result_filename" \
-  --seed "$SEED" \
-  "$@"
+  --seed "$SEED"

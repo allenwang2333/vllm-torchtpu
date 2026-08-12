@@ -9,7 +9,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 MODEL="${MODEL:-moonshotai/Kimi-K3}"
-BASE_URL="${BASE_URL:-http://localhost:8000}"
+if (( $# != 1 )); then
+  echo "Usage: $0 SERVER_IP" >&2
+  exit 2
+fi
+SERVER_IP="$1"
+SERVER_PORT="${SERVER_PORT:-8000}"
+BASE_URL="http://${SERVER_IP}:${SERVER_PORT}"
 COMPLETIONS_URL="${BASE_URL%/}/v1/completions"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/results/gsm8k}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
