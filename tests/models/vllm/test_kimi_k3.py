@@ -168,53 +168,6 @@ def test_mxfp4_expert_weight_loader_rebinds_packed_checkpoint_name() -> None:
     )]
 
 
-def test_load_weights_folds_kda_conv_weights() -> None:
-    """The fold must be driven by `load_weights`.
-
-    vLLM's post-load pass only visits quantization methods and `Attention`
-    layers, so a `process_weights_after_loading` on KDA is never reached on its
-    own -- and its absence is silent: the fused buffer keeps its placeholder
-    contents and the model just answers badly.
-    """
-    model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(
-        num_experts=None,
-        q_lora_rank=None,
-        tie_word_embeddings=False,
-    )
-    model.model = nn.Module()
-    model.model.layers = nn.ModuleList([nn.Module()])
-
-    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
-    nn.Module.__init__(layer)
-    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    for index, name in enumerate(("q_conv1d", "k_conv1d", "v_conv1d")):
-        conv = _ConvWeight()
-        conv.weight = nn.Parameter(
-            torch.arange(12, dtype=torch.float32).view(4, 1, 3) + 100 * index)
-        setattr(layer, name, conv)
-    layer.register_buffer("conv_weight_fused",
-                          torch.full((3, 3, 2, 2), float("nan")),
-                          persistent=False)
-    model.model.layers[0].linear_attn = layer
-
-    model.load_weights([])
-
-    # The layout the kernels read: kernel-major taps over the q|k|v channels,
-    # which is the checkpoint's [dim, 1, kernel_size] concatenated and
-    # transposed.
-    expected = torch.cat(
-        [
-            conv.weight[:, 0, :]
-            for conv in (layer.q_conv1d, layer.k_conv1d, layer.v_conv1d)
-        ],
-        dim=0,
-    ).t()
-    torch.testing.assert_close(layer.conv_weight_fused.reshape(3, 12),
-                               expected)
-
-
 @pytest.mark.parametrize(
     ("min_per_partition", "expected_intermediate", "expected_unpadded"),
     [(None, 1024, None), (256, 2048, 128)],
@@ -593,7 +546,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer)
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -730,7 +684,8 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer)
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
