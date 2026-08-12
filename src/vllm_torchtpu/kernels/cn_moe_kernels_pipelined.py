@@ -18,10 +18,14 @@ _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = float(jnp.finfo(_FP8).max)
 # 0 falls back to bf16xbf16: slower, but ~10x more accurate.
 _USE_FP8_LHS = os.getenv("MOE_CN_FP8_LHS", "1") == "1"
+# fp8 lhs quant adds VPU pressure; bf16 accumulate offsets it (gmm_v2 does
+# the same). Accuracy of this alone: MOE_CN_BF16_ACC=0.
+_ACC = (jnp.bfloat16 if _USE_FP8_LHS
+        and os.getenv("MOE_CN_BF16_ACC", "1") == "1" else jnp.float32)
 
 
 def _blockwise_matmul(lhs, w, scales, n_blocks, block, out_cols):
-    acc = jnp.zeros((1, out_cols), dtype=jnp.float32)
+    acc = jnp.zeros((1, out_cols), dtype=_ACC)
     for b in range(n_blocks):
         s = b * block
         cur = lhs[:, s:s + block]
@@ -32,12 +36,13 @@ def _blockwise_matmul(lhs, w, scales, n_blocks, block, out_cols):
                      jnp.where(lsc == 0, 0.0, 1.0 / lsc)).astype(_FP8)
             blk = jnp.matmul(cur_q,
                              w[s:s + block, :],
-                             preferred_element_type=jnp.float32) * lsc
+                             preferred_element_type=jnp.float32).astype(_ACC)
+            blk = blk * lsc.astype(_ACC)
         else:
             blk = jnp.matmul(cur,
                              w[s:s + block, :],
                              preferred_element_type=jnp.float32)
-        acc = acc + blk * scales[b].reshape(1, out_cols)
+        acc = acc + blk * scales[b].reshape(1, out_cols).astype(_ACC)
     return acc
 
 
@@ -138,15 +143,24 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
+<<<<<<< Updated upstream
     C_PAD = lhs_ref.shape[0]
+=======
+    C_PAD = full_lhs_2d_ref.shape[0]
+
+    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
+    full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
+                                          full_lhs_2d_ref, sem_ref.at[0])
+    full_lhs_copy.start()
+    acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
+    full_lhs_copy.wait()
+>>>>>>> Stashed changes
 
     # ---- lhs is already in VMEM; reshape 2D -> 3D on chip ----
     for t in range(C_PAD):
         row = lhs_ref[pl.ds(t, 1), pl.ds(0, K)]
         lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
             row.reshape(1, 1, K)
-
-    acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
 
     def w1_index_map(slot):
         return (ids_ref[slot], 0, 0)

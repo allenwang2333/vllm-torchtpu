@@ -30,6 +30,20 @@ _CN_K_TILE = int(_os.getenv("MOE_CN_K_TILE", "4096"))
 _CN_I_TILE = int(_os.getenv("MOE_CN_I_TILE", "2048"))
 _CN_NBUF = max(2, int(_os.getenv("MOE_CN_NBUF", "4")))
 
+_FP8 = jnp.float8_e4m3fn
+_FP8_MAX = float(jnp.finfo(_FP8).max)
+# 0 falls back to bf16xbf16: slower, but ~10x more accurate.
+_USE_FP8_LHS = _os.getenv("MOE_CN_FP8_LHS", "1") == "1"
+
+
+def _matmul_f32(lhs, rhs):
+    if not _USE_FP8_LHS:
+        return jnp.matmul(lhs, rhs, preferred_element_type=jnp.float32)
+    l32 = lhs.astype(jnp.float32)
+    sc = jnp.max(jnp.abs(l32), axis=1, keepdims=True) / _FP8_MAX
+    lq = (l32 * jnp.where(sc == 0, 0.0, 1.0 / sc)).astype(_FP8)
+    return jnp.matmul(lq, rhs, preferred_element_type=jnp.float32) * sc
+
 # ── Semaphore layout ────────────────────────────────────────────────
 #   [0                            .. NBUF_W1)           w1 weight DMAs
 #   [NBUF_W1                     .. 2*NBUF_W1)         w1 scale  DMAs
@@ -256,12 +270,10 @@ def _expert_body(
             lhs_tile = lhs_scratch_ref[pl.ds(0, M_PAD),
                                        pl.ds(k * K_TILE, K_TILE)]
 
-            # MXU has no bf16xfp8 mode; the cast itself is exact.
-            w1_cast = w1_fp8.astype(DTYPE_LHS)
+            # MXU has no bf16xfp8 mode; one side has to move.
+            w1_rhs = w1_fp8 if _USE_FP8_LHS else w1_fp8.astype(DTYPE_LHS)
             if DEQUANT_W1_AFTER_:
-                block_acc = jnp.matmul(lhs_tile,
-                                       w1_cast,
-                                       preferred_element_type=jnp.float32)
+                block_acc = _matmul_f32(lhs_tile, w1_rhs)
                 s1_flat = s1.reshape(KB_TILE, 1, 2 * ID)
                 block_acc = block_acc * s1_flat.reshape(1, 2 * ID).astype(
                     jnp.float32)
@@ -269,10 +281,8 @@ def _expert_body(
             else:
                 for b in range(KB_TILE):
                     ks = b * QB_eff
-                    blk = jnp.matmul(
-                        lhs_tile[:, ks:ks + QB_eff],
-                        w1_cast[ks:ks + QB_eff, :],
-                        preferred_element_type=jnp.float32)
+                    blk = _matmul_f32(lhs_tile[:, ks:ks + QB_eff],
+                                      w1_rhs[ks:ks + QB_eff, :])
                     gate_up_acc = gate_up_acc + blk * s1[b].reshape(
                         1, 2 * ID).astype(jnp.float32)
 
@@ -299,11 +309,9 @@ def _expert_body(
                              tile_size=IB_TILE)
             inter_tile = intermediate[:, m * I_TILE:(m + 1) * I_TILE]
 
-            w2_cast = w2_fp8.astype(DTYPE_LHS)
+            w2_rhs = w2_fp8 if _USE_FP8_LHS else w2_fp8.astype(DTYPE_LHS)
             if DEQUANT_W2_AFTER_:
-                block_acc = jnp.matmul(inter_tile,
-                                       w2_cast,
-                                       preferred_element_type=jnp.float32)
+                block_acc = _matmul_f32(inter_tile, w2_rhs)
                 s2_flat = s2.reshape(IB_TILE, 1, H)
                 block_acc = block_acc * s2_flat.reshape(1, H).astype(
                     jnp.float32)
@@ -312,10 +320,8 @@ def _expert_body(
                 IB_eff_ = min(I_TILE, IB)
                 for b in range(IB_TILE):
                     is_ = b * IB_eff_
-                    blk = jnp.matmul(
-                        inter_tile[:, is_:is_ + IB_eff_],
-                        w2_cast[is_:is_ + IB_eff_, :],
-                        preferred_element_type=jnp.float32)
+                    blk = _matmul_f32(inter_tile[:, is_:is_ + IB_eff_],
+                                      w2_rhs[is_:is_ + IB_eff_, :])
                     down_acc = down_acc + blk * s2[b].reshape(
                         1, H).astype(jnp.float32)
 
