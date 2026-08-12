@@ -161,6 +161,18 @@ def _deepseek_v4_attention_jax(
     is_csa: bool,
     two_caches_same_buffer: bool,
 ) -> tuple[jax.Array, jax.Array]:
+    # Trace-time active-marker (runs once per trace, i.e. per kernel_key):
+    # records the exact static geometry baked into THIS compiled kernel.
+    # The 20260812 SWA-cache addressing hunt found the device executing
+    # logical_page_size=4 while every host-side probe read 128 -- this line
+    # is the ground truth for what the kernel was actually traced with.
+    logger.info(
+        "[ATTN_TRACE] swa_only=%s is_csa=%s logical_page_size=%s "
+        "sliding_window=%s two_caches_same_buffer=%s q=%s sw_cache=%s "
+        "main_cache=%s", swa_only, is_csa,
+        logical_page_size, sliding_window, two_caches_same_buffer,
+        getattr(q, "shape", None), getattr(sw_cache, "shape", None),
+        getattr(main_cache_kv, "shape", None))
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         t = q.shape[0]
         n_local_heads = q.shape[1]
@@ -551,8 +563,18 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         """
         op = self.__dict__.get("_attn_op_instance")
         if op is None:
-            op = self._build_attn_op()
-            object.__setattr__(self, "_attn_op_instance", op)
+            op, built_from_real_caches = self._build_attn_op()
+            # vLLM's memory-profiling pass (determine_available_memory ->
+            # profile_run) is ALSO a forward, and it runs before
+            # initialize_kv_cache: the caches are still numel==0
+            # placeholders then, so geometry derived from real tensor
+            # identity (two_caches_same_buffer) is wrong-by-construction.
+            # An op built in that phase must NOT be memoized, or the first
+            # real forward -- and every one after it -- inherits the
+            # placeholder-built kernel. Only pin the op once it was built
+            # against real caches.
+            if built_from_real_caches:
+                object.__setattr__(self, "_attn_op_instance", op)
         return op
 
     def _build_attn_op(self):
@@ -608,6 +630,38 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             and main_cache.numel() > 0 and swa_tensor.numel() > 0
             and main_cache.data_ptr() == swa_tensor.data_ptr())
 
+        # Are the caches real yet, or still the pre-initialize_kv_cache
+        # numel==0 placeholders (profile_run phase)? Placeholder-built ops
+        # are throwaways: see the `attn_op` property.
+        built_from_real_caches = bool(swa_tensor is not None
+                                      and swa_tensor.numel() > 0)
+
+        # Cross-check the layer attribute against the same formula
+        # get_kv_cache_spec uses on the final config. These must agree; a
+        # mismatch means the op is about to bake a page size the runner's
+        # block tables were not built for (the 20260812 defect: kernel
+        # addressing with the provisional block_size=4 while the runner
+        # assigned one 128-token logical page per request).
+        cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
+            vllm_context.vllm_config.cache_config.block_size, self.window_size)
+        if cfg_lps != logical_page_size:
+            logger.warning(
+                "[ATTN_BUILD] %s: swa_cache.block_size=%s disagrees with "
+                "config-derived SWA page size %s (cache_config.block_size=%s,"
+                " window=%s). Using the config-derived value.",
+                self.custom_prefix, logical_page_size, cfg_lps,
+                vllm_context.vllm_config.cache_config.block_size,
+                self.window_size)
+            logical_page_size = cfg_lps
+        logger.info(
+            "[ATTN_BUILD] %s: logical_page_size=%s window=%s swa_only=%s "
+            "is_csa=%s two_caches_same_buffer=%s real_caches=%s "
+            "sw_numel=%s main_numel=%s", self.custom_prefix, logical_page_size,
+            self.window_size, swa_only, is_csa, two_caches_same_buffer,
+            built_from_real_caches,
+            swa_tensor.numel() if swa_tensor is not None else None,
+            main_cache.numel() if main_cache is not None else None)
+
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (getattr(self.mla_attn, "scale", None)
                     or getattr(self.mla_attn, "softmax_scale", None)
@@ -639,12 +693,22 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # can legitimately disagree (one overlaid, one with its own array).
         # Keying the cache on op_type alone would hand the second layer the
         # first one's op.
+        # `_prof` marks a placeholder-built op (load_model's eager
+        # kernel pre-build and profile_run both run BEFORE
+        # initialize_kv_cache): a separate name keeps it out of the real
+        # ops' registries so real forwards rebuild. `_p{page}` bakes the
+        # geometry into the cache key: the 20260812 defect was exactly a
+        # load_model-era op (provisional SWA page size 4) being returned
+        # from this name-keyed cache after initialize_kv_cache's
+        # force-rebuild recomputed the same name.
         op_name = (f"pallas::deepseek_v4_attention_{op_type}_v2"
-                   f"{'_aliased' if two_caches_same_buffer else ''}")
+                   f"_p{logical_page_size}"
+                   f"{'_aliased' if two_caches_same_buffer else ''}"
+                   f"{'' if built_from_real_caches else '_prof'}")
 
         global _attn_op_cache
         if op_name in _attn_op_cache:
-            return _attn_op_cache[op_name]
+            return _attn_op_cache[op_name], built_from_real_caches
 
         from jax.sharding import PartitionSpec as P
         attn_data_axis = None
@@ -686,8 +750,12 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
 
         attn_jax_op.register_fake(_fake_attn)
 
+        # `_prof` ops are stored too (all 43 layers share one registration
+        # during profile_run instead of re-registering the same torch op
+        # name), but under their own key -- the real-cache build always
+        # misses this entry and re-derives geometry from real tensors.
         _attn_op_cache[op_name] = attn_jax_op
-        return attn_jax_op
+        return attn_jax_op, built_from_real_caches
 
     def attn_gemm(self, hidden_states):
         # DSV4_KVSCORE_FIRST=1 -- intervention 3 for the deterministic decode
