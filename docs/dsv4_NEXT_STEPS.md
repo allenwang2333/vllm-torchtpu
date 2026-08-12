@@ -125,6 +125,17 @@ page-dump run (running now; `analyze_pagedumps.py`) bounds the layer-2
 input drift (q/kv) at the step each slot was written: tiny q/kv drift +
 18% row difference = the state→compress path manufactures the error.
 
+Also checked and refuted statically (do not re-chase):
+`pack_state_cache`/`unpack_state_cache` round-trip lossiness — both are
+pure uint8<->f32 bitcasts, byte-lossless and idempotent, so the per-step
+re-pack of the whole buffer cannot accumulate error, and the magnitude of
+the slot difference (absmax 4 fp8 steps apart, ~half the bytes changed)
+is far beyond batch-geometry bf16 noise at decode steps 0-2 (whose caches
+are 100% prefill-built). The difference is manufactured between the state
+cache and the record write. The dumps split it: decode state rows !=
+control state rows => the state WRITE at decode; identical state rows =>
+the gather/compress when the boundary token arrives alone.
+
 **Checked and refuted before testing (do not re-chase): vLLM sliding-window
 block freeing.** The state cache is the only group whose window is small
 enough (`W = coff*compress_ratio` = 8 for CSA, blocks of 16 positions) for
