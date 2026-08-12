@@ -698,6 +698,41 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         else:
             kv_score = None
 
+        # DSV4_DUMP_PAGES matmul-integrity probe (debug layer, rank 0): the
+        # v3 dumps showed kv_score row 0 at decode carries an admixture of
+        # other batch rows' content while fused_wqa_wkv of the SAME tensor is
+        # byte-perfect. A per-row matmul cannot mix rows, so either this
+        # batched `@` lowers wrong at the decode shape, or hidden_states row 0
+        # is already polluted and the other path is insensitive. Dump row 0
+        # computed BOTH ways (batched vs single-row) plus the hidden row
+        # itself, all through synced reads.
+        if (os.getenv("DSV4_DUMP_PAGES") == "1" and not _is_tracing()
+                and kv_score is not None and _DEBUG_LAYER_INFIX() in getattr(
+                    self, "custom_prefix", "")):
+            from vllm.distributed.parallel_state import \
+                get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                import numpy as np
+
+                from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                    _dump_to_numpy
+                _kvs_single = (
+                    hidden_states[0:1] @ compressor.fused_wkv_wgate.weight.T)
+                _step = getattr(self, "_dsv4_gemm_dump_step", 0)
+                self._dsv4_gemm_dump_step = _step + 1
+                _root = os.path.join(
+                    os.getenv("DSV4_DUMP_ROOT",
+                              os.path.expanduser("~/workspace/scratch")),
+                    "page_dumps", os.getenv("DSV4_DUMP_LABEL", "run"))
+                os.makedirs(_root, exist_ok=True)
+                np.savez_compressed(
+                    os.path.join(_root, f"gemm_step{_step:03d}.npz"),
+                    hidden_row0=_dump_to_numpy(hidden_states[0:1]),
+                    hidden_lastrow=_dump_to_numpy(hidden_states[-1:]),
+                    kvs_batched_row0=_dump_to_numpy(kv_score[0:1]),
+                    kvs_single_row0=_dump_to_numpy(_kvs_single),
+                    num_rows=np.asarray(hidden_states.shape[0]))
+
         if self.indexer is not None:
             indexer = self.indexer
             indexer_weights, _ = indexer.weights_proj(hidden_states)
