@@ -165,3 +165,43 @@ at attn_gemm entry, decode row vs prefill row for the same token.
   right; the SWA byte-identity is the anomaly to explain (per-row
   normalization + fp8 absorption?), and the hunt moves up to layers 0-1
   outputs with the same full-dump instrument.
+
+## RESOLUTION OF THE FORK (04:50): the retraction was wrong — decode hidden genuinely differs
+
+Full synced hidden dumps at attn_gemm entry (`hiddenfull` run):
+
+```
+decode step 0 row vs prefill row, same token/history/caches:
+    cos 0.928, mean |diff| 0.0147   (pure prefill-built caches!)
+by step 9: cos 0.580
+prefill self-check: bit-identical (max diff 0.0)
+```
+
+The SWA byte-identity that forced the earlier retraction is explained:
+**fp8 quantization absorbs percent-level input differences** — byte-equal
+cache rows never proved equal inputs. The kv_score/state path preserved
+the difference only because state stores raw f32. All three intervention
+nulls are consistent: there was never a mutation race; the two "snapshots"
+were always the same (diverged) value, and the "clean" sibling was clean
+only after quantization.
+
+**Standing model:** the decode forward diverges from prefill starting in
+layers 0-1's attention reads (layer 0 pre-attention is bit-exact; the
+designed fp8-cache-vs-bf16-in-batch K/V asymmetry is the seed), and the
+divergence is AMPLIFIED across steps (0.93 -> 0.58 cos by step 9) as each
+decode-written row freezes it into the caches. The reference shares the
+same kernels and the same asymmetry but stays within 0.3 logprob — so the
+defect is OUR AMPLIFICATION, somewhere in layers 0-1 / MHC mixing /
+epsilon-vs-reference differences that a healthy loop damps.
+
+**Next experiment (single, well-defined):** the same per-layer hidden-row
+decode-vs-prefill measurement ON THE REFERENCE stack, then compare
+divergence-vs-layer and divergence-vs-step curves between the stacks. Where
+ours departs from theirs is the defect's address. Secondary: the same
+measurement at layers 0 and 1 outputs in our stack narrows it to one
+sublayer before touching the reference at all.
+
+Corrections to earlier sections of this doc: the "untracked-mutation race"
+framing is retired; interventions 1-3 and their nulls are the evidence.
+The tier-2/tier-3 fixes aimed at ordering are moot; the audit list and the
+prevention tooling remain valid and used.
