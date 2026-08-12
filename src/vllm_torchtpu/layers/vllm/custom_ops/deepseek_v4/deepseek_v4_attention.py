@@ -1750,14 +1750,17 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         # INERT: the 13-prompt pool A/B (pool_zp0 vs pool_lpsfix, 20260812)
         # is logprob-identical at every step with it on or off, and the
         # lps=128 kernel is pad-clean in isolation
-        # (scratchpad/kernel_micro_repro.py). Kept default-ON as cheap
-        # hygiene only: our runner does leave full-magnitude stale data in
-        # pad rows (unlike the reference, whose pads are zeros), and two
-        # elementwise multiplies per layer buy insurance against any future
-        # pad-sensitive consumer. DSV4_ZERO_PAD=0 opts out.
-        if os.getenv("DSV4_ZERO_PAD", "1") == "1" and swa_query_start_loc is not None \
+        # (scratchpad/kernel_micro_repro.py). Default OFF since then:
+        # matches the reference (which has no such mask), and the original
+        # default-ON broke torch.compile in the serving path (the gather
+        # below was written with a data-dependent index that dynamo cannot
+        # size-constrain -- phase3b engine-init failure, 20260812).
+        # DSV4_ZERO_PAD=1 re-enables it for A/B; the index_select form is
+        # compile-safe.
+        if os.getenv("DSV4_ZERO_PAD", "0") == "1" and swa_query_start_loc is not None \
                 and swa_request_distribution is not None:
-            _nvalid = swa_query_start_loc[swa_request_distribution[2]]
+            _nvalid = torch.index_select(swa_query_start_loc, 0,
+                                         swa_request_distribution[2:3])
             _rowmask = (torch.arange(q.shape[0], device=q.device) < _nvalid)
             q = q * _rowmask.view(-1, 1, 1).to(q.dtype)
             kv = kv * _rowmask.view(-1, 1).to(kv.dtype)
