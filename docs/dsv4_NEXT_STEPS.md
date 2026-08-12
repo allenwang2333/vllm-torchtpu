@@ -400,3 +400,47 @@ SWA-side metadata (`swa_seq_len == qpos+1`, stable block tables, second SWA
 block appearing at position 128) and main-side metadata. Every input to the
 proven-equivalent kernels is now verified except row content, which the v2
 run measures.
+
+## v2 page dumps (01:10): SWA exonerated byte-for-byte; decode STATE writes convicted; forward-drift finding RETRACTED
+
+The `combined_L2v2` run (block-table-indexed pages) settled almost
+everything:
+
+- **SWA cache: fully exonerated.** Decode-written rows are byte-IDENTICAL
+  to the control's prefill-written rows at every position tested (17, 19,
+  22, 26, 29). Write fidelity at pos 0 is healthy fp8 (2.2% nope, 0% rope).
+  (The pos>0 "100% error" lines in analyze_v2.py section A are a probe
+  methodology artifact -- the stored row is rope-transformed relative to
+  the dumped kv; pos 0 is the identity-rotation case and shows the truth.)
+- **The "decode forward path drifts" reframing is RETRACTED.** It was the
+  documented lazy-read trap: the page-dump probe read live activations
+  with plain .cpu(). Cache tensors read fine; mid-graph activations
+  fabricated a deterministic-per-shape "drift" that passed same-shape
+  controls and failed cross-shape comparisons. Probe now fixed to
+  _dump_to_numpy (4d532a19). The byte-identical SWA rows are the proof:
+  the decode forward's kv values are exactly right.
+- **Compressed slots re-convicted, no echo excuse left:** decode-written
+  slots differ from prefill's by 7.3% / 28.3% / 43.0% (slots 4/5/6),
+  proportional to the fraction of DECODE-WRITTEN STATE rows in each slot's
+  8-position window (3/8, 7/8, 8/8).
+- **Decode-written STATE rows are wrong:** 30-70% relative f32 error vs
+  the control's prefill-written rows, growing with step (pos17: mean diff
+  0.078 on ref magnitude 0.23; pos26: 0.21 on 0.30). Verified stable
+  within-run (identical bytes read at write time and 10 steps later) and
+  from two read distances -- NOT a dump artifact. Prefill-written state
+  rows (pos 5/12/16) are byte-identical across runs.
+- Shape, not scale: cos 0.72-0.98 with norm ratios both directions, so the
+  old "norm ratio 1.32" ghost is NOT the mechanism.
+
+**The remaining contradiction, one run from resolution:** the state rows
+are written from `kv_score` (= hidden @ fused_wkv_wgate.T) and the SWA rows
+from the same `hidden_states` via fused_wqa_wkv -- one byte-perfect, the
+other 5-28% direction-rotated is impossible if the compressor op really
+receives that kv_score. Suspicion: the kv_score tensor reaching the
+`compressor_op` boundary is stale/aliased at decode (lazy-tensor buffer
+reuse across steps would also explain error growing with step). The v3 run
+(in flight) dumps kv_score inside compressor.forward with a synced read:
+- kv_score correct at decode => the corruption happens INSIDE the op
+  boundary (buffer donation/aliasing in pallas.jax_op between steps).
+- kv_score wrong at decode => trace attn_gemm's kv_score at decode
+  (upstream of the op).
