@@ -1673,6 +1673,24 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             self._maybe_dump_sublayer("02_main_cache_kv", main_cache_kv,
                                       _dump_step_now)
 
+        # DSV4_ZERO_PAD=1: zero the batch's PADDING rows of q/kv before the
+        # kernel. Measured (l0attn dumps): our decode padding rows carry
+        # full-magnitude STALE data (prefill leftovers; junk q rows |x| mean
+        # 0.70 vs real row 0.59) while the reference stack's padding is
+        # zeros, and layer 0's attention output diverges ~50% from prefill
+        # with bit-equal real inputs. If zeroing the pads fixes generation,
+        # the kernel is padding-sensitive and stale pads are the root cause.
+        if os.getenv("DSV4_ZERO_PAD") == "1" and swa_query_start_loc is not None \
+                and swa_request_distribution is not None:
+            _nvalid = swa_query_start_loc[swa_request_distribution[2]]
+            _rowmask = (torch.arange(q.shape[0], device=q.device) < _nvalid)
+            q = q * _rowmask.view(-1, 1, 1).to(q.dtype)
+            kv = kv * _rowmask.view(-1, 1).to(kv.dtype)
+            if not _is_tracing() and not getattr(self, "_zp_logged", False):
+                self._zp_logged = True
+                logger.info("[ZERO_PAD_ACTIVE] %s masking rows >= nvalid",
+                            getattr(self, "custom_prefix", "?"))
+
         output, new_sw_cache = self.attn_op(
             q,
             kv,
