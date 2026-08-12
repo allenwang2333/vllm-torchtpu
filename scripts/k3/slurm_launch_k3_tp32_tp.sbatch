@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=kimi-k3-verify
-#SBATCH --partition=ici-2x2x4-b
+#SBATCH --partition=ici-2x2x4-c
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
@@ -52,9 +52,9 @@ export PORT
 # These cache defaults match the original full Kimi-K3 Slurm job. The model
 # checkpoint must already exist in the node-local HF cache on every host when
 # HF_HUB_OFFLINE=1.
-export HF_HOME="${HF_HOME:-/mnt/scratch/hf-hub}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
-export HF_MODULES_CACHE="${HF_MODULES_CACHE:-${HF_HOME}/modules}"
+export HF_HOME="${KIMI_K3_HF_HOME:-/mnt/scratch/hf-hub}"
+export HF_HUB_CACHE="${KIMI_K3_HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_MODULES_CACHE="${KIMI_K3_HF_MODULES_CACHE:-${HF_HOME}/modules}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
