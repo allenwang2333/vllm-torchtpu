@@ -265,18 +265,11 @@ class PhaseBasedProfiler:
             handler = torch.profiler.tensorboard_trace_handler(
                 dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
 
-            # Use dynamic defaults if they aren't explicitly provided via standard_opts
-            host_tracer_level = self.standard_opts.get("host_tracer_level", 2)
-            device_tracer_level = self.standard_opts.get(
-                "device_tracer_level", 1)
-            python_tracer_level = self.standard_opts.get(
-                "python_tracer_level", 1)
-
             config = TpuProfilerConfig(
                 run_dir=self.profile_dir_with_phase_suffix,
-                host_tracer_level=host_tracer_level,
-                device_tracer_level=device_tracer_level,
-                python_tracer_level=python_tracer_level,
+                host_tracer_level=self.standard_opts["host_tracer_level"],
+                device_tracer_level=self.standard_opts["device_tracer_level"],
+                python_tracer_level=self.standard_opts["python_tracer_level"],
                 experimental_options=self.advanced_opts,
             )
             self.profile_context = torch.profiler.profile(

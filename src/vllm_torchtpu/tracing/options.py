@@ -61,17 +61,46 @@ def parse_profile_options(
     return standard_opts, advanced_opts
 
 
+_DEFAULT_STANDARD_OPTS = {
+    "host_tracer_level": 2,
+    "device_tracer_level": 1,
+    "python_tracer_level": 1,
+}
+
+_DEFAULT_ADVANCED_OPTS = {
+    "tpu_trace_mode": "TRACE_COMPUTE",
+    "tpu_num_sparse_cores_to_trace": 1,
+    "tpu_num_sparse_core_tiles_to_trace": 1,
+}
+
+
 def resolve_profile_dir_and_opts(
         base_dir: str, profile_prefix: str | None
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Resolves the profile_dir and extracts standard and advanced tracing options."""
-    standard_opts, advanced_opts = {}, {}
+    """
+    Resolves the target profiling directory and parses dynamic tracing options.
+
+    Args:
+        base_dir: The base directory for trace outputs.
+        profile_prefix: A string. If it contains a semicolon or colon, it's
+            parsed as structured configuration (e.g., "host_tracer_level:1;").
+            Otherwise, it acts solely as a subdirectory name appending to base_dir.
+
+    Returns:
+        A tuple of (profile_dir, standard_opts, advanced_opts) where the opts
+        dictionaries are pre-populated with baseline defaults and merged with
+        any overrides specified in the profile_prefix.
+    """
+    standard_opts = _DEFAULT_STANDARD_OPTS.copy()
+    advanced_opts = _DEFAULT_ADVANCED_OPTS.copy()
     profile_dir = base_dir
 
     if profile_prefix:
         if ":" in profile_prefix or ";" in profile_prefix:
-            standard_opts, advanced_opts = parse_profile_options(
+            parsed_standard, parsed_advanced = parse_profile_options(
                 profile_prefix)
+            standard_opts.update(parsed_standard)
+            advanced_opts.update(parsed_advanced)
         else:
             profile_dir = os.path.join(base_dir, profile_prefix)
 
