@@ -313,3 +313,37 @@ the pool sweep is clean. Gates in order: needle at the SERVING shape (9216
 ctx, non-eager, batched — the untested regime), MMLU-Pro LIMIT=10 smoke,
 then the full benchmark. The zero-pad mask applies to serving
 (query_start_loc-based nvalid is multi-request-correct).
+
+## Defect #2 state after the wc_hunt run (07:50)
+
+Facts (all on the clean-pad build):
+
+- water_cycle decode == its own prefill EXACTLY (logprob level) for steps
+  0-7, breaking only at step 8 (position 23, a %4==3 boundary and the step
+  whose attention first reads the just-written compressed slot 5).
+- Compressed slots decode-vs-control: prefill-written ~2%, decode-written
+  10.8% / 50.5% / 100% (slots 4/5/6) -- the same decode-state-fraction
+  gradient as pre-pad-fix, so NOT explained by padding.
+- kv_score (compressor input) still diverges at decode (cos 0.82-0.99)
+  even with pads masked: the call-site mask attenuates but does not
+  eliminate the contamination path. XLA's margins tolerate the residue;
+  water_cycle's boundary step does not.
+
+Open doubts to re-verify before further byte-conclusions:
+1. The SWA-row probe's address arithmetic is suspect (prompt rows read as
+   all-zero in BOTH runs at several positions): the earlier "SWA rows
+   byte-identical" finding may have compared zero rows. Mirror the
+   kernel's true packed layout (bug-#4 rule) before trusting any SWA-row
+   byte claim.
+2. The kernel's cross-row contamination mechanism is proven by
+   intervention but not located; the new_kv insert path is ragged-correct
+   on reading, so the mixer is elsewhere (candidate: block-level
+   reductions across the padded q dimension). A CPU/pallas-interpret repro
+   with real dumped inputs is the right instrument, or a TPU micro-run
+   toggling junk contents with the kernel called directly.
+
+Next session's opening moves, in order: (1) reference wc curve (phase 2
+data, landing now) for the healthy per-layer baseline on this prompt;
+(2) kernel micro-repro to locate the mixer; (3) fix kernel or extend
+masking to make pad contribution EXACTLY zero; (4) pool sweep; (5) staged
+phase-3 MMLU chain.
