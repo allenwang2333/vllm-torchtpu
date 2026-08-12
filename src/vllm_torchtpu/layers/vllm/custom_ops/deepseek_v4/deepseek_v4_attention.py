@@ -562,19 +562,33 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         dedupes the underlying jax op across layers.
         """
         op = self.__dict__.get("_attn_op_instance")
-        if op is None:
-            op, built_from_real_caches = self._build_attn_op()
-            # vLLM's memory-profiling pass (determine_available_memory ->
-            # profile_run) is ALSO a forward, and it runs before
-            # initialize_kv_cache: the caches are still numel==0
-            # placeholders then, so geometry derived from real tensor
-            # identity (two_caches_same_buffer) is wrong-by-construction.
-            # An op built in that phase must NOT be memoized, or the first
-            # real forward -- and every one after it -- inherits the
-            # placeholder-built kernel. Only pin the op once it was built
-            # against real caches.
-            if built_from_real_caches:
-                object.__setattr__(self, "_attn_op_instance", op)
+        if op is not None:
+            return op
+        # vLLM's memory-profiling pass (determine_available_memory ->
+        # profile_run) is ALSO a forward, and it runs before
+        # initialize_kv_cache: the caches are still numel==0 placeholders
+        # then, so geometry derived from real tensor identity
+        # (two_caches_same_buffer) is wrong-by-construction. An op built in
+        # that phase must NOT become the serving op, or every real forward
+        # inherits the placeholder-built kernel (the lps=4 defect). It gets
+        # its own memo slot instead: still built exactly once (rebuilding
+        # inside a torch.compile'd profile forward puts _build_attn_op's
+        # host-side work under dynamo, which broke serving engine-init),
+        # but never consulted again once the real op exists.
+        # `_initialize_attention_kernels(force=True)` at initialize_kv_cache
+        # pops `_attn_op_instance` and re-enters here eagerly with real
+        # caches, filling the real slot before any compiled real forward.
+        swa_tensor = getattr(getattr(self.mla_attn, "swa_cache_layer", None),
+                             "kv_cache", None)
+        caches_real = swa_tensor is not None and swa_tensor.numel() > 0
+        if not caches_real:
+            prof = self.__dict__.get("_attn_op_prof_instance")
+            if prof is not None:
+                return prof
+        op, built_from_real_caches = self._build_attn_op()
+        object.__setattr__(
+            self, "_attn_op_instance"
+            if built_from_real_caches else "_attn_op_prof_instance", op)
         return op
 
     def _build_attn_op(self):
@@ -645,22 +659,25 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
             vllm_context.vllm_config.cache_config.block_size, self.window_size)
         if cfg_lps != logical_page_size:
-            logger.warning(
-                "[ATTN_BUILD] %s: swa_cache.block_size=%s disagrees with "
-                "config-derived SWA page size %s (cache_config.block_size=%s,"
-                " window=%s). Using the config-derived value.",
-                self.custom_prefix, logical_page_size, cfg_lps,
-                vllm_context.vllm_config.cache_config.block_size,
-                self.window_size)
+            if not _is_tracing():
+                logger.warning(
+                    "[ATTN_BUILD] %s: swa_cache.block_size=%s disagrees with "
+                    "config-derived SWA page size %s "
+                    "(cache_config.block_size=%s, window=%s). Using the "
+                    "config-derived value.", self.custom_prefix,
+                    logical_page_size, cfg_lps,
+                    vllm_context.vllm_config.cache_config.block_size,
+                    self.window_size)
             logical_page_size = cfg_lps
-        logger.info(
-            "[ATTN_BUILD] %s: logical_page_size=%s window=%s swa_only=%s "
-            "is_csa=%s two_caches_same_buffer=%s real_caches=%s "
-            "sw_numel=%s main_numel=%s", self.custom_prefix, logical_page_size,
-            self.window_size, swa_only, is_csa, two_caches_same_buffer,
-            built_from_real_caches,
-            swa_tensor.numel() if swa_tensor is not None else None,
-            main_cache.numel() if main_cache is not None else None)
+        if not _is_tracing():
+            logger.info(
+                "[ATTN_BUILD] %s: logical_page_size=%s window=%s swa_only=%s "
+                "is_csa=%s two_caches_same_buffer=%s real_caches=%s "
+                "sw_numel=%s main_numel=%s", self.custom_prefix,
+                logical_page_size, self.window_size, swa_only, is_csa,
+                two_caches_same_buffer, built_from_real_caches,
+                swa_tensor.numel() if swa_tensor is not None else None,
+                main_cache.numel() if main_cache is not None else None)
 
         hf_config = vllm_context.vllm_config.model_config.hf_config
         sm_scale = (getattr(self.mla_attn, "scale", None)
