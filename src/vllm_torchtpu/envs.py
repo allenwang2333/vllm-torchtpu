@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    MOE_STATIC_TILED_GMM: bool = False
+    MOE_STATIC_GMM_TILES: int | None = None
 
 
 def env_with_choices(
@@ -312,6 +314,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Pad GMM tiles to a fixed compile-time / runtime static tile target to eliminate
+    # multi-core execution desynchronization and barrier core idle stalls under EP.
+    "MOE_STATIC_TILED_GMM":
+    env_bool("MOE_STATIC_TILED_GMM"),
+    "MOE_STATIC_GMM_TILES":
+    lambda: int(v) if (v := os.getenv("MOE_STATIC_GMM_TILES")) is not None else None,
 }
 
 

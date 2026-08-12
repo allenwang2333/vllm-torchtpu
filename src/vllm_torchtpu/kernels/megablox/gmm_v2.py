@@ -23,6 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+import vllm_torchtpu.envs as envs
+
 # Util.
 
 
@@ -283,6 +285,7 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    static_gm_tiles: int | None = None
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -758,7 +761,21 @@ def fill_metadata(
 
         return next_num_gm, end_m_offset
 
-    num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+    num_gm, start_m_offset = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+
+    if cfgs.static_gm_tiles is not None and cfgs.static_gm_tiles > 0:
+        target_num_gm = cfgs.static_gm_tiles
+
+        @jax.named_scope("pad_dummy_gm_tiles")
+        def pad_dummy_tile_fn(tm_id, curr_offset):
+            metadata_ref.gm_id_to_group_id[tm_id] = 0
+            metadata_ref.gm_id_to_m_offset[tm_id] = curr_offset
+            metadata_ref.gm_id_to_m_offset[tm_id + 1] = curr_offset
+            return curr_offset
+
+        lax.fori_loop(num_gm, target_num_gm, pad_dummy_tile_fn, start_m_offset)
+        num_gm = jnp.maximum(num_gm, target_num_gm)
+
     return num_gm
 
 
@@ -1256,6 +1273,10 @@ def make_gmm_configs(
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
 
+    static_tiles = envs.MOE_STATIC_GMM_TILES
+    if static_tiles is None and envs.MOE_STATIC_TILED_GMM:
+        static_tiles = pl.cdiv(dims.size_m, tiles.tile_m)
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1265,6 +1286,7 @@ def make_gmm_configs(
         acc_dtype=jnp.dtype(acc_dtype),
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        static_gm_tiles=static_tiles,
     )
 
 
@@ -1386,6 +1408,8 @@ def gmm_v2(
 
     # Initialize scratch shapes.
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
+    if cfgs.static_gm_tiles is not None and cfgs.static_gm_tiles > 0:
+        max_num_gm = max(max_num_gm, cfgs.static_gm_tiles)
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
     scratch_shapes = [
         # partial_out_ref

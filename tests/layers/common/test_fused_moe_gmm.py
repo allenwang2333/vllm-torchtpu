@@ -727,3 +727,15 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
         })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def test_moe_static_tiled_gmm_env_flags(monkeypatch):
+    monkeypatch.delenv("MOE_STATIC_TILED_GMM", raising=False)
+    monkeypatch.delenv("MOE_STATIC_GMM_TILES", raising=False)
+    assert not envs.environment_variables["MOE_STATIC_TILED_GMM"]()
+    assert envs.environment_variables["MOE_STATIC_GMM_TILES"]() is None
+
+    monkeypatch.setenv("MOE_STATIC_TILED_GMM", "1")
+    monkeypatch.setenv("MOE_STATIC_GMM_TILES", "4")
+    assert envs.environment_variables["MOE_STATIC_TILED_GMM"]()
+    assert envs.environment_variables["MOE_STATIC_GMM_TILES"]() == 4
