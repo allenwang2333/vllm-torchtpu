@@ -146,3 +146,22 @@ prompt-faithful, this is simultaneously the mechanism proof and the
 minimal fix; the principled follow-up is fixing the donation in the
 quantized-linear op path (and the same audit for every other custom-op
 call site whose input is later re-read).
+
+**#3 — DSV4_KVSCORE_FIRST=1 (4cd1123e): FAILED, output unchanged** (all
+four instruments; caveat: like #1 and unlike #2, no positive in-log
+confirmation the flag was active — future interventions must log an
+active-marker). Three byte-identical nulls under radically different
+orderings eliminate the entire "later mutation" family including
+input-buffer donation by fused_wqa_wkv.
+
+**Surviving fork, split by measurement not intervention
+(DSV4_DUMP_HIDDEN_FULL, run in flight):** compare the FULL synced hidden
+at attn_gemm entry, decode row vs prefill row for the same token.
+- Rows equal => the pollution is manufactured between attn_gemm entry and
+  the kv_score consumer in a way reorders cannot touch — which would
+  indict the synced-dump/off-op read path itself and demand a torch-tpu
+  runtime-level investigation.
+- Rows differ => the retracted "decode forward path differs" finding was
+  right; the SWA byte-identity is the anomaly to explain (per-row
+  normalization + fp8 absorption?), and the hunt moves up to layers 0-1
+  outputs with the same full-dump instrument.
