@@ -650,6 +650,12 @@ def sharded_pcp_ragged_paged_attention(
         )
         compact_slot_ids = _compact_writeback_slot_ids_for_cache_rank(
             writeback_mapping, cache_rank)
+        # The rank-major mapping is replicated across all PCP ranks, but one
+        # cache rank can own at most the current compile bucket's query rows.
+        # Keeping the replicated tail here makes the writeback descriptor a
+        # [3, local_tokens * pcp_size] scalar-prefetch operand and can exhaust
+        # the TPU's 1 MiB SMEM before the kernel runs.
+        compact_slot_ids = compact_slot_ids[:q_local.shape[0]]
         writeback_count = writeback_mapping.writeback_counts[cache_rank]
         packed_current_kv = _prepare_packed_kv_for_cache(
             k_local, v_local, kv_cache)
