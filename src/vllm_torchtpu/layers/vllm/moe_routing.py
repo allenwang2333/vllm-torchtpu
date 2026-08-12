@@ -329,25 +329,6 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    use_grouped = (layer is not None and layer.use_grouped_topk
-                   and layer.num_expert_group > 1
-                   and layer.topk_group < layer.num_expert_group)
-    if use_grouped:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
-            grouped_topk
-        topk_weights, topk_ids = grouped_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=topk,
-            renormalize=renormalize,
-            num_expert_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
-            scoring_func=scoring_fn,
-            routed_scaling_factor=layer.routed_scaling_factor,
-            e_score_correction_bias=layer.e_score_correction_bias,
-        )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
-
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = getattr(layer, "e_score_correction_bias",
                                       None) if layer is not None else None
@@ -396,6 +377,7 @@ def select_experts(
                 global_experts = getattr(layer, "global_num_experts",
                                          scores.shape[-1])
 
+    # 1. Capacity-Aware Balanced Routing (if MOE_ROUTING_CAPACITY_FACTOR > 0 and use_ep)
     if (capacity_factor is not None and capacity_factor > 0 and use_ep
             and ep_size > 1):
         topk_weights, topk_ids = _apply_capacity_aware_routing(
@@ -406,6 +388,26 @@ def select_experts(
             global_num_experts=global_experts,
             capacity_factor=capacity_factor,
         )
+    # 2. Grouped top-k routing (e.g. Qwen 3.5 / DeepSeek)
+    elif (layer is not None and getattr(layer, "use_grouped_topk", False)
+          and getattr(layer, "num_expert_group", 0) > 1
+          and getattr(layer, "topk_group", 0) < getattr(
+              layer, "num_expert_group", 0)):
+        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
+            grouped_topk
+        topk_weights, topk_ids = grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=scores_for_choice,
+            topk=topk,
+            renormalize=renormalize,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=scoring_fn,
+            routed_scaling_factor=layer.routed_scaling_factor,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    # 3. Standard top-k routing
     else:
         _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
         topk_weights = scores.gather(-1, topk_ids)
