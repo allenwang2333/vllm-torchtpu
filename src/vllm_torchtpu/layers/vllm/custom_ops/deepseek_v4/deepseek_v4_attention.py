@@ -1480,19 +1480,44 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 "main_cu_q_lens": _np(main_cu_q_lens),
                 "main_distribution": _np(main_distribution),
             }
-            # First 8 physical pages of the main/compressed buffer cover the
-            # request's compressed page, the state pages, and page 0; first 2
-            # SWA pages cover the whole window at this length.
+
+            # Dump the pages the request ACTUALLY uses, indexed via the block
+            # tables (a fixed [:N] window missed them -- fresh requests
+            # allocate pages anywhere in the pool). Page ids are saved
+            # alongside so the analyzer can map positions to dumped rows.
+            def _pages_by_table(cache_t, table, extra=()):
+                ids = []
+                if table is not None:
+                    ids += [int(x) for x in table.flatten()[:2].tolist()]
+                ids += [int(x) for x in extra]
+                ids = [
+                    i for i in dict.fromkeys(ids) if 0 <= i < cache_t.shape[0]
+                ]
+                return cache_t[ids], np.asarray(ids, dtype=np.int32)
+
+            _state_md = None
+            if isinstance(attn_ctx, dict):
+                _state_md = attn_ctx.get(compressor_state_prefix)
+            _state_bt = getattr(_state_md, "block_tables", None) \
+                if _state_md is not None else None
             _mc = main_cache_kv
             if _mc is not None and _mc.numel() > 0:
                 if _mc.ndim == 5:
                     _mc = _mc.squeeze(2)
-                _bundle["main_pages"] = _np(_mc[:8])
+                _extra = ([int(x) for x in _state_bt.flatten()[:2].tolist()]
+                          if _state_bt is not None else [])
+                pages, ids = _pages_by_table(_mc, main_page_indices, _extra)
+                _bundle["main_pages"] = _np(pages)
+                _bundle["main_page_ids"] = ids
+                if _state_bt is not None:
+                    _bundle["state_block_tables"] = _np(_state_bt)
             _sc = sw_cache
             if _sc is not None and _sc.numel() > 0:
                 if _sc.ndim == 5:
                     _sc = _sc.squeeze(2)
-                _bundle["sw_pages"] = _np(_sc[:2])
+                pages, ids = _pages_by_table(_sc, swa_block_tables)
+                _bundle["sw_pages"] = _np(pages)
+                _bundle["sw_page_ids"] = ids
             np.savez_compressed(
                 os.path.join(_root, f"attn_step{_step:03d}.npz"), **{
                     k: v
@@ -1546,9 +1571,11 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             if _nsc.ndim == 5:
                 _nsc = _nsc.squeeze(2)
             _step_done = self._dsv4_page_dump_step - 1
+            _pages_post, _ids_post = _pages_by_table(_nsc, swa_block_tables)
             np.savez_compressed(os.path.join(
                 _root, f"attn_step{_step_done:03d}_post.npz"),
-                                sw_pages_post=_np(_nsc[:2]),
+                                sw_pages_post=_np(_pages_post),
+                                sw_page_ids_post=_ids_post,
                                 attn_output=_np(output))
 
         # Discriminator: is new_sw_cache (the torch tensor returned by
