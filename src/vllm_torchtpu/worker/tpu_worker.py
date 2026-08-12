@@ -474,18 +474,10 @@ class TPUWorker(WorkerBase):
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
-            profile_dir = self.profile_dir
-            standard_opts, advanced_opts = {}, {}
-
-            if profile_prefix:
-                if ":" in profile_prefix or ";" in profile_prefix:
-                    from vllm_torchtpu.profiler_options import \
-                        parse_profile_options
-                    standard_opts, advanced_opts = parse_profile_options(
-                        profile_prefix)
-                else:
-                    profile_dir = os.path.join(profile_dir, profile_prefix)
-
+            from vllm_torchtpu.tracing.options import \
+                resolve_profile_dir_and_opts
+            profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+                self.profile_dir, profile_prefix)
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.

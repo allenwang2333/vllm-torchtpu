@@ -1,3 +1,4 @@
+import os
 import re
 from typing import Any, Dict, Tuple
 
@@ -58,3 +59,20 @@ def parse_profile_options(
             advanced_opts[key] = parsed_val
 
     return standard_opts, advanced_opts
+
+
+def resolve_profile_dir_and_opts(
+        base_dir: str, profile_prefix: str | None
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Resolves the profile_dir and extracts standard and advanced tracing options."""
+    standard_opts, advanced_opts = {}, {}
+    profile_dir = base_dir
+
+    if profile_prefix:
+        if ":" in profile_prefix or ";" in profile_prefix:
+            standard_opts, advanced_opts = parse_profile_options(
+                profile_prefix)
+        else:
+            profile_dir = os.path.join(base_dir, profile_prefix)
+
+    return profile_dir, standard_opts, advanced_opts
