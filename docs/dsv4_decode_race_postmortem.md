@@ -305,3 +305,11 @@ with layer curve + L2 page dumps + ZERO_PAD, one load; (2) reference:
 water_cycle + SELF_TF + layer probe. Production fix for #1 (runner buffer
 zeroing + default-on mask) implemented host-side during the loads, verified
 in the same next run.
+
+## Phase 3 (staged, gated): MMLU-Pro acceptance number
+
+`scratchpad/chain_phase3_mmlu.sh` — run ONLY after defect #2 is fixed and
+the pool sweep is clean. Gates in order: needle at the SERVING shape (9216
+ctx, non-eager, batched — the untested regime), MMLU-Pro LIMIT=10 smoke,
+then the full benchmark. The zero-pad mask applies to serving
+(query_start_loc-based nvalid is multi-request-correct).
