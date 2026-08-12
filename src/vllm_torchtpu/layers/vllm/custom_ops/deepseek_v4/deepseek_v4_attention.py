@@ -1456,14 +1456,17 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
             os.makedirs(_root, exist_ok=True)
 
             def _np(t):
+                # _dump_to_numpy, not .cpu(): plain host reads of lazy
+                # activation tensors are unordered against the deferred graph
+                # and fabricate values (this exact probe produced a fake
+                # "decode q/kv drift" before this fix; cache tensors happened
+                # to read fine, activations did not).
                 if t is None:
                     return None
                 if isinstance(t, torch.Tensor):
-                    tt = t
-                    if tt.dtype not in (torch.uint8, torch.int32, torch.int64,
-                                        torch.float32):
-                        tt = tt.to(torch.float32)
-                    return tt.detach().cpu().numpy()
+                    from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                        _dump_to_numpy
+                    return _dump_to_numpy(t)
                 return np.asarray(t)
 
             _bundle = {

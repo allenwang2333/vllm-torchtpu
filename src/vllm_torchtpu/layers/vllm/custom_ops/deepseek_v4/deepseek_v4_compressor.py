@@ -150,10 +150,10 @@ def _deepseek_v4_compressor_jax(
         # numbers positions within the request's own allocation (the reference
         # has no modulo because its positions always are), and it still stops a
         # stray absolute position from aliasing into the next request's slice.
-        state_cache_block_num = (
-            state_input_positions //
-            state_block_size) % max_num_state_blocks_per_req + (
-                token_to_req_indices * max_num_state_blocks_per_req)
+        state_cache_block_num = (state_input_positions // state_block_size
+                                 ) % max_num_state_blocks_per_req + (
+                                     token_to_req_indices *
+                                     max_num_state_blocks_per_req)
         state_cache_block_offset = state_input_positions % state_block_size
         slot_mapping = (
             state_block_tables[state_cache_block_num] * state_block_size +
@@ -681,6 +681,37 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 )
             except Exception as exc:  # debug only: never fail a run
                 logger.info("[DSV4_GEOM] dump failed: %s", exc)
+
+        # Synced kv_score dump (DSV4_DUMP_PAGES=1, debug layer only): the v2
+        # page dumps showed decode-written STATE rows differ 30-70% from
+        # prefill's while SWA rows (same nominal hidden_states) are
+        # byte-identical -- impossible if both paths really consume the same
+        # tensor. This dumps the exact kv_score the op receives, through
+        # _dump_to_numpy (sync-first read; plain .cpu() on lazy activations
+        # fabricates values, see deepseek_v4_patch.py).
+        if (os.getenv("DSV4_DUMP_PAGES") == "1" and not _is_tracing()
+                and getattr(self, "head_dim", None) == 512
+                and k_cache_prefix_key is not None
+                and f"layers.{os.getenv('DSV4_DEBUG_LAYER', '2')}."
+                in str(k_cache_prefix_key)):
+            from vllm.distributed.parallel_state import \
+                get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                import numpy as np
+
+                from vllm_torchtpu.models.vllm.deepseek_v4_patch import \
+                    _dump_to_numpy
+                _step = getattr(self, "_dsv4_kvscore_step", 0)
+                self._dsv4_kvscore_step = _step + 1
+                _root = os.path.join(
+                    os.getenv("DSV4_DUMP_ROOT",
+                              os.path.expanduser("~/workspace/scratch")),
+                    "page_dumps", os.getenv("DSV4_DUMP_LABEL", "run"))
+                os.makedirs(_root, exist_ok=True)
+                np.savez_compressed(os.path.join(
+                    _root, f"kvscore_step{_step:03d}.npz"),
+                                    kv_score=_dump_to_numpy(kv_score),
+                                    positions=_dump_to_numpy(positions))
 
         updated_cache = self.compressor_op(
             kv_score,
