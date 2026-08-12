@@ -125,6 +125,46 @@ page-dump run (running now; `analyze_pagedumps.py`) bounds the layer-2
 input drift (q/kv) at the step each slot was written: tiny q/kv drift +
 18% row difference = the state→compress path manufactures the error.
 
+### REFRAMED (00:20, page dumps): the compressor was an echo — the decode
+### FORWARD PATH itself drifts
+
+`combined_L2` page dumps, q/kv at layer 2, decode step 0 (qpos 17) vs the
+TF prefill of the identical 18-token context:
+
+    instrument control (prefill ctx18 vs ctx19, shared rows): max diff 0.0
+        -- prefill is BIT-DETERMINISTIC, zero noise floor
+    decode step 0 vs prefill, same token/history/caches:
+        q:  max 2.16, mean 0.19, 65% of elements > 0.1
+        kv: max 0.53, mean 0.13, 51% of elements > 0.1
+
+At decode step 0 there exists NO decode-written cache row anywhere — the
+entire difference is manufactured by the decode forward path through
+layers 0-2 (batch of 16 padded tokens, single real row) vs the prefill
+path (32-padded batch). 10-30% typical element drift through 2.5 layers is
+far beyond bf16 shape variance. The compressed-row differences convicted
+earlier are the echo of these drifted activations (kv_score = drifted
+hidden states); every decode step freezes one drifted row into the caches,
+which is the observed accumulation law.
+
+Puzzle to keep honest about: step-0 LOGITS agree with prefill to ~0.02-0.12
+despite the layer-2 drift — either the network damps one layer's
+perturbation, or the drift partially cancels downstream. The growth of
+output damage comes from cache accumulation, not from single-step logit
+sensitivity.
+
+**In flight: the layer-0 discriminator** (`combined_L0` dumps). At decode
+step 0, layer 0's q/kv involve NO caches and NO upstream layers (embedding
+-> norm -> linear -> rope, all per-token). Decode must match prefill
+essentially exactly there.
+- L0 drifts too => the decode BATCH itself is contaminated (padded rows /
+  embedding / hyper-connection streams) — audit decode batch construction.
+- L0 clean => the drift is created inside layers 0-1's cross-token ops.
+  Prime suspects: (a) fp8 activation-quantization scales computed across
+  the batch, letting junk padded rows (decode padding is STALE data —
+  positions print as [17,1,2,3...]) distort real rows' scales; prefill
+  padding is clean. (b) MoE EP capacity: 15 junk tokens routing to random
+  experts could evict the real token's expert slots at decode only.
+
 Also checked and refuted statically (do not re-chase):
 `pack_state_cache`/`unpack_state_cache` round-trip lossiness — both are
 pure uint8<->f32 bitcasts, byte-lossless and idempotent, so the per-step
