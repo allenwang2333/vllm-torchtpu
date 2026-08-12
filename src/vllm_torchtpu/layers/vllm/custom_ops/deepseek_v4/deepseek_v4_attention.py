@@ -1742,16 +1742,19 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                                       _dump_step_now)
 
         # DSV4_ZERO_PAD=1: zero the batch's PADDING rows of q/kv before the
-        # kernel. Measured (l0attn dumps): our decode padding rows carry
-        # full-magnitude STALE data (prefill leftovers; junk q rows |x| mean
-        # 0.70 vs real row 0.59) while the reference stack's padding is
-        # zeros, and layer 0's attention output diverges ~50% from prefill
-        # with bit-equal real inputs. If zeroing the pads fixes generation,
-        # the kernel is padding-sensitive and stale pads are the root cause.
-        # Default ON since 2026-08-12: proven root cause (stale padding rows
-        # contaminate the padding-sensitive kernel; see
-        # docs/dsv4_decode_race_postmortem.md). DSV4_ZERO_PAD=0 opts out for
-        # A/B only.
+        # kernel. History: this mask changed generation when the attention
+        # op was (wrongly) running with logical_page_size=4 -- the padding
+        # "sensitivity" it mitigated was that geometry bug, not a kernel
+        # property (see docs/dsv4_decode_race_postmortem.md, "ROOT CAUSE
+        # FOUND OFFLINE"). With the correct page size the mask is measured
+        # INERT: the 13-prompt pool A/B (pool_zp0 vs pool_lpsfix, 20260812)
+        # is logprob-identical at every step with it on or off, and the
+        # lps=128 kernel is pad-clean in isolation
+        # (scratchpad/kernel_micro_repro.py). Kept default-ON as cheap
+        # hygiene only: our runner does leave full-magnitude stale data in
+        # pad rows (unlike the reference, whose pads are zeros), and two
+        # elementwise multiplies per layer buy insurance against any future
+        # pad-sensitive consumer. DSV4_ZERO_PAD=0 opts out.
         if os.getenv("DSV4_ZERO_PAD", "1") == "1" and swa_query_start_loc is not None \
                 and swa_request_distribution is not None:
             _nvalid = swa_query_start_loc[swa_request_distribution[2]]
