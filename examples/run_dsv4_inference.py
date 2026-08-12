@@ -5,40 +5,13 @@ os.environ["MODEL_IMPL_TYPE"] = "vllm"
 os.environ["VLLM_NO_USAGE_STATS"] = "1"
 os.environ.setdefault("VLLM_FP4_CACHE_DIR", "/dev/shm/dsv4-flash-real-fp4")
 
-import importlib.util
-import sys
-
-# Dynamic hot-patch to import our local patched pallas module before any vllm imports occur.
-# This registers output_partition_specs support on GKE without modifying the container site-packages.
-try:
-    patch_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src",
-        "vllm_torchtpu", "patches", "pallas_patched.py")
-    if os.path.exists(patch_path):
-        # 1. Import original module and submodule
-        import torch_tpu._internal.pallas as original_pallas
-        import torch_tpu._internal.pallas.pallas as original_pallas_submodule
-
-        # 2. Load our patched module as a temporary standalone module
-        spec = importlib.util.spec_from_file_location("patched_pallas_temp",
-                                                      patch_path)
-        patched_module = importlib.util.module_from_spec(spec)
-        sys.modules["patched_pallas_temp"] = patched_module
-        spec.loader.exec_module(patched_module)
-
-        # 3. Patch both package and submodule namespaces
-        for target in [original_pallas, original_pallas_submodule]:
-            target.jax_op = patched_module.jax_op
-            target.custom_jax_kernel = patched_module.custom_jax_kernel
-            target.JaxCallable = patched_module.JaxCallable
-            target.torch_placeholder = patched_module.torch_placeholder
-            target._convert_shape = patched_module._convert_shape
-
-        print(
-            f"=== [HOT PATCH] Successfully hot-patched pallas package and submodule from {patch_path} ==="
-        )
-except Exception as e:
-    print(f"=== [HOT PATCH ERROR] Failed to hot-patch pallas.py: {e} ===")
+# NOTE: this file used to hot-patch torch_tpu._internal.pallas from
+# src/vllm_torchtpu/patches/pallas_patched.py at startup. That file was
+# removed from the tree (upstream torch_tpu covers it), and the loader's
+# os.path.exists guard made the whole block a silent no-op -- while its
+# presence misled the 20260812 decode-corruption investigation into a
+# false "hot-patched bridge" premise (docs/dsv4_decode_race_postmortem.md).
+# Stock torch_tpu pallas is what actually runs; keep it that way.
 
 from vllm import LLM, SamplingParams
 
