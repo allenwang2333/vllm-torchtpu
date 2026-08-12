@@ -290,3 +290,18 @@ tails likely belongs to this. ~5-logit error at a fixed 22-token context,
 reproducible, instrumented: hunt with the exact playbook that found #1
 (teacher-force this prompt, layer curve, etc.). Indexer/CSA-selection
 inert at this length, so it is none of the previously exonerated paths.
+
+## Root cause #2 hunt (phase 0, offline): the onset is a CLIFF at a group boundary
+
+Fixed-build water_cycle ours@ref per step: EXACTLY 0.0 for steps 0-7
+(including unsaturated steps, gaps 3-4), then -1.125 at step 8 sharp.
+Step 8's query = position 23 = a %4==3 CSA group boundary: the step where
+compressed row 5 (positions 20-23, all decode-generated) completes. With
+padding clean, defect #2 points back at the compressed-row path -- but now
+with a razor instrument (exact onset step) and clean inputs.
+
+Plan (2 TPU loads): (1) ours: water_cycle decode + TF-14 + XLA regression,
+with layer curve + L2 page dumps + ZERO_PAD, one load; (2) reference:
+water_cycle + SELF_TF + layer probe. Production fix for #1 (runner buffer
+zeroing + default-on mask) implemented host-side during the loads, verified
+in the same next run.
