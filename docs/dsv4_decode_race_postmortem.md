@@ -126,3 +126,23 @@ If still broken: the concurrency source is inside torch-tpu's own
 execution (allocator reuse without host-visible async), and the next probe
 is dumping kv_score computed at the TOP of attn_gemm (before
 fused_wqa_wkv's dispatch can flush anything).
+
+**#2 — DSV4_ASYNC_SCHEDULING=0: FAILED, byte-identical to baseline (md5
+ab92f8f5).** Confirmed "Asynchronous scheduling is disabled" in the log.
+Combined with #1, the corruption is **deterministic** — two interventions
+that radically change timing produced bit-identical outputs. Not a race:
+the mutation is ORDERED between the two consumers' value capture, and the
+only code between those adjacent lines is fused_wqa_wkv's own dispatch.
+Refined suspect: **input-buffer donation/reuse by the quantized-linear
+custom op** — the op consumes the true value (byte-perfect SWA rows), then
+its dispatch clobbers the buffer for every later reader (the bare matmuls
+AND all synced dumps, which were always taken after it and always read
+polluted bytes — consistent with every observation including both failed
+interventions).
+
+**#3 — DSV4_KVSCORE_FIRST=1 (4cd1123e): queued.** Computes kv_score and
+the indexer projections BEFORE fused_wqa_wkv. If generation flips
+prompt-faithful, this is simultaneously the mechanism proof and the
+minimal fix; the principled follow-up is fixing the donation in the
+quantized-linear op path (and the same audit for every other custom-op
+call site whose input is later re-read).
