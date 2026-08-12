@@ -125,6 +125,14 @@ def main():
         enable_prefix_caching=os.getenv("DSV4_ENABLE_PREFIX_CACHING",
                                         "1") == "1",
         enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "0") == "1",
+        # DSV4_ASYNC_SCHEDULING=0 disables vLLM's async scheduling
+        # (auto-enabled when the executor supports it). Intervention #2 for
+        # the decode-corruption race: async scheduling preps step s+1's
+        # buffers while step s's deferred side-effect branches (compressor
+        # kv_score) are still unmaterialized -- see
+        # docs/dsv4_decode_race_postmortem.md.
+        async_scheduling=(False if os.getenv("DSV4_ASYNC_SCHEDULING") == "0"
+                          else None),
         # Auto-prefetch only engages for network filesystems (NFS/Lustre);
         # our checkpoint sits on local EXT4 so it never kicks in even though
         # it comfortably fits in RAM. Force it on request.
