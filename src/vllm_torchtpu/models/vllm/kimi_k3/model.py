@@ -366,4 +366,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # load_weights fully consumes the generator before returning, so
         # loaded_experts is complete when the union is taken.
         ordinary_loaded = loader.load_weights(_ordinary_weights())
+
+        for module in self.modules():
+            if isinstance(module, KimiDeltaAttention):
+                module.process_weights_after_loading()
         return loaded_experts | ordinary_loaded
