@@ -695,6 +695,26 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         compressor = getattr(self.mla_attn, "compressor", None)
         if compressor is not None:
             kv_score = hidden_states @ compressor.fused_wkv_wgate.weight.T
+            # DSV4_KVSCORE_SYNC=1 -- intervention experiment for the decode
+            # corruption. Root-cause chain (2026-08-12, page dumps v2-v4 +
+            # offline weight check): at decode, this kv_score materializes
+            # against a MUTATED hidden_states buffer -- offline
+            # `dumped_hidden @ W` reproduces the polluted runtime kv_score at
+            # cos 0.999999 while fused_wqa_wkv of the same variable is
+            # byte-perfect (its consumer, the attention kernel, forces early
+            # materialization; kv_score's only consumer is the compressor's
+            # cache side effect, which nothing in the step's logits depends
+            # on, so the lazy engine defers it past an untracked in-place
+            # stream-buffer write). Forcing materialization here pins the
+            # value at program order. If this fixes generation, the mechanism
+            # is proven by intervention; the proper fix is to stop the
+            # in-place aliasing, not to keep this sync.
+            if os.getenv("DSV4_KVSCORE_SYNC") == "1" and not _is_tracing():
+                try:
+                    from torch_tpu._internal import sync as _sync
+                    _sync.synchronize(kv_score, wait=True)
+                except Exception:
+                    pass
         else:
             kv_score = None
 
