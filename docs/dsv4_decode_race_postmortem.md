@@ -205,3 +205,32 @@ Corrections to earlier sections of this doc: the "untracked-mutation race"
 framing is retired; interventions 1-3 and their nulls are the evidence.
 The tier-2/tier-3 fixes aimed at ordering are moot; the audit list and the
 prevention tooling remain valid and used.
+
+## Injection point found (05:30): LAYER 0's block
+
+Per-layer hidden dumps (`layercurve` run, layers 0-4, decode step s row vs
+TF-control row for the same token):
+
+```
+L0 input: BIT-EQUAL at every step (max diff exactly 0)
+L1 input (= L0's output): cos 0.94 at decode step 0
+L2: 0.93   L3: 0.86   L4: 0.69   (step 0 -- depth-compounding,
+no step accumulation needed)
+```
+
+Layer 0 (SWA-only attention + hash MoE + MHC) turns a bit-identical input
+into a ~3%-divergent output at decode, and every subsequent layer adds
+more. Candidate per-layer injection mechanism -- decode's single-query
+kernel path + fp8 cache reads vs prefill's ragged path + in-batch bf16 K/V
+-- is SHARED with the reference (same kernels), so the discriminating
+measurement is the reference's own curve: instrumented (mirror probe in
+tpu-inference's deepseek_v4_attention.py forward + DSV4_REF_SELF_TF in
+run_dsv4_needle_ref.py) and running.
+
+- Ref curve similar => this channel is normal-and-tolerated; the true
+  defect lies elsewhere and our TF-logprob agreement becomes the thing to
+  re-examine.
+- Ref curve flat (~0.999) => our layer block injects 10-30x more per-layer
+  noise than the identical-architecture reference block -- diff our layer
+  compute (MHC mixing epsilons, norm placement, hash-MoE dispatch) against
+  theirs with this exact number as the target.
