@@ -234,3 +234,24 @@ run_dsv4_needle_ref.py) and running.
   noise than the identical-architecture reference block -- diff our layer
   compute (MHC mixing epsilons, norm placement, hash-MoE dispatch) against
   theirs with this exact number as the target.
+
+## QUANTIFIED (05:45): our layer-0 block injects ~15-220x the reference's divergence
+
+Reference layer curve (identical probe via jax.debug.callback, same
+checkpoint, decode step 0): L0 bit-equal; L1-input cos 0.99973 (mean diff
+0.0007); L2 0.99914; L3 0.99048; L4 0.99157. The decode-vs-prefill
+asymmetry is inherent (shared kernels) but SMALL and non-compounding in
+the reference.
+
+Ours at the same points: L1 0.94016 (mean 0.011 -- 15x mean error, ~220x
+in 1-cos), then compounding to 0.685 by L4. Same bit-equal input, byte-
+equal kernels: the excess is manufactured in OUR layer-0 block between the
+kernel boundary and the block output (attention invocation glue, hash-MoE,
+or MHC mixing).
+
+Next split (in flight): layer-0 raw attention output decode-vs-control
+via DSV4_DUMP_PAGES attn_output at DSV4_DEBUG_LAYER=0.
+- attn out ~0.001 divergent, block out 0.011 => amplifier is our MoE/MHC
+  glue in the block.
+- attn out already 0.011 => our swa_only merge/sinks/scale invocation
+  deviates from the reference's despite equal inputs.
