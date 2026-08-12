@@ -690,11 +690,39 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         return attn_jax_op
 
     def attn_gemm(self, hidden_states):
+        # DSV4_KVSCORE_FIRST=1 -- intervention 3 for the deterministic decode
+        # corruption. Interventions 1 (host sync) and 2 (async scheduling
+        # off) were both byte-inert, so the corruption is NOT a timing race:
+        # the mutation is ordered between the two consumers' value capture,
+        # and the only thing executing between these adjacent lines is
+        # fused_wqa_wkv's own dispatch. Suspicion: the quantized-linear
+        # custom op donates/reuses its input buffer, clobbering
+        # hidden_states for every LATER reader (the bare matmuls, the synced
+        # dumps -- all taken after it and all polluted) while the op itself
+        # got the true value (byte-perfect SWA rows). Computing the bypass
+        # projections BEFORE fused_wqa_wkv captures the clean value; if
+        # generation becomes prompt-faithful this is both the proof and the
+        # minimal fix.
+        _kvscore_first = os.getenv("DSV4_KVSCORE_FIRST") == "1"
+        _pre = {}
+        if _kvscore_first:
+            _c = getattr(self.mla_attn, "compressor", None)
+            if _c is not None:
+                _pre["kv_score"] = (
+                    hidden_states @ _c.fused_wkv_wgate.weight.T)
+            if self.indexer is not None:
+                _pre["indexer_weights"] = self.indexer.weights_proj(
+                    hidden_states)[0]
+                _pre["indexer_kv_score"] = (
+                    hidden_states
+                    @ self.indexer.compressor.fused_wkv_wgate.weight.T)
+
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
 
         compressor = getattr(self.mla_attn, "compressor", None)
         if compressor is not None:
-            kv_score = hidden_states @ compressor.fused_wkv_wgate.weight.T
+            kv_score = (_pre["kv_score"] if _kvscore_first else
+                        hidden_states @ compressor.fused_wkv_wgate.weight.T)
             # DSV4_KVSCORE_SYNC=1 -- intervention experiment for the decode
             # corruption. Root-cause chain (2026-08-12, page dumps v2-v4 +
             # offline weight check): at decode, this kv_score materializes
@@ -754,9 +782,15 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                     num_rows=np.asarray(hidden_states.shape[0]))
 
         if self.indexer is not None:
-            indexer = self.indexer
-            indexer_weights, _ = indexer.weights_proj(hidden_states)
-            indexer_kv_score = hidden_states @ indexer.compressor.fused_wkv_wgate.weight.T
+            if _kvscore_first:
+                indexer_weights = _pre["indexer_weights"]
+                indexer_kv_score = _pre["indexer_kv_score"]
+            else:
+                indexer = self.indexer
+                indexer_weights, _ = indexer.weights_proj(hidden_states)
+                indexer_kv_score = (
+                    hidden_states
+                    @ indexer.compressor.fused_wkv_wgate.weight.T)
         else:
             indexer_weights = None
             indexer_kv_score = None
