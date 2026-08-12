@@ -7,8 +7,8 @@ MODEL="zai-org/GLM-5.2-FP8"
 # v7x-16 hosts have no attached disk, so weights stream from GCS via
 # --load-format runai_streamer.
 MODEL_URI="${MODEL_URI:-gs://tpu-commons-ci/glm/GLM-5.2-FP8}"
-TENSOR_PARALLELISM=16
-DATA_PARALLELISM=1
+TENSOR_PARALLELISM=8
+DATA_PARALLELISM=2
 ENABLE_EP=true
 # No --quantization: the FP8 checkpoint self-describes.
 QUANTIZATION=""
@@ -45,7 +45,7 @@ KV_CACHE_DTYPE="fp8"
 # FLASH_ATTN_MLA whenever use_mla is set.
 
 # Parser flags for tool call / reasoning compatibility.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
 
 # MoE headroom analysis note:
 # FORCE_MOE_RANDOM_ROUTING=1 can be set in the environment for headroom analysis
