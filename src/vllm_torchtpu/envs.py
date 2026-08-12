@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_K3_FUSED_MOE_COMBINE: bool = False
+    TPU_K3_HOST_REPLICATED_SHARED_EXPERTS: bool = False
+    TPU_K3_EARLY_SHARED_ALL_REDUCE: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -260,6 +262,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # latency-bound collective launch per MoE layer. Disabled by default.
     "TPU_K3_FUSED_MOE_COMBINE":
     env_bool("TPU_K3_FUSED_MOE_COMBINE", default=False),
+    # Replicate K3's shared experts between TPU hosts and shard each copy only
+    # across the eight chips in that host. This trades HBM for a smaller GEMM
+    # shard and removes the shared expert's cross-host all-reduce.
+    "TPU_K3_HOST_REPLICATED_SHARED_EXPERTS":
+    env_bool("TPU_K3_HOST_REPLICATED_SHARED_EXPERTS", default=False),
+    # Reduce the shared expert at the end of its MLP and add it outside the
+    # generic MoE runner. This exposes that collective to the compiler while
+    # routed expert computation is still independent.
+    "TPU_K3_EARLY_SHARED_ALL_REDUCE":
+    env_bool("TPU_K3_EARLY_SHARED_ALL_REDUCE", default=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":

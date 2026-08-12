@@ -4,14 +4,40 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
+import vllm.model_executor.layers.linear as linear_module
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+
+@contextmanager
+def _linear_tp_override(tp_rank: int, tp_size: int):
+    """Construct standard vLLM linears with a subgroup's TP geometry.
+
+    The linear classes store the resolved rank and size on the layer and its
+    parameters, so the temporary override only affects construction and weight
+    loading continues to select the intended replicated shard.
+    """
+    old_rank = linear_module.get_tensor_model_parallel_rank
+    old_size = linear_module.get_tensor_model_parallel_world_size
+    linear_module.get_tensor_model_parallel_rank = lambda: tp_rank
+    linear_module.get_tensor_model_parallel_world_size = lambda: tp_size
+    try:
+        yield
+    finally:
+        linear_module.get_tensor_model_parallel_rank = old_rank
+        linear_module.get_tensor_model_parallel_world_size = old_size
 
 
 class SituAndMul(nn.Module):
@@ -48,23 +74,31 @@ class KimiMLP(nn.Module):
         reduce_results: bool = True,
         situ_beta: float | None = None,
         situ_linear_beta: float | None = None,
+        tp_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=f"{prefix}.down_proj",
-        )
+        self.tp_group = tp_group
+        tp_context = (_linear_tp_override(tp_group.rank_in_group,
+                                          tp_group.world_size)
+                      if tp_group is not None else _linear_tp_override(
+                          linear_module.get_tensor_model_parallel_rank(),
+                          linear_module.get_tensor_model_parallel_world_size()))
+        with tp_context:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size, intermediate_size],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=(reduce_results and tp_group is None),
+                prefix=f"{prefix}.down_proj",
+            )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "situ":
@@ -79,6 +113,8 @@ class KimiMLP(nn.Module):
         hidden_states, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
+        if self.tp_group is not None:
+            hidden_states = self.tp_group.all_reduce(hidden_states)
         return hidden_states
 
 

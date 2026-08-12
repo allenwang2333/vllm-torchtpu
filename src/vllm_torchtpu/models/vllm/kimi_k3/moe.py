@@ -9,6 +9,8 @@ from torch import nn
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
+from vllm.distributed.parallel_state import (GroupCoordinator, get_world_group,
+                                             init_model_parallel_group)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -19,6 +21,34 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 
 from .layers import KimiMLP
+
+
+_K3_HOST_TP_GROUP: GroupCoordinator | None = None
+
+
+def _get_k3_host_tp_group() -> GroupCoordinator:
+    """Create four independent, host-local TP8 groups for a v7x-32 slice."""
+    global _K3_HOST_TP_GROUP
+    if _K3_HOST_TP_GROUP is not None:
+        return _K3_HOST_TP_GROUP
+
+    world = get_world_group()
+    host_tp_size = 8
+    if world.world_size != 32 or world.local_rank != world.rank % host_tp_size:
+        raise ValueError(
+            "TPU_K3_HOST_REPLICATED_SHARED_EXPERTS requires a 4-host v7x-32 "
+            "deployment with eight contiguous global ranks per host")
+    group_ranks = [
+        list(range(start, start + host_tp_size))
+        for start in range(0, world.world_size, host_tp_size)
+    ]
+    _K3_HOST_TP_GROUP = init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=world.local_rank,
+        backend=world.torch_distributed_backend,
+        group_name="k3_host_tp",
+    )
+    return _K3_HOST_TP_GROUP
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -127,30 +157,45 @@ class KimiMoE(nn.Module):
                                    if self.routed_expert_up_proj is not None
                                    else None)
 
-        self.shared_experts = (KimiMLP(
-            hidden_size,
-            config.moe_intermediate_size * config.num_shared_experts,
-            config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.shared_experts",
-            reduce_results=False,
-            situ_beta=getattr(config, "activation_situ_beta", None),
-            situ_linear_beta=getattr(config, "activation_situ_linear_beta",
-                                     None),
-        ) if config.num_shared_experts > 0 else None)
-
         dp_size = 1
         pcp_size = 1
         if vllm_config is not None:
             parallel_config = vllm_config.parallel_config
             dp_size = parallel_config.data_parallel_size
             pcp_size = parallel_config.prefill_context_parallel_size
+        self.host_replicated_shared = (
+            envs.TPU_K3_HOST_REPLICATED_SHARED_EXPERTS
+            and config.num_shared_experts > 0 and self.tp_size == 32
+            and dp_size == 1 and pcp_size == 1)
+        self.early_shared_reduce = (
+            envs.TPU_K3_EARLY_SHARED_ALL_REDUCE
+            and config.num_shared_experts > 0 and self.tp_size > 1
+            and dp_size == 1 and pcp_size == 1
+            and not self.host_replicated_shared)
+        shared_tp_group = (_get_k3_host_tp_group()
+                           if self.host_replicated_shared else None)
+
+        self.shared_experts = (KimiMLP(
+            hidden_size,
+            config.moe_intermediate_size * config.num_shared_experts,
+            config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_experts",
+            reduce_results=self.early_shared_reduce,
+            situ_beta=getattr(config, "activation_situ_beta", None),
+            situ_linear_beta=getattr(config, "activation_situ_linear_beta",
+                                     None),
+            tp_group=shared_tp_group,
+        ) if config.num_shared_experts > 0 else None)
+
         # Fused single-collective combine (TPU_K3_FUSED_MOE_COMBINE): the
         # latent norm forces a reduction before up_proj, and the shared
         # experts provide the second reduction to share. Unsupported
         # configs (DP/PCP > 1, scaled routing) keep the two-reduce path;
         # KimiMoE never passes is_sequence_parallel, so SP cannot reach it.
         use_fused_combine = (envs.TPU_K3_FUSED_MOE_COMBINE
+                             and not self.host_replicated_shared
+                             and not self.early_shared_reduce
                              and self.routed_expert_norm is not None
                              and self.shared_experts is not None
                              and self.tp_size > 1 and dp_size == 1
@@ -176,7 +221,9 @@ class KimiMoE(nn.Module):
                                     None)
                             if config.hidden_act == "situ" else None)
         self.experts = FusedMoEFactory(
-            shared_experts=(None if self.fused_combine is not None else
+            shared_experts=(None if self.fused_combine is not None
+                            or self.host_replicated_shared
+                            or self.early_shared_reduce else
                             self.shared_experts),
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
@@ -226,6 +273,14 @@ class KimiMoE(nn.Module):
             latent_partial = self.experts(hidden_states=hidden_states,
                                           router_logits=router_logits)
             output = self.fused_combine(shared_partial, latent_partial)
+        elif self.host_replicated_shared or self.early_shared_reduce:
+            # The routed path performs its required global TP reduction. The
+            # shared path is already complete after either its host-local TP8
+            # reduce or its deliberately early global TP reduce.
+            shared_output = self.shared_experts(hidden_states)
+            routed_output = self.experts(hidden_states=hidden_states,
+                                         router_logits=router_logits)
+            output = shared_output + routed_output
         else:
             output = self.experts(hidden_states=hidden_states,
                                   router_logits=router_logits)
