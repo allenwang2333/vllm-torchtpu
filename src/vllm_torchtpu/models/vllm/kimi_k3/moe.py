@@ -19,6 +19,8 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.vllm.moe_hierarchical import \
+    hierarchical_moe_parallel_config
 
 from .layers import KimiMLP
 
@@ -220,32 +222,36 @@ class KimiMoE(nn.Module):
         situ_linear_beta = (getattr(config, "activation_situ_linear_beta",
                                     None)
                             if config.hidden_act == "situ" else None)
-        self.experts = FusedMoEFactory(
-            shared_experts=(None if self.fused_combine is not None
-                            or self.host_replicated_shared
-                            or self.early_shared_reduce else
-                            self.shared_experts),
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_token,
-            hidden_size=expert_hidden_size,
-            intermediate_size=padded_intermediate_size,
-            activation=config.hidden_act,
-            activation_situ_beta=situ_beta,
-            activation_situ_linear_beta=situ_linear_beta,
-            renormalize=config.moe_renormalize,
-            quant_config=quant_config,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            topk_group=config.topk_group,
-            prefix=f"{prefix}.experts",
-            scoring_func=config.moe_router_activation_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=config.routed_scaling_factor,
-            routed_input_transform=self.routed_expert_down_proj,
-            routed_output_transform=(None if self.fused_combine is not None
-                                     else routed_output_transform),
-            reduce_results=self.fused_combine is None,
-        )
+        # Optionally build the routed weights with EP between physical chips
+        # and TP between the two tensor cores on each chip.
+        with hierarchical_moe_parallel_config():
+            self.experts = FusedMoEFactory(
+                shared_experts=(None if self.fused_combine is not None
+                                or self.host_replicated_shared
+                                or self.early_shared_reduce else
+                                self.shared_experts),
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_token,
+                hidden_size=expert_hidden_size,
+                intermediate_size=padded_intermediate_size,
+                activation=config.hidden_act,
+                activation_situ_beta=situ_beta,
+                activation_situ_linear_beta=situ_linear_beta,
+                renormalize=config.moe_renormalize,
+                quant_config=quant_config,
+                use_grouped_topk=config.use_grouped_topk,
+                num_expert_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                prefix=f"{prefix}.experts",
+                scoring_func=config.moe_router_activation_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=config.routed_scaling_factor,
+                routed_input_transform=self.routed_expert_down_proj,
+                routed_output_transform=(
+                    None if self.fused_combine is not None else
+                    routed_output_transform),
+                reduce_results=self.fused_combine is None,
+            )
         if self.fused_combine is not None:
             assert self.experts.moe_config.skip_final_all_reduce
         if padded_intermediate_size != config.moe_intermediate_size:

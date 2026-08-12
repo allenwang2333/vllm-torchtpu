@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_K3_FUSED_MOE_COMBINE: bool = False
     TPU_K3_HOST_REPLICATED_SHARED_EXPERTS: bool = False
     TPU_K3_EARLY_SHARED_ALL_REDUCE: bool = False
+    TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -315,6 +316,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Hierarchical MoE parallelism: expert-parallel between chips,
+    # tensor-parallel between the two chiplets of a chip. Off by
+    # default; it helps only at low concurrency, where the MoE is
+    # weight-bandwidth bound and the per-device expert load is badly
+    # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
+    "TPU_MOE_HIERARCHICAL_EP":
+    env_bool("TPU_MOE_HIERARCHICAL_EP"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
