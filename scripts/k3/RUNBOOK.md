@@ -234,6 +234,10 @@ when they do not initialize the TPU plugin.
   names such as `custom_call_target="X64SplitHigh"` are not escaped. It can
   also emit one malformed gRPC `event_args` value. Repair only those string
   fields in a streaming parser; do not drop device events.
+- Stopping a distributed Torch profile can take roughly 30--60 seconds after
+  the requested 15 iterations while all ranks merge and flush traces. During
+  that time the in-flight completion can stall. Do not infer its endpoint
+  TPOT from that profiled request; use the separate canonical benchmark.
 - Do not add durations from the two TPU-core lanes or nested async-copy events
   as wall time. Use interval unions for occupancy and one consistent XLA-op
   lane for paired family comparisons. The former 1.387 ms "idle" residual was
@@ -247,23 +251,24 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 was intentionally left allocated, but Slurm controller RPC
-became unresponsive after the bidirectional trial: `squeue` and `scontrol`
-time out even though the controller host's TCP port is reachable. Verify job
-602 when the controller recovers; never cancel that allocation. The exact
-vLLM server PID 2965616 was stopped. Because `scancel 602.67` could not reach
-the controller, the four exact `ray start` ancestors for step `602.67` were
-terminated through a Ray task on their own hosts and all four step tasks then
-drained. A process check shows no local `ray start`, `vllm serve`,
-`EngineCore`, or `RayWorkerProc`; there is no live endpoint now. Start a fresh
-four-host Ray step before the next experiment, using the allocation's new head
-address if it changes. Stop only that new step/server afterward.
+Allocation 602 expired at its 24-hour limit. Replacement allocation 664 is
+running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
+IP `10.13.232.26`. A four-host Ray cluster is live in overlapping step
+`664.8`, with temporary directory `/tmp/ray-k3-job664-mut`. No vLLM server is
+currently running. Those workers imported the now-removed input-mutation
+diagnostic, so they are stale: cancel exactly `664.8`, start fresh Ray workers,
+and verify all 32 TPU resources before the next server. Preserve parent
+allocation 664. The rejected diagnostic used cache
+`/mnt/scratch/kimi-k3-b1-keep-input-mutations` and profile namespace with the
+same name plus `-profile`.
 
-The failed Slurm status checks and safe recovery sequence are:
+Current status checks are:
 
 ```bash
-timeout 12s squeue -j 602 -o '%.18i %.9T %.10M %.6D %R'
-timeout 12s scontrol show job 602
+timeout 12s squeue -j 664 -o '%.18i %.9T %.10M %.6D %R'
+timeout 12s squeue -s -j 664
+curl --max-time 3 -sS -o /dev/null -w '%{http_code}\n' \
+  http://10.13.232.26:8000/health
 ps -eo pid,ppid,stat,etime,args | \
   rg 'ray start|vllm serve|api_server|EngineCore|RayWorkerProc'
 ```
@@ -373,10 +378,32 @@ logical devices and replica groups of 32, four, or two. Leave
 `xla_tpu_inference_short_all_reduce_max_tensor_chunks=0`. Milestone 59 records
 the `readelf`, `objdump`, and flagfile commands and the upgrade/address caveat.
 
-The next experiment after Slurm recovery is the interaction between the exact
-PR #410 fused MoE combine and the newly accepted compiler settings. The patch
-is already present and defaults off; no source edit is required. After starting
-fresh Ray workers with the normal launcher environment, use:
+The exact PR #410 fused MoE combine interaction is complete and rejected. The
+patch remains present but defaults off. Its prerequisite collective-layout
+screen can be reproduced with:
+
+```bash
+export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true'
+srun --jobid="$K3_JOB_ID" --overlap -N4 -n4 --ntasks-per-node=1 \
+  --unbuffered --export=ALL bash -lc '
+    cd /mnt/lustre/homes-x86/woosuk/workspace/vllm-torchtpu-4
+    export PATH="$PWD/.venv/bin:$PATH"
+    export TPU_ACCELERATOR_TYPE=tpu7x-32
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export JAX_PLATFORMS=
+    .venv/bin/python \
+      benchmarks/kernels/benchmark_kimi_k3_allreduce_layout.py \
+      --iterations 1000 --samples 7
+  '
+```
+
+The completed job-664 probe printed `hlo_matches_expected=true` for both paths.
+Both selected `RotatedPincerShortEmitter`/`StrategyND`; medians were 19.331 us
+for the variadic tuple and 19.429 us for flat, a projected +0.0089 ms/decode
+for flat across 92 layers. Never use `--skip-hlo-validation` for an acceptance
+screen. The small negative result still required endpoint and trace validation
+because PR #410 changes more than collective layout. The full-model candidate
+launch and evaluation commands used were:
 
 ```bash
 export K3_RUN_NAME=kimi-k3-b1-pr410-fused-combine-bidirectional
@@ -402,6 +429,49 @@ bidirectional trace's compiler-created variadic TP32 tuple regressed by
 0.01834 ms, while the explicit fused path exposes one flat `[1,10752]`
 operand. Compare all-reduce shape-family time as well as endpoint TPOT. Restore
 `TPU_K3_FUSED_MOE_COMBINE=0` afterward unless the result is causally positive.
+
+The result was causally negative: the endpoint means were 15.19703 and
+15.19804 ms, and the stable executable mean was 14.90591 ms. The flat TP32
+family improved by 0.08876 ms/decode, but total all-reduce time regressed by
+0.10829 ms because the separate `[3584]` and `[128]` families slowed down.
+Milestone 61 has the exact breakdown and latest trace path. Keep the default
+zero.
+
+The next runtime diagnostic tested whether KDA input-state writebacks could be
+kept inside the compiled executable. It is rejected and its temporary source
+was removed, but these are the exact launch and measurement commands for the
+record. They assume the standard cache/profile exports above plus fresh Ray
+workers:
+
+```bash
+export K3_RUN_NAME=kimi-k3-b1-keep-input-mutations
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+TPU_KEEP_INFERENCE_INPUT_MUTATIONS=1 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+NUM_PROMPTS=1 NUM_WARMUPS=0 \
+  OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-one \
+  scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
+```
+
+The single 1,000-token result was 29.99 ms mean TPOT. A focused trace was
+captured by starting one `curl_isl1_osl1k.sh` request, waiting for three engine
+iterations, calling `start_profile.sh`, waiting for 15 more iterations, and
+calling `stop_profile.sh`; this avoids the canonical profiler helper's two
+warmups and second capture when a candidate is already decisively negative.
+The rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-keep-input-mutations-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3169093.1786640594153779741.pt.trace.json.gz`.
+It shows 17 stable 29.726 ms executables and 24 full-state HLO copies totaling
+14.6079 ms. The accepted trace's 0.13437 ms gap instead has 23 host
+`aten::copy_` mutation replays. Do not recreate this flag: retaining mutations
+in XLA trades approximately 0.134 ms of host dispatch for approximately 14.6
+ms of device copies and transiently stressed program memory. Future work must
+batch or alias the runtime writebacks without materializing tensor copies.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of

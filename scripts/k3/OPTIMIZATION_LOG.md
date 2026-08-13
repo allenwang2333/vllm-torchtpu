@@ -2119,6 +2119,155 @@ the regressed TP2 up path remains disabled.
     rediscover it with `readelf` after an upgrade. Revisit the flag only on an
     eight-device slice/group or after a libtpu build broadens the selector.
     No source or launcher setting changed for this rejected idea.
+60. Added a fast, four-host screening benchmark for the next PR #410
+    interaction:
+    `benchmarks/kernels/benchmark_kimi_k3_allreduce_layout.py`. It compares a
+    dependent loop of adjacent `[1,7168]` and `[1,3584]` BF16 psums against one
+    concatenated `[1,10752]` BF16 psum on the exact TP32 device order emitted
+    by the current K3 executable. The loop lives inside one compiled program,
+    amortizing Python/runtime dispatch, and reports seven device-loop samples
+    plus their median difference.
+
+    The probe refuses to time by default unless optimized HLO contains exactly
+    one all-reduce with the expected operand shape(s). This matters because two
+    unmerged reductions would not model the current compiler-created variadic
+    tuple, and a backend-promoted FP32 reduction would not model the K3 BF16
+    operation. A one-device CPU mesh confirms the variadic and concatenated
+    functions return identical arrays; syntax compilation passes. CPU HLO
+    promotes the reduction to FP32, as expected, so CPU timing is deliberately
+    not reported as TPU evidence.
+
+    Allocation 602 later expired at its 24-hour limit. A replacement four-host
+    v7x-32 allocation, job 664, ran the guarded TPU screen successfully. Both
+    programs printed `hlo_matches_expected=true`; optimized HLO contained one
+    BF16 variadic all-reduce for the tuple and one BF16 array all-reduce for
+    the flat operand. Both selected `RotatedPincerShortEmitter` with
+    `StrategyND`, so flattening did not unlock a different backend emitter.
+
+    Seven 1,000-iteration device-loop samples measured a 19.331 us variadic
+    median and a 19.429 us flat median. The flat operand was 0.097 us slower
+    per adjacent pair, projecting to about +0.0089 ms over 92 decoder layers.
+    This is a small negative screen rather than grounds for an early static
+    rejection: PR #410 also changes whole-model scheduling and fusion, so its
+    already-planned full-model interaction run was launched. The exact screen
+    command was:
+
+    ```bash
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true'
+    srun --jobid=664 --overlap -N4 -n4 --ntasks-per-node=1 \
+      --unbuffered --export=ALL bash -lc '
+        cd /mnt/lustre/homes-x86/woosuk/workspace/vllm-torchtpu-4
+        export PATH="$PWD/.venv/bin:$PATH"
+        export TPU_ACCELERATOR_TYPE=tpu7x-32
+        export XLA_PYTHON_CLIENT_PREALLOCATE=false
+        export JAX_PLATFORMS=
+        .venv/bin/python \
+          benchmarks/kernels/benchmark_kimi_k3_allreduce_layout.py \
+          --iterations 1000 --samples 7
+      '
+    ```
+
+    This is a screening result only. Even a favorable flat-layout median must
+    be followed by the planned full-model two-run benchmark and trace because
+    PR #410 also changes layout, scheduling, RMSNorm/up-projection placement,
+    and program size. Never use `--skip-hlo-validation` for an acceptance run.
+61. Re-tested the exact PR #410 fused MoE combine on top of async collective
+    merging and bidirectional all-reduce decomposition. Fresh allocation 664,
+    Ray workers, cache namespace
+    `/mnt/scratch/kimi-k3-b1-pr410-fused-combine-bidirectional`, and
+    `TPU_K3_FUSED_MOE_COMBINE=1` were used. The two endpoint runs measured:
+
+    | Run | Mean TPOT | Median TPOT | P99 TPOT |
+    |---|---:|---:|---:|
+    | first | 15.19703 ms | 15.19633 ms | 15.20928 ms |
+    | repeat | 15.19804 ms | 15.19868 ms | 15.20708 ms |
+
+    Their 15.19753 ms pair average regresses 0.07875 ms from the accepted
+    15.11879 ms pair. The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-pr410-fused-combine-bidirectional-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3054790.1786638279481968652.pt.trace.json.gz`.
+    After excluding its one 19.78574 ms profiler-boundary/warmup executable,
+    18 stable model executables average 14.90591 ms. That is 0.07116 ms slower
+    than the accepted bidirectional trace's 14.83475 ms and explains nearly
+    all of the endpoint regression. Stable executable starts are 15.04232 ms
+    apart and the mean end-to-next-start gap is 0.13628 ms. Primary plus async
+    device intervals cover 14.83790 ms, leaving only 0.06801 ms genuinely
+    uncovered; the regression is device work, not input preparation or idle.
+
+    The HLO-visible all-reduce count remains 348/decode, but total primary-lane
+    all-reduce duration rises from 4.94817 to 5.05646 ms (+0.10829 ms):
+
+    | Shape family | Calls/decode | accepted | PR #410 | Change |
+    |---|---:|---:|---:|---:|
+    | `[1,7168]` | 95 | 1.81566 ms | 1.81818 ms | +0.00252 ms |
+    | tuple `[1,7168] + [1,3584]` / flat `[1,10752]` | 92 | 2.39450 ms | 2.30574 ms | -0.08876 ms |
+    | `[3584]` | 92 | 0.56034 ms | 0.73288 ms | +0.17254 ms |
+    | `[128]` | 69 | 0.17767 ms | 0.19966 ms | +0.02199 ms |
+
+    Flattening helps its intended TP32 family in the full graph, but its
+    scheduling/layout interaction makes the independent TP4 latent-down and
+    TP2 KDA reductions slower by more, producing a net regression. This also
+    explains why the isolated probe was only a screen: it selected the same
+    emitter and predicted a tiny flat penalty, while the full graph changed
+    the surrounding schedule. Keep `TPU_K3_FUSED_MOE_COMBINE=0`; the
+    implementation remains available only for future compiler/hardware
+    interaction tests. The launch, benchmark, profile, cache, sampling, and
+    trace-repair caveats are recorded in `RUNBOOK.md`.
+62. Screened additional installed-libtpu all-reduce controls with the guarded
+    four-host layout benchmark from milestone 60 before considering another
+    full-model compile. Native bidirectional decomposition remained the same
+    `RotatedPincerShortEmitter`/`StrategyND` path (19.378 us variadic versus
+    19.476 us flat), so it does not fix the flat-layout interaction in PR
+    #410. `--xla_tpu_use_routing_table_indices_in_all_reduce=true` and
+    `--xla_tpu_use_tree_reduce=true` were accepted but did not change the
+    selected emitter/configuration or materially move the control timings.
+    `--xla_tpu_small_all_reduce_binomial_threshold_bytes=32768` is not a
+    registered flag in this libtpu build. Finally,
+    `--xla_tpu_force_1d_allreduce_at_chunk_count=1` forced `StrategyRing` and
+    regressed the isolated medians to 94.817/95.183 us. None justified a
+    full-model run; do not add them to the launcher.
+
+    Each registered flag was tested by appending it to the accepted
+    `LIBTPU_INIT_ARGS` from milestone 60 and rerunning the same guarded `srun`
+    command. The benchmark's optimized-HLO shape assertion remained enabled.
+    Driver argv/config evidence is under `/tmp/tpu_logs_woosuk` for allocation
+    664; `/tmp` is ephemeral, so the disposition above is the durable record.
+63. Resolved the approximately 0.134 ms interval between accepted model
+    executables and tested the most direct removal attempt. On the accepted
+    bidirectional rank-0 Torch trace, a normal gap contains 23 serialized
+    host-side `aten::copy_` calls. The first begins 1.022 us after the model
+    executable ends; calls begin roughly every 5.5--6 us, normally last
+    2.3--2.6 us, and the final one ends 0.784 us before the next executable.
+    Their count matches the 23 KDA layers and the `69 = 3 x 23` `[128]`
+    all-reduces. Together with the KDA wrappers' `conv_state.copy_` and
+    `recurrent_state.copy_`, this strongly identifies them as AOTAutograd's
+    input-mutation replay/writeback sequence, not token input preparation.
+
+    A temporary, cache-keyed compiler diagnostic changed TorchTPU's
+    `keep_inference_input_mutations=False` to true only when
+    `TPU_KEEP_INFERENCE_INPUT_MUTATIONS=1`. Two focused compiler tests passed,
+    and a fresh Ray cluster/cache confirmed all ranks compiled the alternate
+    path. The exact one-request result was 29.99 ms mean TPOT for 1,000 output
+    tokens, versus the accepted 15.11879 ms pair. The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-keep-input-mutations-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3169093.1786640594153779741.pt.trace.json.gz`.
+    Excluding one 32.22376 ms profiler-boundary execution, 17 stable model
+    executions average 29.72604 ms and start 29.83863 ms apart, leaving a
+    0.11200 ms post-executable gap with zero `aten::copy_` calls. The graph
+    instead contains 24 large BF16 state copies totaling 14.6079 ms on the
+    primary TPU lane: 23 copies of `[37440,8,2,640]` plus one
+    `[38656,8,2,640]` copy. Thus moving mutation replay into the executable
+    materializes full device copies and explains essentially the whole
+    14.89 ms regression.
+
+    The diagnostic source and its tests were removed after the rejection;
+    the default compiler is unchanged. An alternative direct `set_` mutation
+    was also rejected before a TPU compile because Dynamo fullgraph export
+    reports `Getting an inplace view on a graph input is not supported`.
+    Some workers transiently logged a 17.25 GiB program-allocation failure
+    while loading this much larger executable before the server recovered,
+    another reason not to retain it. A future attack on the gap must batch or
+    rebind the runtime writebacks without turning them into HLO tensor copies.
+    The exact launch/evaluation commands and profiler-flush caveat are in
+    `RUNBOOK.md`.
 
 ## Forward plan
 
@@ -2167,28 +2316,30 @@ the regressed TP2 up path remains disabled.
    approximately 0.02 ms/decode GMM1-only opportunity, while splitting GMM2
    regressed at four or more active local routes. Revisit only with a static
    local-occupancy bound or a new full-width/pipelined kernel design.
-8. Treat the 0.13740 ms post-executable launch gap as a separate bounded
-   target. A model kernel change cannot remove it, and the remaining
-   endpoint-minus-start-spacing envelope is about 0.155 ms across separate
-   requests. Test runtime/dispatch changes only with device start spacing and
-   endpoint TPOT together; do not mislabel either interval input preparation.
+8. Treat the accepted trace's 0.13437 ms post-executable launch gap as a
+   separate bounded runtime target. It is filled by 23 serialized KDA
+   input-mutation `copy_` replays, not generic input preparation. Keeping the
+   mutations inside XLA removes those host calls but materializes 14.6079 ms
+   of full-state device copies and is rejected. Pursue only a batched runtime
+   replay or alias/rebind mechanism that preserves donation; validate device
+   start spacing and endpoint TPOT together.
 9. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
 10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
    budget and exact mixed-parameter/deterministic-generator semantics.
-11. When Slurm RPC recovers, re-test the already-implemented PR #410 fused
-   MoE combine on top of the accepted async merger and bidirectional
-   all-reduce settings. Its original 17.92 versus 17.93 ms result predates
-   both compiler wins. The current compiler forms a variadic
-   `bf16[1,7168] + bf16[1,3584]` TP32 reduction costing 2.39450 ms/decode;
-   bidirectional decomposition regressed that family by 0.01834 ms. PR #410
-   instead presents one flat `bf16[1,10752]` operand, which can select a
-   different backend emitter. This is a newly justified interaction test, not
-   a claim that the formerly neutral patch is now faster. Use
-   `TPU_K3_FUSED_MOE_COMBINE=1`, fresh caches, two endpoint runs, and a trace;
-   retain the default zero unless both endpoint and family evidence improve.
+11. Keep the re-tested PR #410 fused MoE combine disabled. Although its flat
+   `[1,10752]` TP32 reduction saves 0.08876 ms/decode versus the variadic
+   tuple, other all-reduce families regress by more: total all-reduce time
+   rises 0.10829 ms, stable executable time rises 0.07116 ms, and the endpoint
+   pair rises 0.07875 ms. Revisit only if a compiler change removes the TP4
+   `[3584]` scheduling regression; milestone 61 is the required control.
+12. Do not re-enable `keep_inference_input_mutations` for KDA state. Milestone
+   63 proves it doubles TPOT. If runtime mutation replay cannot be batched
+   without copies, return to the device critical path: the remaining credible
+   opportunities are fusing/reusing an existing collective, or a projection
+   shard whose compute saving exceeds its already measured subgroup cost.
 
 ## Current best and gap
 
