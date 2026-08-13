@@ -2268,6 +2268,42 @@ the regressed TP2 up path remains disabled.
     rebind the runtime writebacks without turning them into HLO tensor copies.
     The exact launch/evaluation commands and profiler-flush caveat are in
     `RUNBOOK.md`.
+64. Tested the donation-preserving runtime-rebind version of the KDA mutation
+    idea and rejected it. The diagnostic rewrote AOTAutograd's generated
+    mutation epilogue from `copy_` to `set_`, outside the XLA graph, and armed
+    the rewrite around the compiled callable's lazy first invocation. Two
+    focused CPU tests verified that the patch was scoped/restored and that
+    the updated tensor storage was aliased after the first lazy invocation.
+    The first implementation armed the rewrite only while constructing the
+    AOT wrapper, so it never observed the lazily generated epilogue; that
+    launch was stopped after distributed memory profiling made no progress
+    for more than six minutes. Only its exact server process and Ray step were
+    canceled; allocation 664 was preserved. A fresh 32-resource Ray session
+    was required after correcting the hook.
+
+    The corrected launch logged **324 generated `copy_` sites per rank**, not
+    the expected 23. That is 162 data-mutation inputs with leaf/non-leaf branch
+    variants, so a textual epilogue rewrite is much broader than the 23 KDA
+    calls visible in one accepted post-executable gap. The server nevertheless
+    constructed and completed all requests. Its one canonical four-request
+    result was 15.22068 ms mean TPOT (15.21427 median, 15.24210 p99), a
+    +0.10190 ms regression from the accepted 15.11879 ms pair average. The
+    result is under `results/kimi-k3-b1-runtime-state-rebind-v2`.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-runtime-state-rebind-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3357610.1786644450540916711.pt.trace.json.gz`.
+    Nineteen stable `region.268435455` device intervals have a 14.92480 ms
+    median, 0.10071 ms slower than the accepted trace's 14.82409 ms median.
+    The trace also contains 3,097 `aten::set_` calls (163/decode, 0.21854
+    ms/decode aggregate host duration) and 399 remaining `aten::copy_` calls
+    (21/decode, 0.22857 ms/decode aggregate). Thus broad storage rebinding
+    neither removes all runtime copies nor shortens the device interval, and
+    its host dispatch is itself larger than the original 0.13437 ms gap.
+    Because the candidate is causally slower and changes storage for many
+    non-KDA mutations, no second endpoint run was warranted. The diagnostic
+    compiler/platform/test code was removed after profiling; it is not a
+    launcher option. The exact commands, lazy-codegen trap, cache-format
+    warning, and trace-parser caveat are in `RUNBOOK.md`.
 
 ## Forward plan
 
@@ -2338,8 +2374,15 @@ the regressed TP2 up path remains disabled.
 12. Do not re-enable `keep_inference_input_mutations` for KDA state. Milestone
    63 proves it doubles TPOT. If runtime mutation replay cannot be batched
    without copies, return to the device critical path: the remaining credible
-   opportunities are fusing/reusing an existing collective, or a projection
-   shard whose compute saving exceeds its already measured subgroup cost.
+    opportunities are fusing/reusing an existing collective, or a projection
+    shard whose compute saving exceeds its already measured subgroup cost.
+13. Do not recreate a global AOT mutation-epilogue `copy_` to `set_` textual
+    rewrite. Milestone 64 shows it reaches 162 mutation inputs rather than the
+    23 targeted KDA gap calls, adds about 0.219 ms/decode of host `set_`
+    dispatch, leaves 21 `copy_` calls/decode, and regresses endpoint TPOT by
+    0.102 ms. A future runtime attempt must identify only the 23 donated KDA
+    buffers and batch their rebinds in native code; per-tensor Python/ATen
+    dispatch cannot fit the remaining 0.119 ms budget.
 
 ## Current best and gap
 

@@ -18,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 
 class TestTpuCompilerCache:
 
@@ -102,6 +104,55 @@ class TestTpuCompilerCache:
                 second = compute_tpu_compilation_hash(self._config())
 
         assert first != second
+
+    def test_runtime_state_rebind_codegen_is_scoped(self):
+        from torch._functorch._aot_autograd import subclass_codegen
+
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            _runtime_state_rebind_codegen
+
+        original_compile = subclass_codegen._compile_and_exec_source
+        source = "def apply(original, updated):\n    original.copy_(updated)"
+        original = torch.zeros(2)
+        updated = torch.ones(2)
+
+        with patch.dict(os.environ, {"TPU_K3_RUNTIME_STATE_REBIND": "1"}), \
+                _runtime_state_rebind_codegen():
+            generated = subclass_codegen._compile_and_exec_source(
+                source, {}, "apply", "mutation_epilogue")
+
+        assert subclass_codegen._compile_and_exec_source is original_compile
+        generated(original, updated)
+        updated.add_(1)
+        assert torch.equal(original, updated)
+
+    def test_runtime_state_rebind_is_armed_for_lazy_first_call(self):
+        from torch._functorch._aot_autograd import subclass_codegen
+
+        from vllm_torchtpu.compilation.tpu_compiler import \
+            _rebind_runtime_state_on_first_call
+
+        original_compile = subclass_codegen._compile_and_exec_source
+        generated = None
+
+        def lazy_compile(original, updated):
+            nonlocal generated
+            if generated is None:
+                source = ("def apply(original, updated):\n"
+                          "    original.copy_(updated)")
+                generated = subclass_codegen._compile_and_exec_source(
+                    source, {}, "apply", "mutation_epilogue")
+            generated(original, updated)
+
+        original = torch.zeros(2)
+        updated = torch.ones(2)
+        with patch.dict(os.environ, {"TPU_K3_RUNTIME_STATE_REBIND": "1"}):
+            wrapped = _rebind_runtime_state_on_first_call(lazy_compile)
+            wrapped(original, updated)
+
+        assert subclass_codegen._compile_and_exec_source is original_compile
+        updated.add_(1)
+        assert torch.equal(original, updated)
 
     def test_tpu_hash_covers_compiler_versions(self):
         from vllm_torchtpu.compilation.tpu_compiler import \

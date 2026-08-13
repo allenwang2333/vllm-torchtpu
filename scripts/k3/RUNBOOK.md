@@ -473,6 +473,59 @@ in XLA trades approximately 0.134 ms of host dispatch for approximately 14.6
 ms of device copies and transiently stressed program memory. Future work must
 batch or alias the runtime writebacks without materializing tensor copies.
 
+The follow-up runtime-storage-rebind diagnostic is also rejected and its
+temporary source was removed. It replaced generated mutation-epilogue
+`copy_` calls with `set_` only while the compiled callable performed its lazy
+first invocation. Reproduce the historical launch only from the milestone-64
+diagnostic commit, on fresh Ray workers, with:
+
+```bash
+export TPU_K3_RUNTIME_STATE_REBIND=1
+export K3_RUN_NAME=kimi-k3-b1-runtime-state-rebind-v2
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-bidirectional-allreduce
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
+TEMPERATURE=1 INCLUDE_SEED=0 \
+  OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+  PROF_DIR=$PROF_DIR scripts/k3/profile_isl1_osl1k.sh "$K3_HEAD_IP"
+```
+
+The focused pre-launch check was:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q \
+  tests/compilation/test_tpu_compiler.py -k runtime_state_rebind
+```
+
+It passed 2/2, but the full model logged 324 generated branch sites and the
+trace measured 163 `aten::set_` calls/decode. The 15.22068 ms endpoint mean
+regressed by 0.10190 ms; do not add this environment variable to the launcher.
+The latest trace is
+`/mnt/scratch/kimi-k3-b1-runtime-state-rebind-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3357610.1786644450540916711.pt.trace.json.gz`.
+
+Caveats for any successor:
+
+- AOT's mutation epilogue is generated lazily on the compiled callable's
+  first invocation. A context around compiler/wrapper construction silently
+  misses it; require an explicit rewrite-count log before benchmarking.
+- Existing serialized vLLM AOT entries may fail to load with
+  `a bytes-like object is required, not 'BundledAOTAutogradResult'` after a
+  compiler-source change. vLLM then recompiles; this is startup/cache-format
+  behavior, not steady-state TPOT.
+- Torch traces contain unescaped quotes inside some HLO names, so generic JSON
+  parsers can fail. Use the line-oriented streaming parser described in the
+  optimization log, and compare the same rank, capture position, category,
+  and outlier rule.
+- A source or actor-environment change requires fresh Ray workers. Cancel only
+  the exact Ray/server Slurm step, never the parent allocation.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do
