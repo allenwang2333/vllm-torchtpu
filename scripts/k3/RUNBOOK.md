@@ -528,6 +528,72 @@ Caveats for any successor:
 - A source or actor-environment change requires fresh Ray workers. Cancel only
   the exact Ray/server Slurm step, never the parent allocation.
 
+The shape audit that resolved what those mutations are is default-off source
+on the current experiment branch. Its focused check and exact successful
+launch were:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q \
+  tests/compilation/test_tpu_compiler.py -k runtime_state_mutation_audit
+
+export TPU_K3_RUNTIME_STATE_AUDIT=1
+export K3_RUN_NAME=kimi-k3-b1-runtime-state-audit
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-bidirectional-allreduce
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+scripts/k3/launch_kimi_k3_tp32_ep.sh
+```
+
+Rank 0 logged 162 records in
+`/tmp/ray-k3-job664-state-audit/session_latest/logs/worker-686b13f5806ed393f52e2275d1833bcd560b5bee4396667ae7bdb706-ffffffff-3438328.out`.
+That `/tmp` path is allocation-local and ephemeral; milestone 65 preserves the
+four aggregate families. To re-aggregate a live log:
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+from collections import Counter
+
+path = "<rank-0-worker-log>"
+for line in open(path):
+    if "K3 mutation audit: " in line:
+        records = json.loads(line.split("K3 mutation audit: ", 1)[1])
+        break
+counts = Counter((tuple(x["shape"]), x["dtype"], x["numel"])
+                 for x in records)
+print(len(records), counts)
+PY
+```
+
+Do not reuse the accepted `VLLM_CACHE_ROOT` for this audit. The failed first
+attempt did so and loaded a zero-artifact AOT entry from
+`.../torch_aot_compile/dcd446.../rank_0_0/model`, then failed with
+`TypeError: 'NoneType' object is not callable`. A fresh XLA path does not
+override an explicitly stale `VLLM_CACHE_ROOT`.
+
+The rejected semantics-preserving batching screen uses the same launch with a
+new `K3_RUN_NAME=kimi-k3-b1-foreach-runtime-copies`, audit zero, and:
+
+```bash
+export TPU_K3_RUNTIME_STATE_AUDIT=0
+export TPU_K3_BATCH_RUNTIME_STATE_COPIES=1
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q \
+  tests/compilation/test_tpu_compiler.py -k runtime_state_mutation
+scripts/k3/launch_kimi_k3_tp32_ep.sh
+```
+
+It batches only if generated source contains exactly two leaf `copy_` branches
+for every mutation. All ranks logged 162, but endpoint runs were 15.14086 and
+15.11524 ms mean TPOT (15.12805 ms pair), 0.00927 ms slower than accepted.
+The latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-foreach-runtime-copies-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3517963.1786648147416799827.pt.trace.json.gz`.
+It shows one 0.21790 ms `aten::_foreach_copy_` per decode and an unchanged
+0.13570 ms end-to-next-start gap. Do not enable this flag; the composite call
+does not provide native TPU batching.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do

@@ -18,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 
 class TestTpuCompilerCache:
 
@@ -102,6 +104,59 @@ class TestTpuCompilerCache:
                 second = compute_tpu_compilation_hash(self._config())
 
         assert first != second
+
+    def test_runtime_state_mutation_audit_is_scoped(self):
+        from torch._functorch._aot_autograd import subclass_codegen
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        original_compile = subclass_codegen._compile_and_exec_source
+        source = ("def _apply_mutations(orig_inputs, updated_inputs):\n"
+                  "    orig_inputs[0].copy_(updated_inputs[0])")
+        original = torch.zeros(2, 3)
+        updated = torch.ones(2, 3)
+
+        with patch.dict(os.environ, {"TPU_K3_RUNTIME_STATE_AUDIT": "1"}), \
+                patch.object(tpu_compiler.logger, "info") as log_info, \
+                tpu_compiler._runtime_state_mutation_codegen():
+            generated = subclass_codegen._compile_and_exec_source(
+                source, {}, "_apply_mutations", "mutation_epilogue")
+            generated([original], [updated])
+            payload = log_info.call_args.args[1]
+
+        assert subclass_codegen._compile_and_exec_source is original_compile
+        assert torch.equal(original, updated)
+        assert '"orig_idx": 0' in payload
+        assert '"shape": [2, 3]' in payload
+
+    def test_runtime_state_mutation_copies_can_be_batched(self):
+        from torch._functorch._aot_autograd import subclass_codegen
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        source = ("def _apply_mutations(orig_inputs, updated_inputs):\n"
+                  "    if orig_inputs[0].requires_grad: "
+                  "orig_inputs[0].detach().copy_(updated_inputs[0])\n"
+                  "    else: orig_inputs[0].copy_(updated_inputs[0])\n"
+                  "    if orig_inputs[1].requires_grad: "
+                  "orig_inputs[1].detach().copy_(updated_inputs[1])\n"
+                  "    else: orig_inputs[1].copy_(updated_inputs[1])")
+        original = [torch.zeros(2, 3), torch.zeros(4, dtype=torch.bfloat16)]
+        updated = [torch.ones(2, 3), torch.ones(4, dtype=torch.bfloat16)]
+
+        with patch.dict(os.environ,
+                        {"TPU_K3_BATCH_RUNTIME_STATE_COPIES": "1"}), \
+                patch.object(tpu_compiler.logger, "info") as log_info, \
+                tpu_compiler._runtime_state_mutation_codegen():
+            generated = subclass_codegen._compile_and_exec_source(
+                source, {"torch": torch}, "_apply_mutations",
+                "mutation_epilogue")
+            generated(original, updated)
+
+        assert all(torch.equal(dst, src)
+                   for dst, src in zip(original, updated))
+        assert "Batching %d runtime state" in log_info.call_args.args[0]
+        assert log_info.call_args.args[1] == 2
 
     def test_tpu_hash_covers_compiler_versions(self):
         from vllm_torchtpu.compilation.tpu_compiler import \

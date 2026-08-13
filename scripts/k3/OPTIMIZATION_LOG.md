@@ -2237,10 +2237,12 @@ the regressed TP2 up path remains disabled.
     host-side `aten::copy_` calls. The first begins 1.022 us after the model
     executable ends; calls begin roughly every 5.5--6 us, normally last
     2.3--2.6 us, and the final one ends 0.784 us before the next executable.
-    Their count matches the 23 KDA layers and the `69 = 3 x 23` `[128]`
-    all-reduces. Together with the KDA wrappers' `conv_state.copy_` and
-    `recurrent_state.copy_`, this strongly identifies them as AOTAutograd's
-    input-mutation replay/writeback sequence, not token input preparation.
+    Their count was initially matched to the 23-layer grouping and tentatively
+    attributed to KDA state. The complete mutation-shape audit in milestone
+    65 corrects that narrower attribution: these are the tail of a 162-input
+    AOTAutograd replay, most of which is dispatched while the asynchronous TPU
+    executable is still running. They remain mutation replay rather than token
+    input preparation, but are not an isolated 23-buffer family.
 
     A temporary, cache-keyed compiler diagnostic changed TorchTPU's
     `keep_inference_input_mutations=False` to true only when
@@ -2283,7 +2285,7 @@ the regressed TP2 up path remains disabled.
 
     The corrected launch logged **324 generated `copy_` sites per rank**, not
     the expected 23. That is 162 data-mutation inputs with leaf/non-leaf branch
-    variants, so a textual epilogue rewrite is much broader than the 23 KDA
+    variants, so a textual epilogue rewrite is much broader than the 23 tail
     calls visible in one accepted post-executable gap. The server nevertheless
     constructed and completed all requests. Its one canonical four-request
     result was 15.22068 ms mean TPOT (15.21427 median, 15.24210 p99), a
@@ -2304,6 +2306,55 @@ the regressed TP2 up path remains disabled.
     compiler/platform/test code was removed after profiling; it is not a
     launcher option. The exact commands, lazy-codegen trap, cache-format
     warning, and trace-parser caveat are in `RUNBOOK.md`.
+65. Mapped every AOT mutation input by instrumenting the lazily generated
+    mutation epilogue without changing its behavior. The rank-0 audit recorded
+    exactly 162 data mutations in four shape families:
+
+    | Shape / dtype | Count | Interpretation |
+    |---|---:|---|
+    | `[9,3,1152]` BF16 | 69 | KDA convolution state |
+    | `[9,3,128,128]` FP32 | 69 | KDA recurrent state |
+    | `[37440,8,2,640]` BF16 | 23 | ordinary attention KV pools |
+    | `[38656,8,2,640]` BF16 | 1 | final attention KV pool |
+
+    The 23 ordinary-KV mutations are updated-input indices 6, 13, 20, ...,
+    160. They are interleaved with six KDA-state mutations per group and are
+    followed by the final KV mutation at index 161. Thus the 23
+    `aten::copy_` calls observed after a normal executable are simply the last
+    approximately 23 dispatches of the ordered 162-call epilogue; earlier
+    calls overlap the asynchronous device interval. This reconciles the broad
+    `set_` trace's 163 calls/decode with the 23 normal copies in the visible
+    gap, and invalidates selecting the 23 KV-pool shape as a gap remedy.
+
+    The read-only audit passed its focused test and logged once per generated
+    epilogue on every rank. Its successful fresh-cache launch used
+    `/mnt/scratch/kimi-k3-b1-runtime-state-audit`. An earlier launch
+    accidentally pointed `VLLM_CACHE_ROOT` at the accepted cache and loaded a
+    zero-artifact serialized AOT entry, failing with `TypeError: 'NoneType'
+    object is not callable`. A unique `VLLM_CACHE_ROOT`, not merely a unique
+    XLA/profile path, is mandatory for compiler-wrapper experiments. Exact
+    commands and the rank-0 log path are in `RUNBOOK.md`.
+
+    A semantics-preserving follow-up replaced all 162 Python `Tensor.copy_`
+    dispatches with one mixed-shape/mixed-dtype `aten::_foreach_copy_` call
+    under a default-off diagnostic. Two focused tests passed, and code
+    generation refused the rewrite unless it saw exactly two inference
+    leaf-copy branches for every mutation. All ranks logged exactly 162
+    batched copies and the server completed all requests.
+
+    The canonical endpoint runs measured 15.14086 and 15.11524 ms mean TPOT,
+    averaging 15.12805 ms: 0.00927 ms slower than the accepted 15.11879 ms
+    pair. The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-foreach-runtime-copies-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3517963.1786648147416799827.pt.trace.json.gz`.
+    Its 18 stable model regions average 14.85159 ms and start 14.98840 ms
+    apart, versus 14.83462 and 14.97048 ms in the comparable accepted capture.
+    Most decisively, the end-to-next-start gap is unchanged at 0.13570 ms
+    versus 0.13608 ms accepted. The trace has one 0.21790 ms
+    `aten::_foreach_copy_` event per decode plus 21 remaining `aten::copy_`
+    calls/decode. CompositeExplicitAutograd reduces the visible child dispatch
+    count but does not shorten the critical gap; its own call is larger than
+    that gap and is overlapped with device execution. Reject it and leave the
+    default compiler unchanged.
 
 ## Forward plan
 
@@ -2353,8 +2404,8 @@ the regressed TP2 up path remains disabled.
    regressed at four or more active local routes. Revisit only with a static
    local-occupancy bound or a new full-width/pipelined kernel design.
 8. Treat the accepted trace's 0.13437 ms post-executable launch gap as a
-   separate bounded runtime target. It is filled by 23 serialized KDA
-   input-mutation `copy_` replays, not generic input preparation. Keeping the
+   separate bounded runtime target. It is filled by the tail of 162 serialized
+   AOT input-mutation `copy_` replays, not generic input preparation. Keeping the
    mutations inside XLA removes those host calls but materializes 14.6079 ms
    of full-state device copies and is rejected. Pursue only a batched runtime
    replay or alias/rebind mechanism that preserves donation; validate device
@@ -2378,11 +2429,18 @@ the regressed TP2 up path remains disabled.
     shard whose compute saving exceeds its already measured subgroup cost.
 13. Do not recreate a global AOT mutation-epilogue `copy_` to `set_` textual
     rewrite. Milestone 64 shows it reaches 162 mutation inputs rather than the
-    23 targeted KDA gap calls, adds about 0.219 ms/decode of host `set_`
+    23 visible tail calls, adds about 0.219 ms/decode of host `set_`
     dispatch, leaves 21 `copy_` calls/decode, and regresses endpoint TPOT by
-    0.102 ms. A future runtime attempt must identify only the 23 donated KDA
-    buffers and batch their rebinds in native code; per-tensor Python/ATen
-    dispatch cannot fit the remaining 0.119 ms budget.
+    0.102 ms. Milestone 65 proves there is no isolated 23-buffer KDA family in
+    the gap. A future runtime attempt must batch the complete replay while
+    retaining copy semantics; per-tensor Python/ATen dispatch cannot fit the
+    remaining 0.119 ms budget.
+14. Do not replace the mutation epilogue with `aten::_foreach_copy_` on this
+    TorchTPU build. Milestone 65 shows its composite implementation costs about
+    0.218 ms/decode and leaves the 0.136 ms inter-executable gap unchanged.
+    The remaining gap is therefore not removable merely by reducing Python
+    call count; a future runtime attempt needs native asynchronous batching or
+    a dependency change, not the generic foreach composite.
 
 ## Current best and gap
 
