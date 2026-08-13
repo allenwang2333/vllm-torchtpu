@@ -22,13 +22,23 @@ def test_get_topology_aware_pcp_ranks_single_process():
     assert ranks == (0, )
 
 
-def test_get_topology_aware_pcp_ranks_tp1_preserves_native_order():
-    group = _FakeGroup(ranks=[0, 1, 2, 3], rank_in_group=1)
+def test_get_topology_aware_pcp_ranks_tp1_follows_2d_mesh_path():
+    # 4 PCP x 1 TP mesh tensor following 2D topology mesh path:
+    topo_tensor = torch.tensor([
+        [0],
+        [1],
+        [3],
+        [2],
+    ])
+    group = _FakeGroup(ranks=[0, 1, 2, 3], rank_in_group=0)
     with patch(
             "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
             return_value=1):
-        ranks = pcp._get_topology_aware_pcp_ranks(group, global_rank=1)
-    assert ranks == (0, 1, 2, 3)
+        if not hasattr(torch, "tpu"):
+            torch.tpu = MagicMock()
+        with patch("torch.tpu.topology_aware_mesh", return_value=topo_tensor):
+            ranks = pcp._get_topology_aware_pcp_ranks(group, global_rank=0)
+    assert ranks == (0, 1, 3, 2)
 
 
 def test_get_topology_aware_pcp_ranks_tp2_extracts_topo_lane():

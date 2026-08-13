@@ -118,6 +118,19 @@ def _collect_rank_to_device_id(group: Any, global_rank: int,
     return rank_to_device_id
 
 
+def _decompose_pcp_mesh_rows(
+    topo_tensor: torch.Tensor,
+    pcp_size: int,
+    tp_size: int,
+    base_rank: int = 0,
+) -> list[list[int]]:
+    """Decompose a (pcp_size, tp_size) mesh into per-TP-lane PCP ring rows."""
+    pcp_rows: list[list[int]] = []
+    for t in range(tp_size):
+        pcp_rows.append([base_rank + int(r.item()) for r in topo_tensor[:, t]])
+    return pcp_rows
+
+
 def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ...]:
     """Derive topologically ordered ranks for the current PCP group."""
     pcp_size = int(group.world_size)
@@ -138,17 +151,13 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
     except Exception:
         tp_size = 1
 
-    # 1D Single-Slice: Preserve native sequential order for Pallas causal schedule
-    if tp_size <= 1:
-        return tuple(int(rank) for rank in group.ranks)
-
     try:
         import torch_tpu  # noqa: F401
 
         if hasattr(torch, "tpu") and hasattr(torch.tpu, "topology_aware_mesh"):
             group_ranks_list = [int(r) for r in group.ranks]
+            group_members = frozenset(group_ranks_list)
             base_rank = min(group_ranks_list)
-            relative_rank = global_rank - base_rank
             replica_world = pcp_size * tp_size
 
             topo_tensor = torch.tpu.topology_aware_mesh(
@@ -159,13 +168,11 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
             if topo_tensor.numel() == replica_world:
                 flattened = [int(r.item()) for r in topo_tensor.flatten()]
                 if sorted(flattened) == list(range(replica_world)):
-                    rank_coords = (topo_tensor == relative_rank).nonzero(
-                        as_tuple=False)
-                    if len(rank_coords) > 0:
-                        tp_coord = int(rank_coords[0][1].item())
-                        return tuple(
-                            base_rank + int(r.item())
-                            for r in topo_tensor[:, tp_coord])
+                    candidate_rows = _decompose_pcp_mesh_rows(
+                        topo_tensor, pcp_size, tp_size, base_rank=base_rank)
+                    for row in candidate_rows:
+                        if frozenset(row) == group_members:
+                            return tuple(row)
     except Exception as exc:
         logger.warning(
             "Failed to derive topology-aware PCP mesh, falling back to natural "
