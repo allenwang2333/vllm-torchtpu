@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
+from torch_tpu._internal.profiler import profiler_api
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -258,21 +259,14 @@ class PhaseBasedProfiler:
                 batch_composition_stats)
 
             # Start PyTorch/XLA profiler
-            handler = torch.profiler.tensorboard_trace_handler(
-                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
-            config = TpuProfilerConfig(
-                run_dir=self.profile_dir_with_phase_suffix,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
-            )
-            self.profile_context = torch.profiler.profile(
+            handler = profiler_api.xprof_trace_handler(
+                dir_name=self.profile_dir_with_phase_suffix)
+            self.profile_context = profiler_api.profile(
                 activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.PrivateUse1,
+                    profiler_api.ProfilerActivity.CPU,
+                    profiler_api.ProfilerActivity.TPU,
                 ],
                 on_trace_ready=handler,
-                experimental_config=config,
             )
             try:
                 self.profile_context.__enter__()

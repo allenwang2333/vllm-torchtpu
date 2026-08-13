@@ -3,7 +3,6 @@
 Implementation that uses emit_pipeline instead of hand-rolled version.
 """
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -12,38 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 TOP_K = 10
 M_PAD = 1
-_CN_NBUF = max(2, int(os.getenv("MOE_CN_NBUF", "4")))
-
-_FP8 = jnp.float8_e4m3fn
-_FP8_MAX = float(jnp.finfo(_FP8).max)
-# 0 falls back to bf16xbf16: slower, but ~10x more accurate.
-_USE_FP8_LHS = os.getenv("MOE_CN_FP8_LHS", "1") == "1"
-# fp8 lhs quant adds VPU pressure; bf16 accumulate offsets it (gmm_v2 does
-# the same). Accuracy of this alone: MOE_CN_BF16_ACC=0.
-_ACC = (jnp.bfloat16 if _USE_FP8_LHS
-        and os.getenv("MOE_CN_BF16_ACC", "1") == "1" else jnp.float32)
-
-
-def _blockwise_matmul(lhs, w, scales, n_blocks, block, out_cols):
-    acc = jnp.zeros((1, out_cols), dtype=_ACC)
-    for b in range(n_blocks):
-        s = b * block
-        cur = lhs[:, s:s + block]
-        if _USE_FP8_LHS:
-            cur32 = cur.astype(jnp.float32)
-            lsc = jnp.max(jnp.abs(cur32), axis=1, keepdims=True) / _FP8_MAX
-            cur_q = (cur32 *
-                     jnp.where(lsc == 0, 0.0, 1.0 / lsc)).astype(_FP8)
-            blk = jnp.matmul(cur_q,
-                             w[s:s + block, :],
-                             preferred_element_type=jnp.float32).astype(_ACC)
-            blk = blk * lsc.astype(_ACC)
-        else:
-            blk = jnp.matmul(cur,
-                             w[s:s + block, :],
-                             preferred_element_type=jnp.float32)
-        acc = acc + blk * scales[b].reshape(1, out_cols).astype(_ACC)
-    return acc
+_CN_NBUF = 4
 
 
 def _forward_fill_ids(sorted_ids, sorted_weights):
@@ -89,26 +57,30 @@ def _inner_kernel(
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
-        # MXU has no bf16xfp8 mode; one side has to move.
-        w1 = w1_tile_ref[...].reshape(K, TWO_ID)
-        if not _USE_FP8_LHS:
-            w1 = w1.astype(DTYPE_LHS)
-        s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
-        gate_up = _blockwise_matmul(lhs_row, w1, s1, K_BLOCKS, QB, TWO_ID)
+
+        # Upfront vectorized dequantization in VMEM (zero-stride broadcast across sublanes)
+        w1_cast = w1_tile_ref[0].astype(DTYPE_LHS).reshape(K_BLOCKS, QB, TWO_ID)
+        s1 = w1_scale_tile_ref[0].astype(DTYPE_LHS)
+        w1_dequant = (w1_cast * s1).reshape(K, TWO_ID)
+
+        # Single full MXU systolic GEMV (eliminates 32 micro-matmul loop)
+        gate_up = jnp.matmul(lhs_row, w1_dequant, preferred_element_type=jnp.float32)
 
         gate = gate_up[:, :ID]
         up = gate_up[:, ID:]
-        act = gate * jax.nn.sigmoid(gate) * up
-        intermediate = act if _USE_FP8_LHS else act.astype(DTYPE_LHS)
+        intermediate = (gate * jax.nn.sigmoid(gate) * up).astype(DTYPE_LHS)
 
         _, ID_, H = w2_tile_ref.shape
         I_BLOCKS = w2_scale_tile_ref.shape[1]
         IB = ID_ // I_BLOCKS
-        w2 = w2_tile_ref[...].reshape(ID_, H)
-        if not _USE_FP8_LHS:
-            w2 = w2.astype(DTYPE_LHS)
-        s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
-        down = _blockwise_matmul(intermediate, w2, s2, I_BLOCKS, IB, H)
+
+        # Upfront vectorized dequantization in VMEM for W2
+        w2_cast = w2_tile_ref[0].astype(DTYPE_LHS).reshape(I_BLOCKS, IB, H)
+        s2 = w2_scale_tile_ref[0].astype(DTYPE_LHS)
+        w2_dequant = (w2_cast * s2).reshape(ID_, H)
+
+        # Single full MXU systolic GEMV
+        down = jnp.matmul(intermediate, w2_dequant, preferred_element_type=jnp.float32)
 
         H_acc = acc_ref.shape[2]
         current = acc_ref[pl.ds(tok, 1), pl.ds(0, 1), pl.ds(0, H_acc)]
@@ -143,24 +115,15 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
-<<<<<<< Updated upstream
     C_PAD = lhs_ref.shape[0]
-=======
-    C_PAD = full_lhs_2d_ref.shape[0]
 
-    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
-    full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
-                                          full_lhs_2d_ref, sem_ref.at[0])
-    full_lhs_copy.start()
-    acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
-    full_lhs_copy.wait()
->>>>>>> Stashed changes
-
-    # ---- lhs is already in VMEM; reshape 2D -> 3D on chip ----
+    # ---- lhs is already in VMEM via memory space constraint; reshape 2D -> 3D on chip ----
     for t in range(C_PAD):
         row = lhs_ref[pl.ds(t, 1), pl.ds(0, K)]
         lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
             row.reshape(1, 1, K)
+
+    acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
 
     def w1_index_map(slot):
         return (ids_ref[slot], 0, 0)
@@ -241,8 +204,7 @@ def cn_gemv_w1w2_fused_pipelined(
     N_SLOTS = TOPK_TOTAL
     NBUF = min(_CN_NBUF, G)
 
-    effective_ids = (_forward_fill_ids(sorted_ids, sorted_weights)
-                     if use_ep else sorted_ids)
+    effective_ids = sorted_ids  # sort removed; invalid IDs already clamped to 0
 
     # Hint XLA to keep lhs in VMEM — small enough (<=8 tokens * H) to avoid
     # the HBM write+DMA read round-trip from the preceding layer output.
