@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 import pickle
-from contextlib import contextmanager
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
@@ -60,56 +59,6 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
     "TORCH_TPU_INTERNAL_XLA_OPTIONS",
     "XLA_FLAGS",
 )
-
-
-@contextmanager
-def _runtime_state_rebind_codegen():
-    """Rewrite AOT's mutation epilogue for the K3 donation experiment."""
-    if os.getenv("TPU_K3_RUNTIME_STATE_REBIND", "0") != "1":
-        yield
-        return
-
-    from torch._functorch._aot_autograd import subclass_codegen
-
-    original_compile = subclass_codegen._compile_and_exec_source
-
-    def compile_with_state_rebind(source, globals_dict, fn_name,
-                                  artifact_name, wrapped_fn=None):
-        if artifact_name == "mutation_epilogue":
-            copy_count = source.count(".copy_(")
-            if copy_count:
-                source = source.replace(".copy_(", ".set_(")
-                logger.info(
-                    "[TpuCompilerAdaptor] Rebinding %d donated runtime state "
-                    "mutation(s) with set_", copy_count)
-        return original_compile(source, globals_dict, fn_name, artifact_name,
-                                wrapped_fn)
-
-    subclass_codegen._compile_and_exec_source = compile_with_state_rebind
-    try:
-        yield
-    finally:
-        subclass_codegen._compile_and_exec_source = original_compile
-
-
-def _rebind_runtime_state_on_first_call(compiled_fn: Callable[..., Any]):
-    """Arm the rewrite for AOT's lazy first invocation."""
-    if os.getenv("TPU_K3_RUNTIME_STATE_REBIND", "0") != "1":
-        return compiled_fn
-
-    armed = True
-
-    def call_with_state_rebind(*args, **kwargs):
-        nonlocal armed
-        if armed:
-            with _runtime_state_rebind_codegen():
-                result = compiled_fn(*args, **kwargs)
-            armed = False
-            return result
-        return compiled_fn(*args, **kwargs)
-
-    return call_with_state_rebind
-
 
 _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
@@ -361,8 +310,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             fake_mode.shape_env = ShapeEnv()
         tracing_ctx = (torch._guards.TracingContext(fake_mode)
                        if fake_mode is not None else None)
-        with torch._guards.tracing(tracing_ctx), \
-                _runtime_state_rebind_codegen():
+        with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
@@ -375,8 +323,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
-
-        compiled_fn = _rebind_runtime_state_on_first_call(compiled_fn)
 
         # Save the per-shape PjRt executable to disk.
         # We pickle the inner _TorchTpuCompiledExecutable (which has
@@ -443,7 +389,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # `aot_autograd` calls detect_fake_mode() which asserts all
         # FakeTensorModes match, causing a crash.
         # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None), _runtime_state_rebind_codegen():
+        with torch._guards.tracing(None):
             compiled_fn = aot_autograd(
                 fw_compiler=_cached_compiler,
                 keep_inference_input_mutations=False,
@@ -459,7 +405,5 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
-
-        compiled_fn = _rebind_runtime_state_on_first_call(compiled_fn)
 
         return compiled_fn
