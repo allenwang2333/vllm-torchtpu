@@ -3414,3 +3414,45 @@ class TestTPUConnectorStats(unittest.TestCase):
         stats = TPUConnectorWorker.get_kv_connector_stats(worker)
         assert stats is not None
         assert stats.data["prefill_queue_length"] == [1]
+
+    def test_dynamic_metrics_registration_and_observation(self):
+        mock_telemetry = MagicMock()
+        mock_desc = MagicMock()
+        mock_desc.name = "vllm:tpu_raiden_dma_latency_ms"
+        mock_desc.help = "DMA latency"
+        mock_desc.type = "histogram"
+        mock_desc.buckets = [1.0, 10.0, 100.0]
+        mock_telemetry.get_metric_descriptors.return_value = [mock_desc]
+
+        mock_api = MagicMock()
+        mock_api.telemetry = mock_telemetry
+
+        with patch.dict(
+            "sys.modules", {
+                "tpu_raiden": MagicMock(),
+                "tpu_raiden.api": mock_api,
+            }):
+            registry = CollectorRegistry()
+            metric_types = {
+                Gauge: partial(Gauge, registry=registry),
+                Counter: partial(Counter, registry=registry),
+                Histogram: partial(Histogram, registry=registry),
+            }
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+
+            assert "vllm:tpu_raiden_dma_latency_ms" in metrics.dynamic_metrics
+
+            mock_data = {
+                "vllm:tpu_raiden_dma_latency_ms": [5.0, 15.0],
+            }
+            metrics.observe(mock_data, engine_idx=0)
+
+            mtype, per_engine_obj = metrics.dynamic_metrics[
+                "vllm:tpu_raiden_dma_latency_ms"]
+            hist = per_engine_obj[0]
+            assert hist._sum.get() == 20.0
