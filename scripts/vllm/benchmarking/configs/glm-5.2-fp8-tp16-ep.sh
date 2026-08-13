@@ -44,14 +44,18 @@ RANDOM_RANGE_RATIO="0.0"
 #   rematerialization; sweep matrix in PR #246.
 # - max-num-seqs=64: limits active sequences per step batch, keeping activation working
 #   set and XLA compile sizes manageable.
-MAX_MODEL_LEN=32768
+MAX_MODEL_LEN=9216
 # 1024/engine is required at DP=16: the MoE dispatch dimension
 # topk(4) x DP(16) x batched-tokens must stay at 65536 — 2048/engine
 # puts it at 131072 where a SparseCore fault halts the first batch
 # (dev builds 186/187/188; tracked with the torch_tpu/libtpu teams).
 # Aggregate step budget is still 16 x 1024 = 16k tokens.
 MAX_NUM_BATCHED_TOKENS=1024
-MAX_NUM_SEQS=1024
+# max-num-seqs is PER DP ENGINE (vllm 0.27 scheduler.py:
+# max_num_running_reqs = max_num_seqs, never divided by
+# data_parallel_size), so 64 x DP16 = 1024 concurrent sequences
+# fleet-wide, matching the benchmark concurrency.
+MAX_NUM_SEQS=64
 
 SERVER_READY_WAIT_MIN=180
 GPU_MEMORY_UTILIZATION=0.90
