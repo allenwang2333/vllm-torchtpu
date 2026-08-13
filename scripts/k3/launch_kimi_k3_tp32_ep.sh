@@ -15,6 +15,8 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1}"
 LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
 COMPILE_SIZES="${COMPILE_SIZES:-1}"
 PROF_DIR="${PROF_DIR:-${REPO_DIR}/results/kimi-k3-profile}"
+TP_SIZE="${TP_SIZE:-32}"
+DP_SIZE="${DP_SIZE:-1}"
 
 export PATH="${REPO_DIR}/.venv/bin:${PATH}"
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
@@ -39,13 +41,32 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 export TPU_K3_FUSED_MOE_COMBINE="${TPU_K3_FUSED_MOE_COMBINE:-0}"
 export TPU_K3_HOST_REPLICATED_SHARED_EXPERTS="${TPU_K3_HOST_REPLICATED_SHARED_EXPERTS:-0}"
 export TPU_K3_EARLY_SHARED_ALL_REDUCE="${TPU_K3_EARLY_SHARED_ALL_REDUCE:-0}"
+export TPU_MOE_HIERARCHICAL_EP="${TPU_MOE_HIERARCHICAL_EP:-1}"
+export TPU_MOE_HIERARCHICAL_TP_SIZE="${TPU_MOE_HIERARCHICAL_TP_SIZE:-2}"
+export TPU_K3_BLOCKED_TOPK="${TPU_K3_BLOCKED_TOPK:-0}"
+export TPU_K3_SHARD_LATENT_UP_PROJ="${TPU_K3_SHARD_LATENT_UP_PROJ:-0}"
+export TPU_K3_SHARD_LATENT_DOWN_PROJ="${TPU_K3_SHARD_LATENT_DOWN_PROJ:-1}"
+export TPU_K3_LATENT_DOWN_TP_SIZE="${TPU_K3_LATENT_DOWN_TP_SIZE:-4}"
+export TPU_K3_SHARD_KDA_F_A_PROJ="${TPU_K3_SHARD_KDA_F_A_PROJ:-1}"
+export TPU_K3_KDA_F_A_TP_SIZE="${TPU_K3_KDA_F_A_TP_SIZE:-0}"
+export TPU_K3_OVERLAP_KDA_F_A_REDUCE="${TPU_K3_OVERLAP_KDA_F_A_REDUCE:-0}"
+export TPU_K3_OVERLAP_LATENT_DOWN_ROUTER="${TPU_K3_OVERLAP_LATENT_DOWN_ROUTER:-0}"
+export TPU_K3_SHARD_MLA_A_PROJ="${TPU_K3_SHARD_MLA_A_PROJ:-0}"
+export TPU_K3_SHARD_ATTN_RES_PROJ="${TPU_K3_SHARD_ATTN_RES_PROJ:-0}"
+export TPU_K3_FUSE_ATTN_RES_DOT="${TPU_K3_FUSE_ATTN_RES_DOT:-0}"
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
+# Reduce launch synchronization overhead on this collective-heavy decode
+# graph. Preserve an explicit caller choice (including `=false`).
+if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_use_enhanced_launch_barrier="* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_use_enhanced_launch_barrier=true"
+fi
 
 mkdir -p "${PROF_DIR}"
 
 exec "${REPO_DIR}/.venv/bin/vllm" serve "${MODEL}" \
   --revision "${REVISION}" \
-  -tp 32 \
+  --tensor-parallel-size "${TP_SIZE}" \
+  --data-parallel-size "${DP_SIZE}" \
   --enable-expert-parallel \
   --enable-ep-weight-filter \
   --load-format "${LOAD_FORMAT}" \

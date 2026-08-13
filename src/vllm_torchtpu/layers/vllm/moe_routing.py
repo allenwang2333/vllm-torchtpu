@@ -16,6 +16,7 @@
 import torch
 import vllm.envs as vllm_envs
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -171,6 +172,31 @@ def _apply_scoring_fn(scoring_fn: str,
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
 
 
+def _topk_for_expert_choice(
+        scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact two-stage top-k for K3's batch-1 896-way router.
+
+    A global top-k item must be in the top-k of its own disjoint block. Taking
+    16 candidates from each of fourteen 64-expert blocks and then selecting
+    the global 16 from those 224 candidates is therefore exactly equivalent
+    to top-16 over all 896 experts. The blocked form exposes fourteen small
+    selections in parallel on TPU while leaving every other model shape on
+    the standard lowering.
+    """
+    if (not envs.TPU_K3_BLOCKED_TOPK or scores.shape[-1] != 896
+            or topk != 16):
+        return torch.topk(scores, k=topk, dim=-1)
+
+    blocks = scores.reshape(*scores.shape[:-1], 14, 64)
+    block_values, block_ids = torch.topk(blocks, k=topk, dim=-1)
+    candidates = block_values.flatten(-2)
+    values, candidate_ids = torch.topk(candidates, k=topk, dim=-1)
+    local_ids = block_ids.flatten(-2).gather(-1, candidate_ids)
+    expert_ids = torch.div(candidate_ids, topk,
+                           rounding_mode="floor") * 64 + local_ids
+    return values, expert_ids
+
+
 def _hash_moe_select(
     scores: torch.Tensor,
     hash_indices_table: torch.Tensor,
@@ -266,10 +292,10 @@ def select_experts(
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
-        _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)
+        _, topk_ids = _topk_for_expert_choice(scores_for_choice, topk)
         topk_weights = scores.gather(-1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        topk_weights, topk_ids = _topk_for_expert_choice(scores, topk)
 
     if renormalize:
         topk_weights = topk_weights / torch.clamp(

@@ -123,6 +123,34 @@ def test_hierarchical_split_is_ep_between_chips_tp_within() -> None:
     assert topology.chip_of(0)[0] != topology.chip_of(2)[0]
 
 
+def test_wider_hierarchical_tp_groups_whole_chips(monkeypatch) -> None:
+    """TP4 must pair chips without duplicating an EP/TP coordinate."""
+    from vllm_torchtpu.distributed import chip_topology
+
+    topology = _topology_from(_tpu7x_single_host())
+    monkeypatch.setattr(chip_topology, "get_chip_topology", lambda: topology)
+
+    splits = [
+        chip_topology.hierarchical_moe_split(8, rank, tp_size=4)
+        for rank in range(8)
+    ]
+    assert all(split is not None for split in splits)
+    assert {(split[0], split[2]) for split in splits if split} == {(2, 4)}
+    assert {(split[1], split[3]) for split in splits if split} == {
+        (ep_rank, tp_rank)
+        for ep_rank in range(2)
+        for tp_rank in range(4)
+    }
+
+
+def test_hierarchical_tp_rejects_partial_chips(monkeypatch) -> None:
+    from vllm_torchtpu.distributed import chip_topology
+
+    topology = _topology_from(_tpu7x_single_host())
+    monkeypatch.setattr(chip_topology, "get_chip_topology", lambda: topology)
+    assert chip_topology.hierarchical_moe_split(8, 0, tp_size=3) is None
+
+
 def test_expert_blocks_tile_the_expert_space_exactly() -> None:
     """Chip blocks must partition [0, num_experts) with no gap or overlap.
 

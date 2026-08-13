@@ -231,7 +231,12 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    # At batch 1 there is no token permutation to reconstruct: every routed
+    # row belongs to token zero. Preserve the forward permutation so moe_gmm
+    # can sort the 16 route weights alongside the GMM rows and reduce them
+    # directly. This removes the inverse argsort and the one-hot unpermute.
+    argsort_revert_indices = (sorted_indices if num_tokens_local == 1 else
+                              jnp.argsort(sorted_indices))
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
@@ -321,6 +326,17 @@ def moe_gmm(
                            zero_initialize=False,
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
+    if num_tokens == 1:
+        # argsort_revert_indices carries the forward expert-order permutation
+        # in this specialization (see prepare_routed_gmm_inputs). Since all
+        # rows reduce to the same token, an inverse permutation is needless.
+        sorted_weights = topk_weights_flat[argsort_revert_indices]
+        sorted_valid = valid_mask_flat[argsort_revert_indices]
+        weighted = gmm2_res * sorted_weights[:, None]
+        weighted = jnp.where(sorted_valid[:, None], weighted, 0)
+        return weighted.astype(jnp.float32).sum(axis=0,
+                                                keepdims=True).astype(x.dtype)
+
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster

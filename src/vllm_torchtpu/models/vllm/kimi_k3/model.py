@@ -24,9 +24,13 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               maybe_prefix)
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.vllm.moe_hierarchical import \
+    hierarchical_split_or_none
+
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .layers import AttentionResidual, KimiMLP
-from .moe import KimiMoE
+from .moe import KimiMoE, _get_k3_hierarchical_tp_group
 
 
 class KimiDecoderLayer(nn.Module):
@@ -79,15 +83,21 @@ class KimiDecoderLayer(nn.Module):
 
         self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
         if self.attn_res_block_size is not None:
+            attn_res_tp_group = (
+                _get_k3_hierarchical_tp_group()
+                if envs.TPU_K3_SHARD_ATTN_RES_PROJ
+                and hierarchical_split_or_none() is not None else None)
             self.self_attention_res = AttentionResidual(
                 config.hidden_size,
                 config.rms_norm_eps,
                 prefix=f"{prefix}.self_attention_res_proj",
+                tp_group=attn_res_tp_group,
             )
             self.mlp_res = AttentionResidual(
                 config.hidden_size,
                 config.rms_norm_eps,
                 prefix=f"{prefix}.mlp_res_proj",
+                tp_group=attn_res_tp_group,
             )
 
     def forward(
@@ -158,10 +168,15 @@ class KimiModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if self.attn_res_block_size is not None:
+            attn_res_tp_group = (
+                _get_k3_hierarchical_tp_group()
+                if envs.TPU_K3_SHARD_ATTN_RES_PROJ
+                and hierarchical_split_or_none() is not None else None)
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
                 config.rms_norm_eps,
                 prefix=f"{prefix}.output_attn_res_proj",
+                tp_group=attn_res_tp_group,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -91,7 +91,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
                         lambda *args, **kwargs: 1)
 
-    expected = jnp.full((1, 4), 7, dtype=jnp.bfloat16)
+    expected = jnp.full((2, 4), 7, dtype=jnp.bfloat16)
     calls = []
 
     def fake_ragged_gather_reduce(*args, **kwargs):
@@ -114,15 +114,53 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(monkeypatch):
         topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.float32),
         valid_mask_flat=jnp.array([True, True]),
         activation="silu",
-        num_tokens=1,
-        topk=2,
+        num_tokens=2,
+        topk=1,
         use_ep=True,
         use_sparse_core=True,
     )
 
     np.testing.assert_array_equal(actual, expected)
     assert len(calls) == 1
-    assert calls[0][1]["reduce_group_size"] == 2
+    assert calls[0][1]["reduce_group_size"] == 1
+
+
+def test_moe_gmm_batch1_reduces_in_sorted_order_without_unpermute(
+        monkeypatch):
+    """Batch 1 uses the forward sort to align weights with GMM rows."""
+    gmm_outputs = iter([
+        jnp.ones((2, 4), dtype=jnp.bfloat16),
+        jnp.array([[2, 2, 2, 2], [4, 4, 4, 4]], dtype=jnp.bfloat16),
+    ])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper",
+                        lambda *args, **kwargs: next(gmm_outputs))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",
+                        lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_reduce",
+        lambda *args, **kwargs: pytest.fail("batch-1 must reduce directly"))
+
+    out = fused_moe_gmm.moe_gmm(
+        x=jnp.ones((2, 4), dtype=jnp.bfloat16),
+        w1=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.ones((1, 4, 4), dtype=jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([2], dtype=jnp.int32),
+        # Forward order swaps the original route rows.
+        argsort_revert_indices=jnp.array([1, 0], dtype=jnp.int32),
+        topk_weights_flat=jnp.array([0.25, 0.75], dtype=jnp.bfloat16),
+        valid_mask_flat=jnp.array([True, True]),
+        activation="silu",
+        num_tokens=1,
+        topk=2,
+        use_ep=True,
+        use_sparse_core=True,
+    )
+    np.testing.assert_array_equal(np.asarray(out),
+                                  np.full((1, 4), 2.5, dtype=np.float32))
 
 
 def _require_tpu() -> None:

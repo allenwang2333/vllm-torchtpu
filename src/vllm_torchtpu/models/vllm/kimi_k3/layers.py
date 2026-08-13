@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +16,8 @@ from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+
+from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -126,16 +128,30 @@ class AttentionResidual(nn.Module):
         hidden_size: int,
         eps: float,
         prefix: str,
+        tp_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__()
+        self.tp_group = tp_group
+        self.fuse_dot = envs.TPU_K3_FUSE_ATTN_RES_DOT and tp_group is None
         self.norm = RMSNorm(hidden_size, eps)
-        self.proj = ReplicatedLinear(
-            hidden_size,
-            1,
-            bias=False,
-            quant_config=None,
-            prefix=prefix,
-        )
+        tp_context = (_linear_tp_override(tp_group.rank_in_group,
+                                          tp_group.world_size)
+                      if tp_group is not None else nullcontext())
+        with tp_context:
+            proj_cls = (RowParallelLinear
+                        if tp_group is not None else ReplicatedLinear)
+            proj_kwargs = ({
+                "input_is_parallel": False,
+                "reduce_results": False,
+            } if tp_group is not None else {})
+            self.proj = proj_cls(
+                hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=prefix,
+                **proj_kwargs,
+            )
 
     def forward(
         self,
@@ -143,6 +159,16 @@ class AttentionResidual(nn.Module):
         block_residuals: torch.Tensor,
     ) -> torch.Tensor:
         values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)), dim=-2)
-        scores, _ = self.proj(self.norm(values))
+        normalized = self.norm(values)
+        if self.fuse_dot:
+            # A 7168-to-1 batch-one projection is a dot product. Expressing it
+            # directly lets XLA fuse the multiply/reduce with neighboring
+            # elementwise work instead of lowering a tiny dense convolution.
+            scores = (normalized * self.proj.weight).sum(dim=-1,
+                                                         keepdim=True)
+        else:
+            scores, _ = self.proj(normalized)
+        if self.tp_group is not None:
+            scores = self.tp_group.all_reduce(scores)
         probabilities = scores.float().softmax(dim=-2)
         return (probabilities * values.float()).sum(dim=-2).to(values.dtype)

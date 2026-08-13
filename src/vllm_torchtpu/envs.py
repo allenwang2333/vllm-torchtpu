@@ -47,6 +47,18 @@ if TYPE_CHECKING:
     TPU_K3_HOST_REPLICATED_SHARED_EXPERTS: bool = False
     TPU_K3_EARLY_SHARED_ALL_REDUCE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_HIERARCHICAL_TP_SIZE: int = 2
+    TPU_K3_BLOCKED_TOPK: bool = False
+    TPU_K3_SHARD_LATENT_UP_PROJ: bool = False
+    TPU_K3_SHARD_LATENT_DOWN_PROJ: bool = False
+    TPU_K3_LATENT_DOWN_TP_SIZE: int = 0
+    TPU_K3_SHARD_KDA_F_A_PROJ: bool = False
+    TPU_K3_KDA_F_A_TP_SIZE: int = 0
+    TPU_K3_OVERLAP_KDA_F_A_REDUCE: bool = False
+    TPU_K3_OVERLAP_LATENT_DOWN_ROUTER: bool = False
+    TPU_K3_SHARD_MLA_A_PROJ: bool = False
+    TPU_K3_SHARD_ATTN_RES_PROJ: bool = False
+    TPU_K3_FUSE_ATTN_RES_DOT: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -323,6 +335,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Routed-expert width shard inside one hierarchical EP replica. Two is a
+    # physical TPU v7 chip; wider values group adjacent chips while keeping
+    # per-rank routed weight memory constant.
+    "TPU_MOE_HIERARCHICAL_TP_SIZE":
+    lambda: int(os.getenv("TPU_MOE_HIERARCHICAL_TP_SIZE", "2")),
+    # Exact two-stage top-16 selection for K3's 896-way router.
+    "TPU_K3_BLOCKED_TOPK": env_bool("TPU_K3_BLOCKED_TOPK"),
+    # Row-shard K3's latent-MoE up projection across global TP. Its partial
+    # output is combined with the unreduced shared-expert partial before the
+    # existing hidden-width all-reduce, so this adds no collective.
+    "TPU_K3_SHARD_LATENT_UP_PROJ":
+    env_bool("TPU_K3_SHARD_LATENT_UP_PROJ"),
+    # Row-shard K3's latent-MoE input projection inside the hierarchical TP
+    # group, then finish it with a chip-local reduction before routed GMM1.
+    "TPU_K3_SHARD_LATENT_DOWN_PROJ":
+    env_bool("TPU_K3_SHARD_LATENT_DOWN_PROJ"),
+    # Optional independent shard width for latent down_proj. Zero reuses the
+    # hierarchical routed-expert TP width.
+    "TPU_K3_LATENT_DOWN_TP_SIZE":
+    lambda: int(os.getenv("TPU_K3_LATENT_DOWN_TP_SIZE", "0")),
+    "TPU_K3_SHARD_KDA_F_A_PROJ": env_bool("TPU_K3_SHARD_KDA_F_A_PROJ"),
+    # Optional independent shard width for KDA's full-rank f_a projection.
+    # Zero reuses the hierarchical routed-expert TP width.
+    "TPU_K3_KDA_F_A_TP_SIZE":
+    lambda: int(os.getenv("TPU_K3_KDA_F_A_TP_SIZE", "0")),
+    "TPU_K3_OVERLAP_KDA_F_A_REDUCE":
+    env_bool("TPU_K3_OVERLAP_KDA_F_A_REDUCE"),
+    "TPU_K3_OVERLAP_LATENT_DOWN_ROUTER":
+    env_bool("TPU_K3_OVERLAP_LATENT_DOWN_ROUTER"),
+    "TPU_K3_SHARD_MLA_A_PROJ": env_bool("TPU_K3_SHARD_MLA_A_PROJ"),
+    "TPU_K3_SHARD_ATTN_RES_PROJ": env_bool("TPU_K3_SHARD_ATTN_RES_PROJ"),
+    "TPU_K3_FUSE_ATTN_RES_DOT": env_bool("TPU_K3_FUSE_ATTN_RES_DOT"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.

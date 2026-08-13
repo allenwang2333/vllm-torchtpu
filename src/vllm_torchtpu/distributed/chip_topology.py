@@ -91,11 +91,15 @@ def get_chip_topology() -> ChipTopology | None:
 
 
 def hierarchical_moe_split(world_size: int,
-                           rank: int) -> tuple[int, int, int, int] | None:
+                           rank: int,
+                           tp_size: int | None = None
+                           ) -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)`` for hierarchical MoE.
 
-    Expert parallelism runs *between* chips and tensor parallelism *within*
-    one, so ``ep_size`` is the chip count and ``tp_size`` the cores per chip.
+    Expert parallelism runs between device groups and tensor parallelism
+    within a group. By default a group is one physical chip. A larger
+    ``tp_size`` groups adjacent whole chips, enabling wider expert tensor
+    sharding without changing per-rank routed weight memory.
     Returns ``None`` when the split does not apply -- a topology that cannot be
     read, a single core per chip, or a world size that is not the full visible
     device set (a partial world would make "which chip" ambiguous).
@@ -114,6 +118,18 @@ def hierarchical_moe_split(world_size: int,
             "guess the chip split.", world_size, len(topology.device_ids))
         return None
 
+    requested_tp = tp_size or topology.cores_per_chip
+    if (requested_tp < topology.cores_per_chip
+            or requested_tp % topology.cores_per_chip != 0
+            or world_size % requested_tp != 0):
+        logger.warning(
+            "Hierarchical MoE TP size %d must be a whole number of physical "
+            "chips and divide world size %d (cores per chip=%d).",
+            requested_tp, world_size, topology.cores_per_chip)
+        return None
+
+    chips_per_group = requested_tp // topology.cores_per_chip
     chip_index, core_on_chip = topology.chip_of(rank)
-    return (topology.num_chips, chip_index, topology.cores_per_chip,
-            core_on_chip)
+    ep_rank, chip_within_group = divmod(chip_index, chips_per_group)
+    tp_rank = chip_within_group * topology.cores_per_chip + core_on_chip
+    return (world_size // requested_tp, ep_rank, requested_tp, tp_rank)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -936,6 +937,113 @@ def test_fused_combine_off_by_default_keeps_two_reduce_path(
     assert fused_moe_args["reduce_results"] is True
     assert isinstance(fused_moe_args["routed_output_transform"],
                       kimi_moe.KimiRoutedOutputTransform)
+
+
+def test_sharded_latent_up_uses_row_parallel_and_custom_runner(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRowParallel(_FakeReplicatedLinear):
+
+        def __init__(self, input_size, output_size, **kwargs) -> None:
+            self.init_kwargs = kwargs.copy()
+            super().__init__(input_size, output_size, **kwargs)
+
+    monkeypatch.setenv("TPU_K3_SHARD_LATENT_UP_PROJ", "1")
+    monkeypatch.setattr(kimi_moe, "RowParallelLinear", FakeRowParallel)
+    monkeypatch.setattr(kimi_moe, "hierarchical_split_or_none",
+                        lambda: (16, 0, 2, 0))
+    layer, fused_moe_args = _build_kimi_moe(monkeypatch, _latent_moe_config())
+
+    assert isinstance(layer.routed_expert_up_proj, FakeRowParallel)
+    assert layer.routed_expert_up_proj.init_kwargs["input_is_parallel"] is False
+    assert layer.routed_expert_up_proj.init_kwargs["reduce_results"] is False
+    assert fused_moe_args["runner_cls"] is kimi_moe.KimiShardedUpMoERunner
+    assert fused_moe_args["shared_experts"] is layer.shared_experts
+    assert fused_moe_args["reduce_results"] is True
+    assert fused_moe_args["routed_output_transform"].output_scale == 2 / 8
+
+
+def test_sharded_up_runner_keeps_shared_partial_then_reduces_sum(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = object.__new__(kimi_moe.KimiShardedUpMoERunner)
+    shared = torch.randn(2, 6)
+    assert runner._maybe_reduce_shared_expert_output(shared, True) is shared
+
+    calls: list[torch.Tensor] = []
+
+    def fake_all_reduce(t: torch.Tensor) -> torch.Tensor:
+        calls.append(t)
+        return t + 7
+
+    monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce",
+                        fake_all_reduce)
+    partial_sum = torch.randn(2, 8)
+    actual = runner._maybe_reduce_final_output(partial_sum, 6, True)
+    torch.testing.assert_close(actual, (partial_sum + 7)[..., :6])
+    assert calls == [partial_sum]
+
+
+def test_sharded_latent_down_uses_hierarchical_row_parallel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRowParallel(_FakeReplicatedLinear):
+
+        def __init__(self, input_size, output_size, **kwargs) -> None:
+            self.init_kwargs = kwargs.copy()
+            super().__init__(input_size, output_size, **kwargs)
+
+    class FakeGroup:
+        world_size = 2
+        rank_in_group = 0
+
+        def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            return tensor
+
+    group = FakeGroup()
+    monkeypatch.setenv("TPU_K3_SHARD_LATENT_DOWN_PROJ", "1")
+    monkeypatch.setenv("TPU_MOE_HIERARCHICAL_EP", "1")
+    monkeypatch.setattr(kimi_moe, "RowParallelLinear", FakeRowParallel)
+    monkeypatch.setattr(kimi_moe, "hierarchical_split_or_none",
+                        lambda: (16, 0, 2, 0))
+    monkeypatch.setattr(kimi_moe, "_get_k3_hierarchical_tp_group",
+                        lambda: group)
+    monkeypatch.setattr(kimi_moe, "hierarchical_moe_parallel_config",
+                        nullcontext)
+    def enable_ep(vllm_config: VllmConfig) -> None:
+        vllm_config.parallel_config.enable_expert_parallel = True
+
+    layer, fused_moe_args = _build_kimi_moe(
+        monkeypatch, _latent_moe_config(), configure_vllm_config=enable_ep)
+
+    assert isinstance(layer.routed_expert_down_proj, FakeRowParallel)
+    assert layer.routed_expert_down_proj.init_kwargs["input_is_parallel"] is False
+    assert layer.routed_expert_down_proj.init_kwargs["reduce_results"] is False
+    transform = fused_moe_args["routed_input_transform"]
+    assert isinstance(transform, kimi_moe.KimiRoutedInputTransform)
+    assert transform.down_proj is layer.routed_expert_down_proj
+    assert transform.tp_group is group
+
+
+def test_sharded_latent_down_transform_reduces_projection() -> None:
+    class DownProj(nn.Module):
+
+        def forward(self, tensor: torch.Tensor):
+            return tensor + 3, None
+
+    class Group:
+
+        def __init__(self) -> None:
+            self.inputs: list[torch.Tensor] = []
+
+        def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            self.inputs.append(tensor)
+            return tensor * 2
+
+    group = Group()
+    transform = kimi_moe.KimiRoutedInputTransform(DownProj(), group)
+    inputs = torch.randn(2, 4)
+    actual = transform(inputs)
+    torch.testing.assert_close(actual, (inputs + 3) * 2)
+    assert len(group.inputs) == 1
+    torch.testing.assert_close(group.inputs[0], inputs + 3)
 
 
 def _set_pcp2(vllm_config: VllmConfig) -> None:

@@ -16,8 +16,30 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_torchtpu.layers.vllm import moe_routing
+
+
+@pytest.mark.parametrize("leading_shape", [(1, ), (3, ), (2, 3)])
+def test_k3_blocked_topk_matches_global_topk(monkeypatch, leading_shape) -> None:
+    monkeypatch.setenv("TPU_K3_BLOCKED_TOPK", "1")
+    generator = torch.Generator().manual_seed(1234)
+    scores = torch.randn(*leading_shape, 896, generator=generator)
+
+    expected_values, expected_ids = torch.topk(scores, k=16, dim=-1)
+    actual_values, actual_ids = moe_routing._topk_for_expert_choice(scores, 16)
+
+    torch.testing.assert_close(actual_values, expected_values)
+    assert torch.equal(actual_ids, expected_ids)
+
+
+def test_non_k3_topk_uses_standard_shape() -> None:
+    scores = torch.randn(2, 128)
+    expected = torch.topk(scores, k=8, dim=-1)
+    actual = moe_routing._topk_for_expert_choice(scores, 8)
+    torch.testing.assert_close(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
 
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):

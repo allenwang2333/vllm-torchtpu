@@ -40,7 +40,8 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     if world_size <= 1:
         return None
 
-    split = hierarchical_moe_split(world_size, rank)
+    split = hierarchical_moe_split(world_size, rank,
+                                   envs.TPU_MOE_HIERARCHICAL_TP_SIZE)
     if split is None:
         _warn_once(
             "TPU_MOE_HIERARCHICAL_EP is set but the chip topology could not be "

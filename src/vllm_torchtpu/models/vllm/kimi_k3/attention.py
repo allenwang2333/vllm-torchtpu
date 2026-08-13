@@ -36,6 +36,10 @@ from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
     build_kimi_sconv_op)
 from vllm_torchtpu.logger import init_logger
 
+from .layers import _linear_tp_override
+from .moe import (_get_k3_hierarchical_tp_group,
+                  _get_k3_projection_tp_group)
+
 logger = init_logger(__name__)
 
 _USE_NAIVE_KDA_ENV = "VLLM_TPU_USE_NAIVE_KDA"
@@ -132,6 +136,48 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
         super().weight_loader(param, loaded_weight, loaded_shard_id)
 
 
+class MergedRowParallelLinear(RowParallelLinear):
+    """Row-sharded fused linear with merged-checkpoint shard loading."""
+
+    def __init__(self, input_size: int, output_sizes: list[int], *,
+                 quant_config: QuantizationConfig | None, prefix: str,
+                 tp_group) -> None:
+        self.merged_output_sizes = output_sizes
+        self.tp_group = tp_group
+        super().__init__(
+            input_size,
+            sum(output_sizes),
+            bias=False,
+            input_is_parallel=False,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
+                      loaded_shard_id: int | None = None) -> None:
+        if not isinstance(loaded_shard_id, int):
+            return super().weight_loader(param, loaded_weight)
+
+        output_dim = getattr(param, "output_dim", None)
+        input_dim = getattr(param, "input_dim", None)
+        if output_dim is None:
+            return super().weight_loader(param, loaded_weight)
+        offset = sum(self.merged_output_sizes[:loaded_shard_id])
+        size = self.merged_output_sizes[loaded_shard_id]
+        param_data = param.data.narrow(output_dim, offset, size)
+        if input_dim is not None:
+            shard_size = param_data.shape[input_dim]
+            loaded_weight = loaded_weight.narrow(
+                input_dim, self.tp_rank * shard_size, shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+    def forward(self, input_: torch.Tensor):
+        output, bias = super().forward(input_)
+        return self.tp_group.all_reduce(output), bias
+
+
 class MultiHeadLatentAttention(nn.Module):
     """NoPE MLA dispatched through the TPU Pallas MLA custom op."""
 
@@ -172,6 +218,15 @@ class MultiHeadLatentAttention(nn.Module):
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
+        mla_split = None
+        if envs.TPU_K3_SHARD_MLA_A_PROJ:
+            from vllm_torchtpu.layers.vllm.moe_hierarchical import \
+                hierarchical_split_or_none
+            mla_split = hierarchical_split_or_none()
+        self.shard_mla_a_proj = (self.q_lora_rank is not None
+                                 and mla_split is not None
+                                 and not getattr(config,
+                                                 "mla_use_output_gate", False))
 
         self.mla_gate_is_fused = False
         if self.q_lora_rank is None:
@@ -203,14 +258,27 @@ class MultiHeadLatentAttention(nn.Module):
                 )
                 self.mla_gate_is_fused = True
             else:
-                self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                    config.hidden_size,
-                    qkv_a_output_sizes,
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.fused_qkv_a_proj",
-                    disable_tp=True,
-                )
+                if self.shard_mla_a_proj:
+                    assert mla_split is not None
+                    _, _, mla_tp_size, mla_tp_rank = mla_split
+                    mla_tp_group = _get_k3_hierarchical_tp_group()
+                    with _linear_tp_override(mla_tp_rank, mla_tp_size):
+                        self.fused_qkv_a_proj = MergedRowParallelLinear(
+                            config.hidden_size,
+                            qkv_a_output_sizes,
+                            quant_config=quant_config,
+                            prefix=f"{prefix}.fused_qkv_a_proj",
+                            tp_group=mla_tp_group,
+                        )
+                else:
+                    self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                        config.hidden_size,
+                        qkv_a_output_sizes,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.fused_qkv_a_proj",
+                        disable_tp=True,
+                    )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -355,6 +423,27 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_size = int(kda_config["short_conv_kernel_size"])
         self.gate_lower_bound = kda_config.get("gate_lower_bound")
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
+        hierarchical_split = None
+        if envs.TPU_K3_SHARD_KDA_F_A_PROJ:
+            from vllm_torchtpu.layers.vllm.moe_hierarchical import (
+                hierarchical_moe_split, hierarchical_split_or_none)
+            hierarchical_split = hierarchical_split_or_none()
+            requested_f_a_tp = envs.TPU_K3_KDA_F_A_TP_SIZE
+            if requested_f_a_tp:
+                hierarchical_split = hierarchical_moe_split(
+                    get_tensor_model_parallel_world_size(),
+                    get_tensor_model_parallel_rank(), requested_f_a_tp)
+                if hierarchical_split is None:
+                    raise ValueError(
+                        f"TPU_K3_KDA_F_A_TP_SIZE={requested_f_a_tp} is "
+                        "not a valid whole-chip topology split")
+        self.shard_f_a_proj = (self.use_full_rank_gate
+                               and hierarchical_split is not None)
+        self.f_a_tp_group = None
+        if self.shard_f_a_proj:
+            assert hierarchical_split is not None
+            _, _, f_a_tp_size, _ = hierarchical_split
+            self.f_a_tp_group = _get_k3_projection_tp_group(f_a_tp_size)
         quant_config = vllm_config.quant_config
 
         self.fused_qkvb_proj = MergedColumnParallelLinear(
@@ -366,13 +455,27 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         if self.use_full_rank_gate:
             self.fused_fa_ga_proj = None
-            self.f_a_proj = ReplicatedLinear(
-                config.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_a_proj",
-            )
+            if self.shard_f_a_proj:
+                assert hierarchical_split is not None
+                _, _, f_a_tp_size, f_a_tp_rank = hierarchical_split
+                with _linear_tp_override(f_a_tp_rank, f_a_tp_size):
+                    self.f_a_proj = RowParallelLinear(
+                        config.hidden_size,
+                        self.head_dim,
+                        bias=False,
+                        quant_config=quant_config,
+                        input_is_parallel=False,
+                        reduce_results=False,
+                        prefix=f"{prefix}.f_a_proj",
+                    )
+            else:
+                self.f_a_proj = ReplicatedLinear(
+                    config.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_a_proj",
+                )
             self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
                 self.projection_size,
@@ -506,7 +609,18 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             assert self.f_a_proj is not None
             f_a, _ = self.f_a_proj(hidden_states)
             assert self.g_proj is not None
-            output_gate, _ = self.g_proj(hidden_states)
+            if envs.TPU_K3_OVERLAP_KDA_F_A_REDUCE:
+                # Keep the independent, much larger gate projection between
+                # producing the partial f_a value and consuming its reduction.
+                # This gives XLA an explicit scheduling window for the small
+                # subgroup collective without changing graph math.
+                output_gate, _ = self.g_proj(hidden_states)
+                if self.f_a_tp_group is not None:
+                    f_a = self.f_a_tp_group.all_reduce(f_a)
+            else:
+                if self.f_a_tp_group is not None:
+                    f_a = self.f_a_tp_group.all_reduce(f_a)
+                output_gate, _ = self.g_proj(hidden_states)
         else:
             assert self.fused_fa_ga_proj is not None
             gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
