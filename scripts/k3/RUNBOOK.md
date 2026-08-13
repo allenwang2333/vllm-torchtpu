@@ -196,15 +196,15 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. A fresh latency-hiding layer
-scheduler experiment is starting on the current best graph with
-`--xla_tpu_enable_latency_hiding_layer_scheduler=true`, unique namespace
-`/mnt/scratch/kimi-k3-b1-latency-hiding-layer-scheduler`, and no additional
-experimental flags. At the time this section was written, all 32 Ray workers
-were alive and loading/compiling, but port 8000 was not yet healthy. Benchmark
-it only after health succeeds. Accept it only if two canonical runs beat the
-15.91567/15.92282 ms dependent-scheduler controls; otherwise document and
-reject it.
+Allocation job 602 is intentionally still active. The latency-hiding layer
+scheduler experiment completed in namespace
+`/mnt/scratch/kimi-k3-b1-latency-hiding-layer-scheduler`. Its two canonical
+runs measured 15.91772 and 15.91197 ms mean TPOT versus 15.91567 and 15.92282
+ms for the dependent-scheduler controls. This is neutral within run noise, so
+`--xla_tpu_enable_latency_hiding_layer_scheduler=true` is rejected as a
+default. At the time this section was updated, that experimental server was
+still healthy on port 8000. Stop its vLLM PID and exact Ray step before any
+source or libtpu-flag experiment; do not cancel allocation job 602.
 
 ## Non-Slurm cluster
 

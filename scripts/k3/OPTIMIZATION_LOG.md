@@ -1110,6 +1110,31 @@ the regressed TP2 up path remains disabled.
     0.06--0.07 ms and have tight p99, so the guarded flag is now a launcher
     default. This is a real scheduling reduction inside the executable, not
     recovery of the invalidly inferred 1.3 ms idle residual.
+40. Captured two temperature-1 profile windows for the new dependent-
+    collective default and compared the second rank-0 trace with the matching
+    pre-scheduler neutral-sampling trace using the same repaired parser and
+    accounting scope. Median model-executable duration fell from 15.69323 to
+    15.63341 ms, a 0.05982 ms reduction. On the primary XLA-op lane,
+    all-reduce self-time fell from 5.20205 to 5.14697 ms (-0.05507 ms) and
+    copies fell from 3.70740 to 3.70142 ms (-0.00599 ms). Dense work, fused
+    elementwise work, routed GMMs, sort, and custom calls were unchanged to
+    within approximately 0.001 ms. This reconciles essentially the entire
+    endpoint gain with collective scheduling rather than host or idle time.
+    The traces are under
+    `/mnt/scratch/kimi-k3-b1-dep-collective-scheduler-profile`.
+
+    Based on that attribution, tested the broader
+    `--xla_tpu_enable_latency_hiding_layer_scheduler=true` in addition to the
+    default dependent-collective scheduler, with a fresh Ray cluster and fresh
+    compilation caches. The two canonical runs measured 15.91772/15.91831/
+    15.93611 ms and 15.91197/15.90822/15.93072 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-latency-hiding-layer-scheduler/kimi-k3_isl1_osl1000_concurrency1_20260813-080442.json`
+    and
+    `results/kimi-k3-b1-latency-hiding-layer-scheduler-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-080823.json`.
+    The first is 0.00205 ms slower than the best dependent-scheduler control;
+    the repeat is 0.00370 ms faster. Both lie inside the existing run-to-run
+    spread, so the full latency-hiding scheduler is neutral and is not added
+    to launcher defaults.
 
 ## Forward plan
 
