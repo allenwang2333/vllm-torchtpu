@@ -1905,6 +1905,53 @@ the regressed TP2 up path remains disabled.
     not the complete 17--18 ms device timeline. The current interval-union
     table is the detailed wall-time accounting; do not subtract a top-N kernel
     list from endpoint TPOT and label the difference host overhead.
+55. Tested libtpu async collective fusion on fresh Ray workers and fresh
+    caches. This is a compiler fusion pass, distinct from the rejected
+    `xla_enable_async_all_reduce` scheduling experiment in section 10. The
+    exact launch override was:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-async-collective-fusion
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_async_collective_fusion=true'
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+    ```
+
+    The flag compiled and served on this TPU v7x-32/libtpu build, but libtpu
+    itself warns that the pass is supported/recommended only on Viperlite and
+    may otherwise cause incorrect results, hangs, or SDC. Its cold compile was
+    also exceptionally verbose (hundreds of thousands of layout-assignment
+    messages); log volume is not a readiness signal. The canonical benchmark
+    pair and profile were run with:
+
+    ```bash
+    OUTPUT_DIR="$PWD/results/kimi-k3-b1-async-collective-fusion" \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR="$PWD/results/kimi-k3-b1-async-collective-fusion-repeat" \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR="$PWD/results/profile-kimi-k3-b1-async-collective-fusion" \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-async-collective-fusion-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The endpoint means were 15.27772 and 15.27654 ms, averaging 15.27713 ms,
+    which is 0.00325 ms slower than the accepted 15.27388 ms pair. The latest
+    rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-async-collective-fusion-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2731456.1786629679643870728.pt.trace.json.gz`.
+    Sixteen normal model executables average 14.98988 ms (14.98926 ms median),
+    versus 14.98202 ms for the accepted profile. Their start-to-start spacing
+    averages 15.12862 ms and the end-to-next-start gap averages 0.13917 ms,
+    versus 15.11888 and 0.13740 ms accepted. The primary plus async device-lane
+    union is 14.92637 ms, leaving only 0.06351 ms uncovered.
+
+    Most importantly, the trace has the same 623 matched collective events per
+    normal decode as the accepted trace. On the same primary-lane accounting,
+    collective duration increased from 5.22903 to 5.24140 ms/decode; the async
+    collective lane remained 0.2064 ms. This pass neither merged collectives
+    nor shortened their critical path. Reject it, restore
+    `xla_tpu_enable_async_collective_fusion=false`, and do not expose this
+    platform-risky flag as a launcher option.
 
 ## Forward plan
 
@@ -1925,11 +1972,14 @@ the regressed TP2 up path remains disabled.
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-5. Continue from the now-enabled dependent-collective layer scheduler and
-   inspect its paired trace for changed all-reduce/copy ordering. Test another
-   libtpu collective mechanism only if it targets a remaining measured stall
-   and is distinct from rejected decomposition, SparseCore offload,
-   async-all-reduce, and collective-matmul V2 settings.
+5. Continue from the now-enabled dependent-collective layer scheduler. Async
+   collective fusion is now also rejected: it left all 623 collective events
+   intact, regressed stable executable time by 0.008 ms, and carries an
+   explicit non-Viperlite correctness/hang warning. The next isolated compiler
+   candidate is `xla_tpu_enable_async_collective_merger=true`, which is a
+   separate merger pass and does not require enabling the risky fusion pass.
+   Accept it only if a trace shows fewer/shorter collective events and endpoint
+   TPOT improves. Otherwise return to collective reuse at the model boundary.
 6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,

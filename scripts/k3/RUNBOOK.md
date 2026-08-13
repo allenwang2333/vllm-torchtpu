@@ -245,13 +245,12 @@ when they do not initialize the TPU plugin.
 ### Live state at this handoff
 
 Allocation job 602 is intentionally still active. There is currently no Ray
-step and no vLLM server: the rejected block-router server was stopped and only
-Ray step `602.55` was canceled before an isolated GMM tile sweep. Start fresh
-Ray workers with the four-host command above before the next full-model
-experiment. The most recent server used cache namespace
-`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk` and profile directory
-`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile`; it is no longer
-running.
+step and no vLLM server: async-collective-fusion server PID 2744587 was stopped
+cleanly and only Ray step `602.62` was canceled. Start fresh Ray workers with
+the four-host command above before the next experiment; a fresh Ray step is
+mandatory because the last trial changed `LIBTPU_INIT_ARGS`. The next planned
+isolated trial is `--xla_tpu_enable_async_collective_merger=true` on top of the
+normal launcher flags, with async collective fusion omitted/false.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -296,6 +295,18 @@ scale-load, lane-interleave, and bucketized-M improvements are already present;
 its exact `approx_max_k` path is the already rejected K3 JAX experiment; and
 its fused MoE kernel cannot accept one token under EP16 or lossless block-32
 MXFP4. No upstream code was ported from that audit.
+
+The most recent rejected full-model trial is milestone 55. Its endpoint pair
+is under `results/kimi-k3-b1-async-collective-fusion{,-repeat}` and measures
+15.27772 and 15.27654 ms mean TPOT. Its latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-async-collective-fusion-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2731456.1786629679643870728.pt.trace.json.gz`.
+Stable executable time is 14.98988 ms and primary-lane collective time is
+5.24140 ms, both slightly slower than the accepted profile. Do not enable
+`xla_tpu_enable_async_collective_fusion`: besides being non-improving, the
+installed libtpu warns that it is unsupported/not recommended off Viperlite
+and could cause incorrect results, hangs, or SDC. It also emits extremely
+large compiler logs; use `/health`, process state, and per-rank artifact saves
+rather than log volume to judge cold-start progress.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
