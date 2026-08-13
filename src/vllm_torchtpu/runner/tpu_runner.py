@@ -4225,24 +4225,26 @@ class TPUModelRunner(GPUModelRunner):
                     device=self.device,
                     dtype=self._hidden_states_dtype,
                 )
-                placeholder = torch.empty((1, 1), device=self.device)
-                out = self.sample_from_sharded_hidden_states_func(
+                local_pair = self.sample_local_noisy_max(
                     hidden_states,
                     temperatures,
                     u,
-                    placeholder,
-                    placeholder,
                     all_greedy=False,
                 )
-                sync.synchronize(out, wait=True)
-                out = self.sample_from_sharded_hidden_states_func(
+                sync.synchronize(local_pair, wait=True)
+                local_pair = self.sample_local_noisy_max(
                     hidden_states,
-                    placeholder,
-                    placeholder,
-                    placeholder,
-                    placeholder,
+                    temperatures,
+                    u,
                     all_greedy=True,
                 )
+                sync.synchronize(local_pair, wait=True)
+                gathered = torch.zeros(
+                    (num_reqs, self.model.lm_head.tp_size * 2),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                out = self.select_global_token_from_pairs(gathered)
                 sync.synchronize(out, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
@@ -5566,22 +5568,19 @@ class TPUModelRunner(GPUModelRunner):
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def sample_from_sharded_hidden_states(
+    def sample_local_noisy_max(
             self,
             hidden_states: torch.Tensor,
             temperatures: torch.Tensor,
             u: torch.Tensor,
-            top_k: torch.Tensor,
-            top_p: torch.Tensor,
             all_greedy: bool = False) -> torch.Tensor:
-        """Exact neutral sampler without a full-vocabulary TP all-gather.
+        """Return this TP rank's exact neutral-sampling maximum pair.
 
         The full ``u`` input deliberately preserves the existing generator
-        advancement and token-to-random-number mapping. Each rank consumes its
-        vocab slice, reduces to one local maximum, and all-gathers only the
-        resulting (value, global-token-id) pair.
+        advancement and token-to-random-number mapping. This compiled graph has
+        no collective: the caller performs the two-value all-gather through the
+        synchronized process-group path after every rank has reached it.
         """
-        del top_k, top_p
         logits_processor = self.model.logits_processor
         lm_head = self.model.lm_head
         local_logits = logits_processor._apply_head(lm_head, hidden_states,
@@ -5615,12 +5614,39 @@ class TPUModelRunner(GPUModelRunner):
         local_max_vals, local_max_indices = local_logits.max(
             dim=-1, keepdim=True)
         global_indices = local_max_indices + vocab_start
-        local_pair = torch.cat(
+        return torch.cat(
             (local_max_vals.float(), global_indices.float()), dim=-1)
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
-        gathered = gathered.view(hidden_states.shape[0], lm_head.tp_size, 2)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def select_global_token_from_pairs(
+            self, gathered: torch.Tensor) -> torch.Tensor:
+        """Select the winning global token from TP-rank maximum pairs."""
+        lm_head = self.model.lm_head
+        gathered = gathered.view(gathered.shape[0], lm_head.tp_size, 2)
         max_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
         return gathered[..., 1].gather(-1, max_rank).to(torch.int64)
+
+    def sample_from_sharded_hidden_states(
+            self,
+            hidden_states: torch.Tensor,
+            temperatures: torch.Tensor,
+            u: torch.Tensor,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            all_greedy: bool = False) -> torch.Tensor:
+        """Exact neutral sampler without a full-vocabulary TP all-gather.
+
+        Keep the collective outside the compiled local-max graph. The first
+        implementation put the process-group all-gather inside its own XLA
+        executable and stalled on the first live request even though all ranks
+        compiled it. Reaching the eager process-group call from the common
+        runner path gives the host controllers an explicit rendezvous point.
+        """
+        del top_k, top_p
+        local_pair = self.sample_local_noisy_max(hidden_states, temperatures,
+                                                 u, all_greedy=all_greedy)
+        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        return self.select_global_token_from_pairs(gathered)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,

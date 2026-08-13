@@ -2482,6 +2482,81 @@ the regressed TP2 up path remains disabled.
     15.1187865 ms best pair are unchanged. Static checks and the normal-device
     `tests/runner/test_tpu_runner.py` suite pass (80 tests).
 
+70. Re-audited current
+    [`vllm-project/tpu-inference`](https://github.com/vllm-project/tpu-inference)
+    at head `5fa7bb815bf63afec509e27f4bc7f68922cdd233` (2026-08-13),
+    used its lockstep design to repair the distributed sampler deadlock, and
+    rejected the repaired sampler on matched performance evidence.
+
+    The current upstream MoE conclusions are unchanged from milestone 53.
+    Its stride-zero GMM scale load, fused gate/up lane interleave, bucketized-M
+    execution, exact `approx_max_k`, shared-expert reduction deferral, and
+    SparseCore gather/reduce paths are already present locally or already
+    measured/rejected for K3 batch 1. No newer K3-applicable MoE kernel was
+    found. The new useful architectural reference is
+    [`tpu_inference/runner/decode_loop.py`](https://github.com/vllm-project/tpu-inference/blob/5fa7bb815bf63afec509e27f4bc7f68922cdd233/tpu_inference/runner/decode_loop.py):
+    `model_fn -> compute_logits_fn -> sample_fn` runs inside one top-level
+    `jax.jit`/`lax.while_loop`, with donated KV cache. PR
+    [#3374](https://github.com/vllm-project/tpu-inference/pull/3374) also shows
+    that this wrapper must inherit the model step's compiler options rather
+    than nest independently compiled functions. Its normal sampling path still
+    explicitly unshards the full vocabulary before sampling and carries a TODO
+    for sharded-vocab sampling, so it contains no ready-made pair-reduction
+    sampler. Its compilation manager does provide an important operational
+    rule: dummy logits and sampling metadata must exactly match live dtype and
+    sharding (`float32` logits/temperature/top-p and `int32` top-k), or the
+    first request recompiles.
+
+    A direct port of that fused loop is not a small change in this TorchTPU
+    runner. K3's 92-layer decoder is compiled by vLLM's `support_torch_compile`
+    wrapper as one AOT backbone, while input prep, sampling, async placeholder
+    state, and KDA mutation replay live outside it. Wrapping the already
+    compiled backbone plus a sampler cannot create the single SPMD compilation
+    boundary used by JAX; a faithful port would recompile the entire decoder,
+    thread/donate KV and KDA state through it, and change scheduler ownership.
+    That is disproportionate for a measured 0.119 ms target gap and risks
+    changing the canonical one-host-step workload.
+
+    Instead, the milestone-69 sampler was split at the risky boundary. The
+    local LM head, exact temperature/Gumbel transform, and local maximum now
+    run in a collective-free compiled graph; every worker then calls the
+    ordinary process-group two-value all-gather from the common runner path;
+    a second tiny compiled graph selects the winning global token. Precompile
+    now builds only the two collective-free graphs using live-matching shapes
+    and dtypes. Fresh Ray step `664.30` had 32/32 TPUs. A four-token liveness
+    request returned HTTP 200 with four tokens in 1.6 seconds, proving that the
+    split removes the previous first-request deadlock.
+
+    The canonical endpoint result rejects it. Two candidate means were
+    15.2901584 and 15.2938704 ms; two same-source, same-Ray, independently
+    clean-compiled flag-off controls were 15.2733866 and 15.2872469 ms. Pair
+    averages are 15.2920144 versus 15.2803168 ms: the repaired sampler is
+    **0.0116976 ms/token slower**. Cross-session comparison to the 15.1187865
+    ms absolute best is invalid here because both fresh source hashes produced
+    a roughly 14.99 ms backbone; the matched control is the attribution.
+
+    Two candidate traces give a 152.83--153.32 us post-backbone gap, versus
+    140.28--140.38 us for two controls. Candidate device components are about
+    38.8 us local LM-head/Gumbel/max, 49.7--50.1 us across the two emitted
+    pair-allgather modules, 9.3--9.4 us final selection, 6.1 us vocabulary RNG,
+    5.1 us token view, and 4.6--4.8 us placeholder scatter, leaving about
+    31.1 us uncovered. Controls spend about 72.7 us on LM head/full-vocab
+    all-gather, 18.8 us on sampling/argmax, 6.7 us on the two RNG modules,
+    5.0 us on the token view, and 4.7 us on placeholder scatter, leaving about
+    31.0 us uncovered. Thus shrinking the communication payload does work, but
+    the extra executable plus process-group rendezvous gives the time back and
+    adds about 12 us, matching the endpoint regression.
+
+    `analyze_trace_tail.py` initially misreported 34 half-step gaps and a
+    7.5 ms "backbone" because the tiny final-select executable reused the same
+    root `region.268435455` name as the decoder. It now ignores same-named
+    regions shorter than 1000 us by default; override with
+    `--min-backbone-duration-us` only for a genuinely different model. This is
+    a trace-tool correction, not a performance change. `git diff --check`,
+    Python and shell syntax checks, and `tests/runner/test_tpu_runner.py` pass
+    (80 tests, 15 warnings). Keep the repaired code default-off for
+    reproducibility, but do not pursue another sampler-only executable split.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -2571,14 +2646,17 @@ the regressed TP2 up path remains disabled.
     The remaining gap is therefore not removable merely by reducing Python
     call count; a future runtime attempt needs native asynchronous batching or
     a dependency change, not the generic foreach composite.
-15. Keep the milestone-69 distributed neutral sampler disabled. Its exact
-    local-head/pair-reduction graph compiles, but a live request stalls at the
-    new standalone TP collective before producing a token. Do not rerun the
-    same architecture. A future attempt must integrate the reduction into a
-    TP-lockstep executable or validate a synchronized eager collective first,
-    then compare endpoint TPOT and the device gap against milestone-67 fusion
-    and flag-off controls. Preserve full RNG advancement and do not generalize
-    to top-k/top-p, penalties, grammar, or logprobs without exact semantics.
+15. Keep the distributed neutral sampler disabled. Milestone 70 repairs the
+    first-request deadlock by placing the pair all-gather at an explicit
+    process-group rendezvous between collective-free compiled graphs, but its
+    matched endpoint pair regresses by 0.01170 ms/token and its post-backbone
+    tail grows by about 12 us. Do not try another sampler-only split. The only
+    remaining version of this idea with a credible cost model would place the
+    local head, pair reduction, and final selection in the same already-needed
+    backbone executable, analogous to `tpu-inference`'s whole-loop JAX design;
+    that requires a full runner/state compilation redesign, not another
+    wrapper. Preserve full RNG advancement and do not generalize to top-k/top-p,
+    penalties, grammar, or logprobs without exact semantics.
 
 ## Current best and gap
 

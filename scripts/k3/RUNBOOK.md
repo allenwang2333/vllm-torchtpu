@@ -253,14 +253,13 @@ when they do not initialize the TPU plugin.
 
 Allocation 602 expired at its 24-hour limit. Replacement allocation 664 is
 running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
-IP `10.13.232.26`. A four-host Ray cluster is live in overlapping step
-`664.8`, with temporary directory `/tmp/ray-k3-job664-mut`. No vLLM server is
-currently running. Those workers imported the now-removed input-mutation
-diagnostic, so they are stale: cancel exactly `664.8`, start fresh Ray workers,
-and verify all 32 TPU resources before the next server. Preserve parent
-allocation 664. The rejected diagnostic used cache
-`/mnt/scratch/kimi-k3-b1-keep-input-mutations` and profile namespace with the
-same name plus `-profile`.
+IP `10.13.232.26`. A fresh four-host Ray cluster is live in overlapping step
+`664.30`, using `/tmp/ray/session_2026-08-13_20-57-56_866337_3828332`; all
+32 TPU resources are free. No vLLM server is currently running. These workers
+imported the milestone-70 source tree and are suitable for another experiment
+only if no source or `LIBTPU_INIT_ARGS` value changes. Otherwise cancel exactly
+`664.30`, start fresh workers, and verify 32/32 TPUs. Preserve parent allocation
+664.
 
 Current status checks are:
 
@@ -322,11 +321,11 @@ contains run variance and client/streaming accounting. It is not a four-ms
 input-preparation cost. See milestones 50 and 54 for the complete device-lane
 scope rules.
 
-The current `vllm-project/tpu-inference` audit is milestone 53. Its recent GMM
-scale-load, lane-interleave, and bucketized-M improvements are already present;
-its exact `approx_max_k` path is the already rejected K3 JAX experiment; and
-its fused MoE kernel cannot accept one token under EP16 or lossless block-32
-MXFP4. No upstream code was ported from that audit.
+Milestone 70 supersedes the milestone-53 `vllm-project/tpu-inference` audit at
+current head `5fa7bb815bf63afec509e27f4bc7f68922cdd233`. The GMM, exact
+`approx_max_k`, fused-MoE, and one-token EP16 conclusions are unchanged. Its
+whole-loop JAX compilation boundary informed the deadlock-free sampler split,
+but no upstream code was ported blindly; the measured split was slower.
 
 The most recent rejected full-model trial is milestone 55. Its endpoint pair
 is under `results/kimi-k3-b1-async-collective-fusion{,-repeat}` and measures
@@ -753,6 +752,111 @@ ideas were already implemented as the exact full-width Pallas router and the
 rejected `7 x 128` blockwise merge; see milestones 49 and 51. A future sampler
 retry must preserve the full-vocabulary RNG draw and token-to-random-number
 mapping until deterministic equivalence is separately proven.
+
+Milestone 70 completed that synchronized-eager retry and supersedes the
+warning above for the current code. The flag now compiles the local
+LM-head/Gumbel/max and final pair selection separately, while the ordinary
+process-group all-gather runs between them from the common runner path. This
+version is live (a four-token request returned HTTP 200), but remains rejected:
+its two endpoint means were 15.2901584 and 15.2938704 ms versus matched flag-off
+controls at 15.2733866 and 15.2872469 ms, a pair-average regression of
+0.0116976 ms/token. Candidate post-backbone gaps were 152.83--153.32 us versus
+140.28--140.38 us for controls. Keep the flag at zero.
+
+The exact candidate launch used fresh Ray step `664.30` and:
+
+```bash
+export K3_RUN_NAME=kimi-k3-b1-distributed-neutral-eager-pair-v3
+export RAY_ADDRESS=10.13.232.26:6379
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-bidirectional-allreduce
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+TPU_K3_FUSE_LM_HEAD_SAMPLER=0 \
+TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER=1 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+  scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+TEMPERATURE=1 INCLUDE_SEED=0 \
+  OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+  PROF_DIR=$PROF_DIR \
+  scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+```
+
+The same-source control stopped only the candidate vLLM PID, retained Ray step
+`664.30`, then used identical exports except:
+
+```bash
+export K3_RUN_NAME=kimi-k3-b1-distributed-neutral-eager-control-v3
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+TPU_K3_FUSE_LM_HEAD_SAMPLER=0 \
+TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER=0 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+  scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+TEMPERATURE=1 INCLUDE_SEED=0 \
+  OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+  PROF_DIR=$PROF_DIR \
+  scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+```
+
+Changing the flag changes the TPU compilation hash, so both candidate and
+control performed clean roughly 12-minute one-token AOT compiles even though
+the tier-2/tier-3 cache paths point at the accepted run. Do not compare the
+resulting approximately 14.99 ms backbones directly to the 14.834 ms absolute
+best; use the matched endpoint/tail delta. The four result directories are:
+
+```text
+results/kimi-k3-b1-distributed-neutral-eager-pair-v3
+results/kimi-k3-b1-distributed-neutral-eager-pair-v3-repeat
+results/kimi-k3-b1-distributed-neutral-eager-control-v3
+results/kimi-k3-b1-distributed-neutral-eager-control-v3-repeat
+```
+
+The two latest rank-0 candidate traces are:
+
+```text
+/mnt/scratch/kimi-k3-b1-distributed-neutral-eager-pair-v3-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3829629.1786655891099248784.pt.trace.json.gz
+/mnt/scratch/kimi-k3-b1-distributed-neutral-eager-pair-v3-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3829629.1786655958226410877.pt.trace.json.gz
+```
+
+The two control traces are:
+
+```text
+/mnt/scratch/kimi-k3-b1-distributed-neutral-eager-control-v3-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3829636.1786657319052264810.pt.trace.json.gz
+/mnt/scratch/kimi-k3-b1-distributed-neutral-eager-control-v3-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_3829636.1786657386659161910.pt.trace.json.gz
+```
+
+Analyze each with:
+
+```bash
+.venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 15 TRACE
+```
+
+The analyzer now defaults to `--min-backbone-duration-us 1000`. This is
+required because the candidate's tiny final-select executable reused the
+decoder's `region.268435455` root name; without duration filtering the old
+tool formed 34 alternating gaps and falsely reported a 7.5 ms backbone.
+
+The current `tpu-inference` audit is at head
+`5fa7bb815bf63afec509e27f4bc7f68922cdd233`. Its fused continue-decode loop
+keeps model, logits, and sampling in one top-level JAX executable with donated
+KV state, but its ordinary sampler still unshards full logits. Treat it as an
+architectural reference only: reproducing that compilation boundary in this
+Torch runner requires a full decoder/KV/KDA/scheduler redesign, not wrapping
+the already-AOT-compiled backbone. See milestone 70 for the source paths,
+compiler-option and runtime-sharding caveats, and disposition.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of

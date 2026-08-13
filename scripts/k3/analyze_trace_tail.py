@@ -110,6 +110,15 @@ def main() -> None:
         help="skip profiler-boundary backbone regions before forming gaps",
     )
     parser.add_argument(
+        "--min-backbone-duration-us",
+        type=float,
+        default=1000.0,
+        help=(
+            "ignore same-named short compiled regions; K3's backbone is about "
+            "15 ms, while sampling epilogues may reuse the root region name"
+        ),
+    )
+    parser.add_argument(
         "--top-modules",
         type=int,
         default=0,
@@ -119,7 +128,12 @@ def main() -> None:
 
     events = read_device_events(args.trace)
     regions = sorted(
-        (event for event in events if event.name == args.region),
+        (
+            event
+            for event in events
+            if event.name == args.region
+            and event.dur >= args.min_backbone_duration_us
+        ),
         key=lambda event: event.ts,
     )[args.skip_first :]
     if len(regions) < 2:
