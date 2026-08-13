@@ -923,7 +923,7 @@ the regressed TP2 up path remains disabled.
     This regresses 0.08 ms mean and 0.20 ms p99 from enhanced barriers alone.
     The compiler mechanisms interact negatively; decomposition stays at its
     libtpu default.
-34. Began an isolated large-buffer memory-placement experiment on the
+34. Completed an isolated large-buffer memory-placement experiment on the
     unchanged enhanced-barrier best graph using
     `--xla_tpu_alternate_memory_benefit_scaling_factor_for_large_buffers=0`.
     The flag is present in the installed libtpu and is already used by the
@@ -933,9 +933,59 @@ the regressed TP2 up path remains disabled.
     32 KiB decomposition server still held port 8000 despite its original
     terminal session no longer appearing active. The stale frontend was
     identified exactly as PID 1465297, stopped with SIGINT, and the isolated
-    experiment was relaunched with fresh compile caches. Compilation and the
-    canonical benchmark are currently in progress; this flag is not a
-    launcher default unless the result beats and repeats against 16.141 ms.
+    experiment was relaunched with fresh compile caches. All 32 workers
+    constructed and the full graph compiled. The canonical result was
+    16.15640 ms mean, 16.15304 ms median, 16.16570 ms p99, 61.85 output
+    tokens/s, and 27.48 ms mean TTFT:
+    `results/kimi-k3-b1-tep32-hier-ep-b1-down-tp4-kda-fa-enh-barrier-altmem0/kimi-k3_isl1_osl1000_concurrency1_20260813-060612.json`.
+    This is 0.01527 ms slower than the enhanced-barrier repeat best, within
+    run noise but with no evidence of copy-path improvement. The memory flag
+    is rejected and was not added to the launcher default.
+35. Surveyed [`vllm-project/tpu-inference`](https://github.com/vllm-project/tpu-inference)
+    and its current optimization PRs for mechanisms transferable to this
+    batch-1 Torch/XLA graph. The most directly relevant item is open Kimi-K3
+    PR [`#3292`](https://github.com/vllm-project/tpu-inference/pull/3292), whose
+    JAX-native design uses composed EP4 x TP8 routed-expert sharding and
+    full-device KDA head sharding. Its PR explicitly calls throughput tuning
+    follow-up work and reports no batch-1 TPOT. The EP4 x TP8 expert layout is
+    not a promising direct transplant here: our paired EP16 x TP2 versus EP8
+    x TP4 test already regressed 0.14 ms at TP4, so the documented geometry
+    trend rejects widening the same GMM contraction to TP8. Full-device KDA
+    head sharding primarily distributes independent heads and model memory;
+    it is distinct from widening KDA's contracting-axis `f_a_proj`, where our
+    TP4 test regressed 0.13 ms from TP2.
+
+    Other findings were triaged against the exact workload:
+
+    - Open PR [`#3237`](https://github.com/vllm-project/tpu-inference/pull/3237)
+      removes per-step RNG splitting and redundant logits casts from the
+      JAX-native sampling path. The TorchTPU runner already feeds native-dtype
+      logits into a separately compiled `sample_from_logits`, skips all
+      sampling transforms on its `all_greedy` branch, and only executes
+      `gather_logprobs` when requested, so the patch is not directly portable.
+      The remaining non-greedy path still creates a vocabulary-sized
+      `torch.rand_like(logits)` outside that compiled function and is worth a
+      trace-level check if the canonical client resolves to sampling rather
+      than greedy mode.
+    - Open PR [`#3363`](https://github.com/vllm-project/tpu-inference/pull/3363)
+      moves greedy argmax before BF16-to-FP32 widening. The current TorchTPU
+      `sample_from_logits` already performs argmax directly on its input
+      dtype and returns token IDs only; it has no equivalent full-vocabulary
+      FP32 return materialization to remove.
+    - Low-concurrency MoE PR
+      [`#3204`](https://github.com/vllm-project/tpu-inference/pull/3204)
+      explicitly accepts only more than one token, so it excludes batch 1.
+      Fused EP MoE PRs
+      [`#3040`](https://github.com/vllm-project/tpu-inference/pull/3040) and
+      [`#3288`](https://github.com/vllm-project/tpu-inference/pull/3288) target
+      larger batches where collective traffic can overlap with useful GMM
+      work; their published small-batch data are neutral or slower, and one
+      implementation's 4096 hidden-width ceiling excludes K3's width 7168.
+    - The repository's all-gather-matmul and matmul-reduce-scatter
+      microbenchmarks currently benchmark XLA baselines at token counts 256,
+      1024, and 8192. They provide useful harness structure but no batch-1
+      evidence. The installed collective-matmul V2 lowering was already
+      tested end to end here and rejected at 16.27 ms mean.
 
 ## Forward plan
 
@@ -962,6 +1012,12 @@ the regressed TP2 up path remains disabled.
    reductions are rejected.
 6. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
+7. Resolve the canonical benchmark request's effective sampling mode from the
+   server-side request metadata. If it is non-greedy, profile the external
+   vocabulary-sized `torch.rand_like(logits)` dispatch and test folding random
+   generation into `sample_from_logits`; the JAX-native repository's sampling
+   work identifies launch overhead as material, but its exact patches are
+   already present or structurally inapplicable in this Torch runner.
 
 ## Current best and gap
 
