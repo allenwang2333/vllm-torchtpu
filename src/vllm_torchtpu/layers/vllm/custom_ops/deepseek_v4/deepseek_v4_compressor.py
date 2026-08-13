@@ -25,6 +25,7 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import (CompressorStateCache,
                                                 DeepseekCompressor)
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
 from vllm_torchtpu.kernels.deepseek_v4.compressor import (
@@ -155,6 +156,25 @@ def _compressor_jax(
                              k_block_tables, cache)
 
 
+class TpuCompressorStateSpec(SlidingWindowMLASpec):
+    """Spec whose admission cost states the compressor ring's true footprint.
+
+    The compressor kernel stores state as a per-request ring: block indices
+    wrap via `% max_num_state_blocks_per_req`, so a request holds at most
+    `sliding_window` rows regardless of sequence length or in-flight tokens.
+    The base class prices `window + in_flight` tokens — for these tiny-page
+    specs (block_size 16/1) that inflates per-request demand to thousands of
+    pool slots, failing vLLM's KV admission check at any real
+    `max_num_batched_tokens` and throttling the runtime scheduler.
+    """
+
+    def max_admission_blocks_per_request(self, max_in_flight_tokens: int,
+                                         max_model_len: int) -> int:
+        # +1: a ring of W rows can straddle one extra page mid-wrap.
+        num_tokens = min(self.sliding_window, max_model_len)
+        return cdiv(num_tokens, self.block_size) + 1
+
+
 class VllmCompressorStateCache(CompressorStateCache):
     """Compressor state cache, paged to fit the host compressed-KV page."""
 
@@ -201,7 +221,7 @@ class VllmCompressorStateCache(CompressorStateCache):
         self.block_size = self._state_block_size(
             vllm_config.cache_config.block_size)
         bytes_per_row = self.state_dim * 4
-        return SlidingWindowMLASpec(
+        return TpuCompressorStateSpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=align_to(bytes_per_row, 128),

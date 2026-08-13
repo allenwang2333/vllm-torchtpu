@@ -2290,6 +2290,51 @@ def test_dsv4_specs_are_exempt_from_tpu_normalization():
             > ds_v4_spec.block_size // ds_v4_spec.compress_ratio * 640)
 
 
+def test_dsv4_compressor_state_spec_admission_is_ring_sized():
+    """Compressor-state admission cost must be the ring's constant footprint.
+
+    The base SlidingWindowSpec prices `window + in_flight` tokens; with these
+    tiny pages (block_size 16/1) that demanded thousands of pool slots per
+    request and failed vLLM's KV admission check at any real
+    max_num_batched_tokens (80.66 GiB claimed @ 4096/8192).
+    """
+    from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
+        TpuCompressorStateSpec
+
+    # HCA-shaped: 1 row/page, window 128; CSA-shaped: 16 rows/page, window 8.
+    hca = TpuCompressorStateSpec(block_size=1,
+                                 num_kv_heads=1,
+                                 head_size=4096,
+                                 dtype=torch.uint8,
+                                 sliding_window=128,
+                                 alignment=None)
+    csa = TpuCompressorStateSpec(block_size=16,
+                                 num_kv_heads=1,
+                                 head_size=8192,
+                                 dtype=torch.uint8,
+                                 sliding_window=8,
+                                 alignment=None)
+
+    # Constant in in-flight tokens, small in absolute terms.
+    for in_flight in (0, 2048, 16384):
+        assert hca.max_admission_blocks_per_request(in_flight, 9216) == 129
+        assert csa.max_admission_blocks_per_request(in_flight, 9216) == 2
+
+    # The base class's inflated arithmetic is what this guards against.
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+    base = SlidingWindowMLASpec(block_size=1,
+                                num_kv_heads=1,
+                                head_size=4096,
+                                dtype=torch.uint8,
+                                sliding_window=128,
+                                alignment=None)
+    assert base.max_admission_blocks_per_request(16384, 9216) > 1000
+
+    # Subclass must still group as a SlidingWindowMLASpec (vLLM's DSv4
+    # grouping is isinstance-based).
+    assert isinstance(hca, SlidingWindowMLASpec)
+
+
 def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
     """vLLM hands DSv4 its groups wrapped in `UniformTypeKVCacheSpecs`.
 
