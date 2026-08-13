@@ -120,6 +120,12 @@ TPU_K3_SHARD_LATENT_UP_PROJ=1 TPU_K3_LATENT_UP_TP_SIZE=4 \
   scripts/k3/launch_kimi_k3_tp32_ep.sh
 ```
 
+Do not substitute PyTorch's functional `all_reduce_coalesced` in this path.
+The installed `tpu_dist` process group rejects it during FX-to-MLIR export
+with `Backend tpu_dist does not support allreduce_coalesced`; the server never
+reaches compilation or health. Putting two ordinary all-reduces next to one
+another was also measured and did not make XLA variadically combine them.
+
 Unset the override on the next launch to recover the accepted launcher default
 of TP4 MLA A sharding with latent-up disabled. A model-only environment
 override needs a new vLLM server and unique caches, but not a new Ray step when
@@ -224,21 +230,27 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Ray step `602.48` is active
+Allocation job 602 is intentionally still active. Ray step `602.50` is active
 on all four hosts with head `10.13.232.26`; its persistent terminal/session is
-`34506`. No vLLM server is active. The rejected TP4 latent-up server (former
-API PID 2150761, EngineCore PID 2153816) was stopped with SIGINT after two
-endpoint runs and two profiles. Its caches and profiles remain under
-`/mnt/scratch/kimi-k3-b1-latent-up-tp4{,-profile}`, and results are under
-`results/kimi-k3-b1-latent-up-tp4{,-repeat}`. The pair measured 16.13678 and
-16.13220 ms mean TPOT, 0.17043 ms slower than the fresh default control pair.
-Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`; the opt-in TP4 width breaks 92 existing
-variadic global reduction fusions and raises all-reduce time by 1.479 ms.
+`10531`. No vLLM server is active. The most recent launch used fresh namespace
+`/mnt/scratch/kimi-k3-b1-latent-up-tp4-coalesced` but failed before serving
+because `ProcessGroupTPU` does not support `allreduce_coalesced`; its former
+API PID 2301781 exited. The source was restored to the compile-safe TP4
+latent-up implementation after that failure.
 
-Step `602.48` can be reused for another model-only environment experiment.
-Cancel only step `602.48` and start fresh Ray workers before any source or
-`LIBTPU_INIT_ARGS` change. Never cancel allocation job 602 while continuing
-this work.
+The preceding early-shared-ordering server on Ray step `602.49` was stopped
+after two endpoint runs and profiles. Its caches and profiles remain under
+`/mnt/scratch/kimi-k3-b1-latent-up-tp4-early-shared{,-profile}`, and results
+are under `results/kimi-k3-b1-latent-up-tp4-early-shared{,-repeat}`. The pair
+measured 16.13022 and 16.12713 ms mean TPOT, 0.16462 ms slower than the fresh
+default control. Its trace still contains 440 physical all-reduces and no
+variadic collective, so the temporary ordering code was removed.
+
+Step `602.50` has imported the now-removed coalesced source and must not be
+reused. Cancel only step `602.50`, then start fresh Ray workers before the next
+source, model, or `LIBTPU_INIT_ARGS` experiment. Never cancel allocation job
+602 while continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0` for the
+accepted configuration.
 
 Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the
 selector still lowers to the same 92 `[1,896]` sorts (0.45000 ms/decode) and

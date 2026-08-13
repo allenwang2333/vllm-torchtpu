@@ -1382,6 +1382,112 @@ the regressed TP2 up path remains disabled.
     this startup cost is excluded from TPOT. The first benchmark warmup again
     took about 19 seconds, versus about 16.15 seconds after warmup. Only the
     four post-warmup requests in each JSON are used above.
+46. Tested whether changing the TP4 latent-up runner's ordering could recover
+    the control graph's 92 variadic global reductions. The temporary runner
+    first issued the latent `[1,3584]` and shared `[1,7168]` reductions next
+    to each other, then applied latent RMSNorm and the TP4 row-sharded up
+    projection, reduced only that routed `[1,7168]` partial, and finally added
+    the already-reduced shared output. The focused runner/construction suite
+    passed 3/3. Fresh Ray step `602.49` and cache namespace
+    `/mnt/scratch/kimi-k3-b1-latent-up-tp4-early-shared` compiled and served
+    successfully.
+
+    The two canonical runs measured
+    16.13022/16.13083/16.13275 ms and
+    16.12713/16.12420/16.13744 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-latent-up-tp4-early-shared/kimi-k3_isl1_osl1000_concurrency1_20260813-105226.json`
+    and
+    `results/kimi-k3-b1-latent-up-tp4-early-shared-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-105445.json`.
+    Their 16.12868 ms average is only 0.00581 ms faster than the original TP4
+    latent-up trial and remains 0.16462 ms slower than the fresh default
+    control pair. It is rejected.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-latent-up-tp4-early-shared-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2220250.1786618613922061502.pt.trace.json.gz`.
+    Excluding the first profiler-boundary outlier, 18 model executions average
+    15.84788 ms. The key result is structural: XLA still emitted 440 physical
+    all-reduces per decode and no variadic collective. Global `[1,3584]`
+    reductions cost 2.20643 ms, 187 global `[1,7168]` reductions cost about
+    3.76618 ms, TP4 latent-down reductions cost 0.59001 ms, and TP2 KDA
+    reductions cost 0.18749 ms, for 6.75011 ms total. Merely placing two
+    Python all-reduce calls adjacent does not make XLA coalesce them.
+
+    Historical reproduction, while the temporary runner was present, used:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-latent-up-tp4-early-shared
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_SHARD_LATENT_UP_PROJ=1 TPU_K3_LATENT_UP_TP_SIZE=4 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-latent-up-tp4-early-shared \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-latent-up-tp4-early-shared-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-kimi-k3-b1-latent-up-tp4-early-shared \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-latent-up-tp4-early-shared-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The temporary ordering code was removed after measurement; the command is
+    retained for provenance, not as a currently selectable mode.
+47. Tried to express the same pair explicitly with PyTorch's functional
+    `all_reduce_coalesced([latent, shared], "sum", tp_group)` operation. The
+    installed TorchTPU compiler recognizes the functional op name in its
+    collective graph handling, and the focused suite again passed 3/3, but a
+    fresh hardware launch on Ray step `602.50` failed during backbone FX-to-
+    MLIR export before compilation or serving. Every worker reported:
+
+    ```text
+    RuntimeError: Backend tpu_dist does not support allreduce_coalesced
+    While executing %all_reduce_coalesced = call_function[
+      target=torch.ops._c10d_functional.all_reduce_coalesced.default](
+        args=([%fused_moe_kernel_0, %mm_18], sum, 3), kwargs={})
+    ```
+
+    The FX interpreter dispatches the operation through `ProcessGroupTPU`
+    before the compiler can lower it, so compiler-side recognition alone is
+    insufficient. The failed launch used fresh namespace
+    `/mnt/scratch/kimi-k3-b1-latent-up-tp4-coalesced` and the otherwise normal
+    command:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-latent-up-tp4-coalesced
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_SHARD_LATENT_UP_PROJ=1 TPU_K3_LATENT_UP_TP_SIZE=4 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+    ```
+
+    No endpoint result exists because the server never became healthy. The
+    unsupported source path was removed. A real retry requires implementing
+    `allreduce_coalesced` in the TorchTPU process group or adding a supported
+    purpose-built variadic collective custom op; it is not a model-only edit.
+48. Revisited current `vllm-project/tpu-inference` specifically for a backend
+    workaround to milestone 47. Repository code search finds no
+    `all_reduce_coalesced` or `variadic` implementation. The most relevant
+    current work is merged PR
+    [`#2849`](https://github.com/vllm-project/tpu-inference/pull/2849), which
+    defers both shared-expert and routed-expert reductions, adds the same-shape
+    local outputs, and issues one ordinary `jax.lax.psum`; release correctness
+    fix [`#3155`](https://github.com/vllm-project/tpu-inference/pull/3155)
+    wires the defer flag through the unquantized linear path. This is a useful
+    confirmation of the preferred pattern when outputs have the same shape,
+    but it does not solve K3 latent MoE: the `[1,3584]` routed latent must be
+    globally reduced before RMSNorm/up-projection, while the shared output is
+    `[1,7168]`. They cannot be locally added before reduction. This makes
+    backend support for a mixed-shape variadic reduction, or a more deeply
+    fused latent-MoE kernel, the necessary next boundary.
 
 ## Forward plan
 
@@ -1403,8 +1509,11 @@ the regressed TP2 up path remains disabled.
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
    per-layer scorer collectives, and explicit local scorer reductions are
-   rejected. A future up-projection attempt is justified only if it preserves
-   the 92 variadic global `(7168,3584)` reductions.
+   rejected. Another model-only reordering is low priority: adjacent ordinary
+   reductions remained separate, and functional `all_reduce_coalesced` is not
+   supported by `ProcessGroupTPU`. A future up-projection attempt is justified
+   only after adding a supported mixed-shape variadic collective or fusing the
+   latent reduction, norm, projection, and shared combine more deeply.
 5. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
 6. Treat sampling as bounded: the exact-server temperature-1 versus greedy
