@@ -2026,6 +2026,56 @@ the regressed TP2 up path remains disabled.
     dominant collective path slower on this workload. Ray step `602.65` and
     server PID 2885827 were stopped after profiling, while allocation job 602
     was deliberately preserved.
+58. Tested bidirectional all-reduce decomposition on top of the accepted
+    async collective merger, using fresh Ray workers and fresh caches. The
+    exact launch addition was:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-bidirectional-allreduce
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true'
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+    ```
+
+    The canonical validation and profile commands were:
+
+    ```bash
+    OUTPUT_DIR="$PWD/results/kimi-k3-b1-bidirectional-allreduce" \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR="$PWD/results/kimi-k3-b1-bidirectional-allreduce-repeat" \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR="$PWD/results/profile-kimi-k3-b1-bidirectional-allreduce" \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Endpoint means are 15.11826 and 15.11931 ms, averaging 15.11879 ms. This
+    improves the accepted merger pair by 0.09284 ms and leaves a 0.11879 ms
+    gap to the 15 ms objective. The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2952330.1786635017233596519.pt.trace.json.gz`.
+    Nineteen stable model executables average 14.83475 ms (14.83529 ms
+    median), 0.08339 ms below the accepted merger profile. Stable starts are
+    14.96886 ms apart and their post-executable gap averages 0.13437 ms.
+    Primary plus async device-lane occupancy is 14.76383 ms, leaving only
+    0.07093 ms uncovered.
+
+    HLO-visible all-reduce count remains exactly 348/decode. Their primary-lane
+    duration falls from 5.03057 to 4.94817 ms (-0.08240 ms), which explains
+    essentially the entire executable win. The per-decode shape breakdown is:
+
+    | All-reduce result shape | Calls | Merger control | Bidirectional | Change |
+    | --- | ---: | ---: | ---: | ---: |
+    | tuple `bf16[1,7168] + bf16[1,3584]` | 92 | 2.37616 ms | 2.39450 ms | +0.01834 ms |
+    | `bf16[1,7168]` | 95 | 1.81723 ms | 1.81566 ms | -0.00157 ms |
+    | `bf16[3584]` | 92 | 0.65925 ms | 0.56034 ms | -0.09891 ms |
+    | `bf16[128]` | 69 | 0.17793 ms | 0.17767 ms | -0.00026 ms |
+
+    Thus this is not a generic reduction of every collective. The win comes
+    from the 92 TP4-width `bf16[3584]` reductions, partially offset by the
+    variadic tuple family. No safety warning was emitted by this libtpu build.
+    Accept the flag as a launcher default, while preserving explicit `=false`
+    for controls.
 
 ## Forward plan
 
@@ -2047,13 +2097,15 @@ the regressed TP2 up path remains disabled.
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
 5. Preserve the now-enabled dependent-collective layer scheduler and async
-   collective merger. The merger reduces the collective critical path by
-   0.06736 ms without changing HLO-visible count; async collective fusion is
-   rejected and must remain off because it regressed and carries an explicit
-   non-Viperlite safety warning. TensorCore compute/collective overlap is also
-   rejected because it adds 0.05270 ms to primary collective duration. Further
-   compiler work must target a different measured mechanism and retain
-   explicit control runs.
+   collective merger, plus bidirectional all-reduce decomposition. The merger
+   reduces the collective critical path by 0.06736 ms, and bidirectional
+   decomposition removes another 0.08240 ms of all-reduce time without
+   changing HLO-visible counts. Async collective fusion is rejected and must
+   remain off because it regressed and carries an explicit non-Viperlite
+   safety warning. TensorCore compute/collective overlap is also rejected
+   because it adds 0.05270 ms to primary collective duration. Further compiler
+   work must target a different measured mechanism and retain explicit control
+   runs.
 6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
@@ -2081,12 +2133,12 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.20766--15.21559 ms from the fused
+The best verified steady-state result is 15.11826--15.11931 ms from the fused
 exact Pallas router plus the exact rank-16 route permutation, hierarchical
 routed experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers, dependent-collective layer scheduling, async collective merging, TP4
-MLA fused A-projection sharding, plus the neutral top-k/top-p sampling
-specialization. The remaining gap to the 15 ms target is 0.212 ms (1.4% of the
-pair average). No
-speculative decoding is used in any result.
+barriers, dependent-collective layer scheduling, async collective merging,
+bidirectional all-reduce decomposition, TP4 MLA fused A-projection sharding,
+plus the neutral top-k/top-p sampling specialization. The remaining gap to the
+15 ms target is 0.119 ms (0.8% of the pair average). No speculative decoding
+is used in any result.

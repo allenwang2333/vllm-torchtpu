@@ -78,6 +78,12 @@ fi
 if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_enable_async_collective_merger="* ]]; then
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_enable_async_collective_merger=true"
 fi
+# Use both directions of the TPU interconnect for eligible all-reduces. This
+# specifically shortens K3's repeated TP4 bf16[3584] reductions at batch 1.
+# Preserve an explicit caller choice for isolation/control experiments.
+if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_decompose_all_reduce_bidirectional_communication="* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_decompose_all_reduce_bidirectional_communication=true"
+fi
 
 mkdir -p "${PROF_DIR}"
 

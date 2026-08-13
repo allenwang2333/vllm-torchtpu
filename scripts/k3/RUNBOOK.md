@@ -10,7 +10,7 @@ slice, without speculative decoding. All performance runs use dummy weights,
 `compile_sizes=[1]`, ISL=1, OSL=1000, and concurrency 1. Read
 `OPTIMIZATION_LOG.md` before selecting another experiment; it records rejected
 ideas as well as results. The best repeated configuration currently measures
-15.20766--15.21559 ms mean TPOT. It is backed up on the non-main branch
+15.11826--15.11931 ms mean TPOT. It is backed up on the non-main branch
 `agent/k3-b1-tpot-optimization-backup`.
 
 The launcher defaults contain the current winning model configuration:
@@ -24,8 +24,9 @@ The launcher defaults contain the current winning model configuration:
 - TP4 MLA fused query/KV A projection;
 - neutral top-k/top-p sampler specialization;
 - enhanced TPU launch barriers;
-- XLA dependent-collective layer scheduling; and
-- XLA asynchronous collective merging.
+- XLA dependent-collective layer scheduling;
+- XLA asynchronous collective merging; and
+- bidirectional all-reduce decomposition.
 
 Do not enable opt-in experimental flags just because their implementation is
 present. Many are retained for reproducibility after measuring neutral or
@@ -147,10 +148,10 @@ override needs a new vLLM server and unique caches, but not a new Ray step when
 neither source nor `LIBTPU_INIT_ARGS` changed.
 
 The launcher appends the winning enhanced-barrier, dependent-collective
-scheduler, and async-collective-merger flags unless the caller explicitly
-supplies a setting with `=true` or `=false`. For an isolated compiler
-experiment, append only that experiment's flag to `LIBTPU_INIT_ARGS`; do not
-bundle unrelated tuning flags.
+scheduler, async-collective-merger, and bidirectional-all-reduce flags unless
+the caller explicitly supplies a setting with `=true` or `=false`. For an
+isolated compiler experiment, append only that experiment's flag to
+`LIBTPU_INIT_ARGS`; do not bundle unrelated tuning flags.
 
 Wait for health before benchmarking:
 
@@ -246,11 +247,14 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active, but no Ray step or vLLM
-server is running at this handoff. The rejected overlap experiment's server
-PID 2885827 was stopped and exact Ray step `602.65` was canceled; allocation
-job 602 was not canceled. Start fresh Ray workers before the next source or
-`LIBTPU_INIT_ARGS` experiment.
+Allocation job 602 is intentionally still active. Ray step `602.67` and vLLM
+server PID 2965616 are currently running at `10.13.232.26:8000` with the
+accepted async merger and bidirectional all-reduce settings. Its cache is
+`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce` and profile directory is
+`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile`. Because the
+launcher source was updated after these workers imported it, start fresh Ray
+workers before the next source or `LIBTPU_INIT_ARGS` experiment. Stop that
+exact server and Ray step only; never cancel allocation job 602.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -308,7 +312,7 @@ and could cause incorrect results, hangs, or SDC. It also emits extremely
 large compiler logs; use `/health`, process state, and per-rank artifact saves
 rather than log volume to judge cold-start progress.
 
-The current best full-model trial is milestone 56. Its endpoint results under
+The previous accepted full-model trial is milestone 56. Its endpoint results under
 `results/kimi-k3-b1-async-collective-merger{,-repeat}` are 15.20766 and
 15.21559 ms mean TPOT (15.21162 ms pair average). Its latest rank-0 trace is
 `/mnt/scratch/kimi-k3-b1-async-collective-merger-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2812978.1786631597999023926.pt.trace.json.gz`.
@@ -319,7 +323,7 @@ their backend critical path by 0.06736 ms/decode. It is now a launcher default;
 set `--xla_tpu_enable_async_collective_merger=false` explicitly in
 `LIBTPU_INIT_ARGS` only for a control.
 
-The most recent experiment is the rejected TensorCore collective-overlap
+The immediately preceding experiment is the rejected TensorCore collective-overlap
 trial in milestone 57. Its sole endpoint result under
 `results/kimi-k3-b1-overlap-compute-collective-tc` is 15.25797 ms mean TPOT.
 Its latest rank-0 trace is
@@ -328,6 +332,16 @@ Stable executable time rose to 14.97352 ms and primary-lane collective time to
 5.21436 ms, so leave `xla_tpu_overlap_compute_collective_tc` disabled. Only
 one endpoint run was taken because the trace causally confirmed the
 regression; this result must not replace the two-run accepted merger pair.
+
+The current best trial is milestone 58. Endpoint results under
+`results/kimi-k3-b1-bidirectional-allreduce{,-repeat}` are 15.11826 and
+15.11931 ms mean TPOT (15.11879 ms pair average). Its latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2952330.1786635017233596519.pt.trace.json.gz`.
+Stable executable time is 14.83475 ms. All-reduce count remains 348/decode,
+but duration falls from 5.03057 to 4.94817 ms; the 92 `bf16[3584]` TP4
+reductions alone improve by 0.09891 ms. The launcher now enables
+`xla_tpu_decompose_all_reduce_bidirectional_communication`; set it explicitly
+to `false` in `LIBTPU_INIT_ARGS` only for a control.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
