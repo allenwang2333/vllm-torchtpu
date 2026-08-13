@@ -561,6 +561,111 @@ def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
+def _routing_reference(topk_indices,
+                       topk_weights,
+                       local_num_experts,
+                       *,
+                       skip_padded_tokens=False):
+    """The routing contract as a numpy stable sort:
+    (token_indices_sorted, group_sizes_local, argsort_revert_indices)."""
+    ids = np.asarray(topk_indices)
+    num_tokens, topk = ids.shape
+    flat = ids.reshape(-1)
+    valid = flat >= 0
+    if skip_padded_tokens:
+        valid &= np.asarray(topk_weights).reshape(-1) != 0
+    keys = np.where(valid, flat, local_num_experts)
+    order = np.argsort(keys, kind="stable")
+    tokens = np.arange(num_tokens, dtype=np.int32).repeat(topk)
+    group_sizes = np.bincount(keys[valid], minlength=local_num_experts)
+    return (tokens[order], group_sizes[:local_num_experts].astype(np.int32),
+            np.argsort(order, kind="stable").astype(np.int32))
+
+
+# M = 800 exercises the block padding (800 % 512), which lands in the sentinel
+# bucket this caller discards.
+@pytest.mark.parametrize("structure",
+                         ["mixed", "all_non_local", "single_expert", "skewed"])
+def test_prepare_routed_metadata_matches_stable_sort(structure):
+    num_tokens, topk, local_num_experts, hidden = 100, 8, 16, 4
+    rng = np.random.default_rng(0)
+    if structure == "mixed":
+        ids = rng.integers(-1, local_num_experts, size=(num_tokens, topk))
+    elif structure == "all_non_local":
+        ids = np.full((num_tokens, topk), -1)
+    elif structure == "single_expert":
+        ids = np.full((num_tokens, topk), local_num_experts - 1)
+    else:
+        ids = np.where(
+            rng.random((num_tokens, topk)) < 0.9, 0, local_num_experts - 1)
+    topk_indices = jnp.asarray(ids, jnp.int32)
+    topk_weights = jnp.full((num_tokens, topk), 0.5, jnp.float32)
+    # Row i is the constant i, so the permuted activations name the tokens.
+    hidden_states = jnp.tile(
+        jnp.arange(num_tokens, dtype=jnp.float32)[:, None], (1, hidden))
+
+    x, group_sizes, revert, _, _ = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False)
+
+    want_tokens, want_group_sizes, want_revert = _routing_reference(
+        topk_indices, topk_weights, local_num_experts)
+    np.testing.assert_array_equal(
+        np.asarray(x)[:, 0].astype(np.int32), want_tokens)
+    np.testing.assert_array_equal(np.asarray(group_sizes), want_group_sizes)
+    np.testing.assert_array_equal(np.asarray(revert), want_revert)
+
+
+def test_prepare_routed_metadata_skip_padded_tokens():
+    """Zero-weight rows leave the group sizes though their ids are valid."""
+    num_tokens, topk, local_num_experts, hidden = 100, 8, 16, 4
+    rng = np.random.default_rng(1)
+    topk_indices = jnp.asarray(
+        rng.integers(0, local_num_experts, size=(num_tokens, topk)), jnp.int32)
+    weights = np.full((num_tokens, topk), 0.5, np.float32)
+    weights[num_tokens // 2:] = 0.0
+    topk_weights = jnp.asarray(weights)
+    hidden_states = jnp.tile(
+        jnp.arange(num_tokens, dtype=jnp.float32)[:, None], (1, hidden))
+
+    _, group_sizes, revert, _, _ = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False,
+        skip_padded_tokens=True)
+
+    _, want_group_sizes, want_revert = _routing_reference(
+        topk_indices, topk_weights, local_num_experts, skip_padded_tokens=True)
+    np.testing.assert_array_equal(np.asarray(group_sizes), want_group_sizes)
+    np.testing.assert_array_equal(np.asarray(revert), want_revert)
+    assert int(np.asarray(group_sizes).sum()) == num_tokens // 2 * topk
+
+
+# Below the block, exactly one, and both sides of padding; no sentinel here, so
+# the totals pin the padding accounting too.
+@pytest.mark.parametrize("num_rows", [1, 51, 511, 512, 513, 800, 1024, 1025])
+def test_counting_sort_positions_matches_stable_argsort(num_rows):
+    num_buckets = 9
+    keys = np.random.default_rng(num_rows).integers(0,
+                                                    num_buckets,
+                                                    size=num_rows)
+    pos, counts = fused_moe_gmm._counting_sort_positions(
+        jnp.asarray(keys, jnp.int32), num_buckets)
+    want = np.argsort(np.argsort(keys, kind="stable"), kind="stable")
+    np.testing.assert_array_equal(np.asarray(pos), want)
+    np.testing.assert_array_equal(np.asarray(counts),
+                                  np.bincount(keys, minlength=num_buckets))
+
+
 def test_prepare_routed_onehot_permute_matches_plain_gather():
     num_tokens, topk, hidden = 4, 2, 8
     hidden_states = (jnp.arange(num_tokens * hidden, dtype=jnp.float32) /
