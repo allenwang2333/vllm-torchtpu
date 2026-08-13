@@ -124,6 +124,11 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
     if pcp_size <= 1:
         return (global_rank, )
 
+    # Multi-host slices use DCN rather than single-slice torus ring
+    from vllm_torchtpu import envs
+    if envs.TPU_MULTIHOST_BACKEND:
+        return tuple(int(rank) for rank in group.ranks)
+
     try:
         from vllm.distributed.parallel_state import (
             get_tensor_model_parallel_world_size,
@@ -133,6 +138,7 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
     except Exception:
         tp_size = 1
 
+    # 1D Single-Slice: Preserve native sequential order for Pallas causal schedule
     if tp_size <= 1:
         return tuple(int(rank) for rank in group.ranks)
 
@@ -140,19 +146,30 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
         import torch_tpu  # noqa: F401
 
         if hasattr(torch, "tpu") and hasattr(torch.tpu, "topology_aware_mesh"):
+            group_ranks_list = [int(r) for r in group.ranks]
+            base_rank = min(group_ranks_list)
+            relative_rank = global_rank - base_rank
+            replica_world = pcp_size * tp_size
+
             topo_tensor = torch.tpu.topology_aware_mesh(
                 mesh_shape=(pcp_size, tp_size),
                 topology="single_slice",
                 contiguous_submeshes=True,
             )
-            rank_coords = (topo_tensor == global_rank).nonzero(
-                as_tuple=False)
-            if len(rank_coords) > 0:
-                tp_coord = int(rank_coords[0][1].item())
-                return tuple(
-                    int(r.item()) for r in topo_tensor[:, tp_coord])
-    except Exception:
-        pass
+            if topo_tensor.numel() == replica_world:
+                flattened = [int(r.item()) for r in topo_tensor.flatten()]
+                if sorted(flattened) == list(range(replica_world)):
+                    rank_coords = (topo_tensor == relative_rank).nonzero(
+                        as_tuple=False)
+                    if len(rank_coords) > 0:
+                        tp_coord = int(rank_coords[0][1].item())
+                        return tuple(
+                            base_rank + int(r.item())
+                            for r in topo_tensor[:, tp_coord])
+    except Exception as exc:
+        logger.warning(
+            "Failed to derive topology-aware PCP mesh, falling back to natural "
+            "order: %s", exc)
 
     return tuple(int(rank) for rank in group.ranks)
 

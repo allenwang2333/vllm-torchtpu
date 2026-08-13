@@ -54,6 +54,53 @@ def test_get_topology_aware_pcp_ranks_tp2_extracts_topo_lane():
     assert ranks == (0, 2, 4, 6)
 
 
+def test_get_topology_aware_pcp_ranks_with_base_rank_offset():
+    # 2 PCP x 2 TP mesh tensor for a secondary replica (e.g. PP stage 1 with ranks 4..7):
+    # Relative mesh: [[0, 1], [2, 3]]
+    # Absolute ranks: [[4, 5], [6, 7]]
+    topo_tensor = torch.tensor([
+        [0, 1],
+        [2, 3],
+    ])
+    group = _FakeGroup(ranks=[4, 6], rank_in_group=0)
+
+    with patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            return_value=2):
+        if not hasattr(torch, "tpu"):
+            torch.tpu = MagicMock()
+        with patch("torch.tpu.topology_aware_mesh", return_value=topo_tensor):
+            # global_rank=6 corresponds to relative_rank=2 (row 1, col 0)
+            ranks = pcp._get_topology_aware_pcp_ranks(group, global_rank=6)
+
+    assert ranks == (4, 6)
+
+
+def test_get_topology_aware_pcp_ranks_multihost_guard(monkeypatch):
+    from vllm_torchtpu import envs
+    monkeypatch.setattr(envs, "TPU_MULTIHOST_BACKEND", "ray")
+    group = _FakeGroup(ranks=[0, 1, 2, 3], rank_in_group=0)
+
+    ranks = pcp._get_topology_aware_pcp_ranks(group, global_rank=0)
+    assert ranks == (0, 1, 2, 3)
+
+
+def test_get_topology_aware_pcp_ranks_mesh_failure_fallback():
+    group = _FakeGroup(ranks=[0, 2], rank_in_group=0)
+
+    with patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            return_value=2):
+        if not hasattr(torch, "tpu"):
+            torch.tpu = MagicMock()
+        with patch(
+                "torch.tpu.topology_aware_mesh",
+                side_effect=RuntimeError("Mesh topology unsupported")):
+            ranks = pcp._get_topology_aware_pcp_ranks(group, global_rank=0)
+
+    assert ranks == (0, 2)
+
+
 def test_get_pcp_group_layout_builds_layout(monkeypatch):
     group = _FakeGroup(ranks=[0, 1], rank_in_group=0)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)
