@@ -2687,6 +2687,45 @@ the regressed TP2 up path remains disabled.
     accepted set before Ray startup. The server and exact step `664.33` were
     stopped after capture; parent allocation `664` remains running.
 
+72. Screened the next narrow extension of milestone 71 and rejected it on
+    trace causality. Installed libtpu exposes the autotune range
+    `--xla_tpu_layer_scheduler_min_compute_latency={0.0,1.0}`; the default is
+    `auto`. Fresh Ray step `664.34` used the complete accepted startup string
+    plus `--xla_tpu_layer_scheduler_min_compute_latency=0.0`, with unique
+    cache/profile namespace
+    `/mnt/scratch/kimi-k3-b1-layer-scheduler-min-compute-zero-v1`.
+
+    Two canonical endpoint means were 15.1222852 and 15.1167043 ms, averaging
+    15.1194947 ms. That is superficially 0.0109487 ms faster than the
+    milestone-71 multi-compute candidate pair, but the stable second trace
+    does not support that attribution:
+
+    | Device interval | min-compute `0.0` | milestone-71 candidate | Change |
+    | --- | ---: | ---: | ---: |
+    | Backbone | 14.8346349 ms | 14.8395028 ms | -0.0048679 ms |
+    | Post-backbone gap | 0.1402548 ms | 0.1360355 ms | +0.0042193 ms |
+    | Start spacing | 14.9748897 ms | 14.9755383 ms | -0.0006486 ms |
+
+    The candidate merely trades about 4--5 us from the backbone into the tail,
+    leaving device start spacing neutral. A fresh flag-off compile is not
+    justified for a sub-microsecond device delta. Keep the threshold at
+    `auto`; do not add it to launcher defaults. Result directories are
+    `results/kimi-k3-b1-layer-scheduler-min-compute-zero-v1{,-repeat}`. The
+    analyzed rank-0 trace is:
+
+    ```text
+    /mnt/scratch/kimi-k3-b1-layer-scheduler-min-compute-zero-v1-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_4141542.1786663173234711254.pt.trace.json.gz
+    ```
+
+    The exact launch was the milestone-71 accepted command with only this
+    appended before Ray startup:
+    `--xla_tpu_layer_scheduler_min_compute_latency=0.0`; benchmark/profile and
+    analyzer commands were unchanged. The server and exact Ray step `664.34`
+    were stopped; allocation `664` remains running. Static inspection also
+    established that `xla_tpu_scheduler_using_real_cost_model` and
+    `xla_tpu_enable_scheduler_memory_pressure_tracking` default true in this
+    libtpu, so explicitly enabling either is not a new experiment.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The

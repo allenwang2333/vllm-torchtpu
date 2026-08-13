@@ -271,7 +271,7 @@ when they do not initialize the TPU plugin.
 
 Allocation 602 expired at its 24-hour limit. Replacement allocation 664 is
 running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
-IP `10.13.232.26`. The milestone-71 server and exact Ray step `664.33` were
+IP `10.13.232.26`. The milestone-72 server and exact Ray step `664.34` were
 cleanly stopped after profiling. No Ray step or vLLM server is currently
 running; all 32 TPUs are free. Start fresh workers with the complete accepted
 flag string above, verify 32/32 resources, and preserve parent allocation 664.
