@@ -631,6 +631,11 @@ class TPUModelRunner(GPUModelRunner):
         self.speculative_config = self.vllm_config.speculative_config
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
+        self._fuse_k3_lm_head_sampler = (
+            envs.TPU_K3_FUSE_LM_HEAD_SAMPLER
+            and self.speculative_config is None
+            and not self.is_pooling_model)
+        self.sample_from_hidden_states_func = self.sample_from_hidden_states
 
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
@@ -3037,7 +3042,17 @@ class TPUModelRunner(GPUModelRunner):
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
-            if sample_hidden_states is None:
+            if self._fuse_k3_lm_head_sampler:
+                if sample_hidden_states is None:
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
+                    logits = torch.index_select(hidden_states, 0,
+                                                logits_indices)
+                else:
+                    logits = sample_hidden_states
+            elif sample_hidden_states is None:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
@@ -3313,6 +3328,11 @@ class TPUModelRunner(GPUModelRunner):
                 "TPU runner does not support full logprobs (`logprobs=-1`) "
                 "with the merged vLLM v1 sampler path yet.")
         needs_logprobs = max_num_logprobs is not None
+        if self._fuse_k3_lm_head_sampler and (needs_logprobs
+                                             or grammar_output is not None):
+            raise RuntimeError(
+                "TPU_K3_FUSE_LM_HEAD_SAMPLER supports only requests without "
+                "logprobs or structured decoding")
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -3491,10 +3511,12 @@ class TPUModelRunner(GPUModelRunner):
                                                     grammar_bitmask_padded,
                                                     logits, arange)
                 if all_greedy:
-                    dummy_placeholder = torch.empty((1, 1),
-                                                    dtype=logits.dtype,
-                                                    device=logits.device)
-                    selected_token_ids = self.sample_from_logits_func(
+                    dummy_placeholder = torch.empty(
+                        (1, 1), dtype=logits.dtype, device=logits.device)
+                    sampler = (self.sample_from_hidden_states_func
+                               if self._fuse_k3_lm_head_sampler else
+                               self.sample_from_logits_func)
+                    selected_token_ids = sampler(
                         logits,
                         dummy_placeholder,
                         dummy_placeholder,
@@ -3512,15 +3534,34 @@ class TPUModelRunner(GPUModelRunner):
                     apply_sampling_filters = (
                         self._requires_top_k_top_p_filter(
                             cur_start_idx, cur_end_idx))
-                    u = torch.rand_like(logits, generator=sampling_generator)
-                    selected_token_ids = self.sample_from_logits_func(
-                        logits,
-                        temperatures_tpu,
-                        u,
-                        top_k_tpu,
-                        top_p_tpu,
-                        all_greedy=all_greedy,
-                        apply_sampling_filters=apply_sampling_filters)
+                    if self._fuse_k3_lm_head_sampler:
+                        u = torch.rand(
+                            (logits.shape[0], self.vocab_size),
+                            dtype=logits.dtype,
+                            device=logits.device,
+                            generator=sampling_generator,
+                        )
+                        selected_token_ids = (
+                            self.sample_from_hidden_states_func(
+                                logits,
+                                temperatures_tpu,
+                                u,
+                                top_k_tpu,
+                                top_p_tpu,
+                                all_greedy=False,
+                                apply_sampling_filters=apply_sampling_filters,
+                            ))
+                    else:
+                        u = torch.rand_like(logits,
+                                            generator=sampling_generator)
+                        selected_token_ids = self.sample_from_logits_func(
+                            logits,
+                            temperatures_tpu,
+                            u,
+                            top_k_tpu,
+                            top_p_tpu,
+                            all_greedy=all_greedy,
+                            apply_sampling_filters=apply_sampling_filters)
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -4086,6 +4127,51 @@ class TPUModelRunner(GPUModelRunner):
                 sync.synchronize(out, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
+    def _precompile_sample_from_hidden_states(self) -> None:
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("sample_from_hidden_states"):
+            for num_reqs in self.num_reqs_paddings:
+                hidden_states = torch.zeros(
+                    (num_reqs, hsize),
+                    device=self.device,
+                    dtype=self._hidden_states_dtype,
+                )
+                temperatures = torch.ones(
+                    (num_reqs, 1),
+                    device=self.device,
+                    dtype=self._hidden_states_dtype,
+                )
+                u = torch.full(
+                    (num_reqs, self.vocab_size),
+                    0.5,
+                    device=self.device,
+                    dtype=self._hidden_states_dtype,
+                )
+                top_k = torch.zeros(
+                    (num_reqs, 1), device=self.device, dtype=torch.int32)
+                top_p = torch.ones(
+                    (num_reqs, 1), device=self.device, dtype=torch.float32)
+                out = self.sample_from_hidden_states_func(
+                    hidden_states,
+                    temperatures,
+                    u,
+                    top_k,
+                    top_p,
+                    all_greedy=False,
+                    apply_sampling_filters=False,
+                )
+                sync.synchronize(out, wait=True)
+                out = self.sample_from_hidden_states_func(
+                    hidden_states,
+                    temperatures,
+                    u,
+                    top_k,
+                    top_p,
+                    all_greedy=True,
+                )
+                sync.synchronize(out, wait=True)
+                logger.info("  -- num_seqs: %d", num_reqs)
+
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decode_arange.to(self.device)
@@ -4300,12 +4386,16 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
-        self._precompile_compute_selected_logits()
-        if (_get_sequence_layout_planner_for_runner(
-                self).uses_selected_logits_hidden_states):
-            self._precompile_compute_logits_from_hidden_states()
+        if self._fuse_k3_lm_head_sampler:
+            self._precompile_sample_from_hidden_states()
+        else:
+            self._precompile_compute_selected_logits()
+            if (_get_sequence_layout_planner_for_runner(
+                    self).uses_selected_logits_hidden_states):
+                self._precompile_compute_logits_from_hidden_states()
         self._precompile_structured_decoding()
-        self._precompile_sample_from_logits()
+        if not self._fuse_k3_lm_head_sampler:
+            self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
     def capture_model(self) -> None:
@@ -5354,6 +5444,37 @@ class TPUModelRunner(GPUModelRunner):
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
+        if all_greedy:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        is_greedy = temperatures <= SAMPLING_EPS
+        scaled_logits = self._apply_temperature(logits, temperatures)
+        masked_logits = (apply_top_k_top_p(scaled_logits, top_k, top_p)
+                         if apply_sampling_filters else scaled_logits)
+        u_clamped = torch.clamp(u,
+                                min=torch.finfo(u.dtype).tiny,
+                                max=1.0 - torch.finfo(u.dtype).eps)
+        gumbel_noise = -torch.log(-torch.log(u_clamped))
+        noisy_logits = masked_logits + gumbel_noise
+        final_logits = torch.where(is_greedy, logits, noisy_logits)
+        return torch.argmax(final_logits, dim=-1, keepdim=True)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def sample_from_hidden_states(self,
+                                  hidden_states: torch.Tensor,
+                                  temperatures: torch.Tensor,
+                                  u: torch.Tensor,
+                                  top_k: torch.Tensor,
+                                  top_p: torch.Tensor,
+                                  all_greedy: bool = False,
+                                  apply_sampling_filters: bool = True
+                                  ) -> torch.Tensor:
+        """Fuse the selected-hidden -> full logits -> sampler boundary.
+
+        This intentionally retains the ordinary LogitsProcessor TP all-gather
+        and the exact full-vocabulary Gumbel-max implementation. It is a
+        launch-fusion diagnostic, not a sampling-algorithm change.
+        """
+        logits = self.model.compute_logits(hidden_states)
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS

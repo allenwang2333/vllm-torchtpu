@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     TPU_K3_MLA_A_TP_SIZE: int = 0
     TPU_K3_SHARD_ATTN_RES_PROJ: bool = False
     TPU_K3_FUSE_ATTN_RES_DOT: bool = False
+    TPU_K3_FUSE_LM_HEAD_SAMPLER: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -392,6 +393,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_K3_MLA_A_TP_SIZE", "0")),
     "TPU_K3_SHARD_ATTN_RES_PROJ": env_bool("TPU_K3_SHARD_ATTN_RES_PROJ"),
     "TPU_K3_FUSE_ATTN_RES_DOT": env_bool("TPU_K3_FUSE_ATTN_RES_DOT"),
+    # Batch-1 experiment: keep the selected-hidden -> LM head -> sampler chain
+    # in one compiled TPU module instead of launching the LM head and sampler
+    # as independent executables. It remains opt-in because the fused path
+    # intentionally excludes speculative decode, grammar, and logprobs.
+    "TPU_K3_FUSE_LM_HEAD_SAMPLER":
+    env_bool("TPU_K3_FUSE_LM_HEAD_SAMPLER"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.

@@ -596,6 +596,120 @@ It shows one 0.21790 ms `aten::_foreach_copy_` per decode and an unchanged
 0.13570 ms end-to-next-start gap. Do not enable this flag; the composite call
 does not provide native TPU batching.
 
+### Device-only post-backbone tail accounting
+
+Do not align host `aten::*` events with TPU kernels by their raw Chrome-trace
+timestamps. In this profiler output the Ray-worker clock and TPU-device clock
+have a several-millisecond offset, which is large relative to the 0.136 ms
+tail. Use only TPU `pid` 2/3 timestamps for this breakdown:
+
+```bash
+.venv/bin/python scripts/k3/analyze_trace_tail.py \
+  /mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile/rank_0/\
+tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_\
+2952330.1786635017233596519.pt.trace.json.gz
+```
+
+Expected accepted-capture means in microseconds are `gap=136.08002`,
+`device_module_union=105.17285`, `uncovered=30.90717`, `lm_head=68.38793`,
+`uniform_vocab=4.09355`, `uniform_seed=2.52651`,
+`sample_argmax=18.81089`, `token_view=5.03490`, and
+`placeholder_scatter=4.62236`. The parser skips the first profiler-boundary
+backbone region by default and forms 17 stable consecutive gaps. It parses
+one trace object at a time because some HLO names contain unescaped quotes.
+
+This corrects the earlier claim that the tail was filled by AOT mutation
+copies. Those calls and the 162-input shape audit are real, but their host
+timestamps do not establish occupancy of this device interval. The current
+next target is the separate 68.4 us LM-head projection/all-gather boundary,
+followed by the approximately 31 us of inter-module launch intervals. See
+milestone 66 for the full accounting and endpoint reconciliation.
+
+### Opt-in LM-head/sampler fusion experiment
+
+Milestone 67 tests the separate 68 us LM-head boundary with
+`TPU_K3_FUSE_LM_HEAD_SAMPLER=1`. The flag is deliberately off by default and
+supports only non-speculative generation without grammar or logprobs. It does
+not change the full-vocabulary Gumbel-max algorithm or remove the TP32 vocab
+all-gather. Use a fresh vLLM runtime/config cache for each flag value, while
+reusing the accepted Tier-2/Tier-3 compiler lineage:
+
+```bash
+export K3_HEAD_IP=10.13.232.26
+export K3_RUN_NAME=kimi-k3-b1-fused-lm-head-sampler-v2
+export RAY_ADDRESS=$K3_HEAD_IP:6379
+export HF_HOME=/mnt/scratch/hf-hub
+export HF_HUB_CACHE=$HF_HOME/hub
+export TRANSFORMERS_CACHE=$HF_HOME/hub
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-bidirectional-allreduce
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false'
+export TPU_K3_FUSE_LM_HEAD_SAMPLER=1
+scripts/k3/launch_kimi_k3_tp32_ep.sh
+```
+
+The launcher appends the accepted dependent-collective scheduler, async
+collective merger, bidirectional all-reduce, and enhanced-barrier flags.
+Inspect the startup argv: on allocation 664 the distributed safety layer
+rewrote `xla_tpu_use_enhanced_launch_barrier=true` to false. Do not compare
+this run to an older allocation at microsecond resolution. For the matched
+control, stop only the vLLM server, retain the Ray allocation, set
+`K3_RUN_NAME=kimi-k3-b1-fused-control-v2` and
+`TPU_K3_FUSE_LM_HEAD_SAMPLER=0`, recompute the three vLLM cache variables and
+`PROF_DIR`, then relaunch. A source or actor-environment change needs fresh
+actors; never cancel the parent allocation merely to restart vLLM.
+
+Run each endpoint configuration twice:
+
+```bash
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh $K3_HEAD_IP
+OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+  scripts/k3/bench_isl1_osl1k.sh $K3_HEAD_IP
+```
+
+Capture two short traces per configuration with the same non-greedy request
+shape used by the candidate:
+
+```bash
+TEMPERATURE=1 INCLUDE_SEED=0 \
+OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile \
+  scripts/k3/profile_isl1_osl1k.sh $K3_HEAD_IP
+```
+
+Analyze rank 0 using TPU timestamps only. Add `--top-modules 8` to discover
+the fused module name rather than relying on source-line numbers embedded in
+HLO names:
+
+```bash
+.venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 8 \
+  /mnt/scratch/kimi-k3-b1-fused-lm-head-sampler-v2-profile/rank_0/\
+tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_\
+3610275.1786650623170757310.pt.trace.json.gz
+
+.venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 8 \
+  /mnt/scratch/kimi-k3-b1-fused-control-v2-profile/rank_0/\
+tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_\
+3610281.1786651991968150704.pt.trace.json.gz
+```
+
+Fused endpoint means were 15.1334594 and 15.1313557 ms; matched controls were
+15.1419436 and 15.1396092 ms, a 0.0083688 ms/token fused win. Fused gaps were
+127.999 and 128.363 us; control gaps were 135.901 and 136.094 us. The fused
+LM-head/all-gather/argmax module was 81.285 us versus 87.12 us for the two
+separate control modules. The vocabulary RNG remains separate (5.996 us fused
+versus 4.09 us control); the larger whole-gap saving comes partly from
+eliminating a launch interval. Short traces can include a slow backbone
+outlier, so report means and medians and do not infer a new absolute best from
+a single capture.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do

@@ -2231,18 +2231,15 @@ the regressed TP2 up path remains disabled.
     command. The benchmark's optimized-HLO shape assertion remained enabled.
     Driver argv/config evidence is under `/tmp/tpu_logs_woosuk` for allocation
     664; `/tmp` is ephemeral, so the disposition above is the durable record.
-63. Resolved the approximately 0.134 ms interval between accepted model
-    executables and tested the most direct removal attempt. On the accepted
-    bidirectional rank-0 Torch trace, a normal gap contains 23 serialized
-    host-side `aten::copy_` calls. The first begins 1.022 us after the model
-    executable ends; calls begin roughly every 5.5--6 us, normally last
-    2.3--2.6 us, and the final one ends 0.784 us before the next executable.
-    Their count was initially matched to the 23-layer grouping and tentatively
-    attributed to KDA state. The complete mutation-shape audit in milestone
-    65 corrects that narrower attribution: these are the tail of a 162-input
-    AOTAutograd replay, most of which is dispatched while the asynchronous TPU
-    executable is still running. They remain mutation replay rather than token
-    input preparation, but are not an isolated 23-buffer family.
+63. Investigated the approximately 0.134 ms interval between accepted model
+    executables and tested the first suspected removal mechanism. An initial
+    host/device overlay appeared to put 23 serialized `aten::copy_` calls in
+    that interval. Milestone 66 corrects that interpretation: this Torch trace
+    does not align the host and TPU clocks at microsecond resolution. The host
+    calls are real and milestone 65 maps them to the tail of a 162-input
+    AOTAutograd replay, but their host timestamps cannot be used to claim that
+    they occupy the TPU interval. The device-only breakdown instead finds
+    about 0.105 ms of auxiliary TPU modules and only about 0.031 ms uncovered.
 
     A temporary, cache-keyed compiler diagnostic changed TorchTPU's
     `keep_inference_input_mutations=False` to true only when
@@ -2357,6 +2354,81 @@ the regressed TP2 up path remains disabled.
     default compiler unchanged. The exact audit/foreach diagnostic and tests
     are archived in commit `75922a6f`; commit `63bae361` removes them from the
     branch tip while retaining this durable record.
+66. Reparsed the accepted trace using only TPU-device timestamps and resolved
+    the remaining inter-backbone interval. Across 17 stable gaps, consecutive
+    `region.268435455` backbone executions start 14.97048 ms apart and leave a
+    0.13608 ms mean interval after the preceding backbone finishes. The union
+    of top-level TPU modules on both cores fills 0.10517 ms of that interval;
+    only 0.03091 ms is not covered by a top-level device module. Mean module
+    contributions are:
+
+    | Post-backbone TPU work | Mean per token |
+    |---|---:|
+    | LM-head local projection + TP32 vocabulary all-gather | 0.06839 ms |
+    | Vocabulary-sized random tensor | 0.00409 ms |
+    | RNG-state update | 0.00253 ms |
+    | Neutral-sampling Gumbel argmax | 0.01881 ms |
+    | Token view / `as_strided` | 0.00503 ms |
+    | Async placeholder-token scatter | 0.00462 ms |
+    | Other tiny/overlapping device work | about 0.00170 ms |
+    | Inter-module interval not covered by a top-level TPU module | 0.03091 ms |
+
+    This is the detailed answer to the earlier “where is the remaining 4 ms?”
+    and “what is the 1.3 ms idle?” questions: neither residual exists in a
+    stable decode. The 14.83475 ms backbone plus 0.13608 ms post-backbone tail
+    explains the 14.97048 ms device start spacing. The endpoint pair is
+    15.11879 ms, leaving about 0.14831 ms from device start spacing to client
+    TPOT; that last cross-request difference includes server/client streaming
+    and measurement variance and is not a hidden four-ms model stage.
+
+    The correction matters for causality. Chrome-trace host events (`pid` of
+    the Ray worker) and TPU events (`pid` 2/3) have a several-millisecond clock
+    offset in this capture, so an `aten::copy_` timestamp must not be overlaid
+    directly on a TPU gap. The generic foreach experiment remains a valid
+    negative endpoint result, but its unchanged device gap does not prove that
+    mutation replay occupies that gap. Reproduce the device-only accounting
+    with `scripts/k3/analyze_trace_tail.py`; the exact command is in
+    `RUNBOOK.md`.
+67. Implemented and measured an opt-in selected-hidden -> LM-head -> sampler
+    fusion with `TPU_K3_FUSE_LM_HEAD_SAMPLER=1`. It keeps the existing TP32
+    full-vocabulary all-gather and exact Gumbel-max sampling algorithm, but
+    places the local projection, all-gather, and argmax in one compiled TPU
+    module. The flag is restricted to non-speculative generation without
+    grammar or logprobs; unsupported requests fail explicitly. It remains off
+    by default because it is a narrow batch-1 specialization, not a general
+    replacement for the sampler.
+
+    Two fused endpoint runs measured 15.1334594 and 15.1313557 ms mean TPOT
+    (15.1324076 ms pair). Those absolute values are slower than the older
+    accepted 15.1187865 ms pair, but the environment rewrote the enhanced
+    launch barrier to false in this allocation, so the old pair is not a fair
+    microsecond-scale control. A fresh same-allocation, same-source flag-off
+    control measured 15.1419436 and 15.1396092 ms (15.1407764 ms pair). The
+    fusion therefore wins the matched endpoint comparison by **0.0083688 ms
+    per token**.
+
+    Device-only traces agree. The two fused captures leave 0.12800 and
+    0.12836 ms mean post-backbone gaps versus 0.13590 and 0.13609 ms for the
+    matched controls. The fused LM-head/all-gather/argmax module costs
+    0.081285 ms/decode versus 0.06835 + 0.01877 = 0.08712 ms for the two
+    separate control modules. The vocabulary RNG remains a separate launch
+    (0.005996 ms fused versus 0.00409 ms control); including it, named device
+    work falls by about 0.0039 ms while eliminating one launch reduces the
+    whole gap by about 0.0079 ms and endpoint TPOT by about 0.0084 ms. The
+    clean second fused capture starts backbones 14.95671 ms
+    apart, but short profiles contain occasional slow backbone outliers, so
+    use the endpoint pair and gap/module decomposition rather than treating
+    one start-spacing mean as a new absolute best.
+
+    Exact launch, benchmark, profiling, analysis commands, cache paths, and
+    trace paths are in `RUNBOOK.md`. `scripts/k3/analyze_trace_tail.py` now
+    reports backbone duration, start spacing, and optional top device-module
+    names in addition to the detailed tail accounting. `git diff --check`,
+    shell/Python syntax checks, and all 80 `tests/runner/test_tpu_runner.py`
+    tests pass. Running that suite with `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+    causes 25 fixture setup errors because `torch.device("tpu")` is then
+    unregistered; rerun normally rather than interpreting those as candidate
+    failures.
 
 ## Forward plan
 
@@ -2405,13 +2477,17 @@ the regressed TP2 up path remains disabled.
    approximately 0.02 ms/decode GMM1-only opportunity, while splitting GMM2
    regressed at four or more active local routes. Revisit only with a static
    local-occupancy bound or a new full-width/pipelined kernel design.
-8. Treat the accepted trace's 0.13437 ms post-executable launch gap as a
-   separate bounded runtime target. It is filled by the tail of 162 serialized
-   AOT input-mutation `copy_` replays, not generic input preparation. Keeping the
-   mutations inside XLA removes those host calls but materializes 14.6079 ms
-   of full-state device copies and is rejected. Pursue only a batched runtime
-   replay or alias/rebind mechanism that preserves donation; validate device
-   start spacing and endpoint TPOT together.
+8. Treat the accepted trace's 0.13608 ms post-backbone tail as mostly device
+   work, not runtime idle: milestone 66 accounts for 0.10517 ms in the LM head,
+   sampling, views, and placeholder scatter and leaves 0.03091 ms uncovered.
+   The mutation-replay experiments remain rejected, but host/device clock skew
+   means they were aimed at the wrong interval. Prioritize fusing the LM-head
+   boundary or avoiding its full-vocabulary TP32 all-gather; validate device
+   start spacing and endpoint TPOT together. Milestone 67 validates the first
+   such fusion: it saves 0.00837 ms/token against a matched control, but is
+   opt-in because it excludes speculative decode, grammar, and logprobs. The
+   remaining larger opportunity would have to avoid or shrink the full-vocab
+   TP32 all-gather rather than merely combining launches.
 9. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
 10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
