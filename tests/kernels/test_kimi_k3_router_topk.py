@@ -21,14 +21,19 @@ import pytest
 from vllm_torchtpu.kernels.kimi_k3.router_topk import kimi_k3_router_topk
 
 
+@pytest.mark.parametrize("blockwise", [False, True])
 @pytest.mark.parametrize("seed", [0, 7, 41])
-def test_kimi_k3_router_topk_matches_exact_reference(seed: int) -> None:
+def test_kimi_k3_router_topk_matches_exact_reference(seed: int,
+                                                     blockwise: bool) -> None:
     key = jax.random.key(seed)
     logits = jax.random.normal(key, (1, 896), dtype=jnp.float32)
     bias = 0.1 * jax.random.normal(jax.random.fold_in(key, 1), (896, ),
                                    dtype=jnp.float32)
 
-    weights, ids = kimi_k3_router_topk(logits, bias, interpret=True)
+    weights, ids = kimi_k3_router_topk(logits,
+                                       bias,
+                                       interpret=True,
+                                       blockwise=blockwise)
     scores = jax.nn.sigmoid(logits)
     _, expected_ids = jax.lax.top_k(scores + bias, 16)
     expected_weights = jnp.take_along_axis(scores, expected_ids, axis=1)

@@ -1678,17 +1678,98 @@ the regressed TP2 up path remains disabled.
     `JAX_PLATFORMS=cpu`; it did not reach a test failure, and server health
     remained HTTP 200. Do not run that import-heavy test again against a live
     distributed server.
+51. Tested an MLJ-inspired two-stage Pallas router selector and rejected it as
+    a default. The relevant NVIDIA reference is
+    `Inferact/mlj@7219aae117ae9a174b102acc7f39e3c4c0269e7f`,
+    `vllm/models/tml/nvidia/ops/gate_topk.py`: it streams 32-entry blocks,
+    keeps a local top 16, then bitonically merges candidates. The Inkling
+    reference in `vllm/models/inkling/nvidia/moe.py` instead uses the same
+    iterative full-width selection structure as the already accepted K3
+    Pallas kernel, so it did not expose a distinct algorithm to port.
+
+    The TPU experiment uses seven native 128-column blocks because Mosaic's
+    vector layout and the 896-expert shape naturally map to `7 x 128`. It
+    computes each block's exact local top 16 in parallel, flattens the 112
+    candidates in global expert-index order, and performs an exact global top
+    16 pass. This preserves first-index tie behavior and avoids the
+    cross-vector-register dynamic gather that failed in milestone 49. The
+    implementation is retained behind
+    `TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=1`; both its generic and K3 launcher
+    defaults are zero.
+
+    The focused interpreter test command was:
+
+    ```bash
+    JAX_PLATFORMS=cpu TPU_ACCELERATOR_TYPE= \
+      .venv/bin/pytest -q tests/kernels/test_kimi_k3_router_topk.py
+    ```
+
+    All six cases passed in 7.31 seconds: three random seeds for both the
+    accepted full-width and experimental blockwise implementations. An
+    earlier invocation omitted `JAX_PLATFORMS=cpu`, initialized the TPU/VFIO
+    plugin, and was terminated without reaching a test result. Always force
+    the CPU platform for this interpreter-only test, and never run the
+    accidental form while a distributed server is starting.
+
+    Fresh Ray step `602.55`, cache namespace
+    `/mnt/scratch/kimi-k3-b1-pallas-block-router-topk`, and the explicit
+    blockwise flag compiled and served successfully on all 32 chips. The
+    profile backbone compiled in 47.65 seconds, its full AOT stage took 126.05
+    seconds, and the runtime backbone compiled in 134.77 seconds. Exact launch
+    and measurement commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-pallas-block-router-topk
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-pallas-block-router-topk \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-pallas-block-router-topk-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-kimi-k3-b1-pallas-block-router-topk \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The endpoint runs measured 15.24950 and 15.25911 ms mean TPOT, averaging
+    15.25431 ms. That is nominally 0.01958 ms faster than the accepted pair,
+    but the paired kernel evidence rejects a causal router improvement. The
+    latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2599376.1786626871906653164.pt.trace.json.gz`.
+    Excluding one 21.50944 ms profiler-boundary outlier, 18 model executables
+    average 14.97524 ms (14.97548 ms median). Primary-lane occupancy is
+    14.55725 ms; its union with asynchronous device work is 14.91150 ms,
+    leaving only 0.06375 ms uncovered. There is no host-input or executable
+    idle bubble to explain the endpoint movement.
+
+    More importantly, 92 block-router calls cost 0.30741 ms/decode, 0.02925 ms
+    more than the accepted full-width router's 0.27816 ms. Stable model time
+    improved by only 0.00678 ms, within run-to-run variation, while all-reduce
+    time moved independently. The MLJ-style decomposition is therefore a
+    measured router regression on TPU, despite the favorable raw endpoint
+    sample. TPU lacks the reference kernel's cheap packed-key bitonic merge;
+    repeated local reductions plus a second 112-way selection add work. Do
+    not promote this flag without a new primitive or a direct trace showing
+    the router family itself below 0.27816 ms.
 
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
    896-way selector and 16-route GMM permutation now contain zero TPU sort
    operations; do not reintroduce a general sort into either batch-1 path.
-2. Port the MLJ block-streaming/bitonic-merge idea to Pallas only if it can
-   retain the successful score/bias/gather/normalization fusion. The current
-   repeated-argmax kernel costs about 0.27816 ms/decode, so this is a bounded
-   target, not a 0.45 ms opportunity anymore. Validate exact tie behavior and
-   avoid cross-vreg dynamic gather, which Mosaic rejects.
+2. Keep the MLJ-inspired `7 x 128` blockwise selector disabled. It preserves
+   the successful score/bias/selection/normalization fusion and exact order,
+   but its router family costs 0.30741 ms/decode versus 0.27816 ms for the
+   accepted full-width kernel. Revisit only with a TPU-native bitonic/merge
+   primitive; avoid cross-vreg dynamic gather, which Mosaic rejects.
 3. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
    neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
    against its fresh TP4 control. Do not widen this collective further.

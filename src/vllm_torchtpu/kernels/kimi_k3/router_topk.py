@@ -59,11 +59,70 @@ def _router_topk_kernel(logits_ref, bias_ref, weights_ref, ids_ref):
     ids_ref[...] = jnp.pad(ids, output_padding)
 
 
+def _router_block_topk_kernel(logits_ref, bias_ref, weights_ref, ids_ref):
+    """Two-stage exact selector using TPU-native 128-column blocks.
+
+    Each of the seven expert blocks produces its local top 16 in parallel.
+    A second 112-candidate pass selects the global top 16. Candidate order is
+    block-major and stable within a block, preserving global first-index tie
+    behavior without a dynamic gather across source vector registers.
+    """
+    logits = logits_ref[...].astype(jnp.float32)
+    scores = jax.nn.sigmoid(logits)
+    choice = (scores + bias_ref[...].astype(jnp.float32)).reshape(
+        _TPU_TILE_ROWS, _NUM_EXPERTS // _TPU_TILE_COLS, _TPU_TILE_COLS)
+    score_blocks = scores.reshape(choice.shape)
+    local_iota = jax.lax.broadcasted_iota(jnp.int32, choice.shape, 2)
+    block_offsets = (jnp.arange(_NUM_EXPERTS // _TPU_TILE_COLS,
+                                dtype=jnp.int32) * _TPU_TILE_COLS)[None, :]
+
+    candidate_choice = []
+    candidate_weights = []
+    candidate_ids = []
+    for _ in range(_TOPK):
+        local_id = jnp.argmax(choice, axis=2)
+        is_selected = local_iota == local_id[:, :, None]
+        candidate_choice.append(
+            jnp.sum(jnp.where(is_selected, choice, 0.0), axis=2))
+        candidate_weights.append(
+            jnp.sum(jnp.where(is_selected, score_blocks, 0.0), axis=2))
+        candidate_ids.append(local_id + block_offsets)
+        choice = jnp.where(is_selected, -jnp.inf, choice)
+
+    choices = jnp.stack(candidate_choice, axis=2).reshape(
+        _TPU_TILE_ROWS, -1)
+    candidate_weights_array = jnp.stack(candidate_weights, axis=2).reshape(
+        _TPU_TILE_ROWS, -1)
+    candidate_ids_array = jnp.stack(candidate_ids, axis=2).reshape(
+        _TPU_TILE_ROWS, -1)
+    candidate_iota = jax.lax.broadcasted_iota(jnp.int32, choices.shape, 1)
+
+    selected_weights = []
+    selected_ids = []
+    for _ in range(_TOPK):
+        candidate_id = jnp.argmax(choices, axis=1)
+        is_selected = candidate_iota == candidate_id[:, None]
+        selected_weights.append(
+            jnp.sum(jnp.where(is_selected, candidate_weights_array, 0.0),
+                    axis=1))
+        selected_ids.append(
+            jnp.sum(jnp.where(is_selected, candidate_ids_array, 0), axis=1))
+        choices = jnp.where(is_selected, -jnp.inf, choices)
+
+    weights = jnp.stack(selected_weights, axis=1)
+    weights /= jnp.maximum(weights.sum(axis=1, keepdims=True), 1e-20)
+    ids = jnp.stack(selected_ids, axis=1).astype(jnp.int32)
+    output_padding = ((0, 0), (0, _TPU_TILE_COLS - _TOPK))
+    weights_ref[...] = jnp.pad(weights, output_padding)
+    ids_ref[...] = jnp.pad(ids, output_padding)
+
+
 def kimi_k3_router_topk(
     logits: jax.Array,
     correction_bias: jax.Array,
     *,
     interpret: bool = False,
+    blockwise: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Return normalized sigmoid weights and exact top-16 expert IDs.
 
@@ -86,10 +145,13 @@ def kimi_k3_router_topk(
         jax.ShapeDtypeStruct((_TPU_TILE_ROWS, _TPU_TILE_COLS), jnp.float32),
         jax.ShapeDtypeStruct((_TPU_TILE_ROWS, _TPU_TILE_COLS), jnp.int32),
     )
+    kernel = (_router_block_topk_kernel if blockwise else
+              _router_topk_kernel)
     weights, ids = pl.pallas_call(
-        _router_topk_kernel,
+        kernel,
         out_shape=out_shape,
-        name="kimi_k3_router_topk",
+        name=("kimi_k3_router_block_topk"
+              if blockwise else "kimi_k3_router_topk"),
         interpret=interpret,
     )(padded_logits, padded_bias)
     return weights[:1, :_TOPK], ids[:1, :_TOPK]

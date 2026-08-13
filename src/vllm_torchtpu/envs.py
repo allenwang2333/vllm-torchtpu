@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     TPU_K3_BLOCKED_TOPK: bool = False
     TPU_K3_JAX_EXACT_TOPK: bool = False
     TPU_K3_PALLAS_ROUTER_TOPK: bool = False
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK: bool = False
     TPU_K3_RANK16_ROUTE_PERMUTE: bool = False
     TPU_K3_SHARD_LATENT_UP_PROJ: bool = False
     TPU_K3_LATENT_UP_TP_SIZE: int = 0
@@ -353,6 +354,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather, and renormalization. Experimental and disabled by default.
     "TPU_K3_PALLAS_ROUTER_TOPK":
     env_bool("TPU_K3_PALLAS_ROUTER_TOPK"),
+    # Two-stage native-width variant of the fused batch-1 K3 router.
+    "TPU_K3_PALLAS_BLOCK_ROUTER_TOPK":
+    env_bool("TPU_K3_PALLAS_BLOCK_ROUTER_TOPK"),
     # Replace batch-1 top-16 route argsort with an exact pairwise rank network.
     "TPU_K3_RANK16_ROUTE_PERMUTE": env_bool("TPU_K3_RANK16_ROUTE_PERMUTE"),
     # Row-shard K3's latent-MoE up projection across global TP. Its partial

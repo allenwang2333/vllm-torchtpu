@@ -36,7 +36,12 @@ correction bias, exact top-16 selection, selected-score collection, and
 renormalization. The rank-16 route permutation is also a launcher default;
 set `TPU_K3_RANK16_ROUTE_PERMUTE=0` only for its control. Together their latest
 two acceptance runs average 15.27388 ms mean TPOT, and the paired profile has
-zero TPU sort operations per decode. The
+zero TPU sort operations per decode. The MLJ-inspired two-stage selector is
+reproduced with `TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=1`. It passed exact CPU
+interpreter tests and served successfully, but its traced router cost
+regressed from 0.27816 to 0.30741 ms/decode. Leave it zero; its superficially
+faster endpoint pair was collective/session variance rather than a router
+improvement. The
 older exact TPU/JAX router experiment is reproduced by adding
 `TPU_K3_JAX_EXACT_TOPK=1` before launch. It compiles and is exact, but its two
 runs averaged 0.015 ms slower than the launcher default, so leave it unset.
@@ -239,14 +244,15 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Fresh Ray step `602.54` is
+Allocation job 602 is intentionally still active. Fresh Ray step `602.55` is
 active on all four hosts with head `10.13.232.26`; its persistent terminal is
-session `71031`. The healthy vLLM server is terminal/session `16851`, API PID
-2516387, EngineCore PID 2519478. It uses cache namespace
-`/mnt/scratch/kimi-k3-b1-rank16-route-permute` and profile directory
-`/mnt/scratch/kimi-k3-b1-rank16-route-permute-profile`. The launch passed
-`TPU_K3_RANK16_ROUTE_PERMUTE=1`; both it and the fused Pallas router are now
-launcher defaults.
+session `59873`. The healthy experimental vLLM server is terminal/session
+`49800`, API PID 2612522, EngineCore PID 2616972, and rank-0 worker PID
+2599376. It uses cache namespace
+`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk` and profile directory
+`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile`. The launch passed
+`TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=1`; this is a rejected, default-off
+experiment, not the accepted launcher configuration.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -259,13 +265,22 @@ router calls totaling 0.27816 ms/decode, and zero sort operations of any shape.
 Primary plus asynchronous device work covers 14.91656 ms, leaving only
 0.06545 ms uncovered.
 
+The current experimental server's endpoint result files are under
+`results/kimi-k3-b1-pallas-block-router-topk{,-repeat}` and measure 15.24950
+and 15.25911 ms mean TPOT. Its latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2599376.1786626871906653164.pt.trace.json.gz`.
+The stable executable average is 14.97524 ms, but the block-router family is
+0.30741 ms/decode and therefore slower than the accepted router. Restore the
+accepted configuration by starting fresh Ray workers after source edits and
+launching with the default `TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0`.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do
-not restore the dynamic gather. Step `602.54` imported both accepted routing
-optimizations and is safe for read-only profiling or another benchmark. Any Python
-source edit, model-graph edit, or `LIBTPU_INIT_ARGS` change requires canceling
-only `602.54` and starting fresh Ray workers. Never cancel allocation job 602
+not restore the dynamic gather. Step `602.55` imported the experimental
+blockwise selector and is safe for read-only profiling or another benchmark.
+Any Python source edit, model-graph edit, or `LIBTPU_INIT_ARGS` change requires
+canceling only `602.55` and starting fresh Ray workers. Never cancel allocation job 602
 while continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
 
 Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the

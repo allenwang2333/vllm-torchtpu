@@ -11,6 +11,8 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+import vllm_torchtpu.envs as envs
+
 
 _K3_NUM_EXPERTS = 896
 _K3_TOPK = 16
@@ -51,7 +53,11 @@ def _k3_router_topk_jax(
     correction_bias: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     from vllm_torchtpu.kernels.kimi_k3.router_topk import kimi_k3_router_topk
-    return kimi_k3_router_topk(logits, correction_bias)
+    return kimi_k3_router_topk(
+        logits,
+        correction_bias,
+        blockwise=envs.TPU_K3_PALLAS_BLOCK_ROUTER_TOPK,
+    )
 
 
 k3_router_topk = pallas.jax_op("pallas::k3_router_topk", _k3_router_topk_jax)
