@@ -476,8 +476,10 @@ batch or alias the runtime writebacks without materializing tensor copies.
 The follow-up runtime-storage-rebind diagnostic is also rejected and its
 temporary source was removed. It replaced generated mutation-epilogue
 `copy_` calls with `set_` only while the compiled callable performed its lazy
-first invocation. Reproduce the historical launch only from the milestone-64
-diagnostic commit, on fresh Ray workers, with:
+first invocation. The exact default-off diagnostic is archived in commit
+`0e96e808`; the branch tip removes it again in commit `80be4ba3`. Reproduce
+the historical launch from a detached worktree at `0e96e808`, on fresh Ray
+workers, with:
 
 ```bash
 export TPU_K3_RUNTIME_STATE_REBIND=1
