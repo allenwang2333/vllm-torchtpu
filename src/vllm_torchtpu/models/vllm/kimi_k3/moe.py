@@ -324,7 +324,17 @@ class KimiMoE(nn.Module):
         latent_up_tp_size = self.tp_size
         latent_up_tp_rank = 0
         if shard_latent_up:
-            split = hierarchical_split_or_none()
+            requested_up_tp = envs.TPU_K3_LATENT_UP_TP_SIZE
+            if requested_up_tp:
+                split = hierarchical_moe_split(
+                    get_tensor_model_parallel_world_size(),
+                    get_tensor_model_parallel_rank(), requested_up_tp)
+                if split is None:
+                    raise ValueError(
+                        f"TPU_K3_LATENT_UP_TP_SIZE={requested_up_tp} is "
+                        "not a valid whole-chip topology split")
+            else:
+                split = hierarchical_split_or_none()
             if split is not None:
                 _, _, latent_up_tp_size, latent_up_tp_rank = split
         up_proj_cls = RowParallelLinear if shard_latent_up else ReplicatedLinear

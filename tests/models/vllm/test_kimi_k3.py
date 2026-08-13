@@ -962,6 +962,34 @@ def test_sharded_latent_up_uses_row_parallel_and_custom_runner(
     assert fused_moe_args["routed_output_transform"].output_scale == 2 / 8
 
 
+def test_sharded_latent_up_accepts_independent_tp_width(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRowParallel(_FakeReplicatedLinear):
+
+        def __init__(self, input_size, output_size, **kwargs) -> None:
+            self.init_kwargs = kwargs.copy()
+            super().__init__(input_size, output_size, **kwargs)
+
+    calls: list[tuple[int, int, int]] = []
+
+    def fake_split(world_size: int, rank: int,
+                   tp_size: int) -> tuple[int, int, int, int]:
+        calls.append((world_size, rank, tp_size))
+        return 2, 0, tp_size, 0
+
+    monkeypatch.setenv("TPU_K3_SHARD_LATENT_UP_PROJ", "1")
+    monkeypatch.setenv("TPU_K3_LATENT_UP_TP_SIZE", "4")
+    monkeypatch.setattr(kimi_moe, "RowParallelLinear", FakeRowParallel)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(kimi_moe, "hierarchical_moe_split", fake_split)
+    layer, fused_moe_args = _build_kimi_moe(monkeypatch,
+                                             _latent_moe_config())
+
+    assert calls == [(8, 0, 4)]
+    assert isinstance(layer.routed_expert_up_proj, FakeRowParallel)
+    assert fused_moe_args["routed_output_transform"].output_scale == 4 / 8
+
+
 def test_sharded_up_runner_keeps_shared_partial_then_reduces_sum(
         monkeypatch: pytest.MonkeyPatch) -> None:
     runner = object.__new__(kimi_moe.KimiShardedUpMoERunner)

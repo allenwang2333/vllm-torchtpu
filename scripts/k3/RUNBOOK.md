@@ -113,10 +113,17 @@ TPU_K3_MLA_A_TP_SIZE=8 \
   scripts/k3/launch_kimi_k3_tp32_ep.sh
 ```
 
+The rejected intermediate latent-up shard is reproduced with:
+
+```bash
+TPU_K3_SHARD_LATENT_UP_PROJ=1 TPU_K3_LATENT_UP_TP_SIZE=4 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+```
+
 Unset the override on the next launch to recover the accepted launcher default
-of TP4. A model-only environment override needs a new vLLM server and unique
-caches, but not a new Ray step when neither source nor `LIBTPU_INIT_ARGS`
-changed.
+of TP4 MLA A sharding with latent-up disabled. A model-only environment
+override needs a new vLLM server and unique caches, but not a new Ray step when
+neither source nor `LIBTPU_INIT_ARGS` changed.
 
 The launcher appends the winning enhanced-barrier and dependent-collective
 flags unless the caller explicitly supplies either flag with `=true` or
@@ -217,18 +224,19 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Ray step `602.46` is active
+Allocation job 602 is intentionally still active. Ray step `602.48` is active
 on all four hosts with head `10.13.232.26`; its persistent terminal/session is
-`87931`. No vLLM server is active. The rejected TP8 MLA A-projection server
-(former API PID 2073327, EngineCore PID 2079180) was stopped with SIGINT after
-both endpoint runs. Its caches remain under
-`/mnt/scratch/kimi-k3-b1-mla-a-tp8`, and results are under
-`results/kimi-k3-b1-mla-a-tp8{,-repeat}`. The pair measured 16.06524 and
-16.04567 ms mean TPOT, 0.09140 ms slower than the fresh TP4 control pair, so
-leave the launcher default at TP4 and do not set `TPU_K3_MLA_A_TP_SIZE=8`.
+`34506`. No vLLM server is active. The rejected TP4 latent-up server (former
+API PID 2150761, EngineCore PID 2153816) was stopped with SIGINT after two
+endpoint runs and two profiles. Its caches and profiles remain under
+`/mnt/scratch/kimi-k3-b1-latent-up-tp4{,-profile}`, and results are under
+`results/kimi-k3-b1-latent-up-tp4{,-repeat}`. The pair measured 16.13678 and
+16.13220 ms mean TPOT, 0.17043 ms slower than the fresh default control pair.
+Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`; the opt-in TP4 width breaks 92 existing
+variadic global reduction fusions and raises all-reduce time by 1.479 ms.
 
-Step `602.46` can be reused for another model-only environment experiment.
-Cancel only step `602.46` and start fresh Ray workers before any source or
+Step `602.48` can be reused for another model-only environment experiment.
+Cancel only step `602.48` and start fresh Ray workers before any source or
 `LIBTPU_INIT_ARGS` change. Never cancel allocation job 602 while continuing
 this work.
 

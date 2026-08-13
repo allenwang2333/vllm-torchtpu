@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     TPU_K3_BLOCKED_TOPK: bool = False
     TPU_K3_JAX_EXACT_TOPK: bool = False
     TPU_K3_SHARD_LATENT_UP_PROJ: bool = False
+    TPU_K3_LATENT_UP_TP_SIZE: int = 0
     TPU_K3_SHARD_LATENT_DOWN_PROJ: bool = False
     TPU_K3_LATENT_DOWN_TP_SIZE: int = 0
     TPU_K3_SHARD_KDA_F_A_PROJ: bool = False
@@ -351,6 +352,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # existing hidden-width all-reduce, so this adds no collective.
     "TPU_K3_SHARD_LATENT_UP_PROJ":
     env_bool("TPU_K3_SHARD_LATENT_UP_PROJ"),
+    # Optional independent shard width for latent up_proj. Zero reuses the
+    # hierarchical routed-expert TP width.
+    "TPU_K3_LATENT_UP_TP_SIZE":
+    lambda: int(os.getenv("TPU_K3_LATENT_UP_TP_SIZE", "0")),
     # Row-shard K3's latent-MoE input projection inside the hierarchical TP
     # group, then finish it with a chip-local reduction before routed GMM1.
     "TPU_K3_SHARD_LATENT_DOWN_PROJ":

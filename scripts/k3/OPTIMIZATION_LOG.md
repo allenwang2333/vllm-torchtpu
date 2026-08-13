@@ -1237,6 +1237,21 @@ the regressed TP2 up path remains disabled.
     | All remaining leaf categories | 0.36700 |
     | **Primary-lane total** | **15.02905** |
 
+    The 5.05100 ms all-reduce row decomposes completely by payload and group:
+
+    | Reduction family | Calls/decode | Mean per decode (ms) |
+    | --- | ---: | ---: |
+    | Variadic global TP32 `(bf16[1,7168], bf16[1,3584])` | 92 | 2.48760 |
+    | Standalone global TP32 `bf16[1,7168]` | 95 | 1.70837 |
+    | Latent-down TP4 `bf16[3584]` | 92 | 0.67390 |
+    | KDA `f_a` TP2 `bf16[128]` | 69 | 0.18113 |
+    | **Total** | **348** | **5.05100** |
+
+    The single largest dense family is the replicated latent-MoE `up_proj`:
+    its 92 `3584 -> 7168` convolution-fusion matmuls total about 2.141 ms per
+    decode. This made an intermediate TP width worth testing, but only if its
+    dataflow preserved the existing variadic collective fusion.
+
     Primary-lane interval occupancy is 15.02785 ms. Including asynchronous
     device-lane intervals covers 15.62018 ms of the 15.68095 ms executable,
     leaving only 0.06077 ms genuinely uncovered. Thus the approximately
@@ -1294,7 +1309,79 @@ the regressed TP2 up path remains disabled.
     took about 19 seconds while later 1,000-token requests took about 16.1
     seconds. Only the four post-warmup requests in each saved JSON determine
     the reported TPOT. The server was stopped after the repeat; Ray step
-    `602.46` and parent allocation 602 remain active.
+    `602.46` and parent allocation 602 were deliberately left active at that
+    milestone. Milestone 45 later replaced only that Ray step.
+45. Used the detailed kernel breakdown to test an untried intermediate shard
+    for latent-MoE `up_proj`. The new opt-in
+    `TPU_K3_LATENT_UP_TP_SIZE` selects a topology-valid width independently of
+    routed-expert TP; zero preserves the old TP2 reproduction path. The trial
+    used TP4, making each local up projection `896 -> 7168`, while retaining
+    TP4 latent-down, TP2 KDA `f_a`, TP4 MLA A projection, and the accepted
+    scheduler flags. It reuses the existing global hidden-width reduction and
+    adds no logical payload. Three focused construction/runner tests pass.
+
+    A fresh Ray step and fresh cache namespace
+    `/mnt/scratch/kimi-k3-b1-latent-up-tp4` compiled and served on all 32
+    workers. The two canonical runs measured
+    16.13678/16.13159/16.15579 ms and
+    16.13220/16.13095/16.14028 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-latent-up-tp4/kimi-k3_isl1_osl1000_concurrency1_20260813-101638.json`
+    and
+    `results/kimi-k3-b1-latent-up-tp4-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-102025.json`.
+    Their 16.13449 ms pair average is 0.17043 ms slower than the fresh TP4
+    control pair, so the feature remains opt-in and disabled in the launcher.
+
+    The second rank-0 trace has 18 decode executions and explains why the
+    apparently high-leverage dense shard loses. Convolution-fusion time falls
+    from 5.38134 to 4.12883 ms (-1.25251 ms), but all-reduce grows from
+    5.05100 to 6.52982 ms (+1.47882 ms). The unchanged logical payloads are
+    lowered differently:
+
+    | Reduction family | Control calls/ms | TP4-up calls/ms |
+    | --- | ---: | ---: |
+    | Variadic global `(7168,3584)` | 92 / 2.48760 | 0 / 0 |
+    | Global `7168` | 95 / 1.70837 | 187 / 3.55016 |
+    | Global `3584` | fused above | 92 / 2.20280 |
+    | TP4 latent-down `3584` | 92 / 0.67390 | 92 / 0.58993 |
+    | TP2 KDA `128` | 69 / 0.18113 | 69 / 0.18693 |
+    | **Total** | **348 / 5.05100** | **440 / 6.52982** |
+
+    Thus TP4-up does not add bytes, but its dependency change prevents XLA
+    from variadically fusing 92 global 7168- and 3584-wide reductions. The 92
+    extra launches cost more than the sharded dense projection saves. The
+    complete primary-lane total rises from 15.02905 to 15.28393 ms, consistent
+    with the endpoint regression. Other major families remain close:
+    custom-call 1.73598 ms, loop fusion 1.30042 ms, and sort 0.56860 ms.
+    Profiles are under
+    `/mnt/scratch/kimi-k3-b1-latent-up-tp4-profile`.
+
+    Reproduction after the standard `RUNBOOK.md` environment is:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-latent-up-tp4
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_SHARD_LATENT_UP_PROJ=1 TPU_K3_LATENT_UP_TP_SIZE=4 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-latent-up-tp4 \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-latent-up-tp4-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-kimi-k3-b1-latent-up-tp4 \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-latent-up-tp4-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The cold launch took about 224 seconds in runtime backbone compilation;
+    this startup cost is excluded from TPOT. The first benchmark warmup again
+    took about 19 seconds, versus about 16.15 seconds after warmup. Only the
+    four post-warmup requests in each JSON are used above.
 
 ## Forward plan
 
@@ -1314,8 +1401,10 @@ the regressed TP2 up path remains disabled.
    async-all-reduce, and collective-matmul V2 settings.
 4. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
-   TP8 latent-down, per-layer scorer collectives, and explicit local scorer
-   reductions are rejected.
+   TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
+   per-layer scorer collectives, and explicit local scorer reductions are
+   rejected. A future up-projection attempt is justified only if it preserves
+   the 92 variadic global `(7168,3584)` reductions.
 5. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
 6. Treat sampling as bounded: the exact-server temperature-1 versus greedy
