@@ -10,7 +10,7 @@ slice, without speculative decoding. All performance runs use dummy weights,
 `compile_sizes=[1]`, ISL=1, OSL=1000, and concurrency 1. Read
 `OPTIMIZATION_LOG.md` before selecting another experiment; it records rejected
 ideas as well as results. The best repeated configuration currently measures
-15.92 ms mean TPOT. It is backed up on the non-main branch
+15.82--15.85 ms mean TPOT. It is backed up on the non-main branch
 `agent/k3-b1-tpot-optimization-backup`.
 
 The launcher defaults contain the current winning model configuration:
@@ -19,6 +19,7 @@ The launcher defaults contain the current winning model configuration:
 - direct batch-1 routed-row combine;
 - TP4 latent-MoE down projection;
 - TP2 KDA `f_a` projection;
+- TP4 MLA fused query/KV A projection;
 - neutral top-k/top-p sampler specialization;
 - enhanced TPU launch barriers; and
 - XLA dependent-collective layer scheduling.
@@ -26,6 +27,13 @@ The launcher defaults contain the current winning model configuration:
 Do not enable opt-in experimental flags just because their implementation is
 present. Many are retained for reproducibility after measuring neutral or
 slower. The optimization log is authoritative for their disposition.
+
+The exact TPU/JAX router experiment is reproduced by adding
+`TPU_K3_JAX_EXACT_TOPK=1` before launch. It compiles and is exact, but its two
+runs averaged 0.015 ms slower than the launcher default, so leave it unset.
+After any source change, verify that worker PIDs are newer than the edit or,
+preferably, restart the exact Ray Slurm step. A new cache path alone does not
+refresh Python imports in persistent Ray workers.
 
 ### Resume an existing four-host Slurm allocation
 
@@ -197,14 +205,16 @@ when they do not initialize the TPU plugin.
 ### Live state at this handoff
 
 Allocation job 602 is intentionally still active. The latency-hiding layer
-scheduler experiment completed in namespace
-`/mnt/scratch/kimi-k3-b1-latency-hiding-layer-scheduler`. Its two canonical
-runs measured 15.91772 and 15.91197 ms mean TPOT versus 15.91567 and 15.92282
-ms for the dependent-scheduler controls. This is neutral within run noise, so
-`--xla_tpu_enable_latency_hiding_layer_scheduler=true` is rejected as a
-default. At the time this section was updated, that experimental server was
-still healthy on port 8000. Stop its vLLM PID and exact Ray step before any
-source or libtpu-flag experiment; do not cancel allocation job 602.
+scheduler experiment is complete and its old server is stopped. The current
+healthy server on port 8000 is PID 1921701 on exact Ray step `602.44`, using
+namespace
+`/mnt/scratch/kimi-k3-b1-mla-a-tp4-jax-exact-topk-fresh`. It has the accepted
+TP4 MLA A-projection sharding plus the *rejected* opt-in exact JAX top-k. Its
+two runs are 15.86269 and 15.83474 ms mean TPOT, versus 15.84994 and 15.81726
+ms for TP4 MLA alone; leave `TPU_K3_JAX_EXACT_TOPK` unset on the next launch.
+Two profile captures are present under the matching `-profile` directory.
+Stop PID 1921701 and only step `602.44` before another source or libtpu-flag
+experiment; do not cancel allocation job 602.
 
 ## Non-Slurm cluster
 

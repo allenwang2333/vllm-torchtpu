@@ -1136,6 +1136,66 @@ the regressed TP2 up path remains disabled.
     spread, so the full latency-hiding scheduler is neutral and is not added
     to launcher defaults.
 
+41. Tested the proposed additional attention projection sharding on MLA's
+    fused 7168-to-2112 query/KV A projection. The implementation now accepts
+    an independent `TPU_K3_MLA_A_TP_SIZE`; zero retains the hierarchical TP
+    group, while the experiment used TP4. This is deliberately narrower than
+    globally changing attention TP: only the contracting dimension is sharded
+    and the 2112-element partial is completed by one TP4 all-reduce. Fresh
+    caches and all 32 workers compiled successfully. The two canonical runs
+    measured 15.84994/15.85881/15.86342 ms and
+    15.81726/15.81855/15.82880 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-mla-a-tp4/kimi-k3_isl1_osl1000_concurrency1_20260813-082618.json`
+    and
+    `results/kimi-k3-b1-mla-a-tp4-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-082847.json`.
+    Their pairwise mean is 0.08564 ms faster than the two-run 15.91925 ms
+    dependent-scheduler control. The TP4 variant is therefore enabled in the
+    K3 launcher; the generic environment defaults remain off so other models
+    are unchanged. This also refines the projection boundary: TP2 was neutral
+    for this 2112-wide output, but TP4 produces enough matmul savings to pay
+    for the wider subgroup collective.
+42. Investigated the proposed NVIDIA MoE top-k implementations and built a
+    TPU-native exact alternative. The Inkling Triton kernel fuses scoring,
+    bias, iterative top-16 selection, and renormalization; the MLJ Triton
+    kernel is a stable streaming selector that takes block-local candidates
+    and bitonically merges a running top-16. Neither CUDA/Triton kernel is
+    directly usable on TPU, but the current-best rank-0 trace proves this is a
+    material target: 92 router sorts over `[1,896]` total 0.45020 ms/step,
+    plus 92 downstream expert-ID sorts over `[16]` total 0.11923 ms/step.
+
+    The first exact blocked Torch formulation (14 blocks of 64, 16 candidates
+    each, then top-16 of 224) had already been rejected because whole-model
+    layout assignment ran for more than ten minutes and never served. The new
+    opt-in `TPU_K3_JAX_EXACT_TOPK=1` instead calls
+    `jax.lax.approx_max_k(..., recall_target=1.0)` behind a Torch/JAX custom-op
+    boundary. Despite its name, recall 1.0 is exact; the repository already
+    uses this form in StreamIndex with a note that it is faster than
+    `lax.top_k`. Focused routing tests passed 5/5. A fresh four-host Ray
+    session was mandatory after the source change; an initial launch using
+    worker PIDs from the preceding experiment was explicitly discarded.
+
+    On fresh workers, the standalone selector compiled as a 72-instruction
+    `tt_jit_custom_kernel` with only two extra layout passes. The first
+    profiler backbone compile took about 51 seconds and produced a 51 MB
+    artifact, versus roughly 142 seconds and 120 MB for the TP4-MLA control,
+    because the 92 selections no longer expand inside the monolithic graph.
+    The runtime backbone also completed despite verbose layout diagnostics.
+    Endpoint performance, however, was neutral/slightly slower:
+    15.86269/15.84342/15.94707 ms and
+    15.83474/15.83138/15.85209 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-mla-a-tp4-jax-exact-topk/kimi-k3_isl1_osl1000_concurrency1_20260813-084908.json`
+    and
+    `results/kimi-k3-b1-mla-a-tp4-jax-exact-topk-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-085137.json`.
+    Their mean is 0.01511 ms slower than the two-run TP4-MLA control, so the
+    exact custom op remains disabled. The result shows that the 0.450 ms sort
+    family is not freely recoverable: the separate exact selector and custom
+    call replace it on the critical path. A future attempt should fuse score
+    activation, correction bias, selection, gather, and renormalization in one
+    TPU kernel (the transferable Inkling idea), or integrate routing directly
+    with MoE dispatch; another standalone exact selector is low priority.
+    Two post-warmup profiles were captured under
+    `/mnt/scratch/kimi-k3-b1-mla-a-tp4-jax-exact-topk-fresh-profile`.
+
 ## Forward plan
 
 1. Capture an equivalently formatted 16.80 ms direct-combine control if a
@@ -1169,11 +1229,10 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.92 ms from hierarchical routed
+The best verified steady-state result is 15.82--15.85 ms from hierarchical routed
 experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers, dependent-collective layer scheduling, plus the neutral top-k/top-p
-sampling specialization. The remaining gap to the 15 ms target is 0.92 ms
-(5.8% of the
-current result). No
+barriers, dependent-collective layer scheduling, TP4 MLA fused A-projection
+sharding, plus the neutral top-k/top-p sampling specialization. The remaining
+gap to the 15 ms target is 0.82 ms (5.2% of the best repeat). No
 speculative decoding is used in any result.

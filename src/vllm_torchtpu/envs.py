@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_HIERARCHICAL_TP_SIZE: int = 2
     TPU_K3_BLOCKED_TOPK: bool = False
+    TPU_K3_JAX_EXACT_TOPK: bool = False
     TPU_K3_SHARD_LATENT_UP_PROJ: bool = False
     TPU_K3_SHARD_LATENT_DOWN_PROJ: bool = False
     TPU_K3_LATENT_DOWN_TP_SIZE: int = 0
@@ -343,6 +344,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_MOE_HIERARCHICAL_TP_SIZE", "2")),
     # Exact two-stage top-16 selection for K3's 896-way router.
     "TPU_K3_BLOCKED_TOPK": env_bool("TPU_K3_BLOCKED_TOPK"),
+    # TPU-native exact top-16 via lax.approx_max_k(recall_target=1.0).
+    "TPU_K3_JAX_EXACT_TOPK": env_bool("TPU_K3_JAX_EXACT_TOPK"),
     # Row-shard K3's latent-MoE up projection across global TP. Its partial
     # output is combined with the unreduced shared-expert partial before the
     # existing hidden-width all-reduce, so this adds no collective.

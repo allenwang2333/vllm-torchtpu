@@ -34,6 +34,24 @@ def test_k3_blocked_topk_matches_global_topk(monkeypatch, leading_shape) -> None
     assert torch.equal(actual_ids, expected_ids)
 
 
+def test_k3_jax_exact_topk_dispatch(monkeypatch) -> None:
+    monkeypatch.setenv("TPU_K3_JAX_EXACT_TOPK", "1")
+    scores = torch.randn(2, 896)
+    expected_values, expected_ids = torch.topk(scores, k=16, dim=-1)
+
+    def fake_exact_topk(actual_scores):
+        assert actual_scores is scores
+        return expected_values, expected_ids
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.custom_ops.moe_topk_op.k3_exact_topk",
+        fake_exact_topk,
+    )
+    actual_values, actual_ids = moe_routing._topk_for_expert_choice(scores, 16)
+    assert actual_values is expected_values
+    assert actual_ids is expected_ids
+
+
 def test_non_k3_topk_uses_standard_shape() -> None:
     scores = torch.randn(2, 128)
     expected = torch.topk(scores, k=8, dim=-1)

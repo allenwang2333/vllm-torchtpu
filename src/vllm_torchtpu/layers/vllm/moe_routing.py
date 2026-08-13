@@ -174,17 +174,24 @@ def _apply_scoring_fn(scoring_fn: str,
 
 def _topk_for_expert_choice(
         scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact two-stage top-k for K3's batch-1 896-way router.
+    """Select experts, with opt-in exact K3 router experiments.
 
-    A global top-k item must be in the top-k of its own disjoint block. Taking
+    The JAX custom-op path uses TPU's exact ``approx_max_k`` implementation.
+    The older blocked Torch path relies on the fact that a global top-k item
+    must be in the top-k of its own disjoint block. Taking
     16 candidates from each of fourteen 64-expert blocks and then selecting
     the global 16 from those 224 candidates is therefore exactly equivalent
     to top-16 over all 896 experts. The blocked form exposes fourteen small
     selections in parallel on TPU while leaving every other model shape on
     the standard lowering.
     """
-    if (not envs.TPU_K3_BLOCKED_TOPK or scores.shape[-1] != 896
-            or topk != 16):
+    is_k3_router = scores.shape[-1] == 896 and topk == 16
+    if envs.TPU_K3_JAX_EXACT_TOPK and is_k3_router:
+        from vllm_torchtpu.layers.vllm.custom_ops.moe_topk_op import \
+            k3_exact_topk
+        return k3_exact_topk(scores)
+
+    if not envs.TPU_K3_BLOCKED_TOPK or not is_k3_router:
         return torch.topk(scores, k=topk, dim=-1)
 
     blocks = scores.reshape(*scores.shape[:-1], 14, 64)
