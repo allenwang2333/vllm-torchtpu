@@ -1488,24 +1488,133 @@ the regressed TP2 up path remains disabled.
     `[1,7168]`. They cannot be locally added before reduction. This makes
     backend support for a mixed-shape variadic reduction, or a more deeply
     fused latent-MoE kernel, the necessary next boundary.
+49. Implemented the transferable part of the proposed NVIDIA MoE router
+    designs as a real TPU Mosaic/Pallas kernel. The relevant references are
+    the fused iterative selector in
+    [`vllm/models/inkling/nvidia/moe.py`](https://github.com/vllm-project/vllm/blob/main/vllm/models/inkling/nvidia/moe.py#L81)
+    and the streaming top-k merge in
+    [`gate_topk.py`](https://github.com/Inferact/mlj/blob/7219aae117ae9a174b102acc7f39e3c4c0269e7f/vllm/models/tml/nvidia/ops/gate_topk.py).
+    The new opt-in boundary initially performed sigmoid, correction-bias add,
+    16 exact argmax/remove passes over 896 experts, selected-score gather, and
+    renormalization in one kernel. It is deliberately restricted to the exact
+    K3 decode case: logits `[1,896]`, top-k 16, sigmoid scoring, correction
+    bias, renormalization, and routed scaling factor 1.0.
+
+    The first TPU attempt on fresh Ray step `602.52` failed during FX-to-MLIR
+    compilation. CPU Pallas interpretation had matched the JAX reference
+    exactly, but Mosaic rejected the dynamic gather across the seven
+    128-column source vector registers:
+
+    ```text
+    Not implemented: Multiple source vregs along gather dimension
+    %190 = "tpu.dynamic_gather"(...) :
+      (vector<8x896xf32>, vector<8x1xi32>) -> vector<8x1xf32>
+    ```
+
+    Replacing that gather with an equivalent one-hot masked reduction kept all
+    score access statically tiled. Three random-seed interpreter tests still
+    matched exact expert IDs and normalized weights bit-for-bit. Fresh Ray
+    step `602.53`, cache namespace
+    `/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask`, and the masked kernel
+    then compiled and served successfully on all 32 chips. The profile
+    backbone compiled in 46.65 seconds to a 42 MB artifact; the runtime
+    backbone compile took 133.92 seconds, and the full model compile stage
+    took 215.15 seconds. These are startup costs, not TPOT.
+
+    The two canonical runs measured
+    15.44748/15.42422/15.52063 ms and
+    15.42870/15.43001/15.43442 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-pallas-router-topk-mask/kimi-k3_isl1_osl1000_concurrency1_20260813-114456.json`
+    and
+    `results/kimi-k3-b1-pallas-router-topk-mask-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-114722.json`.
+    The 15.43809 ms pair average is 0.39551 ms faster than the former best
+    15.83360 ms pair and 0.52597 ms faster than the fresh 15.96406 ms control
+    pair. This is the new best, so `TPU_K3_PALLAS_ROUTER_TOPK=1` is now the K3
+    launcher default; the generic environment default remains false.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2411951.1786621907237364489.pt.trace.json.gz`.
+    Excluding the first profiler-boundary outlier, 18 model executions average
+    15.13673 ms (15.13633 ms median). The additive primary XLA-op lane is:
+
+    | XLA category | Mean per decode (ms) |
+    | --- | ---: |
+    | All fusion operations | 6.84388 |
+    | All-reduce | 5.14840 |
+    | Other custom calls | 1.69143 |
+    | Fused K3 router Pallas calls | 0.27328 |
+    | Data formatting | 0.38780 |
+    | Remaining expert-ID sorts | 0.15532 |
+    | All other leaf operations | 0.22719 |
+    | **Primary-lane total** | **14.72730** |
+
+    There are 92 fused router calls per decode and **zero** remaining
+    `[1,896]` router sorts; the prior graph had 92 such sorts costing about
+    0.450 ms. The remaining 92 sorts are only the downstream 16-route
+    expert-order permutation used to group rows for GMM. Primary-lane interval
+    occupancy is 14.72613 ms. Its union with asynchronous device work is
+    15.07414 ms, leaving 0.06259 ms uncovered inside the 15.13673 ms model
+    executable. Thus there is again no 1.3 ms in-executable idle or host-input
+    bubble: nearly the whole interval is accounted for device work.
+
+    Exact reproduction after starting fresh Ray workers and exporting the
+    standard runbook cache variables is:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-pallas-router-topk-mask
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_PALLAS_ROUTER_TOPK=1 scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-pallas-router-topk-mask \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-pallas-router-topk-mask-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-kimi-k3-b1-pallas-router-topk-mask \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Caveats: real logits are finite and random finite tests match the current
+    exact reference bit-for-bit. Exact ties follow repeated `argmax`'s
+    first-index rule; `top_k` does not specify a portable tie order. Dummy
+    weights make endpoint quality checks meaningless, so correctness evidence
+    is the exact interpreter comparison plus successful full-model execution.
+    The kernel keeps eight padded token rows to satisfy TPU tiling; only row
+    zero is returned. Do not restore the cross-vreg dynamic gather without a
+    Mosaic backend change.
 
 ## Forward plan
 
-1. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
+1. Preserve the accepted fused Pallas router in the K3 launcher. Its next
+   measured boundary is the 92 downstream `[16]` expert-order sorts
+   (0.15532 ms/decode). Explore an EP-aware router output order or a fused
+   route-to-GMM preparation path that makes that permutation unnecessary;
+   simply adding another standalone top-k/sort boundary is not promising.
+2. Port the MLJ block-streaming/bitonic-merge idea to Pallas only if it can
+   retain the successful score/bias/gather/normalization fusion. The current
+   repeated-argmax kernel itself costs 0.27328 ms/decode, so this is a bounded
+   target, not a 0.45 ms opportunity anymore.
+3. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
    neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
    against its fresh TP4 control. Do not widen this collective further.
-2. Use the measured projection boundary to prioritize transformations that
+4. Use the measured projection boundary to prioritize transformations that
    reuse or fuse an existing collective: 7168-to-128 KDA sharding is slightly
    positive, 7168-to-2112 MLA sharding is neutral, while 179 independent
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-3. Continue from the now-enabled dependent-collective layer scheduler and
+5. Continue from the now-enabled dependent-collective layer scheduler and
    inspect its paired trace for changed all-reduce/copy ordering. Test another
    libtpu collective mechanism only if it targets a remaining measured stall
    and is distinct from rejected decomposition, SparseCore offload,
    async-all-reduce, and collective-matmul V2 settings.
-4. Use the current-best profile to prioritize collective reuse/fusion or
+6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
    per-layer scorer collectives, and explicit local scorer reductions are
@@ -1514,19 +1623,20 @@ the regressed TP2 up path remains disabled.
    supported by `ProcessGroupTPU`. A future up-projection attempt is justified
    only after adding a supported mixed-shape variadic collective or fusing the
    latent reduction, norm, projection, and shared combine more deeply.
-5. Preserve the best known configuration as the launcher default and run a
+7. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
-6. Treat sampling as bounded: the exact-server temperature-1 versus greedy
+8. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
    budget and exact mixed-parameter/deterministic-generator semantics.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.82--15.85 ms from hierarchical routed
-experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
+The best verified steady-state result is 15.43--15.45 ms from the fused exact
+Pallas router, hierarchical routed experts at EP16 x TP2, batch-1 direct
+routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
 barriers, dependent-collective layer scheduling, TP4 MLA fused A-projection
 sharding, plus the neutral top-k/top-p sampling specialization. The remaining
-gap to the 15 ms target is 0.82 ms (5.2% of the best repeat). No
+gap to the 15 ms target is 0.43 ms (2.8% of the best repeat). No
 speculative decoding is used in any result.

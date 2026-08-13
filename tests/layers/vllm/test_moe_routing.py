@@ -60,6 +60,50 @@ def test_non_k3_topk_uses_standard_shape() -> None:
     assert torch.equal(actual[1], expected[1])
 
 
+def test_k3_pallas_router_dispatches_only_for_exact_supported_case(
+        monkeypatch) -> None:
+    monkeypatch.setenv("TPU_K3_PALLAS_ROUTER_TOPK", "1")
+    hidden_states = torch.randn(1, 32, dtype=torch.bfloat16)
+    logits = torch.randn(1, 896)
+    bias = torch.randn(896)
+    expected_weights = torch.randn(1, 16)
+    expected_ids = torch.arange(16, dtype=torch.int32).reshape(1, 16)
+    calls = []
+
+    def fake_router_topk(actual_logits, actual_bias):
+        calls.append((actual_logits, actual_bias))
+        return expected_weights, expected_ids
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.custom_ops.moe_topk_op.k3_router_topk",
+        fake_router_topk,
+    )
+    layer = SimpleNamespace(
+        hash_indices_table=None,
+        use_grouped_topk=False,
+        num_expert_group=1,
+        topk_group=1,
+        e_score_correction_bias=bias,
+        routed_scaling_factor=1.0,
+    )
+    actual_weights, actual_ids = moe_routing.select_experts(
+        hidden_states,
+        logits,
+        topk=16,
+        renormalize=True,
+        scoring_fn="sigmoid",
+        layer=layer,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is logits
+    torch.testing.assert_close(calls[0][1], bias)
+    assert actual_weights.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_weights,
+                               expected_weights.to(torch.bfloat16))
+    assert torch.equal(actual_ids, expected_ids)
+
+
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):
     return SimpleNamespace(
         moe_config=SimpleNamespace(

@@ -44,3 +44,22 @@ def _fake_k3_exact_topk(scores: torch.Tensor):
     shape = (*scores.shape[:-1], _K3_TOPK)
     return (torch.empty(shape, dtype=scores.dtype, device=scores.device),
             torch.empty(shape, dtype=torch.int32, device=scores.device))
+
+
+def _k3_router_topk_jax(
+    logits: jax.Array,
+    correction_bias: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    from vllm_torchtpu.kernels.kimi_k3.router_topk import kimi_k3_router_topk
+    return kimi_k3_router_topk(logits, correction_bias)
+
+
+k3_router_topk = pallas.jax_op("pallas::k3_router_topk", _k3_router_topk_jax)
+
+
+@k3_router_topk.register_fake
+def _fake_k3_router_topk(logits: torch.Tensor, correction_bias: torch.Tensor):
+    del correction_bias
+    shape = (*logits.shape[:-1], _K3_TOPK)
+    return (torch.empty(shape, dtype=torch.float32, device=logits.device),
+            torch.empty(shape, dtype=torch.int32, device=logits.device))

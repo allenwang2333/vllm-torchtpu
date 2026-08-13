@@ -291,9 +291,24 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = getattr(layer, "e_score_correction_bias",
                                       None) if layer is not None else None
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
+                                    1.0) if layer is not None else 1.0
+
+    is_k3_pallas_case = (envs.TPU_K3_PALLAS_ROUTER_TOPK
+                         and router_logits.shape == (1, 896) and topk == 16
+                         and scoring_fn == "sigmoid"
+                         and e_score_correction_bias is not None
+                         and renormalize and routed_scaling_factor == 1.0)
+    if is_k3_pallas_case:
+        from vllm_torchtpu.layers.vllm.custom_ops.moe_topk_op import \
+            k3_router_topk
+        bias = e_score_correction_bias.float().reshape(896)
+        topk_weights, topk_ids = k3_router_topk(router_logits.float(), bias)
+        return (topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32))
+
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
@@ -307,8 +322,6 @@ def select_experts(
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
             topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
-    routed_scaling_factor = getattr(layer, "routed_scaling_factor",
-                                    1.0) if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 

@@ -10,12 +10,13 @@ slice, without speculative decoding. All performance runs use dummy weights,
 `compile_sizes=[1]`, ISL=1, OSL=1000, and concurrency 1. Read
 `OPTIMIZATION_LOG.md` before selecting another experiment; it records rejected
 ideas as well as results. The best repeated configuration currently measures
-15.82--15.85 ms mean TPOT. It is backed up on the non-main branch
+15.43--15.45 ms mean TPOT. It is backed up on the non-main branch
 `agent/k3-b1-tpot-optimization-backup`.
 
 The launcher defaults contain the current winning model configuration:
 
 - hierarchical MoE EP16 x TP2;
+- exact fused Pallas router top-k for the batch-1 K3 shape;
 - direct batch-1 routed-row combine;
 - TP4 latent-MoE down projection;
 - TP2 KDA `f_a` projection;
@@ -28,7 +29,11 @@ Do not enable opt-in experimental flags just because their implementation is
 present. Many are retained for reproducibility after measuring neutral or
 slower. The optimization log is authoritative for their disposition.
 
-The exact TPU/JAX router experiment is reproduced by adding
+The accepted Pallas router is the launcher default. Set
+`TPU_K3_PALLAS_ROUTER_TOPK=0` only to obtain a control. It fuses sigmoid,
+correction bias, exact top-16 selection, selected-score collection, and
+renormalization; its two acceptance runs averaged 15.43809 ms mean TPOT. The
+older exact TPU/JAX router experiment is reproduced by adding
 `TPU_K3_JAX_EXACT_TOPK=1` before launch. It compiles and is exact, but its two
 runs averaged 0.015 ms slower than the launcher default, so leave it unset.
 After any source change, verify that worker PIDs are newer than the edit or,
@@ -230,27 +235,32 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Ray step `602.50` is active
-on all four hosts with head `10.13.232.26`; its persistent terminal/session is
-`10531`. No vLLM server is active. The most recent launch used fresh namespace
-`/mnt/scratch/kimi-k3-b1-latent-up-tp4-coalesced` but failed before serving
-because `ProcessGroupTPU` does not support `allreduce_coalesced`; its former
-API PID 2301781 exited. The source was restored to the compile-safe TP4
-latent-up implementation after that failure.
+Allocation job 602 is intentionally still active. Fresh Ray step `602.53` is
+active on all four hosts with head `10.13.232.26`; its persistent terminal is
+session `98307`. The healthy vLLM server is terminal/session `36353`, API PID
+2425130, EngineCore PID 2428330. It uses cache namespace
+`/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask` and profile directory
+`/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask-profile`. The launch passed
+`TPU_K3_PALLAS_ROUTER_TOPK=1`; this is now also the launcher default.
 
-The preceding early-shared-ordering server on Ray step `602.49` was stopped
-after two endpoint runs and profiles. Its caches and profiles remain under
-`/mnt/scratch/kimi-k3-b1-latent-up-tp4-early-shared{,-profile}`, and results
-are under `results/kimi-k3-b1-latent-up-tp4-early-shared{,-repeat}`. The pair
-measured 16.13022 and 16.12713 ms mean TPOT, 0.16462 ms slower than the fresh
-default control. Its trace still contains 440 physical all-reduces and no
-variadic collective, so the temporary ordering code was removed.
+The accepted result files are under
+`results/kimi-k3-b1-pallas-router-topk-mask{,-repeat}` and measure 15.44748
+and 15.42870 ms mean TPOT. The two profile requests are under
+`results/profile-kimi-k3-b1-pallas-router-topk-mask`. The latest rank-0 trace
+is
+`/mnt/scratch/kimi-k3-b1-pallas-router-topk-mask-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2411951.1786621907237364489.pt.trace.json.gz`.
+It contains 18 normal decode executions averaging 15.13673 ms, 92 fused
+router calls totaling 0.27328 ms/decode, zero `[1,896]` router sorts, and 92
+remaining `[16]` GMM-route-order sorts totaling 0.15532 ms/decode.
 
-Step `602.50` has imported the now-removed coalesced source and must not be
-reused. Cancel only step `602.50`, then start fresh Ray workers before the next
-source, model, or `LIBTPU_INIT_ARGS` experiment. Never cancel allocation job
-602 while continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0` for the
-accepted configuration.
+The immediately preceding Pallas attempt on Ray step `602.52` failed because
+Mosaic cannot dynamically gather across the seven source vector registers of
+an `8x896` score tile. The current code uses a masked reduction instead. Do
+not restore the dynamic gather. Step `602.53` imported the accepted masked
+source and is safe for read-only profiling or another benchmark. Any Python
+source edit, model-graph edit, or `LIBTPU_INIT_ARGS` change requires canceling
+only `602.53` and starting fresh Ray workers. Never cancel allocation job 602
+while continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
 
 Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the
 selector still lowers to the same 92 `[1,896]` sorts (0.45000 ms/decode) and
