@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -306,6 +307,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Shard Kimi K3's latent-MoE down/up projections across the cores of a
+    # chip instead of replicating them. They are unquantized [7168, 3584] and
+    # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
+    # time at TP=32; halving the bytes each core reads costs two on-package
+    # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
+    "TPU_LATENT_PROJ_INTRA_CHIP_TP":
+    env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
