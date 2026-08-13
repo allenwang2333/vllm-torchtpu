@@ -1093,6 +1093,23 @@ the regressed TP2 up path remains disabled.
     inverse-CDF rewrite is therefore rejected for now: it has no measured
     latency budget to recover and would add numerical/correctness risk. Work
     returns to the in-model collective and copy critical path.
+39. Inventoried the installed libtpu's collective scheduling controls and
+    isolated `--xla_tpu_enable_layer_scheduler_for_dependent_collectives=true`
+    on the unchanged best graph. Unlike the rejected Python async-all-reduce
+    rewrite, this leaves model math and collective placement unchanged and
+    lets XLA schedule already-dependent collectives on the executable's layer
+    critical path. A new Ray cluster and fresh Tier-2, Tier-3, and XLA caches
+    were used; all 32 workers constructed and the complete graph compiled.
+    The first canonical temperature-1 run measured 15.91567 ms mean, 15.91622
+    ms median, 15.92265 ms p99, 62.78 output tokens/s, and 29.07 ms mean TTFT:
+    `results/kimi-k3-b1-dep-collective-scheduler/kimi-k3_isl1_osl1000_concurrency1_20260813-073429.json`.
+    An immediate same-server repeat measured 15.92282 ms mean, 15.92112 ms
+    median, 15.93465 ms p99, 62.75 output tokens/s, and 28.32 ms mean TTFT:
+    `results/kimi-k3-b1-dep-collective-scheduler-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-073810.json`.
+    Both runs improve on the prior 15.98475 ms result by approximately
+    0.06--0.07 ms and have tight p99, so the guarded flag is now a launcher
+    default. This is a real scheduling reduction inside the executable, not
+    recovery of the invalidly inferred 1.3 ms idle residual.
 
 ## Forward plan
 
@@ -1109,10 +1126,11 @@ the regressed TP2 up path remains disabled.
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-4. Inventory the installed libtpu binary's exposed collective and launch
-   flags, then select one isolated mechanism that targets the measured
-   5.030 ms all-reduce budget without reintroducing rejected decomposition,
-   SparseCore offload, async-all-reduce, or collective-matmul V2 settings.
+4. Continue from the now-enabled dependent-collective layer scheduler and
+   inspect its paired trace for changed all-reduce/copy ordering. Test another
+   libtpu collective mechanism only if it targets a remaining measured stall
+   and is distinct from rejected decomposition, SparseCore offload,
+   async-all-reduce, and collective-matmul V2 settings.
 5. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, per-layer scorer collectives, and explicit local scorer
@@ -1126,10 +1144,11 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.98 ms from hierarchical routed
+The best verified steady-state result is 15.92 ms from hierarchical routed
 experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers, plus the neutral top-k/top-p sampling specialization. The remaining
-gap to the 15 ms target is 0.98 ms (6.2% of the
+barriers, dependent-collective layer scheduling, plus the neutral top-k/top-p
+sampling specialization. The remaining gap to the 15 ms target is 0.92 ms
+(5.8% of the
 current result). No
 speculative decoding is used in any result.

@@ -60,6 +60,12 @@ export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_use_enhanced_launch_barrier="* ]]; then
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_use_enhanced_launch_barrier=true"
 fi
+# Let XLA schedule serial collective dependencies as a layer-level critical
+# path. This is a small but repeatable batch-1 win on K3's latent-MoE graph.
+# Preserve an explicit caller choice for isolation/control experiments.
+if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_enable_layer_scheduler_for_dependent_collectives="* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true"
+fi
 
 mkdir -p "${PROF_DIR}"
 
