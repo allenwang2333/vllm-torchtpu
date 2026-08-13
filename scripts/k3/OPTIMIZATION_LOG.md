@@ -2726,6 +2726,35 @@ the regressed TP2 up path remains disabled.
     `xla_tpu_enable_scheduler_memory_pressure_tracking` default true in this
     libtpu, so explicitly enabling either is not a new experiment.
 
+73. Tested the complementary short-communication threshold and rejected it on
+    a tight endpoint pair. Fresh Ray step `664.35` used the complete accepted
+    milestone-71 flag set plus
+    `--xla_tpu_layer_scheduler_min_async_communication_latency=0.0`, supplied
+    before Ray startup. Its unique cache/profile namespace was
+    `/mnt/scratch/kimi-k3-b1-layer-scheduler-min-async-zero-v1`.
+
+    Canonical means were 15.1316907 and 15.1331638 ms, averaging 15.1324273
+    ms. This is 0.0019838 ms slower than the milestone-71 multi-compute pair
+    average of 15.1304435 ms and is entirely within run noise. Because there
+    is no endpoint improvement to attribute, no profile or fresh flag-off
+    compile was taken. Keep the threshold at `auto`; the result directories
+    are `results/kimi-k3-b1-layer-scheduler-min-async-zero-v1{,-repeat}`.
+    The server and exact Ray step `664.35` were stopped; allocation `664`
+    remains running.
+
+    A source audit also bounded the next substantive tail idea. The existing
+    `TPU_K3_FUSE_LM_HEAD_SAMPLER` graph begins after
+    `KimiModel.forward`'s `support_torch_compile` boundary, which explains why
+    it removes only one auxiliary launch and saves 0.00837 ms. A true
+    backbone/LM-head/sampler fusion cannot be obtained by wrapping that
+    already-compiled function. It requires moving the compilation boundary to
+    `KimiLinearForCausalLM`, passing fixed-shape temperature/top-k/top-p/RNG
+    tensors into the model step, returning the selected token through
+    `execute_model`, and bypassing the later sampler only for the strict
+    no-speculation/no-grammar/no-logprobs path. This is the next credible
+    design capable of attacking most of the measured 0.136 ms tail; it must
+    preserve full-vocabulary Gumbel-max and generator advancement exactly.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
