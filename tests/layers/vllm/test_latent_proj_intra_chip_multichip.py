@@ -92,6 +92,90 @@ def _prepare_worker_env() -> dict[str, str]:
     return env
 
 
+def _measure(rank: int) -> dict[str, object]:
+    """Form the chip group, then check a sharded projection against a full one."""
+    import torch
+
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+    from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
+
+    group = get_intra_chip_group()
+    if group is None:
+        raise AssertionError("no intra-chip group was formed")
+
+    topology = get_chip_topology()
+    chip_index, _ = topology.chip_of(rank)
+    peers = sorted(group.ranks)
+
+    # (1) The group must be this rank's chip, not an arbitrary pair.
+    expected = sorted(r for r in range(WORLD_SIZE)
+                      if topology.chip_of(r)[0] == chip_index)
+    if peers != expected:
+        raise AssertionError(
+            f"group {peers} is not chip {chip_index}'s cores {expected}")
+
+    shard = LATENT // group.world_size
+    torch.manual_seed(1234)  # same weight on every rank
+    weight = torch.randn(LATENT, HIDDEN, dtype=torch.bfloat16)
+    x = torch.randn(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16)
+
+    x_tpu = x.to("tpu")
+    weight_tpu = weight.to("tpu")
+    # The reference is the *replicated device* projection, not a CPU one. A CPU
+    # bf16 matmul accumulates differently from the MXU, and over a 7168-long
+    # contraction of unit normals the outputs land near 85, where one bf16 ULP
+    # is 0.5 -- so comparing against CPU reports half-unit "errors" that say
+    # nothing about the sharding. Device-vs-device isolates the one variable.
+    reference = torch.nn.functional.linear(x_tpu, weight_tpu).cpu().float()
+
+    local_weight = weight_tpu.narrow(0, group.rank_in_group * shard, shard)
+
+    def sharded(inp):
+        partial = torch.nn.functional.linear(inp, local_weight)
+        return group.all_gather(partial, dim=-1)
+
+    # (2) Eager.
+    eager = sharded(x_tpu).cpu().float()
+
+    # (3) Compiled -- the case that actually matters, since these layers live
+    # inside the compiled decode graph.
+    from torch_tpu._internal import compile as tpu_compile
+    compiled_fn = torch.compile(sharded,
+                                fullgraph=True,
+                                dynamic=False,
+                                backend=tpu_compile.TpuBackend())
+    compiled = compiled_fn(x_tpu).cpu().float()
+
+    eager_max = float((eager - reference).abs().max().item())
+    compiled_max = float((compiled - reference).abs().max().item())
+    scale = float(reference.abs().max().item())
+
+    # Compiled must be bit-exact. Column-parallel splits the output, so every
+    # element is still accumulated over the whole contraction in one go -- the
+    # sharded graph should reduce to the same arithmetic, and it does. This is
+    # the path that matters: the projections live inside the compiled decode
+    # graph.
+    #
+    # Eager is allowed about one bf16 ULP. Dispatching op-by-op, the narrow
+    # [1792, 7168] GEMM does not always land on the same kernel as the
+    # full-width one, and a differently tiled accumulation rounds differently
+    # in the last place. That is kernel selection, not a mis-shard: a wrong
+    # shard or a swapped gather is off by whole tensor halves, not 1e-3.
+    if compiled_max != 0.0 or eager_max > 4e-3 * scale:
+        raise AssertionError(
+            f"rank={rank} eager_max={eager_max} compiled_max={compiled_max} "
+            f"scale={scale}")
+
+    return {
+        "rank": rank,
+        "chip": chip_index,
+        "group_ranks": peers,
+        "rank_in_group": int(group.rank_in_group),
+        "eager_max": eager_max,
+        "compiled_max": compiled_max,
+    }
+
+
 def _run_worker(result_dir: Path) -> None:
     import torch
     import torch_tpu  # noqa: F401
@@ -107,8 +191,13 @@ def _run_worker(result_dir: Path) -> None:
         # Match vLLM startup: touch the device before querying JAX topology.
         torch.empty((1, ), device="tpu").cpu()
 
-        from vllm.distributed.parallel_state import (
-            init_distributed_environment, initialize_model_parallel)
+        from vllm.distributed.parallel_state import \
+            init_distributed_environment
+
+        # Only the world group is set up, not the TP group: the intra-chip
+        # group is derived from the chip topology and the world size, and
+        # `initialize_model_parallel` would drag in a full VllmConfig, which
+        # the TPU platform hook cannot build without a real model.
         init_distributed_environment(
             world_size=WORLD_SIZE,
             rank=rank,
@@ -116,71 +205,7 @@ def _run_worker(result_dir: Path) -> None:
             distributed_init_method="env://",
             backend="tpu_dist",
         )
-        initialize_model_parallel(tensor_model_parallel_size=WORLD_SIZE,
-                                  backend="tpu_dist")
-
-        from vllm_torchtpu.distributed.chip_topology import get_chip_topology
-        from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
-
-        group = get_intra_chip_group()
-        if group is None:
-            raise AssertionError("no intra-chip group was formed")
-
-        topology = get_chip_topology()
-        chip_index, _ = topology.chip_of(rank)
-        peers = sorted(group.ranks)
-
-        # (1) The group must be this rank's chip, not an arbitrary pair.
-        expected = sorted(r for r in range(WORLD_SIZE)
-                          if topology.chip_of(r)[0] == chip_index)
-        if peers != expected:
-            raise AssertionError(
-                f"group {peers} is not chip {chip_index}'s cores {expected}")
-
-        shard = LATENT // group.world_size
-        torch.manual_seed(1234)  # same weight on every rank
-        weight = torch.randn(LATENT, HIDDEN, dtype=torch.bfloat16)
-        x = torch.randn(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16)
-
-        reference = torch.nn.functional.linear(x, weight).float()
-
-        local_weight = weight.narrow(0, group.rank_in_group * shard,
-                                     shard).to("tpu")
-        x_tpu = x.to("tpu")
-
-        def sharded(inp):
-            partial = torch.nn.functional.linear(inp, local_weight)
-            return group.all_gather(partial, dim=-1)
-
-        # (2) Eager.
-        eager = sharded(x_tpu).cpu().float()
-
-        # (3) Compiled -- the case that actually matters, since these layers
-        # live inside the compiled decode graph.
-        from torch_tpu import compile as tpu_compile
-        compiled_fn = torch.compile(sharded,
-                                    fullgraph=True,
-                                    dynamic=False,
-                                    backend=tpu_compile.TpuBackend())
-        compiled = compiled_fn(x_tpu).cpu().float()
-
-        eager_max = float((eager - reference).abs().max().item())
-        compiled_max = float((compiled - reference).abs().max().item())
-        # Column-parallel does not change any accumulation order, so the only
-        # tolerable difference is zero.
-        if eager_max != 0.0 or compiled_max != 0.0:
-            raise AssertionError(
-                f"rank={rank} eager_max={eager_max} compiled_max={compiled_max}"
-            )
-
-        result = {
-            "rank": rank,
-            "chip": chip_index,
-            "group_ranks": peers,
-            "rank_in_group": int(group.rank_in_group),
-            "eager_max": eager_max,
-            "compiled_max": compiled_max,
-        }
+        result = _measure(rank)
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         traceback.print_exc()
         result = {"rank": rank, "error": repr(exc)}
@@ -234,8 +259,11 @@ def test_intra_chip_gather_matches_the_replicated_projection(tmp_path):
         f"worker failure: returncode={completed.returncode}, errors={errors}\n"
         f"output tail:\n{completed.stdout[-12000:]}")
 
-    assert all(r["eager_max"] == 0.0 for r in results)
-    assert all(r["compiled_max"] == 0.0 for r in results)
+    # The worker already enforces the per-rank bounds; restate the one that
+    # carries the claim so a reader of this test sees it.
+    assert all(r["compiled_max"] == 0.0 for r in results), (
+        "the compiled sharded projection must be bit-exact vs the replicated "
+        f"one: {[(r['rank'], r['compiled_max']) for r in results]}")
     # Four chips, two cores each, and the two cores of a chip must have taken
     # different shards -- if both took shard 0 the gather would still return a
     # full-width tensor, holding the same half twice.
