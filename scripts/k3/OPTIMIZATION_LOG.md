@@ -108,34 +108,44 @@ Average self-time per decode step from 18 profiled model iterations:
 These named operations total about 12.6 ms, but this is a top-operations list,
 not a wall-time decomposition. In particular, it omits many copies and fused
 elementwise kernels and therefore must not be subtracted from TPOT to infer
-host overhead. The paired rank-0 Torch trace puts the baseline's top-level
-model executable at 18.445 ms per profiled decode (profiling overhead makes
-this slightly slower than the 17.93 ms endpoint TPOT). Thus the apparent
-roughly 5.3 ms remainder is predominantly TPU work omitted from this short
-XPlane table plus dependency/idle gaps *inside* the executable, not 5.3 ms of
-input preparation.
+host overhead. The paired rank-0 Torch trace puts the model executable across
+essentially the whole decode interval. Thus the apparent roughly 5.3 ms
+remainder is predominantly TPU work omitted from this short XPlane table, not
+5.3 ms of input preparation.
 
 The later comprehensive enhanced-barrier trace provides the clearest
 reconciliation on the optimized graph:
 
-| Scope | Average per decode (ms) |
+| Scope | Typical per decode (ms) |
 | --- | ---: |
-| Top-level XLA model executable | 16.334 |
-| Categorized leaf XLA ops | 14.947 |
-| In-executable dependency/idle/uncategorized remainder | 1.387 |
-| Canonical endpoint TPOT (unprofiled) | 16.141 |
+| Top-level XLA model executable, median | 15.526 |
+| Union of XLA + async device-lane activity | 15.459 |
+| Interval not represented on those device lanes | about 0.067 |
+| Greedy endpoint TPOT on the nearby temperature control | 15.796 |
 
 The leaf total includes 5.030 ms all-reduce, 2.741 ms copies, 2.082 ms dense
 dot/convolution, 1.981 ms fused elementwise work, 1.516 ms routed GMM, 0.569
 ms sort, 0.374 ms gather, 0.172 ms other reductions, 0.081 ms other custom
 calls, and 0.031 ms all-gather. Those displayed rounded families sum to
-14.577 ms; the additional 0.370 ms in the parser's exhaustive leaf total is
-the long tail of sub-threshold operations. Since the profiled model executable
-itself is already longer than the unprofiled endpoint TPOT, these traces do
-not support a material outside-model/input-preparation gap. Host-side work is
-overlapped or below the approximately 0.2 ms profiling/measurement difference
-at batch 1. The dominant actionable categories remain collectives, copies, and
-dense/fused compute, not attention or input preparation.
+14.577 ms; the additional 0.370 ms in the parser's leaf aggregation is the
+long tail of sub-threshold operations. This self-time-style family aggregation
+is useful for ranking kernels but is not directly subtractable from module
+wall time because async work and the two TPU-core lanes have different
+accounting scopes.
+
+An interval-level audit found that the earlier 16.334 ms arithmetic module
+mean was distorted by profiler-boundary outliers. Sixteen of 18 rank-0 model
+executions are 15.519--15.579 ms, while two are 18.617 and 26.225 ms. The
+module median is 15.526 ms. Across both TPU cores, the union of XLA Ops and
+Async XLA Ops intervals is approximately 15.459 ms on a normal execution,
+leaving only about 0.067 ms that is not represented by a device activity lane.
+The nearby greedy endpoint is approximately 0.27 ms longer than the median
+model module. Separately compiled argmax, striding, and placeholder-substitution
+modules account for about 0.02 ms in the trace; the balance includes
+inter-module/runtime gaps, measurement/config differences between captures,
+and any non-overlapped host work. These traces therefore show no multi-millisecond
+outside-model or input-preparation gap. The dominant actionable categories
+remain collectives, copies, and dense/fused compute.
 
 ## Major issues discovered
 
@@ -904,9 +914,12 @@ the regressed TP2 up path remains disabled.
 30. Captured two enhanced-barrier profile windows in
     `/mnt/scratch/kimi-k3-b1-tep32-hier-ep-b1-down-tp4-kda-fa-enh-barrier-profile`
     and parsed the second rank-0 trace with the same repaired streaming parser
-    used for the control. Over 18 decode executions, the XLA-module lane fell
-    from 17.664 to 16.334 ms and leaf XLA-ops time fell from 15.055 to 14.947
-    ms. All-reduce accounts for essentially the entire leaf-op gain, falling
+    used for the control. The raw arithmetic XLA-module means were 17.664 ms
+    for the control and 16.334 ms for enhanced barriers, but a later interval
+    audit found profiler-boundary outliers in those small samples; these means
+    must not be used as an endpoint wall-time comparison. The stable leaf
+    XLA-op aggregation fell from 15.055 to 14.947 ms. All-reduce accounts for
+    essentially the entire leaf-op gain, falling
     from 5.135 to 5.030 ms (-0.105 ms). Copies (2.741 ms), dense
     dot/convolution (2.082 ms), fused elementwise work (1.981 ms), and routed
     GMM (1.516 ms) are unchanged within 0.002 ms. The profile therefore
