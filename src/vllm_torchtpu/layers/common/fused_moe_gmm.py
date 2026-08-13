@@ -50,6 +50,27 @@ ragged_gather_reduce = _select_ragged_gather_reduce(
 _ONEHOT_AUTO_CAP = 64
 
 
+def _rank16_argsort(keys: jax.Array) -> jax.Array:
+    """Stable ascending argsort for one 16-element route vector.
+
+    Every item computes its exact stable rank with pairwise comparisons, then
+    a one-hot reduction inverts ranks into the usual sorted-indices form. This
+    exposes fixed elementwise/reduction work instead of a general TPU sort.
+    """
+    if keys.shape != (16, ):
+        raise ValueError(f"expected 16 route keys, got {keys.shape}")
+    indices = jnp.arange(16, dtype=jnp.int32)
+    lhs_keys = keys[:, None]
+    rhs_keys = keys[None, :]
+    lhs_indices = indices[:, None]
+    rhs_indices = indices[None, :]
+    comes_before = ((lhs_keys < rhs_keys) |
+                    ((lhs_keys == rhs_keys) & (lhs_indices < rhs_indices)))
+    ranks = comes_before.sum(axis=0, dtype=jnp.int32)
+    return (jax.nn.one_hot(ranks, 16, dtype=jnp.int32) *
+            indices[:, None]).sum(axis=0, dtype=jnp.int32)
+
+
 def resolve_onehot_permute_threshold() -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
@@ -230,7 +251,11 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
+    if (envs.TPU_K3_RANK16_ROUTE_PERMUTE and num_tokens_local == 1
+            and topk == 16):
+        sorted_indices = _rank16_argsort(sort_keys)
+    else:
+        sorted_indices = jnp.argsort(sort_keys)
     # At batch 1 there is no token permutation to reconstruct: every routed
     # row belongs to token zero. Preserve the forward permutation so moe_gmm
     # can sort the 16 route weights alongside the GMM rows and reduce them

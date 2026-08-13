@@ -1588,18 +1588,107 @@ the regressed TP2 up path remains disabled.
     The kernel keeps eight padded token rows to satisfy TPU tiling; only row
     zero is returned. Do not restore the cross-vreg dynamic gather without a
     Mosaic backend change.
+50. Removed the second and final TPU sort family with an exact fixed-size
+    rank network. After the fused Pallas router, every batch-1 routed MoE
+    layer still called a general stable `argsort` on its 16 selected expert
+    IDs to group rows for GMM. The new `_rank16_argsort` computes each item's
+    stable rank from all 16x16 `(expert_id, original_position)` comparisons,
+    then inverts those unique ranks with a one-hot reduction. It is enabled
+    only for the exact batch-1/top-16 path; other token counts and top-k values
+    retain the general `jnp.argsort`. Duplicate-ID tests include the EP-local
+    invalid-route sentinel and match NumPy's stable reference exactly.
+
+    Fresh Ray step `602.54`, cache namespace
+    `/mnt/scratch/kimi-k3-b1-rank16-route-permute`, and
+    `TPU_K3_RANK16_ROUTE_PERMUTE=1` compiled and served on all 32 chips. The
+    profile backbone compiled in 47.56 seconds, its full AOT stage took 125.08
+    seconds, and the runtime backbone compiled in 134.12 seconds. These are
+    startup costs, not steady-state latency.
+
+    The two canonical endpoint runs measured
+    15.27481/15.27821/15.28103 ms and
+    15.27295/15.27367/15.27611 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-rank16-route-permute/kimi-k3_isl1_osl1000_concurrency1_20260813-122123.json`
+    and
+    `results/kimi-k3-b1-rank16-route-permute-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-122503.json`.
+    Their 15.27388 ms pair average is 0.16421 ms faster than the fused-router
+    baseline pair and 0.55972 ms faster than the former 15.83360 ms best. This
+    is accepted, so `TPU_K3_RANK16_ROUTE_PERMUTE=1` is now the K3 launcher
+    default; the generic environment default remains false.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-rank16-route-permute-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2503254.1786624163924546668.pt.trace.json.gz`.
+    Excluding one profiler-boundary outlier, 18 model executables average
+    14.98202 ms (14.98424 ms median, 14.96134--14.99963 ms). A paired parse
+    with the same operation-family rules as milestone 49 gives:
+
+    | XLA category | Mean per decode (ms) |
+    | --- | ---: |
+    | All fusion operations | 6.86487 |
+    | All-reduce | 5.09829 |
+    | Other custom calls | 1.72813 |
+    | Fused K3 router Pallas calls | 0.27816 |
+    | Data formatting | 0.39019 |
+    | Sort | **0.00000** |
+    | All other leaf operations | 0.20665 |
+    | **Primary-lane total** | **14.56628** |
+
+    The trace contains 92 fused router calls and zero sort operations of any
+    shape per decode. The fixed-rank work raised fusion/custom/router time by
+    about 0.063 ms while removing 0.15532 ms of sort and coinciding with about
+    0.071 ms less other/collective work; net primary-lane time fell about
+    0.161 ms. Stable primary-lane occupancy is 14.56567 ms. Its union with
+    asynchronous device work is 14.91656 ms, leaving only 0.06545 ms uncovered
+    inside the 14.98202 ms model executable. As in the previous profile, there
+    is no 1.3 ms in-executable idle or host-input interval.
+
+    Exact launch, benchmark, and profile commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-rank16-route-permute
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_RANK16_ROUTE_PERMUTE=1 scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-rank16-route-permute \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-rank16-route-permute-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-kimi-k3-b1-rank16-route-permute \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-rank16-route-permute-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Caveats: the optimization relies on exactly 16 route entries and stable
+    integer-key ordering. It does not replace the 896-way router selector,
+    whose exact tie semantics remain in the fused Pallas kernel. Dummy weights
+    make output-quality checks meaningless; correctness evidence is stable
+    duplicate/sentinel unit coverage plus successful full-model execution.
+    The profile's single 15.94352 ms executable is profiler-boundary overhead
+    and is excluded from the stable 18-execution statistic. Raw benchmark and
+    profile-response directories remain intentionally untracked. Before the
+    distributed launch, focused CPU tests passed (three tests, 27 deselected).
+    A later repeat while the server was live was interrupted during plugin
+    import because this environment initializes the TPU platform even with
+    `JAX_PLATFORMS=cpu`; it did not reach a test failure, and server health
+    remained HTTP 200. Do not run that import-heavy test again against a live
+    distributed server.
 
 ## Forward plan
 
-1. Preserve the accepted fused Pallas router in the K3 launcher. Its next
-   measured boundary is the 92 downstream `[16]` expert-order sorts
-   (0.15532 ms/decode). Explore an EP-aware router output order or a fused
-   route-to-GMM preparation path that makes that permutation unnecessary;
-   simply adding another standalone top-k/sort boundary is not promising.
+1. Preserve both accepted exact routing optimizations in the K3 launcher. The
+   896-way selector and 16-route GMM permutation now contain zero TPU sort
+   operations; do not reintroduce a general sort into either batch-1 path.
 2. Port the MLJ block-streaming/bitonic-merge idea to Pallas only if it can
    retain the successful score/bias/gather/normalization fusion. The current
-   repeated-argmax kernel itself costs 0.27328 ms/decode, so this is a bounded
-   target, not a 0.45 ms opportunity anymore.
+   repeated-argmax kernel costs about 0.27816 ms/decode, so this is a bounded
+   target, not a 0.45 ms opportunity anymore. Validate exact tie behavior and
+   avoid cross-vreg dynamic gather, which Mosaic rejects.
 3. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
    neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
    against its fresh TP4 control. Do not widen this collective further.
@@ -1632,11 +1721,11 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.43--15.45 ms from the fused exact
-Pallas router, hierarchical routed experts at EP16 x TP2, batch-1 direct
-routed-row combine, independent TP4
+The best verified steady-state result is 15.27295--15.27481 ms from the fused
+exact Pallas router plus the exact rank-16 route permutation, hierarchical
+routed experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
 barriers, dependent-collective layer scheduling, TP4 MLA fused A-projection
 sharding, plus the neutral top-k/top-p sampling specialization. The remaining
-gap to the 15 ms target is 0.43 ms (2.8% of the best repeat). No
+gap to the 15 ms target is 0.274 ms (1.8% of the pair average). No
 speculative decoding is used in any result.

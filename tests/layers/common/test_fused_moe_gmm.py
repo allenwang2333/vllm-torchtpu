@@ -28,6 +28,16 @@ from vllm_torchtpu.layers.common import fused_moe_gmm
 from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
 
 
+@pytest.mark.parametrize("keys", [
+    [9, 2, 7, 2, 5, 1, 8, 3, 3, 0, 6, 4, 7, 5, 1, 9],
+    [56, 4, 56, 1, 56, 3, 2, 56, 0, 56, 5, 56, 56, 6, 56, 56],
+])
+def test_rank16_argsort_matches_stable_reference(keys):
+    actual = fused_moe_gmm._rank16_argsort(jnp.array(keys, dtype=jnp.int32))
+    expected = np.argsort(np.asarray(keys), kind="stable").astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(actual), expected)
+
+
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
 def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)
