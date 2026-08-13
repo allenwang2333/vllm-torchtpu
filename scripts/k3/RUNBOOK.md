@@ -247,14 +247,37 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Ray step `602.67` and vLLM
-server PID 2965616 are currently running at `10.13.232.26:8000` with the
-accepted async merger and bidirectional all-reduce settings. Its cache is
-`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce` and profile directory is
-`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile`. Because the
-launcher source was updated after these workers imported it, start fresh Ray
-workers before the next source or `LIBTPU_INIT_ARGS` experiment. Stop that
-exact server and Ray step only; never cancel allocation job 602.
+Allocation job 602 was intentionally left allocated, but Slurm controller RPC
+became unresponsive after the bidirectional trial: `squeue` and `scontrol`
+time out even though the controller host's TCP port is reachable. Verify job
+602 when the controller recovers; never cancel that allocation. The exact
+vLLM server PID 2965616 was stopped. Because `scancel 602.67` could not reach
+the controller, the four exact `ray start` ancestors for step `602.67` were
+terminated through a Ray task on their own hosts and all four step tasks then
+drained. A process check shows no local `ray start`, `vllm serve`,
+`EngineCore`, or `RayWorkerProc`; there is no live endpoint now. Start a fresh
+four-host Ray step before the next experiment, using the allocation's new head
+address if it changes. Stop only that new step/server afterward.
+
+The failed Slurm status checks and safe recovery sequence are:
+
+```bash
+timeout 12s squeue -j 602 -o '%.18i %.9T %.10M %.6D %R'
+timeout 12s scontrol show job 602
+ps -eo pid,ppid,stat,etime,args | \
+  rg 'ray start|vllm serve|api_server|EngineCore|RayWorkerProc'
+```
+
+Do not repeat a broad process kill. If stale workers recur, resolve the exact
+new step/PIDs first. The bidirectional trial cache remains
+`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce` and its profile directory is
+`/mnt/scratch/kimi-k3-b1-bidirectional-allreduce-profile`.
+
+The router's CPU-interpreter pytest command has a current environment caveat:
+two handoff-time invocations hung during import/initialization despite
+`JAX_PLATFORMS=cpu TPU_ACCELERATOR_TYPE=` and were stopped by their exact PIDs.
+They produced no test result. Do not launch parallel retries; milestone 51
+retains the prior six-case pass and describes the measured full-model evidence.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -342,6 +365,13 @@ but duration falls from 5.03057 to 4.94817 ms; the 92 `bf16[3584]` TP4
 reductions alone improve by 0.09891 ms. The launcher now enables
 `xla_tpu_decompose_all_reduce_bidirectional_communication`; set it explicitly
 to `false` in `LIBTPU_INIT_ARGS` only for a control.
+
+The next collective idea was statically closed without a full-model launch.
+Installed libtpu's inference-short all-reduce emitter requires exactly eight
+logical TPU devices and an eight-device collective; this v7x-32 graph has 32
+logical devices and replica groups of 32, four, or two. Leave
+`xla_tpu_inference_short_all_reduce_max_tensor_chunks=0`. Milestone 59 records
+the `readelf`, `objdump`, and flagfile commands and the upgrade/address caveat.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of

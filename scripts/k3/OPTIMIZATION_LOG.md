@@ -1758,7 +1758,15 @@ the regressed TP2 up path remains disabled.
     sample. TPU lacks the reference kernel's cheap packed-key bitonic merge;
     repeated local reductions plus a second 112-way selection add work. Do
     not promote this flag without a new primitive or a direct trace showing
-    the router family itself below 0.27816 ms.
+    the router family itself below 0.27816 ms. A later handoff-time repeat of
+    the documented CPU-only pytest command did not emit a test result: two
+    pytest instances remained in import/initialization for more than a minute
+    at roughly 1 GB RSS each even though no distributed server was live. Only
+    those exact PIDs were terminated. This is an environment/plugin hang, not
+    a failed assertion, and does not replace the earlier six-case pass or the
+    successful full-model executions. Do not start parallel repeats; first
+    diagnose JAX plugin discovery in a standalone process if another unit-test
+    rerun is needed.
 52. Reconstructed the exact routed-GMM breakdown and swept the current
     hierarchical 56-group geometry. The accepted rank-16 trace records 1,729
     timed calls for each of router, GMM1, and GMM2. This is not 91 calls across
@@ -2076,6 +2084,41 @@ the regressed TP2 up path remains disabled.
     variadic tuple family. No safety warning was emitted by this libtpu build.
     Accept the flag as a launcher default, while preserving explicit `=false`
     for controls.
+59. Audited the installed libtpu implementation before spending a full-model
+    compile on `xla_tpu_inference_short_all_reduce_max_tensor_chunks`. The
+    flag exists and defaults to zero (disabled), but this workload cannot
+    select its emitter. The installed binary is
+    `/opt/tpu-info-venv/lib/python3.12/site-packages/libtpu/libtpu.so`; its
+    retained local symbol
+    `RingSumEmitter::ShouldUseInferenceShortLatencyEmitter` first checks
+    `inference_short_ring_sum_emitter_utils::IsSupported`, the configured
+    tensor-size limit in target chunks, and exact chunk divisibility. Its
+    successful return path then requires both the collective's relevant
+    device-count argument and `TpuTopology::LogicalDeviceCount(...)` to equal
+    exactly eight. The emitter's retained action builders likewise name only
+    `2x2x2` and `4x2` eight-device layouts.
+
+    The K3 v7x-32 executable has 32 logical TPU devices and its measured
+    all-reduce replica groups have sizes 32, four, or two, not eight. Raising
+    the chunk limit therefore cannot make any of the current 348 all-reduces
+    eligible. A full-model trial would only pay another cold compile and could
+    not exercise the candidate path, so this is a static rejection rather
+    than an unmeasured performance claim. The audit commands are:
+
+    ```bash
+    LIBTPU=/opt/tpu-info-venv/lib/python3.12/site-packages/libtpu/libtpu.so
+    readelf -Ws "$LIBTPU" | c++filt | \
+      rg 'FUNC.*RingSumEmitter::ShouldUseInferenceShortLatencyEmitter'
+    objdump -d --demangle --start-address=0x10502750 \
+      --stop-address=0x10502a50 "$LIBTPU"
+    rg -n 'xla_tpu_inference_short_all_reduce' \
+      /mnt/scratch/sc-probe-s1/module_0045*.{flagfile,tpu_comp_env.txt}
+    ```
+
+    Caveat: the function address is specific to this installed libtpu build;
+    rediscover it with `readelf` after an upgrade. Revisit the flag only on an
+    eight-device slice/group or after a libtpu build broadens the selector.
+    No source or launcher setting changed for this rejected idea.
 
 ## Forward plan
 
@@ -2087,6 +2130,9 @@ the regressed TP2 up path remains disabled.
    but its router family costs 0.30741 ms/decode versus 0.27816 ms for the
    accepted full-width kernel. Revisit only with a TPU-native bitonic/merge
    primitive; avoid cross-vreg dynamic gather, which Mosaic rejects.
+   The Inkling iterative selector and MLJ streaming/block-merge references
+   have both already been ported and measured; neither remains an unexplored
+   top-k suggestion.
 3. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
    neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
    against its fresh TP4 control. Do not widen this collective further.
@@ -2105,7 +2151,9 @@ the regressed TP2 up path remains disabled.
    safety warning. TensorCore compute/collective overlap is also rejected
    because it adds 0.05270 ms to primary collective duration. Further compiler
    work must target a different measured mechanism and retain explicit control
-   runs.
+   runs. Do not try the installed inference-short all-reduce chunk flag on
+   v7x-32: milestone 59 proves its emitter is gated to exactly eight logical
+   devices and an eight-device collective.
 6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
