@@ -3509,6 +3509,9 @@ class TPUModelRunner(GPUModelRunner):
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
                         self._build_padded_sampling_params(
                             cur_start_idx, cur_end_idx, logits))
+                    apply_sampling_filters = (
+                        self._requires_top_k_top_p_filter(
+                            cur_start_idx, cur_end_idx))
                     u = torch.rand_like(logits, generator=sampling_generator)
                     selected_token_ids = self.sample_from_logits_func(
                         logits,
@@ -3516,7 +3519,8 @@ class TPUModelRunner(GPUModelRunner):
                         u,
                         top_k_tpu,
                         top_p_tpu,
-                        all_greedy=all_greedy)
+                        all_greedy=all_greedy,
+                        apply_sampling_filters=apply_sampling_filters)
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -4110,14 +4114,24 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1),
                                          dtype=torch.float32,
                                          device=self.device)
-                for all_greedy in [False, True]:
+                for apply_sampling_filters in [False, True]:
                     out = self.sample_from_logits_func(dummy_logits,
                                                        dummy_temperatures,
                                                        dummy_u,
                                                        dummy_top_k,
                                                        dummy_top_p,
-                                                       all_greedy=all_greedy)
+                                                       all_greedy=False,
+                                                       apply_sampling_filters=(
+                                                           apply_sampling_filters
+                                                       ))
                     sync.synchronize(out, wait=True)
+                out = self.sample_from_logits_func(dummy_logits,
+                                                   dummy_temperatures,
+                                                   dummy_u,
+                                                   dummy_top_k,
+                                                   dummy_top_p,
+                                                   all_greedy=True)
+                sync.synchronize(out, wait=True)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_gather_logprobs(self) -> None:
@@ -5259,6 +5273,18 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
+    def _requires_top_k_top_p_filter(self, cur_start_idx: int,
+                                     cur_end_idx: int) -> bool:
+        """Whether any active request has a non-neutral top-k/top-p filter."""
+        active_top_k = self.input_batch.top_k_cpu_tensor[
+            cur_start_idx:cur_end_idx]
+        active_top_p = self.input_batch.top_p_cpu_tensor[
+            cur_start_idx:cur_end_idx]
+        has_top_k = torch.any((active_top_k > 0)
+                              & (active_top_k < self.vocab_size)).item()
+        has_top_p = torch.any(active_top_p < 1.0).item()
+        return bool(has_top_k or has_top_p)
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
@@ -5322,7 +5348,8 @@ class TPUModelRunner(GPUModelRunner):
                            u: torch.Tensor,
                            top_k: torch.Tensor,
                            top_p: torch.Tensor,
-                           all_greedy: bool = False) -> torch.Tensor:
+                           all_greedy: bool = False,
+                           apply_sampling_filters: bool = True) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
@@ -5331,7 +5358,8 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        masked_logits = (apply_top_k_top_p(scaled_logits, top_k, top_p)
+                         if apply_sampling_filters else scaled_logits)
         u_clamped = torch.clamp(u,
                                 min=torch.finfo(u.dtype).tiny,
                                 max=1.0 - torch.finfo(u.dtype).eps)

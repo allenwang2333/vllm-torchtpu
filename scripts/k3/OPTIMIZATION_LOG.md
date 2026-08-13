@@ -105,9 +105,37 @@ Average self-time per decode step from 18 profiled model iterations:
 | Reduce-sum | 0.081 |
 | MLA | 0.066 |
 
-These named operations total about 12.6 ms. The remaining TPOT is smaller
-operations, dependency/idle gaps, and launch/runtime overhead. The dominant
-actionable categories are collectives and dense matmuls, not attention.
+These named operations total about 12.6 ms, but this is a top-operations list,
+not a wall-time decomposition. In particular, it omits many copies and fused
+elementwise kernels and therefore must not be subtracted from TPOT to infer
+host overhead. The paired rank-0 Torch trace puts the baseline's top-level
+model executable at 18.445 ms per profiled decode (profiling overhead makes
+this slightly slower than the 17.93 ms endpoint TPOT). Thus the apparent
+roughly 5.3 ms remainder is predominantly TPU work omitted from this short
+XPlane table plus dependency/idle gaps *inside* the executable, not 5.3 ms of
+input preparation.
+
+The later comprehensive enhanced-barrier trace provides the clearest
+reconciliation on the optimized graph:
+
+| Scope | Average per decode (ms) |
+| --- | ---: |
+| Top-level XLA model executable | 16.334 |
+| Categorized leaf XLA ops | 14.947 |
+| In-executable dependency/idle/uncategorized remainder | 1.387 |
+| Canonical endpoint TPOT (unprofiled) | 16.141 |
+
+The leaf total includes 5.030 ms all-reduce, 2.741 ms copies, 2.082 ms dense
+dot/convolution, 1.981 ms fused elementwise work, 1.516 ms routed GMM, 0.569
+ms sort, 0.374 ms gather, 0.172 ms other reductions, 0.081 ms other custom
+calls, and 0.031 ms all-gather. Those displayed rounded families sum to
+14.577 ms; the additional 0.370 ms in the parser's exhaustive leaf total is
+the long tail of sub-threshold operations. Since the profiled model executable
+itself is already longer than the unprofiled endpoint TPOT, these traces do
+not support a material outside-model/input-preparation gap. Host-side work is
+overlapped or below the approximately 0.2 ms profiling/measurement difference
+at batch 1. The dominant actionable categories remain collectives, copies, and
+dense/fused compute, not attention or input preparation.
 
 ## Major issues discovered
 
@@ -986,6 +1014,42 @@ the regressed TP2 up path remains disabled.
       1024, and 8192. They provide useful harness structure but no batch-1
       evidence. The installed collective-matmul V2 lowering was already
       tested end to end here and rejected at 16.27 ms mean.
+36. Resolved the benchmark/profile sampling mismatch. The canonical
+    `bench_isl1_osl1k.sh` request leaves temperature unset, which the server
+    resolves to temperature-1 sampling, while `curl_isl1_osl1k.sh` had
+    explicitly requested greedy decoding. A paired temperature-0 run on the
+    same alternate-memory server measured 15.79632 ms mean, 15.79296 ms
+    median, 15.80356 ms p99, and 63.24 output tokens/s:
+    `results/kimi-k3-b1-tep32-hier-ep-b1-down-tp4-kda-fa-enh-barrier-altmem0-greedy/kimi-k3_isl1_osl1000_concurrency1_20260813-061540.json`.
+    That is 0.36008 ms faster than the paired sampled run. Sampled and greedy
+    rank-0 traces localized 0.341 ms of the delta to the compiled sampler:
+    0.35150 versus 0.01036 ms per token. The backbone was unchanged. The
+    profiling helper now accepts `TEMPERATURE` while preserving zero as its
+    default, and `INCLUDE_SEED=0` supports the server's working unseeded
+    non-greedy path. Seeded non-greedy raw completion requests returned HTTP
+    500 with an empty `InternalServerError`; unseeded requests and the
+    canonical benchmark succeeded. This API correctness issue is separate
+    from TPOT optimization.
+37. Profiled the temperature-1 sampler and found the principal waste:
+    `apply_top_k_top_p` unconditionally materialized both binary-search
+    filters. Its runtime `where` guards did not prevent 32 top-k and 33 top-p
+    full-vocabulary reductions even when every request used neutral defaults
+    (`top_k=0`, `top_p=1`). Added a compiled specialization selected from the
+    CPU-resident active request parameters that skips both filters only when
+    all are neutral. The filtered and unfiltered non-greedy variants plus the
+    greedy variant are precompiled; non-neutral top-k/top-p semantics are
+    unchanged. Four pure decision cases were added to
+    `tests/runner/test_tpu_runner.py`. The focused pytest was interrupted
+    before collection because importing the TPU plugin attempted runtime
+    initialization while the distributed allocation was active; static
+    compile, shell, and diff checks passed, and all 32 fresh hardware workers
+    constructed and compiled both sampler specializations. The canonical
+    temperature-1 result improved to 15.98475 ms mean, 15.98058 ms median,
+    16.00039 ms p99, 62.51 output tokens/s, and 28.20 ms mean TTFT:
+    `results/kimi-k3-b1-sampling-neutral-fastpath/kimi-k3_isl1_osl1000_concurrency1_20260813-065157.json`.
+    This improves the prior 16.14113 ms best by 0.15638 ms/token. The remaining
+    roughly 0.18 ms sampled-versus-greedy delta is the vocabulary-sized random
+    generation, Gumbel transforms, and final reduction rather than input prep.
 
 ## Forward plan
 
@@ -1012,18 +1076,19 @@ the regressed TP2 up path remains disabled.
    reductions are rejected.
 6. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
-7. Resolve the canonical benchmark request's effective sampling mode from the
-   server-side request metadata. If it is non-greedy, profile the external
-   vocabulary-sized `torch.rand_like(logits)` dispatch and test folding random
-   generation into `sample_from_logits`; the JAX-native repository's sampling
-   work identifies launch overhead as material, but its exact patches are
-   already present or structurally inapplicable in this Torch runner.
+7. Optimize the remaining approximately 0.18 ms sampled-versus-greedy gap.
+   Compare the current full-vocabulary uniform/Gumbel-max implementation with
+   an exact exponential-race formulation or a one-scalar inverse-CDF sampler,
+   preserving deterministic-generator and mixed sampling-parameter semantics.
+   Profile before adopting either path; the neutral top-k/top-p fast path has
+   already removed the binary-search reductions.
 
 ## Current best and gap
 
-The best verified steady-state result is 16.14 ms from hierarchical routed
+The best verified steady-state result is 15.98 ms from hierarchical routed
 experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers. The remaining gap to the 15 ms target is 1.14 ms (7.1% of the
+barriers, plus the neutral top-k/top-p sampling specialization. The remaining
+gap to the 15 ms target is 0.98 ms (6.2% of the
 current result). No
 speculative decoding is used in any result.

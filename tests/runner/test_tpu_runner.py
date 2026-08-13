@@ -63,6 +63,30 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
         assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 
 
+@pytest.mark.parametrize(
+    ("top_k", "top_p", "expected"),
+    [
+        ([0, 0], [1.0, 1.0], False),
+        ([200, 0], [1.0, 1.0], False),
+        ([5, 0], [1.0, 1.0], True),
+        ([0, 0], [0.95, 1.0], True),
+    ],
+)
+def test_requires_top_k_top_p_filter(top_k, top_p, expected):
+    runner = SimpleNamespace(
+        vocab_size=200,
+        input_batch=SimpleNamespace(
+            top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor(top_p, dtype=torch.float32),
+        ),
+    )
+
+    actual = TPUModelRunner._requires_top_k_top_p_filter(
+        runner, 0, len(top_k))
+
+    assert actual is expected
+
+
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the
