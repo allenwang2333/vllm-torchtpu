@@ -13,6 +13,8 @@
 # limitations under the License.
 
 x-unit-test-defaults: &unit_test_defaults
+  env:
+    TPU_PARALLEL_PRECOMPILE: "1"
   commands:
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 

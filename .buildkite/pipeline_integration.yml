@@ -23,6 +23,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          TPU_PARALLEL_PRECOMPILE: "1"
           RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh"
@@ -50,6 +51,7 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
+          TPU_PARALLEL_PRECOMPILE: "1"
           RUN_ROOT: "/perf_eval_results/qwen35_apc_ci"
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"

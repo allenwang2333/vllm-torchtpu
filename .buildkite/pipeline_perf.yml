@@ -23,6 +23,7 @@ steps:
         parallelism: 3
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -44,6 +45,7 @@ steps:
           queue: "tpu_v7x_2_queue"
         env:
           BENCHMARK_WARMUP_RUNS: "1"
+          TPU_PARALLEL_PRECOMPILE: "1"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-0.6b-tp1 --run-lm-eval --results-dir /perf_eval_results"
         artifact_paths:
@@ -58,6 +60,7 @@ steps:
         parallelism: 3
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -77,6 +80,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           # One discarded warmup pass per cell buffers scheduling-regime noise
           # (golden cmds used num-warmups=0; the measured invocation is
@@ -97,6 +101,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -115,6 +120,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -129,6 +135,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -150,6 +157,7 @@ steps:
           queue: "tpu_v7x_16_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
@@ -164,6 +172,7 @@ steps:
           queue: "tpu_v7x_8_queue"
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_PARALLEL_PRECOMPILE: "1"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:

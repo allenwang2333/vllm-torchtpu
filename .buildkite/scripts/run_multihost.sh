@@ -155,6 +155,7 @@ CONTAINER_ENV=(
   -e BUILDKITE_BRANCH="${BUILDKITE_BRANCH:-}"
   -e BUILDKITE_PULL_REQUEST="${BUILDKITE_PULL_REQUEST:-}"
   ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"}
+  ${TPU_PARALLEL_PRECOMPILE:+-e TPU_PARALLEL_PRECOMPILE="${TPU_PARALLEL_PRECOMPILE}"}
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"}
   ${MODEL_URI:+-e MODEL_URI="${MODEL_URI}"}
   -v "${PERSIST_ROOT}/perf_eval_results:/perf_eval_results"
@@ -220,7 +221,7 @@ for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
   (
     for _attempt in 1 2 3; do
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1 ${TPU_PARALLEL_PRECOMPILE:+-e TPU_PARALLEL_PRECOMPILE='${TPU_PARALLEL_PRECOMPILE}'}" \
         && break
       echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
       sleep 15
