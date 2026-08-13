@@ -2354,7 +2354,9 @@ the regressed TP2 up path remains disabled.
     calls/decode. CompositeExplicitAutograd reduces the visible child dispatch
     count but does not shorten the critical gap; its own call is larger than
     that gap and is overlapped with device execution. Reject it and leave the
-    default compiler unchanged.
+    default compiler unchanged. The exact audit/foreach diagnostic and tests
+    are archived in commit `75922a6f`; commit `63bae361` removes them from the
+    branch tip while retaining this durable record.
 
 ## Forward plan
 

@@ -528,9 +528,10 @@ Caveats for any successor:
 - A source or actor-environment change requires fresh Ray workers. Cancel only
   the exact Ray/server Slurm step, never the parent allocation.
 
-The shape audit that resolved what those mutations are is default-off source
-on the current experiment branch. Its focused check and exact successful
-launch were:
+The shape audit that resolved what those mutations are is archived as
+default-off source in commit `75922a6f`; the clean branch tip removes it in
+commit `63bae361`. Reproduce from a detached worktree at the archive commit.
+Its focused check and exact successful launch were:
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest -q \
@@ -574,8 +575,9 @@ attempt did so and loaded a zero-artifact AOT entry from
 `TypeError: 'NoneType' object is not callable`. A fresh XLA path does not
 override an explicitly stale `VLLM_CACHE_ROOT`.
 
-The rejected semantics-preserving batching screen uses the same launch with a
-new `K3_RUN_NAME=kimi-k3-b1-foreach-runtime-copies`, audit zero, and:
+The rejected semantics-preserving batching screen is in the same archive
+commit and uses the same launch with a new
+`K3_RUN_NAME=kimi-k3-b1-foreach-runtime-copies`, audit zero, and:
 
 ```bash
 export TPU_K3_RUNTIME_STATE_AUDIT=0
