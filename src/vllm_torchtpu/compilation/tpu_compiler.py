@@ -12,8 +12,6 @@ import importlib.util
 import json
 import os
 import pickle
-import re
-from contextlib import contextmanager
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Callable
@@ -61,96 +59,6 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
     "TORCH_TPU_INTERNAL_XLA_OPTIONS",
     "XLA_FLAGS",
 )
-
-@contextmanager
-def _runtime_state_mutation_codegen():
-    """Instrument or batch AOT's lazily generated mutation epilogue."""
-    audit = os.getenv("TPU_K3_RUNTIME_STATE_AUDIT", "0") == "1"
-    batch_copies = os.getenv("TPU_K3_BATCH_RUNTIME_STATE_COPIES", "0") == "1"
-    if not audit and not batch_copies:
-        yield
-        return
-
-    from torch._functorch._aot_autograd import subclass_codegen
-
-    original_compile = subclass_codegen._compile_and_exec_source
-
-    def compile_with_mutation_audit(source, globals_dict, fn_name,
-                                    artifact_name, wrapped_fn=None):
-        if artifact_name == "mutation_epilogue":
-            pairs = list(dict.fromkeys(
-                (int(orig_idx), int(updated_idx))
-                for orig_idx, updated_idx in re.findall(
-                    r"orig_inputs\[(\d+)\].*?copy_\(updated_inputs\[(\d+)\]\)",
-                    source)))
-            if audit and pairs:
-                logged = False
-
-                def log_shapes(orig_inputs, updated_inputs):
-                    nonlocal logged
-                    if logged:
-                        return
-                    logged = True
-                    records = [{
-                        "orig_idx": orig_idx,
-                        "updated_idx": updated_idx,
-                        "shape": tuple(orig_inputs[orig_idx].shape),
-                        "dtype": str(orig_inputs[orig_idx].dtype),
-                        "numel": orig_inputs[orig_idx].numel(),
-                    } for orig_idx, updated_idx in pairs]
-                    logger.info("[TpuCompilerAdaptor] K3 mutation audit: %s",
-                                json.dumps(records))
-
-                globals_dict["_k3_log_mutation_shapes"] = log_shapes
-                source = source.replace(
-                    "def _apply_mutations(orig_inputs, updated_inputs):",
-                    "def _apply_mutations(orig_inputs, updated_inputs):\n"
-                    "    _k3_log_mutation_shapes(orig_inputs, updated_inputs)")
-            if batch_copies and pairs:
-                copy_count = source.count(".copy_(")
-                if copy_count != 2 * len(pairs):
-                    raise RuntimeError(
-                        "K3 runtime-state batching expected exactly two "
-                        f"leaf copy branches per mutation, got {copy_count} "
-                        f"copy sites for {len(pairs)} mutations")
-                destinations = ", ".join(
-                    f"orig_inputs[{orig_idx}]" for orig_idx, _ in pairs)
-                sources = ", ".join(
-                    f"updated_inputs[{updated_idx}]" for _, updated_idx in pairs)
-                source = (
-                    "def _apply_mutations(orig_inputs, updated_inputs):\n"
-                    f"    torch._foreach_copy_([{destinations}], "
-                    f"[{sources}])")
-                logger.info(
-                    "[TpuCompilerAdaptor] Batching %d runtime state "
-                    "mutation copies with aten::_foreach_copy_", len(pairs))
-        return original_compile(source, globals_dict, fn_name, artifact_name,
-                                wrapped_fn)
-
-    subclass_codegen._compile_and_exec_source = compile_with_mutation_audit
-    try:
-        yield
-    finally:
-        subclass_codegen._compile_and_exec_source = original_compile
-
-
-def _audit_runtime_state_on_first_call(compiled_fn: Callable[..., Any]):
-    if (os.getenv("TPU_K3_RUNTIME_STATE_AUDIT", "0") != "1"
-            and os.getenv("TPU_K3_BATCH_RUNTIME_STATE_COPIES", "0") != "1"):
-        return compiled_fn
-
-    armed = True
-
-    def call_with_mutation_audit(*args, **kwargs):
-        nonlocal armed
-        if armed:
-            with _runtime_state_mutation_codegen():
-                result = compiled_fn(*args, **kwargs)
-            armed = False
-            return result
-        return compiled_fn(*args, **kwargs)
-
-    return call_with_mutation_audit
 
 _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
@@ -402,8 +310,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             fake_mode.shape_env = ShapeEnv()
         tracing_ctx = (torch._guards.TracingContext(fake_mode)
                        if fake_mode is not None else None)
-        with torch._guards.tracing(tracing_ctx), \
-                _runtime_state_mutation_codegen():
+        with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         if was_wrapped:
@@ -416,8 +323,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
-
-        compiled_fn = _audit_runtime_state_on_first_call(compiled_fn)
 
         # Save the per-shape PjRt executable to disk.
         # We pickle the inner _TorchTpuCompiledExecutable (which has
@@ -484,8 +389,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # `aot_autograd` calls detect_fake_mode() which asserts all
         # FakeTensorModes match, causing a crash.
         # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None), \
-                _runtime_state_mutation_codegen():
+        with torch._guards.tracing(None):
             compiled_fn = aot_autograd(
                 fw_compiler=_cached_compiler,
                 keep_inference_input_mutations=False,
@@ -501,7 +405,5 @@ class TpuCompilerAdaptor(CompilerInterface):
                 return result
 
             compiled_fn = unwrap_fn
-
-        compiled_fn = _audit_runtime_state_on_first_call(compiled_fn)
 
         return compiled_fn
