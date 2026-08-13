@@ -63,11 +63,6 @@ export TPU_K3_FUSE_ATTN_RES_DOT="${TPU_K3_FUSE_ATTN_RES_DOT:-0}"
 export TPU_K3_FUSE_LM_HEAD_SAMPLER="${TPU_K3_FUSE_LM_HEAD_SAMPLER:-0}"
 export TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER="${TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER:-0}"
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
-# Reduce launch synchronization overhead on this collective-heavy decode
-# graph. Preserve an explicit caller choice (including `=false`).
-if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_use_enhanced_launch_barrier="* ]]; then
-  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_use_enhanced_launch_barrier=true"
-fi
 # Let XLA schedule serial collective dependencies as a layer-level critical
 # path. This is a small but repeatable batch-1 win on K3's latent-MoE graph.
 # Preserve an explicit caller choice for isolation/control experiments.
@@ -85,6 +80,12 @@ fi
 # Preserve an explicit caller choice for isolation/control experiments.
 if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_decompose_all_reduce_bidirectional_communication="* ]]; then
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_decompose_all_reduce_bidirectional_communication=true"
+fi
+# Let the layer scheduler overlap more than one compute region while hiding
+# communication. A matched fresh-Ray control localized a 74.5 us/token win to
+# the K3 model executable. Preserve an explicit caller choice for controls.
+if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler="* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true"
 fi
 
 mkdir -p "${PROF_DIR}"

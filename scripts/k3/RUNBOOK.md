@@ -23,10 +23,10 @@ The launcher defaults contain the current winning model configuration:
 - TP2 KDA `f_a` projection;
 - TP4 MLA fused query/KV A projection;
 - neutral top-k/top-p sampler specialization;
-- enhanced TPU launch barriers;
 - XLA dependent-collective layer scheduling;
 - XLA asynchronous collective merging; and
-- bidirectional all-reduce decomposition.
+- bidirectional all-reduce decomposition; and
+- multi-compute overlap in the XLA layer scheduler.
 
 Do not enable opt-in experimental flags just because their implementation is
 present. Many are retained for reproducibility after measuring neutral or
@@ -71,6 +71,7 @@ can silently reuse actors with old imports or an old libtpu runtime.
 
 ```bash
 export K3_REPO_DIR="$PWD"
+export LIBTPU_INIT_ARGS="--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true"
 srun --jobid="$K3_JOB_ID" --overlap -N4 -n4 --ntasks-per-node=1 \
   --unbuffered --export=ALL bash -lc '
     export PATH="$K3_REPO_DIR/.venv/bin:$PATH"
@@ -117,7 +118,6 @@ export VLLM_CONFIG_ROOT="$VLLM_XLA_CACHE_PATH/vllm-config"
 export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${USER}_${K3_RUN_NAME}"
 export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$VLLM_XLA_CACHE_PATH/torch_tpu_tier3"
 export PROF_DIR="/mnt/scratch/${K3_RUN_NAME}-profile"
-export LIBTPU_INIT_ARGS="--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false"
 scripts/k3/launch_kimi_k3_tp32_ep.sh
 ```
 
@@ -147,11 +147,22 @@ of TP4 MLA A sharding with latent-up disabled. A model-only environment
 override needs a new vLLM server and unique caches, but not a new Ray step when
 neither source nor `LIBTPU_INIT_ARGS` changed.
 
-The launcher appends the winning enhanced-barrier, dependent-collective
-scheduler, async-collective-merger, and bidirectional-all-reduce flags unless
-the caller explicitly supplies a setting with `=true` or `=false`. For an
-isolated compiler experiment, append only that experiment's flag to
-`LIBTPU_INIT_ARGS`; do not bundle unrelated tuning flags.
+The launcher appends the winning dependent-collective scheduler,
+async-collective-merger, bidirectional-all-reduce, and multi-compute-overlap
+flags unless the caller explicitly supplies a setting with `=true` or
+`=false`. This protects standalone launches, but it is **not sufficient for a
+persistent Ray cluster**: Ray actors inherit libtpu configuration when their
+Ray nodes start. Put the complete intended `LIBTPU_INIT_ARGS` in the environment
+of the Ray `srun`, as shown above, then use the same value for the server. An
+initial milestone-71 candidate that set only the new flag before Ray startup
+was discarded before benchmarking because actor command lines lacked the
+other accepted flags.
+
+Do not add `--xla_tpu_use_enhanced_launch_barrier=true`. This TorchTPU build
+rewrites it to `false` in distributed actors to avoid hangs, so it was never
+part of the effective accepted executable despite older notes describing it
+as enabled. For an isolated compiler control, copy the complete accepted flag
+string above and change only the one controlled setting.
 
 Wait for health before benchmarking:
 
@@ -205,6 +216,13 @@ NUM_CONCURRENT=1 OUTPUT_DIR="$PWD/results/${K3_RUN_NAME}-gsm8k" \
   scripts/k3/eval_gsm8k.sh "$K3_HEAD_IP"
 ```
 
+The optimization launcher defaults to `LOAD_FORMAT=dummy`. A GSM8K run against
+that server validates only request plumbing and stability; its accuracy is
+meaningless. Model-quality validation requires a separate real-checkpoint
+launch with the appropriate load format and available checkpoint files. Do not
+mix that quality run into the dummy-weight TPOT control series, and do not
+expect its compile/load timing to match the canonical performance setup.
+
 ### Safe shutdown and experiment boundaries
 
 Stop the vLLM PID with SIGINT, wait for it to exit, then cancel only the exact
@@ -253,13 +271,10 @@ when they do not initialize the TPU plugin.
 
 Allocation 602 expired at its 24-hour limit. Replacement allocation 664 is
 running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
-IP `10.13.232.26`. A fresh four-host Ray cluster is live in overlapping step
-`664.30`, using `/tmp/ray/session_2026-08-13_20-57-56_866337_3828332`; all
-32 TPU resources are free. No vLLM server is currently running. These workers
-imported the milestone-70 source tree and are suitable for another experiment
-only if no source or `LIBTPU_INIT_ARGS` value changes. Otherwise cancel exactly
-`664.30`, start fresh workers, and verify 32/32 TPUs. Preserve parent allocation
-664.
+IP `10.13.232.26`. The milestone-71 server and exact Ray step `664.33` were
+cleanly stopped after profiling. No Ray step or vLLM server is currently
+running; all 32 TPUs are free. Start fresh workers with the complete accepted
+flag string above, verify 32/32 resources, and preserve parent allocation 664.
 
 Current status checks are:
 
@@ -382,7 +397,7 @@ patch remains present but defaults off. Its prerequisite collective-layout
 screen can be reproduced with:
 
 ```bash
-export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true'
+export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true'
 srun --jobid="$K3_JOB_ID" --overlap -N4 -n4 --ntasks-per-node=1 \
   --unbuffered --export=ALL bash -lc '
     cd /mnt/lustre/homes-x86/woosuk/workspace/vllm-torchtpu-4
@@ -654,10 +669,10 @@ scripts/k3/launch_kimi_k3_tp32_ep.sh
 ```
 
 The launcher appends the accepted dependent-collective scheduler, async
-collective merger, bidirectional all-reduce, and enhanced-barrier flags.
-Inspect the startup argv: on allocation 664 the distributed safety layer
-rewrote `xla_tpu_use_enhanced_launch_barrier=true` to false. Do not compare
-this run to an older allocation at microsecond resolution. For the matched
+collective merger, bidirectional all-reduce, and multi-compute-overlap flags.
+Those flags affect persistent actors only when they were also supplied before
+Ray startup. Do not compare this run to an older allocation at microsecond
+resolution. For the matched
 control, stop only the vLLM server, retain the Ray allocation, set
 `K3_RUN_NAME=kimi-k3-b1-fused-control-v2` and
 `TPU_K3_FUSE_LM_HEAD_SAMPLER=0`, recompute the three vLLM cache variables and

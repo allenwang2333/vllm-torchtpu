@@ -61,7 +61,11 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
 export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${KIMI_K3_TIER2_CACHE_NAMESPACE:-${RUN_USER}_kimi_k3_${SLURM_JOB_ID}}"
 export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="${TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/torch_tpu_tier3}"
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false}"
+# Ray actors initialize libtpu from the Ray-node environment. Supplying these
+# flags only to the later vLLM launcher is too late for persistent actors.
+# Keep this default synchronized with the accepted guards in the launcher;
+# an explicit caller value is preserved for controlled experiments.
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true}"
 
 mkdir -p "${LOG_DIR}"
 srun --overlap -N4 -n4 --ntasks-per-node=1 mkdir -p \

@@ -20,6 +20,7 @@ repository workflow (`../download.sh` plus the local project install).
 Start a fresh four-node Ray cluster inside the active Slurm allocation:
 
 ```bash
+export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true'
 srun --jobid="$SLURM_JOB_ID" --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
 set -e
 RAY=/absolute/path/to/vllm-torchtpu-4/.venv/bin/ray
@@ -113,7 +114,7 @@ essentially the whole decode interval. Thus the apparent roughly 5.3 ms
 remainder is predominantly TPU work omitted from this short XPlane table, not
 5.3 ms of input preparation.
 
-The later comprehensive enhanced-barrier trace provides the clearest
+The later comprehensive trace historically labeled `enhanced-barrier` provides the clearest
 reconciliation on the optimized graph:
 
 | Scope | Typical per decode (ms) |
@@ -927,6 +928,11 @@ the regressed TP2 up path remains disabled.
     `results/kimi-k3-b1-tep32-hier-ep-b1-down-tp4-kda-fa-enh-barrier-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-044145.json`.
     The launcher now appends the flag by default while preserving an explicit
     caller-supplied true or false value.
+
+    Correction from milestone 71: distributed TorchTPU rewrote this flag to
+    `false` in the worker executable, as it did in later sessions. This was not
+    a valid flag-on/flag-off experiment; the small endpoint change was session
+    variance. The launcher no longer appends the flag.
 30. Captured two enhanced-barrier profile windows in
     `/mnt/scratch/kimi-k3-b1-tep32-hier-ep-b1-down-tp4-kda-fa-enh-barrier-profile`
     and parsed the second rank-0 trace with the same repaired streaming parser
@@ -941,6 +947,12 @@ the regressed TP2 up path remains disabled.
     GMM (1.516 ms) are unchanged within 0.002 ms. The profile therefore
     validates the intended mechanism rather than attributing the endpoint
     result to compute noise.
+
+    Correction from milestone 71: because the allegedly enhanced workers had
+    the barrier forced off, this profile comparison cannot validate enhanced
+    barriers. The trace remains useful for operation and occupancy accounting,
+    but its between-session collective delta must not be attributed to this
+    flag.
 31. Tested an equivalent-math KDA scheduling rewrite behind
     `TPU_K3_OVERLAP_KDA_F_A_REDUCE`: after producing the partial TP2 `f_a`,
     place the independent output-gate projection before consuming the
@@ -2557,6 +2569,124 @@ the regressed TP2 up path remains disabled.
     (80 tests, 15 warnings). Keep the repaired code default-off for
     reproducibility, but do not pursue another sampler-only executable split.
 
+71. Accepted libtpu's multi-compute layer-scheduler overlap after a matched,
+    fresh-Ray candidate/control experiment. The exact candidate-only delta was
+    `--xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true`. It does
+    not change model math, sharding, or HLO-visible collective count; it lets
+    the dependent-collective layer scheduler overlap multiple compute regions.
+
+    The first attempted session (`664.31`) was invalidated before benchmarking.
+    Ray was started with only the candidate flag, while the server launcher
+    appended the previously accepted scheduler/merger/bidirectional flags.
+    Inspection of a remote `tpu_driver` command line showed that actors had
+    inherited only the flag present at Ray-node startup. This establishes an
+    important operational rule: changing `LIBTPU_INIT_ARGS` on a later vLLM
+    launcher does not reliably reconfigure persistent Ray actors. The complete
+    flag set must be exported before the Ray `srun`, and every libtpu change
+    requires fresh Ray workers as well as fresh compilation caches.
+
+    A second audit found that TorchTPU rewrites
+    `--xla_tpu_use_enhanced_launch_barrier=true` to `false` in distributed
+    actors, with a warning that `true` can cause distributed hangs. Historical
+    worker logs show the same rewrite in the older accepted sessions. Enhanced
+    barriers therefore were never part of the effective accepted executable;
+    the launcher default has been removed and the historical 15.1187865 ms
+    result remains valid under the effective `false` setting.
+
+    Fresh candidate Ray step `664.32` received this complete startup value
+    (the enhanced-barrier argument is shown only to record the discovery; the
+    worker rewrote it to `false`):
+
+    ```bash
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true --xla_tpu_enable_async_collective_merger=true --xla_tpu_decompose_all_reduce_bidirectional_communication=true --xla_tpu_enable_multi_compute_overlap_in_layer_scheduler=true'
+    export K3_REPO_DIR=$PWD K3_JOB_ID=664 K3_HEAD_IP=10.13.232.26 K3_RAY_PORT=6379
+    srun --jobid="$K3_JOB_ID" --overlap -N4 -n4 --ntasks-per-node=1 \
+      --unbuffered --export=ALL bash -lc '
+        export PATH="$K3_REPO_DIR/.venv/bin:$PATH"
+        node_ip=$(hostname -I | cut -d" " -f1)
+        if [[ $SLURM_PROCID -eq 0 ]]; then
+          exec ray start --head --node-ip-address="$node_ip" \
+            --port="$K3_RAY_PORT" --resources='"'"'{"TPU":8}'"'"' \
+            --disable-usage-stats --block
+        fi
+        until timeout 1 bash -c \
+            "</dev/tcp/$K3_HEAD_IP/$K3_RAY_PORT" 2>/dev/null; do sleep 1; done
+        exec ray start --address="$K3_HEAD_IP:$K3_RAY_PORT" \
+          --node-ip-address="$node_ip" --resources='"'"'{"TPU":8}'"'"' \
+          --disable-usage-stats --block
+      '
+    ```
+
+    After verifying 32 TPU resources, the exact candidate server, benchmark,
+    and profile commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-multi-compute-layer-scheduler-v2
+    export RAY_ADDRESS=10.13.232.26:6379
+    export HF_HOME=/mnt/scratch/hf-hub
+    export HF_HUB_CACHE=$HF_HOME/hub HF_MODULES_CACHE=$HF_HOME/modules HF_HUB_OFFLINE=1
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME PROF_DIR=$PROF_DIR \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The control required another fresh Ray step (`664.33`), because libtpu was
+    already initialized in the candidate actors. It used the same startup
+    string with only the multi-compute flag removed, then the same commands
+    with `K3_RUN_NAME=kimi-k3-b1-multi-compute-layer-scheduler-control-v2`.
+    Actor command lines were inspected in both sessions: candidate workers had
+    dependent scheduling, async merging, bidirectional decomposition, and
+    multi-compute overlap effective; controls had the first three but not the
+    candidate. Enhanced barriers were effective `false` in both.
+
+    | Measurement | Candidate | Matched control | Candidate change |
+    | --- | ---: | ---: | ---: |
+    | Endpoint run 1 mean TPOT | 15.1348461 ms | 15.2038554 ms | -0.0690093 ms |
+    | Endpoint run 2 mean TPOT | 15.1260408 ms | 15.2060887 ms | -0.0800479 ms |
+    | Endpoint pair average | **15.1304435 ms** | **15.2049720 ms** | **-0.0745286 ms** |
+    | Stable trace backbone | 14.8395028 ms | 14.9154054 ms | -0.0759026 ms |
+    | Post-backbone device gap | 0.1360355 ms | 0.1378425 ms | -0.0018071 ms |
+    | Device start spacing | 14.9755383 ms | 15.0532480 ms | -0.0777097 ms |
+
+    The trace localizes essentially the entire endpoint win to the model
+    executable. It is not input preparation, sampling, or the roughly 0.136 ms
+    post-backbone tail. The candidate's absolute pair is 0.01166 ms slower
+    than the historical best because fresh compilation/session baselines
+    shifted; use the matched -0.07453 ms delta for attribution. Applying that
+    delta to the historical 15.1187865 ms pair projects 15.0442579 ms, but that
+    number is **not** a verified endpoint result. The strict best remains
+    15.1187865 ms until a clean accepted-stack validation reproduces the gain.
+
+    Candidate results are in
+    `results/kimi-k3-b1-multi-compute-layer-scheduler-v2{,-repeat}`; controls
+    are in
+    `results/kimi-k3-b1-multi-compute-layer-scheduler-control-v2{,-repeat}`.
+    The stable rank-0 traces used above are:
+
+    ```text
+    /mnt/scratch/kimi-k3-b1-multi-compute-layer-scheduler-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_4002722.1786659616108759429.pt.trace.json.gz
+    /mnt/scratch/kimi-k3-b1-multi-compute-layer-scheduler-control-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_4066076.1786661087127912117.pt.trace.json.gz
+    ```
+
+    Analyze either with
+    `.venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 15 TRACE`.
+    The launcher and Slurm wrapper now default the accepted flag on, while
+    preserving explicit caller settings. The Slurm wrapper supplies the full
+    accepted set before Ray startup. The server and exact step `664.33` were
+    stopped after capture; parent allocation `664` remains running.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -2579,8 +2709,11 @@ the regressed TP2 up path remains disabled.
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-5. Preserve the now-enabled dependent-collective layer scheduler and async
-   collective merger, plus bidirectional all-reduce decomposition. The merger
+5. Preserve the now-enabled dependent-collective layer scheduler, multi-compute
+   layer-scheduler overlap, async collective merger, and bidirectional
+   all-reduce decomposition. The matched milestone-71 result attributes a
+   further 0.07453 ms/token win to multi-compute overlap, almost entirely in
+   the model executable. The merger
    reduces the collective critical path by 0.06736 ms, and bidirectional
    decomposition removes another 0.08240 ms of all-reduce time without
    changing HLO-visible counts. Async collective fusion is rejected and must
@@ -2615,8 +2748,11 @@ the regressed TP2 up path remains disabled.
    opt-in because it excludes speculative decode, grammar, and logprobs. The
    remaining larger opportunity would have to avoid or shrink the full-vocab
    TP32 all-gather rather than merely combining launches.
-9. Preserve the best known configuration as the launcher default and run a
-   final clean five-request endpoint validation once TPOT reaches 15 ms.
+9. Preserve the best known configuration as the launcher default. First run a
+   clean accepted-stack validation with the milestone-71 flag supplied before
+   Ray startup; the matched delta projects 15.04426 ms but the strict verified
+   best is still 15.11879 ms. Run a final clean five-request endpoint
+   validation once TPOT reaches 15 ms.
 10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
@@ -2660,12 +2796,17 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.11826--15.11931 ms from the fused
+The best strict absolute steady-state result remains 15.11826--15.11931 ms
+from the fused
 exact Pallas router plus the exact rank-16 route permutation, hierarchical
 routed experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
-latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers, dependent-collective layer scheduling, async collective merging,
+latent `down_proj`, TP2 KDA `f_a_proj` sharding, dependent-collective layer
+scheduling, async collective merging,
 bidirectional all-reduce decomposition, TP4 MLA fused A-projection sharding,
-plus the neutral top-k/top-p sampling specialization. The remaining gap to the
-15 ms target is 0.119 ms (0.8% of the pair average). No speculative decoding
-is used in any result.
+plus the neutral top-k/top-p sampling specialization. Milestone 71 additionally
+accepts multi-compute layer-scheduler overlap from a matched -0.07453 ms/token
+comparison and projects the combined stack to 15.04426 ms; that projection is
+not yet a replacement for the strict absolute result. The strict remaining
+gap is 0.119 ms, while the projected gap is 0.044 ms. Enhanced launch barriers
+are not part of either effective configuration because TorchTPU forces them
+off in distributed actors. No speculative decoding is used in any result.
