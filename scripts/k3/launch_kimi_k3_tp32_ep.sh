@@ -61,6 +61,7 @@ export TPU_K3_MLA_A_TP_SIZE="${TPU_K3_MLA_A_TP_SIZE:-4}"
 export TPU_K3_SHARD_ATTN_RES_PROJ="${TPU_K3_SHARD_ATTN_RES_PROJ:-0}"
 export TPU_K3_FUSE_ATTN_RES_DOT="${TPU_K3_FUSE_ATTN_RES_DOT:-0}"
 export TPU_K3_FUSE_LM_HEAD_SAMPLER="${TPU_K3_FUSE_LM_HEAD_SAMPLER:-0}"
+export TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER="${TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER:-0}"
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 # Reduce launch synchronization overhead on this collective-heavy decode
 # graph. Preserve an explicit caller choice (including `=false`).

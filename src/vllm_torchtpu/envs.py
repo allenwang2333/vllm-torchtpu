@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     TPU_K3_SHARD_ATTN_RES_PROJ: bool = False
     TPU_K3_FUSE_ATTN_RES_DOT: bool = False
     TPU_K3_FUSE_LM_HEAD_SAMPLER: bool = False
+    TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
 
@@ -399,6 +400,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # intentionally excludes speculative decode, grammar, and logprobs.
     "TPU_K3_FUSE_LM_HEAD_SAMPLER":
     env_bool("TPU_K3_FUSE_LM_HEAD_SAMPLER"),
+    # Avoid the full-vocabulary TP all-gather for neutral greedy/Gumbel-max
+    # sampling by reducing one local (value, token-id) pair per TP rank.
+    "TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER":
+    env_bool("TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.

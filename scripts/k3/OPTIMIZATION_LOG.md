@@ -2445,6 +2445,43 @@ the regressed TP2 up path remains disabled.
     otherwise. This is an analyzed future candidate, not yet implemented or
     benchmarked.
 
+69. Implemented the milestone-68 candidate behind the default-off
+    `TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER=1` flag and rejected this first
+    standalone-collective architecture. The implementation preserves the
+    current full-vocabulary random draw on every rank, slices the local vocab
+    interval, applies the local LM head plus exact temperature/Gumbel transform,
+    and all-gathers only one fp32 `(max_value, global_token_id)` pair per TP
+    rank. Greedy selection uses the same reduction without noise. It is gated
+    to non-speculative requests with neutral top-k/top-p and no grammar or
+    logprobs. This is the same pair-reduction primitive as installed vLLM's
+    `LogitsProcessor.get_top_tokens()`; the NVIDIA Inkling and MLJ router
+    sources concern the separate 896-way MoE top-16 problem already resolved
+    and measured in milestones 49 and 51.
+
+    A clean four-host launch used fresh Ray step `664.18` after cancelling
+    only stale step `664.17`; parent allocation `664` remained running. XLA
+    successfully compiled `sample_from_sharded_hidden_states` on all 32 ranks.
+    The candidate server became healthy, but the first canonical benchmark
+    warmup produced no token for 176 seconds. Worker logs show the live sampler
+    executable compiling at 20:44:19--20:44:20 UTC, followed by repeated
+    `No available shared memory broadcast block found in 60 seconds` messages
+    and no request completion. `/health` continued returning HTTP 200, so
+    endpoint health alone was misleading. The benchmark was interrupted at
+    `0/2` warmups; no result JSON or usable trace was produced. The server was
+    then stopped, while Ray step `664.18` and the parent allocation were
+    preserved.
+
+    The evidence is consistent with a collective-order/participation stall in
+    the new standalone sampling executable, not a compile rejection. Do not
+    benchmark this flag as-is. A justified retry must put the pair reduction
+    inside an executable already known to run in TP lockstep, or first prove a
+    synchronized eager reduction in a small multihost harness. It must also
+    make precompile arguments exactly match live dtypes so the first request
+    does not build another sampler variant. Keep the code default-off as a
+    reproducible prototype and warning; the accepted configuration and
+    15.1187865 ms best pair are unchanged. Static checks and the normal-device
+    `tests/runner/test_tpu_runner.py` suite pass (80 tests).
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -2534,12 +2571,14 @@ the regressed TP2 up path remains disabled.
     The remaining gap is therefore not removable merely by reducing Python
     call count; a future runtime attempt needs native asynchronous batching or
     a dependency change, not the generic foreach composite.
-15. Prototype the milestone-68 distributed neutral sampler next. Reuse
-    vLLM's existing local-head application and pair-reduction pattern, retain
-    the full RNG draw initially for exact deterministic semantics, and compare
-    both endpoint TPOT and the device gap against the milestone-67 fused and
-    flag-off controls. Do not generalize it to top-k/top-p, penalties, grammar,
-    or logprobs until each semantic path has an exact distributed algorithm.
+15. Keep the milestone-69 distributed neutral sampler disabled. Its exact
+    local-head/pair-reduction graph compiles, but a live request stalls at the
+    new standalone TP collective before producing a token. Do not rerun the
+    same architecture. A future attempt must integrate the reduction into a
+    TP-lockstep executable or validate a synchronized eager collective first,
+    then compare endpoint TPOT and the device gap against milestone-67 fusion
+    and flag-off controls. Preserve full RNG advancement and do not generalize
+    to top-k/top-p, penalties, grammar, or logprobs without exact semantics.
 
 ## Current best and gap
 

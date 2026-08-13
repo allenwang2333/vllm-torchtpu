@@ -710,15 +710,49 @@ eliminating a launch interval. Short traces can include a slow backbone
 outlier, so report means and medians and do not infer a new absolute best from
 a single capture.
 
-The next continuation candidate is an exact distributed neutral sampler.
-`LogitsProcessor.get_top_tokens()` in the installed vLLM already demonstrates
-the greedy pair-reduction primitive. For temperature sampling with neutral
-top-k/top-p, compute shard-local Gumbel maxima and all-gather only one
-`(value, global_token_id)` pair per TP rank. Initially generate the same full
-vocabulary `u` tensor on every rank and slice by `lm_head.shard_indices`; this
-preserves current RNG state advancement and token-to-random-number mapping.
-Gate it to no grammar/logprobs and fall back for filtered sampling. This is a
-future milestone-68 experiment, not a validated launcher option.
+Milestone 69 implemented the exact distributed neutral sampler, but the first
+standalone-collective architecture is rejected and remains default-off. Its
+local LM head, exact temperature/Gumbel transform, and 32-pair reduction all
+compile, yet the first live request stalls before producing a token. Do not
+enable `TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER=1` for serving or benchmarking until
+the collective is moved into an executable known to run in TP lockstep (or a
+synchronized eager alternative is independently validated).
+
+The exact failed reproduction used fresh Ray step `664.18` and these launcher
+overrides in addition to the standard exports above:
+
+```bash
+export K3_RUN_NAME=kimi-k3-b1-distributed-neutral-sampler-v2
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-bidirectional-allreduce
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-bidirectional-allreduce/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+TPU_K3_FUSE_LM_HEAD_SAMPLER=0 \
+TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER=1 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
+```
+
+The server became healthy, and XLA compiled the sampler on all 32 ranks. The
+benchmark then remained at `0/2` warmups for 176 seconds while workers emitted
+one-minute shared-memory wait warnings. No result JSON and no usable TPU trace
+were created. `/health` remained HTTP 200 during the stall, so use actual token
+progress as the liveness check for collective experiments. Stop only the
+server with Ctrl-C; if source changes again, cancel the exact Ray step
+(`scancel 664.18` for this run), never parent allocation `664`, and start a
+fresh Ray step before retrying.
+
+The installed `LogitsProcessor.get_top_tokens()` is the source of the greedy
+pair-reduction idea. The NVIDIA Inkling and MLJ `gate_topk.py` links describe
+the MoE router top-16 problem, not this vocabulary sampler. Their transferable
+ideas were already implemented as the exact full-width Pallas router and the
+rejected `7 x 128` blockwise merge; see milestones 49 and 51. A future sampler
+retry must preserve the full-vocabulary RNG draw and token-to-random-number
+mapping until deterministic equivalence is separately proven.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
