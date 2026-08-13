@@ -62,6 +62,18 @@ steps:
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
+      - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
+        key: "vllm_torchtpu_multihost_presubmit"
+        soft_fail: true
+        if: '"${TPU_VERSION:-tpu6e}" == "tpu7x"'
+        command: "bash .buildkite/scripts/run_multihost.sh 'python3 tests/multihost/test_multihost_inference.py'"
+        timeout_in_minutes: 20
+        agents:
+          queue: "tpu_v7x_16_queue"
+        env:
+          IMAGE_TAG: "${CI_IMAGE_TAG}"
+          TPU_VERSION: "${TPU_VERSION:-tpu6e}"
+
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
         <<: *unit_test_defaults
