@@ -94,6 +94,7 @@ def quantize_native_fp4_kmajor(
 
 
 def _allocate_kernel_instance_id() -> int:
+    """Allocate a unique monotonic integer ID for Pallas custom op registration."""
     global _kernel_instance_counter
     kernel_instance_id = _kernel_instance_counter
     _kernel_instance_counter += 1
@@ -107,6 +108,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
 ):
+    """Build and register a Pallas custom op for fused MoE execution."""
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
@@ -151,6 +153,7 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
 ):
+    """Retrieve or build cached Pallas custom op for fused MoE execution."""
     cache_key = (topk, activation, use_ep, rhs_quant_dtype)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -205,6 +208,9 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+
+    Executes in chunks of 2048 tokens along the first dimension of ``hidden_states``.
+    Asserts that the first dimension of ``hidden_states`` is a multiple of 2048.
     """
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
@@ -220,15 +226,47 @@ def fused_moe_gmm(
         experts_start = torch.zeros((),
                                     dtype=torch.int32,
                                     device=hidden_states.device)
-    return fused_moe(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        topk_weights,
-        topk_ids,
-        experts_start,
-    )
+    # return fused_moe(
+    #     hidden_states,
+    #     w1,
+    #     w2,
+    #     w1_scale,
+    #     w2_scale,
+    #     w1_bias,
+    #     w2_bias,
+    #     topk_weights,
+    #     topk_ids,
+    #     experts_start,
+    # )
+
+    chunk_size = 2048 * 8
+    num_tokens = hidden_states.shape[0]
+    if not torch.compiler.is_compiling():
+        assert num_tokens % chunk_size == 0, (
+            f"hidden_states shape[0] ({num_tokens}) must be a multiple of "
+            f"{chunk_size}"
+        )
+
+    total_steps = (num_tokens + chunk_size - 1) // chunk_size
+    hidden_states_chunks = torch.chunk(hidden_states, total_steps, dim=0)
+    topk_weights_chunks = torch.chunk(topk_weights, total_steps, dim=0)
+    topk_ids_chunks = torch.chunk(topk_ids, total_steps, dim=0)
+
+    outputs = []
+    for k in range(total_steps):
+        chunk_out = fused_moe(
+            hidden_states_chunks[k],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            topk_weights_chunks[k],
+            topk_ids_chunks[k],
+            experts_start,
+        )
+        outputs.append(chunk_out)
+
+    return torch.cat(outputs, dim=0)
+
