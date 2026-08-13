@@ -246,13 +246,11 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Ray step `602.65` and vLLM
-server PID 2810872 are currently running at `10.13.232.26:8000` with the newly
-accepted `--xla_tpu_enable_async_collective_merger=true` setting. Its cache is
-`/mnt/scratch/kimi-k3-b1-async-collective-merger` and its profile directory is
-`/mnt/scratch/kimi-k3-b1-async-collective-merger-profile`. Stop that exact
-server and Ray step before any source or `LIBTPU_INIT_ARGS` experiment; never
-cancel allocation job 602.
+Allocation job 602 is intentionally still active, but no Ray step or vLLM
+server is running at this handoff. The rejected overlap experiment's server
+PID 2885827 was stopped and exact Ray step `602.65` was canceled; allocation
+job 602 was not canceled. Start fresh Ray workers before the next source or
+`LIBTPU_INIT_ARGS` experiment.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -320,6 +318,16 @@ does not reduce the 623 HLO-visible matched collective events, but it shortens
 their backend critical path by 0.06736 ms/decode. It is now a launcher default;
 set `--xla_tpu_enable_async_collective_merger=false` explicitly in
 `LIBTPU_INIT_ARGS` only for a control.
+
+The most recent experiment is the rejected TensorCore collective-overlap
+trial in milestone 57. Its sole endpoint result under
+`results/kimi-k3-b1-overlap-compute-collective-tc` is 15.25797 ms mean TPOT.
+Its latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-overlap-compute-collective-tc-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2888689.1786633296525064381.pt.trace.json.gz`.
+Stable executable time rose to 14.97352 ms and primary-lane collective time to
+5.21436 ms, so leave `xla_tpu_overlap_compute_collective_tc` disabled. Only
+one endpoint run was taken because the trace causally confirmed the
+regression; this result must not replace the two-run accepted merger pair.
 
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of

@@ -1986,6 +1986,46 @@ the regressed TP2 up path remains disabled.
     agree with the endpoint pair, establishing a causal backend schedule win.
     Accept the flag as a launcher default while preserving explicit `=false`
     for controls.
+57. Tested TensorCore compute/collective overlap on top of the accepted async
+    collective merger, using fresh Ray workers and caches. This is distinct
+    from both async collective fusion and merging. The exact launch was:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-overlap-compute-collective-tc
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_async_collective_merger=true --xla_tpu_overlap_compute_collective_tc=true'
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+    ```
+
+    The endpoint and profile commands were:
+
+    ```bash
+    OUTPUT_DIR="$PWD/results/kimi-k3-b1-overlap-compute-collective-tc" \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR="$PWD/results/profile-kimi-k3-b1-overlap-compute-collective-tc" \
+      PROF_DIR=/mnt/scratch/kimi-k3-b1-overlap-compute-collective-tc-profile \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The single canonical endpoint run measured 15.25797 ms mean TPOT, 0.04635
+    ms slower than the accepted merger pair. A second endpoint run was not
+    justified because the trace independently attributes a larger regression:
+    15 stable executables average 14.97352 ms (14.97319 ms median), versus
+    14.91814 ms accepted. Primary-lane matched collective duration rises from
+    5.16166 to 5.21436 ms/decode, while the count remains 615 primary plus
+    eight async events. The primary plus async interval union rises from
+    14.85122 to 14.90776 ms; uncovered time remains only 0.06576 ms. Normal
+    post-executable gaps have a 0.13702 ms median; the raw mean is invalidated
+    by a profiler-window boundary outlier and must not be used as dispatch
+    time.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-overlap-compute-collective-tc-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2888689.1786633296525064381.pt.trace.json.gz`.
+    Reject `xla_tpu_overlap_compute_collective_tc`; it makes the already
+    dominant collective path slower on this workload. Ray step `602.65` and
+    server PID 2885827 were stopped after profiling, while allocation job 602
+    was deliberately preserved.
 
 ## Forward plan
 
@@ -2010,8 +2050,10 @@ the regressed TP2 up path remains disabled.
    collective merger. The merger reduces the collective critical path by
    0.06736 ms without changing HLO-visible count; async collective fusion is
    rejected and must remain off because it regressed and carries an explicit
-   non-Viperlite safety warning. Further compiler work must target a different
-   measured mechanism and retain explicit control runs.
+   non-Viperlite safety warning. TensorCore compute/collective overlap is also
+   rejected because it adds 0.05270 ms to primary collective duration. Further
+   compiler work must target a different measured mechanism and retain
+   explicit control runs.
 6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
