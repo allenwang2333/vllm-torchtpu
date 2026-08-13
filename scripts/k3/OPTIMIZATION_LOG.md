@@ -147,6 +147,22 @@ and any non-overlapped host work. These traces therefore show no multi-milliseco
 outside-model or input-preparation gap. The dominant actionable categories
 remain collectives, copies, and dense/fused compute.
 
+The previously reported 1.3--1.4 ms "in-executable dependency/idle/long-tail"
+was not a separately measured trace category. It was the residual from
+subtracting the 14.947 ms average leaf-family aggregation from the 16.334 ms
+arithmetic mean of top-level modules: 1.387 ms. That top-level mean includes
+the two profiler-boundary outliers above, while the leaf aggregation has
+different two-core and async self-time accounting, so the subtraction is not
+valid. Using the normal-step module median reduces the numerical residual to
+0.579 ms, but even that value must not be labeled idle. Of it, approximately
+0.370 ms is explicitly identified as the long tail of sub-threshold leaf
+operations. The direct interval union is the appropriate idle/bubble test and
+leaves only about 0.067 ms without XLA or async device-lane activity. Any
+remaining difference is trace-accounting scope and rounding, not evidence for
+a 1.3 ms host wait or a single hidden kernel. In practical terms, the large
+optimization targets are the operations already executing during that span,
+especially the roughly 5.0 ms of collectives and 2.7 ms of copies.
+
 ## Major issues discovered
 
 ### Ray workers can retain stale model code
@@ -1063,6 +1079,20 @@ the regressed TP2 up path remains disabled.
     This improves the prior 16.14113 ms best by 0.15638 ms/token. The remaining
     roughly 0.18 ms sampled-versus-greedy delta is the vocabulary-sized random
     generation, Gumbel transforms, and final reduction rather than input prep.
+38. Repeated the greedy control on the *same* neutral-filter-fast-path server,
+    removing configuration and capture differences from the comparison. It
+    measured 15.97893 ms mean, 15.95625 ms median, 16.05147 ms p99, 62.53
+    output tokens/s, and 28.32 ms mean TTFT:
+    `results/kimi-k3-b1-sampling-neutral-fastpath-greedy/kimi-k3_isl1_osl1000_concurrency1_20260813-070702.json`.
+    The paired temperature-1 mean is only 0.00582 ms slower, well below run
+    noise, so the earlier approximately 0.18 ms residual was not a stable
+    sampling cost. New temperature-1 traces show about 0.14 ms from model
+    return through the separately compiled sampler/striding/placeholder
+    modules and their gaps, but that tail is also present in endpoint control
+    accounting and does not explain the approximately 0.98 ms target gap. An
+    inverse-CDF rewrite is therefore rejected for now: it has no measured
+    latency budget to recover and would add numerical/correctness risk. Work
+    returns to the in-model collective and copy critical path.
 
 ## Forward plan
 
@@ -1089,12 +1119,10 @@ the regressed TP2 up path remains disabled.
    reductions are rejected.
 6. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
-7. Optimize the remaining approximately 0.18 ms sampled-versus-greedy gap.
-   Compare the current full-vocabulary uniform/Gumbel-max implementation with
-   an exact exponential-race formulation or a one-scalar inverse-CDF sampler,
-   preserving deterministic-generator and mixed sampling-parameter semantics.
-   Profile before adopting either path; the neutral top-k/top-p fast path has
-   already removed the binary-search reductions.
+7. Treat sampling as bounded: the exact-server temperature-1 versus greedy
+   delta is only 0.006 ms. Revisit it only if a future trace shows a stable
+   endpoint delta; do not adopt inverse-CDF sampling without both a measurable
+   budget and exact mixed-parameter/deterministic-generator semantics.
 
 ## Current best and gap
 
