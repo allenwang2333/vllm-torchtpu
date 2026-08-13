@@ -1259,6 +1259,16 @@ class TPURaidenConnectorWorker:
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        try:
+            from tpu_raiden.api import telemetry
+            raiden_samples = telemetry.get_metric_samples()
+            for metric_name, values in raiden_samples.items():
+                if metric_name not in self.transfer_stats.data:
+                    self.transfer_stats.data[metric_name] = []
+                self.transfer_stats.data[metric_name].extend(values)
+        except Exception as e:
+            logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
+
         if self.tp_rank == 0:
             if self.is_producer:
                 prefill_queue_len = (len(self._stage3_registered_sends)

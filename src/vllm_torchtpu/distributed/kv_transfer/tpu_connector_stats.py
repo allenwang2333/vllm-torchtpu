@@ -24,6 +24,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+
 @dataclass
 class TpuKVConnectorStats(KVConnectorStats):
     """Container for transfer performance metrics"""
@@ -139,17 +144,17 @@ class TpuKVConnectorStats(KVConnectorStats):
         }
 
     def is_empty(self) -> bool:
-        return (len(self.data["d2h_transfer_time"]) == 0
-                and len(self.data["h2d_transfer_time"]) == 0
-                and len(self.data["kv_pull_time"]) == 0
-                and len(self.data["mb_transferred"]) == 0
-                and len(self.data["num_failed_transfers"]) == 0
-                and len(self.data["prefill_queue_length"]) == 0
-                and len(self.data["decode_queue_length"]) == 0)
+        return (len(self.data.get("d2h_transfer_time", [])) == 0
+                and len(self.data.get("h2d_transfer_time", [])) == 0
+                and len(self.data.get("kv_pull_time", [])) == 0
+                and len(self.data.get("mb_transferred", [])) == 0
+                and len(self.data.get("num_failed_transfers", [])) == 0
+                and len(self.data.get("prefill_queue_length", [])) == 0
+                and len(self.data.get("decode_queue_length", [])) == 0)
 
     @property
     def num_successful_transfers(self) -> int:
-        return len(self.data["mb_transferred"])
+        return len(self.data.get("mb_transferred", []))
 
 
 class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
@@ -253,6 +258,49 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
+        self.dynamic_metrics: dict[str, tuple[str, Any]] = {}
+
+        # Dynamically load TPU Raiden C++ metric schema descriptors
+        try:
+            from tpu_raiden.api import telemetry
+            descriptors = telemetry.get_metric_descriptors()
+        except Exception as e:
+            logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
+            descriptors = []
+
+        for desc in descriptors:
+            name = desc.name
+            help_str = desc.help
+            mtype = desc.type
+
+            if mtype == "histogram":
+                buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
+                metric_obj = self._histogram_cls(
+                    name=name,
+                    documentation=help_str,
+                    buckets=buckets_val,
+                    labelnames=labelnames,
+                )
+            elif mtype == "counter":
+                metric_obj = self._counter_cls(
+                    name=name,
+                    documentation=help_str,
+                    labelnames=labelnames,
+                )
+            elif mtype == "gauge":
+                metric_obj = self._gauge_cls(
+                    name=name,
+                    documentation=help_str,
+                    labelnames=labelnames,
+                )
+            else:
+                continue
+
+            self.dynamic_metrics[name] = (
+                mtype,
+                create_metric_per_engine(metric_obj, self.per_engine_labelvalues)
+            )
+
     def observe(self,
                 transfer_stats_data: dict[str, Any],
                 engine_idx: int = 0):
@@ -270,8 +318,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "mb_transferred",
             ],
         ):
-            for list_item in transfer_stats_data[list_item_key]:
-                prom_obj[engine_idx].observe(list_item)
+            if list_item_key in transfer_stats_data:
+                for list_item in transfer_stats_data[list_item_key]:
+                    prom_obj[engine_idx].observe(list_item)
 
         for counter_obj, counter_item_key in zip(
             [
@@ -279,8 +328,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
             ["num_failed_transfers"],
         ):
-            for list_item in transfer_stats_data[counter_item_key]:
-                counter_obj[engine_idx].inc(list_item)
+            if counter_item_key in transfer_stats_data:
+                for list_item in transfer_stats_data[counter_item_key]:
+                    counter_obj[engine_idx].inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
             [
@@ -296,3 +346,14 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                     gauge_item_key]:
                 for list_item in transfer_stats_data[gauge_item_key]:
                     gauge_obj[engine_idx].set(list_item)
+
+        # Dynamic metric observations
+        for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
+            if name in transfer_stats_data and transfer_stats_data[name]:
+                for val in transfer_stats_data[name]:
+                    if mtype == "histogram":
+                        per_engine_obj[engine_idx].observe(val)
+                    elif mtype == "counter":
+                        per_engine_obj[engine_idx].inc(val)
+                    elif mtype == "gauge":
+                        per_engine_obj[engine_idx].set(val)
