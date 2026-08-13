@@ -150,7 +150,7 @@ class TpuKVConnectorStats(KVConnectorStats):
 
     @property
     def num_successful_transfers(self) -> int:
-        return len(self.data.get("mb_transferred", []))
+        return len(self.data["mb_transferred"])
 
 
 class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
@@ -336,8 +336,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "decode_queue_length",
             ],
         ):
-            for list_item in transfer_stats_data[gauge_item_key]:
-                gauge_obj[engine_idx].set(list_item)
+            if gauge_item_key in transfer_stats_data and transfer_stats_data[
+                    gauge_item_key]:
+                for list_item in transfer_stats_data[gauge_item_key]:
+                    gauge_obj[engine_idx].set(list_item)
 
         # Dynamic metric observations
         for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
