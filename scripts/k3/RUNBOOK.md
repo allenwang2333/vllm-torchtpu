@@ -105,6 +105,19 @@ export LIBTPU_INIT_ARGS="--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm
 scripts/k3/launch_kimi_k3_tp32_ep.sh
 ```
 
+Set model experiment overrides on the launcher invocation, not on the Ray
+step. For example, the rejected TP8 MLA A-projection boundary was launched as:
+
+```bash
+TPU_K3_MLA_A_TP_SIZE=8 \
+  scripts/k3/launch_kimi_k3_tp32_ep.sh
+```
+
+Unset the override on the next launch to recover the accepted launcher default
+of TP4. A model-only environment override needs a new vLLM server and unique
+caches, but not a new Ray step when neither source nor `LIBTPU_INIT_ARGS`
+changed.
+
 The launcher appends the winning enhanced-barrier and dependent-collective
 flags unless the caller explicitly supplies either flag with `=true` or
 `=false`. For an isolated compiler experiment, append only that experiment's
@@ -204,17 +217,26 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. The latency-hiding layer
-scheduler experiment is complete and its old server is stopped. The current
-healthy server on port 8000 is PID 1921701 on exact Ray step `602.44`, using
-namespace
-`/mnt/scratch/kimi-k3-b1-mla-a-tp4-jax-exact-topk-fresh`. It has the accepted
-TP4 MLA A-projection sharding plus the *rejected* opt-in exact JAX top-k. Its
-two runs are 15.86269 and 15.83474 ms mean TPOT, versus 15.84994 and 15.81726
-ms for TP4 MLA alone; leave `TPU_K3_JAX_EXACT_TOPK` unset on the next launch.
-Two profile captures are present under the matching `-profile` directory.
-Stop PID 1921701 and only step `602.44` before another source or libtpu-flag
-experiment; do not cancel allocation job 602.
+Allocation job 602 is intentionally still active. Ray step `602.46` is active
+on all four hosts with head `10.13.232.26`; its persistent terminal/session is
+`87931`. No vLLM server is active. The rejected TP8 MLA A-projection server
+(former API PID 2073327, EngineCore PID 2079180) was stopped with SIGINT after
+both endpoint runs. Its caches remain under
+`/mnt/scratch/kimi-k3-b1-mla-a-tp8`, and results are under
+`results/kimi-k3-b1-mla-a-tp8{,-repeat}`. The pair measured 16.06524 and
+16.04567 ms mean TPOT, 0.09140 ms slower than the fresh TP4 control pair, so
+leave the launcher default at TP4 and do not set `TPU_K3_MLA_A_TP_SIZE=8`.
+
+Step `602.46` can be reused for another model-only environment experiment.
+Cancel only step `602.46` and start fresh Ray workers before any source or
+`LIBTPU_INIT_ARGS` change. Never cancel allocation job 602 while continuing
+this work.
+
+Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the
+selector still lowers to the same 92 `[1,896]` sorts (0.45000 ms/decode) and
+92 `[16]` expert-ID sorts (0.11900 ms/decode). The custom boundary reduced the
+size/compile time of the monolithic backbone artifact but did not replace the
+device sort algorithm. Do not treat the 0.450 ms family as removed.
 
 ## Non-Slurm cluster
 

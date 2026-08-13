@@ -1187,42 +1187,138 @@ the regressed TP2 up path remains disabled.
     and
     `results/kimi-k3-b1-mla-a-tp4-jax-exact-topk-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-085137.json`.
     Their mean is 0.01511 ms slower than the two-run TP4-MLA control, so the
-    exact custom op remains disabled. The result shows that the 0.450 ms sort
-    family is not freely recoverable: the separate exact selector and custom
-    call replace it on the critical path. A future attempt should fuse score
-    activation, correction bias, selection, gather, and renormalization in one
-    TPU kernel (the transferable Inkling idea), or integrate routing directly
-    with MoE dispatch; another standalone exact selector is low priority.
+    exact custom op remains disabled.
+
+    A subsequent streaming parse of the rank-0 TPU trace corrected the first
+    interpretation of what happened inside the custom boundary. The trace has
+    19 decode executions and attributes 1,748 `[1,896]` sort events directly
+    to `moe_topk_op.py:30`, where `approx_max_k` is called. Dividing the raw
+    totals by 19 gives 92 router sorts and 0.45000 ms per decode (4.891 us
+    mean per sort), plus 92 `[16]` expert-ID sorts and 0.11900 ms per decode
+    (1.293 us mean per sort). These are effectively identical to the original
+    0.45020/0.11923 ms families. In this exact shape, recall-1.0
+    `approx_max_k` lowers to an ordinary sort; it does **not** implement a
+    faster TPU selection algorithm. The smaller monolithic artifact and
+    shorter reported backbone compile came from isolating those sorts behind
+    the custom-op boundary, not from removing them at runtime.
+
+    The result therefore shows that the 0.450 ms sort family is not freely
+    recoverable with a standalone exact JAX selector. A future attempt should
+    fuse score activation, correction bias, selection, gather, and
+    renormalization in one TPU kernel (the transferable Inkling idea), or
+    integrate routing directly with MoE dispatch; another standalone exact
+    selector is low priority.
     Two post-warmup profiles were captured under
     `/mnt/scratch/kimi-k3-b1-mla-a-tp4-jax-exact-topk-fresh-profile`.
+43. Captured a fresh, directly comparable profile of the accepted TP4-MLA
+    graph with exact JAX top-k disabled. Two endpoint runs on this fresh
+    session measured 15.96797 and 15.96015 ms mean TPOT. They are tightly
+    paired but about 0.13 ms slower than the earlier 15.84994/15.81726 ms
+    pair, so this is recorded as cross-session variance and does not replace
+    the best verified result. The results are under
+    `results/kimi-k3-b1-current-best-tp4-mla-trace{,-repeat}` and the two
+    15-iteration profiles are under
+    `/mnt/scratch/kimi-k3-b1-current-best-tp4-mla-trace-profile`.
+
+    The second rank-0 capture contains 19 model executions. A streaming
+    parser, needed because the trace again contains unescaped quotes in HLO
+    names, gives a mean/median model executable of 15.68095/15.67916 ms and
+    the following *additive primary XLA-op lane* breakdown:
+
+    | XLA category | Mean per decode (ms) |
+    | --- | ---: |
+    | Convolution fusion (dense matmul lowering) | 5.38134 |
+    | All-reduce | 5.05100 |
+    | Custom calls (including routed GMM/custom kernels) | 1.75196 |
+    | Loop fusion | 1.33258 |
+    | Sort | 0.56909 |
+    | Data formatting | 0.31681 |
+    | Custom fusion | 0.25931 |
+    | All remaining leaf categories | 0.36700 |
+    | **Primary-lane total** | **15.02905** |
+
+    Primary-lane interval occupancy is 15.02785 ms. Including asynchronous
+    device-lane intervals covers 15.62018 ms of the 15.68095 ms executable,
+    leaving only 0.06077 ms genuinely uncovered. Thus the approximately
+    0.59 ms between the primary leaf lane and the model interval is
+    asynchronous device work that fills primary-lane gaps, not host input
+    preparation or idle time. The earlier 2.7--3.7 ms "copies" figures are
+    asynchronous-copy occupancy/accounting and overlap other device work;
+    they must not be added to this primary-lane table as serial latency.
+
+    Applying the identical parser to the exact-JAX-top-k trace produced the
+    same 184 sorts and 0.56900 ms per decode, versus 184 and 0.56909 ms here.
+    Every non-collective category also agrees within 0.006 ms. Its different
+    profile-window total comes from all-reduce variance, not the selector.
+    This independently confirms that recall-1.0 `approx_max_k` merely moves
+    the unchanged sort lowering behind a separate executable.
+44. Tested the remaining MLA fused A-projection width boundary at TP8. This
+    used the accepted graph unchanged except for
+    `TPU_K3_MLA_A_TP_SIZE=8`, with a fresh cache namespace
+    `/mnt/scratch/kimi-k3-b1-mla-a-tp8` on Ray step `602.46`. The launch
+    compiled successfully on all 32 workers. The canonical runs measured
+    16.06524/16.05379/16.10537 ms and
+    16.04567/16.04575/16.04602 ms mean/median/p99 TPOT:
+    `results/kimi-k3-b1-mla-a-tp8/kimi-k3_isl1_osl1000_concurrency1_20260813-094834.json`
+    and
+    `results/kimi-k3-b1-mla-a-tp8-repeat/kimi-k3_isl1_osl1000_concurrency1_20260813-095217.json`.
+    Their 16.05546 ms pair average is 0.09140 ms slower than the fresh TP4
+    control pair (15.96797/15.96015 ms). TP8 is therefore rejected and the
+    launcher remains at TP4. Together with the neutral TP2 result, this pins
+    the useful width boundary for the 7168-to-2112 fused projection at TP4:
+    halving the remaining local matmul again does not pay for widening its
+    2112-element all-reduce from four to eight ranks.
+
+    Exact reproduction after exporting the standard Ray/cache variables from
+    `RUNBOOK.md` is:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-mla-a-tp8
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_MLA_A_TP_SIZE=8 scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-mla-a-tp8 \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/kimi-k3-b1-mla-a-tp8-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Caveats: the first launch used cold compile caches and spent several
+    minutes in model construction plus the batch-1 backbone compile; this is
+    startup cost and is excluded from TPOT. The first benchmark's first warmup
+    took about 19 seconds while later 1,000-token requests took about 16.1
+    seconds. Only the four post-warmup requests in each saved JSON determine
+    the reported TPOT. The server was stopped after the repeat; Ray step
+    `602.46` and parent allocation 602 remain active.
 
 ## Forward plan
 
-1. Capture an equivalently formatted 16.80 ms direct-combine control if a
-   strict paired attribution of TP4-down's dense savings and subgroup
-   collective cost is needed; the current-best profile itself is parsed and
-   establishes the absolute device-time budget above.
-2. Parse the paired up-projection profiles to quantify why global TP32 is
-   neutral while repeated TP2 is a regression, and use the result to choose
-   attention projection shard widths.
-3. Use the measured projection boundary to prioritize transformations that
+1. Treat TP4 as the measured optimum for MLA's fused A projection: TP2 was
+   neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
+   against its fresh TP4 control. Do not widen this collective further.
+2. Use the measured projection boundary to prioritize transformations that
    reuse or fuse an existing collective: 7168-to-128 KDA sharding is slightly
    positive, 7168-to-2112 MLA sharding is neutral, while 179 independent
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-4. Continue from the now-enabled dependent-collective layer scheduler and
+3. Continue from the now-enabled dependent-collective layer scheduler and
    inspect its paired trace for changed all-reduce/copy ordering. Test another
    libtpu collective mechanism only if it targets a remaining measured stall
    and is distinct from rejected decomposition, SparseCore offload,
    async-all-reduce, and collective-matmul V2 settings.
-5. Use the current-best profile to prioritize collective reuse/fusion or
+4. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, per-layer scorer collectives, and explicit local scorer
    reductions are rejected.
-6. Preserve the best known configuration as the launcher default and run a
+5. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
-7. Treat sampling as bounded: the exact-server temperature-1 versus greedy
+6. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
    budget and exact mixed-parameter/deterministic-generator semantics.
