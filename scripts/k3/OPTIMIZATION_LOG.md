@@ -2178,6 +2178,17 @@ the regressed TP2 up path remains disabled.
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
    budget and exact mixed-parameter/deterministic-generator semantics.
+11. When Slurm RPC recovers, re-test the already-implemented PR #410 fused
+   MoE combine on top of the accepted async merger and bidirectional
+   all-reduce settings. Its original 17.92 versus 17.93 ms result predates
+   both compiler wins. The current compiler forms a variadic
+   `bf16[1,7168] + bf16[1,3584]` TP32 reduction costing 2.39450 ms/decode;
+   bidirectional decomposition regressed that family by 0.01834 ms. PR #410
+   instead presents one flat `bf16[1,10752]` operand, which can select a
+   different backend emitter. This is a newly justified interaction test, not
+   a claim that the formerly neutral patch is now faster. Use
+   `TPU_K3_FUSED_MOE_COMBINE=1`, fresh caches, two endpoint runs, and a trace;
+   retain the default zero unless both endpoint and family evidence improve.
 
 ## Current best and gap
 

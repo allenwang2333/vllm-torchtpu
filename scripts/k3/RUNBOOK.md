@@ -373,6 +373,36 @@ logical devices and replica groups of 32, four, or two. Leave
 `xla_tpu_inference_short_all_reduce_max_tensor_chunks=0`. Milestone 59 records
 the `readelf`, `objdump`, and flagfile commands and the upgrade/address caveat.
 
+The next experiment after Slurm recovery is the interaction between the exact
+PR #410 fused MoE combine and the newly accepted compiler settings. The patch
+is already present and defaults off; no source edit is required. After starting
+fresh Ray workers with the normal launcher environment, use:
+
+```bash
+export K3_RUN_NAME=kimi-k3-b1-pr410-fused-combine-bidirectional
+export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+TPU_K3_FUSED_MOE_COMBINE=1 scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+  scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
+OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+  scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
+TEMPERATURE=1 INCLUDE_SEED=0 \
+  OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+  PROF_DIR=$PROF_DIR scripts/k3/profile_isl1_osl1k.sh "$K3_HEAD_IP"
+```
+
+The reason to revisit a previously neutral flag is narrow: the accepted
+bidirectional trace's compiler-created variadic TP32 tuple regressed by
+0.01834 ms, while the explicit fused path exposes one flat `[1,10752]`
+operand. Compare all-reduce shape-family time as well as endpoint TPOT. Restore
+`TPU_K3_FUSED_MOE_COMBINE=0` afterward unless the result is causally positive.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do
