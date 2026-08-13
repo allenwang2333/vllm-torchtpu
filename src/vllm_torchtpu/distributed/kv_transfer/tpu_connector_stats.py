@@ -144,13 +144,9 @@ class TpuKVConnectorStats(KVConnectorStats):
         }
 
     def is_empty(self) -> bool:
-        return (len(self.data.get("d2h_transfer_time", [])) == 0
-                and len(self.data.get("h2d_transfer_time", [])) == 0
-                and len(self.data.get("kv_pull_time", [])) == 0
-                and len(self.data.get("mb_transferred", [])) == 0
-                and len(self.data.get("num_failed_transfers", [])) == 0
-                and len(self.data.get("prefill_queue_length", [])) == 0
-                and len(self.data.get("decode_queue_length", [])) == 0)
+        if not self.data:
+            return True
+        return not any(self.data.values())
 
     @property
     def num_successful_transfers(self) -> int:
@@ -318,9 +314,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "mb_transferred",
             ],
         ):
-            if list_item_key in transfer_stats_data:
-                for list_item in transfer_stats_data[list_item_key]:
-                    prom_obj[engine_idx].observe(list_item)
+            for list_item in transfer_stats_data[list_item_key]:
+                prom_obj[engine_idx].observe(list_item)
 
         for counter_obj, counter_item_key in zip(
             [
@@ -328,9 +323,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
             ["num_failed_transfers"],
         ):
-            if counter_item_key in transfer_stats_data:
-                for list_item in transfer_stats_data[counter_item_key]:
-                    counter_obj[engine_idx].inc(list_item)
+            for list_item in transfer_stats_data[counter_item_key]:
+                counter_obj[engine_idx].inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
             [
@@ -342,10 +336,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "decode_queue_length",
             ],
         ):
-            if gauge_item_key in transfer_stats_data and transfer_stats_data[
-                    gauge_item_key]:
-                for list_item in transfer_stats_data[gauge_item_key]:
-                    gauge_obj[engine_idx].set(list_item)
+            for list_item in transfer_stats_data[gauge_item_key]:
+                gauge_obj[engine_idx].set(list_item)
 
         # Dynamic metric observations
         for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
