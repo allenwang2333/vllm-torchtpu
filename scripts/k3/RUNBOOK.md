@@ -710,6 +710,16 @@ eliminating a launch interval. Short traces can include a slow backbone
 outlier, so report means and medians and do not infer a new absolute best from
 a single capture.
 
+The next continuation candidate is an exact distributed neutral sampler.
+`LogitsProcessor.get_top_tokens()` in the installed vLLM already demonstrates
+the greedy pair-reduction primitive. For temperature sampling with neutral
+top-k/top-p, compute shard-local Gumbel maxima and all-gather only one
+`(value, global_token_id)` pair per TP rank. Initially generate the same full
+vocabulary `u` tensor on every rank and slice by `lm_head.shard_indices`; this
+preserves current RNG state advancement and token-to-random-number mapping.
+Gate it to no grammar/logprobs and fall back for filtered sampling. This is a
+future milestone-68 experiment, not a validated launcher option.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do

@@ -2430,6 +2430,21 @@ the regressed TP2 up path remains disabled.
     unregistered; rerun normally rather than interpreting those as candidate
     failures.
 
+68. Identified the next exact candidate after the fusion screen. The installed
+    vLLM `LogitsProcessor.get_top_tokens()` already implements vocab-parallel
+    greedy argmax by gathering only one `(max_value, global_token_id)` pair
+    per TP rank instead of all-gathering the vocabulary. Neutral Gumbel-max
+    sampling admits the same exact reduction: apply temperature/noise to each
+    local vocab shard, compute its local noisy maximum, all-gather 32 pairs,
+    and select the global maximum. The first implementation should still draw
+    the current full-vocabulary `u` tensor on every rank and slice the local
+    shard. That preserves existing generator advancement and deterministic
+    random-number mapping while removing the logits all-gather; optimizing the
+    random draw can follow only after proving generator equivalence. Gate the
+    path to no grammar, no logprobs, and neutral top-k/top-p, falling back
+    otherwise. This is an analyzed future candidate, not yet implemented or
+    benchmarked.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -2519,6 +2534,12 @@ the regressed TP2 up path remains disabled.
     The remaining gap is therefore not removable merely by reducing Python
     call count; a future runtime attempt needs native asynchronous batching or
     a dependency change, not the generic foreach composite.
+15. Prototype the milestone-68 distributed neutral sampler next. Reuse
+    vLLM's existing local-head application and pair-reduction pattern, retain
+    the full RNG draw initially for exact deterministic semantics, and compare
+    both endpoint TPOT and the device gap against the milestone-67 fused and
+    flag-off controls. Do not generalize it to top-k/top-p, penalties, grammar,
+    or logprobs until each semantic path has an exact distributed algorithm.
 
 ## Current best and gap
 
