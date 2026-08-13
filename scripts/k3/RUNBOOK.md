@@ -244,15 +244,14 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. Fresh Ray step `602.55` is
-active on all four hosts with head `10.13.232.26`; its persistent terminal is
-session `59873`. The healthy experimental vLLM server is terminal/session
-`49800`, API PID 2612522, EngineCore PID 2616972, and rank-0 worker PID
-2599376. It uses cache namespace
+Allocation job 602 is intentionally still active. There is currently no Ray
+step and no vLLM server: the rejected block-router server was stopped and only
+Ray step `602.55` was canceled before an isolated GMM tile sweep. Start fresh
+Ray workers with the four-host command above before the next full-model
+experiment. The most recent server used cache namespace
 `/mnt/scratch/kimi-k3-b1-pallas-block-router-topk` and profile directory
-`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile`. The launch passed
-`TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=1`; this is a rejected, default-off
-experiment, not the accepted launcher configuration.
+`/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile`; it is no longer
+running.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -265,7 +264,7 @@ router calls totaling 0.27816 ms/decode, and zero sort operations of any shape.
 Primary plus asynchronous device work covers 14.91656 ms, leaving only
 0.06545 ms uncovered.
 
-The current experimental server's endpoint result files are under
+The last experimental server's endpoint result files are under
 `results/kimi-k3-b1-pallas-block-router-topk{,-repeat}` and measure 15.24950
 and 15.25911 ms mean TPOT. Its latest rank-0 trace is
 `/mnt/scratch/kimi-k3-b1-pallas-block-router-topk-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2599376.1786626871906653164.pt.trace.json.gz`.
@@ -274,14 +273,36 @@ The stable executable average is 14.97524 ms, but the block-router family is
 accepted configuration by starting fresh Ray workers after source edits and
 launching with the default `TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0`.
 
+The accepted trace's 1,729 timed router/GMM events are 18 complete 92-layer
+decodes plus one 73-layer profile-boundary fragment. Do not divide them by 19.
+Mean call time times 92 gives 0.27849 ms router, 0.79947 ms GMM1, and 0.59325
+ms GMM2 per complete decode. The exact current 56-group tile sweep and its
+four-host `srun` command are milestone 52 in `OPTIMIZATION_LOG.md`. Its
+low-occupancy split candidate was rejected because it regressed from four
+active local routes onward; no production GMM tile changed.
+
+For the same accepted profile, stable model executables average 14.98202 ms,
+start 15.11888 ms apart, and leave a 0.13740 ms mean end-to-next-start launch
+gap. The accepted endpoint pair averages 15.27388 ms, so the approximate
+endpoint-minus-executable envelope is 0.29187 ms: 0.13740 ms between device
+executables plus about 0.15500 ms from device start spacing to client TPOT.
+These are separate profile and benchmark requests, so the last component also
+contains run variance and client/streaming accounting. It is not a four-ms
+input-preparation cost. See milestones 50 and 54 for the complete device-lane
+scope rules.
+
+The current `vllm-project/tpu-inference` audit is milestone 53. Its recent GMM
+scale-load, lane-interleave, and bucketized-M improvements are already present;
+its exact `approx_max_k` path is the already rejected K3 JAX experiment; and
+its fused MoE kernel cannot accept one token under EP16 or lossless block-32
+MXFP4. No upstream code was ported from that audit.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do
-not restore the dynamic gather. Step `602.55` imported the experimental
-blockwise selector and is safe for read-only profiling or another benchmark.
-Any Python source edit, model-graph edit, or `LIBTPU_INIT_ARGS` change requires
-canceling only `602.55` and starting fresh Ray workers. Never cancel allocation job 602
-while continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
+not restore the dynamic gather. The next experiment requires fresh Ray workers
+because no Ray step is active. Never cancel allocation job 602 while
+continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
 
 Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the
 selector still lowers to the same 92 `[1,896]` sorts (0.45000 ms/decode) and

@@ -1759,6 +1759,152 @@ the regressed TP2 up path remains disabled.
     repeated local reductions plus a second 112-way selection add work. Do
     not promote this flag without a new primitive or a direct trace showing
     the router family itself below 0.27816 ms.
+52. Reconstructed the exact routed-GMM breakdown and swept the current
+    hierarchical 56-group geometry. The accepted rank-16 trace records 1,729
+    timed calls for each of router, GMM1, and GMM2. This is not 91 calls across
+    19 equivalent decodes: the window contains 18 complete 92-layer MoE
+    decodes plus a 73-layer profiler-boundary fragment (`18 * 92 + 73 =
+    1729`). Dividing by 19 undercounts these families. Using mean call time
+    times 92 gives the complete-decode breakdown:
+
+    | Routed kernel | Exact traced geometry | Mean per complete decode |
+    | --- | --- | ---: |
+    | Router | fused exact top-16 | 0.27849 ms |
+    | GMM1 gate/up | `g=56,m=16,k=3584,n=3072,tn=1536` | 0.79947 ms |
+    | GMM2 down | `g=56,m=16,k=1536,n=3584,tn=3584` | 0.59325 ms |
+
+    Thus the two routed GMMs account for about 1.39272 ms/decode. GMM1 is the
+    larger surface, while GMM2 already uses one full-width N tile. These are
+    `device_duration_ps` custom-kernel times, not an additive endpoint/host
+    remainder; the primary-lane interval-union accounting in milestone 50 is
+    still authoritative for wall time.
+
+    Before the sweep, the rejected block-router server was stopped cleanly
+    and only Ray step `602.55` was canceled. Allocation job 602 remained
+    active. A first one-host microbenchmark attempt, temporary step `602.56`,
+    was canceled after JAX correctly warned that TPU backend initialization
+    required all hosts of the v7x-32 slice. The valid harness starts one
+    coordinated process on each of the four hosts:
+
+    ```bash
+    srun --jobid=602 --overlap -N4 -n4 --ntasks-per-node=1 \
+      --unbuffered --export=ALL bash -lc '
+        cd /mnt/lustre/homes-x86/woosuk/workspace/vllm-torchtpu-4
+        export PATH="$PWD/.venv/bin:$PATH"
+        export TPU_ACCELERATOR_TYPE=tpu7x-32
+        export XLA_PYTHON_CLIENT_PREALLOCATE=false
+        .venv/bin/python benchmarks/kernels/benchmark_kimi_k3_mxfp4_gmm.py \
+          --weight-experts 56 --active-experts 1 --iterations 100 \
+          --gmm1-tile 16,3584,1024 --gmm2-tile 16,3072,1792
+      '
+    ```
+
+    Unlike the older 28-group EP32 sweep, `--weight-experts 56` reproduces the
+    current EP16 x TP2 per-rank weight geometry. The authoritative metric is
+    the five-sample dependent `pair_device_loop_us`, not separately queued
+    GMM timings, which contain a large host-dispatch floor. Four-host medians
+    for current `GMM1 tn=1536/GMM2 tn=3584` versus the best low-occupancy
+    `GMM1 tn=1024/GMM2 tn=1792` candidate were:
+
+    | Active local routes | Current pair | Split candidate | Change |
+    | ---: | ---: | ---: | ---: |
+    | 1 | 21.362 us | 20.526 us | -0.837 us |
+    | 2 | 31.341 us | 31.019 us | -0.322 us |
+    | 4 | 50.840 us | 52.377 us | +1.537 us |
+    | 8 | 89.123 us | 94.865 us | +5.742 us |
+    | 16 | 165.659 us | 179.747 us | +14.088 us |
+
+    Intermediate GMM1-only candidates at one active route bounded the tuning
+    surface: `tn=1280` was about 23.0 us/pair, `tn=768` about 21.4 us, and
+    `tn=1024` with full-width GMM2 about 21.2 us, versus about 21.4 us for an
+    explicit current-tile control in the same warm session. The GMM1-only
+    opportunity is therefore only roughly 0.2 us/layer (about 0.02 ms/decode)
+    before occupancy risk and run variance. Splitting GMM2 creates a larger
+    one-route win but crosses over by four routes and regresses the legal
+    16-route case by 8.5%.
+
+    Conclusion: do not compile the combined split in the full model and do
+    not change production tiles. Dynamic top-16 routing provides no static
+    guarantee of at most two local routes, and an input-dependent tile choice
+    would require the same costly conditional/custom-kernel boundaries that
+    were rejected in the original GMM investigation. A future GMM attempt
+    needs either a kernel that pipelines full-width GMM2 without occupancy
+    regression or a static routing bound established outside the operator.
+53. Audited current `vllm-project/tpu-inference` at head
+    `7dddc17a98b17fa9aed8d477e4268022045a3212` (2026-08-13) after the router and
+    GMM bounds above. No source was ported blindly. The useful findings and
+    dispositions are:
+
+    - Its recent GMM improvements are already in this branch: stride-zero
+      scale replication ([#3135](https://github.com/vllm-project/tpu-inference/pull/3135)),
+      fused gate/up lane interleaving
+      ([#3161](https://github.com/vllm-project/tpu-inference/pull/3161)), and
+      bucketized M execution
+      ([#3219](https://github.com/vllm-project/tpu-inference/pull/3219)).
+      The current trace names include the resulting bucket/tile geometry, so
+      copying these commits would duplicate existing code.
+    - StreamIndex uses `jax.lax.approx_max_k(..., recall_target=1.0)` as its
+      exact faster-than-`top_k` selector. That exact primitive is already the
+      implementation of `TPU_K3_JAX_EXACT_TOPK`. Milestone 47 measured it
+      0.015 ms slower at the endpoint, and its trace still contained the same
+      896-way TPU sort. It is not a new alternative to the accepted Pallas
+      router.
+    - Shared-expert reduction deferral
+      ([#2849](https://github.com/vllm-project/tpu-inference/pull/2849)) is the
+      same one-collective direction as local PR #410 and the earlier K3 fused
+      combine experiments. The exact PR #410 patch is included here and was
+      endpoint-neutral; the later latent/shared sharding variants are also
+      measured in this log.
+    - Dense SparseCore gather-reduce and its tree reduction
+      ([#2979](https://github.com/vllm-project/tpu-inference/pull/2979),
+      [#3018](https://github.com/vllm-project/tpu-inference/pull/3018)) target
+      generic/high-row unpermute. K3 batch 1 already uses a direct 16-row FP32
+      weighted reduction and has zero route-permutation sorts. Paying an HBM
+      round trip to SparseCore is not justified for this shape.
+    - `VLLM_MOE_CHUNK_SIZE` pipelines unpermute with collectives only when a
+      token batch can be divided into multiple chunks. One decode token has no
+      such pipeline depth. Hierarchical reduce-scatter likewise requires a
+      scatterable token/sequence dimension and does not fit a one-token
+      all-reduce.
+    - The repository's monolithic `fused_ep_moe` kernel is not a viable K3
+      batch-1 port. It requires `num_tokens % ep_size == 0`, while this workload
+      has one token and EP16. Its subchannel-quantized weight path also requires
+      scale blocks aligned to 256, while the lossless checkpoint is MXFP4
+      block 32. Padding to 16 tokens and lossy block-256 requantization would
+      change both the work and model semantics before any performance claim.
+    - The new stacked-RPA work targets conventional paged attention. K3's
+      accepted trace instead has specialized KDA and MLA custom calls totaling
+      only about 0.32 ms/decode, and the local tree already contains its KDA v3
+      and MLA v2 paths. A large stacked-RPA port cannot close the current gap
+      on the measured kernel mix.
+
+    Conclusion: the current upstream audit yields no safe untested patch. The
+    remaining actionable ideas must reduce the measured TP32 collective path,
+    the 0.137 ms inter-executable launch gap, or fuse work across an existing
+    K3-specific boundary. Re-check upstream after a direct-VMEM SparseCore
+    top-k or a batch-1/EP-capable fused MoE kernel lands.
+54. Quantified the time outside the stable model executable. For the accepted
+    rank-16 profile, 18 non-outlier model executables average 14.98202 ms. Their
+    start-to-start spacing averages 15.11888 ms (15.12171 ms median), and the
+    gap from each stable executable end to the next executable start averages
+    0.13740 ms (0.13733 ms median, 0.13637--0.13845 ms range). This is the real
+    device inter-launch/dependency interval; it is neither 1.3 ms nor 4 ms.
+
+    The accepted endpoint pair averages 15.27388 ms TPOT. Comparing that with
+    the profile gives an approximate 0.29187 ms endpoint-minus-executable
+    envelope: 0.13740 ms is visible between device executables, and the
+    remaining approximately 0.15500 ms lies between device start spacing and
+    client-observed TPOT. The endpoint and profiler are separate requests, so
+    the latter subtraction includes run variance, streaming/async-output
+    accounting, and client timing; it is not evidence of 0.155 ms of input
+    preparation. Inside the executable, primary plus asynchronous device work
+    already leaves only 0.06545 ms uncovered.
+
+    This also explains the old baseline's apparent four-to-five-millisecond
+    remainder: the 12.6 ms table was only a selected list of named operations,
+    not the complete 17--18 ms device timeline. The current interval-union
+    table is the detailed wall-time accounting; do not subtract a top-N kernel
+    list from endpoint TPOT and label the difference host overhead.
 
 ## Forward plan
 
@@ -1793,9 +1939,18 @@ the regressed TP2 up path remains disabled.
    supported by `ProcessGroupTPU`. A future up-projection attempt is justified
    only after adding a supported mixed-shape variadic collective or fusing the
    latent reduction, norm, projection, and shared combine more deeply.
-7. Preserve the best known configuration as the launcher default and run a
+7. Keep the current routed-GMM tiles. The exact 56-group sweep found only an
+   approximately 0.02 ms/decode GMM1-only opportunity, while splitting GMM2
+   regressed at four or more active local routes. Revisit only with a static
+   local-occupancy bound or a new full-width/pipelined kernel design.
+8. Treat the 0.13740 ms post-executable launch gap as a separate bounded
+   target. A model kernel change cannot remove it, and the remaining
+   endpoint-minus-start-spacing envelope is about 0.155 ms across separate
+   requests. Test runtime/dispatch changes only with device start spacing and
+   endpoint TPOT together; do not mislabel either interval input preparation.
+9. Preserve the best known configuration as the launcher default and run a
    final clean five-request endpoint validation once TPOT reaches 15 ms.
-8. Treat sampling as bounded: the exact-server temperature-1 versus greedy
+10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
    budget and exact mixed-parameter/deterministic-generator semantics.
