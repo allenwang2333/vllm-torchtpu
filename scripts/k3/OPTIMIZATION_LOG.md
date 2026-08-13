@@ -1952,6 +1952,40 @@ the regressed TP2 up path remains disabled.
     nor shortened their critical path. Reject it, restore
     `xla_tpu_enable_async_collective_fusion=false`, and do not expose this
     platform-risky flag as a launcher option.
+56. Tested the separate libtpu async collective merger on fresh Ray workers
+    and caches, while holding the accepted model graph and other launcher flags
+    fixed. Unlike async collective fusion, this pass emitted no non-Viperlite
+    safety warning. The exact launch addition was:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-async-collective-merger
+    export LIBTPU_INIT_ARGS='--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false --xla_tpu_enable_async_collective_merger=true'
+    TPU_K3_PALLAS_BLOCK_ROUTER_TOPK=0 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+    ```
+
+    The benchmark and profile commands are the milestone-55 commands with
+    `async-collective-fusion` replaced by `async-collective-merger`. Endpoint
+    means are 15.20766 and 15.21559 ms, averaging 15.21162 ms. This improves
+    the previous accepted 15.27388 ms pair by 0.06226 ms and leaves a 0.21162
+    ms gap to the 15 ms objective.
+
+    The latest rank-0 trace is
+    `/mnt/scratch/kimi-k3-b1-async-collective-merger-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2812978.1786631597999023926.pt.trace.json.gz`.
+    Eighteen stable executables average 14.91814 ms (14.91951 ms median), down
+    0.06387 ms from the accepted control. Stable starts are 15.05362 ms apart,
+    and the post-executable gap is 0.13612 ms. The primary plus async device
+    union falls from 14.91656 to 14.85122 ms, while uncovered time remains
+    essentially unchanged at 0.06692 ms.
+
+    The HLO-visible matched collective count remains 623 events/decode (615
+    primary-lane and eight async-lane events), so do not describe this as
+    removing high-level all-reduces. On identical primary-lane accounting,
+    their duration falls from 5.22903 to 5.16166 ms (-0.06736 ms); the async
+    lane stays 0.2062 ms. The collective reduction and executable reduction
+    agree with the endpoint pair, establishing a causal backend schedule win.
+    Accept the flag as a launcher default while preserving explicit `=false`
+    for controls.
 
 ## Forward plan
 
@@ -1972,14 +2006,12 @@ the regressed TP2 up path remains disabled.
    scalar attention-residual reductions are collectively expensive despite
    minimal payload. Avoid adding per-layer collectives solely for small
    replicated scorers.
-5. Continue from the now-enabled dependent-collective layer scheduler. Async
-   collective fusion is now also rejected: it left all 623 collective events
-   intact, regressed stable executable time by 0.008 ms, and carries an
-   explicit non-Viperlite correctness/hang warning. The next isolated compiler
-   candidate is `xla_tpu_enable_async_collective_merger=true`, which is a
-   separate merger pass and does not require enabling the risky fusion pass.
-   Accept it only if a trace shows fewer/shorter collective events and endpoint
-   TPOT improves. Otherwise return to collective reuse at the model boundary.
+5. Preserve the now-enabled dependent-collective layer scheduler and async
+   collective merger. The merger reduces the collective critical path by
+   0.06736 ms without changing HLO-visible count; async collective fusion is
+   rejected and must remain off because it regressed and carries an explicit
+   non-Viperlite safety warning. Further compiler work must target a different
+   measured mechanism and retain explicit control runs.
 6. Use the current-best profile to prioritize collective reuse/fusion or
    dense projections with enough work to beat the now-bounded subgroup cost;
    TP8 latent-down, TP4 latent-up when it breaks variadic reduction fusion,
@@ -2007,11 +2039,12 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best verified steady-state result is 15.27295--15.27481 ms from the fused
+The best verified steady-state result is 15.20766--15.21559 ms from the fused
 exact Pallas router plus the exact rank-16 route permutation, hierarchical
 routed experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, and enhanced libtpu launch
-barriers, dependent-collective layer scheduling, TP4 MLA fused A-projection
-sharding, plus the neutral top-k/top-p sampling specialization. The remaining
-gap to the 15 ms target is 0.274 ms (1.8% of the pair average). No
+barriers, dependent-collective layer scheduling, async collective merging, TP4
+MLA fused A-projection sharding, plus the neutral top-k/top-p sampling
+specialization. The remaining gap to the 15 ms target is 0.212 ms (1.4% of the
+pair average). No
 speculative decoding is used in any result.

@@ -72,6 +72,12 @@ fi
 if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_enable_layer_scheduler_for_dependent_collectives="* ]]; then
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_enable_layer_scheduler_for_dependent_collectives=true"
 fi
+# Merge compatible asynchronous collective work in the backend schedule. This
+# lowers the batch-1 K3 collective critical path without changing HLO-visible
+# collective count. Preserve an explicit caller choice for control runs.
+if [[ " ${LIBTPU_INIT_ARGS:-} " != *" --xla_tpu_enable_async_collective_merger="* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_enable_async_collective_merger=true"
+fi
 
 mkdir -p "${PROF_DIR}"
 

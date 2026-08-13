@@ -10,7 +10,7 @@ slice, without speculative decoding. All performance runs use dummy weights,
 `compile_sizes=[1]`, ISL=1, OSL=1000, and concurrency 1. Read
 `OPTIMIZATION_LOG.md` before selecting another experiment; it records rejected
 ideas as well as results. The best repeated configuration currently measures
-15.27295--15.27481 ms mean TPOT. It is backed up on the non-main branch
+15.20766--15.21559 ms mean TPOT. It is backed up on the non-main branch
 `agent/k3-b1-tpot-optimization-backup`.
 
 The launcher defaults contain the current winning model configuration:
@@ -23,8 +23,9 @@ The launcher defaults contain the current winning model configuration:
 - TP2 KDA `f_a` projection;
 - TP4 MLA fused query/KV A projection;
 - neutral top-k/top-p sampler specialization;
-- enhanced TPU launch barriers; and
-- XLA dependent-collective layer scheduling.
+- enhanced TPU launch barriers;
+- XLA dependent-collective layer scheduling; and
+- XLA asynchronous collective merging.
 
 Do not enable opt-in experimental flags just because their implementation is
 present. Many are retained for reproducibility after measuring neutral or
@@ -145,10 +146,11 @@ of TP4 MLA A sharding with latent-up disabled. A model-only environment
 override needs a new vLLM server and unique caches, but not a new Ray step when
 neither source nor `LIBTPU_INIT_ARGS` changed.
 
-The launcher appends the winning enhanced-barrier and dependent-collective
-flags unless the caller explicitly supplies either flag with `=true` or
-`=false`. For an isolated compiler experiment, append only that experiment's
-flag to `LIBTPU_INIT_ARGS`; do not bundle unrelated tuning flags.
+The launcher appends the winning enhanced-barrier, dependent-collective
+scheduler, and async-collective-merger flags unless the caller explicitly
+supplies a setting with `=true` or `=false`. For an isolated compiler
+experiment, append only that experiment's flag to `LIBTPU_INIT_ARGS`; do not
+bundle unrelated tuning flags.
 
 Wait for health before benchmarking:
 
@@ -244,13 +246,13 @@ when they do not initialize the TPU plugin.
 
 ### Live state at this handoff
 
-Allocation job 602 is intentionally still active. There is currently no Ray
-step and no vLLM server: async-collective-fusion server PID 2744587 was stopped
-cleanly and only Ray step `602.62` was canceled. Start fresh Ray workers with
-the four-host command above before the next experiment; a fresh Ray step is
-mandatory because the last trial changed `LIBTPU_INIT_ARGS`. The next planned
-isolated trial is `--xla_tpu_enable_async_collective_merger=true` on top of the
-normal launcher flags, with async collective fusion omitted/false.
+Allocation job 602 is intentionally still active. Ray step `602.65` and vLLM
+server PID 2810872 are currently running at `10.13.232.26:8000` with the newly
+accepted `--xla_tpu_enable_async_collective_merger=true` setting. Its cache is
+`/mnt/scratch/kimi-k3-b1-async-collective-merger` and its profile directory is
+`/mnt/scratch/kimi-k3-b1-async-collective-merger-profile`. Stop that exact
+server and Ray step before any source or `LIBTPU_INIT_ARGS` experiment; never
+cancel allocation job 602.
 
 The accepted result files are under
 `results/kimi-k3-b1-rank16-route-permute{,-repeat}` and measure 15.27481 and
@@ -308,12 +310,21 @@ and could cause incorrect results, hangs, or SDC. It also emits extremely
 large compiler logs; use `/health`, process state, and per-rank artifact saves
 rather than log volume to judge cold-start progress.
 
+The current best full-model trial is milestone 56. Its endpoint results under
+`results/kimi-k3-b1-async-collective-merger{,-repeat}` are 15.20766 and
+15.21559 ms mean TPOT (15.21162 ms pair average). Its latest rank-0 trace is
+`/mnt/scratch/kimi-k3-b1-async-collective-merger-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_2812978.1786631597999023926.pt.trace.json.gz`.
+Stable executable time is 14.91814 ms, primary-lane collective time is
+5.16166 ms, and the primary-plus-async device union is 14.85122 ms. The flag
+does not reduce the 623 HLO-visible matched collective events, but it shortens
+their backend critical path by 0.06736 ms/decode. It is now a launcher default;
+set `--xla_tpu_enable_async_collective_merger=false` explicitly in
+`LIBTPU_INIT_ARGS` only for a control.
+
 The immediately preceding Pallas attempt on Ray step `602.52` failed because
 Mosaic cannot dynamically gather across the seven source vector registers of
 an `8x896` score tile. The current code uses a masked reduction instead. Do
-not restore the dynamic gather. The next experiment requires fresh Ray workers
-because no Ray step is active. Never cancel allocation job 602 while
-continuing this work. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
+not restore the dynamic gather. Leave `TPU_K3_SHARD_LATENT_UP_PROJ=0`.
 
 Trace caveat for the earlier exact-JAX experiment: its rank-0 trace proves the
 selector still lowers to the same 92 `[1,896]` sorts (0.45000 ms/decode) and
