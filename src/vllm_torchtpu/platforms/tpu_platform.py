@@ -592,6 +592,7 @@ class TpuPlatform(Platform):
         "TPU_K3_OVERLAP_KDA_F_A_REDUCE",
         "TPU_K3_OVERLAP_LATENT_DOWN_ROUTER",
         "TPU_K3_SHARD_MLA_A_PROJ",
+        "TPU_K3_MLA_A_TP_SIZE",
         "TPU_K3_SHARD_ATTN_RES_PROJ",
         "TPU_K3_FUSE_ATTN_RES_DOT",
         "TPU_ACCELERATOR_TYPE"

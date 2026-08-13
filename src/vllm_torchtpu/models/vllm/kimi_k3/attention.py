@@ -219,10 +219,21 @@ class MultiHeadLatentAttention(nn.Module):
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
         mla_split = None
+        mla_tp_group = None
         if envs.TPU_K3_SHARD_MLA_A_PROJ:
             from vllm_torchtpu.layers.vllm.moe_hierarchical import \
                 hierarchical_split_or_none
             mla_split = hierarchical_split_or_none()
+            if mla_split is not None:
+                requested_mla_tp = envs.TPU_K3_MLA_A_TP_SIZE
+                if requested_mla_tp:
+                    mla_tp_group = _get_k3_projection_tp_group(
+                        requested_mla_tp)
+                    mla_split = (mla_split[0], mla_split[1],
+                                 mla_tp_group.world_size,
+                                 mla_tp_group.rank_in_group)
+                else:
+                    mla_tp_group = _get_k3_hierarchical_tp_group()
         self.shard_mla_a_proj = (self.q_lora_rank is not None
                                  and mla_split is not None
                                  and not getattr(config,
@@ -260,8 +271,8 @@ class MultiHeadLatentAttention(nn.Module):
             else:
                 if self.shard_mla_a_proj:
                     assert mla_split is not None
+                    assert mla_tp_group is not None
                     _, _, mla_tp_size, mla_tp_rank = mla_split
-                    mla_tp_group = _get_k3_hierarchical_tp_group()
                     with _linear_tp_override(mla_tp_rank, mla_tp_size):
                         self.fused_qkv_a_proj = MergedRowParallelLinear(
                             config.hidden_size,
