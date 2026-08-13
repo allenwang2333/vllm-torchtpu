@@ -133,25 +133,24 @@ def _get_topology_aware_pcp_ranks(group: Any, global_rank: int) -> tuple[int, ..
     except Exception:
         tp_size = 1
 
+    if tp_size <= 1:
+        return tuple(int(rank) for rank in group.ranks)
+
     try:
         import torch_tpu  # noqa: F401
 
         if hasattr(torch, "tpu") and hasattr(torch.tpu, "topology_aware_mesh"):
-            mesh_shape = (pcp_size, tp_size) if tp_size > 1 else (pcp_size, )
             topo_tensor = torch.tpu.topology_aware_mesh(
-                mesh_shape=mesh_shape,
+                mesh_shape=(pcp_size, tp_size),
                 topology="single_slice",
                 contiguous_submeshes=True,
             )
-            if tp_size > 1:
-                rank_coords = (topo_tensor == global_rank).nonzero(
-                    as_tuple=False)
-                if len(rank_coords) > 0:
-                    tp_coord = int(rank_coords[0][1].item())
-                    return tuple(
-                        int(r.item()) for r in topo_tensor[:, tp_coord])
-            else:
-                return tuple(int(r.item()) for r in topo_tensor.flatten())
+            rank_coords = (topo_tensor == global_rank).nonzero(
+                as_tuple=False)
+            if len(rank_coords) > 0:
+                tp_coord = int(rank_coords[0][1].item())
+                return tuple(
+                    int(r.item()) for r in topo_tensor[:, tp_coord])
     except Exception:
         pass
 

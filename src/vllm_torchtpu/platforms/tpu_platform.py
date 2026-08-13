@@ -22,7 +22,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
-from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -807,10 +806,6 @@ class TpuPlatform(Platform):
         if not multihost_backend:  # Single host
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
-                if pcp_size > 1:
-                    ensure_pcp_local_rank_remap(
-                        parallel_config.world_size_across_dp,
-                        get_topology=cls._get_tpu_topology)
                 # Single-host DP uses one torch_tpu slice across all DP*TP
                 # workers; the worker spawn shim exposes a DP-adjusted chip
                 # ordinal to TorchTPU for physical binding.
@@ -840,13 +835,6 @@ class TpuPlatform(Platform):
                     os.environ.pop("TORCH_TPU_DP_SIZE", "1") or 1)
                 torch_tpu_world_size = (parallel_config.world_size *
                                         dp_slice_size)
-                if pcp_size > 1:
-                    logger.info(
-                        "Preparing TorchTPU bootstrap env for native PCP "
-                        "multiprocess world_size=%d.", torch_tpu_world_size)
-                    ensure_pcp_local_rank_remap(
-                        torch_tpu_world_size,
-                        get_topology=cls._get_tpu_topology)
                 cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
             if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
                     and parallel_config.pipeline_parallel_size == 1

@@ -163,8 +163,7 @@ class TPUWorker(WorkerBase):
         binding = get_tpu_worker_binding(pc,
                                          self.rank,
                                          self.local_rank,
-                                         env=os.environ,
-                                         use_spawned_pcp_local_rank=True)
+                                         env=os.environ)
         # Slice-global rank: unique per worker process across DP replicas and
         # TP/PP ranks, which is what trace filenames must be keyed on. Set
         # before TPUModelRunner is built below, since the phased profiler
@@ -194,22 +193,16 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
-            if pc.enable_expert_parallel:
-                init_rank = binding.init_rank
-                init_world = binding.init_world_size
-                dist_init_method = self.distributed_init_method
-            else:
-                init_rank = binding.init_rank
-                init_world = binding.init_world_size
-                dist_init_method = self.distributed_init_method
+            init_rank = binding.init_rank
+            init_world = binding.init_world_size
+            dist_init_method = self.distributed_init_method
             local_rank_for_init = binding.init_local_rank
             dist_world_size = binding.world_size
             logger.info(
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "init_local_rank=%d pcp_remap=%s source=%s "
-                "(vllm_init_rank=%d vllm_init_world=%d)",
+                "init_local_rank=%d (vllm_init_rank=%d vllm_init_world=%d)",
                 dp_size,
                 dp_rank,
                 per_engine_world,
@@ -219,8 +212,6 @@ class TPUWorker(WorkerBase):
                 binding.local_rank,
                 binding.world_size,
                 binding.init_local_rank,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
                 init_rank,
                 init_world,
             )
@@ -231,50 +222,29 @@ class TPUWorker(WorkerBase):
                 raise ValueError(
                     "Expected tcp://<host>:<port> distributed_init_method, "
                     f"got: {dist_init_method!r}")
-            if pcp_size > 1:
+            local_world = os.environ.get(
+                "LOCAL_WORLD_SIZE") or pc.world_size
+            local_rank_for_init = int(self.local_rank)
+            debug_local_rank_offset = _debug_tpu_local_rank_offset()
+            tpu_local_rank_env = (local_rank_for_init +
+                                  debug_local_rank_offset)
+            tpu_local_world = int(local_world)
+            if debug_local_rank_offset:
+                tpu_local_world = max(
+                    tpu_local_world,
+                    debug_local_rank_offset + pc.world_size)
                 logger.info(
-                    "PCP native-rank TPU binding | rank=%d "
-                    "native_local_rank=%d local_rank_env=%d "
-                    "tpu_local_rank_env=%d local_world=%s "
-                    "tpu_local_world=%d remap=%s source=%s",
-                    self.rank,
-                    self.local_rank,
-                    binding.init_local_rank,
-                    binding.local_rank,
-                    binding.world_size,
-                    binding.local_world_size,
-                    binding.pcp_local_rank_remap,
-                    binding.pcp_remap_source,
-                )
-                init_rank = binding.init_rank
-                init_world = binding.init_world_size
-                local_rank_for_init = binding.init_local_rank
-                dist_world_size = binding.world_size
-                os.environ.update(binding.as_env())
-            else:
-                local_world = os.environ.get(
-                    "LOCAL_WORLD_SIZE") or pc.world_size
-                local_rank_for_init = int(self.local_rank)
-                debug_local_rank_offset = _debug_tpu_local_rank_offset()
-                tpu_local_rank_env = (local_rank_for_init +
-                                      debug_local_rank_offset)
-                tpu_local_world = int(local_world)
-                if debug_local_rank_offset:
-                    tpu_local_world = max(
-                        tpu_local_world,
-                        debug_local_rank_offset + pc.world_size)
-                    logger.info(
-                        "DEBUG TPU local rank offset applied: rank=%d "
-                        "local_rank=%d %s=%d -> tpu_local_rank=%d "
-                        "tpu_local_world=%d", self.rank, self.local_rank,
-                        DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
-                        debug_local_rank_offset, tpu_local_rank_env,
-                        tpu_local_world)
-                init_rank = self.rank
-                init_world = pc.world_size
-                dist_world_size = pc.world_size
-                _configure_tpu_process_env(self.rank, tpu_local_rank_env,
-                                           pc.world_size, tpu_local_world)
+                    "DEBUG TPU local rank offset applied: rank=%d "
+                    "local_rank=%d %s=%d -> tpu_local_rank=%d "
+                    "tpu_local_world=%d", self.rank, self.local_rank,
+                    DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
+                    debug_local_rank_offset, tpu_local_rank_env,
+                    tpu_local_world)
+            init_rank = self.rank
+            init_world = pc.world_size
+            dist_world_size = pc.world_size
+            _configure_tpu_process_env(self.rank, tpu_local_rank_env,
+                                       pc.world_size, tpu_local_world)
             if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
