@@ -2781,24 +2781,40 @@ the regressed TP2 up path remains disabled.
     averaging 15.1212043 ms. Both detailed result files show four successful,
     zero failed requests, four input tokens, and 4,000 generated tokens, with
     every input length exactly 1 and output length exactly 1,000. Stable
-    second-trace device accounting is:
+    second-trace device accounting against the fresh-Ray, same-source flag-off
+    control is:
 
-    | Device interval | Outer fused graph | Milestone-71 accepted trace | Change |
+    | Device interval | Outer fused graph | Matched flag-off control | Change |
     | --- | ---: | ---: | ---: |
-    | Compiled executable | 14.9032681 ms | 14.8395028 ms | +0.0637653 ms |
-    | Post-executable gap | 0.0427384 ms | 0.1360355 ms | -0.0932971 ms |
-    | Start spacing | 14.9460064 ms | 14.9755383 ms | -0.0295319 ms |
+    | Compiled executable | 14.9032681 ms | 14.9237891 ms | -0.0205211 ms |
+    | Post-executable gap | 0.0427384 ms | 0.1377510 ms | -0.0950126 ms |
+    | Start spacing | 14.9460064 ms | 15.0615401 ms | -0.1155337 ms |
 
-    Thus fusion removes about 93 us from the visible tail but moves about 64
-    us of that work into the outer executable; the net cross-compile device
-    indication is about 29.5 us/token. The remaining 42.74 us gap contains
+    The matched control endpoint means were 15.2135721 and 15.2168965 ms,
+    averaging 15.2152343 ms. The fused candidate therefore wins by
+    0.0940301 ms/token end to end. The stable device trace indicates a
+    0.1155337 ms/token start-spacing win: it eliminates the control's separate
+    69.934 us LM-head/all-gather and 18.805 us argmax modules and associated
+    launch intervals. The outer executable is itself 20.521 us shorter in
+    this compile rather than longer, which is why the earlier comparison to
+    the older milestone-71 binary understated the gain. The remaining 42.74
+    us gap contains
     about 4.54 us full-vocabulary uniform generation, 2.88 us seed/uniform
     setup, 5.20 us token view, 4.85 us placeholder scatter, and 24.81 us not
     attributed to named device modules. It does not erase sampling work, and
     random-number generation still occurs outside the outer graph before its
-    input can be consumed. A fresh-Ray same-source flag-off control is in
-    progress on exact Ray step `664.45`; do not accept the 29.5 us
-    cross-compile delta until that control pair and trace are recorded here.
+    input can be consumed.
+
+    Candidate and control detailed JSONs both completed 4/4 requests per run
+    with no errors and the exact expected 1-token inputs/1,000-token outputs.
+    More strongly, the four detokenized outputs are byte-for-byte identical
+    between candidate and control in each corresponding run. Their SHA-256
+    hashes (over the JSON-encoded output list) are
+    `7028e05098bf2cc993b9a27608577eeba2157c6b13283b5296521b08c830f6b7`
+    and
+    `b6138c70a6259103bf7bc0a84bc3347e376a35754b176f49032f92ab8b4356b0`.
+    This is useful equivalence evidence for the dummy-weight sampled path,
+    not a substitute for real-checkpoint quality validation.
 
     Exact candidate launch on fresh Ray step `664.36`:
 
@@ -2831,6 +2847,32 @@ the regressed TP2 up path remains disabled.
       /mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_89892.1786667257350005705.pt.trace.json.gz
     ```
 
+    The matched control used exact Ray step `664.45`, the same complete
+    `LIBTPU_INIT_ARGS`, source checkout, and Tier-2/Tier-3 lineage, but a fresh
+    flag-off runtime namespace:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-backbone-lm-sampler-control-v2
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=0 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+      PROF_DIR=$PROF_DIR \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+
+    .venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 30 \
+      /mnt/scratch/kimi-k3-b1-backbone-lm-sampler-control-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_201194.1786668732781632626.pt.trace.json.gz
+    ```
+
     The canonical workload is real serving execution with synthetic content:
     one probe, two unmeasured warmups, then four measured sequential requests;
     each has one reproducible random non-special prefix token (`seed=42`) and
@@ -2843,6 +2885,115 @@ the regressed TP2 up path remains disabled.
     a 20--30 second benchmark-client startup while it imports TorchTPU and
     emits the benign metadata 404. `VLLM_PLUGINS=""` breaks this installed CLI
     with an unresolved `current_platform`; it is not a client-startup fix.
+
+75. Eliminated the remaining view and placeholder-scatter modules from the
+    opt-in whole-step path, but did not establish a new absolute endpoint
+    best. The outer graph now returns its sampled token as one-dimensional
+    `int32`; the async runner parks that tensor without `view(-1)` and, for the
+    admitted exact batch-1 continuation, reuses it directly as the next
+    step's `input_ids` rather than staging two index tensors and launching
+    `_substitute_placeholder_token`.
+
+    The first live `v3` attempt compiled successfully but exposed a host-side
+    shape assumption before any timed request completed. The async public
+    output path already normalizes a 1-D copied token tensor to
+    `[num_reqs, 1]`, while `_modify_prev_results` did not; its `.tolist()`
+    therefore produced an integer and failed at `len(sampled_ids)` with
+    `TypeError: object of type 'int' has no len()`. The benchmark correctly
+    reported 0 successful/4 failed requests and HTTP 500, and the repeat was
+    interrupted before it ran. `_modify_prev_results` now performs the same
+    1-D-to-2-D normalization. Fresh Ray step `664.47` then completed a smoke
+    request with exactly one prompt and 1,000 completion tokens, followed by
+    three detailed 4/4 endpoint runs with zero errors and exact
+    `input_lens=[1,1,1,1]` / `output_lens=[1000,1000,1000,1000]`.
+
+    The endpoint results were:
+
+    | Run | Mean TPOT | Median TPOT | Interpretation |
+    | --- | ---: | ---: | --- |
+    | `direct-token-v3-fix` | 15.1744385 ms | 15.1711596 ms | clean |
+    | `direct-token-v3-fix-repeat` | 15.3153087 ms | 15.1784383 ms | one request contained a 138.19 ms ITL stall |
+    | `direct-token-v3-fix-repeat2` | 15.2000188 ms | 15.1678214 ms | one request contained a 79.09 ms ITL stall |
+
+    Excluding those isolated stalls, individual request means cluster at
+    15.1672--15.1881 ms. This is slower than the earlier whole-step `v2`
+    pair (15.1212043 ms average), so it is not a new absolute best and does
+    not close the 15 ms objective. The stalls are why detailed per-request
+    ITLs and a repeat are mandatory; never average the all-failed attempt or
+    interpret a single long ITL as TPU kernel time.
+
+    The first stable rank-0 capture is:
+
+    ```text
+    /mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3-fix-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_332681.1786670922652223808.pt.trace.json.gz
+    ```
+
+    Its device accounting versus whole-step `v2` is:
+
+    | Device interval | Direct-token v3 | Whole-step v2 | Change |
+    | --- | ---: | ---: | ---: |
+    | Compiled executable | 14.9991191 ms | 14.9032681 ms | +0.0958510 ms |
+    | Post-executable gap | 0.0275971 ms | 0.0427384 ms | -0.0151413 ms |
+    | Start spacing | 15.0267162 ms | 14.9460064 ms | +0.0807098 ms |
+    | Token view | 0 | 0.0051971 ms | -0.0051971 ms |
+    | Placeholder scatter | 0 | 0.0048511 ms | -0.0048511 ms |
+
+    The micro-optimization is real in its intended scope: it removes both
+    named modules and another roughly 5 us of launch/interval overhead. The
+    new outer binary's unrelated 95.9 us executable regression dominates the
+    absolute comparison, illustrating again why cross-compile endpoint
+    attribution is unsafe. Keep the direct handoff inside the already opt-in
+    whole-step feature for future work, but do not claim it as a new measured
+    endpoint win without a same-binary/matched control method.
+
+    Exact repair validation and profile commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-backbone-lm-sampler-direct-token-v3-fix
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-backbone-lm-sampler-v1
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v1/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/smoke-$K3_RUN_NAME \
+      scripts/k3/curl_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat2 \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+      PROF_DIR=$PROF_DIR \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Reusing the failed server's vLLM runtime cache did not avoid all host AOT
+    work: both profile and serving wrappers logged `a bytes-like object is
+    required, not 'BundledAOTAutogradResult'`, regenerated their wrappers,
+    and then loaded the cached TPU executable. Treat a saved XLA artifact and
+    a reusable vLLM AOT wrapper as distinct cache layers.
+
+    A leaf-timeline audit also rejects the tempting temperature-1 follow-up:
+    the outer executable's final full-vocabulary `broadcast_divide_fusion`
+    costs only 0.061 us in the representative step, while the fused
+    Gumbel/argmax reduction costs 10.612 us. Hard-coding temperature 1 would
+    narrow semantics for effectively no device gain. The remaining visible
+    tail is about 4.15 us vocabulary RNG, 2.58 us RNG setup, and 20.74 us of
+    inter-module intervals. Moving RNG into the compiled graph is the only
+    remaining tail fusion with even single-digit-microsecond kernel leverage,
+    but it must preserve the rank-synchronized generator stream and exact
+    random-number-to-token mapping. A separate host-side hygiene experiment
+    may launch the same binary with `--disable-log-stats` to see whether it
+    removes the isolated 79/138 ms ITL stalls; do not project it as a stable
+    TPOT or TPU-kernel win unless clean paired endpoint data supports that.
 
 ## Forward plan
 
@@ -2894,22 +3045,24 @@ the regressed TP2 up path remains disabled.
    approximately 0.02 ms/decode GMM1-only opportunity, while splitting GMM2
    regressed at four or more active local routes. Revisit only with a static
    local-occupancy bound or a new full-width/pipelined kernel design.
-8. Treat the accepted trace's 0.13608 ms post-backbone tail as mostly device
-   work, not runtime idle: milestone 66 accounts for 0.10517 ms in the LM head,
-   sampling, views, and placeholder scatter and leaves 0.03091 ms uncovered.
-   The mutation-replay experiments remain rejected, but host/device clock skew
-   means they were aimed at the wrong interval. Prioritize fusing the LM-head
-   boundary or avoiding its full-vocabulary TP32 all-gather; validate device
-   start spacing and endpoint TPOT together. Milestone 67 validates the first
-   such fusion: it saves 0.00837 ms/token against a matched control, but is
-   opt-in because it excludes speculative decode, grammar, and logprobs. The
-   remaining larger opportunity would have to avoid or shrink the full-vocab
-   TP32 all-gather rather than merely combining launches.
-9. Preserve the best known configuration as the launcher default. First run a
-   clean accepted-stack validation with the milestone-71 flag supplied before
-   Ray startup; the matched delta projects 15.04426 ms but the strict verified
-   best is still 15.11879 ms. Run a final clean five-request endpoint
-   validation once TPOT reaches 15 ms.
+8. Treat the original 0.13608 ms post-backbone tail as mostly device work,
+   not runtime idle. Milestone 74's outer backbone/LM-head/sampler graph cuts
+   the matched tail to 0.04274 ms and wins 0.09403 ms/token end to end; retain
+   it as an opt-in canonical temperature-1 path because its request contract
+   is deliberately narrow. Milestone 75's direct token handoff further cuts
+   the tail to 0.02760 ms and removes both view/scatter modules, but its fresh
+   outer binary is 0.09585 ms slower and therefore sets no absolute best.
+   Hard-coding temperature 1 is statically rejected because the traced divide
+   costs only 0.061 us. The only remaining tail fusion is moving the roughly
+   6.7 us RNG work into the executable with exact generator semantics; larger
+   gains must instead improve the backbone or avoid/shrink the full-vocabulary
+   TP32 all-gather.
+9. Preserve the broadly applicable best configuration as the launcher default
+   and keep the narrow whole-step path opt-in. The combined matched deltas now
+   project 14.95023 ms, but no absolute whole-step binary has verified that
+   number. The next acceptance gate is an absolute clean run at or below
+   15 ms with all intended flags present before Ray startup; once reached,
+   repeat it with at least five measured requests and no long-ITL outlier.
 10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
@@ -2962,8 +3115,13 @@ scheduling, async collective merging,
 bidirectional all-reduce decomposition, TP4 MLA fused A-projection sharding,
 plus the neutral top-k/top-p sampling specialization. Milestone 71 additionally
 accepts multi-compute layer-scheduler overlap from a matched -0.07453 ms/token
-comparison and projects the combined stack to 15.04426 ms; that projection is
-not yet a replacement for the strict absolute result. The strict remaining
-gap is 0.119 ms, while the projected gap is 0.044 ms. Enhanced launch barriers
-are not part of either effective configuration because TorchTPU forces them
-off in distributed actors. No speculative decoding is used in any result.
+comparison. Milestone 74 measures a further -0.09403 ms/token matched delta
+for the opt-in whole-step graph on top of that flag set. Arithmetically
+stacking both matched deltas with the strict 15.11879 ms pair projects about
+14.95023 ms, but this is not a verified absolute result: the separately
+compiled whole-step binaries measured 15.12120 ms (`v2`) and 15.17444 ms
+(clean direct-token `v3`) in their own sessions. The strict verified gap
+therefore remains 0.119 ms even though the delta projection crosses the goal.
+Enhanced launch barriers are not part of any effective configuration because
+TorchTPU forces them off in distributed actors. No speculative decoding is
+used in any result.

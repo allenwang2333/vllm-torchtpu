@@ -51,6 +51,44 @@ After any source change, verify that worker PIDs are newer than the edit or,
 preferably, restart the exact Ray Slurm step. A new cache path alone does not
 refresh Python imports in persistent Ray workers.
 
+The latest accepted canonical-path experiment is the opt-in whole-step
+backbone/LM-head/sampler graph (`TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1`).
+Its two endpoint means are 15.1354325 and 15.1069760 ms (15.1212043 ms
+average), versus 15.2135721 and 15.2168965 ms (15.2152343 ms average) for a
+fresh-Ray, same-source flag-off control: a 0.0940301 ms/token matched win. A
+stable rank-0 trace shows start spacing fall from 15.0615401 to 14.9460064 ms
+and the post-executable tail fall from 0.1377510 to 0.0427384 ms. The detailed
+candidate/control output lists are byte-identical in both paired runs. Keep
+the feature opt-in because it intentionally rejects greedy, filtered,
+grammar, logprobs, speculative, PCP, and batch-greater-than-one requests; it
+is valid for the canonical temperature-1 benchmark only. Milestone 74 has the
+exact launch, benchmark, profile, trace, and output-hash evidence.
+
+Milestone 75 further removes the fused path's token-view and async
+placeholder-scatter launches by returning a 1-D int32 token and reusing it as
+the next decode input. Its first attempt failed before timing because
+`_modify_prev_results` treated a 1-D copied tensor's `.tolist()` as a list of
+request rows; the repaired code normalizes it to `[num_reqs,1]`, and a smoke
+request plus three detailed runs all completed exact 1/1000 token lengths.
+The stable trace tail improves from 42.738 to 27.597 us, but that fresh outer
+binary's executable regressed by 95.851 us, so its clean endpoint run is
+15.1744385 ms and it is not a new absolute best. Two repeats contain isolated
+79/138 ms ITL stalls; use per-request ITLs and medians when diagnosing them.
+The exact trace and commands are in milestone 75. A reused vLLM AOT wrapper
+may still regenerate with a `BundledAOTAutogradResult` load error even when
+the cached TPU executable itself loads successfully.
+
+Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
+Ray step `664.47` are running; the repaired direct-token server is healthy at
+`10.13.232.26:8000` (API PID 331448, engine PID 332029). Its run/profile name
+is `kimi-k3-b1-backbone-lm-sampler-direct-token-v3-fix`, while its vLLM/XLA
+cache intentionally reuses
+`/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3`. Continue with a
+same-binary `--disable-log-stats` jitter control or another read-only trace
+audit before changing source. If source changes, stop the server and cancel
+only step `664.47`, then start fresh Ray workers; do not cancel parent
+allocation `664`.
+
 ### Resume an existing four-host Slurm allocation
 
 The commands below show the exact manual workflow used during optimization.
