@@ -2995,6 +2995,58 @@ the regressed TP2 up path remains disabled.
     removes the isolated 79/138 ms ITL stalls; do not project it as a stable
     TPOT or TPU-kernel win unless clean paired endpoint data supports that.
 
+76. **Disabling periodic vLLM request statistics removes the observed large
+    endpoint stalls, but does not lower the stable device/TPOT floor.** The
+    repaired direct-token v3 server was restarted on the same Ray step with
+    the same source, model flags, libtpu flags, cache roots, and canonical
+    request, adding only `--disable-log-stats`. Two detailed endpoint runs
+    completed all eight measured requests with exact one-token inputs and
+    1,000-token outputs:
+
+    | Run | Mean TPOT | Median TPOT | P99 TPOT | Worst individual ITL |
+    | --- | ---: | ---: | ---: | ---: |
+    | `direct-token-v3-disable-log-stats` | 15.1726597 ms | 15.1700076 ms | 15.1848790 ms | 26.6853 ms |
+    | `direct-token-v3-disable-log-stats-repeat` | 15.1690104 ms | 15.1662968 ms | 15.1774271 ms | 26.4205 ms |
+
+    This is much cleaner than the flag-on predecessor repeats that contained
+    isolated 79.09 and 138.19 ms ITLs. It is useful host-side benchmark
+    hygiene and should be used for future endpoint measurements. It is not a
+    kernel optimization: central TPOT remains about 15.17 ms, consistent with
+    the direct-token v3 executable floor, and no trace was needed to establish
+    that the device critical path did not improve. Eight clean requests also
+    do not prove that request-stat logging alone caused every rare stall;
+    longer soak testing would be needed for a tail-SLO claim.
+
+    Exact launch and benchmark commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-backbone-lm-sampler-direct-token-v3-disable-log-stats
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-backbone-lm-sampler-v1
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v1/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh --disable-log-stats
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Cache caveat: this restart reused the prior cache paths and resolved the
+    same graph/config cache directories, but vLLM nevertheless regenerated
+    both profile and serving AOT wrappers and ran fresh TPU compilation on all
+    ranks. Startup took roughly 12 minutes. Consequently the comparison is
+    same-source/same-flags but not a zero-recompile matched binary experiment;
+    do not attribute sub-0.1-ms central-latency movement to
+    `--disable-log-stats`. The detailed JSONs contain four generated-text
+    strings and empty errors in each run, but dummy weights make those strings
+    random rather than quality evidence.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The

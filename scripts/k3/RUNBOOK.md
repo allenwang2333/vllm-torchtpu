@@ -3,7 +3,7 @@
 Run these commands from the repository root. Replace `<SERVER_IP>` with the IP
 of the host serving the OpenAI-compatible endpoint.
 
-## Optimization handoff (2026-08-13)
+## Optimization handoff (2026-08-14)
 
 The active objective is batch-1 TPOT at or below 15 ms on one TPU v7x-32
 slice, without speculative decoding. All performance runs use dummy weights,
@@ -78,16 +78,26 @@ The exact trace and commands are in milestone 75. A reused vLLM AOT wrapper
 may still regenerate with a `BundledAOTAutogradResult` load error even when
 the cached TPU executable itself loads successfully.
 
+Milestone 76 tested `--disable-log-stats` on that repaired v3 path. Two
+detailed runs measured 15.1726597 and 15.1690104 ms mean TPOT; their worst
+individual ITLs were only 26.685 and 26.420 ms, versus the earlier isolated
+79/138 ms stalls. Use this option as endpoint benchmark hygiene, but do not
+call it a device optimization: the stable 15.17 ms floor did not move, eight
+clean requests are not a long tail-SLO soak, and the restart unexpectedly
+regenerated both vLLM AOT layers plus the TPU executable despite reusing the
+same cache paths.
+
 Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
 Ray step `664.47` are running; the repaired direct-token server is healthy at
-`10.13.232.26:8000` (API PID 331448, engine PID 332029). Its run/profile name
-is `kimi-k3-b1-backbone-lm-sampler-direct-token-v3-fix`, while its vLLM/XLA
-cache intentionally reuses
+`10.13.232.26:8000` (API PID 398527, engine PID 400405). Its run/profile name
+is `kimi-k3-b1-backbone-lm-sampler-direct-token-v3-disable-log-stats`, while
+its vLLM/XLA cache intentionally reuses
 `/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3`. Continue with a
-same-binary `--disable-log-stats` jitter control or another read-only trace
-audit before changing source. If source changes, stop the server and cancel
-only step `664.47`, then start fresh Ray workers; do not cancel parent
-allocation `664`.
+longer logging-disabled tail soak only if tail behavior matters; it cannot
+close the stable TPOT gap. Otherwise return to a device-critical-path idea or
+another read-only trace audit before changing source. If source changes, stop
+the server and cancel only step `664.47`, then start fresh Ray workers; do not
+cancel parent allocation `664`.
 
 ### Resume an existing four-host Slurm allocation
 
@@ -338,14 +348,14 @@ when they do not initialize the TPU plugin.
   agent is unavailable, `gh auth setup-git` followed by an HTTPS push is the
   working fallback.
 
-### Live state at this handoff
+### Historical allocation state
 
 Allocation 602 expired at its 24-hour limit. Replacement allocation 664 is
 running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
 IP `10.13.232.26`. The milestone-73 server and exact Ray step `664.35` were
-cleanly stopped after its endpoint pair. No Ray step or vLLM server is currently
-running; all 32 TPUs are free. Start fresh workers with the complete accepted
-flag string above, verify 32/32 resources, and preserve parent allocation 664.
+cleanly stopped after its endpoint pair. This paragraph is historical; the
+authoritative current state is the live handoff near the top of this file,
+currently Ray step `664.47` and the milestone-76 logging-disabled server.
 
 Current status checks are:
 
