@@ -3107,6 +3107,66 @@ the regressed TP2 up path remains disabled.
     warmups per invocation are real requests but are excluded from the saved
     four-request performance aggregate.
 
+    A same-server profile then supplied the current detailed runtime
+    reconciliation. Because `--disable-log-stats` removes the
+    `vllm:iteration_tokens_total_count` metric, the normal
+    `profile_isl1_osl1k.sh` helper completed its two warmups but exited before
+    capture when its iteration-counter poll failed. The working method used
+    the server's already configured `delay_iterations=3` and
+    `max_iterations=15` directly:
+
+    ```bash
+    scripts/k3/start_profile.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_FILE=$PWD/results/profile-$K3_RUN_NAME/manual-capture-1-response.json \
+      scripts/k3/curl_isl1_osl1k.sh 10.13.232.26
+    scripts/k3/stop_profile.sh 10.13.232.26
+
+    .venv/bin/python scripts/k3/analyze_trace_tail.py \
+      --region 'tt_jit_model_L332C0_forward_argmax(1115740701171761723)' \
+      --top-modules 40 \
+      /mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v2-restored-disable-log-stats-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_448724.1786674414491634297.pt.trace.json.gz
+    ```
+
+    The manual capture response again contains exactly one prompt token and
+    1,000 completion tokens. Distributed `/stop_profile` flushing took about
+    90 seconds; never use that request for endpoint latency. The trace has 80
+    usable decode-to-decode gaps:
+
+    | Current rank-0 interval | Mean | Median |
+    | --- | ---: | ---: |
+    | Outer executable | 14.966610 ms | 14.941079 ms |
+    | Post-executable gap | 0.042732 ms | 0.042728 ms |
+    | Decode start spacing | 15.009342 ms | 14.983568 ms |
+    | Named device modules in the gap | 0.015346 ms | 0.015332 ms |
+    | Uncovered gap interval | 0.027386 ms | 0.027378 ms |
+
+    The gap's named means are 4.757 us token view, 4.277 us placeholder
+    scatter, 3.962 us vocabulary RNG, and 2.351 us RNG setup. A separate
+    name-based, exclusive aggregation of the XLA-op lane over 61 fully
+    leaf-covered stable modules gives:
+
+    | In-executable leaf family | Self time/decode |
+    | --- | ---: |
+    | All-reduce | 5.039157 ms |
+    | Copy | 3.628891 ms |
+    | Fusion | 2.322230 ms |
+    | Custom call | 1.730640 ms |
+    | Dense dot/convolution | 1.275414 ms |
+    | Reshape/bitcast | 0.220060 ms |
+    | Gather | 0.110654 ms |
+    | Other | 0.068551 ms |
+    | All-gather | 0.030756 ms |
+
+    Those exclusive leaf names sum to 14.426354 ms versus a 14.937575 ms
+    enclosing-module median on the same leaf-covered subset. The 0.511 ms
+    arithmetic difference is not a measured idle category: leaf self time,
+    async/core interval coverage, and enclosing module wall time have
+    different scopes. Together with the directly measured 0.0427 ms outer
+    gap, the current trace again rules out both a 4 ms outside-model/input-prep
+    remainder and a 1.3 ms hidden idle kernel. The dominant targets remain
+    in-executable all-reduces, copies, fusions, and custom/dense compute.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The

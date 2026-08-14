@@ -96,6 +96,12 @@ were clean, with exact 1/1000 request lengths and worst ITLs of 23.294 and
 hardens `_modify_prev_results`, but do not force the outer graph to return a
 1-D int32 token or bypass normal placeholder substitution: the trace proved a
 15.141 us tail saving but no executable or endpoint win.
+The same-server milestone-77 trace measures a 14.9411 ms median outer
+executable, 0.042728 ms median tail, and 14.9836 ms median decode-start
+spacing. Its current leaf-family table is dominated by 5.0392 ms all-reduce,
+3.6289 ms copy, 2.3222 ms fusion, 1.7306 ms custom calls, and 1.2754 ms dense
+dot/convolution. There is no multi-millisecond outside-model/input-prep gap or
+1.3 ms measured idle category; see the milestone for the accounting caveats.
 
 Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
 Ray step `664.48` are running; the restored-v2 server is healthy at
@@ -346,6 +352,14 @@ when they do not initialize the TPU plugin.
   the requested 15 iterations while all ranks merge and flush traces. During
   that time the in-flight completion can stall. Do not infer its endpoint
   TPOT from that profiled request; use the separate canonical benchmark.
+- `profile_isl1_osl1k.sh` polls
+  `vllm:iteration_tokens_total_count`; that metric is absent under
+  `--disable-log-stats`, so the helper exits after its warmups and before
+  capture. With a server launched using `delay_iterations=3` and
+  `max_iterations=15`, call `start_profile.sh`, issue one exact
+  `curl_isl1_osl1k.sh` request, and then call `stop_profile.sh` instead.
+  Milestone 77 records the exact commands and current trace. Its distributed
+  flush took about 90 seconds, longer than the usual range.
 - Do not add durations from the two TPU-core lanes or nested async-copy events
   as wall time. Use interval unions for occupancy and one consistent XLA-op
   lane for paired family comparisons. The former 1.387 ms "idle" residual was
@@ -364,7 +378,8 @@ running on `tpu-rack1-w-[001-004]` through 2026-08-14 16:00:28 UTC, with head
 IP `10.13.232.26`. The milestone-73 server and exact Ray step `664.35` were
 cleanly stopped after its endpoint pair. This paragraph is historical; the
 authoritative current state is the live handoff near the top of this file,
-currently Ray step `664.47` and the milestone-76 logging-disabled server.
+currently Ray step `664.48` and the milestone-77 restored-v2 logging-disabled
+server.
 
 Current status checks are:
 
