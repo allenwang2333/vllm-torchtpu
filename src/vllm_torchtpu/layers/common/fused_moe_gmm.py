@@ -466,7 +466,7 @@ def fused_moe_func(
         k_dim = w1.shape[1]
         id_dim = w1.shape[2] // 2
         use_pipelined = (_USE_PIPELINED_CN and k_dim <= _CN_K_TILE
-                        and id_dim <= _CN_I_TILE)
+                         and id_dim <= _CN_I_TILE)
         cn_fn = cn_moe_full_pipelined if use_pipelined else cn_moe_full
         _lc_logger.info(
             f"CN kernel variant: {'pipelined' if use_pipelined else 'original'}")
