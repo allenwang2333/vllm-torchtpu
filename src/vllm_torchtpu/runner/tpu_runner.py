@@ -2106,23 +2106,6 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
-        if self._fuse_k3_backbone_lm_head_sampler:
-            # This experiment is admitted only for the exact batch-1,
-            # non-speculative async path. Its sole decode input is precisely
-            # the previous step's sole sampled token, so reuse that device
-            # tensor directly instead of copying two index tensors H2D and
-            # launching the compiled placeholder-scatter program.
-            assert input_ids.shape == (1, )
-            assert token_in_tpu_cur_input_indices.shape == (1, )
-            assert token_in_tpu_pre_next_tokens_indices.shape == (1, )
-            assert token_in_tpu_cur_input_indices[0] == 0
-            assert token_in_tpu_pre_next_tokens_indices[0] == 0
-            assert self._pre_async_results is not None
-            next_tokens = self._pre_async_results.next_tokens_tpu
-            assert next_tokens.shape == (1, )
-            assert next_tokens.dtype == input_ids.dtype
-            return next_tokens
-
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside
@@ -3694,14 +3677,7 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
-                    if state.tokens_preselected:
-                        # The fused outer graph already returns the canonical
-                        # async source as 1-D int32; avoid a separate as_strided
-                        # view program on the hot path.
-                        next_tokens_tpu_chunks.append(selected_token_ids)
-                    else:
-                        next_tokens_tpu_chunks.append(
-                            selected_token_ids.view(-1))
+                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
                     for req_idx in range(cur_start_idx, cur_end_idx):
                         next_token_indices[req_idx] = (next_tokens_tpu_offset +
                                                        req_idx - cur_start_idx)

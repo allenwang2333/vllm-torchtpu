@@ -2942,9 +2942,9 @@ the regressed TP2 up path remains disabled.
     named modules and another roughly 5 us of launch/interval overhead. The
     new outer binary's unrelated 95.9 us executable regression dominates the
     absolute comparison, illustrating again why cross-compile endpoint
-    attribution is unsafe. Keep the direct handoff inside the already opt-in
-    whole-step feature for future work, but do not claim it as a new measured
-    endpoint win without a same-binary/matched control method.
+    attribution is unsafe. Milestone 77 subsequently removes the direct
+    handoff after a fresh-Ray, fresh-cache endpoint recheck found no benefit;
+    do not restore it without a same-binary/matched control method.
 
     Exact repair validation and profile commands were:
 
@@ -3047,6 +3047,66 @@ the regressed TP2 up path remains disabled.
     strings and empty errors in each run, but dummy weights make those strings
     random rather than quality evidence.
 
+77. **Removed the direct-token handoff specialization after a clean recheck
+    found no endpoint benefit.** Milestone 75 established that returning a
+    1-D `int32` token and bypassing normal placeholder substitution saved
+    15.141 us in the post-executable tail, but its newly compiled outer
+    executable lost 95.851 us. Keeping a narrow, shape-sensitive runner path
+    for an unaccepted result was therefore not justified. The outer sampler
+    once again returns the normal `[1,1]` argmax tensor, async scheduling uses
+    `view(-1)` and `_substitute_placeholder_token`, and the special direct
+    reuse branch is gone. The independent 1-D-to-2-D normalization in
+    `_modify_prev_results` remains as a harmless correctness hardening.
+
+    This was validated on fresh exact Ray step `664.48`, after the source edit
+    and with a unique cold cache namespace, all accepted libtpu flags,
+    `TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1`, and `--disable-log-stats`.
+    Compilation confirmed the restored outer HLO module
+    `tt_jit_model_L332C0_forward_argmax` (70,922 initial instructions) and the
+    placeholder-scatter program. Both detailed serving benchmarks completed
+    four of four measured requests with no errors:
+
+    | Run | Mean TPOT | Median TPOT | P99 TPOT | Worst individual ITL |
+    | --- | ---: | ---: | ---: | ---: |
+    | `v2-restored-disable-log-stats` | 15.1711375 ms | 15.1697700 ms | 15.1834833 ms | 23.2942 ms |
+    | `v2-restored-disable-log-stats-repeat` | 15.1680589 ms | 15.1678781 ms | 15.1733049 ms | 21.2040 ms |
+
+    Their 15.1695982 ms average is only 0.0012368 ms below the milestone-76
+    logging-disabled v3 average (15.1708350 ms), far below attribution noise.
+    This is a source-simplification/correctness decision, not a claimed
+    performance win and not a new absolute best. It also reinforces that the
+    earlier 15.1212043 ms v2 average versus 15.17 ms later binaries contains
+    substantial cross-compile/session variance.
+
+    Exact server and benchmark commands were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-backbone-lm-sampler-v2-restored-disable-log-stats
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-backbone-lm-sampler-v1
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v1/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh --disable-log-stats
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The two JSON files each contain `completed=4`, `failed=0`,
+    `input_lens=[1,1,1,1]`, `output_lens=[1000,1000,1000,1000]`, four empty
+    error strings, and four detokenized generated-text strings. As documented
+    in milestone 74 and the runbook, this is real OpenAI-serving-path work
+    over reproducible synthetic one-token content and dummy-shaped weights;
+    the outputs are random and are not model-quality data. The probe and two
+    warmups per invocation are real requests but are excluded from the saved
+    four-request performance aggregate.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -3101,9 +3161,10 @@ the regressed TP2 up path remains disabled.
    not runtime idle. Milestone 74's outer backbone/LM-head/sampler graph cuts
    the matched tail to 0.04274 ms and wins 0.09403 ms/token end to end; retain
    it as an opt-in canonical temperature-1 path because its request contract
-   is deliberately narrow. Milestone 75's direct token handoff further cuts
-   the tail to 0.02760 ms and removes both view/scatter modules, but its fresh
-   outer binary is 0.09585 ms slower and therefore sets no absolute best.
+   is deliberately narrow. Milestone 75's direct token handoff cut the tail
+   to 0.02760 ms and removed both view/scatter modules, but its fresh outer
+   binary was 0.09585 ms slower; milestone 77 removes that unaccepted
+   specialization after a clean recheck found no endpoint benefit.
    Hard-coding temperature 1 is statically rejected because the traced divide
    costs only 0.061 us. The only remaining tail fusion is moving the roughly
    6.7 us RNG work into the executable with exact generator semantics; larger

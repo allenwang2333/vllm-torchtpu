@@ -328,12 +328,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             max=1.0 - torch.finfo(sampling_uniform.dtype).eps,
         )
         gumbel_noise = -torch.log(-torch.log(u_clamped))
-        # The canonical batch-1 async path consumes this token directly as
-        # the next step's ``input_ids``. Match that tensor's 1-D int32
-        # contract here so the runner does not need a view or dtype-conversion
-        # program after the compiled outer-model graph.
         return torch.argmax(scaled_logits + gumbel_noise,
-                            dim=-1).to(torch.int32)
+                            dim=-1,
+                            keepdim=True)
 
     def compute_logits(self,
                        hidden_states: torch.Tensor) -> torch.Tensor | None:

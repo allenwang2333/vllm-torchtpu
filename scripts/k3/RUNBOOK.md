@@ -64,13 +64,13 @@ grammar, logprobs, speculative, PCP, and batch-greater-than-one requests; it
 is valid for the canonical temperature-1 benchmark only. Milestone 74 has the
 exact launch, benchmark, profile, trace, and output-hash evidence.
 
-Milestone 75 further removes the fused path's token-view and async
+Milestone 75 tested removing the fused path's token-view and async
 placeholder-scatter launches by returning a 1-D int32 token and reusing it as
 the next decode input. Its first attempt failed before timing because
 `_modify_prev_results` treated a 1-D copied tensor's `.tolist()` as a list of
 request rows; the repaired code normalizes it to `[num_reqs,1]`, and a smoke
 request plus three detailed runs all completed exact 1/1000 token lengths.
-The stable trace tail improves from 42.738 to 27.597 us, but that fresh outer
+The stable trace tail improved from 42.738 to 27.597 us, but that fresh outer
 binary's executable regressed by 95.851 us, so its clean endpoint run is
 15.1744385 ms and it is not a new absolute best. Two repeats contain isolated
 79/138 ms ITL stalls; use per-request ITLs and medians when diagnosing them.
@@ -87,16 +87,25 @@ clean requests are not a long tail-SLO soak, and the restart unexpectedly
 regenerated both vLLM AOT layers plus the TPU executable despite reusing the
 same cache paths.
 
+Milestone 77 removed the direct-token specialization after a fresh-Ray,
+fresh-cache logging-disabled recheck. The restored v2 handoff measured
+15.1711375 and 15.1680589 ms mean TPOT (15.1695982 ms average), effectively
+neutral versus the logging-disabled v3 average of 15.1708350 ms. Both runs
+were clean, with exact 1/1000 request lengths and worst ITLs of 23.294 and
+21.204 ms. Retain the independent 1-D copied-result normalization because it
+hardens `_modify_prev_results`, but do not force the outer graph to return a
+1-D int32 token or bypass normal placeholder substitution: the trace proved a
+15.141 us tail saving but no executable or endpoint win.
+
 Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
-Ray step `664.47` are running; the repaired direct-token server is healthy at
-`10.13.232.26:8000` (API PID 398527, engine PID 400405). Its run/profile name
-is `kimi-k3-b1-backbone-lm-sampler-direct-token-v3-disable-log-stats`, while
-its vLLM/XLA cache intentionally reuses
-`/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-direct-token-v3`. Continue with a
-longer logging-disabled tail soak only if tail behavior matters; it cannot
-close the stable TPOT gap. Otherwise return to a device-critical-path idea or
+Ray step `664.48` are running; the restored-v2 server is healthy at
+`10.13.232.26:8000` (API PID 461886, engine PID 465024). Its run/profile and
+fresh vLLM/XLA cache namespace are
+`kimi-k3-b1-backbone-lm-sampler-v2-restored-disable-log-stats` and the matching
+`/mnt/scratch/...` paths. `TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1` and
+`--disable-log-stats` are active. Return to a device-critical-path idea or
 another read-only trace audit before changing source. If source changes, stop
-the server and cancel only step `664.47`, then start fresh Ray workers; do not
+the server and cancel only step `664.48`, then start fresh Ray workers; do not
 cancel parent allocation `664`.
 
 ### Resume an existing four-host Slurm allocation
