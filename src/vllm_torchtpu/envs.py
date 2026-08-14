@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_K3_KDA_F_A_TP_SIZE: int = 0
     TPU_K3_SHARD_ROUTER_GATE: bool = False
     TPU_K3_ROUTER_GATE_TP_SIZE: int = 0
+    TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE: bool = False
     TPU_K3_OVERLAP_KDA_F_A_REDUCE: bool = False
     TPU_K3_OVERLAP_LATENT_DOWN_ROUTER: bool = False
     TPU_K3_SHARD_MLA_A_PROJ: bool = False
@@ -391,6 +392,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_K3_SHARD_ROUTER_GATE": env_bool("TPU_K3_SHARD_ROUTER_GATE"),
     "TPU_K3_ROUTER_GATE_TP_SIZE":
     lambda: int(os.getenv("TPU_K3_ROUTER_GATE_TP_SIZE", "0")),
+    # Concatenate compatible router and latent-down partials and complete both
+    # with the already-required latent-down subgroup reduction.
+    "TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE":
+    env_bool("TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE"),
     "TPU_K3_OVERLAP_KDA_F_A_REDUCE":
     env_bool("TPU_K3_OVERLAP_KDA_F_A_REDUCE"),
     "TPU_K3_OVERLAP_LATENT_DOWN_ROUTER":

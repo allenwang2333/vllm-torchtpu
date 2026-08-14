@@ -159,15 +159,24 @@ class KimiShardedRouterGate(RowParallelLinear):
         self.tp_group = tp_group
         self.out_dtype = out_dtype
 
+    def project(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, nn.Parameter | None]:
+        return super().forward(hidden_states)
+
+    def complete(self, partial: torch.Tensor) -> torch.Tensor:
+        logits = partial
+        if self.out_dtype is not None and logits.dtype != self.out_dtype:
+            logits = logits.to(self.out_dtype)
+        return logits
+
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, nn.Parameter | None]:
-        partial, output_bias = super().forward(hidden_states)
-        logits = self.tp_group.all_reduce(partial)
-        if self.out_dtype is not None and logits.dtype != self.out_dtype:
-            logits = logits.to(self.out_dtype)
-        return logits, output_bias
+        partial, output_bias = self.project(hidden_states)
+        return self.complete(self.tp_group.all_reduce(partial)), output_bias
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -298,6 +307,8 @@ class KimiMoE(nn.Module):
         shard_router_gate = (envs.TPU_K3_SHARD_ROUTER_GATE
                              and self.tp_size > 1 and dp_size == 1
                              and pcp_size == 1)
+        router_gate_tp_size = 0
+        router_gate_tp_group = None
         if shard_router_gate:
             requested_gate_tp = envs.TPU_K3_ROUTER_GATE_TP_SIZE
             gate_split = hierarchical_moe_split(
@@ -373,8 +384,23 @@ class KimiMoE(nn.Module):
         routed_input_transform = (KimiRoutedInputTransform(
             down_proj, latent_down_tp_group) if shard_latent_down else down_proj)
         self.routed_input_transform = routed_input_transform
+        requested_fused_router_down = (
+            envs.TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE)
+        can_fuse_router_down = (
+            shard_router_gate and shard_latent_down
+            and router_gate_tp_size == latent_down_tp_size
+            and router_gate_tp_group is latent_down_tp_group
+            and isinstance(routed_input_transform, KimiRoutedInputTransform)
+            and isinstance(self.gate, KimiShardedRouterGate))
+        if requested_fused_router_down and not can_fuse_router_down:
+            raise ValueError(
+                "TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE requires router-gate "
+                "and latent-down sharding with the same topology TP group")
+        self.fuse_router_latent_down_reduce = (
+            requested_fused_router_down and can_fuse_router_down)
         self.overlap_latent_down_router = (
             envs.TPU_K3_OVERLAP_LATENT_DOWN_ROUTER
+            and not self.fuse_router_latent_down_reduce
             and isinstance(routed_input_transform, KimiRoutedInputTransform))
         self.routed_expert_norm = (
             RMSNorm(expert_hidden_size, config.rms_norm_eps)
@@ -531,7 +557,24 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         routed_hidden_states = hidden_states
         shared_experts_input = None
-        if self.overlap_latent_down_router:
+        if self.fuse_router_latent_down_reduce:
+            assert isinstance(self.routed_input_transform,
+                              KimiRoutedInputTransform)
+            assert isinstance(self.gate, KimiShardedRouterGate)
+            routed_partial = self.routed_input_transform.project(hidden_states)
+            router_partial, router_bias = self.gate.project(hidden_states)
+            assert router_bias is None
+            routed_width = routed_partial.shape[-1]
+            router_width = router_partial.shape[-1]
+            joint_partial = torch.cat((routed_partial, router_partial), dim=-1)
+            joint_sum = self.routed_input_transform.reduce(joint_partial)
+            routed_hidden_states, router_sum = joint_sum.split(
+                (routed_width, router_width), dim=-1)
+            router_logits = self.gate.complete(router_sum)
+            # Signal that routed_input_transform was already applied while
+            # preserving the full hidden width for shared experts.
+            shared_experts_input = hidden_states
+        elif self.overlap_latent_down_router:
             assert isinstance(self.routed_input_transform,
                               KimiRoutedInputTransform)
             routed_partial = self.routed_input_transform.project(hidden_states)

@@ -3296,6 +3296,152 @@ the regressed TP2 up path remains disabled.
     numerical equivalence remains untested; the opt-in path reduces BF16
     partial logits before FP32 conversion and may have different rounding.
 
+79. **Coalescing the TP4 router and latent-down partials preserves the
+    collective count but is rejected; its matched flag-off control is the
+    first repeated absolute result below 15 ms.** This is the viable form of
+    the proposed additional linear sharding: instead of paying the rejected
+    milestone-78 router-only reduction, shard both `7168 -> 3584` latent-down
+    and `7168 -> 896` router projections over the same topology-local TP4
+    group, concatenate their BF16 partials into `[1,4480]`, perform the one
+    latent-down reduction already required, then split the result and convert
+    the router logits to FP32. The implementation is opt-in through
+    `TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE=1`; it raises at construction time
+    unless both projections use the identical group. The launcher default is
+    zero because the matched result below is slightly slower.
+
+    Focused validation passed before hardware launch:
+
+    ```bash
+    .venv/bin/python -m py_compile \
+      src/vllm_torchtpu/envs.py \
+      src/vllm_torchtpu/models/vllm/kimi_k3/moe.py \
+      tests/models/vllm/test_kimi_k3.py
+    .venv/bin/pytest -q tests/models/vllm/test_kimi_k3.py \
+      -k 'fused_router_latent_down or sharded_router_gate or sharded_latent_down'
+    # 6 passed, 29 deselected
+    ```
+
+    Exact Ray step `664.50` used 32 TPU resources and the canonical libtpu
+    flags. The first server attempt failed before model construction because
+    an inherited generic tier-2 cache namespace had a lock owned by another
+    process (`/dev/shm/torch_tpu_cache/tpu_tier2_cache/...lock: Permission
+    denied`). This is not a model/compiler result. Both measured launches used
+    unique tier-2 and tier-3 namespaces:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-router-latent-down-joint-tp4-v1
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=${USER}_${K3_RUN_NAME}
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_SHARD_ROUTER_GATE=1 \
+    TPU_K3_ROUTER_GATE_TP_SIZE=4 \
+    TPU_K3_SHARD_LATENT_DOWN_PROJ=1 \
+    TPU_K3_LATENT_DOWN_TP_SIZE=4 \
+    TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE=1 \
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh --disable-log-stats
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The candidate means were 15.0011168223 and 15.0143775253 ms TPOT,
+    averaging 15.0077471738 ms. After stopping only that vLLM server, the
+    same source, Ray step, runtime flags, and hardware launched a cold-cache
+    control with `K3_RUN_NAME=kimi-k3-b1-router-latent-down-joint-tp4-control-v1`,
+    `TPU_K3_SHARD_ROUTER_GATE=0`,
+    `TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE=0`, latent-down TP4 enabled, and
+    the same whole-step flag. Its two exact benchmark commands produced
+    **14.9869212855 and 14.9878221406 ms mean TPOT**, averaging
+    **14.9873717131 ms**. Thus the joint shard is a matched
+    **+0.0203754607 ms/token regression** and remains off. Crucially, both
+    independent control runs are below the 15 ms objective, with four
+    successful measured requests each, so this is the first repeated absolute
+    verification of the goal without speculative decoding. P99 TPOT was
+    15.0056645743 and 15.0138493946 ms; worst individual ITL was 35.8135310
+    and 24.5288340 ms, so the result is a mean-TPOT achievement rather than a
+    claim that every token interval is below 15 ms.
+
+    The benchmark data is real serving traffic but not real-checkpoint quality
+    data. Each detailed JSON records `completed=4`, `failed=0`,
+    `input_lens=[1,1,1,1]`, `output_lens=[1000,1000,1000,1000]`, four empty
+    errors, four full detokenized output strings, four prompt tokens total,
+    and 4,000 generated tokens total. `vllm bench serve` creates one
+    reproducible random non-special prefix token per request using
+    `dataset=random`, `seed=42`, `random_input_len=0`, and
+    `random_prefix_len=1`; it does not persist the prompt token ID or prompt
+    text. The OpenAI-compatible HTTP request, tokenizer, scheduler, all model
+    layers, TPU kernels/collectives, sampling, streaming, and detokenization
+    are genuinely executed. However, `--load-format dummy` initializes model
+    tensors with dummy weights, so the saved outputs are random byte-like text
+    (the first control string is 1,100 decoded characters for 1,000 tokens),
+    not meaningful Kimi answers. Use a real checkpoint and an accuracy suite
+    for correctness/quality; do not use these outputs for that purpose.
+
+    Candidate and winning-control profiles used this manual procedure because
+    the servers ran with `--disable-log-stats`:
+
+    ```bash
+    scripts/k3/start_profile.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_FILE=$PWD/results/profile-$K3_RUN_NAME/manual-capture-1-response.json \
+      scripts/k3/curl_isl1_osl1k.sh 10.13.232.26
+    scripts/k3/stop_profile.sh 10.13.232.26
+
+    .venv/bin/python scripts/k3/analyze_trace_tail.py \
+      --region 'tt_jit_model_L332C0_forward_argmax(7719650634456492049)' \
+      --top-modules 20 \
+      /mnt/scratch/kimi-k3-b1-router-latent-down-joint-tp4-control-v1-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_653852.1786681005329954551.pt.trace.json.gz
+    .venv/bin/python scripts/k3/analyze_trace_kernels.py --show-counts \
+      --region 'tt_jit_model_L332C0_forward_argmax(7719650634456492049)' \
+      /mnt/scratch/kimi-k3-b1-router-latent-down-joint-tp4-control-v1-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_653852.1786681005329954551.pt.trace.json.gz
+    ```
+
+    The winning control has 80 usable decode gaps. Median start spacing is
+    14.834461 ms: 14.791631 ms in the whole-step executable followed by only
+    0.042713 ms outside it. The latter contains 0.015391 ms of named device
+    modules (4.761 us token view, 4.293 us placeholder scatter, 3.968 us
+    vocabulary RNG, and 2.354 us RNG setup) plus 0.027281 ms uncovered. This
+    directly rules out a 4 ms input-preparation remainder and a 1.3 ms runtime
+    idle block in the steady-state step.
+
+    On 60 fully leaf-covered stable modules, the corrected exclusive
+    opcode-based analyzer reports this detailed winning-binary breakdown:
+
+    | Primary XLA-op family | Mean self time/decode | Mean events/decode |
+    | --- | ---: | ---: |
+    | Fusion | 6.906359 ms | 4,828 |
+    | All-reduce | 4.775341 ms | 348 |
+    | Custom call | 2.014242 ms | 729 |
+    | Reshape | 0.183045 ms | 1,177 |
+    | Copy | 0.130746 ms | 231 |
+    | Concatenate | 0.107849 ms | 228 |
+    | Conditional | 0.063754 ms | 69 |
+    | Copy-done | 0.052776 ms | 3,059 |
+    | Pad | 0.042362 ms | 72 |
+    | All-gather | 0.034490 ms | 1 |
+    | Copy-start | 0.023730 ms | 3,059 |
+    | All remaining opcodes | 0.019895 ms | see analyzer output |
+
+    Leaf self time averages 14.354609 ms versus 14.799360 ms enclosing-module
+    mean; the 0.444752 ms arithmetic difference is dependency gaps, nested
+    scope/accounting, and parent overhead *inside* the executable, not a
+    separately observed idle kernel. The candidate also has exactly 348
+    all-reduces per decode, proving the joint `[1,4480]` reduction avoided the
+    milestone-78 increase to 440. Its trace median module time is 14.786991 ms
+    versus 14.786246 ms for this control; device-trace variance is effectively
+    neutral even though the matched endpoint pair rejects it. The candidate
+    trace explicitly consumes `[1,4480]` reductions and slices the 3,584-wide
+    latent result; its 0.112464 ms median concatenate family and wider payload
+    leave no measured win. Real-checkpoint numerical equivalence remains
+    untested because BF16 partials are reduced before the router FP32 cast.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The
@@ -3316,7 +3462,10 @@ the regressed TP2 up path remains disabled.
     reuse or fuse an existing collective: 7168-to-128 KDA sharding is slightly
     positive, 7168-to-2112 MLA sharding is neutral, and milestone 78 proves
     that 7168-to-896 router sharding loses 0.273 ms/token by adding 92 new
-    reductions. The 179 independent scalar attention-residual reductions are
+    reductions. Milestone 79 proves that coalescing its partial into the
+    existing TP4 latent-down reduction preserves 348 collectives but still
+    regresses by 0.02038 ms/token; leave the default off. The 179 independent
+    scalar attention-residual reductions are
     likewise collectively expensive despite minimal payload. Avoid adding
     per-layer collectives solely for replicated scorers; a remaining linear
     shard needs to reuse or fuse a reduction already on the critical path.
@@ -3362,11 +3511,11 @@ the regressed TP2 up path remains disabled.
    gains must instead improve the backbone or avoid/shrink the full-vocabulary
    TP32 all-gather.
 9. Preserve the broadly applicable best configuration as the launcher default
-   and keep the narrow whole-step path opt-in. The combined matched deltas now
-   project 14.95023 ms, but no absolute whole-step binary has verified that
-   number. The next acceptance gate is an absolute clean run at or below
-   15 ms with all intended flags present before Ray startup; once reached,
-   repeat it with at least five measured requests and no long-ITL outlier.
+   and keep the narrow whole-step path opt-in. Milestone 79 is the first
+   repeated absolute whole-step verification below 15 ms. A future acceptance
+   gate should strengthen the tail claim with more measured requests: this
+   pair crosses the mean-TPOT goal, but P99 TPOT and isolated ITLs exceed
+   15 ms.
 10. Treat sampling as bounded: the exact-server temperature-1 versus greedy
    delta is only 0.006 ms. Revisit it only if a future trace shows a stable
    endpoint delta; do not adopt inverse-CDF sampling without both a measurable
@@ -3410,8 +3559,8 @@ the regressed TP2 up path remains disabled.
 
 ## Current best and gap
 
-The best strict absolute steady-state result remains 15.11826--15.11931 ms
-from the fused
+The best strict absolute steady-state result is now **14.986921--14.987822
+ms** from milestone 79's matched flag-off control. This uses the fused
 exact Pallas router plus the exact rank-16 route permutation, hierarchical
 routed experts at EP16 x TP2, batch-1 direct routed-row combine, independent TP4
 latent `down_proj`, TP2 KDA `f_a_proj` sharding, dependent-collective layer
@@ -3421,11 +3570,12 @@ plus the neutral top-k/top-p sampling specialization. Milestone 71 additionally
 accepts multi-compute layer-scheduler overlap from a matched -0.07453 ms/token
 comparison. Milestone 74 measures a further -0.09403 ms/token matched delta
 for the opt-in whole-step graph on top of that flag set. Arithmetically
-stacking both matched deltas with the strict 15.11879 ms pair projects about
-14.95023 ms, but this is not a verified absolute result: the separately
-compiled whole-step binaries measured 15.12120 ms (`v2`) and 15.17444 ms
-(clean direct-token `v3`) in their own sessions. The strict verified gap
-therefore remains 0.119 ms even though the delta projection crosses the goal.
+stacking both matched deltas with the older 15.11879 ms pair projected about
+14.95023 ms. Milestone 79 now provides the required absolute verification,
+although separately compiled whole-step binaries previously measured
+15.12120 ms (`v2`) and 15.17444 ms (clean direct-token `v3`). The verified
+mean-TPOT gap is closed by 0.01218--0.01308 ms; this does not claim P99 TPOT
+or every ITL is below 15 ms.
 Enhanced launch barriers are not part of any effective configuration because
 TorchTPU forces them off in distributed actors. No speculative decoding is
 used in any result.

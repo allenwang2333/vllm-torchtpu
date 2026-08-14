@@ -10,7 +10,7 @@ slice, without speculative decoding. All performance runs use dummy weights,
 `compile_sizes=[1]`, ISL=1, OSL=1000, and concurrency 1. Read
 `OPTIMIZATION_LOG.md` before selecting another experiment; it records rejected
 ideas as well as results. The best repeated configuration currently measures
-15.11826--15.11931 ms mean TPOT. It is backed up on the non-main branch
+14.98692--14.98782 ms mean TPOT. It is backed up on the non-main branch
 `agent/k3-b1-tpot-optimization-backup`.
 
 The launcher defaults contain the current winning model configuration:
@@ -120,15 +120,41 @@ launch, benchmark, profile, result fields, dummy-data caveat, and trace paths.
 Use `analyze_trace_kernels.py` for opcode-based pairwise family attribution
 and `analyze_trace_tail.py` for executable/tail wall intervals.
 
+Milestone 79 tested the only credible follow-up: sharding the router at TP4
+but concatenating its partial with the existing TP4 latent-down partial so a
+single `[1,4480]` collective completes both. The candidate preserves 348
+all-reduces/decode and measures 15.00112 and 15.01438 ms TPOT, but the matched
+same-Ray flag-off control measures **14.98692 and 14.98782 ms**, making the
+feature a +0.02038 ms/token regression. Leave
+`TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE=0` and
+`TPU_K3_SHARD_ROUTER_GATE=0`. The control is the first repeated absolute
+verification below the 15 ms mean-TPOT goal. Its median trace spacing is
+14.83446 ms: 14.79163 ms executable plus a 0.04271 ms runtime tail. The
+exclusive mean leaf families are 6.90636 ms fusion, 4.77534 ms all-reduce,
+2.01424 ms custom calls, and 0.65867 ms all other opcodes. The 0.44475 ms
+enclosing-module/leaf difference is in-executable dependency/scope overhead,
+not measured input prep or a distinct idle kernel.
+
+Benchmark data caveat: every canonical result is a real OpenAI-compatible
+HTTP serving run with one generated random prefix token and 1,000 actual
+completion tokens per request. The detailed JSON persists lengths, timings,
+errors, ITLs, and the full detokenized outputs, but not the input token ID or
+prompt text. Dummy weights make those outputs random byte-like strings, so
+the runs validate performance and system execution, not model correctness or
+answer quality. Milestone 79 records the exact client arguments and fields.
+
 Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
-Ray step `664.49` are running. The rejected router-TP2 server (API PID 566789,
-engine PID 569693) was stopped cleanly after profiling; no endpoint is active.
-Its run/profile and fresh vLLM/XLA cache namespace are
-`kimi-k3-b1-router-gate-tp2-v1` and the matching `/mnt/scratch/...` paths. Do
-not relaunch it as a candidate. The next source or libtpu-flag experiment must
-cancel only exact step `664.49`, then start fresh Ray workers; do not cancel
-parent allocation `664`. A same-source, server-only launch may reuse step
-`664.49`, but first ensure the intended feature flags are explicitly reset.
+Ray step `664.50` are running. The winning milestone-79 flag-off control is
+active at `10.13.232.26:8000` (API PID 731423, engine PID 734252) after its
+profile export. Its run/cache namespace is
+`kimi-k3-b1-router-latent-down-joint-tp4-control-v1` and its profile namespace
+adds `-profile`. The rejected joint candidate and its profile use
+`kimi-k3-b1-router-latent-down-joint-tp4-v1`. The first candidate launch that
+inherited a generic tier-2 cache lock failed before model construction; always
+set a unique `TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`. The next source or
+libtpu-flag experiment must cancel only exact step `664.50`, then start fresh
+Ray workers; do not cancel parent allocation `664`. A same-source, server-only
+launch may reuse step `664.50`, but explicitly reset both router flags.
 
 ### Resume an existing four-host Slurm allocation
 

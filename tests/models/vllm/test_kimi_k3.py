@@ -1143,6 +1143,124 @@ def test_sharded_router_gate_reduces_then_casts_logits(
     torch.testing.assert_close(gate.tp_group.inputs[0], inputs + 1)
 
 
+def test_fused_router_latent_down_uses_one_matching_tp_group(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRowParallel(_FakeReplicatedLinear):
+        pass
+
+    class FakeShardedGate(_FakeReplicatedLinear):
+
+        def __init__(self, input_size, output_size, **kwargs) -> None:
+            self.tp_group = kwargs["tp_group"]
+            super().__init__(input_size, output_size, **kwargs)
+
+    class FakeGroup:
+        pass
+
+    group = FakeGroup()
+
+    def fake_split(world_size: int, rank: int,
+                   tp_size: int) -> tuple[int, int, int, int]:
+        del world_size, rank
+        return 2, 0, tp_size, 1
+
+    def enable_ep(vllm_config: VllmConfig) -> None:
+        vllm_config.parallel_config.enable_expert_parallel = True
+
+    monkeypatch.setenv("TPU_K3_SHARD_ROUTER_GATE", "1")
+    monkeypatch.setenv("TPU_K3_ROUTER_GATE_TP_SIZE", "4")
+    monkeypatch.setenv("TPU_K3_SHARD_LATENT_DOWN_PROJ", "1")
+    monkeypatch.setenv("TPU_K3_LATENT_DOWN_TP_SIZE", "4")
+    monkeypatch.setenv("TPU_K3_FUSE_ROUTER_LATENT_DOWN_REDUCE", "1")
+    monkeypatch.setattr(kimi_moe, "RowParallelLinear", FakeRowParallel)
+    monkeypatch.setattr(kimi_moe, "KimiShardedRouterGate", FakeShardedGate)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(kimi_moe, "hierarchical_split_or_none",
+                        lambda: (2, 0, 4, 1))
+    monkeypatch.setattr(kimi_moe, "hierarchical_moe_split", fake_split)
+    monkeypatch.setattr(kimi_moe, "_get_k3_projection_tp_group",
+                        lambda tp_size: group)
+    monkeypatch.setattr(kimi_moe, "hierarchical_moe_parallel_config",
+                        nullcontext)
+
+    layer, _ = _build_kimi_moe(
+        monkeypatch, _latent_moe_config(), configure_vllm_config=enable_ep)
+
+    assert layer.fuse_router_latent_down_reduce
+    assert layer.gate.tp_group is group
+    assert layer.routed_input_transform.tp_group is group
+
+
+def test_fused_router_latent_down_forward_concatenates_one_reduce() -> None:
+    class DownProj(nn.Module):
+
+        def forward(self, hidden_states: torch.Tensor):
+            return hidden_states[:, :8] + 2, None
+
+    class Group:
+
+        def __init__(self) -> None:
+            self.inputs: list[torch.Tensor] = []
+
+        def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            self.inputs.append(tensor)
+            return tensor * 2
+
+    class Gate(kimi_moe.KimiShardedRouterGate):
+
+        def __init__(self, group: Group) -> None:
+            nn.Module.__init__(self)
+            self.tp_group = group
+            self.out_dtype = torch.float32
+
+        def project(self, hidden_states: torch.Tensor):
+            return hidden_states[:, :4] + 3, None
+
+    class Experts(nn.Module):
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_states = None
+            self.router_logits = None
+            self.shared_experts_input = None
+
+        def forward(self, hidden_states: torch.Tensor,
+                    router_logits: torch.Tensor,
+                    shared_experts_input: torch.Tensor | None = None):
+            self.hidden_states = hidden_states
+            self.router_logits = router_logits
+            self.shared_experts_input = shared_experts_input
+            return hidden_states.new_zeros(hidden_states.shape[0], 16)
+
+    group = Group()
+    layer = object.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(layer)
+    layer.routed_input_transform = kimi_moe.KimiRoutedInputTransform(
+        DownProj(), group)
+    layer.gate = Gate(group)
+    layer.experts = Experts()
+    layer.fuse_router_latent_down_reduce = True
+    layer.overlap_latent_down_router = False
+    layer.fused_combine = None
+    layer.host_replicated_shared = False
+    layer.early_shared_reduce = False
+    inputs = torch.arange(32, dtype=torch.bfloat16).view(2, 16)
+
+    output = layer(inputs)
+
+    assert output.shape == inputs.shape
+    assert len(group.inputs) == 1
+    expected_partial = torch.cat((inputs[:, :8] + 2, inputs[:, :4] + 3),
+                                 dim=-1)
+    torch.testing.assert_close(group.inputs[0], expected_partial)
+    torch.testing.assert_close(layer.experts.hidden_states,
+                               (inputs[:, :8] + 2) * 2)
+    torch.testing.assert_close(layer.experts.router_logits,
+                               ((inputs[:, :4] + 3) * 2).float())
+    assert layer.experts.router_logits.dtype is torch.float32
+    torch.testing.assert_close(layer.experts.shared_experts_input, inputs)
+
+
 def _set_pcp2(vllm_config: VllmConfig) -> None:
     vllm_config.parallel_config.prefill_context_parallel_size = 2
 
