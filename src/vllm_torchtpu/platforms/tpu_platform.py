@@ -156,13 +156,6 @@ _tpu_patches_applied = False
 _tpu_kv_connectors_registered = False
 
 
-def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
-    multimodal_config = model_config.multimodal_config
-    if multimodal_config is None:
-        return False
-    return bool(multimodal_config.language_model_only)
-
-
 def _configure_torchtpu_eager_mode() -> None:
     from torch_tpu._internal import execution_mode
     previous_mode = execution_mode.eager_mode
@@ -969,14 +962,6 @@ class TpuPlatform(Platform):
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
-        if (scheduler_config.is_multimodal_model
-                and not _is_language_model_only_config(model_config)
-                and not scheduler_config.disable_chunked_mm_input):
-            logger.warning("TPU does not support running Multimodal models"\
-            " without setting `--disable_chunked_mm_input`. " \
-            "Forcing --disable_chunked_mm_input.")
-            scheduler_config.disable_chunked_mm_input = True
-
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
             if scheduler_config.scheduler_cls != dp_sched_cls:
@@ -992,10 +977,8 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
-                "TPUConnectorV2",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "TPUConnectorHMA",
                 "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
@@ -1005,10 +988,6 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
-            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not unified_kv_layout_enabled(vllm_config)):
-                raise ValueError("TPUConnectorV2 requires "
-                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
                                     in ("OffloadingConnector",
                                         "TPURaidenOffloadingConnector")

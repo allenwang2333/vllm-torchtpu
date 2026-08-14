@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+        skip: "Temporarily disabled pending Raiden in-engine migration (#435)"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -62,18 +63,17 @@ steps:
           queue: "tpu_v7x_16_queue"
         commands:
           - |
-            MODEL="gs://tpu-commons-ci/qwen/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
             bash .buildkite/scripts/run_multihost.sh \
-              "vllm serve \${MODEL} \
-                --port 8000 \
+              python3 examples/offline_inference.py \
+                --model Qwen/Qwen3-0.6B \
                 --tensor-parallel-size 16 \
-                --trust-remote-code \
-                --max-model-len 1024 \
-                --no-async-scheduling \
-                --load-format=runai_streamer \
-                --no-enable-prefix-caching" \
-              "curl http://localhost:8000/v1/completions \
-                -X POST \
-                -H 'Content-Type: application/json' \
-                -d '{\"model\": \"'\"\${MODEL}\"'\", \"prompt\": \"San Francisco is a\", \"max_tokens\": 50}'
-              "
+                --max-model-len 256 \
+                --max-num-batched-tokens 256 \
+                --max-tokens 32
+
+      - label: "Integration: compilation-cache-e2e"
+        key: "integration_compilation_cache_e2e"
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
