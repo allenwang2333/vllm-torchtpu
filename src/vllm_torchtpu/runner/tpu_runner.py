@@ -111,6 +111,9 @@ class ExecuteModelState:
     pooler_output_list: list[Any]
     num_reqs_list: list[int]
     spec_decode_metadata_list: list["SpecDecodeMetadata | None"]
+    # The opt-in K3 outer-model graph returns sampled token ids in logits_list.
+    # This marker lets sample_tokens bypass its separate LM-head/sampler graph.
+    tokens_preselected: bool = False
     # Per-chunk draft inputs (token ids, positions, attn ctx, aux
     # hidden states) captured from the target verify pass. None if
     # spec decode proposer is disabled.
@@ -636,6 +639,22 @@ class TPUModelRunner(GPUModelRunner):
             envs.TPU_K3_FUSE_LM_HEAD_SAMPLER
             and self.speculative_config is None
             and not self.is_pooling_model)
+        self._fuse_k3_backbone_lm_head_sampler = (
+            envs.TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER
+            and self.speculative_config is None
+            and not self.is_pooling_model)
+        if (self._fuse_k3_backbone_lm_head_sampler
+                and (self.scheduler_config.max_num_seqs != 1
+                     or self.scheduler_config.max_num_batched_tokens != 1)):
+            raise ValueError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER currently requires "
+                "max_num_seqs=max_num_batched_tokens=1")
+        if (self._fuse_k3_backbone_lm_head_sampler
+                and (self._fuse_k3_lm_head_sampler
+                     or envs.TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER)):
+            raise ValueError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER is mutually exclusive "
+                "with the two post-backbone K3 sampler experiments")
         self._k3_distributed_neutral_sampler = (
             envs.TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER
             and self.speculative_config is None
@@ -3040,19 +3059,55 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens_padded),
             ), set_vllm_model_wrapper_context(mesh=self.mesh,
                                               vllm_config=self.vllm_config):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                )
+                if self._fuse_k3_backbone_lm_head_sampler:
+                    self._validate_k3_backbone_sampler_request(
+                        start_index, end_index)
+                    # This experiment targets compile_sizes=[1].  Do not carry
+                    # the generic minimum request-padding bucket (8) through
+                    # the LM head: the outer graph is captured with one real
+                    # request and the downstream path consumes only real rows.
+                    fused_num_reqs = num_reqs
+                    temperatures_tpu, _, _ = (
+                        self._build_padded_sampling_params_for_shape(
+                            start_index,
+                            end_index,
+                            fused_num_reqs,
+                            self._hidden_states_dtype,
+                            self.device,
+                        ))
+                    sampling_uniform = torch.rand(
+                        (fused_num_reqs, self.vocab_size),
+                        dtype=self._hidden_states_dtype,
+                        device=self.device,
+                        generator=self._get_sampling_generator(),
+                    )
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        logits_indices=logits_indices[:fused_num_reqs],
+                        temperatures=temperatures_tpu,
+                        sampling_uniform=sampling_uniform,
+                    )
+                else:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                    )
 
-            sequence_layout_planner = _get_sequence_layout_planner_for_runner(
-                self)
-            layout_plan = self._last_sequence_layout_plan
-            sample_hidden_states = (
-                sequence_layout_planner.maybe_select_logits_hidden_states(
-                    hidden_states, layout_plan, logits_indices))
-            if self._keep_sampling_hidden_states:
+            if self._fuse_k3_backbone_lm_head_sampler:
+                logits = hidden_states
+            else:
+                sequence_layout_planner = (
+                    _get_sequence_layout_planner_for_runner(self))
+                layout_plan = self._last_sequence_layout_plan
+                sample_hidden_states = (
+                    sequence_layout_planner.maybe_select_logits_hidden_states(
+                        hidden_states, layout_plan, logits_indices))
+            if self._fuse_k3_backbone_lm_head_sampler:
+                pass
+            elif self._keep_sampling_hidden_states:
                 if sample_hidden_states is None:
                     hidden_states = sequence_layout_planner.finalize_hidden_states(
                         hidden_states,
@@ -3140,6 +3195,7 @@ class TPUModelRunner(GPUModelRunner):
             pooler_output_list=pooler_output_list,
             num_reqs_list=num_reqs_list,
             spec_decode_metadata_list=spec_decode_metadata_list,
+            tokens_preselected=self._fuse_k3_backbone_lm_head_sampler,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
         )
@@ -3343,6 +3399,11 @@ class TPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "K3 hidden-state sampling optimizations support only requests "
                 "without logprobs or structured decoding")
+        if state.tokens_preselected and (needs_logprobs
+                                         or grammar_output is not None):
+            raise RuntimeError(
+                "K3 backbone/LM-head/sampler fusion supports only requests "
+                "without logprobs or structured decoding")
 
         # Per-chunk bucketed (padded) tensors plus their real (unpadded)
         # request counts; kept at bucketed shapes so the async D2H copy hits
@@ -3513,14 +3574,18 @@ class TPUModelRunner(GPUModelRunner):
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
-                if grammar_output is not None:
+                if state.tokens_preselected:
+                    selected_token_ids = logits
+                elif grammar_output is not None:
                     require_struct_decoding, grammar_bitmask_padded, arange = (
                         self.prepare_structured_decoding_input(
                             logits, grammar_output))
                     logits = self.structured_decode(require_struct_decoding,
                                                     grammar_bitmask_padded,
                                                     logits, arange)
-                if all_greedy:
+                if state.tokens_preselected:
+                    pass
+                elif all_greedy:
                     dummy_placeholder = torch.empty(
                         (1, 1), dtype=logits.dtype, device=logits.device)
                     if self._k3_distributed_neutral_sampler:
@@ -4103,10 +4168,34 @@ class TPUModelRunner(GPUModelRunner):
                 set_vllm_model_wrapper_context(mesh=self.mesh,
                                                vllm_config=self.vllm_config),
         ):
-            out, _ = self.forward_model(input_ids=input_ids,
-                                        positions=position_ids,
-                                        inputs_embeds=inputs_embeds)
-            if dp_lockstep:
+            if self._fuse_k3_backbone_lm_head_sampler:
+                dummy_indices = torch.zeros(num_reqs,
+                                            dtype=torch.int32,
+                                            device=self.device)
+                dummy_temperatures = torch.ones(
+                    (num_reqs, 1),
+                    dtype=self._hidden_states_dtype,
+                    device=self.device,
+                )
+                dummy_uniform = torch.full(
+                    (num_reqs, self.vocab_size),
+                    0.5,
+                    dtype=self._hidden_states_dtype,
+                    device=self.device,
+                )
+                out, _ = self.forward_model(
+                    input_ids=input_ids,
+                    positions=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    logits_indices=dummy_indices,
+                    temperatures=dummy_temperatures,
+                    sampling_uniform=dummy_uniform,
+                )
+            else:
+                out, _ = self.forward_model(input_ids=input_ids,
+                                            positions=position_ids,
+                                            inputs_embeds=inputs_embeds)
+            if dp_lockstep and not self._fuse_k3_backbone_lm_head_sampler:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
                 _idx = torch.zeros(num_reqs,
@@ -4114,7 +4203,8 @@ class TPUModelRunner(GPUModelRunner):
                                    device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
             sync.synchronize(out, wait=True)
-        self._hidden_states_dtype = out.dtype
+        if not self._fuse_k3_backbone_lm_head_sampler:
+            self._hidden_states_dtype = out.dtype
 
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
@@ -4462,6 +4552,8 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
+        if self._fuse_k3_backbone_lm_head_sampler:
+            return
         if self._k3_distributed_neutral_sampler:
             self._precompile_sample_from_sharded_hidden_states()
         elif self._fuse_k3_lm_head_sampler:
@@ -4907,8 +4999,11 @@ class TPUModelRunner(GPUModelRunner):
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
-            compiled = (self.model.get_language_model().model if hasattr(
-                self.model, "get_language_model") else self.model.model)
+            language_model = (self.model.get_language_model() if hasattr(
+                self.model, "get_language_model") else self.model)
+            compiled = (language_model
+                        if self._fuse_k3_backbone_lm_head_sampler else
+                        language_model.model)
             reset_compile_wrapper(compiled)
             # reset_compile_wrapper wipes cache_dir; restore so
             # capture_model can read/write the persistent cache.
@@ -5394,12 +5489,25 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def forward_model(self, input_ids, positions, inputs_embeds=None):
+    def forward_model(self,
+                      input_ids,
+                      positions,
+                      inputs_embeds=None,
+                      logits_indices=None,
+                      temperatures=None,
+                      sampling_uniform=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
-        out = self.model(input_ids=input_ids,
-                         positions=positions,
-                         inputs_embeds=inputs_embeds)
+        model_kwargs = dict(input_ids=input_ids,
+                            positions=positions,
+                            inputs_embeds=inputs_embeds)
+        if self._fuse_k3_backbone_lm_head_sampler:
+            model_kwargs.update(
+                logits_indices=logits_indices,
+                temperatures=temperatures,
+                sampling_uniform=sampling_uniform,
+            )
+        out = self.model(**model_kwargs)
         # @support_torch_compile may wrap a single tensor in a 1-element
         # list/tuple; unwrap that first.
         if isinstance(out, (list, tuple)) and len(out) == 1:
@@ -5417,11 +5525,26 @@ class TPUModelRunner(GPUModelRunner):
         cur_end_idx: int,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._build_padded_sampling_params_for_shape(
+            cur_start_idx,
+            cur_end_idx,
+            logits.shape[0],
+            logits.dtype,
+            logits.device,
+        )
+
+    def _build_padded_sampling_params_for_shape(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        padded_num_reqs: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -5436,10 +5559,31 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx])
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
+
+    def _validate_k3_backbone_sampler_request(self, cur_start_idx: int,
+                                              cur_end_idx: int) -> None:
+        if (_get_sequence_layout_planner_for_runner(
+                self).uses_selected_logits_hidden_states):
+            raise RuntimeError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER does not support PCP")
+        if self.input_batch.max_num_logprobs is not None:
+            raise RuntimeError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER does not support "
+                "logprobs")
+        if self._requires_top_k_top_p_filter(cur_start_idx, cur_end_idx):
+            raise RuntimeError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER requires neutral "
+                "top-k/top-p")
+        temperatures = self.input_batch.temperature_cpu_tensor[
+            cur_start_idx:cur_end_idx]
+        if torch.any(temperatures <= SAMPLING_EPS).item():
+            raise RuntimeError(
+                "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER currently requires "
+                "non-greedy temperatures")
 
     def _requires_top_k_top_p_filter(self, cur_start_idx: int,
                                      cur_end_idx: int) -> bool:

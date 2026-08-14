@@ -2755,6 +2755,95 @@ the regressed TP2 up path remains disabled.
     design capable of attacking most of the measured 0.136 ms tail; it must
     preserve full-vocabulary Gumbel-max and generator advancement exactly.
 
+74. Implemented and served the milestone-73 whole-step boundary experiment:
+    opt-in `TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1` moves
+    `support_torch_compile` from `KimiModel` to
+    `KimiLinearForCausalLM`, selects the active hidden row, executes the TP32
+    LM head, applies the existing temperature-scaled full-vocabulary
+    Gumbel-max sampler, and returns the token from one outer executable. The
+    runner supplies the existing rank-synchronized random stream and bypasses
+    the later LM-head/sampler path. It is deliberately restricted to
+    `max_num_seqs=max_num_batched_tokens=1`, no speculation, PCP, grammar,
+    logprobs, greedy requests, or non-neutral top-k/top-p. It is off by
+    default and mutually exclusive with the two earlier post-backbone sampler
+    experiments.
+
+    The first `v1` compile proved the 70,922/81,830-instruction graph viable
+    (151 overlays, 140.56 MiB program, 63.94/64.00 MiB VMEM, about 217 seconds
+    for final capture), but its first real endpoint request failed with
+    `RuntimeProgramInputMismatch`: dummy capture supplied sampling noise
+    `[1,163840]` while the generic request padding path supplied
+    `[8,163840]`. The server correctly returned HTTP 500 and died, so this
+    produced no benchmark result. `v2` passes only the one real request row
+    through the fused LM head and sampler; it compiled and served normally.
+
+    The two canonical `v2` endpoint means were 15.1354325 and 15.1069760 ms,
+    averaging 15.1212043 ms. Both detailed result files show four successful,
+    zero failed requests, four input tokens, and 4,000 generated tokens, with
+    every input length exactly 1 and output length exactly 1,000. Stable
+    second-trace device accounting is:
+
+    | Device interval | Outer fused graph | Milestone-71 accepted trace | Change |
+    | --- | ---: | ---: | ---: |
+    | Compiled executable | 14.9032681 ms | 14.8395028 ms | +0.0637653 ms |
+    | Post-executable gap | 0.0427384 ms | 0.1360355 ms | -0.0932971 ms |
+    | Start spacing | 14.9460064 ms | 14.9755383 ms | -0.0295319 ms |
+
+    Thus fusion removes about 93 us from the visible tail but moves about 64
+    us of that work into the outer executable; the net cross-compile device
+    indication is about 29.5 us/token. The remaining 42.74 us gap contains
+    about 4.54 us full-vocabulary uniform generation, 2.88 us seed/uniform
+    setup, 5.20 us token view, 4.85 us placeholder scatter, and 24.81 us not
+    attributed to named device modules. It does not erase sampling work, and
+    random-number generation still occurs outside the outer graph before its
+    input can be consumed. A fresh-Ray same-source flag-off control is in
+    progress on exact Ray step `664.45`; do not accept the 29.5 us
+    cross-compile delta until that control pair and trace are recorded here.
+
+    Exact candidate launch on fresh Ray step `664.36`:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-backbone-lm-sampler-v2
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=woosuk_kimi-k3-b1-backbone-lm-sampler-v1
+    export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT=/mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v1/torch_tpu_tier3
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    OUTPUT_DIR=$PWD/results/${K3_RUN_NAME}-repeat \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_DIR=$PWD/results/profile-$K3_RUN_NAME \
+      PROF_DIR=$PROF_DIR \
+      scripts/k3/profile_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    Analyze the stable trace with:
+
+    ```bash
+    .venv/bin/python scripts/k3/analyze_trace_tail.py --top-modules 20 \
+      /mnt/scratch/kimi-k3-b1-backbone-lm-sampler-v2-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_89892.1786667257350005705.pt.trace.json.gz
+    ```
+
+    The canonical workload is real serving execution with synthetic content:
+    one probe, two unmeasured warmups, then four measured sequential requests;
+    each has one reproducible random non-special prefix token (`seed=42`) and
+    exactly 1,000 requested outputs with EOS ignored. The launcher uses dummy
+    weights, so tensor shapes, kernels, collectives, scheduling, sampling, and
+    HTTP streaming are real, but generated text is random and is not quality
+    evidence. `bench_isl1_osl1k.sh` now adds `--save-detailed`, preserving
+    per-request lengths/timings/errors and generated text; historical JSONs
+    retain only aggregates. The literal prompt text is not saved. Also expect
+    a 20--30 second benchmark-client startup while it imports TorchTPU and
+    emits the benign metadata 404. `VLLM_PLUGINS=""` breaks this installed CLI
+    with an unresolved `current_platform`; it is not a client-startup fix.
+
 ## Forward plan
 
 1. Preserve both accepted exact routing optimizations in the K3 launcher. The

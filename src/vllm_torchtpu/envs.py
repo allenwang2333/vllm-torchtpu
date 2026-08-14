@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     TPU_K3_SHARD_ATTN_RES_PROJ: bool = False
     TPU_K3_FUSE_ATTN_RES_DOT: bool = False
     TPU_K3_FUSE_LM_HEAD_SAMPLER: bool = False
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER: bool = False
     TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -400,6 +401,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # intentionally excludes speculative decode, grammar, and logprobs.
     "TPU_K3_FUSE_LM_HEAD_SAMPLER":
     env_bool("TPU_K3_FUSE_LM_HEAD_SAMPLER"),
+    # Batch-1 experiment: move the K3 torch.compile boundary from the decoder
+    # to the outer causal-LM module so decoder -> LM head -> exact neutral
+    # Gumbel-max sampling is one TPU executable. This intentionally supports
+    # only the narrow no-spec/no-grammar/no-logprobs path.
+    "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER":
+    env_bool("TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER"),
     # Avoid the full-vocabulary TP all-gather for neutral greedy/Gumbel-max
     # sampling by reducing one local (value, token-id) pair per TP rank.
     "TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER":

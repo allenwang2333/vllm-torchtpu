@@ -60,6 +60,7 @@ echo "Result: ${OUTPUT_DIR}/${result_filename}"
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl,e2el \
   --save-result \
+  --save-detailed \
   --result-dir "$OUTPUT_DIR" \
   --result-filename "$result_filename" \
   --seed "$SEED"

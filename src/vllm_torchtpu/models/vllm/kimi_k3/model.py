@@ -141,11 +141,34 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum + hidden_states, block_residuals
 
 
-@support_torch_compile(dynamic_arg_dims={
+_K3_DYNAMIC_INPUT_DIMS = {
     "input_ids": 0,
     "positions": 0,
     "inputs_embeds": 0,
-})
+}
+
+
+def _compile_k3_decoder(cls: type[nn.Module]) -> type[nn.Module]:
+    """Keep the established decoder boundary except for the tail experiment."""
+    if envs.TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER:
+        return cls
+    return support_torch_compile(
+        dynamic_arg_dims=_K3_DYNAMIC_INPUT_DIMS)(cls)
+
+
+def _compile_k3_causal_lm(cls: type[nn.Module]) -> type[nn.Module]:
+    """Lift compilation to the outer model only for the tail experiment."""
+    if not envs.TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER:
+        return cls
+    return support_torch_compile(dynamic_arg_dims={
+        **_K3_DYNAMIC_INPUT_DIMS,
+        "logits_indices": 0,
+        "temperatures": 0,
+        "sampling_uniform": 0,
+    })(cls)
+
+
+@_compile_k3_decoder
 class KimiModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -210,6 +233,7 @@ class KimiModel(nn.Module):
         return self.norm(hidden_states)
 
 
+@_compile_k3_causal_lm
 class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     """Kimi text model for TPU."""
 
@@ -259,6 +283,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self._fuse_backbone_lm_head_sampler = (
+            envs.TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -269,14 +295,42 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: object | None = None,
+        logits_indices: torch.Tensor | None = None,
+        temperatures: torch.Tensor | None = None,
+        sampling_uniform: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
             raise ValueError("The TPU Kimi model does not support PP")
-        return self.model(
+        hidden_states = self.model(
             input_ids,
             positions,
             inputs_embeds,
         )
+        if not self._fuse_backbone_lm_head_sampler:
+            return hidden_states
+
+        # The runner admits only non-greedy requests with neutral top-k/top-p
+        # to this opt-in path. Keep the full-vocabulary LogitsProcessor and the
+        # existing Gumbel-max mapping exactly; only the compilation boundary
+        # changes. Random numbers are supplied by the runner's existing
+        # rank-synchronized generator so its state advances identically.
+        assert logits_indices is not None
+        assert temperatures is not None
+        assert sampling_uniform is not None
+        selected_hidden_states = torch.index_select(hidden_states, 0,
+                                                    logits_indices)
+        logits = self.compute_logits(selected_hidden_states)
+        assert logits is not None
+        scaled_logits = logits / temperatures
+        u_clamped = torch.clamp(
+            sampling_uniform,
+            min=torch.finfo(sampling_uniform.dtype).tiny,
+            max=1.0 - torch.finfo(sampling_uniform.dtype).eps,
+        )
+        gumbel_noise = -torch.log(-torch.log(u_clamped))
+        return torch.argmax(scaled_logits + gumbel_noise,
+                            dim=-1,
+                            keepdim=True)
 
     def compute_logits(self,
                        hidden_states: torch.Tensor) -> torch.Tensor | None:

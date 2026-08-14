@@ -599,6 +599,9 @@ class TpuPlatform(Platform):
         "TPU_K3_MLA_A_TP_SIZE",
         "TPU_K3_SHARD_ATTN_RES_PROJ",
         "TPU_K3_FUSE_ATTN_RES_DOT",
+        "TPU_K3_FUSE_LM_HEAD_SAMPLER",
+        "TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER",
+        "TPU_K3_DISTRIBUTED_NEUTRAL_SAMPLER",
         "TPU_ACCELERATOR_TYPE"
     ]
 

@@ -181,6 +181,39 @@ OUTPUT_DIR="$PWD/results/${K3_RUN_NAME}-repeat" \
   scripts/k3/bench_isl1_osl1k.sh "$K3_HEAD_IP"
 ```
 
+This is a real OpenAI-compatible serving-path benchmark with synthetic
+content. Each invocation first sends one probe request and two unmeasured
+warmups, then measures four sequential requests (`max_concurrency=1`). Every
+request contains exactly one reproducibly generated non-special prefix token
+(`dataset=random`, `seed=42`, `random_input_len=0`, `random_prefix_len=1`) and
+requests exactly 1,000 output tokens. `--ignore-eos` prevents an early stop.
+The saved detailed JSON must therefore show `completed=4`, `failed=0`,
+`total_input_tokens=4`, `total_output_tokens=4000`, `input_lens=[1,1,1,1]`,
+and `output_lens=[1000,1000,1000,1000]`; it also contains per-request TTFT,
+ITL, errors, and detokenized generated text.
+
+“Real” here means real tokenization, HTTP request handling, scheduling, all
+model/collective kernels, sampling, detokenization, and response streaming.
+It does **not** mean natural prompts or meaningful model answers. The
+optimization launcher uses `LOAD_FORMAT=dummy`, so the parameter tensors have
+the production shapes and execute the production operations, but generated
+tokens/text are random and cannot establish correctness or quality. A
+real-checkpoint launch and an accuracy set such as GSM8K are separate
+validation; never cite dummy-weight output as model-quality evidence. Older
+result files created before `--save-detailed` contain only aggregates such as
+the four/four-thousand token totals. The prompt text itself is not stored by
+`vllm bench serve`; its one-token length and generation recipe are the
+reproducibility contract.
+
+The benchmark CLI imports the installed TorchTPU vLLM platform even though it
+is only an HTTP client. Startup can take roughly 20--30 seconds and prints the
+expected Slurm metadata 404 before the first `/tokenize` or
+`/v1/completions` request. Do not kill it solely because the progress bar has
+not appeared. Setting `VLLM_PLUGINS=""` is not a workaround in this build: it
+leaves `current_platform` unresolved and the CLI raises `ImportError`.
+Distinguish slow client startup from a server failure using `/health` and the
+server access log.
+
 `bench_isl1_osl1k.sh` intentionally leaves temperature unset. With the current
 server this resolves to temperature-1 sampling, not greedy decoding. Use the
 exact request helper for controls:
