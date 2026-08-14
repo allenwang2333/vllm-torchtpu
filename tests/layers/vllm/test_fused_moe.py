@@ -14,10 +14,15 @@
 
 from enum import Enum
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from vllm_torchtpu.layers.common.experimental.chunked_fused_moe_gmm import \
+    chunked_fused_moe_func
+from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
+from vllm_torchtpu.layers.vllm import fused_moe
 from vllm_torchtpu.layers.vllm.fused_moe import get_fused_moe_activation
 
 
@@ -67,3 +72,37 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+@pytest.mark.parametrize("chunk_size,expected_chunked", [(0, False),
+                                                         (128, True)])
+def test_build_fused_moe_custom_op_chunk_selection(monkeypatch, chunk_size,
+                                                   expected_chunked):
+    """Verifies that _build_fused_moe_custom_op wraps chunked_fused_moe_func when chunk_size > 0."""
+    monkeypatch.setattr(fused_moe.envs, "VLLM_TPU_MOE_CHUNK_SIZE", chunk_size)
+
+    captured_fn = None
+
+    def fake_jax_op(name, fn):
+        nonlocal captured_fn
+        captured_fn = fn
+        mock_op = MagicMock()
+        mock_op.register_fake = MagicMock()
+        return mock_op
+
+    monkeypatch.setattr(fused_moe.pallas, "jax_op", fake_jax_op)
+
+    fused_moe._build_fused_moe_custom_op(
+        topk=2,
+        activation="silu",
+        use_ep=False,
+        skip_padded_tokens=False,
+    )
+
+    assert captured_fn is not None
+    if expected_chunked:
+        assert captured_fn.func == chunked_fused_moe_func
+        assert captured_fn.keywords["chunk_size"] == 128
+    else:
+        assert captured_fn.func == fused_moe_func
+        assert "chunk_size" not in captured_fn.keywords

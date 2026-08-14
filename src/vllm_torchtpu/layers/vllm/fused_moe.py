@@ -21,6 +21,8 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.common.experimental.chunked_fused_moe_gmm import \
+    chunked_fused_moe_func
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
     resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
@@ -124,11 +126,17 @@ def _build_fused_moe_custom_op(
     # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    chunk_size = envs.VLLM_TPU_MOE_CHUNK_SIZE
+    if chunk_size > 0:
+        target_fn = functools.partial(chunked_fused_moe_func,
+                                      chunk_size=chunk_size)
+    else:
+        target_fn = fused_moe_func
 
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
-        fused_moe_func,
+        target_fn,
         topk=topk,
         activation=activation,
         use_ep=use_ep,

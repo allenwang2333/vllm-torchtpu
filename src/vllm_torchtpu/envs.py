@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    VLLM_TPU_MOE_CHUNK_SIZE: int = 0
 
 
 def env_with_choices(
@@ -345,6 +346,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # MoE sequence token chunk size for dynamic balanced chunking. When > 0,
+    # sequences with N > chunk_size tokens are split into ceil(N / chunk_size)
+    # balanced chunks so that SparseCore token movement (ragged gather and
+    # gather-reduce) and TensorCore computation (GMM) can overlap across
+    # chunks. 0 (default) disables chunking.
+    "VLLM_TPU_MOE_CHUNK_SIZE":
+    lambda: int(os.getenv("VLLM_TPU_MOE_CHUNK_SIZE") or "0"),
 }
 
 
