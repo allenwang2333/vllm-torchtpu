@@ -3,7 +3,6 @@
 Implementation that uses emit_pipeline instead of hand-rolled version.
 """
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -12,35 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 TOP_K = 10
 M_PAD = 1
-_CN_NBUF = max(2, int(os.getenv("MOE_CN_NBUF", "4")))
-
-_FP8 = jnp.float8_e4m3fn
-_FP8_MAX = float(jnp.finfo(_FP8).max)
-_USE_FP8_LHS = os.getenv("MOE_CN_FP8_LHS", "1") == "1"
-_ACC = (jnp.bfloat16 if _USE_FP8_LHS
-        and os.getenv("MOE_CN_BF16_ACC", "1") == "1" else jnp.float32)
-
-
-def _blockwise_matmul(lhs, w, scales, n_blocks, block, out_cols):
-    acc = jnp.zeros((1, out_cols), dtype=_ACC)
-    for b in range(n_blocks):
-        s = b * block
-        cur = lhs[:, s:s + block]
-        if _USE_FP8_LHS:
-            cur32 = cur.astype(jnp.float32)
-            lsc = jnp.max(jnp.abs(cur32), axis=1, keepdims=True) / _FP8_MAX
-            cur_q = (cur32 *
-                     jnp.where(lsc == 0, 0.0, 1.0 / lsc)).astype(_FP8)
-            blk = jnp.matmul(cur_q,
-                             w[s:s + block, :],
-                             preferred_element_type=jnp.float32).astype(_ACC)
-            blk = blk * lsc.astype(_ACC)
-        else:
-            blk = jnp.matmul(cur,
-                             w[s:s + block, :],
-                             preferred_element_type=jnp.float32)
-        acc = acc + blk * scales[b].reshape(1, out_cols).astype(_ACC)
-    return acc
+_CN_NBUF = 4
 
 
 def _forward_fill_ids(sorted_ids, sorted_weights):
@@ -58,7 +29,7 @@ def _forward_fill_ids(sorted_ids, sorted_weights):
 
 
 def _inner_kernel(
-    lhs_tile_ref,  # [1, K]
+    # Leading expert dim kept at 1 (not squeezed) for Mosaic layout.
     w1_tile_ref,  # [1, K, 2ID]
     w1_scale_tile_ref,  # [1, K_BLOCKS, 1, 2ID]
     w2_tile_ref,  # [1, ID, H]
@@ -67,7 +38,8 @@ def _inner_kernel(
     ids_ref,
     toks_ref,
     weights_ref,
-    acc_ref,  # [N_TOKENS_, 1, H] fp32
+    lhs_ref,  # [C_PAD, 1, K] -- 3D so `tok` indexes leading dim without 2D tiling issues
+    acc_ref,  # [N_TOKENS_, 1, H] fp32 -- likewise
     ID,
     DTYPE_LHS,
 ):
@@ -77,30 +49,42 @@ def _inner_kernel(
 
     @pl.when(weight.astype(jnp.float32) != 0.0)
     def _():
-        lhs_row = lhs_tile_ref[...]
+        K_lhs = lhs_ref.shape[2]
+        lhs_row = lhs_ref[pl.ds(tok, 1),
+                          pl.ds(0, 1),
+                          pl.ds(0, K_lhs)].reshape(1, K_lhs)
 
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
-        w1 = w1_tile_ref[...].reshape(K, TWO_ID)
-        if not _USE_FP8_LHS:
-            w1 = w1.astype(DTYPE_LHS)
+        # Per quant-block matmul, scale the [1, TWO_ID] output (as gmm_v2
+        # does) -- no full-tile fp32 dequant materialized.
+        w1_cast = w1_tile_ref[...].reshape(K, TWO_ID).astype(DTYPE_LHS)
         s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
-        gate_up = _blockwise_matmul(lhs_row, w1, s1, K_BLOCKS, QB, TWO_ID)
+        gate_up = jnp.zeros((1, TWO_ID), dtype=jnp.float32)
+        for b in range(K_BLOCKS):
+            ks = b * QB
+            blk = jnp.matmul(lhs_row[:, ks:ks + QB],
+                             w1_cast[ks:ks + QB, :],
+                             preferred_element_type=jnp.float32)
+            gate_up = gate_up + blk * s1[b].reshape(1, TWO_ID)
 
         gate = gate_up[:, :ID]
         up = gate_up[:, ID:]
-        act = gate * jax.nn.sigmoid(gate) * up
-        intermediate = act if _USE_FP8_LHS else act.astype(DTYPE_LHS)
+        intermediate = (gate * jax.nn.sigmoid(gate) * up).astype(DTYPE_LHS)
 
         _, ID_, H = w2_tile_ref.shape
         I_BLOCKS = w2_scale_tile_ref.shape[1]
         IB = ID_ // I_BLOCKS
-        w2 = w2_tile_ref[...].reshape(ID_, H)
-        if not _USE_FP8_LHS:
-            w2 = w2.astype(DTYPE_LHS)
+        w2_cast = w2_tile_ref[...].reshape(ID_, H).astype(DTYPE_LHS)
         s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
-        down = _blockwise_matmul(intermediate, w2, s2, I_BLOCKS, IB, H)
+        down = jnp.zeros((1, H), dtype=jnp.float32)
+        for b in range(I_BLOCKS):
+            is_ = b * IB
+            blk = jnp.matmul(intermediate[:, is_:is_ + IB],
+                             w2_cast[is_:is_ + IB, :],
+                             preferred_element_type=jnp.float32)
+            down = down + blk * s2[b].reshape(1, H)
 
         H_acc = acc_ref.shape[2]
         current = acc_ref[pl.ds(tok, 1), pl.ds(0, 1), pl.ds(0, H_acc)]
@@ -136,9 +120,6 @@ def _outer_kernel(
 ):
     acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
 
-    def lhs_index_map(slot):
-        return (toks_ref[slot], 0)
-
     def w1_index_map(slot):
         return (ids_ref[slot], 0, 0)
 
@@ -157,15 +138,13 @@ def _outer_kernel(
             ids_ref=ids_ref,
             toks_ref=toks_ref,
             weights_ref=weights_ref,
+            lhs_ref=lhs_ref,
             acc_ref=acc_ref,
             ID=ID,
             DTYPE_LHS=DTYPE_LHS,
         ),
         grid=(N_SLOTS, ),
         in_specs=(
-            pl.BlockSpec((1, K),
-                        lhs_index_map,
-                        pipeline_mode=pl.Buffered(buffer_count=2)),
             pl.BlockSpec((1, K, 2 * ID),
                         w1_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
@@ -181,7 +160,7 @@ def _outer_kernel(
         ),
         out_specs=(),
     )
-    pipeline_fn(lhs_ref, w1_ref, w1_scale_ref, w2_ref, w2_scale_ref)
+    pipeline_fn(w1_ref, w1_scale_ref, w2_ref, w2_scale_ref)
 
     for t in range(N_TOKENS_):
         r = acc_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, H)]
@@ -220,13 +199,23 @@ def cn_gemv_w1w2_fused_pipelined(
     N_SLOTS = TOPK_TOTAL
     NBUF = min(_CN_NBUF, G)
 
-    effective_ids = (_forward_fill_ids(sorted_ids, sorted_weights)
-                     if use_ep else sorted_ids)
+    effective_ids = sorted_ids  # sort removed; invalid IDs already clamped to 0
+
+    # Ensure 3D shape (C_PAD, 1, K) so dim 0 is an untiled batch/token dimension,
+    # avoiding TPU 2D sublane-8 alignment failures when indexing individual token rows.
+    C_PAD = lhs.shape[0]
+    if lhs.ndim == 2:
+        lhs = lhs.reshape(C_PAD, 1, K)
+
+    # Hint XLA to keep lhs in VMEM — small enough (<=8 tokens * H) to avoid
+    # the HBM write+DMA read round-trip from the preceding layer output.
+    lhs = pltpu.with_memory_space_constraint(lhs, pltpu.VMEM)
 
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,  # ids, toks, weights
-        in_specs=[any_spec] * 5,
+        in_specs=[vmem_spec] + [any_spec] * 4,  # lhs (3D) in VMEM; weights in ANY
         out_specs=any_spec,
         grid=(1, ),
         scratch_shapes=[
