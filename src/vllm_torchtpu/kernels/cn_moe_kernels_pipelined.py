@@ -1,6 +1,17 @@
-# Copyright 2026 Google LLC
-"""
-Implementation that uses emit_pipeline instead of hand-rolled version.
+"""EXPERIMENTAL: emit_pipeline-based rewrite of the CN kernel's weight-fetch
+path. Replaces the hand-rolled NBUF-way buffer rotation + manual DMA/
+semaphore code (_select_buf, _start_w1_dma/_wait_w1_dma, seed phase,
+lookahead tables) with Mosaic's native pl.Buffered pipelining -- the same
+mechanism cn_moe_kernels.py's mainline neighbor (megablox/gmm_v2.py) uses.
+
+UNVALIDATED ON REAL HARDWARE. Only interpret-mode correctness has been
+checked here; emit_pipeline's actual lowering/performance on real Mosaic is
+unverified. Kept as a separate file from the working cn_moe_kernels.py so
+nothing about the existing, validated kernel is disturbed.
+
+Only handles NUM_K = NUM_I = 1 (the real production shape) for now --
+multi-tile K/I support would need the grid extended to (N_SLOTS, NUM_K) /
+a second pipeline for w2, not attempted here.
 """
 import functools
 
@@ -57,14 +68,17 @@ def _inner_kernel(
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
-
-        # Upfront vectorized dequantization in VMEM (zero-stride broadcast across sublanes)
-        w1_cast = w1_tile_ref[0].astype(DTYPE_LHS).reshape(K_BLOCKS, QB, TWO_ID)
-        s1 = w1_scale_tile_ref[0].astype(DTYPE_LHS)
-        w1_dequant = (w1_cast * s1).reshape(K, TWO_ID)
-
-        # Single full MXU systolic GEMV (eliminates 32 micro-matmul loop)
-        gate_up = jnp.matmul(lhs_row, w1_dequant, preferred_element_type=jnp.float32)
+        # Per quant-block matmul, scale the [1, TWO_ID] output (as gmm_v2
+        # does) -- no full-tile fp32 dequant materialized.
+        w1_cast = w1_tile_ref[...].reshape(K, TWO_ID).astype(DTYPE_LHS)
+        s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
+        gate_up = jnp.zeros((1, TWO_ID), dtype=jnp.float32)
+        for b in range(K_BLOCKS):
+            ks = b * QB
+            blk = jnp.matmul(lhs_row[:, ks:ks + QB],
+                             w1_cast[ks:ks + QB, :],
+                             preferred_element_type=jnp.float32)
+            gate_up = gate_up + blk * s1[b].reshape(1, TWO_ID)
 
         gate = gate_up[:, :ID]
         up = gate_up[:, ID:]
@@ -73,14 +87,15 @@ def _inner_kernel(
         _, ID_, H = w2_tile_ref.shape
         I_BLOCKS = w2_scale_tile_ref.shape[1]
         IB = ID_ // I_BLOCKS
-
-        # Upfront vectorized dequantization in VMEM for W2
-        w2_cast = w2_tile_ref[0].astype(DTYPE_LHS).reshape(I_BLOCKS, IB, H)
-        s2 = w2_scale_tile_ref[0].astype(DTYPE_LHS)
-        w2_dequant = (w2_cast * s2).reshape(ID_, H)
-
-        # Single full MXU systolic GEMV
-        down = jnp.matmul(intermediate, w2_dequant, preferred_element_type=jnp.float32)
+        w2_cast = w2_tile_ref[...].reshape(ID_, H).astype(DTYPE_LHS)
+        s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
+        down = jnp.zeros((1, H), dtype=jnp.float32)
+        for b in range(I_BLOCKS):
+            is_ = b * IB
+            blk = jnp.matmul(intermediate[:, is_:is_ + IB],
+                             w2_cast[is_:is_ + IB, :],
+                             preferred_element_type=jnp.float32)
+            down = down + blk * s2[b].reshape(1, H)
 
         H_acc = acc_ref.shape[2]
         current = acc_ref[pl.ds(tok, 1), pl.ds(0, 1), pl.ds(0, H_acc)]
@@ -99,6 +114,7 @@ def _outer_kernel(
     w2_ref,
     w2_scale_ref,
     o_ref,
+    full_lhs_2d_ref,
     lhs_full_ref,
     acc_ref,
     out_vmem_ref,
@@ -115,11 +131,16 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
-    C_PAD = lhs_ref.shape[0]
+    C_PAD = full_lhs_2d_ref.shape[0]
 
-    # ---- lhs is already in VMEM via memory space constraint; reshape 2D -> 3D on chip ----
+    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
+    full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
+                                          full_lhs_2d_ref, sem_ref.at[0])
+    full_lhs_copy.start()
+    full_lhs_copy.wait()
+
     for t in range(C_PAD):
-        row = lhs_ref[pl.ds(t, 1), pl.ds(0, K)]
+        row = full_lhs_2d_ref[pl.ds(t, 1), pl.ds(0, K)]
         lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
             row.reshape(1, 1, K)
 
@@ -206,19 +227,15 @@ def cn_gemv_w1w2_fused_pipelined(
 
     effective_ids = sorted_ids  # sort removed; invalid IDs already clamped to 0
 
-    # Hint XLA to keep lhs in VMEM — small enough (<=8 tokens * H) to avoid
-    # the HBM write+DMA read round-trip from the preceding layer output.
-    lhs = pltpu.with_memory_space_constraint(lhs, pltpu.VMEM)
-
     C_PAD = lhs.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
-    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,  # ids, toks, weights
-        in_specs=[vmem_spec] + [any_spec] * 4,  # lhs in VMEM; weights in ANY
+        in_specs=[any_spec] * 5,
         out_specs=any_spec,
         grid=(1, ),
         scratch_shapes=[
+            pltpu.VMEM((C_PAD, K), lhs.dtype),  # full_lhs_2d (DMA pad)
             pltpu.VMEM((C_PAD, 1, K), lhs.dtype),  # full_lhs (3D)
             pltpu.VMEM((n_tokens, 1, H), jnp.float32),  # acc (3D)
             pltpu.VMEM((n_tokens, H), jnp.bfloat16),  # out_2d (DMA pad)
