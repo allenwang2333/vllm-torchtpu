@@ -568,6 +568,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_offloading_config_build()
     _patch_vllm_offloading_connector_spec()
+    _patch_vllm_engine_core_step_with_batch_queue()
     # Platform activation can happen from inside the first Scheduler.__init__.
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
@@ -1348,3 +1349,98 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     from vllm_torchtpu.logger import init_logger
     init_logger(__name__).info(
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+
+
+def _patch_vllm_engine_core_step_with_batch_queue() -> None:
+    """Ensure model_executed is set correctly in EngineCore.step_with_batch_queue.
+
+    Upstream vLLM 0.27.0's step_with_batch_queue only sets `model_executed` when
+    `self.is_ec_consumer` is True, leaving it False for normal engines.
+    For TPU, execute_model returns None and delegates token generation to
+    sample_tokens; when model_executed is False, step_with_batch_queue bypasses
+    sample_tokens, causing Future.result() to return None and raise RuntimeError.
+    """
+    from concurrent.futures import Future
+    from typing import cast
+
+    from vllm.v1.engine.core import EngineCore
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    if getattr(EngineCore, "_tpu_step_with_batch_queue_patched", False):
+        return
+
+    def step_with_batch_queue(self):
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+        assert len(batch_queue) < self.batch_queue_size
+
+        model_executed = False
+        deferred_scheduler_output = None
+        if self.scheduler.has_requests():
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills())
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True)
+            # Fix for TPU: Always treat scheduled tokens as model execution so
+            # sample_tokens is invoked below.
+            model_executed = scheduler_output.total_num_scheduled_tokens > 0
+
+            if self.is_pooling_model or not model_executed:
+                # No sampling required (no requests scheduled).
+                future = cast(Future[ModelRunnerOutput], exec_future)
+            else:
+                if not scheduler_output.pending_structured_output_tokens:
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        scheduler_output)
+                    future = self.model_executor.sample_tokens(grammar_output,
+                                                               non_block=True)
+                else:
+                    deferred_scheduler_output = scheduler_output
+
+            if not deferred_scheduler_output:
+                batch_queue.appendleft((future, scheduler_output, exec_future))
+                if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()):
+                    return None, model_executed
+
+        elif not batch_queue:
+            return None, False
+
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        with (
+                self.capture_iteration_details(scheduler_output) as
+                iteration_details,
+                self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output)
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if deferred_scheduler_output:
+            if self.check_for_draft_tokens:
+                draft_token_ids = self.model_executor.take_draft_token_ids()
+                if draft_token_ids is not None:
+                    self.scheduler.update_draft_token_ids_in_output(
+                        draft_token_ids, deferred_scheduler_output)
+            grammar_output = self.scheduler.get_grammar_bitmask(
+                deferred_scheduler_output)
+            future = self.model_executor.sample_tokens(grammar_output,
+                                                       non_block=True)
+            batch_queue.appendleft(
+                (future, deferred_scheduler_output, exec_future))
+
+        return engine_core_outputs, model_executed
+
+    EngineCore.step_with_batch_queue = step_with_batch_queue
+    EngineCore._tpu_step_with_batch_queue_patched = True
+    from vllm_torchtpu.logger import init_logger
+    init_logger(__name__).info(
+        "Applied TPU patch: EngineCore.step_with_batch_queue model_executed fix."
+    )
