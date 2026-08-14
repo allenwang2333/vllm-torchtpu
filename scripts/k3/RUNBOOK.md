@@ -98,21 +98,37 @@ hardens `_modify_prev_results`, but do not force the outer graph to return a
 15.141 us tail saving but no executable or endpoint win.
 The same-server milestone-77 trace measures a 14.9411 ms median outer
 executable, 0.042728 ms median tail, and 14.9836 ms median decode-start
-spacing. Its current leaf-family table is dominated by 5.0392 ms all-reduce,
-3.6289 ms copy, 2.3222 ms fusion, 1.7306 ms custom calls, and 1.2754 ms dense
-dot/convolution. There is no multi-millisecond outside-model/input-prep gap or
-1.3 ms measured idle category; see the milestone for the accounting caveats.
+spacing. Correct opcode-based attribution of the primary XLA-op lane gives
+6.8650 ms fusion, 4.9064 ms all-reduce, 2.0042 ms custom calls, 0.2324 ms
+other, and only 0.2059 ms total explicit copy/copy-start/copy-done opcodes.
+An earlier name-substring parser incorrectly counted all-reduce/fusion event
+names containing operand text such as `%copy-done` as copies; milestone 77
+records the correction. There is no multi-millisecond outside-model/input-prep
+gap or 1.3 ms measured idle category; see the milestone for the accounting
+caveats.
+
+Milestone 78 tested the remaining `7168 -> 896` router projection shard at
+TP2. It is reproduced with `TPU_K3_SHARD_ROUTER_GATE=1` and
+`TPU_K3_ROUTER_GATE_TP_SIZE=2`, but both launcher defaults are zero. The full
+server compiled and completed four exact 1/1000 requests, yet mean TPOT rose
+to 15.4423880 ms, +0.2727898 ms/token versus the fresh milestone-77 pair. Its
+trace shows 92 additional all-reduces per decode (348 -> 440) and +0.352616 ms
+of all-reduce event self time, while the outer executable grows by about
+0.27 ms and the 0.0427 ms runtime tail is unchanged. Leave the router gate
+replicated; TP4 has no credible cost model. The milestone contains the exact
+launch, benchmark, profile, result fields, dummy-data caveat, and trace paths.
+Use `analyze_trace_kernels.py` for opcode-based pairwise family attribution
+and `analyze_trace_tail.py` for executable/tail wall intervals.
 
 Live handoff at the 2026-08-14 checkpoint: parent allocation `664` and exact
-Ray step `664.48` are running; the restored-v2 server is healthy at
-`10.13.232.26:8000` (API PID 461886, engine PID 465024). Its run/profile and
-fresh vLLM/XLA cache namespace are
-`kimi-k3-b1-backbone-lm-sampler-v2-restored-disable-log-stats` and the matching
-`/mnt/scratch/...` paths. `TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1` and
-`--disable-log-stats` are active. Return to a device-critical-path idea or
-another read-only trace audit before changing source. If source changes, stop
-the server and cancel only step `664.48`, then start fresh Ray workers; do not
-cancel parent allocation `664`.
+Ray step `664.49` are running. The rejected router-TP2 server (API PID 566789,
+engine PID 569693) was stopped cleanly after profiling; no endpoint is active.
+Its run/profile and fresh vLLM/XLA cache namespace are
+`kimi-k3-b1-router-gate-tp2-v1` and the matching `/mnt/scratch/...` paths. Do
+not relaunch it as a candidate. The next source or libtpu-flag experiment must
+cancel only exact step `664.49`, then start fresh Ray workers; do not cancel
+parent allocation `664`. A same-source, server-only launch may reuse step
+`664.49`, but first ensure the intended feature flags are explicitly reset.
 
 ### Resume an existing four-host Slurm allocation
 

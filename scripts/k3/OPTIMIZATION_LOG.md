@@ -3143,29 +3143,158 @@ the regressed TP2 up path remains disabled.
 
     The gap's named means are 4.757 us token view, 4.277 us placeholder
     scatter, 3.962 us vocabulary RNG, and 2.351 us RNG setup. A separate
-    name-based, exclusive aggregation of the XLA-op lane over 61 fully
-    leaf-covered stable modules gives:
+    opcode-based, exclusive aggregation of the primary XLA-op lane over 61
+    fully leaf-covered stable modules gives:
 
     | In-executable leaf family | Self time/decode |
     | --- | ---: |
-    | All-reduce | 5.039157 ms |
-    | Copy | 3.628891 ms |
-    | Fusion | 2.322230 ms |
-    | Custom call | 1.730640 ms |
-    | Dense dot/convolution | 1.275414 ms |
-    | Reshape/bitcast | 0.220060 ms |
-    | Gather | 0.110654 ms |
-    | Other | 0.068551 ms |
-    | All-gather | 0.030756 ms |
+    | Fusion | 6.864951 ms |
+    | All-reduce | 4.906397 ms |
+    | Custom call | 2.004175 ms |
+    | Other | 0.232389 ms |
+    | Reshape | 0.181888 ms |
+    | Copy | 0.130153 ms |
+    | Copy-done | 0.052311 ms |
+    | All-gather | 0.030696 ms |
+    | Copy-start | 0.023394 ms |
 
-    Those exclusive leaf names sum to 14.426354 ms versus a 14.937575 ms
+    Those exclusive leaf opcodes sum to 14.426354 ms versus a 14.937575 ms
     enclosing-module median on the same leaf-covered subset. The 0.511 ms
     arithmetic difference is not a measured idle category: leaf self time,
     async/core interval coverage, and enclosing module wall time have
     different scopes. Together with the directly measured 0.0427 ms outer
     gap, the current trace again rules out both a 4 ms outside-model/input-prep
     remainder and a 1.3 ms hidden idle kernel. The dominant targets remain
-    in-executable all-reduces, copies, fusions, and custom/dense compute.
+    in-executable fusions, all-reduces, and custom calls. Explicit `copy`,
+    `copy-start`, and `copy-done` opcodes total only 0.205858 ms on this lane;
+    asynchronous copy activity can have a different lane/accounting scope.
+
+    Correction: an earlier draft of this table classified raw HLO event names
+    with substring tests. Many all-reduce and fusion event names embed operand
+    text such as `%copy-done`, so that parser incorrectly reported 3.628891 ms
+    as `Copy` and correspondingly understated fusion/custom compute. The total
+    leaf time and the interval-level conclusion were unchanged; the opcode
+    column above is the authoritative current kernel-family breakdown.
+
+78. **Row-sharding the `7168 -> 896` MoE router gate at TP2 is implemented,
+    hardware-valid, and rejected.** This tested the remaining intermediate
+    projection suggested by the broader up/down-projection sharding idea. The
+    implementation uses a `RowParallelLinear` over topology-local two-rank
+    groups, performs one 896-element subgroup all-reduce per MoE layer, then
+    casts the complete logits to FP32 before the existing exact Pallas top-k.
+    Checkpoint parameter names remain `gate.weight` and
+    `gate.e_score_correction_bias`. The opt-in controls are
+    `TPU_K3_SHARD_ROUTER_GATE=1` and `TPU_K3_ROUTER_GATE_TP_SIZE=2`; launcher
+    defaults remain zero because the result regressed.
+
+    Focused construction/forward validation passed before hardware launch:
+
+    ```bash
+    .venv/bin/python -m py_compile \
+      src/vllm_torchtpu/envs.py \
+      src/vllm_torchtpu/models/vllm/kimi_k3/moe.py \
+      tests/models/vllm/test_kimi_k3.py
+    .venv/bin/pytest -q tests/models/vllm/test_kimi_k3.py \
+      -k 'sharded_router_gate or sharded_latent_down or sharded_latent_up'
+    # 6 passed, 27 deselected
+    ```
+
+    Fresh exact Ray step `664.49` imported the changed source and initialized
+    all 32 TPU devices. The complete server and measured benchmark commands
+    were:
+
+    ```bash
+    export K3_RUN_NAME=kimi-k3-b1-router-gate-tp2-v1
+    export RAY_ADDRESS=10.13.232.26:6379
+    export VLLM_XLA_CACHE_PATH=/mnt/scratch/$K3_RUN_NAME
+    export VLLM_CACHE_ROOT=$VLLM_XLA_CACHE_PATH/vllm-runtime
+    export VLLM_CONFIG_ROOT=$VLLM_XLA_CACHE_PATH/vllm-config
+    export PROF_DIR=/mnt/scratch/${K3_RUN_NAME}-profile
+    TPU_K3_SHARD_ROUTER_GATE=1 \
+    TPU_K3_ROUTER_GATE_TP_SIZE=2 \
+    TPU_K3_FUSE_BACKBONE_LM_HEAD_SAMPLER=1 \
+      scripts/k3/launch_kimi_k3_tp32_ep.sh --disable-log-stats
+
+    OUTPUT_DIR=$PWD/results/$K3_RUN_NAME \
+      scripts/k3/bench_isl1_osl1k.sh 10.13.232.26
+    ```
+
+    The detailed result completed all four requests with no errors and gives
+    15.4423879892 ms mean TPOT, 15.4422537848 ms median TPOT,
+    15.4467336855 ms P99 TPOT, 27.9053335 ms mean TTFT, and 23.9260670 ms
+    worst individual ITL. Relative to the fresh milestone-77 flag-off pair's
+    15.1695982096 ms average, this is a clear **+0.2727897800 ms/token
+    regression**. A repeat was deliberately skipped: the loss is more than
+    an order of magnitude larger than run noise and the trace below identifies
+    the expected mechanism.
+
+    The saved JSON is also direct evidence about benchmark data. It contains
+    `completed=4`, `failed=0`, `total_input_tokens=4`,
+    `total_output_tokens=4000`, `input_lens=[1,1,1,1]`,
+    `output_lens=[1000,1000,1000,1000]`, four empty error strings, and four
+    1,000-token detokenized output strings. The client generated each prompt
+    as one reproducible random non-special prefix token (`dataset=random`,
+    `seed=42`, `random_input_len=0`, `random_prefix_len=1`) and did not save
+    the prompt text/token ID. These are real HTTP requests and real serving,
+    model, collective, sampler, streaming, and detokenization operations, but
+    `LOAD_FORMAT=dummy` makes the output strings random byte-like text. The
+    run is valid performance data, not real-checkpoint correctness or quality
+    data.
+
+    The matched profile used the manual procedure required by
+    `--disable-log-stats`:
+
+    ```bash
+    scripts/k3/start_profile.sh 10.13.232.26
+    TEMPERATURE=1 INCLUDE_SEED=0 \
+      OUTPUT_FILE=$PWD/results/profile-$K3_RUN_NAME/manual-capture-1-response.json \
+      scripts/k3/curl_isl1_osl1k.sh 10.13.232.26
+    scripts/k3/stop_profile.sh 10.13.232.26
+
+    .venv/bin/python scripts/k3/analyze_trace_tail.py \
+      --region 'tt_jit_model_L332C0_forward_argmax(3774355073135375805)' \
+      --top-modules 40 \
+      /mnt/scratch/kimi-k3-b1-router-gate-tp2-v1-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_553481.1786676821518314463.pt.trace.json.gz
+
+    .venv/bin/python scripts/k3/analyze_trace_kernels.py --show-counts \
+      --region 'tt_jit_model_L332C0_forward_argmax(3774355073135375805)' \
+      /mnt/scratch/kimi-k3-b1-router-gate-tp2-v1-profile/rank_0/tpu-rack1-w-001.us-central1-c.c.inferact-vllm-tpu.internal_553481.1786676821518314463.pt.trace.json.gz
+    ```
+
+    The candidate trace has 80 usable gaps: its outer executable is
+    15.234860 ms mean / 15.242764 ms median, its post-executable tail remains
+    0.042723 ms mean, and decode-start spacing is 15.277583 ms mean. Thus the
+    regression is wholly inside the model executable, not input preparation
+    or the runtime tail. A same opcode-based event-self-time audit against the
+    milestone-77 trace shows the cause:
+
+    | Primary XLA-op family | Flag off | Router TP2 | Delta |
+    | --- | ---: | ---: | ---: |
+    | All-reduce | 4.930564 ms | 5.283180 ms | +0.352616 ms |
+    | Fusion | 6.901265 ms | 6.929807 ms | +0.028542 ms |
+    | Custom call | 2.014523 ms | 1.967932 ms | -0.046590 ms |
+    | Reshape | 0.183012 ms | 0.161336 ms | -0.021677 ms |
+    | Explicit copy/start/done | 0.207490 ms | 0.205817 ms | -0.001673 ms |
+    | All-gather | 0.031209 ms | 0.035018 ms | +0.003809 ms |
+    | Other opcodes | 0.233826 ms | 0.225196 ms | -0.008630 ms |
+    | Total attributed event self time | 14.501890 ms | 14.808286 ms | +0.306396 ms |
+
+    The all-reduce event count rises exactly from 348 to 440 per decode: one
+    new 896-element reduction in each of 92 MoE layers. The approximately
+    0.353 ms collective increase overwhelms the saved local router matmul.
+    Therefore TP4 is not justified, and this gate should remain replicated.
+    This also sharpens the projection boundary: sharding 7168-to-128 KDA can
+    win, 7168-to-2112 MLA is near neutral, but even 7168-to-896 router compute
+    cannot pay for 92 new serialized subgroup collectives.
+
+    `analyze_trace_kernels.py` is now the reproducible opcode parser used for
+    pairwise audits. It extracts the assigned HLO opcode after ` = ` and never
+    classifies operand substrings such as `%copy-done`; it also subtracts
+    nested child scopes when reporting event self time. Absolute totals remain
+    self-time accounting rather than wall time, so use
+    `analyze_trace_tail.py` for interval/idle questions. Real-checkpoint
+    numerical equivalence remains untested; the opt-in path reduces BF16
+    partial logits before FP32 conversion and may have different rounding.
 
 ## Forward plan
 
@@ -3184,11 +3313,13 @@ the regressed TP2 up path remains disabled.
    neutral, TP4 won about 0.086 ms pairwise, and TP8 regressed about 0.091 ms
    against its fresh TP4 control. Do not widen this collective further.
 4. Use the measured projection boundary to prioritize transformations that
-   reuse or fuse an existing collective: 7168-to-128 KDA sharding is slightly
-   positive, 7168-to-2112 MLA sharding is neutral, while 179 independent
-   scalar attention-residual reductions are collectively expensive despite
-   minimal payload. Avoid adding per-layer collectives solely for small
-   replicated scorers.
+    reuse or fuse an existing collective: 7168-to-128 KDA sharding is slightly
+    positive, 7168-to-2112 MLA sharding is neutral, and milestone 78 proves
+    that 7168-to-896 router sharding loses 0.273 ms/token by adding 92 new
+    reductions. The 179 independent scalar attention-residual reductions are
+    likewise collectively expensive despite minimal payload. Avoid adding
+    per-layer collectives solely for replicated scorers; a remaining linear
+    shard needs to reuse or fuse a reduction already on the critical path.
 5. Preserve the now-enabled dependent-collective layer scheduler, multi-compute
    layer-scheduler overlap, async collective merger, and bidirectional
    all-reduce decomposition. The matched milestone-71 result attributes a

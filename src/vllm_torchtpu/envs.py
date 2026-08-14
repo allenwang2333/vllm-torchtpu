@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     TPU_K3_LATENT_DOWN_TP_SIZE: int = 0
     TPU_K3_SHARD_KDA_F_A_PROJ: bool = False
     TPU_K3_KDA_F_A_TP_SIZE: int = 0
+    TPU_K3_SHARD_ROUTER_GATE: bool = False
+    TPU_K3_ROUTER_GATE_TP_SIZE: int = 0
     TPU_K3_OVERLAP_KDA_F_A_REDUCE: bool = False
     TPU_K3_OVERLAP_LATENT_DOWN_ROUTER: bool = False
     TPU_K3_SHARD_MLA_A_PROJ: bool = False
@@ -384,6 +386,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Zero reuses the hierarchical routed-expert TP width.
     "TPU_K3_KDA_F_A_TP_SIZE":
     lambda: int(os.getenv("TPU_K3_KDA_F_A_TP_SIZE", "0")),
+    # Row-shard the K3 7168-to-896 MoE router projection within a topology
+    # subgroup, then restore its complete logits with one subgroup reduction.
+    "TPU_K3_SHARD_ROUTER_GATE": env_bool("TPU_K3_SHARD_ROUTER_GATE"),
+    "TPU_K3_ROUTER_GATE_TP_SIZE":
+    lambda: int(os.getenv("TPU_K3_ROUTER_GATE_TP_SIZE", "0")),
     "TPU_K3_OVERLAP_KDA_F_A_REDUCE":
     env_bool("TPU_K3_OVERLAP_KDA_F_A_REDUCE"),
     "TPU_K3_OVERLAP_LATENT_DOWN_ROUTER":

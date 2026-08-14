@@ -136,6 +136,40 @@ class KimiRoutedInputTransform(nn.Module):
         return self.reduce(self.project(hidden_states))
 
 
+class KimiShardedRouterGate(RowParallelLinear):
+    """Row-shard router input width and reduce its complete expert logits."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        tp_group: GroupCoordinator,
+        out_dtype: torch.dtype | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_size,
+            bias=False,
+            input_is_parallel=False,
+            reduce_results=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+        self.tp_group = tp_group
+        self.out_dtype = out_dtype
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, nn.Parameter | None]:
+        partial, output_bias = super().forward(hidden_states)
+        logits = self.tp_group.all_reduce(partial)
+        if self.out_dtype is not None and logits.dtype != self.out_dtype:
+            logits = logits.to(self.out_dtype)
+        return logits, output_bias
+
+
 class KimiRoutedOutputTransform(nn.Module):
 
     def __init__(
@@ -261,13 +295,38 @@ class KimiMoE(nn.Module):
             and hierarchical_split is not None and self.use_ep
             and self.tp_size > 1 and dp_size == 1 and pcp_size == 1)
 
-        self.gate = GateLinear(
-            input_size=hidden_size,
-            output_size=config.num_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
-        )
+        shard_router_gate = (envs.TPU_K3_SHARD_ROUTER_GATE
+                             and self.tp_size > 1 and dp_size == 1
+                             and pcp_size == 1)
+        if shard_router_gate:
+            requested_gate_tp = envs.TPU_K3_ROUTER_GATE_TP_SIZE
+            gate_split = hierarchical_moe_split(
+                get_tensor_model_parallel_world_size(),
+                get_tensor_model_parallel_rank(), requested_gate_tp or 2)
+            if gate_split is None:
+                raise ValueError(
+                    "TPU_K3_ROUTER_GATE_TP_SIZE="
+                    f"{requested_gate_tp} is not a valid whole-chip topology "
+                    "split")
+            _, _, router_gate_tp_size, router_gate_tp_rank = gate_split
+            router_gate_tp_group = _get_k3_projection_tp_group(
+                router_gate_tp_size)
+            with _linear_tp_override(router_gate_tp_rank, router_gate_tp_size):
+                self.gate = KimiShardedRouterGate(
+                    input_size=hidden_size,
+                    output_size=config.num_experts,
+                    tp_group=router_gate_tp_group,
+                    out_dtype=torch.float32,
+                    prefix=f"{prefix}.gate",
+                )
+        else:
+            self.gate = GateLinear(
+                input_size=hidden_size,
+                output_size=config.num_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                prefix=f"{prefix}.gate",
+            )
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.num_experts))
 

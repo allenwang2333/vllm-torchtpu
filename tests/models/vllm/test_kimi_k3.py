@@ -1074,6 +1074,75 @@ def test_sharded_latent_down_transform_reduces_projection() -> None:
     torch.testing.assert_close(group.inputs[0], inputs + 3)
 
 
+def test_sharded_router_gate_uses_independent_tp_group(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeShardedGate(_FakeReplicatedLinear):
+
+        def __init__(self, input_size, output_size, **kwargs) -> None:
+            self.init_kwargs = kwargs.copy()
+            super().__init__(input_size, output_size, **kwargs)
+
+    class FakeGroup:
+        pass
+
+    group = FakeGroup()
+    split_calls: list[tuple[int, int, int]] = []
+
+    def fake_split(world_size: int, rank: int,
+                   tp_size: int) -> tuple[int, int, int, int]:
+        split_calls.append((world_size, rank, tp_size))
+        return 2, 0, tp_size, 1
+
+    monkeypatch.setenv("TPU_K3_SHARD_ROUTER_GATE", "1")
+    monkeypatch.setenv("TPU_K3_ROUTER_GATE_TP_SIZE", "4")
+    monkeypatch.setattr(kimi_moe, "KimiShardedRouterGate", FakeShardedGate)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_rank", lambda: 5)
+    monkeypatch.setattr(kimi_moe, "hierarchical_moe_split", fake_split)
+    monkeypatch.setattr(kimi_moe, "_get_k3_projection_tp_group",
+                        lambda tp_size: group)
+
+    layer, _ = _build_kimi_moe(monkeypatch, _latent_moe_config())
+
+    assert split_calls == [(8, 5, 4)]
+    assert isinstance(layer.gate, FakeShardedGate)
+    assert layer.gate.init_kwargs["tp_group"] is group
+    assert layer.gate.init_kwargs["out_dtype"] is torch.float32
+    assert layer.gate.weight.shape == (4, 16)
+    assert layer.gate.e_score_correction_bias.shape == (4, )
+
+
+def test_sharded_router_gate_reduces_then_casts_logits(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeGroup:
+
+        def __init__(self) -> None:
+            self.inputs: list[torch.Tensor] = []
+
+        def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            self.inputs.append(tensor)
+            return tensor * 2
+
+    def fake_row_parallel_forward(self, hidden_states: torch.Tensor):
+        del self
+        return hidden_states + 1, None
+
+    monkeypatch.setattr(kimi_moe.RowParallelLinear, "forward",
+                        fake_row_parallel_forward)
+    gate = object.__new__(kimi_moe.KimiShardedRouterGate)
+    nn.Module.__init__(gate)
+    gate.tp_group = FakeGroup()
+    gate.out_dtype = torch.float32
+    inputs = torch.arange(4, dtype=torch.bfloat16).view(1, 4)
+
+    actual, bias = gate(inputs)
+
+    assert bias is None
+    assert actual.dtype is torch.float32
+    torch.testing.assert_close(actual, ((inputs + 1) * 2).float())
+    assert len(gate.tp_group.inputs) == 1
+    torch.testing.assert_close(gate.tp_group.inputs[0], inputs + 1)
+
+
 def _set_pcp2(vllm_config: VllmConfig) -> None:
     vllm_config.parallel_config.prefill_context_parallel_size = 2
 
