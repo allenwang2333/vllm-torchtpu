@@ -32,7 +32,6 @@ _CN_NBUF = max(2, int(_os.getenv("MOE_CN_NBUF", "4")))
 
 _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = float(jnp.finfo(_FP8).max)
-# 0 falls back to bf16xbf16: slower, but ~10x more accurate.
 _USE_FP8_LHS = _os.getenv("MOE_CN_FP8_LHS", "1") == "1"
 
 
@@ -270,7 +269,6 @@ def _expert_body(
             lhs_tile = lhs_scratch_ref[pl.ds(0, M_PAD),
                                        pl.ds(k * K_TILE, K_TILE)]
 
-            # MXU has no bf16xfp8 mode; one side has to move.
             w1_rhs = w1_fp8 if _USE_FP8_LHS else w1_fp8.astype(DTYPE_LHS)
             if DEQUANT_W1_AFTER_:
                 block_acc = _matmul_f32(lhs_tile, w1_rhs)

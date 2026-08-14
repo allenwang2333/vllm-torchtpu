@@ -16,10 +16,7 @@ _CN_NBUF = max(2, int(os.getenv("MOE_CN_NBUF", "4")))
 
 _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = float(jnp.finfo(_FP8).max)
-# 0 falls back to bf16xbf16: slower, but ~10x more accurate.
 _USE_FP8_LHS = os.getenv("MOE_CN_FP8_LHS", "1") == "1"
-# fp8 lhs quant adds VPU pressure; bf16 accumulate offsets it (gmm_v2 does
-# the same). Accuracy of this alone: MOE_CN_BF16_ACC=0.
 _ACC = (jnp.bfloat16 if _USE_FP8_LHS
         and os.getenv("MOE_CN_BF16_ACC", "1") == "1" else jnp.float32)
 
@@ -61,7 +58,7 @@ def _forward_fill_ids(sorted_ids, sorted_weights):
 
 
 def _inner_kernel(
-    # Leading expert dim kept at 1 (not squeezed) for Mosaic layout.
+    lhs_tile_ref,  # [1, K]
     w1_tile_ref,  # [1, K, 2ID]
     w1_scale_tile_ref,  # [1, K_BLOCKS, 1, 2ID]
     w2_tile_ref,  # [1, ID, H]
@@ -70,8 +67,7 @@ def _inner_kernel(
     ids_ref,
     toks_ref,
     weights_ref,
-    lhs_full_ref,  # [C_PAD, 1, K] -- 3D so `tok` indexes a leading dim
-    acc_ref,  # [N_TOKENS_, 1, H] fp32 -- likewise
+    acc_ref,  # [N_TOKENS_, 1, H] fp32
     ID,
     DTYPE_LHS,
 ):
@@ -81,15 +77,11 @@ def _inner_kernel(
 
     @pl.when(weight.astype(jnp.float32) != 0.0)
     def _():
-        K_lhs = lhs_full_ref.shape[2]
-        lhs_row = lhs_full_ref[pl.ds(tok, 1),
-                               pl.ds(0, 1),
-                               pl.ds(0, K_lhs)].reshape(1, K_lhs)
+        lhs_row = lhs_tile_ref[...]
 
         _, K, TWO_ID = w1_tile_ref.shape
         K_BLOCKS = w1_scale_tile_ref.shape[1]
         QB = K // K_BLOCKS
-        # MXU has no bf16xfp8 mode; one side has to move.
         w1 = w1_tile_ref[...].reshape(K, TWO_ID)
         if not _USE_FP8_LHS:
             w1 = w1.astype(DTYPE_LHS)
@@ -127,8 +119,6 @@ def _outer_kernel(
     w2_ref,
     w2_scale_ref,
     o_ref,
-    full_lhs_2d_ref,
-    lhs_full_ref,
     acc_ref,
     out_vmem_ref,
     sem_ref,
@@ -144,19 +134,10 @@ def _outer_kernel(
     DTYPE_LHS,
     DTYPE_OUT,
 ):
-    C_PAD = full_lhs_2d_ref.shape[0]
-
-    # ---- Stage LHS into a 2D pad, then copy 2D -> 3D on chip ----
-    full_lhs_copy = pltpu.make_async_copy(lhs_ref.at[pl.ds(0, C_PAD)],
-                                          full_lhs_2d_ref, sem_ref.at[0])
-    full_lhs_copy.start()
     acc_ref[...] = jnp.zeros((N_TOKENS_, 1, H), dtype=jnp.float32)
-    full_lhs_copy.wait()
 
-    for t in range(C_PAD):
-        row = full_lhs_2d_ref[pl.ds(t, 1), pl.ds(0, K)]
-        lhs_full_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, K)] = \
-            row.reshape(1, 1, K)
+    def lhs_index_map(slot):
+        return (toks_ref[slot], 0)
 
     def w1_index_map(slot):
         return (ids_ref[slot], 0, 0)
@@ -176,13 +157,15 @@ def _outer_kernel(
             ids_ref=ids_ref,
             toks_ref=toks_ref,
             weights_ref=weights_ref,
-            lhs_full_ref=lhs_full_ref,
             acc_ref=acc_ref,
             ID=ID,
             DTYPE_LHS=DTYPE_LHS,
         ),
         grid=(N_SLOTS, ),
         in_specs=(
+            pl.BlockSpec((1, K),
+                        lhs_index_map,
+                        pipeline_mode=pl.Buffered(buffer_count=2)),
             pl.BlockSpec((1, K, 2 * ID),
                         w1_index_map,
                         pipeline_mode=pl.Buffered(buffer_count=NBUF)),
@@ -198,7 +181,7 @@ def _outer_kernel(
         ),
         out_specs=(),
     )
-    pipeline_fn(w1_ref, w1_scale_ref, w2_ref, w2_scale_ref)
+    pipeline_fn(lhs_ref, w1_ref, w1_scale_ref, w2_ref, w2_scale_ref)
 
     for t in range(N_TOKENS_):
         r = acc_ref[pl.ds(t, 1), pl.ds(0, 1), pl.ds(0, H)]
@@ -240,7 +223,6 @@ def cn_gemv_w1w2_fused_pipelined(
     effective_ids = (_forward_fill_ids(sorted_ids, sorted_weights)
                      if use_ep else sorted_ids)
 
-    C_PAD = lhs.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,  # ids, toks, weights
@@ -248,8 +230,6 @@ def cn_gemv_w1w2_fused_pipelined(
         out_specs=any_spec,
         grid=(1, ),
         scratch_shapes=[
-            pltpu.VMEM((C_PAD, K), lhs.dtype),  # full_lhs_2d (DMA pad)
-            pltpu.VMEM((C_PAD, 1, K), lhs.dtype),  # full_lhs (3D)
             pltpu.VMEM((n_tokens, 1, H), jnp.float32),  # acc (3D)
             pltpu.VMEM((n_tokens, H), jnp.bfloat16),  # out_2d (DMA pad)
             pltpu.SemaphoreType.DMA((1, )),
