@@ -118,6 +118,16 @@ class DFlashProposer:
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
 
+    # Whether load_model overwrites the draft's embed_tokens/lm_head with the
+    # target's unconditionally. DSpark sets this False to honor the draft's
+    # has_own_embed_tokens / has_own_lm_head flags instead.
+    _force_share_target_embeddings = True
+
+    def _query_block_size(self, K: int) -> int:
+        """Query tokens per request: 1 anchor + K mask slots. DSpark's dense
+        layout overrides this to K (the anchor is the first prediction)."""
+        return K + 1
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
@@ -148,16 +158,18 @@ class DFlashProposer:
         self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
                                         target_attn_layer_names)
 
-        # Share Embeddings and LM Head
+        # Share Embeddings and LM Head. DFlash drafts always predict target
+        # vocab, so sharing is forced; DSpark overrides the flag because a
+        # reduced-vocab checkpoint carries its own lm_head/embed_tokens.
         maybe_share_embeddings(self.draft_model,
                                target_model,
                                self._draft_tp_matches_target,
-                               force_share=True)
+                               force_share=self._force_share_target_embeddings)
         maybe_share_lm_head(self.draft_model,
                             target_model,
                             self._draft_replicated,
                             self._draft_tp_matches_target,
-                            force_share=True)
+                            force_share=self._force_share_target_embeddings)
 
         if hasattr(self.draft_model, "get_draft_attn_causal"):
             layer_causal_list = self.draft_model.get_draft_attn_causal()
