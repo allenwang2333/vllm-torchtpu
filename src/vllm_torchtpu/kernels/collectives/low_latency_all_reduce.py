@@ -292,7 +292,8 @@ def one_shot_all_reduce_ws(x: jax.Array,
                            num_devices: int,
                            collective_id: int = 0,
                            barrier_first: bool | None = None,
-                           disable_semaphore_checks: bool = True):
+                           disable_semaphore_checks: bool = True,
+                           has_side_effects: bool = True):
     """One-shot all-reduce over a caller-owned persistent workspace.
 
     Removes barrier #1 from the critical path. :func:`one_shot_all_reduce`
@@ -314,6 +315,17 @@ def one_shot_all_reduce_ws(x: jax.Array,
       barrier_first: Put the barrier ahead of the sends, giving up the overlap
         and most of the speedup. Defaults to off; kept as an escape hatch, and
         as the control that isolated the bug below.
+      has_side_effects: Marks the Pallas call side-effecting, which is what a
+        collective normally wants. It must be False to compile this kernel
+        through torch_tpu: XLA's partitioner rejects a side-effecting custom
+        call inside the manual region a shard_map lowers to
+        ("Side-effect HLO must have sharding"). Dropping it is safe *for this
+        kernel* only because the properties the flag protects are already
+        guaranteed by other means -- the output is consumed so it cannot be
+        dead-code eliminated, each call site gets its own collective_id so two
+        call sites cannot be CSE'd together, and the aliased ws/step chain
+        serializes successive calls that share a workspace. Do not copy this
+        reasoning to a stateless collective.
       disable_semaphore_checks: Must stay True for the overlap. Mosaic
         otherwise asserts every scratch semaphore is zero on kernel exit, and
         this design *deliberately* violates that: a peer that has passed round
@@ -373,7 +385,7 @@ def one_shot_all_reduce_ws(x: jax.Array,
         ],
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
-            has_side_effects=True,
+            has_side_effects=has_side_effects,
             disable_semaphore_checks=disable_semaphore_checks),
     )(x, ws, step)
 
@@ -487,7 +499,8 @@ def two_shot_all_reduce_ws(x: jax.Array,
                            num_devices: int,
                            collective_id: int = 0,
                            barrier_first: bool = False,
-                           disable_semaphore_checks: bool = True):
+                           disable_semaphore_checks: bool = True,
+                           has_side_effects: bool = True):
     """Two-shot all-reduce over a caller-owned persistent workspace.
 
     Does for :func:`two_shot_all_reduce` what :func:`one_shot_all_reduce_ws`
@@ -500,8 +513,9 @@ def two_shot_all_reduce_ws(x: jax.Array,
     they had to move into the workspace too and be copied out at the end.
 
     ``x`` must be 2-D with ``x.shape[0] % num_devices == 0``.
-    ``disable_semaphore_checks`` must stay True; see
-    :func:`one_shot_all_reduce_ws` for why.
+    ``disable_semaphore_checks`` must stay True and ``has_side_effects`` must
+    be False to compile through torch_tpu; see :func:`one_shot_all_reduce_ws`
+    for both.
 
     Returns:
       ``(out, rs, ag, step)`` -- thread the last three into the next call.
@@ -556,7 +570,7 @@ def two_shot_all_reduce_ws(x: jax.Array,
         ],
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
-            has_side_effects=True,
+            has_side_effects=has_side_effects,
             disable_semaphore_checks=disable_semaphore_checks),
     )(x.reshape(num_devices, chunk, cols), rs, ag, step)
     return out.reshape(rows, cols), rs, ag, step

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_LOW_LATENCY_ALLREDUCE: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -299,6 +300,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP":
     env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Route small TP all-reduces to the one-shot/two-shot Pallas kernels
+    # instead of XLA's ring. Only payloads inside the measured crossover are
+    # rerouted; everything else stays on XLA. See
+    # docs/low_latency_allreduce.md and distributed/low_latency_all_reduce.py.
+    "TPU_LOW_LATENCY_ALLREDUCE":
+    env_bool("TPU_LOW_LATENCY_ALLREDUCE"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
