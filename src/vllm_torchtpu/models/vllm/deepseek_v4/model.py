@@ -380,43 +380,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        post_mix: torch.Tensor | None = None,
-        res_mix: torch.Tensor | None = None,
-        residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = x
-            post_mix, res_mix, layer_input = mhc_pre_torch(
-                residual=x,
-                fn=self.hc_attn_fn,
-                hc_scale=self.hc_attn_scale,
-                hc_base=self.hc_attn_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=self.hc_post_alpha,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-            )
-        else:
-            residual = mhc_post_torch(x, residual, post_mix, res_mix)
-            post_mix, res_mix, layer_input = mhc_pre_torch(
-                residual=residual,
-                fn=self.hc_attn_fn,
-                hc_scale=self.hc_attn_scale,
-                hc_base=self.hc_attn_base,
-                rms_eps=self.rms_norm_eps,
-                hc_pre_eps=self.hc_eps,
-                hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=self.hc_post_alpha,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-            )
+    ) -> torch.Tensor:
+        residual = x
+        post, comb, layer_input = mhc_pre_torch(
+            residual=x,
+            fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+        )
 
         x = self.attn_norm(layer_input)
         x = self.attn(positions, x, None)
+        x = mhc_post_torch(x, residual, post, comb)
 
-        residual = mhc_post_torch(x, residual, post_mix, res_mix)
-        post_mix, res_mix, layer_input = mhc_pre_torch(
-            residual=residual,
+        residual = x
+        post, comb, layer_input = mhc_pre_torch(
+            residual=x,
             fn=self.hc_ffn_fn,
             hc_scale=self.hc_ffn_scale,
             hc_base=self.hc_ffn_base,
@@ -429,11 +413,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x = self.ffn_norm(layer_input)
         x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        x = mhc_post_torch(x, residual, post, comb)
+        return x
 
 
 class DeepseekV4Head(nn.Module):
-    """Output projection head applying final MHC residual mixing, HCHead, and RMSNorm."""
+    """Output projection head applying HCHead and RMSNorm."""
 
     def __init__(
         self,
@@ -458,13 +443,7 @@ class DeepseekV4Head(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        post_mix: torch.Tensor | None = None,
-        res_mix: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if residual is not None and post_mix is not None and res_mix is not None:
-            hidden_states = mhc_post_torch(hidden_states, residual, post_mix,
-                                           res_mix)
         hidden_states = self.hc_head_op(
             hidden_states,
             self.hc_head_fn,
@@ -481,9 +460,6 @@ support_torch_compile(
     dynamic_arg_dims={
         "x": 0,
         "positions": 0,
-        "residual": 0,
-        "post_mix": 0,
-        "res_mix": 0,
         "input_ids": 0,
     },
 )
@@ -492,9 +468,6 @@ support_torch_compile(
     DeepseekV4Head,
     dynamic_arg_dims={
         "hidden_states": 0,
-        "residual": 0,
-        "post_mix": 0,
-        "res_mix": 0,
     },
 )
 
@@ -613,21 +586,17 @@ class DeepseekV4Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        residual, post_mix, res_mix = None, None, None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states = layer(
                 hidden_states,
                 positions,
                 input_ids,
-                post_mix,
-                res_mix,
-                residual,
             )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        return self.head(hidden_states, residual, post_mix, res_mix)
+        return self.head(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -702,9 +671,8 @@ class DeepseekV4Model(nn.Module):
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
+                            loaded_params.add(name_mapped)
                             break
-                    loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
