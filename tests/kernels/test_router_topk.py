@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax import lax
 
 from vllm_torchtpu.kernels.router_topk import (MAX_BLOCK_ROWS, block_rows_for,
                                                select)
@@ -77,6 +78,41 @@ def test_kernel_matches_torch_topk_on_real_routing_distribution():
     np.testing.assert_array_equal(np.asarray(kw), ref_v.numpy())
     gathered = torch.gather(scores, 1, torch.from_numpy(np.asarray(ki)).long())
     np.testing.assert_array_equal(gathered.numpy(), ref_v.numpy())
+
+
+def test_all_nan_row_selects_k_distinct_experts():
+    """The kernel half of the same property (see the torch reference test).
+
+    An all-NaN row is the flush sentinel in every column; masking with that
+    same sentinel keeps every column tied with the row max, so every pass
+    returns column 0 and the row selects one expert ``TOPK`` times. Measured
+    against the sort path at 512 experts / top-k 10, that is 1 distinct expert
+    where ``lax.sort`` takes 10.
+    """
+    scores = np.full((3, EXPERTS), np.nan, dtype=np.float32)
+    kw, ki = select(jnp.asarray(scores), TOPK, interpret=True)
+    ki = np.asarray(ki)
+    assert np.isnan(np.asarray(kw)).all()
+    for row in ki:
+        assert sorted(row.tolist()) == list(range(TOPK))
+    iota = lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+    _, sort_i = lax.sort((-jnp.asarray(scores), iota),
+                         dimension=1,
+                         is_stable=False,
+                         num_keys=1)
+    for got, ref in zip(ki, np.asarray(sort_i)[:, :TOPK]):
+        assert len(set(got.tolist())) == len(set(ref.tolist())) == TOPK
+
+
+def test_partial_nan_row_selects_k_distinct_finite_experts():
+    rng = np.random.default_rng(5)
+    scores = rng.random((2, EXPERTS), dtype=np.float32)
+    scores[:, :5] = np.nan
+    kw, ki = select(jnp.asarray(scores), TOPK, interpret=True)
+    assert np.isfinite(np.asarray(kw)).all()
+    for row in np.asarray(ki):
+        assert len(set(row.tolist())) == TOPK
+        assert min(row.tolist()) >= 5
 
 
 def test_kernel_ties_and_nan_match_the_reference():

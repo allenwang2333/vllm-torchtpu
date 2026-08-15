@@ -204,6 +204,45 @@ def test_all_nan_row_stays_poisoned():
     assert (i >= 0).all() and (i < EXPERTS).all(), "ids stay real experts"
 
 
+def test_all_nan_row_selects_k_distinct_experts():
+    """A poisoned row must still name ``k`` *different* experts.
+
+    Every column of a fully-NaN row is the flush sentinel, so a mask value
+    equal to that sentinel leaves every column tied with the row max and each
+    pass returns column 0: one expert, ``k`` times. The sort path names ``k``
+    distinct ones, so the MoE gathers ten times fewer expert bytes on exactly
+    the rows a corrupted hidden state produces -- a selector-dependent change
+    in how much work the layer does, on top of the poisoned weights.
+
+    Which ``k`` is a free choice (``torch.topk`` leaves the order of an
+    all-NaN row unspecified and returns an arbitrary permutation); 0..k-1 is
+    the lowest-index rule this module already applies to ties.
+    """
+    scores = torch.full((3, EXPERTS), float("nan"))
+    _, i = rowmax_topk(scores, TOPK)
+    for row in i:
+        assert sorted(row.tolist()) == list(range(TOPK))
+    ref_i = torch.topk(scores, TOPK, dim=-1).indices
+    for got, ref in zip(i, ref_i):
+        assert len(set(got.tolist())) == len(set(ref.tolist())) == TOPK
+
+
+def test_partial_nan_row_selects_k_distinct_finite_experts():
+    scores = torch.rand(2, EXPERTS)
+    scores[:, :5] = float("nan")
+    v, i = rowmax_topk(scores, TOPK)
+    assert not torch.isnan(v).any()
+    for row in i:
+        assert len(set(row.tolist())) == TOPK
+        assert min(row.tolist()) >= 5, "NaN columns must never be selected"
+
+
+def test_masking_is_below_the_flush_sentinel():
+    """The property the two must not share, stated once."""
+    assert torch.finfo(torch.float32).min < NEG
+    assert torch.finfo(torch.bfloat16).min < NEG
+
+
 def test_sentinel_is_below_every_real_score_but_above_the_reduce_identity():
     assert NEG < 0.0
     assert NEG > torch.finfo(torch.float32).min
