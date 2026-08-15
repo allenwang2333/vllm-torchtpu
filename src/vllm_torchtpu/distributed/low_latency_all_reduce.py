@@ -106,12 +106,21 @@ _GATE: dict[int, tuple[int, int, int]] = {
 class _Plan:
     """What to do with one (shape, dtype) of all-reduce on one group."""
 
-    __slots__ = ("kernel", "op", "buffers")
+    __slots__ = ("kernel", "op", "buffers", "shape", "dtype")
 
-    def __init__(self, kernel: str, op: Any, buffers: tuple):
+    def __init__(self,
+                 kernel: str,
+                 op: Any,
+                 buffers: tuple,
+                 shape: tuple = (),
+                 dtype: Any = None):
         self.kernel = kernel  # "one_shot" | "two_shot" | "xla"
         self.op = op
         self.buffers = buffers
+        # The kernel is compiled for exactly this shape; the entry op checks
+        # before using it, because a mismatch would re-lower at runtime.
+        self.shape = shape
+        self.dtype = dtype
 
 
 def _two_shot_enabled() -> bool:
@@ -163,6 +172,16 @@ class LowLatencyAllReduce:
         self._plans: dict[tuple, _Plan] = {}
         self._next_collective_id = _COLLECTIVE_ID_BASE
         self._axis = "tp"
+        # Torch op names must be unique and stable; the group name is both.
+        self.op_suffix = str(getattr(communicator, "unique_name",
+                                     "tp")).replace(":", "_")
+        # The one shape the entry op is wired to reduce with a kernel. Chosen
+        # at warmup; everything else goes to XLA. Single rather than
+        # shape-dispatched because the buffers have to be *arguments* of the
+        # entry op to become graph inputs -- captured tensors are not provided
+        # to the compiled program and abort it with
+        # "identified an argument that was not provided: DeviceBufferRef".
+        self.primary_plan: _Plan | None = None
 
     # -- mesh ---------------------------------------------------------------
 
@@ -373,7 +392,7 @@ class LowLatencyAllReduce:
                     op, buffers = self._build_one_shot(tuple(x.shape), x.dtype)
                 else:
                     op, buffers = self._build_two_shot(tuple(x.shape), x.dtype)
-                plan = _Plan(kernel, op, buffers)
+                plan = _Plan(kernel, op, buffers, tuple(x.shape), x.dtype)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Could not build the %s all-reduce for %s %s (%s); "
@@ -390,67 +409,71 @@ class LowLatencyAllReduce:
 
     # -- entry point --------------------------------------------------------
 
-    def maybe_all_reduce(self, x: torch.Tensor) -> torch.Tensor | None:
-        """Reduced tensor, or ``None`` to let the caller use XLA's all-reduce.
+    def xla_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """What the communicator would have done, out of place.
 
-        Kept deliberately thin: past the cache lookup this is only the custom
-        op and its writeback, so what dynamo traces is the collective and
-        nothing else. All construction happens in ``_build_plan``, which dynamo
-        does not enter.
+        The clone is forced by the custom-op contract: the entry op declares
+        no mutated arguments, so it cannot reduce ``x`` in place the way
+        ``DeviceCommunicatorBase.all_reduce`` does. It is a real difference
+        between the arms on shapes that stay on XLA, small (a 28 KiB copy) but
+        worth knowing about when reading a result.
         """
-        if self._world_size < 2:
-            return None
-        if not x.is_contiguous():
-            return None
+        import torch.distributed as dist
 
-        # Only dispatch on a fully static shape. vLLM marks the token dimension
-        # dynamic and compiles a symbolic graph alongside the per-bucket
-        # specialized ones; reading a symbolic dim into a Python value -- which
-        # is what using the shape as a dict key does -- pins it to whatever
-        # value happened to be traced, and compilation fails with
-        #
-        #   Constraints violated (L['input_ids'].size()[0])! You marked it as
-        #   dynamic but your code specialized it to be a constant (512).
-        #
-        # A SymInt is not an int, so this check bails before anything hashes
-        # the shape. The symbolic graph then reduces through XLA, while the
-        # bucket-specialized graphs -- the ones decode actually runs -- keep
-        # the kernel.
-        shape = tuple(x.shape)
-        if not all(isinstance(dim, int) for dim in shape):
-            return None
+        out = x.clone()
+        dist.all_reduce(out, group=self._comm.device_group)
+        return out
 
-        key = (shape, x.dtype)
-        plan = self._plans.get(key)
-        if plan is None:
-            if torch.compiler.is_compiling():
-                # Never build inside the traced region -- see _build_plan. A
-                # shape that reaches here unbuilt is one `prebuild` did not
-                # anticipate; XLA's all-reduce is always correct, so it takes
-                # it. `prebuild` logs what it covered, which is where to look
-                # if the kernels appear to be doing nothing.
-                return None
-            plan = self._build_plan(x, key)
-        if plan.kernel == "xla":
-            return None
 
-        if plan.kernel == "one_shot":
-            ws, step = plan.buffers
+_ENTRY_OPS: dict[str, Any] = {}
+
+
+def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
+    """An opaque torch op that reduces a tensor, built once per group.
+
+    Two constraints meet here and between them leave only this shape.
+
+    Dynamo must not see the shape. Selecting a kernel in traced Python means
+    reading dims, and reading vLLM's dynamic token dimension pins it and fails
+    the whole compilation ("Constraints violated (L['input_ids'].size()[0])").
+    No guard avoids it: dynamo presents a SymInt as an int, so even
+    ``isinstance(dim, int)`` is True. ``torch.library.custom_op`` is not traced
+    into, so the graph gets one call node and the dims are read later, at
+    execution, when they are ordinary ints.
+
+    The workspaces must be *arguments*. They cannot be captured inside the
+    implementation: a tensor the compiled program references but was never
+    handed aborts it with "identified an argument that was not provided:
+    DeviceBufferRef". So the op takes the primary plan's ``ws`` and ``step``
+    directly, which is also why exactly one shape is wired up rather than a
+    dispatch table -- a second shape would need a second pair of arguments.
+
+    Anything that is not that shape reduces through XLA, which is always
+    correct.
+    """
+    name = f"vllm_torchtpu::ll_all_reduce_{dispatcher.op_suffix}"
+    existing = _ENTRY_OPS.get(name)
+    if existing is not None:
+        return existing
+
+    def _impl(x: torch.Tensor, ws: torch.Tensor,
+              step: torch.Tensor) -> torch.Tensor:
+        plan = dispatcher.primary_plan
+        if (plan is not None and tuple(x.shape) == plan.shape
+                and x.dtype == plan.dtype and x.is_contiguous()):
             out, new_ws, new_step = plan.op(x, ws, step)
             # Donation + copy_ writeback, as the RPA kernel does for the KV
-            # cache: XLA aliases the donated buffer onto the output and the
-            # copy compiles away, leaving the workspace updated in place and
-            # its identity stable for the next call.
+            # cache: XLA aliases the donated buffer onto the output, so this
+            # updates the workspace in place and keeps its identity stable.
             ws.copy_(new_ws)
             step.copy_(new_step)
             return out
+        return dispatcher.xla_all_reduce(x)
 
-        rs, ag, step = plan.buffers
-        out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
-        rs.copy_(new_rs)
-        ag.copy_(new_ag)
-        step.copy_(new_step)
-        return out
+    op = torch.library.custom_op(name, _impl, mutates_args=("ws", "step"))
+    op.register_fake(lambda x, ws, step: torch.empty_like(x))
+    _ENTRY_OPS[name] = op
+    return op
 
 
 def _candidate_shapes(vllm_config) -> tuple[list[tuple[int, int]], Any]:
@@ -498,6 +521,8 @@ def warmup(vllm_config) -> None:
     of which dynamo can trace; doing it here is what keeps the traced region
     down to the collective itself.
     """
+    import os
+
     from vllm_torchtpu import envs
 
     if not envs.TPU_LOW_LATENCY_ALLREDUCE:
@@ -519,7 +544,7 @@ def warmup(vllm_config) -> None:
                        "shapes; every all-reduce will stay on XLA.")
         return
 
-    built = 0
+    kernel_plans = []
     for rows, cols in shapes:
         probe = torch.empty((rows, cols),
                             dtype=dtype,
@@ -527,10 +552,32 @@ def warmup(vllm_config) -> None:
         plan = dispatcher._build_plan(probe, ((rows, cols), dtype))
         del probe
         if plan.kernel != "xla":
-            built += 1
+            kernel_plans.append(plan)
+
+    # Exactly one shape can be wired to the entry op (its workspaces are op
+    # arguments), so pick the smallest payload that takes a kernel: that is
+    # the low-concurrency decode reduction this is aimed at. Everything else
+    # reduces through XLA.
+    override = os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_SHAPE", "").strip()
+    chosen = None
+    if override:
+        try:
+            want = tuple(int(v) for v in override.lower().split("x"))
+            chosen = next(p for p in kernel_plans if p.shape == want)
+        except (ValueError, StopIteration):
+            logger.warning(
+                "TPU_LOW_LATENCY_ALLREDUCE_SHAPE=%s does not match any shape "
+                "that takes a kernel (%s); falling back to the smallest.",
+                override, [p.shape for p in kernel_plans])
+    if chosen is None and kernel_plans:
+        chosen = min(kernel_plans, key=lambda p: p.shape[0] * p.shape[1])
+    dispatcher.primary_plan = chosen
+
     logger.info(
         "Low-latency all-reduce warmup: %d of %d candidate shapes take a "
-        "kernel.", built, len(shapes))
+        "kernel; wired to %s (%s). Every other shape uses XLA.",
+        len(kernel_plans), len(shapes), chosen.shape if chosen else None,
+        chosen.kernel if chosen else "none")
 
 
 def get_dispatcher(communicator) -> LowLatencyAllReduce:

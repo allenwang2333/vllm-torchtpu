@@ -40,10 +40,16 @@ from torch.distributed._functional_collectives import \
 
 
 class _StubCommunicator:
-    """The four attributes LowLatencyAllReduce reads off a communicator."""
+    """The attributes LowLatencyAllReduce reads off a real communicator.
 
-    def __init__(self, cpu_group, rank_in_group: int, world_size: int):
+    ``cpu_group`` carries the rank->device gather (gloo, since tpu_dist cannot
+    move pickles); ``device_group`` is the one the XLA fallback reduces over.
+    """
+
+    def __init__(self, cpu_group, device_group, rank_in_group: int,
+                 world_size: int):
         self.cpu_group = cpu_group
+        self.device_group = device_group
         self.rank_in_group = rank_in_group
         self.world_size = world_size
         self.device = torch.device("tpu")
@@ -88,10 +94,22 @@ def main() -> int:
     gloo = dist.new_group(ranks=list(range(world_size)), backend="gloo")
 
     from vllm_torchtpu.distributed.low_latency_all_reduce import (
-        LowLatencyAllReduce, _choose_kernel)
+        LowLatencyAllReduce, _choose_kernel, get_entry_op)
 
-    comm = _StubCommunicator(gloo, rank, world_size)
+    comm = _StubCommunicator(gloo, dist.group.WORLD, rank, world_size)
     dispatcher = LowLatencyAllReduce(comm)
+    # Exactly what TpuDeviceCommunicator.all_reduce calls. Driving
+    # dispatcher.dispatch() directly would skip the custom-op boundary, which
+    # is the whole mechanism under test.
+    entry_op = get_entry_op(dispatcher)
+
+    def reduce(t):
+        plan = dispatcher.primary_plan
+        if plan is None:
+            return funcol_all_reduce(t, "sum", list(range(world_size)))
+        ws, step = plan.buffers
+        return entry_op(t.contiguous(), ws, step)
+
     device = torch.device("tpu")
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     itemsize = torch.finfo(dtype).bits // 8
@@ -116,17 +134,28 @@ def main() -> int:
         # This is the sequence a vLLM server runs: warmup() builds every plan
         # before torch.compile sees a forward, and the traced region then only
         # ever hits the cache.
+        kernel_plans = []
         for rows in (int(r) for r in args.rows.split(",")):
             probe = torch.empty((rows, args.cols), dtype=dtype, device=device)
-            dispatcher._build_plan(probe, ((rows, args.cols), dtype))
+            plan = dispatcher._build_plan(probe, ((rows, args.cols), dtype))
             del probe
+            if plan.kernel != "xla":
+                kernel_plans.append(plan)
+        # Same choice warmup() makes: the smallest shape that takes a kernel.
+        if kernel_plans:
+            dispatcher.primary_plan = min(
+                kernel_plans, key=lambda p: p.shape[0] * p.shape[1])
+        if rank == 0:
+            print(
+                f"  primary plan: "
+                f"{dispatcher.primary_plan.shape if dispatcher.primary_plan else None}",
+                flush=True)
         for rows in (int(r) for r in args.rows.split(",")):
             x = (torch.randn(rows, args.cols,
                              dtype=torch.float32).to(dtype).to(device))
 
             def one(x):
-                out = dispatcher.maybe_all_reduce(x.contiguous())
-                return x if out is None else out
+                return reduce(x)
 
             try:
                 compiled = torch.compile(one,
@@ -169,8 +198,7 @@ def main() -> int:
         torch._dynamo.mark_dynamic(x, 0)
 
         def one_dyn(x):
-            out = dispatcher.maybe_all_reduce(x.contiguous())
-            return x if out is None else out
+            return reduce(x)
 
         try:
             compiled = torch.compile(one_dyn, backend="tpu", fullgraph=True)
@@ -211,15 +239,7 @@ def main() -> int:
         want = x
         worst = 0.0
         for step in range(args.chain):
-            out = dispatcher.maybe_all_reduce(got.contiguous())
-            if out is None:
-                if expected_route != "xla":
-                    failures.append(f"rows={rows}: expected "
-                                    f"{expected_route}, dispatcher declined")
-                    break
-                # Declining is the gate working; the reference path is what
-                # the communicator would have done.
-                out = funcol_all_reduce(got, "sum", list(range(world_size)))
+            out = reduce(got)
             twist = float(step + 1)
             got = out * (1.0 / world_size) + twist
             want = funcol_all_reduce(want, "sum", list(range(world_size)))
@@ -265,8 +285,7 @@ def main() -> int:
         def f(x):
             for _ in range(n_ops):
                 if use_kernel:
-                    out = dispatcher.maybe_all_reduce(x.contiguous())
-                    x = x if out is None else out
+                    x = reduce(x)
                 else:
                     x = funcol_all_reduce(x, "sum", list(range(world_size)))
                 x = x * (1.0 / world_size)

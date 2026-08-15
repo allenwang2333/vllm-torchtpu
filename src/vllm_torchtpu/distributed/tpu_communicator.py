@@ -48,12 +48,21 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         XLA's all-reduce, which is always correct.
         """
         if (envs.TPU_LOW_LATENCY_ALLREDUCE
-                and self.unique_name.split(":")[0] == "tp"):
-            from vllm_torchtpu.distributed.low_latency_all_reduce import \
-                get_dispatcher
-            out = get_dispatcher(self).maybe_all_reduce(input_)
-            if out is not None:
-                return out
+                and self.unique_name.split(":")[0] == "tp"
+                and self.world_size > 1):
+            from vllm_torchtpu.distributed.low_latency_all_reduce import (
+                get_dispatcher, get_entry_op)
+
+            dispatcher = get_dispatcher(self)
+            plan = dispatcher.primary_plan
+            if plan is not None:
+                ws, step = plan.buffers
+                # Call unconditionally and pass the workspaces as arguments.
+                # Whether this tensor is the shape the kernel was built for is
+                # decided inside the op, at execution time: deciding it here
+                # would read the shape while dynamo is tracing, which pins
+                # vLLM's dynamic token dimension and fails the compilation.
+                return get_entry_op(dispatcher)(input_, ws, step)
         return super().all_reduce(input_)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
