@@ -145,6 +145,10 @@ def main() -> int:
         if kernel_plans:
             dispatcher.primary_plan = min(
                 kernel_plans, key=lambda p: p.shape[0] * p.shape[1])
+            # warmup() registers the entry op here, before anything is traced;
+            # registering it lazily inside the traced forward calls
+            # infer_schema, which dynamo refuses to trace.
+            get_entry_op(dispatcher)
         if rank == 0:
             print(
                 f"  primary plan: "

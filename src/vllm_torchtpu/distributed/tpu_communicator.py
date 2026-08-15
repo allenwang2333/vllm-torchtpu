@@ -19,8 +19,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
-from vllm_torchtpu import envs
-
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -38,31 +36,23 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        """TP all-reduce, optionally through the low-latency Pallas kernels.
+        """TP all-reduce, optionally through a low-latency Pallas kernel.
 
-        Only the tensor-parallel group is rerouted: it carries the per-layer
-        decode reductions the kernels are built for, and restricting the
-        change keeps every other group (DP, EP, world) on the path it has
-        always used. Any shape outside the measured crossover, and any failure
-        to build the mesh or the op, returns ``None`` here and falls through to
-        XLA's all-reduce, which is always correct.
+        Only the tensor-parallel group is ever rerouted, and only for the one
+        payload shape wired up at warmup; the op itself sends anything else to
+        XLA. Restricting it this way keeps every other group (DP, EP, world)
+        on the path it has always used.
         """
-        if (envs.TPU_LOW_LATENCY_ALLREDUCE
-                and self.unique_name.split(":")[0] == "tp"
-                and self.world_size > 1):
-            from vllm_torchtpu.distributed.low_latency_all_reduce import (
-                get_dispatcher, get_entry_op)
-
-            dispatcher = get_dispatcher(self)
-            plan = dispatcher.primary_plan
-            if plan is not None:
-                ws, step = plan.buffers
-                # Call unconditionally and pass the workspaces as arguments.
-                # Whether this tensor is the shape the kernel was built for is
-                # decided inside the op, at execution time: deciding it here
-                # would read the shape while dynamo is tracing, which pins
-                # vLLM's dynamic token dimension and fails the compilation.
-                return get_entry_op(dispatcher)(input_, ws, step)
+        # `_ll_entry` is set by low_latency_all_reduce.warmup(), before
+        # torch.compile traces anything, and is None unless the kernels are
+        # enabled and a shape was wired up. Deciding anything here instead --
+        # reading the payload shape, looking up an op, registering one --
+        # fails compilation outright: shapes pin vLLM's dynamic token
+        # dimension, and registration calls into code dynamo will not trace.
+        entry = getattr(self, "_ll_entry", None)
+        if entry is not None:
+            op, ws, step = entry
+            return op(input_, ws, step)
         return super().all_reduce(input_)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:

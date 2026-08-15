@@ -573,6 +573,22 @@ def warmup(vllm_config) -> None:
         chosen = min(kernel_plans, key=lambda p: p.shape[0] * p.shape[1])
     dispatcher.primary_plan = chosen
 
+    # Register the entry op here too, not on first use. Registering it is what
+    # torch.library.custom_op does, and that calls infer_schema, which dynamo
+    # refuses to trace ("Attempted to call function marked as skipped"). First
+    # use is inside the traced forward, so lazy registration is fatal.
+    #
+    # Everything the traced path needs is then stashed as one attribute, so
+    # what dynamo sees in TpuDeviceCommunicator.all_reduce is an attribute
+    # read and an opaque op call -- no lookups, no string work, nothing that
+    # can register or allocate.
+    if chosen is not None:
+        entry_op = get_entry_op(dispatcher)
+        ws, step = chosen.buffers
+        communicator._ll_entry = (entry_op, ws, step)
+    else:
+        communicator._ll_entry = None
+
     logger.info(
         "Low-latency all-reduce warmup: %d of %d candidate shapes take a "
         "kernel; wired to %s (%s). Every other shape uses XLA.",
