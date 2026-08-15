@@ -13,15 +13,15 @@
 # limitations under the License.
 
 import functools
-from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import torch
-import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -213,16 +213,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         return VllmDeepseekSparseSWABackend
 
 
-# The AMD model constructs this class directly (amd/model.py:250);
-# `patch_deepseek_v4_mla_cls` swaps the name to our TPU subclass.
-# TODO(patemotter): drop this dependency once bringup is done, by subclassing
-# the generic DeepseekV4Attention ABC and implementing its platform hooks.
-_orig_ds_v4_attention_cls = ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention
-
-
-# DeepseekV4Attention must come first: it may already inherit
-# AttentionLayerBase, and the reverse order is an unresolvable MRO.
-class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
+class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                                  AttentionLayerBase):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
@@ -234,31 +225,26 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         aux_stream_list: list | None = None,
     ) -> None:
         orig_indexer = dsv4_attention.DeepseekV4Indexer
-        orig_amd_indexer = getattr(ds_v4_amd_model, "DeepseekV4Indexer", None)
         orig_compressor = dsv4_attention.DeepseekCompressor
         orig_swa_cache = dsv4_attention.DeepseekV4SWACache
         dsv4_attention.DeepseekV4Indexer = VllmDeepseekV4Indexer
-        if orig_amd_indexer is not None:
-            ds_v4_amd_model.DeepseekV4Indexer = VllmDeepseekV4Indexer
         dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
         dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
+
+        orig_event = torch.Event
+        orig_cuda_event = getattr(torch.cuda, "Event", None)
+        torch.Event = lambda *args, **kwargs: None
+        if hasattr(torch, "cuda"):
+            torch.cuda.Event = lambda *args, **kwargs: None
         try:
-            cast(Any, _orig_ds_v4_attention_cls).__init__(
-                self,
+            super().__init__(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
             )
             self.custom_prefix = prefix
-            _real_mla_attn = getattr(self, "mla_attn", self)
-            # `self.mla_attn` aliases `self` below, so swa_cache_layer /
-            # compressor / indexer must be read from the wrapper.
-            for _attr in ("swa_cache_layer", "compressor", "indexer"):
-                if hasattr(_real_mla_attn, _attr) and not hasattr(self, _attr):
-                    object.__setattr__(self, _attr,
-                                       getattr(_real_mla_attn, _attr))
-            self.__dict__['mla_attn'] = self
+            object.__setattr__(self, "mla_attn", self)
             for module in self.modules():
                 if module is not self and hasattr(module, "get_kv_cache_spec"):
                     if module.__class__.__name__ in (
@@ -268,18 +254,28 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                         module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
-            if orig_amd_indexer is not None:
-                ds_v4_amd_model.DeepseekV4Indexer = orig_amd_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
-        if hasattr(self.mla_attn,
-                   "compressor") and self.mla_attn.compressor is not None:
+            torch.Event = orig_event
+            if orig_cuda_event is not None:
+                torch.cuda.Event = orig_cuda_event
+        if hasattr(self, "compressor") and self.compressor is not None:
             if self.compress_ratio <= 1:
-                object.__setattr__(self.mla_attn.compressor, "k_cache",
-                                   self.mla_attn.swa_cache_layer)
+                object.__setattr__(self.compressor, "k_cache",
+                                   self.swa_cache_layer)
             else:
-                object.__setattr__(self.mla_attn.compressor, "k_cache",
-                                   self.mla_attn.mla_attn)
+                object.__setattr__(self.compressor, "k_cache", self)
+        if hasattr(self, "attn_sink") and self.attn_sink is not None:
+
+            def _attn_sink_loader(param, loaded_weight):
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+                n_local = loaded_weight.shape[0] // tp_size
+                narrow = loaded_weight[tp_rank * n_local:(tp_rank + 1) *
+                                       n_local]
+                param[:narrow.shape[0]].copy_(narrow)
+
+            self.attn_sink.weight_loader = _attn_sink_loader
         hf_config = vllm_config.model_config.hf_config
         object.__setattr__(self, "attn_out_dim",
                            hf_config.num_attention_heads * hf_config.head_dim)
@@ -741,18 +737,10 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
     def _o_proj(self, o: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         t = o.shape[0]
-        o_f = o.to(torch.float32).view(t, self.mla_attn.n_local_heads,
-                                       self.mla_attn.head_dim)
+        o_f = o.to(torch.float32).view(t, self.n_local_heads, self.head_dim)
         # Inverse GPT-J RoPE on the trailing rotary_dim channels of each head.
-        o_ref, _ = self.mla_attn.rotary_emb(positions, o_f, inverse=True)
+        o_ref, _ = self.rotary_emb(positions, o_f, inverse=True)
         o_ref = o_ref.to(torch.bfloat16)
-
-        # Requant + TP sharding leave `wo_a.weight_scale` as a 1-D per-output-
-        # channel vector matching the local weight's rows.
-        w = self.wo_a.weight
-        s = self.wo_a.weight_scale
-        assert s.ndim == 1 and s.shape[0] == w.shape[0], (w.shape, s.shape)
-        wo_a_dequant = w.to(o_ref.dtype) * s.view(-1, 1).to(o_ref.dtype)
 
         # Heads are chunked into groups; each group projects with its own
         # [o_lora_rank, d] block of wo_a.
@@ -760,9 +748,14 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         o_lora_rank = self.o_lora_rank
 
         o_ref_grouped = o_ref.view(t, n_local_groups, -1)
-        wo_a_grouped = wo_a_dequant.view(n_local_groups, o_lora_rank, -1)
+        wo_a_grouped = self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)
+        wo_a_scale = self.wo_a.weight_scale.view(n_local_groups, o_lora_rank)
 
-        z = torch.einsum("tgd,grd->tgr", o_ref_grouped, wo_a_grouped)
+        # Einsum in float32 and apply per-channel scale post-einsum (aligned to reference).
+        z = torch.einsum("tgd,grd->tgr", o_ref_grouped.to(torch.float32),
+                         wo_a_grouped.to(torch.float32))
+        z = z * wo_a_scale.unsqueeze(0).to(torch.float32)
+        z = z.to(torch.bfloat16)
         z_flat = z.flatten(1)
 
         # wo_b: RowParallelLinear back to hidden_size (returns (out, bias)).
