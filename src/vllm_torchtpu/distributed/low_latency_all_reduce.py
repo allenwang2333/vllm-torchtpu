@@ -343,12 +343,21 @@ class LowLatencyAllReduce:
         step = torch.zeros(1, dtype=torch.int32, device=device)
         return op, (rs, ag, step)
 
-    def _plan_for(self, x: torch.Tensor) -> _Plan:
-        key = (tuple(x.shape), x.dtype)
-        plan = self._plans.get(key)
-        if plan is not None:
-            return plan
-
+    # Everything this builds -- a process group gather, a torch custom-op
+    # registration, persistent workspace buffers, a log line -- is a side
+    # effect, and it runs the first time a shape is seen, which is *during*
+    # torch.compile tracing. Dynamo cannot trace any of it; on K3 it died on
+    # the log call alone:
+    #
+    #   Unresolved GetAttrVariable comparison ... LoggingLoggerVariable
+    #
+    # and the workspace allocation would have been worse than an error --
+    # tensors created inside the traced region are graph temporaries, not the
+    # persistent state these kernels require. Disabling dynamo here runs the
+    # builder eagerly and hands the traced region ready-made buffers to close
+    # over, which is exactly how the RPA kernel's KV cache reaches the graph.
+    @torch._dynamo.disable(recursive=True)
+    def _build_plan(self, x: torch.Tensor, key: tuple) -> _Plan:
         numel = x.numel()
         payload = numel * x.element_size()
         kernel = _choose_kernel(self._world_size, payload, numel)
@@ -382,12 +391,28 @@ class LowLatencyAllReduce:
     # -- entry point --------------------------------------------------------
 
     def maybe_all_reduce(self, x: torch.Tensor) -> torch.Tensor | None:
-        """Reduced tensor, or ``None`` to let the caller use XLA's all-reduce."""
+        """Reduced tensor, or ``None`` to let the caller use XLA's all-reduce.
+
+        Kept deliberately thin: past the cache lookup this is only the custom
+        op and its writeback, so what dynamo traces is the collective and
+        nothing else. All construction happens in ``_build_plan``, which dynamo
+        does not enter.
+        """
         if self._world_size < 2:
             return None
         if not x.is_contiguous():
             return None
-        plan = self._plan_for(x)
+        key = (tuple(x.shape), x.dtype)
+        plan = self._plans.get(key)
+        if plan is None:
+            if torch.compiler.is_compiling():
+                # Never build inside the traced region -- see _build_plan. A
+                # shape that reaches here unbuilt is one `prebuild` did not
+                # anticipate; XLA's all-reduce is always correct, so it takes
+                # it. `prebuild` logs what it covered, which is where to look
+                # if the kernels appear to be doing nothing.
+                return None
+            plan = self._build_plan(x, key)
         if plan.kernel == "xla":
             return None
 
@@ -408,6 +433,86 @@ class LowLatencyAllReduce:
         ag.copy_(new_ag)
         step.copy_(new_step)
         return out
+
+
+def _candidate_shapes(vllm_config) -> tuple[list[tuple[int, int]], Any]:
+    """(rows, cols) an all-reduce might carry, derived from the config.
+
+    Rows are the static compile buckets, since a decode step is padded up to
+    one of them. Columns are the widths a TP reduction can have: the hidden
+    size, plus the routed-expert latent width when the model has one -- K3
+    reduces in both, 7168 after attention and 3584 around the latent MoE.
+
+    Over-generating is free: a shape outside the crossover gets an "xla" plan,
+    which allocates nothing.
+    """
+    model_config = vllm_config.model_config
+    hf = getattr(model_config, "hf_text_config",
+                 None) or model_config.hf_config
+
+    widths = []
+    for attr in ("hidden_size", "routed_expert_hidden_size"):
+        value = getattr(hf, attr, None)
+        if isinstance(value, int) and value > 0 and value not in widths:
+            widths.append(value)
+
+    rows = []
+    compile_sizes = getattr(vllm_config.compilation_config, "compile_sizes",
+                            None) or []
+    for size in compile_sizes:
+        if isinstance(size, int) and size > 0 and size not in rows:
+            rows.append(size)
+    max_batched = getattr(vllm_config.scheduler_config,
+                          "max_num_batched_tokens", None)
+    if isinstance(max_batched, int) and max_batched > 0 \
+            and max_batched not in rows:
+        rows.append(max_batched)
+
+    return [(r, c) for r in sorted(rows) for c in widths], model_config.dtype
+
+
+def warmup(vllm_config) -> None:
+    """Build every plan the model is expected to need, before compile traces.
+
+    Must run after the weights are loaded (the process groups exist) and
+    before torch.compile sees a forward pass. ``_build_plan`` registers a torch
+    custom op, gathers a device map and allocates persistent workspaces, none
+    of which dynamo can trace; doing it here is what keeps the traced region
+    down to the collective itself.
+    """
+    from vllm_torchtpu import envs
+
+    if not envs.TPU_LOW_LATENCY_ALLREDUCE:
+        return
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        communicator = get_tp_group().device_communicator
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Low-latency all-reduce warmup skipped (%s).", e)
+        return
+    if communicator is None or int(getattr(communicator, "world_size", 1)) < 2:
+        return
+
+    dispatcher = get_dispatcher(communicator)
+    shapes, dtype = _candidate_shapes(vllm_config)
+    if not shapes:
+        logger.warning("Low-latency all-reduce warmup found no candidate "
+                       "shapes; every all-reduce will stay on XLA.")
+        return
+
+    built = 0
+    for rows, cols in shapes:
+        probe = torch.empty((rows, cols),
+                            dtype=dtype,
+                            device=communicator.device)
+        plan = dispatcher._build_plan(probe, ((rows, cols), dtype))
+        del probe
+        if plan.kernel != "xla":
+            built += 1
+    logger.info(
+        "Low-latency all-reduce warmup: %d of %d candidate shapes take a "
+        "kernel.", built, len(shapes))
 
 
 def get_dispatcher(communicator) -> LowLatencyAllReduce:

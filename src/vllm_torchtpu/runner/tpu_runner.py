@@ -4284,6 +4284,14 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
+
+        # Same reason the attention kernels are built here: the low-latency
+        # all-reduce has to register its ops and allocate its persistent
+        # workspaces outside the traced region, and this is the point where
+        # the weights are loaded but torch.compile has not yet seen a forward.
+        from vllm_torchtpu.distributed import low_latency_all_reduce
+        low_latency_all_reduce.warmup(self.vllm_config)
+
         self._attention_kernels_initialized = True
 
     @torch.no_grad()

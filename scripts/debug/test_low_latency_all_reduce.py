@@ -63,6 +63,13 @@ def parse_args():
     p.add_argument("--repeats", type=int, default=15)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--skip-timing", action="store_true")
+    p.add_argument("--compile-first",
+                   action="store_true",
+                   help="Trace under torch.compile before any eager call, "
+                   "which is how a vLLM server hits this: the first time "
+                   "a shape is seen is inside dynamo. An eager pass "
+                   "first would populate the plan cache and hide any "
+                   "untraceable work in the builder.")
     p.add_argument("--dtype",
                    default="bfloat16",
                    choices=["bfloat16", "float32"],
@@ -98,6 +105,59 @@ def main() -> int:
             flush=True)
 
     failures = []
+
+    if args.compile_first:
+        # A vLLM server meets every shape for the first time *inside* dynamo,
+        # so anything untraceable in the plan builder fails there. Running an
+        # eager pass first would populate the cache and hide exactly that.
+        if rank == 0:
+            print("\n-- compile-first: prebuild eagerly, then trace --",
+                  flush=True)
+        # This is the sequence a vLLM server runs: warmup() builds every plan
+        # before torch.compile sees a forward, and the traced region then only
+        # ever hits the cache.
+        for rows in (int(r) for r in args.rows.split(",")):
+            probe = torch.empty((rows, args.cols), dtype=dtype, device=device)
+            dispatcher._build_plan(probe, ((rows, args.cols), dtype))
+            del probe
+        for rows in (int(r) for r in args.rows.split(",")):
+            x = (torch.randn(rows, args.cols,
+                             dtype=torch.float32).to(dtype).to(device))
+
+            def one(x):
+                out = dispatcher.maybe_all_reduce(x.contiguous())
+                return x if out is None else out
+
+            try:
+                compiled = torch.compile(one,
+                                         backend="tpu",
+                                         fullgraph=True,
+                                         dynamic=False)
+                got = compiled(x)
+                want = funcol_all_reduce(x, "sum", list(range(world_size)))
+                d = (got.float() - want.float()).abs().max().cpu().item()
+                scale = max(1.0, want.float().abs().max().cpu().item())
+                rel = d / scale
+                ok = rel < (1e-5 if dtype == torch.float32 else 0.02)
+                if not ok:
+                    failures.append(
+                        f"compile-first rows={rows}: rel={rel:.5f}")
+                if rank == 0:
+                    print(
+                        f"  rows={rows:>4} traced+ran, rel={rel:.5f} "
+                        f"{'OK' if ok else 'FAIL'}",
+                        flush=True)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"compile-first rows={rows}: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}")
+                if rank == 0:
+                    print(
+                        f"  rows={rows:>4} FAILED: {type(exc).__name__}: "
+                        f"{str(exc)[:300]}",
+                        flush=True)
+        if rank == 0:
+            print("", flush=True)
+
     for rows in (int(r) for r in args.rows.split(",")):
         payload = rows * args.cols * itemsize
         expected_route = _choose_kernel(world_size, payload, rows * args.cols)
