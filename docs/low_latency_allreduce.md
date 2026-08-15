@@ -1,0 +1,392 @@
+# Low-latency all-reduce on TPU7x (8 devices, 4 chips)
+
+Machine: `tpu-rack1-w-014`, 8 × TPU7x (Ironwood), 2×2×1 chips × 2 cores, single host.
+JAX 0.10.2 / libtpu 0.0.44.1 / torch_tpu 0.1.1. All numbers bfloat16, `cols=1024`.
+
+Methodology: two-point slope. Time a chain of 20 then 60 data-dependent
+all-reduces in one compiled graph, take `(T60 - T20) / 40`. Every fixed cost
+(dispatch, H2D/D2H, host sync) cancels exactly, which matters because those are
+~10-400 µs here and would otherwise swamp a few-µs collective. Chaining also
+matches how a TP all-reduce appears in decode: on the critical path, one per
+layer, nothing to overlap with.
+
+Reproduce:
+
+```bash
+python scripts/allreduce_latency_bench.py --devices 2,4,8 --sc-offload-bytes 67108864
+```
+
+## 1. XLA's default SparseCore offload threshold is a 3.5x latency cliff
+
+`--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes` defaults to **64 KiB**
+on this build. At or above that size XLA offloads the all-reduce to SparseCore,
+which costs a flat ~30 µs regardless of payload:
+
+| payload | forced TensorCore | forced SparseCore | default |
+|--------:|------------------:|------------------:|--------:|
+| 16 KiB  | 10.5 µs | 31.9 µs | 10.2 µs |
+| 32 KiB  | 10.6 µs | 31.9 µs | 10.2 µs |
+| **64 KiB** | **11.0 µs** | **36.3 µs** | **36.4 µs** ← cliff |
+| 128 KiB | 15.2 µs | 37.7 µs | 37.8 µs |
+| 1 MiB   | 24.9 µs | 41.1 µs | 41.2 µs |
+
+`env_override.py` already raises this threshold to per-tensor-core VMEM
+(64 MiB on `tpu7x`), and I confirmed the prefix match fires here — GCE metadata
+reports `tpu7x-8`, which hits the `"tpu7x"` entry in
+`_TPU_VMEM_BYTES_PER_TENSOR_CORE`. **So vLLM already avoids this cliff.** It is
+worth knowing that the override is load-bearing, not cosmetic: without it, any
+all-reduce ≥64 KiB (e.g. 32 tokens × 4096 hidden bf16 = 256 KiB) pays 3.5x.
+
+All comparisons below therefore use TensorCore-forced XLA as the baseline,
+since that is what vLLM actually runs.
+
+## 2. Custom Pallas kernels vs XLA, 8 devices
+
+`one_shot` = single all-to-all broadcast round, 1 hop, `M·(N-1)` bytes out/device.
+`two_shot` = direct (non-ring) reduce-scatter + all-gather, 2 hops, `2M(N-1)/N` out/device.
+XLA's default is a *ring* RS+AG: bandwidth-optimal but `2(N-1)` = 14 sequential hops.
+
+One consistent sweep, one shape per process, bfloat16, `cols=1024`. `–` = not
+applicable (`two_shot*` scatter along rows, so they need `rows % 8 == 0`) or
+past the point where that kernel is worth measuring.
+
+| payload | XLA | one_shot_ws | two_shot | **two_shot_ws** | best vs XLA |
+|--------:|----:|------------:|---------:|----------------:|------------:|
+| 2 KiB   | 9.09 | **4.27** | – | – | 2.13x |
+| 4 KiB   | 9.29 | **4.18** | – | – | 2.22x |
+| 8 KiB   | 9.08 | **3.62** | – | – | 2.51x |
+| 16 KiB  | 10.34 | **4.85** | 9.40 | 7.39 | 2.13x |
+| 32 KiB  | 10.47 | **5.86** | 9.60 | 7.50 | 1.79x |
+| 64 KiB  | 10.64 | 8.72 | 9.88 | **8.14** | 1.31x |
+| 128 KiB | 15.26 | 13.63 | 10.61 | **8.85** | 1.72x |
+| 256 KiB | 15.84 | 24.48 | 13.32 | **11.28** | 1.40x |
+| 512 KiB | 20.15 | 45.69 | 18.53 | **16.54** | 1.22x |
+| 1 MiB   | **25.00** | 91.39 | 28.36 | 26.85 | 0.93x |
+
+(Plain `one_shot` is omitted; `one_shot_ws` supersedes it everywhere.)
+
+**The workspace treatment is worth ~2 µs to two-shot as well** — 9.40 → 7.39,
+10.61 → 8.85, 13.32 → 11.28, 18.53 → 16.54. Exactly the barrier-overlap saving
+predicted from two-shot being synchronization-bound rather than
+bandwidth-bound, and it holds across the whole range.
+
+Crossover is ~64 KiB: `one_shot_ws` below, `two_shot_ws` from there to ~512 KiB,
+XLA's ring above ~1 MiB.
+
+At 2 and 4 devices the win is smaller (XLA's ring is only 2 and 6 hops), but
+one-shot still leads at small sizes — 1.4-2.1x at 2 devices, 1.2-1.6x at 4.
+
+## 2b. Scaling to 16 chips / 32 devices
+
+Full `ici-2x2x4` slice: 4 hosts × 4 chips × 2 cores. One consistent run
+(job 32, ~4 min wall). `✗` = takes down the slice at 32 devices; `–` = not
+applicable (`two_shot` needs `rows % 32 == 0`, which at `cols=1024` puts its
+smallest payload at 64 KiB).
+
+| payload | XLA | one_shot_ws | two_shot | **two_shot_ws** | best vs XLA |
+|--------:|----:|------------:|---------:|----------------:|------------:|
+| 2 KiB   | 15.88 | **8.15** | – | – | 1.95x |
+| 4 KiB   | 16.16 | **8.01** | – | – | 2.02x |
+| 8 KiB   | 16.36 | **10.08** | – | – | 1.62x |
+| 16 KiB  | 17.29 | **15.14** | – | – | 1.14x |
+| 32 KiB  | **18.00** | 25.86 | – | – | 0.70x |
+| 64 KiB  | 19.76 | 49.65 | 17.59 | **14.20** | 1.39x |
+| 128 KiB | 22.26 | 104.30 | 17.09 | **14.25** | 1.56x |
+| 256 KiB | 24.18 | 208.32 | 22.64 | **18.68** | 1.29x |
+| 512 KiB | 27.92 | 425.89 | 33.54 | 28.54 | 0.98x |
+| 1 MiB   | 37.84 | 857.36 | 57.60 | 51.15 | 0.74x |
+
+Both `_ws` kernels work at 32 devices once the exit-time semaphore check is
+disabled (§3a). `one_shot_ws` holds the same ~2x peak as at 8 devices, with an
+earlier crossover (~8 KiB vs ~64 KiB) for the usual bandwidth reason.
+`two_shot_ws` is worth ~3 µs over plain two-shot here and lifts the 64-256 KiB
+range from 1.05-1.21x to **1.29-1.56x**.
+
+**The remaining gap is 32 KiB at 32 devices**, where XLA still wins: one-shot is
+already bandwidth-bound at 31 peers, and neither two-shot variant can run there.
+That second part is an artifact, not physics — both scatter along rows, so they
+inherit `rows % N == 0`, which at `cols=1024` and 32 devices means no payload
+between 16 KiB and 64 KiB is expressible. Scattering the flattened array instead
+would close it, and is much cheaper than another kernel.
+
+Two more things to read off this:
+
+* **one-shot's peak win is stable at ~1.4x**, same as 8 devices — its floor
+  (11.1 µs) and XLA's floor (16.3 µs) both grow with device count, but at
+  roughly the same rate.
+* **Its useful range collapses from ≤32 KiB to ≤8 KiB.** One-shot's egress is
+  `M·(N-1)`, so 4x the devices costs 4x the bandwidth at the same payload,
+  and the slope above the crossover is brutal — 477 µs at 512 KiB.
+* **two_shot is sync-bound here too**: 17.57 → 17.91 µs from 64 to 128 KiB,
+  double the payload for +2%. Same conclusion as at 8 devices — its floor is
+  hops plus barrier, so the workspace treatment is where its headroom is.
+
+XLA scales well here: 4x the devices costs only 1.8x latency (9.1 → 16.1 µs at
+2 KiB), so its lowering is clearly not a naive 2(N-1)-hop ring at this scale.
+
+`two_shot`'s egress is `2M(N-1)/N ≈ 2M`, essentially independent of N, so it
+holds a ~17.5 µs floor where one-shot has already exploded. But XLA is only
+20-24 µs there, so the win is 1.05-1.21x. Two-shot's value at 32 devices today
+is that it *bounds the downside* above the one-shot crossover, not that it is
+fast -- which is exactly why giving it the workspace treatment is the
+interesting move.
+
+Caveat: sub-meshes (8 or 16 of the 32) were **not** measured in the multi-host
+job. Every process must participate in each jitted collective, so a mesh over a
+device subset risks a hang; the 8-device numbers above come from a single-host
+run instead.
+
+## 3. Remaining headroom
+
+Both barriers in the kernel are pure overhead. Dropping the second
+(re-entrancy) barrier — unsafe as shipped, diagnostic only via `oneshot_sb`:
+
+| payload | XLA | one_shot | one_shot, single barrier |
+|--------:|----:|---------:|-------------------------:|
+| 2 KiB  | 9.05 | 6.45 | **4.95** (1.83x) |
+| 8 KiB  | 8.68 | 6.27 | **4.88** (1.78x) |
+| 32 KiB | 10.52 | 7.58 | **6.73** (1.56x) |
+
+So ~1.4 µs of the 6.4 µs floor is the second barrier. `scripts/allreduce_breakdown.py`
+strips the kernel down further — 8 devices, bfloat16, µs:
+
+| payload | copy (launch) | bar1 | bar2 | dma1bar | full |
+|--------:|--------------:|-----:|-----:|--------:|-----:|
+| 2 KiB   | – | 1.54 | 3.01 | 4.90 | 6.28 |
+| 8 KiB   | 1.28 | 1.77 | 3.37 | 4.48 | 6.20 |
+| 32 KiB  | – | 1.91 | 2.87 | 6.67 | 8.21 |
+| 128 KiB | 0.20 | 1.68 | 3.03 | 14.69 | 16.29 |
+
+At 2 KiB the 6.28 µs splits roughly as **1.5 µs barrier #1 (incl. launch) +
+1.5 µs barrier #2 + 3.4 µs DMA+reduce**. So **about half the floor is barrier
+overhead, not communication.**
+
+Both barriers are removable in principle:
+
+* **Barrier #2 (~1.5 µs)** — double-buffered scratch keyed on invocation
+  parity, so a peer's receive is itself permission to send again.
+* **Barrier #1 (~1.5 µs)** — the bigger structural win. Today it is a full
+  round trip *before any data moves*. Replacing it with per-peer capacity
+  semaphores lets the DMAs start immediately and overlaps the synchronization
+  with the transfer instead of serializing them.
+
+That puts a realistic floor near **3.4-3.6 µs, or ~2.6x over XLA's 9.1 µs**, up
+from 1.4x today. Both need invocation-parity state carried across calls, so this
+is real work, not a flag flip.
+
+### Barrier #1 removed: `one_shot_all_reduce_ws` (~2.2x over XLA)
+
+Measured on 8 devices, bfloat16, one shape per process:
+
+| payload | XLA | `one_shot` | `one_shot_ws` | speedup |
+|--------:|----:|-----------:|--------------:|--------:|
+| 2 KiB   | 9.92 | 6.83 | **3.90** | 2.54x |
+| 4 KiB   | 9.22 | 5.97 | **4.21** | 2.19x |
+| 8 KiB   | 9.14 | 6.34 | **4.20** | 2.18x |
+| 16 KiB  | 10.12 | 6.80 | **4.81** | 2.10x |
+| 32 KiB  | 10.43 | 8.26 | **6.59** | 1.58x |
+| 64 KiB  | 11.07 | 10.91 | **9.02** | 1.23x |
+
+3.90 µs at 2 KiB lands on the 3.4-3.6 µs floor the decomposition predicted.
+
+**How.** Barrier #1's real job is not buffer reuse — it guarantees the
+destination is *owned by this kernel on the receiver* when the data lands.
+Kernel scratch is live only while the kernel runs, so a write that arrives
+early scribbles on VMEM XLA has given to another op. The fix is to make the
+destination a caller-owned workspace threaded through every call: it stays live
+between kernels (XLA cannot reuse a value that is still needed), so an early
+write is harmless and the barrier can move *after* the sends, where it overlaps
+the transfer. Three things must be double-buffered together:
+
+* **data slots** — round `k` writes `ws[k%2]`, last read by round `k-2`;
+  passing round `k-1`'s barrier proves peers finished round `k-2`'s reduce;
+* **DMA semaphores** — otherwise a round-`k` send satisfies a peer's pending
+  round `k-1` byte-count wait early;
+* **the barrier must stay a *double* barrier** — double-buffering the data does
+  not license a single one, since a fast peer can signal two rounds' arrivals.
+
+Round parity is carried at runtime in an aliased `step` counter, so a call site
+that repeats across decode steps works without trace-time constants.
+
+**Validation.** `scripts/allreduce_ws_stress.py`: 700 executions across 7 shapes
+× 5 chain lengths (1-64 rounds), values checked against `psum` every time, zero
+failures. The chain uses a per-round twist rather than a plain mean-of-means, so
+a dropped, doubled or stale round shows up as a value mismatch. In float32 a
+200-round chain matches to 1.5e-7; the ~0.02 bfloat16 deltas are accumulation
+drift, not corruption (confirmed by the float32 run).
+
+**Known limit.** Validated to 64 KiB per shard; **128 KiB takes down the slice**
+(`SLICE_FAILURE_SW_INJECT_ERROR`), diagnosis pending. Not currently blocking:
+one-shot is bandwidth-bound well before that and `two_shot` already wins from
+~64 KiB, so the limit sits outside the range where this kernel is the right
+choice. It does mean the dispatch gate is mandatory, not optional.
+
+### 3a. Root cause: Mosaic's exit-time semaphore check
+
+The slice failures had a single root cause, found in the TPU driver log the
+`SLICE_FAILURE_SW_INJECT_ERROR` message points at (`/tmp/tpu_logs_<user>/`,
+which is where to look first next time -- the libtpu message itself is generic):
+
+```
+Node 1 halted unexpectedly at tag:pc TensorCoreSequencer:1:0x584:
+Semaphore (scratch argument 3) has a nonzero value upon exit from a Mosaic
+kernel. Make sure every DMA is awaited, and every semaphore signal is paired
+with a wait.
+```
+
+Scratch argument 3 is `recv_sem`. **It is not a data race.** With the barrier
+*after* the sends, a peer that has passed round `k`'s barrier issues its round
+`k+1` sends *before* its own round `k+1` barrier. Those DMAs land in our
+`ws[(k+1)%2]` and bump `recv_sem[(k+1)%2]` while we are still finishing round
+`k`. The data is fine -- that is the other slot, which is exactly what double
+buffering is for -- but Mosaic asserts every scratch semaphore is zero on
+kernel exit, and that one legitimately is not. Double-buffering the semaphores
+did not fix it; it only moved which index is nonzero.
+
+This accounts for every observation:
+
+* **Nondeterminism at 32 devices** -- it depends on whether a peer's next-round
+  DMA beats our exit, so more devices and more cross-host dispatch skew make it
+  more likely.
+* **Byte sensitivity at 8 devices** (784 KiB fine, 896 KiB fatal) -- larger
+  transfers widen the window.
+* **`barrier_first` always clean** -- no peer can send round `k+1` until
+  everyone has entered it, so nothing arrives early.
+
+**Fix:** `disable_semaphore_checks=True` in `CompilerParams`, now the default
+for this kernel. The early counts are not lost -- they carry over and are
+consumed by the next round's wait, verified exact against `psum` in float32:
+160 executions at 8 devices (including the previous reliable crasher at 64-round
+chains) and 280 at 32 devices, all to ~1e-6. The device cap and in-flight byte
+cap are gone; both were symptoms of this one bug.
+
+`barrier_first` remains as an escape hatch and as the control that isolated the
+bug. Note it must stay possible to *reproduce* the failure --
+`--enable-sem-checks` does that.
+
+**Process note.** Two separate crashes came from the same argparse trap:
+`action="store_true"` defaults to `False`, so a flag meant to say "leave the
+default alone" instead actively forced the unsafe setting. Both flags now
+default to `None`.
+
+### The failed attempt that got here (kept for the record)
+
+First attempt (`one_shot_all_reduce_db`, since deleted) double-buffered the recv
+slots in *kernel scratch* and moved the barrier after the sends. Measured on
+8 devices, 2 KiB:
+
+| variant | latency | vs XLA |
+|---|---:|---:|
+| `one_shot` (shipped) | 6.3-6.6 µs | 1.4x |
+| barrier after sends, double barrier | **4.25 µs** | 1.91x |
+| barrier after sends, single barrier | **3.53 µs** | 2.33x |
+
+Neither variant was correct — both eventually killed the slice or hung. Three
+real bugs surfaced, all of which the workspace version above had to fix too:
+
+1. Double-buffering the *data* doesn't license a single barrier — a fast peer
+   can signal two rounds' arrivals, so "I collected N-1 signals" stops meaning
+   "everyone arrived".
+2. Round 0 issued a leading *and* trailing barrier while later rounds issued
+   one, so barrier-semaphore counts drifted and later rounds ate stale signals.
+3. The *DMA semaphores* are shared across rounds too: a round-`k` send can land
+   while a peer drains round `k-1`'s byte-count waits and satisfy them early.
+
+It still failed after all three, because kernel scratch is the wrong home for
+the destination — hence the workspace design above, which is the same
+symmetric-memory idea as the paper's `ncclLLBuffer`.
+
+One methodology note worth carrying forward: a mid-bisect hypothesis that the
+crash was "multi-shape" was **wrong**. Python block-buffers stdout when
+redirected to a file, so results printed before an abort were lost and the crash
+looked like it happened one config earlier than it did. The real trigger was
+payload size. Run these with `python -u`.
+
+Caveat on the attribution: the `copy` variant's slope fell below noise at 2 and
+32 KiB (shown `-`), so launch is somewhere in 0.2-1.3 µs and the split between
+"launch" and "barrier #1" is soft. The `bar1`/`bar2`/`dma1bar`/`full` columns
+are directly measured and solid; only their *decomposition* carries that slack.
+
+Note also there is no barrier-free variant here, deliberately: removing every
+barrier lets a peer's DMA land after the receiving kernel exits, which corrupts
+semaphore state and kills the slice (`SLICE_FAILURE_SW_INJECT_ERROR`). One
+barrier is the hard floor for a stateless kernel.
+
+## 4. torchtpu's all-reduce carries large per-collective overhead
+
+Measured through the stack vLLM actually uses (`tpu_dist` functional collectives
+under `torch.compile(backend="tpu")`, 8 processes), same slope methodology:
+
+| payload | torchtpu | JAX/XLA same collective |
+|--------:|---------:|------------------------:|
+| 2 KiB   | 139.6 µs | 9.1 µs |
+| 8 KiB   | 139.1 µs | 9.2 µs |
+| 32 KiB  | 140.4 µs | 10.8 µs |
+| 128 KiB | 139.7 µs | 15.2 µs |
+
+Controls run:
+
+* Compute-only chain (`--op noop`): T20 = T60 = 0.38 ms, ~0 µs/op. So the
+  harness's fixed cost genuinely cancels and the 139 µs is per-all-reduce.
+* Absolute times are linear: T20 = 2.97 ms, T60 = 8.54 ms.
+* With a matmul interleaved before each collective (`--interleave-matmul`),
+  still ~130 µs/op.
+
+**The cost is flat from 8 KiB to 128 KiB.** No collective is flat in payload
+size, so this is not wire time — it is per-collective overhead ~15x larger than
+the collective itself.
+
+Likely mechanism, *not yet confirmed*: `torch_tpu/_internal/compile/fx_passes/
+force_collectives_output.py` promotes every collective and `wait_tensor` to a
+submodule output, so a graph of N collectives becomes N separately dispatched
+executables (`_SplitCompiledExecutable`). A host round-trip per collective is
+consistent with a flat, size-independent ~139 µs.
+
+Caveat worth resolving before acting: at 139 µs × ~60 layers a decode step would
+be ~8 ms of pure all-reduce, which does not match observed vLLM decode times —
+so either production graphs avoid the per-collective split, or the host pipelines
+the dispatches in a way this microbenchmark's blocking chain prevents. **The next
+step is a profile of a real decode step** (e.g. the traces in
+`k3_pruned_profiles/`) to see the actual device-side collective duration and the
+gaps between them.
+
+## Recommendation
+
+1. **Confirm §4 first.** If torchtpu really adds ~130 µs per collective in
+   production graphs, that dwarfs everything else here — a 2x kernel win on a
+   9 µs op is irrelevant next to a 139 µs dispatch. If it is a microbenchmark
+   artifact, discard it and go to #2.
+2. **Ship the `_ws` kernels with a size/device dispatch gate.** Measured best
+   choice, bfloat16, `cols=1024`:
+
+   | devices | payload | use | vs XLA |
+   |--------:|--------:|-----|-------:|
+   | 8  | ≤ 32 KiB | `one_shot_all_reduce_ws` | 1.8-2.5x |
+   | 8  | 64 KiB - 512 KiB | `two_shot_all_reduce_ws` | 1.2-1.7x |
+   | 8  | > 512 KiB | XLA | — |
+   | 32 | ≤ 16 KiB | `one_shot_all_reduce_ws` | 1.1-2.0x |
+   | 32 | 64 - 256 KiB | `two_shot_all_reduce_ws` | 1.3-1.6x |
+   | 32 | 32 KiB, > 256 KiB | XLA | — |
+
+   The gate is mandatory, not an optimization: off-crossover the one-shot family
+   is catastrophically worse (857 µs at 1 MiB / 32 devices).
+3. **Cost of adoption.** Each call site needs a workspace and round counter
+   threaded through it (`make_workspace` / `make_two_shot_workspace`). On an
+   8-device TP decode with ~60 all-reduces/step, `one_shot_ws` saves ~5 µs each,
+   ≈ **300 µs/step**.
+4. **Cheap follow-up: drop the `rows % N == 0` constraint** by scattering the
+   flattened array. At 32 devices it is the only reason nothing beats XLA at
+   32 KiB, and it is much less work than another kernel.
+5. **Keep the `env_override.py` SparseCore threshold.** Worth 3.5x at ≥64 KiB,
+   and the `tpu7x` prefix match is what makes it fire.
+
+## Files
+
+* `src/vllm_torchtpu/kernels/collectives/low_latency_all_reduce.py` — the kernels.
+* `scripts/allreduce_latency_bench.py` — JAX benchmark (XLA vs one-shot vs `_ws` vs two-shot).
+* `scripts/allreduce_ws_stress.py` — correctness stress for the workspace
+  kernels (`--kernel oneshot|twoshot`), float32 oracle. Run this to a clean exit
+  before trusting any `_ws` change; it caught every bug in both.
+* `scripts/allreduce_breakdown.py` — latency attribution (launch / barrier / DMA).
+* `scripts/slurm_allreduce_32.sbatch` — 32-device (16-chip) multi-host run.
+* `scripts/torchtpu_allreduce_bench.py` — torchrun benchmark of torchtpu's own all-reduce.
