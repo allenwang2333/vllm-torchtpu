@@ -3055,10 +3055,21 @@ class TPUModelRunner(GPUModelRunner):
                           PreparedPrefillMicrobatch], tuple(bundles))
 
     def _prepare_dummy_prefill_microbatch(
-            self, index: int) -> PreparedPrefillMicrobatch:
-        """Build one fixed-shape dummy bundle with real attention metadata."""
+            self, index: int,
+            num_reqs: int | None = None) -> PreparedPrefillMicrobatch:
+        """Build one fixed-shape dummy bundle with real attention metadata.
+
+        ``num_reqs`` drives the attention metadata's request dimension, and so
+        selects which compiled program this bundle launches. A live idle rank
+        leaves it None and gets ``num_reqs_max_model_len``, which is the shape
+        its peers expect from it. Warmup passes the values a *real* bundle
+        produces instead -- see ``_staged_warmup_req_counts`` for why that is
+        not the same set.
+        """
         num_tokens = PREFILL_MICROBATCH_TOKENS
-        num_reqs = self.num_reqs_max_model_len
+        if num_reqs is None:
+            num_reqs = self.num_reqs_max_model_len
+        num_reqs = max(1, min(int(num_reqs), self.num_reqs_max_model_len))
         # Mirror _dummy_run's mrope branch. A real bundle carries
         # self.position_ids, which is (3, num_tokens) under mrope; a 1-D dummy
         # here would feed the staged path a differently ranked positions
@@ -3206,14 +3217,39 @@ class TPUModelRunner(GPUModelRunner):
         return (restored, [1] * plan.num_real_microbatches,
                 [None] * plan.num_real_microbatches)
 
-    def _run_idle_two_microbatch_prefill(self) -> None:
+    def _staged_warmup_req_counts(self) -> tuple[int, ...]:
+        """Request-dimension shapes a staged bundle can launch with.
+
+        A real slot holding *n* requests gets
+        ``_get_padded_num_reqs_with_upper_limit(n, max_num_reqs)``, which lands
+        on one of ``num_reqs_paddings``. An idle rank's dummy uses
+        ``num_reqs_max_model_len``. Those are different numbers -- a
+        single-request slot pads to MIN_NUM_SEQS -- so warming only the dummy
+        shape leaves every real staged step to compile mid-flight.
+
+        Differing here is safe, only slow: the EP collectives are sized by
+        tokens, not requests, so a rank whose slot carries a different request
+        count still rendezvouses. It just pays for a program nobody warmed.
+        """
+        counts = {int(self.num_reqs_max_model_len)}
+        counts.update(int(value) for value in self.num_reqs_paddings
+                      if 0 < int(value) <= self.num_reqs_max_model_len)
+        return tuple(sorted(counts))
+
+    def _run_idle_two_microbatch_prefill(self,
+                                         num_reqs: int | None = None) -> None:
         """Run the staged step with all-dummy bundles on a rank with no work.
 
         An idle EP rank must still emit the same collective stream its busy
         peers do, so it runs the identical shaped step and discards the result.
+
+        ``num_reqs`` is passed only by warmup, which walks every request shape
+        a real slot can produce. Live idle steps leave it None and take
+        ``num_reqs_max_model_len``.
         """
-        bundles = tuple(self._prepare_dummy_prefill_microbatch(index)
-                        for index in range(NUM_PREFILL_MICROBATCHES))
+        bundles = tuple(
+            self._prepare_dummy_prefill_microbatch(index, num_reqs=num_reqs)
+            for index in range(NUM_PREFILL_MICROBATCHES))
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             self._token_padding_state.update(0, PREFILL_MICROBATCH_TOKENS)
         hidden = self._run_two_microbatch_forward(
@@ -4726,8 +4762,21 @@ class TPUModelRunner(GPUModelRunner):
                     # Precompile the staged shapes on every rank. A rank that
                     # compiled during a live staged step would stall its peers
                     # inside the collectives they entered together.
-                    logger.info("  -- fixed two-prefill microbatch graph")
-                    self._run_idle_two_microbatch_prefill()
+                    #
+                    # Every request shape, not just the dummy's: a bundle's
+                    # program is selected by its request dimension as well as
+                    # its token count, and a real slot pads to a different one
+                    # than an all-dummy slot does.
+                    req_counts = self._staged_warmup_req_counts()
+                    logger.info(
+                        "  -- two-prefill microbatch graphs: %d request "
+                        "shape(s)", len(req_counts))
+                    for num_reqs in req_counts:
+                        logger.info(
+                            "  -- two-prefill microbatch graph: %d requests",
+                            num_reqs)
+                        self._run_idle_two_microbatch_prefill(
+                            num_reqs=num_reqs)
 
             self._precompile_sampling_subgraphs()
 
