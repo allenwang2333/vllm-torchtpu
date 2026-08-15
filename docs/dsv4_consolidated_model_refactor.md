@@ -70,6 +70,21 @@ Everything above ran with `VLLM_ENFORCE_EAGER=1`. The `support_torch_compile`
 `src/vllm_torchtpu/__init__.py` are therefore unexercised, as is the removal of
 the `torch._dynamo` metrics-logging bypass the patch module carried.
 
+## Open items
+
+`model.py` raises the interpreter recursion limit to 50000 before tracing,
+carried over from #464 where the comment reads "tracing this model exceeds the
+default 1000 frames". That was measured against the patch-based architecture,
+whose monkey-patched call stacks were deeper than the native model's. Whether
+the native model still needs it is unverified. To settle it: drop the
+`sys.setrecursionlimit` call, run the compile gate, and see whether tracing
+raises `RecursionError`. If it does, record the depth it actually needs instead
+of keeping a round number.
+
+`deepseek_v4_stubs.py` defines `patch_cuda_stubs()` but nothing calls it now
+that the patch module is gone. Either the native model needs no CUDA stubs, in
+which case the module can go, or a path exists that has not been exercised.
+
 ## Prior MMLU measurement
 
 An earlier run of this code, before the in-layer mixing change, scored 0.2390

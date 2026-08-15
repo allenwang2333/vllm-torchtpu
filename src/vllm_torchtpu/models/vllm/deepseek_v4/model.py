@@ -455,23 +455,11 @@ class DeepseekV4Head(nn.Module):
         return self.norm(hidden_states)
 
 
-support_torch_compile(
-    DeepseekV4DecoderLayer,
-    dynamic_arg_dims={
-        "x": 0,
-        "positions": 0,
-        "input_ids": 0,
-    },
-)
-
-support_torch_compile(
-    DeepseekV4Head,
-    dynamic_arg_dims={
-        "hidden_states": 0,
-    },
-)
-
-
+@support_torch_compile(dynamic_arg_dims={
+    "input_ids": 0,
+    "positions": 0,
+    "inputs_embeds": 0,
+})
 class DeepseekV4Model(nn.Module):
     """DeepSeek-V4 backbone model containing token embedding, layers, and head."""
 
