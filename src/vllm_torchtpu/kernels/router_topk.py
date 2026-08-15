@@ -32,8 +32,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 # Below any real routing score (softmax/sigmoid/sqrtsoftplus are all >= 0) and
-# above -FLT_MAX, the identity of a max-reduce, so a masked column can never
-# win a later pass.
+# above -FLT_MAX, which is what a column is masked with: the two must differ,
+# or a row that is entirely sentinel cannot advance past its first column.
 NEG = -3.0e38
 
 # Rows per grid step. 512 measured fastest at 512 experts at 8192 and 16384
@@ -54,8 +54,14 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     NaN is flushed to the sentinel before the first max so every row has a
     maximum that some column equals, and every index written is a real
     expert. Ties resolve to the lowest expert id.
+
+    Masking uses a value strictly *below* that sentinel. ``NEG`` is a score a
+    whole row can be made of (a fully-NaN row is nothing else), so masking
+    with ``NEG`` would leave every column still equal to the row max and every
+    pass would return column 0 -- one expert selected ``topk`` times.
     """
     x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])
+    masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
@@ -64,7 +70,7 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
         idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
         w_ref[:, j] = m[:, 0]
         i_ref[:, j] = idx.astype(jnp.int32)
-        x = jnp.where(iota == idx[:, None], NEG, x)
+        x = jnp.where(iota == idx[:, None], masked, x)
     # A row that was entirely NaN has no real maximum, only the sentinel:
     # keep it poisonous rather than routing it to experts 0..k-1 with a
     # weight the renormalization would turn into something plausible.

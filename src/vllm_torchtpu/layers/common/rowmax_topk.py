@@ -30,7 +30,9 @@ import torch
 
 # Below any real routing score (softmax and sigmoid are >= 0, sqrtsoftplus is
 # >= 0, and an ``e_score_correction_bias`` shifts them by a finite constant),
-# and above -FLT_MAX so it survives a max-reduce whose identity is -FLT_MAX.
+# and above the dtype minimum, which is what a selected column is masked with:
+# the two must differ, or a row that is entirely sentinel cannot advance past
+# its first column.
 NEG = -3.0e38
 
 
@@ -45,14 +47,19 @@ def rowmax_topk(scores: torch.Tensor,
 
     NaN is flushed to the sentinel before the first pass, so every returned
     index is a real expert even for a poisoned row; a row that is *entirely*
-    NaN keeps its poison in the weights rather than silently routing to
-    experts 0..k-1.
+    NaN keeps its poison in the weights, and still names ``k`` distinct
+    experts (0..k-1, as the sort path does) so the MoE gathers what it would
+    have gathered for any other row.
     """
     n = scores.shape[-1]
     if k > n:
         raise ValueError(f"topk k={k} exceeds the expert count {n}")
     iota = torch.arange(n, device=scores.device, dtype=torch.int32)
     neg = torch.tensor(NEG, dtype=scores.dtype, device=scores.device)
+    # Strictly below `neg`: see the comment on NEG.
+    masked = torch.tensor(torch.finfo(scores.dtype).min,
+                          dtype=scores.dtype,
+                          device=scores.device)
     last = torch.tensor(n - 1, dtype=torch.int32, device=scores.device)
 
     cur = torch.where(torch.isnan(scores), neg, scores)
@@ -66,7 +73,7 @@ def rowmax_topk(scores: torch.Tensor,
                          keepdim=True)
         values.append(m)
         indices.append(idx)
-        cur = torch.where(iota == idx, neg, cur)
+        cur = torch.where(iota == idx, masked, cur)
 
     weights = torch.cat(values, dim=-1)
     ids = torch.cat(indices, dim=-1)
