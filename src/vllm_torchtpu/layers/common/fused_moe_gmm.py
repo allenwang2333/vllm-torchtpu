@@ -78,6 +78,41 @@ def resolve_onehot_permute_threshold() -> int:
     return threshold
 
 
+def routed_buffer_capacity(
+    num_tokens: int,
+    topk: int,
+    ep_size: int,
+    *,
+    alpha: float,
+    beta: float = 7.0,
+    c0: int = 16,
+    quantum: int = 512,
+) -> int:
+    """Rows to reserve in the per-rank routed buffer.
+
+    Only ``num_tokens * topk / ep_size`` of the ``num_tokens * topk`` routed
+    (token, expert) rows belong to this EP rank. Sizing the buffer to a
+    capacity instead of the global count shrinks the permute, the GMM ``m``
+    dimension and the XLA temp by ``ep_size``, at the cost of dropping rows if
+    the rank's actual load exceeds the capacity.
+
+    The slack is multiplicative *and* additive: the relative fluctuation of the
+    rank total scales as ``1/sqrt(mean)``, so a constant ``alpha`` is wrong --
+    the alpha needed for a 1e-12 drop bound runs from 2.15 at 32 tokens to
+    1.046 at 16384. ``alpha`` therefore buys margin against *routing skew* and
+    ``beta``/``c0`` against sampling noise; ``quantum`` matches the GMM m-tile
+    so the capacity never adds a ragged tail. Tail derivation:
+    ``$AMPLIO_ARTIFACT_DIR/w5/notes/capacity-stats.md``.
+    """
+    routed_rows = num_tokens * topk
+    if ep_size <= 1:
+        return routed_rows
+    mean = routed_rows / ep_size
+    target = alpha * mean + beta * (mean**0.5) + c0
+    capacity = int(-(-target // quantum)) * quantum
+    return min(capacity, routed_rows)
+
+
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
     """Unpack a uint8-packed E2M1 weight (2 fp4 per byte along the last axis)
     into ``float4_e2m1fn`` and move the contracting axis into GMM layout. Input
@@ -190,6 +225,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    routed_capacity: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -216,6 +252,18 @@ def prepare_routed_gmm_inputs(
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
+
+    if routed_capacity is not None and routed_capacity < sort_keys.size:
+        # Valid rows sort ahead of invalid ones, so a valid row's destination
+        # `argsort_revert_indices` is already its index in the compacted
+        # buffer; rows past the capacity are the overflow and are dropped by
+        # clearing their mask bit. The sentinel keeps every index in range for
+        # the bounds-check-free SparseCore gathers.
+        kept_mask = valid_mask & (argsort_revert_indices < routed_capacity)
+        argsort_revert_indices = jnp.where(kept_mask, argsort_revert_indices,
+                                           0)
+        valid_mask = kept_mask
+        sorted_indices = sorted_indices[:routed_capacity]
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
@@ -306,7 +354,7 @@ def moe_gmm(
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+        if gmm2_res.shape[0] <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
             if skip_padded_tokens:
@@ -320,7 +368,7 @@ def moe_gmm(
                 gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
-                                    argsort_revert_indices.size,
+                                    gmm2_res.shape[0],
                                     dtype=gmm2_res.dtype)
             # revert_indices is a permutation, so each routed row lands in
             # exactly one (token, k) slot: the products and the sum over k
@@ -361,6 +409,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "ep_size",
     ),
 )
 def fused_moe_func(
@@ -381,6 +430,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    ep_size: int = 1,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -431,6 +481,16 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
+    # `ep_size` is identical on every rank (unlike `experts_start`), so binding
+    # the capacity as a compile-time constant keeps the ranks' programs
+    # structurally identical -- which it must be, or XLA cannot shrink the
+    # routed buffer at all.
+    capacity_alpha = envs.TPU_MOE_ROUTED_CAPACITY_ALPHA
+    routed_capacity = (routed_buffer_capacity(
+        num_tokens, topk, ep_size, alpha=capacity_alpha) if
+                       (use_ep and ep_size > 1 and capacity_alpha > 0) else
+                       None)
+
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(
          hidden_states,
@@ -442,6 +502,7 @@ def fused_moe_func(
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
          skip_padded_tokens=skip_padded_tokens,
+         routed_capacity=routed_capacity,
      )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(

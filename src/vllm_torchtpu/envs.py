@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_ROUTED_CAPACITY_ALPHA: float = 0.0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -300,6 +301,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Size the EP routed buffer to a capacity instead of num_tokens * topk:
+    # C = ceil_to_tile(alpha * num_tokens * topk / ep + beta * sqrt(...)).
+    # 0 (default) keeps the full global size. See
+    # fused_moe_gmm.routed_buffer_capacity for the formula and the drop risk.
+    "TPU_MOE_ROUTED_CAPACITY_ALPHA":
+    lambda: float(os.getenv("TPU_MOE_ROUTED_CAPACITY_ALPHA") or "0"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
