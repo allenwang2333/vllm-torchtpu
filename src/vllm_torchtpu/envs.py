@@ -39,6 +39,10 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     VLLM_TPU_NAIVE_PREFILL_MICROBATCHING: bool = False
+    VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER: bool = False
+    VLLM_TPU_NAIVE_PREFILL_LEGACY_ADMISSION: bool = False
+    VLLM_TPU_NAIVE_PREFILL_REORDER: bool = True
+    VLLM_TPU_NAIVE_PREFILL_MICROBATCH_BUCKETS: list[int] = []
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -289,6 +293,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for the configuration envelope it requires.
     "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING":
     env_bool("VLLM_TPU_NAIVE_PREFILL_MICROBATCHING"),
+    # Measurement-only: let a single request stage against a dummy partner.
+    # That costs 2*pad(T) against a serial pad(T), so the planner rejects it
+    # by default; it exists because a concurrency-1 harness cannot observe the
+    # staged path any other way.
+    "VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER":
+    env_bool("VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER"),
+    # Admit only the original fixed envelope: one or two fresh requests of
+    # exactly 1024 tokens. Keeps compare_staged_vs_serial.py's 1023-vs-1024
+    # control working and records #25/#26/#30 reproducible; the cost-aware
+    # planner admits 1023 too, which collapses both of that script's arms onto
+    # the staged path.
+    "VLLM_TPU_NAIVE_PREFILL_LEGACY_ADMISSION":
+    env_bool("VLLM_TPU_NAIVE_PREFILL_LEGACY_ADMISSION"),
+    # Permute the step's prefill requests when that turns a partition the
+    # planner would admit into a contiguous one it can prepare. On by default;
+    # set 0 for the control arm, which measures how much yield the ragged
+    # cases were actually costing. A slot is one contiguous _prepare_inputs
+    # range, so without this a step like [500, 1024, 512] runs serial even
+    # though {500, 512} | {1024} fits two slots exactly.
+    "VLLM_TPU_NAIVE_PREFILL_REORDER":
+    env_bool("VLLM_TPU_NAIVE_PREFILL_REORDER", True),
+    # Per-microbatch token lengths the staged graph is precompiled for. Each
+    # entry costs a full graph compile at startup. Empty means the default
+    # (512, 1024).
+    "VLLM_TPU_NAIVE_PREFILL_MICROBATCH_BUCKETS":
+    lambda: [
+        int(v) for v in os.getenv(
+            "VLLM_TPU_NAIVE_PREFILL_MICROBATCH_BUCKETS", "").split(",")
+        if v.strip()
+    ],
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

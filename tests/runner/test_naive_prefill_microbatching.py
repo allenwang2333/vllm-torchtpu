@@ -4,8 +4,9 @@ import pytest
 
 from vllm_torchtpu.runner.naive_prefill_microbatching import (
     PREFILL_MICROBATCH_TOKENS, PrefillStepMode, build_two_microbatch_plan,
-    coordinated_step_mode, local_step_mode, staged_token_bucket,
-    validate_feature_config, validate_staged_microbatch_tokens)
+    coordinated_step_mode, local_step_mode,
+    staged_token_bucket, validate_feature_config,
+    validate_staged_microbatch_tokens)
 
 # ----- Planning: which local work is eligible for the staged path -----
 
@@ -15,8 +16,9 @@ def test_plan_has_two_independent_fixed_request_ranges():
                                      {"a": 0, "b": 0})
     assert plan is not None
     assert plan.request_ids == ("b", "a")
-    assert [(m.input_start, m.input_end) for m in plan.microbatches] == [
-        (0, 1024), (1024, 2048)]
+    assert [(m.start_index, m.end_index) for m in plan.microbatches] == [
+        (0, 1), (1, 2)]
+    assert [m.num_tokens for m in plan.microbatches] == [1024, 1024]
     assert plan.restore_output_order(["b-logits", "a-logits"]) == [
         "b-logits", "a-logits"]
 
@@ -87,24 +89,42 @@ def test_busy_and_idle_paths_use_one_unified_coordination_payload(monkeypatch):
 
     def all_reduce(tensor, op, group):
         payloads.append(tensor.tolist())
-        tensor.copy_(torch.tensor([1024, 1, 1]))
+        tensor.copy_(torch.tensor([2048, 1, 1, 1024]))
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
     class FakeRunner:
         num_tokens_paddings = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        _staged_microbatch_tokens = 1024
 
         def _dp_lockstep_enabled(self):
             return True
 
-    busy = TPUModelRunner._dp_coordinated_step(
-        FakeRunner(), 1024, 1, PrefillStepMode.TWO_MICROBATCH)
-    idle = TPUModelRunner._dp_coordinated_step(
-        FakeRunner(), 0, 0, PrefillStepMode.IDLE)
+        _staged_microbatch_buckets = (512, 1024)
 
-    assert payloads == [[1024, 1, 1], [0, 0, 0]]
-    assert busy == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
-    assert idle == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
+        def _local_staged_microbatch_tokens(self):
+            return self._local_tokens
+
+        _default_staged_tokens = TPUModelRunner._default_staged_tokens
+        _enforce_staged_cost_rule = (
+            TPUModelRunner._enforce_staged_cost_rule)
+
+    busy = FakeRunner()
+    busy._local_tokens = 1024
+    idle = FakeRunner()
+    idle._local_tokens = 0
+    busy_result = TPUModelRunner._dp_coordinated_step(
+        busy, 2048, 1, PrefillStepMode.TWO_MICROBATCH)
+    idle_result = TPUModelRunner._dp_coordinated_step(
+        idle, 0, 0, PrefillStepMode.IDLE)
+
+    # An idle rank contributes 0 to the slot-length MAX, so it cannot drag the
+    # group to a length nobody asked for -- but it still reads back the busy
+    # rank's 1024 and runs its dummies at that shape.
+    assert payloads == [[2048, 1, 1, 1024], [0, 0, 0, 0]]
+    assert busy_result == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
+    assert idle_result == (1024, 1, PrefillStepMode.TWO_MICROBATCH)
+    assert idle._staged_microbatch_tokens == 1024
 
 
 def test_coordination_payload_omits_the_mode_when_the_feature_is_off(
@@ -175,12 +195,18 @@ def test_zero_token_step_issues_no_dp_coordination(monkeypatch):
                                       req_ids=[],
                                       num_computed_tokens_cpu=np.zeros(0))
         scheduler_config = SimpleNamespace(async_scheduling=True)
+        num_tokens_paddings = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        num_reqs_max_model_len = 8
+        _staged_microbatch_buckets = (512, 1024)
+        _staged_microbatch_tokens = 1024
         _two_microbatch_plan = None
         _naive_prefill_step_mode = PrefillStepMode.IDLE
         _last_logged_naive_prefill_mode = PrefillStepMode.IDLE
 
         _build_local_naive_prefill_plan = (
             TPUModelRunner._build_local_naive_prefill_plan)
+        _naive_prefill_planner_limits = (
+            TPUModelRunner._naive_prefill_planner_limits)
 
         def _update_states(self, scheduler_output):
             calls.append("update_states")
@@ -229,10 +255,18 @@ def test_serial_modes_keep_the_reduced_step_bucket():
 
 def test_staged_bundle_length_is_validated():
     validate_staged_microbatch_tokens(PREFILL_MICROBATCH_TOKENS, role="real",
-                                      index=0, field="input_ids")
+                                      index=0, field="input_ids",
+                                      expected=PREFILL_MICROBATCH_TOKENS)
+    # 512 is a legal slot length now, but only for a step that agreed on 512.
+    validate_staged_microbatch_tokens(512, role="real", index=0,
+                                      field="input_ids", expected=512)
     with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
         validate_staged_microbatch_tokens(2048, role="real", index=1,
-                                          field="input_ids")
+                                          field="input_ids",
+                                          expected=PREFILL_MICROBATCH_TOKENS)
+    with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
+        validate_staged_microbatch_tokens(1024, role="real", index=1,
+                                          field="input_ids", expected=512)
 
 
 def test_staged_forward_rejects_equal_but_wrong_lengths():
@@ -249,7 +283,7 @@ def test_staged_forward_rejects_equal_but_wrong_lengths():
     def bundle(num_tokens):
         return SimpleNamespace(input_ids=torch.zeros(num_tokens))
 
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(_staged_microbatch_tokens=1024)
     assert TPUModelRunner._staged_forward_num_tokens(
         runner, (bundle(1024), bundle(1024))) == 1024
     with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
@@ -258,6 +292,14 @@ def test_staged_forward_rejects_equal_but_wrong_lengths():
     with pytest.raises(RuntimeError, match="equal shapes"):
         TPUModelRunner._staged_forward_num_tokens(
             runner, (bundle(1024), bundle(2048)))
+    # The agreed length is per step, not a constant: 512 is right for a step
+    # that settled on 512 and wrong for one that settled on 1024.
+    runner_512 = SimpleNamespace(_staged_microbatch_tokens=512)
+    assert TPUModelRunner._staged_forward_num_tokens(
+        runner_512, (bundle(512), bundle(512))) == 512
+    with pytest.raises(RuntimeError, match="in-graph EP collectives desync"):
+        TPUModelRunner._staged_forward_num_tokens(
+            runner, (bundle(512), bundle(512)))
 
 
 # ----- Configuration envelope -----
@@ -288,7 +330,7 @@ def test_fixed_feature_config_is_accepted():
 
 
 @pytest.mark.parametrize("override", [
-    {"dp": 4}, {"tp": 2}, {"ep": False}, {"tokens": 4096}, {"seqs": 4},
+    {"dp": 4}, {"tp": 2}, {"ep": False}, {"tokens": 512}, {"seqs": 1},
     {"model_len": 1024}, {"prefix": True}, {"speculative": object()},
 ])
 def test_unsupported_feature_config_is_rejected(override):
@@ -335,14 +377,19 @@ def test_prepared_bundles_do_not_alias_runner_staging():
 
     class FakeRunner:
         _two_microbatch_plan = plan
+        _staged_microbatch_tokens = 1024
         input_batch = SimpleNamespace(req_ids=["a", "b"])
         input_ids = torch.zeros(1024, dtype=torch.int32)
         position_ids = torch.zeros(1024, dtype=torch.int32)
         logits = torch.zeros(1, dtype=torch.int32)
 
         def _prepare_inputs(self, scheduler_output, start_index,
-                            num_decode_reqs, max_chunk_reqs=None):
+                            num_decode_reqs, max_chunk_reqs=None,
+                            force_use_max_model_len=False):
             assert max_chunk_reqs == 1
+            # Both slots must take the same branch, or they disagree on
+            # padded_num_reqs and compile different programs.
+            assert force_use_max_model_len is True
             self.input_ids.fill_(start_index + 1)
             self.position_ids.fill_(start_index + 10)
             self.logits.fill_(start_index + 20)
@@ -413,13 +460,15 @@ def _dispatch_runner(bundles, plan, forwarded=None):
         # from is exactly what this dispatch has to get right.
         _staged_microbatch_logits = TPUModelRunner._staged_microbatch_logits
 
-        def _prepare_two_microbatch_inputs(self, scheduler_output):
+        def _prepare_two_microbatch_inputs(self, scheduler_output,
+                                           num_decode_reqs=0):
             return bundles
 
         def _flush_mamba_state_seed_copies(self):
             pass
 
-        def _run_two_microbatch_forward(self, prepared):
+        def _run_two_microbatch_forward(self, prepared,
+                                        expected_tokens=None):
             if forwarded is not None:
                 forwarded.extend(prepared)
             return tuple(torch.tensor([index + 1])
@@ -551,6 +600,9 @@ def test_staged_forward_dispatches_one_graph_with_both_metadata_sets(
         model = object()
         mesh = None
         vllm_config = None
+        _two_microbatch_plan = None
+        _staged_microbatch_tokens = PREFILL_MICROBATCH_TOKENS
+        _naive_prefill_timed_forwards = set()
         _staged_forward_num_tokens = (
             TPUModelRunner._staged_forward_num_tokens)
 
@@ -587,3 +639,115 @@ def test_staged_forward_requires_an_initialized_communicator():
                                                        bundles)
     finally:
         parallel_state.get_dp_group = original
+
+
+# ----- Capture harness: one profiled staged step per server start -----
+
+
+class _NoReadTensor:
+    """Tensor stub whose contents cannot be read without raising.
+
+    The fingerprint runs on the launch path of the very step we are debugging,
+    so it must stay host-side. Reading a device tensor's data there would force
+    a synchronization and change the timing it exists to measure.
+    """
+
+    def __init__(self, shape, dtype="int32"):
+        self.shape = shape
+        self.dtype = dtype
+
+    def __iter__(self):
+        raise AssertionError("fingerprint read tensor contents")
+
+    def tolist(self):
+        raise AssertionError("fingerprint read tensor contents")
+
+    def item(self):
+        raise AssertionError("fingerprint read tensor contents")
+
+
+def _fake_bundle(*, start_index, mamba=True):
+    context = SimpleNamespace(
+        num_reqs=4, start_index=start_index, use_max_model_len=True,
+        seq_lens=_NoReadTensor((4, )),
+        query_start_loc=_NoReadTensor((5, )),
+        request_distribution=_NoReadTensor((3, )),
+        position_ids_override=_NoReadTensor((1024, )),
+        mamba_state_indices=_NoReadTensor((4, )) if mamba else None,
+        mamba_slot_read_offsets=None, mamba_request_distribution=None,
+        sequence_layout_descriptor=SimpleNamespace(cache_key=("all", "v", 1)))
+    return SimpleNamespace(
+        num_reqs=1, start_index=start_index, end_index=start_index + 1,
+        padded_num_reqs=4, input_ids=_NoReadTensor((1024, )),
+        position_ids=_NoReadTensor((1024, )),
+        logits_indices=_NoReadTensor((4, )), spec_decode_metadata=None,
+        attention_builder_context=context,
+        layout_plan=SimpleNamespace(
+            token_slice=slice(0, 1024), global_num_tokens=1024,
+            global_padded_num_tokens=1024, local_num_tokens=1024,
+            local_padded_num_tokens=1024))
+
+
+def test_step_accounting_counts_every_step_not_just_transitions(monkeypatch,
+                                                                caplog):
+    """The burst summary must count steps, not mode changes.
+
+    The admission line fires only when the coordinated mode changes, so it
+    cannot say how many steps staged nor how often a rank held two real
+    microbatches. Three separate conclusions in the debugging record were
+    weakened by reading transition counts as step counts; this asserts the
+    summary does not repeat that.
+    """
+    import logging
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.envs."
+        "VLLM_TPU_NAIVE_PREFILL_MICROBATCHING", True)
+
+    class FakeRunner:
+        _naive_prefill_step_mode = PrefillStepMode.IDLE
+        _last_logged_naive_prefill_mode = None
+        _two_microbatch_plan = None
+        _count_naive_prefill_step = TPUModelRunner._count_naive_prefill_step
+        _set_coordinated_naive_prefill_mode = (
+            TPUModelRunner._set_coordinated_naive_prefill_mode)
+
+        def __init__(self):
+            self._naive_prefill_mode_steps = {}
+            self._naive_prefill_real_steps = {}
+            self._naive_prefill_total_staged_steps = 0
+            self._naive_prefill_reorders = 0
+
+    runner = FakeRunner()
+    # Ten staged steps in a row: two real microbatches for six of them, one
+    # for the rest. The admission line would report this as a single
+    # transition; the summary has to report ten.
+    for i in range(10):
+        runner._two_microbatch_plan = SimpleNamespace(
+            num_real_microbatches=2 if i < 6 else 1)
+        runner._set_coordinated_naive_prefill_mode(
+            PrefillStepMode.TWO_MICROBATCH)
+    runner._two_microbatch_plan = None
+    for _ in range(3):
+        runner._set_coordinated_naive_prefill_mode(PrefillStepMode.SERIAL)
+
+    assert runner._naive_prefill_total_staged_steps == 10
+    assert runner._naive_prefill_real_steps == {2: 6, 1: 4}
+
+    with caplog.at_level(logging.INFO):
+        runner._set_coordinated_naive_prefill_mode(PrefillStepMode.IDLE)
+    summary = [r.getMessage() for r in caplog.records
+               if "burst summary" in r.getMessage()]
+    assert len(summary) == 1, summary
+    assert "staged_steps=10" in summary[0]
+    assert "real2=6 real1=4 real0=0" in summary[0]
+    assert "serial_steps=3" in summary[0]
+
+    # Counters reset, so a second idle step does not re-emit the same burst.
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        runner._set_coordinated_naive_prefill_mode(PrefillStepMode.IDLE)
+    assert not [r for r in caplog.records if "burst summary" in r.getMessage()]
+    # The lifetime total survives the reset.
+    assert runner._naive_prefill_total_staged_steps == 10

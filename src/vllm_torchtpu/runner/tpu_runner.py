@@ -92,8 +92,12 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.naive_prefill_microbatching import (
     NUM_PREFILL_MICROBATCHES, PREFILL_MICROBATCH_TOKENS, PrefillStepMode,
-    build_two_microbatch_plan, local_step_mode, staged_token_bucket,
-    validate_feature_config, validate_staged_microbatch_bundle,
+    build_two_microbatch_plan, coordinated_microbatch_tokens, local_step_mode,
+    plan_reordered_two_microbatch_step, plan_two_microbatch_step,
+    resolve_staged_microbatch_buckets,
+    staged_step_is_cheaper, staged_token_bucket,
+    validate_dummy_partner_config, validate_feature_config,
+    validate_staged_microbatch_bundle,
     validate_staged_microbatch_tokens)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
@@ -397,6 +401,13 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
+        if envs.VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER:
+            validate_dummy_partner_config(
+                envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING)
+            logger.warning(
+                "VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER is on: a lone "
+                "request will stage against a dummy partner, which costs "
+                "about twice the serial path. Measurement only.")
         if envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING:
             validate_feature_config(vllm_config)
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
@@ -544,6 +555,28 @@ class TPUModelRunner(GPUModelRunner):
         self._two_microbatch_plan: Any = None
         self._naive_prefill_step_mode = PrefillStepMode.IDLE
         self._last_logged_naive_prefill_mode: PrefillStepMode | None = None
+        # The per-slot padded length this step's staged forwards launch at,
+        # settled by DP coordination. Every rank -- busy, idle, and the one
+        # that supplied the maximum -- reads this same number, because a rank
+        # that padded its slots to anything else would compile a structurally
+        # different program and hang the group inside the EP collectives.
+        self._staged_microbatch_tokens: int = PREFILL_MICROBATCH_TOKENS
+        # Slot lengths the staged graph is precompiled for. Set in
+        # capture_model, which is also what warms each of them.
+        self._staged_microbatch_buckets: tuple[int, ...] = ()
+        # Per-step accounting. The admission line above is emitted only when
+        # the coordinated mode changes, so it cannot answer how many steps
+        # actually staged, nor how often a rank carried one real microbatch
+        # versus two. These counters are host-side integers only: they issue
+        # no collective and change no shape, so they cannot affect what the
+        # ranks launch. Flushed as one summary line when a burst ends.
+        self._naive_prefill_mode_steps: dict[PrefillStepMode, int] = {}
+        self._naive_prefill_real_steps: dict[int, int] = {}
+        self._naive_prefill_total_staged_steps = 0
+        # Steps whose requests were permuted to expose a staged partition. The
+        # number to read next to staged_steps: it says how much of the yield
+        # came from reordering rather than from the order vLLM handed us.
+        self._naive_prefill_reorders = 0
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -594,6 +627,17 @@ class TPUModelRunner(GPUModelRunner):
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
+        if envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING:
+            # Resolved here rather than at first use: an unusable bucket must
+            # fail at startup, not thousands of steps later when a workload
+            # first selects it and one rank compiles inside a collective.
+            self._staged_microbatch_buckets = (
+                resolve_staged_microbatch_buckets(
+                    self.num_tokens_paddings,
+                    envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCH_BUCKETS or None))
+            self._staged_microbatch_tokens = self._staged_microbatch_buckets[-1]
+            logger.info("Naive prefill staged microbatch buckets: %s",
+                        list(self._staged_microbatch_buckets))
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention")
         self.num_kv_heads = self.model_config.get_num_kv_heads(
@@ -2407,7 +2451,8 @@ class TPUModelRunner(GPUModelRunner):
                         start_index: int,
                         num_decode_reqs: int,
                         num_windowed_reqs: int | None = None,
-                        max_chunk_reqs: int | None = None):
+                        max_chunk_reqs: int | None = None,
+                        force_use_max_model_len: bool = False):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
         assert scheduler_output.total_num_scheduled_tokens > 0
@@ -2415,8 +2460,9 @@ class TPUModelRunner(GPUModelRunner):
         assert num_reqs > 0
         assert start_index < num_reqs
         # A chunk normally consumes as many requests as its shape allows.
-        # Staged prefill needs one request per call instead, because each
-        # microbatch is an independent bundle addressed by its own slot.
+        # Staged prefill caps it at the slot's own request count instead,
+        # because each microbatch is an independent bundle addressed by its
+        # own slot and must not absorb the next slot's requests.
         available_end = num_reqs
         if max_chunk_reqs is not None:
             if max_chunk_reqs <= 0:
@@ -2424,7 +2470,16 @@ class TPUModelRunner(GPUModelRunner):
             available_end = min(num_reqs, start_index + max_chunk_reqs)
 
         # Get the number of scheduled tokens for each request.
-        use_max_model_len = self.most_model_len is None
+        #
+        # force_use_max_model_len takes the larger, request-count-capped
+        # branch unconditionally. Only the staged path sets it, and it needs
+        # it because this choice changes padded_num_reqs and the attention
+        # metadata's shape: two slots holding different work would answer it
+        # differently, and two ranks holding different work would too. Either
+        # divergence compiles structurally different programs under one op
+        # name and hangs every core in the in-graph EP collectives.
+        use_max_model_len = (force_use_max_model_len
+                             or self.most_model_len is None)
         num_scheduled_tokens_per_req = []
         max_num_scheduled_tokens_all_reqs = 0
         end_index = start_index
@@ -2891,6 +2946,13 @@ class TPUModelRunner(GPUModelRunner):
             local_mode = (PrefillStepMode.IDLE if local_num_tokens == 0 else
                           PrefillStepMode.SERIAL)
         if not self._dp_lockstep_enabled():
+            # No peers to agree with, so this rank's own plan is the agreement.
+            # Still has to be installed: the bundle builders read the slot
+            # length from here, and a value left over from an earlier step
+            # would pad this one's forwards to the wrong shape.
+            local_tokens = self._local_staged_microbatch_tokens()
+            if local_tokens > 0:
+                self._staged_microbatch_tokens = local_tokens
             return None, local_num_chunks, local_mode
         from vllm.distributed.parallel_state import get_dp_group
 
@@ -2905,21 +2967,104 @@ class TPUModelRunner(GPUModelRunner):
         include_mode = envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING
         values = [int(local_num_tokens), int(local_num_chunks)]
         if include_mode:
+            # The slot length rides the same reduction as the mode, for the
+            # same reason the mode does: a separately placed all-reduce would
+            # be one more thing the ranks could disagree about, and gloo pairs
+            # reductions by issue order rather than by step.
             values.append(int(local_mode))
+            values.append(int(self._local_staged_microbatch_tokens()))
         t = torch.tensor(values, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(t,
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=get_dp_group().cpu_group)
         coordinated_mode = (PrefillStepMode(int(t[2].item()))
                             if include_mode else local_mode)
+        serial_bucket = _get_padded_token_len(self.num_tokens_paddings,
+                                              int(t[0].item()))
+        if include_mode:
+            # MAX again: a rank must never launch a *smaller* program than a
+            # peer, or the peer's in-graph collective waits on operands that
+            # were never sent. Padding up wastes device time; padding down
+            # hangs the core.
+            microbatch_tokens = coordinated_microbatch_tokens(
+                [int(t[3].item())], fallback=self._default_staged_tokens())
+            coordinated_mode = self._enforce_staged_cost_rule(
+                coordinated_mode, microbatch_tokens, serial_bucket)
+            if (coordinated_mode is PrefillStepMode.TWO_MICROBATCH
+                    and self._staged_microbatch_buckets
+                    and microbatch_tokens
+                    not in self._staged_microbatch_buckets):
+                # Unreachable: every rank draws its slot length from the
+                # compiled set, and a MAX over that set stays in it. Checked
+                # because the alternative failure is the worst one available
+                # -- this rank compiles a new program while eight peers wait
+                # inside the collectives they already entered, and the log
+                # says nothing at all. A traceback on one rank is strictly
+                # better than a silent DP-wide hang.
+                raise RuntimeError(
+                    f"DP coordination settled on a {microbatch_tokens}-token "
+                    f"staged microbatch, which is not one of the precompiled "
+                    f"slot lengths {list(self._staged_microbatch_buckets)}; "
+                    "launching it would compile mid-step and stall every peer")
+            self._staged_microbatch_tokens = microbatch_tokens
+        else:
+            microbatch_tokens = None
         # The bucket and the mode are established by this one collective and
         # must stay consistent, so resolve them together here rather than at
         # each call site: the max-reduced step total is a per-step quantity and
         # only the serial modes consume it as a per-forward padding target.
-        bucket = staged_token_bucket(
-            coordinated_mode,
-            _get_padded_token_len(self.num_tokens_paddings, int(t[0].item())))
+        bucket = staged_token_bucket(coordinated_mode, serial_bucket,
+                                     microbatch_tokens)
         return bucket, int(t[1].item()), coordinated_mode
+
+    def _default_staged_tokens(self) -> int:
+        """Slot length to fall back on when no rank asked for one.
+
+        The largest *compiled* shape rather than the module constant: with a
+        narrowed bucket list the constant may not be a shape this process ever
+        traced.
+        """
+        if self._staged_microbatch_buckets:
+            return int(self._staged_microbatch_buckets[-1])
+        return PREFILL_MICROBATCH_TOKENS
+
+    def _local_staged_microbatch_tokens(self) -> int:
+        """This rank's desired slot length, or 0 when it has nothing to say.
+
+        Zero rather than a default, so an idle rank cannot drag the group's
+        MAX up to a length nobody needed.
+        """
+        plan = self._two_microbatch_plan
+        return 0 if plan is None else int(plan.microbatch_tokens)
+
+    def _enforce_staged_cost_rule(self, mode: PrefillStepMode,
+                                  microbatch_tokens: int,
+                                  serial_bucket: int) -> PrefillStepMode:
+        """Drop to serial when the coordinated shapes cost more than serial.
+
+        Every busy rank already applied this rule to its own numbers, and both
+        inputs here are MAX-reductions of quantities the local rule was
+        monotonic in, so this should never fire. It is checked anyway because
+        the failure it catches is invisible from outside: the group would do
+        double the device work and the benchmark would report it as the feature
+        simply not helping.
+
+        Both operands come from the reduction, so every rank computes the same
+        answer and the group cannot split over it.
+        """
+        if mode is not PrefillStepMode.TWO_MICROBATCH:
+            return mode
+        if envs.VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER:
+            # The measurement override exists precisely to run a plan the cost
+            # rule rejects, so the rule must not undo it.
+            return mode
+        if staged_step_is_cheaper(microbatch_tokens, serial_bucket):
+            return mode
+        logger.warning(
+            "Naive prefill cost rule vetoed a staged step | "
+            "2 x %d microbatch tokens > %d serial tokens | falling back to "
+            "the serial path", microbatch_tokens, serial_bucket)
+        return PrefillStepMode.SERIAL
 
     def _build_local_naive_prefill_plan(
             self, scheduler_output: "SchedulerOutput") -> PrefillStepMode:
@@ -2938,27 +3083,174 @@ class TPUModelRunner(GPUModelRunner):
             return mode
         num_reqs = self.input_batch.num_reqs
         request_ids = self.input_batch.req_ids[:num_reqs]
-        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-        self._two_microbatch_plan = build_two_microbatch_plan(
-            request_ids, scheduler_output.num_scheduled_tokens, computed)
+        # num_computed_tokens is deliberately not consulted. A partially
+        # computed request -- the middle chunk of a chunked prefill -- reads
+        # KV that *earlier steps* wrote, never KV that this step's other slot
+        # writes, so it is as independent as a fresh request. See
+        # naive_prefill_microbatching.partition_is_independent.
+        if envs.VLLM_TPU_NAIVE_PREFILL_LEGACY_ADMISSION:
+            # The original fixed envelope, kept selectable because the
+            # cost-aware planner admits 1023-token requests too -- which
+            # collapses compare_staged_vs_serial.py's two arms onto the same
+            # path and silently turns that A/B into a self-comparison.
+            self._two_microbatch_plan = build_two_microbatch_plan(
+                request_ids, scheduler_output.num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[:num_reqs])
+            mode = local_step_mode(
+                scheduler_output.total_num_scheduled_tokens,
+                self._two_microbatch_plan)
+            self._naive_prefill_step_mode = mode
+            return mode
+        self._two_microbatch_plan = plan_two_microbatch_step(
+            request_ids,
+            scheduler_output.num_scheduled_tokens,
+            self.num_tokens_paddings,
+            **self._naive_prefill_planner_limits(),
+            allow_dummy_partner=(
+                envs.VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER),
+        )
         mode = local_step_mode(scheduler_output.total_num_scheduled_tokens,
                                self._two_microbatch_plan)
         self._naive_prefill_step_mode = mode
         return mode
 
+    def _naive_prefill_planner_limits(self) -> dict[str, Any]:
+        """Shape limits both planners must be given identically.
+
+        The reordering search and the contiguous planner are compared against
+        each other, so a limit passed to one and not the other would make the
+        comparison decide by the difference in arguments rather than by the
+        partitions.
+        """
+        return {
+            "microbatch_buckets": self._staged_microbatch_buckets or None,
+            # A slot is one _prepare_inputs call, which caps a chunk at this
+            # many requests; a group above the cap could not be one forward.
+            "max_reqs_per_microbatch": self.num_reqs_max_model_len,
+        }
+
+    def _maybe_reorder_batch_for_microbatching(
+            self, scheduler_output: "SchedulerOutput",
+            num_frozen_prefix: int) -> bool:
+        """Permute the step's prefill requests to expose a staged partition.
+
+        A slot is one contiguous ``[start, end)`` range of the input batch, so
+        the planner can only cut the step at one point. vLLM hands out steps
+        that no single cut can balance -- ``[500, 1024, 512]`` is the shape
+        that motivated this -- while a permutation of the same requests has a
+        cut that fits two slots exactly. The batch is ours to permute:
+        ``_reorder_batch_for_rpa`` already does it every step, and a request's
+        row index carries no meaning beyond the order the kernels see.
+
+        ``num_frozen_prefix`` is that reorder's decode segment, which stays
+        put. Requests inside it are 1-token decodes and the ragged-paged
+        attention kernel is told the segment ends where it does.
+
+        Applies the permutation only when it buys a *strictly* cheaper or
+        better balanced step than the current order already gives, so a step
+        the planner already admits is left alone and pays nothing. Returns
+        whether the batch moved.
+        """
+        if not envs.VLLM_TPU_NAIVE_PREFILL_REORDER:
+            return False
+        if (not envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING
+                or envs.VLLM_TPU_NAIVE_PREFILL_LEGACY_ADMISSION):
+            return False
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs < 2:
+            return False
+        request_ids = self.input_batch.req_ids[:num_reqs]
+        limits = self._naive_prefill_planner_limits()
+        current = plan_two_microbatch_step(
+            request_ids, scheduler_output.num_scheduled_tokens,
+            self.num_tokens_paddings, **limits,
+            allow_dummy_partner=(
+                envs.VLLM_TPU_NAIVE_PREFILL_ALLOW_DUMMY_PARTNER))
+        partition = plan_reordered_two_microbatch_step(
+            request_ids, scheduler_output.num_scheduled_tokens,
+            self.num_tokens_paddings, **limits,
+            num_frozen_prefix=num_frozen_prefix)
+        if partition is None or partition.is_already_contiguous():
+            return False
+        if current is not None and current.cost_key <= partition.cost_key:
+            return False
+
+        # Selection into place: walk the target order and swap whatever is
+        # sitting in each position out to where the current occupant belongs.
+        # swap_states keeps req_id_to_index in step, so reading the position
+        # back per request is what makes this correct as the batch moves under
+        # it. At most one swap per request, and none at all for a request the
+        # partition leaves where it was.
+        target_ids = [request_ids[index] for index in partition.new_order]
+        swaps = 0
+        for position, req_id in enumerate(target_ids):
+            current_index = self.input_batch.req_id_to_index[req_id]
+            if current_index != position:
+                self.input_batch.swap_states(position, current_index)
+                swaps += 1
+        self._naive_prefill_reorders += 1
+        logger.debug(
+            "Naive prefill reorder | swaps=%d | slots=%d+%d tokens=%d+%d | "
+            "was=%s now=%s", swaps, len(partition.left_indices),
+            len(partition.right_indices), partition.left_tokens,
+            partition.right_tokens,
+            None if current is None else current.cost_key, partition.cost_key)
+        return True
+
     def _set_coordinated_naive_prefill_mode(
             self, mode: PrefillStepMode) -> None:
         """Install the mode returned by DP coordination and log transitions."""
         self._naive_prefill_step_mode = mode
-        if (envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING
-                and mode != self._last_logged_naive_prefill_mode):
-            real_microbatches = (
-                0 if self._two_microbatch_plan is None else
-                self._two_microbatch_plan.num_real_microbatches)
+        if not envs.VLLM_TPU_NAIVE_PREFILL_MICROBATCHING:
+            return
+        real_microbatches = (0 if self._two_microbatch_plan is None else
+                             self._two_microbatch_plan.num_real_microbatches)
+        self._count_naive_prefill_step(mode, real_microbatches)
+        if mode != self._last_logged_naive_prefill_mode:
             logger.info("Naive prefill microbatch admission | mode=%s | "
                         "local_real_microbatches=%d", mode.name,
                         real_microbatches)
             self._last_logged_naive_prefill_mode = mode
+
+    def _count_naive_prefill_step(self, mode: PrefillStepMode,
+                                  real_microbatches: int) -> None:
+        """Tally one step, and flush a summary when a burst of work ends.
+
+        Every counted quantity here is derived from state this rank already
+        holds. Nothing is reduced across ranks, so an engine that counts
+        differently from its peers cannot desynchronise the group.
+
+        The flush point is the transition to IDLE, which is where a benchmark
+        run drains. Counters reset after each flush, so one line describes one
+        burst rather than the process lifetime.
+        """
+        counts = self._naive_prefill_mode_steps
+        counts[mode] = counts.get(mode, 0) + 1
+        if mode == PrefillStepMode.TWO_MICROBATCH:
+            self._naive_prefill_real_steps[real_microbatches] = (
+                self._naive_prefill_real_steps.get(real_microbatches, 0) + 1)
+            self._naive_prefill_total_staged_steps += 1
+
+        if mode != PrefillStepMode.IDLE:
+            return
+        staged = counts.get(PrefillStepMode.TWO_MICROBATCH, 0)
+        serial = counts.get(PrefillStepMode.SERIAL, 0)
+        if staged == 0 and serial == 0:
+            return  # already flushed; do not repeat once idle
+        real = self._naive_prefill_real_steps
+        eligible = staged + serial
+        logger.info(
+            "Naive prefill burst summary | staged_steps=%d (%.1f%% of %d "
+            "non-idle) | real2=%d real1=%d real0=%d | serial_steps=%d | "
+            "idle_steps=%d | reordered_steps=%d | "
+            "staged_steps_since_start=%d", staged,
+            100.0 * staged / eligible if eligible else 0.0, eligible,
+            real.get(2, 0), real.get(1, 0), real.get(0, 0), serial,
+            counts.get(PrefillStepMode.IDLE, 0), self._naive_prefill_reorders,
+            self._naive_prefill_total_staged_steps)
+        self._naive_prefill_mode_steps = {}
+        self._naive_prefill_real_steps = {}
+        self._naive_prefill_reorders = 0
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(bucket,
@@ -2997,31 +3289,61 @@ class TPUModelRunner(GPUModelRunner):
             self, scheduler_output: "SchedulerOutput",
             num_decode_reqs: int = 0
     ) -> tuple[PreparedPrefillMicrobatch, PreparedPrefillMicrobatch]:
-        """Prepare two independent request bundles without shared staging."""
+        """Prepare two independent request groups without shared staging.
+
+        A slot may now hold several requests of unequal length, so two things
+        that used to be true by construction have to be enforced here instead.
+
+        Every slot is padded to ``_staged_microbatch_tokens``, the length the
+        DP reduction settled on rather than the length this rank's group
+        happens to need. That comes for free: ``_dp_target_bucket`` holds the
+        staged length in this mode and the layout planner treats it as a
+        floor, while the planner's cost rule guarantees each group's own tokens
+        pad to no more than it. The validator below is what proves the two
+        agree. Every slot is also prepared with ``force_use_max_model_len``, so
+        both slots agree on ``padded_num_reqs`` and on the attention
+        metadata's shape. Left to itself ``_prepare_inputs`` picks that from
+        the group's own longest request, which two slots holding different
+        work would answer differently -- and a difference there is a
+        structurally different program under one op name, which is the DP-wide
+        hang this whole file exists to avoid.
+
+        ``num_decode_reqs`` is the batch-wide count of leading 1-token decode
+        requests, and it becomes load-bearing as soon as a slot may hold
+        decodes: ``_prepare_inputs`` turns it into ``request_distribution``,
+        which is how the ragged-paged-attention kernel is told which requests
+        are decodes. The fixed-shape path could pass 0 because every admitted
+        step was all-prefill; passing 0 now would describe a decode slot to the
+        kernel as prefill.
+        """
         plan = self._two_microbatch_plan
         if plan is None:
             raise RuntimeError("two-microbatch preparation requires a plan")
+        expected_tokens = self._staged_microbatch_tokens
 
         bundles: list[PreparedPrefillMicrobatch] = []
         start_index = 0
         for microbatch in plan.microbatches:
             prepared = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs,
-                max_chunk_reqs=1)
+                max_chunk_reqs=microbatch.num_reqs,
+                force_use_max_model_len=True)
             (attention_metadata, logits_indices, padded_num_reqs, num_reqs,
              end_index, cur_input_indices, pre_next_tokens_indices,
              spec_decode_metadata) = prepared
-            if num_reqs != 1 or end_index != start_index + 1:
+            if (num_reqs != microbatch.num_reqs
+                    or end_index != start_index + microbatch.num_reqs):
                 raise RuntimeError(
                     "microbatch preparation crossed a request boundary")
-            request_id = self.input_batch.req_ids[start_index]
-            if request_id != microbatch.request_id:
+            request_ids = tuple(
+                self.input_batch.req_ids[start_index:end_index])
+            if request_ids != microbatch.request_ids:
                 raise RuntimeError(
                     "scheduler order changed after plan creation")
             ready_input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices)
             bundles.append(PreparedPrefillMicrobatch(
-                request_id=microbatch.request_id,
+                request_id=request_ids[0],
                 output_index=microbatch.output_index,
                 input_ids=_snapshot_microbatch_value(ready_input_ids),
                 position_ids=_snapshot_microbatch_value(self.position_ids),
@@ -3044,20 +3366,22 @@ class TPUModelRunner(GPUModelRunner):
                     self._attn_metadata_builder_ctx),
             ))
             validate_staged_microbatch_bundle(bundles[-1], role="real",
-                                              index=len(bundles) - 1)
+                                              index=len(bundles) - 1,
+                                              expected=expected_tokens)
             start_index = end_index
 
         while len(bundles) < NUM_PREFILL_MICROBATCHES:
             bundles.append(self._prepare_dummy_prefill_microbatch(
-                len(bundles)))
+                len(bundles), num_tokens=expected_tokens))
 
         return cast(tuple[PreparedPrefillMicrobatch,
                           PreparedPrefillMicrobatch], tuple(bundles))
 
     def _prepare_dummy_prefill_microbatch(
             self, index: int,
+            num_tokens: int | None = None,
             num_reqs: int | None = None) -> PreparedPrefillMicrobatch:
-        """Build one fixed-shape dummy bundle with real attention metadata.
+        """Build one dummy bundle, at the step's agreed slot length.
 
         ``num_reqs`` drives the attention metadata's request dimension, and so
         selects which compiled program this bundle launches. A live idle rank
@@ -3066,7 +3390,9 @@ class TPUModelRunner(GPUModelRunner):
         produces instead -- see ``_staged_warmup_req_counts`` for why that is
         not the same set.
         """
-        num_tokens = PREFILL_MICROBATCH_TOKENS
+        if num_tokens is None:
+            num_tokens = self._staged_microbatch_tokens
+        num_tokens = int(num_tokens)
         if num_reqs is None:
             num_reqs = self.num_reqs_max_model_len
         num_reqs = max(1, min(int(num_reqs), self.num_reqs_max_model_len))
@@ -3121,18 +3447,22 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata=None, layout_plan=layout,
             attention_builder_context=_snapshot_microbatch_value(
                 self._attn_metadata_builder_ctx))
-        validate_staged_microbatch_bundle(bundle, role="dummy", index=index)
+        validate_staged_microbatch_bundle(bundle, role="dummy", index=index,
+                                          expected=num_tokens)
         return bundle
 
     def _staged_forward_num_tokens(
-        self, bundles: Sequence[PreparedPrefillMicrobatch]
+        self, bundles: Sequence[PreparedPrefillMicrobatch],
+        expected: int | None = None,
     ) -> int:
         """Return the token length every staged microbatch launches with.
 
         Agreeing with each other is necessary but not sufficient: the length
-        must also be the fixed staged one, because peers pad to that constant
-        rather than to whatever this rank happened to choose.
+        must also be the DP-coordinated one, because peers pad to the number
+        the reduction settled on rather than to whatever this rank chose.
         """
+        if expected is None:
+            expected = self._staged_microbatch_tokens
         num_tokens = bundles[0].input_ids.shape[0]
         for index, bundle in enumerate(bundles[1:], start=1):
             if bundle.input_ids.shape[0] != num_tokens:
@@ -3141,7 +3471,8 @@ class TPUModelRunner(GPUModelRunner):
                     f"bundle 0 has {num_tokens} tokens and bundle {index} has "
                     f"{bundle.input_ids.shape[0]}")
         validate_staged_microbatch_tokens(num_tokens, role="forward", index=0,
-                                          field="input_ids")
+                                          field="input_ids",
+                                          expected=expected)
         return num_tokens
 
     # Warmup reaches this through capture_model, which is not itself guarded --
@@ -3151,7 +3482,8 @@ class TPUModelRunner(GPUModelRunner):
     @torch.no_grad()
     def _run_two_microbatch_forward(
         self, bundles: tuple[PreparedPrefillMicrobatch,
-                             PreparedPrefillMicrobatch]
+                             PreparedPrefillMicrobatch],
+        expected_tokens: int | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Install both metadata sets and dispatch the one staged graph.
 
@@ -3167,7 +3499,7 @@ class TPUModelRunner(GPUModelRunner):
             raise RuntimeError("TPU EP device communicator is not initialized")
         metadata = TwoMicrobatchAttentionMetadata(
             bundles[0].attention_metadata, bundles[1].attention_metadata)
-        num_tokens = self._staged_forward_num_tokens(bundles)
+        num_tokens = self._staged_forward_num_tokens(bundles, expected_tokens)
         with set_forward_context(
                 metadata,
                 self.vllm_config,
@@ -3196,25 +3528,30 @@ class TPUModelRunner(GPUModelRunner):
         return self.compute_logits_from_hidden_states(selected)
 
     def _execute_two_microbatch_prefill(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", num_decode_reqs: int = 0
     ) -> tuple[list[torch.Tensor], list[int], list[Any]]:
         """Execute and select logits per microbatch, then restore order."""
         plan = self._two_microbatch_plan
         assert plan is not None
-        bundles = self._prepare_two_microbatch_inputs(scheduler_output)
+        bundles = self._prepare_two_microbatch_inputs(
+            scheduler_output, num_decode_reqs)
         self._flush_mamba_state_seed_copies()
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             # Padding state is shared by both physical slots. When only one
             # request is real, execute the dummy as full-shape harmless work
             # and discard its output instead of masking real tokens too.
-            self._token_padding_state.update(PREFILL_MICROBATCH_TOKENS,
-                                             PREFILL_MICROBATCH_TOKENS)
+            self._token_padding_state.update(self._staged_microbatch_tokens,
+                                             self._staged_microbatch_tokens)
         hidden = self._run_two_microbatch_forward(bundles)
         logits = [self._staged_microbatch_logits(state, bundle)
                   for state, bundle in zip(hidden, bundles)]
         restored = plan.restore_output_order(
             logits[:plan.num_real_microbatches])
-        return (restored, [1] * plan.num_real_microbatches,
+        # Slots are contiguous runs of the scheduler's request order, so these
+        # are exactly the per-chunk counts the serial path reports and
+        # sample_tokens consumes -- one slot is one chunk covering
+        # [cur_start, cur_start + num_reqs).
+        return (restored, list(plan.num_reqs_per_microbatch),
                 [None] * plan.num_real_microbatches)
 
     def _staged_warmup_req_counts(self) -> tuple[int, ...]:
@@ -3225,7 +3562,9 @@ class TPUModelRunner(GPUModelRunner):
         on one of ``num_reqs_paddings``. An idle rank's dummy uses
         ``num_reqs_max_model_len``. Those are different numbers -- a
         single-request slot pads to MIN_NUM_SEQS -- so warming only the dummy
-        shape leaves every real staged step to compile mid-flight.
+        shape leaves every real staged step to compile mid-flight, which is
+        what record #34 measured: 49 s on one rank while seven peers sat inside
+        the collectives they had already entered.
 
         Differing here is safe, only slow: the EP collectives are sized by
         tokens, not requests, so a rank whose slot carries a different request
@@ -3237,24 +3576,34 @@ class TPUModelRunner(GPUModelRunner):
         return tuple(sorted(counts))
 
     def _run_idle_two_microbatch_prefill(self,
+                                         num_tokens: int | None = None,
                                          num_reqs: int | None = None) -> None:
         """Run the staged step with all-dummy bundles on a rank with no work.
 
         An idle EP rank must still emit the same collective stream its busy
         peers do, so it runs the identical shaped step and discards the result.
 
-        ``num_reqs`` is passed only by warmup, which walks every request shape
-        a real slot can produce. Live idle steps leave it None and take
-        ``num_reqs_max_model_len``.
+        ``num_tokens`` is passed only by warmup, which walks every staged
+        bucket. Live idle steps leave it None and take the length the DP
+        reduction just settled on -- an idle rank contributes 0 to that MAX, so
+        the length it runs is the one a busy peer asked for.
         """
-        bundles = tuple(
-            self._prepare_dummy_prefill_microbatch(index, num_reqs=num_reqs)
-            for index in range(NUM_PREFILL_MICROBATCHES))
+        if num_tokens is None:
+            num_tokens = self._staged_microbatch_tokens
+        num_tokens = int(num_tokens)
+        # Warmup passes a bucket explicitly and walks several of them; install
+        # it so the slot length this rank runs is the one being traced rather
+        # than a leftover from another bucket.
+        self._staged_microbatch_tokens = num_tokens
+        bundles = cast(
+            tuple[PreparedPrefillMicrobatch, PreparedPrefillMicrobatch],
+            tuple(self._prepare_dummy_prefill_microbatch(
+                index, num_tokens=num_tokens, num_reqs=num_reqs)
+                  for index in range(NUM_PREFILL_MICROBATCHES)))
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-            self._token_padding_state.update(0, PREFILL_MICROBATCH_TOKENS)
-        hidden = self._run_two_microbatch_forward(
-            cast(tuple[PreparedPrefillMicrobatch,
-                       PreparedPrefillMicrobatch], bundles))
+            self._token_padding_state.update(0, num_tokens)
+        hidden = self._run_two_microbatch_forward(bundles,
+                                                  expected_tokens=num_tokens)
         # Match the busy rank's per-microbatch logits collectives without
         # exposing any output.
         for state, bundle in zip(hidden, bundles):
@@ -3271,6 +3620,9 @@ class TPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
         # Update cached state
         self._update_states(scheduler_output)
+        # A first pass, so a zero-token step reaches the early return below
+        # already recorded as IDLE. The plan it produces is provisional: the
+        # batch has not been reordered yet, so it is rebuilt after the reorder.
         local_mode = self._build_local_naive_prefill_plan(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
@@ -3306,6 +3658,22 @@ class TPUModelRunner(GPUModelRunner):
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
+        # Second permutation, inside the segment the first one left alone: the
+        # prefill/mixed requests are reordered when that turns a partition the
+        # planner would admit into a contiguous one it can prepare. Runs after
+        # the RPA reorder so it can be told which prefix is off limits, and
+        # before the plan below so the plan describes the final order.
+        self._maybe_reorder_batch_for_microbatching(scheduler_output,
+                                                    num_windowed_reqs)
+        # Re-plan against the post-reorder request order. _reorder_batch_for_rpa
+        # moves 1-token decodes to the front of the input batch, and a
+        # microbatch names a contiguous [start_index, end_index) range of that
+        # batch -- so a plan built before the move points at the wrong
+        # requests. The fixed-shape planner never saw this: it only ever
+        # admitted all-prefill steps, where the reorder has nothing to move.
+        # Host-side and collective-free, so running it twice is free and
+        # cannot desynchronise anything.
+        local_mode = self._build_local_naive_prefill_plan(scheduler_output)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
         if self.phase_based_profiler:
@@ -3392,7 +3760,7 @@ class TPUModelRunner(GPUModelRunner):
                     "a busy rank reached the staged path without a plan")
             (logits_list, num_reqs_list,
              spec_decode_metadata_list) = self._execute_two_microbatch_prefill(
-                 scheduler_output)
+                 scheduler_output, num_decode_reqs)
             self.execute_model_state = ExecuteModelState(
                 scheduler_output=scheduler_output,
                 logits_list=logits_list,
@@ -4763,20 +5131,29 @@ class TPUModelRunner(GPUModelRunner):
                     # compiled during a live staged step would stall its peers
                     # inside the collectives they entered together.
                     #
-                    # Every request shape, not just the dummy's: a bundle's
-                    # program is selected by its request dimension as well as
-                    # its token count, and a real slot pads to a different one
-                    # than an all-dummy slot does.
+                    # One program per (slot length, request count), which is
+                    # the whole reason the staged bucket list is short: every
+                    # combination here is a full graph compile, and warming one
+                    # no workload ever selects is pure startup cost.
+                    #
+                    # Both loops are needed. Warming only the request count an
+                    # idle rank uses leaves every *real* staged step to compile
+                    # mid-flight -- record #34 measured 49 s of that on one
+                    # rank while seven peers waited inside the collectives they
+                    # had already entered.
                     req_counts = self._staged_warmup_req_counts()
                     logger.info(
-                        "  -- two-prefill microbatch graphs: %d request "
-                        "shape(s)", len(req_counts))
-                    for num_reqs in req_counts:
-                        logger.info(
-                            "  -- two-prefill microbatch graph: %d requests",
-                            num_reqs)
-                        self._run_idle_two_microbatch_prefill(
-                            num_reqs=num_reqs)
+                        "  -- two-prefill microbatch graphs: %d slot length(s) "
+                        "x %d request shape(s) = %d programs",
+                        len(self._staged_microbatch_buckets), len(req_counts),
+                        len(self._staged_microbatch_buckets) * len(req_counts))
+                    for bucket in self._staged_microbatch_buckets:
+                        for num_reqs in req_counts:
+                            logger.info(
+                                "  -- two-prefill microbatch graph: %d tokens "
+                                "per slot, %d requests", bucket, num_reqs)
+                            self._run_idle_two_microbatch_prefill(
+                                num_tokens=bucket, num_reqs=num_reqs)
 
             self._precompile_sampling_subgraphs()
 
