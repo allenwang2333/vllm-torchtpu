@@ -470,7 +470,20 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
             return out
         return dispatcher.xla_all_reduce(x)
 
-    op = torch.library.custom_op(name, _impl, mutates_args=("ws", "step"))
+    # mutates_args stays empty even though the implementation writes the
+    # workspace in place. Declaring the mutation makes AOTAutograd add both
+    # buffers to the graph's outputs, and the compiled artifact then returns
+    # one where the runtime wrapper expects three:
+    #
+    #   AssertionError: expected 3 outputs, got 1
+    #
+    # Leaving it undeclared is a deliberate deviation from the custom-op
+    # contract, and safe only because of what these buffers are: private to
+    # this op, read by nothing else in the graph, and never aliased to a
+    # value the compiler could fold. Two calls are also never identical --
+    # each layer passes a different x -- so nothing can be CSE'd on the
+    # assumption that the op is pure.
+    op = torch.library.custom_op(name, _impl, mutates_args=())
     op.register_fake(lambda x, ws, step: torch.empty_like(x))
     _ENTRY_OPS[name] = op
     return op
