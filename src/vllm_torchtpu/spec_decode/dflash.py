@@ -109,6 +109,16 @@ class DFlashProposer:
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
 
+    # Whether load_model overwrites the draft's embed_tokens/lm_head with the
+    # target's unconditionally. DSpark sets this False to honor the draft's
+    # has_own_embed_tokens / has_own_lm_head flags instead.
+    _force_share_target_embeddings = True
+
+    def _query_block_size(self, K: int) -> int:
+        """Query tokens per request: 1 anchor + K mask slots. DSpark's dense
+        layout overrides this to K (the anchor is the first prediction)."""
+        return K + 1
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
@@ -142,16 +152,18 @@ class DFlashProposer:
         self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
                                         target_attn_layer_names)
 
-        # Share Embeddings and LM Head
+        # Share Embeddings and LM Head. DFlash drafts always predict target
+        # vocab, so sharing is forced; DSpark overrides the flag because a
+        # reduced-vocab checkpoint carries its own lm_head/embed_tokens.
         maybe_share_embeddings(self.draft_model,
                                target_model,
                                self._draft_tp_matches_target,
-                               force_share=True)
+                               force_share=self._force_share_target_embeddings)
         maybe_share_lm_head(self.draft_model,
                             target_model,
                             self._draft_replicated,
                             self._draft_tp_matches_target,
-                            force_share=True)
+                            force_share=self._force_share_target_embeddings)
 
         if hasattr(self.draft_model, "get_draft_attn_causal"):
             layer_causal_list = self.draft_model.get_draft_attn_causal()
@@ -206,7 +218,7 @@ class DFlashProposer:
         runner = self.runner
         chunk_ctx = chunk.attn_ctx
         K = self.speculative_config.num_speculative_tokens
-        block_size = K + 1
+        block_size = self._query_block_size(K)
 
         padded_num_reqs = num_tokens_padded // block_size
         if padded_num_reqs == 0:
@@ -263,7 +275,7 @@ class DFlashProposer:
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
         K = self.speculative_config.num_speculative_tokens
-        block_size = K + 1
+        block_size = self._query_block_size(K)
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
@@ -412,7 +424,7 @@ class DFlashProposer:
                 "DFlash propose called but no draft chunks captured.")
 
         K = self.speculative_config.num_speculative_tokens
-        block_size = K + 1
+        block_size = self._query_block_size(K)
 
         # EP-DP lockstep: a rank whose step produced fewer chunks than the
         # DP-group max must pad each draft phase to the group's chunk count —
@@ -498,7 +510,7 @@ class DFlashProposer:
 
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
-        block_size = K + 1
+        block_size = self._query_block_size(K)
         # A most-model-len chunk holds up to num_reqs_most_model_len
         # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
         # coordinated bucket is sized from the DP-wide max chunk request
@@ -624,7 +636,7 @@ class DFlashProposer:
     ) -> None:
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
-        block_size = K + 1
+        block_size = self._query_block_size(K)
 
         input_ids = torch.zeros((num_tokens),
                                 dtype=torch.int32).to(runner.device)

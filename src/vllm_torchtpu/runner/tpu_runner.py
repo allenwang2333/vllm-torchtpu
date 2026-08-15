@@ -923,6 +923,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
+            elif self.speculative_config.method == "dspark":
+                from vllm_torchtpu.spec_decode.dspark import DSparkProposer
+                self.drafter = DSparkProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self, self.vllm_config)
             else:
