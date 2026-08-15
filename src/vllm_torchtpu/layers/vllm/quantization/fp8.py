@@ -924,6 +924,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
         if self.quant_config.is_checkpoint_fp8_serialized:
+            layer.allow_fp8_block_shape_mismatch = True
             Fp8LinearMethod.create_weights(self, layer,
                                            input_size_per_partition,
                                            output_partition_sizes, input_size,
