@@ -743,7 +743,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         return future, device_shards
 
     def _synchronize_device(self, tensor: torch.Tensor) -> None:
-        synchronize_tensors(tensor)
+        synchronize_tensors(tensor, wait=False)
 
     def _try_fast_scatter(
             self, device_shards: list[torch.Tensor],

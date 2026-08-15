@@ -888,7 +888,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             outputs = outputs[..., :self.head_size]
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
-            synchronize_tensors(kv_cache)
+            synchronize_tensors(kv_cache, wait=False)
 
         if query_dim == 2:
             outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
