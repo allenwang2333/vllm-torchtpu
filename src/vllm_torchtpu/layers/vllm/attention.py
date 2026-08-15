@@ -86,6 +86,10 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
+    if vllm_config.model_config is None:
+        # Non-autoregressive models (e.g. diffusion in vLLM-Omni) or mock configs have
+        # no model_config; return 16 (vLLM default block size and TPU vector tile alignment).
+        return 16
     max_num_page_per_req = (1024 * 1024 // 2 //
                             vllm_config.scheduler_config.max_num_seqs // 4)
     min_page_size = cdiv(vllm_config.model_config.max_model_len,
@@ -428,6 +432,8 @@ class PallasAttentionBackend(AttentionBackend):
         # For long model length, we use 16 page-size to avoid too much
         # VMEM spill. A more robust solution should be implemented to
         # handle VREG spills.
+        if vllm_config.model_config is None:
+            return 16
         if vllm_config.model_config.max_model_len > 8192:
             return 16
         page_size = next_power_of_2(

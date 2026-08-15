@@ -305,3 +305,15 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def is_tpu_device(device_or_tensor: Any) -> bool:
+    """Check whether a device, tensor, or device string corresponds to TPU."""
+    if device_or_tensor is None:
+        return False
+    if isinstance(device_or_tensor, torch.Tensor):
+        device_or_tensor = device_or_tensor.device
+    dev_str = device_or_tensor.type if hasattr(
+        device_or_tensor, "type") else str(device_or_tensor)
+    return dev_str.lower() in (
+        "tpu", "privateuseone") or dev_str.lower().startswith("tpu:")
