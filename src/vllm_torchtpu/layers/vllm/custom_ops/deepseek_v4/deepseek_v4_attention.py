@@ -751,10 +751,11 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         wo_a_grouped = self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)
         wo_a_scale = self.wo_a.weight_scale.view(n_local_groups, o_lora_rank)
 
-        # Einsum in float32 and apply per-channel scale post-einsum (aligned to reference).
-        z = torch.einsum("tgd,grd->tgr", o_ref_grouped.to(torch.float32),
-                         wo_a_grouped.to(torch.float32))
-        z = z * wo_a_scale.unsqueeze(0).to(torch.float32)
+        # bf16 operands keep the matmul on the MXU; the scale is applied after
+        # the einsum, in bf16, matching the reference.
+        z = torch.einsum("tgd,grd->tgr", o_ref_grouped,
+                         wo_a_grouped.to(torch.bfloat16))
+        z = z * wo_a_scale.unsqueeze(0).to(torch.bfloat16)
         z = z.to(torch.bfloat16)
         z_flat = z.flatten(1)
 
