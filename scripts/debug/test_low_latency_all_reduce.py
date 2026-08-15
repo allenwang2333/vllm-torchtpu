@@ -155,6 +155,44 @@ def main() -> int:
                         f"  rows={rows:>4} FAILED: {type(exc).__name__}: "
                         f"{str(exc)[:300]}",
                         flush=True)
+        # vLLM also compiles a *symbolic* graph beside the per-bucket ones.
+        # Reading a dynamic dim into a Python value pins it to the traced
+        # value and the whole compile fails with ConstraintViolationError, so
+        # the dispatcher has to decline symbolic shapes rather than dispatch
+        # on them. Marking dim 0 dynamic reproduces that graph here.
+        if rank == 0:
+            print("-- dynamic-shape graph (must not specialize) --",
+                  flush=True)
+        rows_list = [int(r) for r in args.rows.split(",")]
+        x = (torch.randn(rows_list[0], args.cols,
+                         dtype=torch.float32).to(dtype).to(device))
+        torch._dynamo.mark_dynamic(x, 0)
+
+        def one_dyn(x):
+            out = dispatcher.maybe_all_reduce(x.contiguous())
+            return x if out is None else out
+
+        try:
+            compiled = torch.compile(one_dyn, backend="tpu", fullgraph=True)
+            got = compiled(x)
+            want = funcol_all_reduce(x, "sum", list(range(world_size)))
+            d = (got.float() - want.float()).abs().max().cpu().item()
+            scale = max(1.0, want.float().abs().max().cpu().item())
+            ok = (d / scale) < (1e-5 if dtype == torch.float32 else 0.02)
+            if not ok:
+                failures.append(f"dynamic graph: rel={d / scale:.5f}")
+            if rank == 0:
+                print(
+                    f"  traced+ran, rel={d / scale:.5f} "
+                    f"{'OK' if ok else 'FAIL'}",
+                    flush=True)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"dynamic graph: {type(exc).__name__}: "
+                            f"{str(exc)[:200]}")
+            if rank == 0:
+                print(f"  FAILED: {type(exc).__name__}: {str(exc)[:300]}",
+                      flush=True)
+
         if rank == 0:
             print("", flush=True)
 

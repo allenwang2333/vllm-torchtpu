@@ -402,7 +402,25 @@ class LowLatencyAllReduce:
             return None
         if not x.is_contiguous():
             return None
-        key = (tuple(x.shape), x.dtype)
+
+        # Only dispatch on a fully static shape. vLLM marks the token dimension
+        # dynamic and compiles a symbolic graph alongside the per-bucket
+        # specialized ones; reading a symbolic dim into a Python value -- which
+        # is what using the shape as a dict key does -- pins it to whatever
+        # value happened to be traced, and compilation fails with
+        #
+        #   Constraints violated (L['input_ids'].size()[0])! You marked it as
+        #   dynamic but your code specialized it to be a constant (512).
+        #
+        # A SymInt is not an int, so this check bails before anything hashes
+        # the shape. The symbolic graph then reduces through XLA, while the
+        # bucket-specialized graphs -- the ones decode actually runs -- keep
+        # the kernel.
+        shape = tuple(x.shape)
+        if not all(isinstance(dim, int) for dim in shape):
+            return None
+
+        key = (shape, x.dtype)
         plan = self._plans.get(key)
         if plan is None:
             if torch.compiler.is_compiling():
