@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_ROUTER_TOPK: str = "sort"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -288,6 +289,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # MoE router top-k implementation. "sort" (default) is torch.topk, which
+    # torch_tpu lowers to a full stablehlo.sort of every expert plus a slice;
+    # "rowmax" is the sort-free k-pass row-max selection in
+    # layers/common/rowmax_topk.py. Read once, at MoE-routing import.
+    "TPU_MOE_ROUTER_TOPK":
+    env_with_choices("TPU_MOE_ROUTER_TOPK", "sort", ["sort", "rowmax"]),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
