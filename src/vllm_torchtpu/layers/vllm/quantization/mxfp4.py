@@ -68,6 +68,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.common import quant_weight_cache
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
@@ -306,6 +307,31 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
                           if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
 
+_FP4_CACHE_NAMESPACE = "dsv4_mxfp4"
+
+
+def _fp4_cache_key(layer, w13_shape, w2_shape, orig_intermediate: int,
+                   activation_str: str, rhs_quant_dtype) -> dict:
+    """Every input that changes the requantized weights, so a cache entry
+    built under one configuration is never served to a run expecting another.
+    """
+    try:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    return {
+        "layer": getattr(layer, "layer_name", None) or "unknown",
+        "rank": rank,
+        "w13_shape": tuple(w13_shape),
+        "w2_shape": tuple(w2_shape),
+        "orig_intermediate": orig_intermediate,
+        "w13_block_size": REQUANTIZED_BLOCK_SIZE,
+        "w2_block_size": min(REQUANTIZED_BLOCK_SIZE, orig_intermediate),
+        "activation": activation_str,
+        "rhs_quant_dtype": str(rhs_quant_dtype),
+    }
+
 
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
@@ -447,9 +473,26 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
-        (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-         w2_weight_scale) = self._requantize_native_fp4(
-             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+        cache_key = _fp4_cache_key(layer, w13_weight_padded.shape,
+                                   w2_weight_padded.shape, orig_intermediate,
+                                   activation_str, self.rhs_quant_dtype)
+        cache_file = quant_weight_cache.cache_path(_FP4_CACHE_NAMESPACE,
+                                                   cache_key)
+        cached = quant_weight_cache.load(cache_file, cache_key, device=device)
+        if cached is not None:
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale) = cached
+        else:
+            (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+             w2_weight_scale) = self._requantize_native_fp4(
+                 w13_weight_padded, w2_weight_padded, orig_intermediate,
+                 device)
+            quant_weight_cache.save(cache_file, cache_key, [
+                w13_weight_processed,
+                w2_weight_processed,
+                w13_weight_scale,
+                w2_weight_scale,
+            ])
         self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
