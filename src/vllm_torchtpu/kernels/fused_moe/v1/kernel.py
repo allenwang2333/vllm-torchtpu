@@ -1133,9 +1133,19 @@ def _fused_ep_moe_kernel(
         wait_fetch_b_gating(bt_id)
 
         b_gating = b_gating_x2_vmem[bt_sem_id]
-        b_gating_score = apply_scoring_fn(scoring_fn, b_gating)
+        # Local: score in fp32, as the torch router does
+        # (`moe_routing._apply_scoring_fn(scoring_fn, router_logits.float())`).
+        # Scoring in bf16 reorders near-ties, so the kernel would select a
+        # different top-k for a few percent of tokens -- measured off-TPU at
+        # 512 experts / top-10: 99.76% top-k set agreement at logit sigma 1.0,
+        # 94.4% at 0.25, 43.5% at 0.05, versus exactly 100% at every sigma with
+        # fp32 scoring. The weights are rounded back to the activation dtype
+        # because the torch path does that too (`topk_weights.to(x.dtype)`).
+        b_gating_score = apply_scoring_fn(scoring_fn,
+                                          b_gating.astype(jnp.float32))
         top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score, top_k, renormalize_topk_logits)
+        top_k_logits_lst = [w.astype(t_dtype) for w in top_k_logits_lst]
 
         all_reduce_metadata(bt_sem_id, t2e_routing, expert_starts,
                             expert_sizes)
