@@ -26,6 +26,10 @@ Two things are checked without a TPU, at the shapes we actually serve:
 """
 
 import functools
+import os
+import pathlib
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -170,3 +174,103 @@ def test_explicit_axes_give_the_bridge_a_local_output_shape(mesh, topology):
         local_tokens * EP_SIZE, HIDDEN
     ), ("Auto axes are expected to erase the shard_map out-spec; if that ever "
         "changes, ep_mesh no longer needs to pin the axis types")
+
+
+# Every test file this branch adds. Import hygiene is checked for all of them
+# together because the cost of getting it wrong is not local to one file.
+_ADDED_TEST_FILES = (
+    "tests/kernels/fused_moe/test_fused_ep_aot.py",
+    "tests/kernels/fused_moe/test_fused_ep_v1_upstream.py",
+    "tests/layers/common/test_fused_moe_ep_numerics.py",
+    "tests/layers/vllm/test_fused_moe_ep.py",
+    "tests/layers/vllm/test_fused_moe_ep_contract.py",
+    "tests/layers/vllm/test_fused_moe_ep_default_off.py",
+)
+
+_IMPORT_HYGIENE_PROBE = """
+import importlib.util, sys
+from jax._src import xla_bridge as xb
+
+def live():
+    return sorted(getattr(xb, "_backends", {}))
+
+assert not live(), f"a backend existed before any test module was imported: {live()}"
+for i, path in enumerate(sys.argv[1:]):
+    spec = importlib.util.spec_from_file_location(f"_probe_{i}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if live():
+        raise SystemExit(f"{path} initialised a JAX backend at import: {live()}")
+print("OK")
+"""
+
+
+def test_importing_these_modules_opens_no_device():
+    """Collection must not create a PJRT client. Run in a child, or the parent's
+    own backend would mask the very thing being checked.
+
+    A module-scope ``jax.default_backend()`` reads like a query and is not one:
+    it initialises the backend. Doing that at import time means it happens
+    during pytest *collection*, so the pytest process holds the TPU's vfio
+    groups for the rest of the run and every later test that spawns an engine
+    or a worker dies on ``Device or resource busy``. That is not hypothetical
+    -- it took down three CI builds (PR #478, builds 2947/2952) and it looked
+    convincingly like runner contention, because the set of busy iommu groups
+    differed every time.
+    """
+    root = pathlib.Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [
+            sys.executable, "-c", _IMPORT_HYGIENE_PROBE,
+            *(str(root / f) for f in _ADDED_TEST_FILES)
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ, "PYTHONPATH": f"{root / 'src'}{os.pathsep}{root}"
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# Substrings that mean "this test wants a PJRT client of its own": it starts a
+# vLLM engine, a multiproc worker, or a spawned isolated process.
+_NEEDS_ITS_OWN_DEVICE = ("run_in_isolated_process", "LLM(", "EngineCore",
+                         "multiproc", "subprocess", "Process(")
+
+_PORTED_SUITE = "tests/kernels/fused_moe/test_fused_ep_v1_upstream.py"
+
+
+def test_nothing_needing_a_fresh_device_is_scheduled_after_the_ported_suite():
+    """The ported suite runs in-process, so pin what may follow it.
+
+    In the multichip job its tests really execute and build an 8-device mesh,
+    which leaves a PJRT client alive in the pytest process (the same reason
+    tests/distributed/tpu_test_utils.py exists). That is fine for neighbours
+    that use JAX in-process -- they share the client, as the other ~34 kernel
+    test files do -- and fatal for a neighbour that spawns an engine, which
+    would get `Device or resource busy`.
+
+    Today the two engine-spawning multichip files (`test_generate_tp*.py`) sort
+    *before* us and the only one after is `test_gdn_attention_pcp.py`, which
+    spawns nothing. CI feeds pytest a sorted glob, so that ordering is a
+    property of the paths and is checkable here rather than being an assumption
+    a future rename would silently break.
+    """
+    root = pathlib.Path(__file__).resolve().parents[3]
+    marked = sorted(
+        p.relative_to(root).as_posix() for p in (root / "tests").rglob("*.py")
+        if "multichip" in p.read_text(errors="ignore"))
+    assert _PORTED_SUITE in marked, "the ported suite lost its multichip marker"
+
+    offenders = {
+        path:
+        sorted(s for s in _NEEDS_ITS_OWN_DEVICE
+               if s in (root / path).read_text(errors="ignore"))
+        for path in marked if path > _PORTED_SUITE
+    }
+    offenders = {k: v for k, v in offenders.items() if v}
+    assert not offenders, (
+        "these multichip files sort after the ported suite and want their own "
+        f"device: {offenders}. Either they will fail with 'Device or resource "
+        "busy', or the ported suite now needs subprocess isolation.")

@@ -17,7 +17,7 @@ Source: tpu-inference df2643f9c, tests/kernels/fused_moe_v1_test.py. Kept as
 close to upstream as possible so a re-vendor can be re-validated by diffing
 this file against theirs; the local changes are the import path, the
 ``w13_concat_layout`` coverage our loader needs (marked "Local"), and the
-backend skip below.
+``multichip`` marker below.
 
 Note on the bar this sets: upstream asserts atol=rtol=2e-1 (4e-1 for
 ``test_scoring_fn``). That is loose enough to pass with a materially different
@@ -37,13 +37,22 @@ from vllm_torchtpu.kernels.fused_moe.v1.kernel import fused_ep_moe, ref_moe
 
 jax.config.parse_flags_with_absl()
 
-# Upstream's setUp already skips off TPUv7+; this makes the whole module skip
-# without constructing a mesh, and marks it for the multichip CI agent.
-pytestmark = [
-    pytest.mark.multichip,
-    pytest.mark.skipif(jax.default_backend() != "tpu",
-                       reason="fused EP kernel needs a TPU backend"),
-]
+# Nothing at module scope may touch a device. pytest imports every file in the
+# job's list during *collection*, before any test runs, and a PJRT client
+# created here would be held for the lifetime of the pytest process -- which is
+# exactly what tests/distributed/tpu_test_utils.run_in_isolated_process exists
+# to prevent ("PJRT keeps TPU device handles alive for the lifetime of its
+# process"). Every later test that spawns an engine or worker would then fail
+# `open(/dev/vfio/N): Device or resource busy`.
+#
+# In particular: do NOT put `jax.default_backend()` in a module-level skipif.
+# It is not a query, it initialises the backend -- measured, `xla_bridge`'s
+# backend table goes from empty to populated across the call.
+#
+# The backend gate belongs where upstream already has it, in setUp: it runs at
+# test setup, only for tests that were selected, and it skips before the mesh
+# is built.
+pytestmark = pytest.mark.multichip
 
 
 def cdiv(a, b):
