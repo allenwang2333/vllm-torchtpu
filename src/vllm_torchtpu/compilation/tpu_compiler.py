@@ -79,6 +79,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/attention.py",
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
     "vllm_torchtpu/layers/vllm/linear_common.py",
     "vllm_torchtpu/layers/vllm/quantization",
     "vllm_torchtpu/layers/vllm/vision_attention.py",

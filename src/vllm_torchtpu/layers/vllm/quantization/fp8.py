@@ -65,7 +65,7 @@ from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8, FP8,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
-from vllm_torchtpu.layers.vllm import moe_routing, token_padding
+from vllm_torchtpu.layers.vllm import fused_moe_ep, moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
@@ -797,10 +797,51 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight.device)
+
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+        )
+
+        # Decided once per layer, not per step: a layer that engages the fused
+        # kernel runs it for every forward, which is what lets it claim
+        # supports_internal_mk below.
+        self._fused_ep_enabled = fused_moe_ep.is_enabled(layer)
+        if self._fused_ep_enabled:
+            fused_moe_ep.register_replica_rank_buffer(
+                layer, device=layer.w13_weight.device)
+            # Resolve the kernel config once, here: the forward must look up an
+            # op that already exists, never build one inside the compiled
+            # region (see test_the_forward_never_builds_the_op).
+            self._fused_ep_config = self._fused_ep_kernel_config(layer)
+            fused_moe_ep.prebuild_fused_ep_moe_kernel(**self._fused_ep_config)
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Tell vLLM's runner we own EP dispatch/combine.
+
+        The fused EP kernel takes this rank's own token rows and returns them
+        combined across every expert, so the runner's naive DP all-gather and
+        reduce-scatter (``moe_runner.do_naive_dispatch_combine``) must not run.
+        The TP all-reduce still must, and does: ``_fused_output_is_reduced`` is
+        driven by ``moe_kernel``, which stays None here.
+        """
+        return getattr(self, "_fused_ep_enabled", False)
+
+    @staticmethod
+    def _fused_ep_kernel_config(layer: RoutedExperts) -> dict:
+        """Static kernel config; ``subc_quant_*`` == the contracting extent is
+        the kernel's spelling of per-output-channel scales."""
+        # From w2 ([E, F, H]) so this is layout-independent.
+        intermediate_size, hidden_size = layer.w2_weight.shape[-2:]
+        return dict(
+            top_k=layer.moe_config.experts_per_token,
+            renormalize=bool(layer.renormalize),
+            activation=layer._tpu_activation_str,
+            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            subc_quant_w1_sz=hidden_size,
+            subc_quant_w2_sz=intermediate_size,
         )
 
     def apply_monolithic(
@@ -812,6 +853,18 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
+        if getattr(self, "_fused_ep_enabled", False):
+            return fused_moe_ep.fused_moe_ep(
+                hidden_states=x,
+                router_logits=router_logits,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                replica_rank=layer._ep_replica_rank,
+                **self._fused_ep_config,
+            )
+
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
