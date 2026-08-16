@@ -28,9 +28,9 @@ Priority is what to spend the next TPU run on, not what is most interesting.
 **Current objective (Pate, 2026-08-16):** accuracy parity with tpu-inference's
 DSv4, expressed in the structure `kimi_k3` already uses in this repo. *Not*
 exact parity with tpu-inference, and not its memory or compile characteristics.
-Accuracy parity is met (A6). The remaining work is design parity — the G rows.
-The compile-ceiling question is closed: A8 was refuted on 2026-08-16 and
-compiled serving works at 9216 (A14).
+Accuracy parity is met (A6). G5 is fixed and gated (2026-08-16). G1 was dropped
+as a misattributed request. The compile-ceiling question is closed: A8 was
+refuted on 2026-08-16 and compiled serving works at 9216 (A14).
 
 ## Picking this up cold
 
@@ -127,14 +127,12 @@ like a code bug and is not one.
 **`LOAD_FORMAT=dummy`** is valid for shape, sizing and compile questions only.
 Never for anything depending on weight values.
 
-`/dev/shm/torch_tpu_cache` currently holds 109 GB of RAM. Not urgent, but it is
+`/dev/shm/torch_tpu_cache` holds 192 GB of RAM (measured 2026-08-16). Not urgent, but it is
 the same category of problem as the weight cache that was moved to disk.
 
-**Utilization.** Every other model on this hardware runs `gpu-memory-utilization`
-at 0.92–0.95; every working DSv4 config sits at 0.48–0.55. That is not
-conservatism — at 0.92 the DSv4 KV init fails asking for 2.19 GB with 1.60 GB
-free. See G5. Until that is fixed, treat high utilization as unavailable for
-DSv4 and record the highest value observed to work.
+**Utilization.** Highest value verified to serve is **0.75** (`36abf661`,
+ctx 9216, KV 485,612 tokens, 52.69x). Before the G5 fix it was 0.55. 0.92 still
+fails, but in *compile*, not KV — see "What still caps 0.92".
 
 **Use `scripts/vllm/benchmarking/cleanup_server.sh`** to free the chips. It
 already handles `vllm serve`, `vllm.entrypoints`, `VLLM::` workers and
@@ -187,7 +185,7 @@ Draft and hand over.
 | E2 | DP attention — sharding change through runner and KV cache manager | deferred | P3 | tpu-inference hard-validates MLA + DP, so no DP-off reference control exists | Needs its own planning pass |
 | E3 | No genuine ours-vs-reference comparison has ever run — every "identical" compares us to ourselves | open | P3 | consequence of E2 | Unblocked only by E2 |
 | F1 | `"DeepseekV4ROCMAiterMLAAttention"` string at `deepseek_v4_attention.py:253` | open | P3 | gxd3 asked on PR #459 to drop the ROCm dependency; the module-level import and `getattr` fallback he commented on are already gone | Remove if the tuple's other names can be shown not to match |
-| G1 | **We still monkey-patch vLLM**: `model.py:147` does `HCHeadOp.forward_native = mhc_hc_head_native` | verified, **fully scoped** | **P1** | vLLM's `HCHeadOp.forward_native` raises `NotImplementedError` (only `forward_cuda`/`forward_xpu` exist), so a reimplementation *is* needed — but the reference does it through vLLM's supported out-of-tree hook: `tpu_inference/layers/vllm/custom_ops/mhc.py`, 131 lines, four `@X.register_oot` subclasses each defining `forward_tpu`. We already use `register_oot` in `gdn_attention_op.py`, `mla_attention_op.py`, `vision_attention.py` — DSv4's MHC is the lone outlier | See the G1 plan below |
+| G1 | ~~Replace the MHC monkey-patch at `model.py:147` with `register_oot`~~ | **dropped 2026-08-16 (Pate)** | — | The row claimed this was "the pattern gxd3 asked us to drop." It is not: no comment on PR #459, #462 or #464 mentions `HCHeadOp`, `forward_native` or `register_oot` — see the Refuted table. The underlying difference from the reference is real but cosmetic, and it gates nothing | Nothing. Do not re-raise it as a reviewer commitment |
 | G2 | No `Head` class in the reference — it inlines `hc_head_op(...)` then `norm(...)` at the tail of `Model.forward` | verified | P2 | reference `deepseek_v4.py:656-664`; ours has a `DeepseekV4Head` class at `model.py:418` | Inline it to match, removing the extra class |
 | G3 | File layout does not match `kimi_k3`: DSv4 is one 30 KB `model.py`, kimi splits into `layers.py`/`moe.py`/`model.py`/`attention.py` | verified | P2 | `ls models/vllm/kimi_k3/` vs `models/vllm/deepseek_v4/` | Split: `DeepseekV4MLP` + head + `mhc_*` → `layers.py`; `DeepseekV4MoE` → `moe.py`; keep decoder/model/causal-LM in `model.py`. Pure moves, but needs a re-gate |
 | G5 | **DSv4 over-allocates KV by 1.3223×** — 22 of 43 sliding-window caches find no overlay host and take standalone `num_blocks` arrays | cause **measured**; fix written, ungated | **P1** | measurement in "G5 measured" below, from `kvprobe092_7744ac9b`. Root cause: `_plan_ds_v4_swa_overlay` kept one global `taken` set where the reference rebuilds the host list per cache group (`tpu-inference/runner/kv_cache_manager.py:1159-1178`) | Gate the per-group fix, then raise `gpu-memory-utilization` toward 0.92 |
@@ -226,30 +224,41 @@ The next three steps, in order, each answering one thing:
 
 Do not conclude anything about `de8a5a1c` before step 3.
 
-## G1 plan — replace the MHC monkey-patch with `register_oot`
+## G1 was dropped — what the reviewer actually asked
 
-Copy the reference's structure; the math is already ours and stays unchanged.
+G1 was not a reviewer request. It was produced by this project's own
+tracker-vs-reference gap analysis on 2026-08-16 (`a59f6c0b`) and then written up
+as though gxd3 had asked for it.
 
-1. Add `src/vllm_torchtpu/layers/vllm/custom_ops/mhc.py` with four subclasses,
-   mirroring `tpu_inference/layers/vllm/custom_ops/mhc.py`:
-   `@MHCPreOp.register_oot class VllmMHCPreOp(MHCPreOp)` with `forward_tpu`, and
-   the same for `MHCPostOp`, `HCHeadOp`, `MHCFusedPostPreOp`.
-2. Move the bodies of `mhc_pre_torch`, `mhc_post_torch` and
-   `mhc_hc_head_native` (`model.py:57-146`) into those `forward_tpu` methods
-   verbatim. No numerics change is intended.
-3. Delete `HCHeadOp.forward_native = mhc_hc_head_native` (`model.py:147`) and
-   the three free functions.
-4. In `DeepseekV4DecoderLayer.__init__`, hold `self.mhc_pre = MHCPreOp()` and
-   `self.mhc_post = MHCPostOp()` and call them, as the reference does at
-   `deepseek_v4.py:368-370, 379, 399`.
-5. Ensure the new module is imported where the platform registers custom ops —
-   see `platforms/tpu_platform.py:366`, which explains that `register_oot` only
-   takes effect once the module is imported.
+What gxd3 actually asked, verified against the threads on 2026-08-16:
 
-Risk: dispatch changes from a patched `forward_native` to `forward_tpu`, so the
-call path differs even though the arithmetic does not. Needs a compiled gate;
-generations are expected identical, and a diff would mean the bodies did not
-transfer cleanly.
+- **PR #462**, on `deepseek_v4_patch.py:19`: "Instead of patching, how about just
+  define the our TPU DSv4 model.py ... and update the registry to point to it",
+  citing `tpu-inference` PR #3065. That is **D1**, and it is already implemented
+  on this branch — `deepseek_v4_patch.py` is gone. gxd3 accepted a TODO and
+  deferring it.
+- **PR #459**, on `deepseek_v4_attention.py`: drop the
+  `DeepseekV4ROCMAiterMLAAttention` dependency. That is **F1**. A TODO was
+  accepted.
+- **PR #464**: three asks about generic files carrying DSv4-specific changes —
+  `tpu_compiler.py` (split out, see D3), the recursion-limit bump, and
+  `__init__.py`.
+
+None of them mentions MHC. The monkey-patch at `model.py:147` is still a real
+difference from the reference, which registers the four MHC ops through
+`register_oot` (`tpu_inference/layers/vllm/custom_ops/mhc.py`), and this repo
+already registers `gdn_attention_op`, `kda_attention_op` and `mla_attention_op`
+that way through `layers/vllm/custom_ops/__init__.py`. It is a consistency
+cleanup with no dependent work, and it is not being done.
+
+One measurement worth keeping from the attempt: our `mhc_pre_torch` and
+`mhc_post_torch` (`model.py:57-125`) are line-for-line identical to vLLM's
+`model_executor/kernels/mhc/torch.py`, so they could delegate. Our
+`mhc_hc_head_native` (`model.py:128-144`) is **not** identical to the
+reference's `forward_tpu`: ours keeps float32 through the linear and the
+weighted sum, the reference downcasts to bfloat16 first. Ours is the
+higher-precision path and is the one the 0.78 MMLU-Pro results were measured
+with, so any future port must move our body, not copy the reference's.
 
 ## Gap analysis, 2026-08-16
 
@@ -258,7 +267,7 @@ transfer cleanly.
 | Area | tpu-inference | ours | Verdict |
 |---|---|---|---|
 | Model classes | 5: `MLP`, `MoE`, `DecoderLayer`, `Model`, `ForCausalLM` | 6 — adds `DeepseekV4Head` | **G2** |
-| MHC ops | four `@X.register_oot` subclasses with `forward_tpu`, in `layers/vllm/custom_ops/mhc.py` (131 lines) | monkey-patches `HCHeadOp.forward_native`, plus three module-level `mhc_*` functions in `model.py` | **G1** |
+| MHC ops | four `@X.register_oot` subclasses with `forward_tpu`, in `layers/vllm/custom_ops/mhc.py` (131 lines) | monkey-patches `HCHeadOp.forward_native`, plus three module-level `mhc_*` functions in `model.py` | real difference, **not being fixed** (G1 dropped) |
 | KV cache allocation | shared path | bespoke `_initialize_ds_v4_kv_cache` branch that skips the profiler reconciliation | **G5** |
 | Attention weight requant | none | none — deleted in `83abd731` | closed |
 | Custom ops | `deepseek_v4_{attention,compressor,indexer}.py` | same three, same names | aligned |
@@ -277,7 +286,8 @@ transfer cleanly.
 | `gpu-memory-utilization` | 0.92–0.95 house standard | ≤0.83 | consequence of G5 |
 
 **Distance summary.** Against the reference the remaining gaps are three: how MHC
-is registered (G1), one extra class (G2), and KV allocation (G5). Everything
+is registered (dropped), one extra class (G2), and KV allocation (G5, fixed).
+Everything
 else is aligned, and the apparent kernel gap is illusory. Against `kimi_k3` the
 gaps are layout (G3, G4) plus the same G5. G5 is the only one that costs
 capacity rather than tidiness.
@@ -298,6 +308,10 @@ recorded so the same ground is not re-covered.
 | "tpu-inference is not comparable because it doesn't use torch.compile" | **wrong framing** | it is the design being emulated and serves this model on this hardware. Its graph boundaries are a legitimate model to copy, even though it is JAX-jitted |
 | "G5 is fixed by folding `_is_ds_v4` into the shared allocation tail" | **inapplicable as written** | the shared tail computes `num_blocks = tensor_size // total_group_page_size` per tensor, but under the packed layout `tensor_size` is the whole slab, so that formula yields nonsense per-tensor block counts — and DSv4's layers must share one block-ID space. The allocation was never the problem: the overlay plan was. The TODO at `tpu_runner.py:5364` stands as tidiness, not as the G5 fix |
 | "DSv4's bespoke KV allocation is a deviation from tpu-inference" | **false** | the reference has the same bespoke overlay, the same 43-vs-21 shortfall and the same standalone-array overflow (`kv_cache_manager.py:1015-1053`). It is a deviation from the *shared vLLM path*, not from the reference. Fixing the host selection makes our memory behavior better than the reference's, which is fine — memory parity with it is out of scope |
+| "`max-num-batched-tokens` drives the compile-temporaries OOM" | **false** | 8192 → 1024 moved temporaries 106.41G → 106.38G at otherwise identical settings. A10's finding is about KV cache size, a different budget; do not carry it over to compile scratch |
+| "`max-num-seqs` drives the compile-temporaries OOM" | **false** | 512 → 32 moved temporaries 106.38G → 106.43G. Batch shape does not move this number at all; ctx and util are the remaining candidates |
+| "gxd3 asked us to drop the MHC monkey-patch / G1 is the change he would notice" | **false** | no comment on PR #459, #462 or #464 mentions `HCHeadOp`, `forward_native`, `register_oot` or MHC. #462 asks for a native `model.py` plus a registry entry (that is D1, already implemented); #459 asks about `DeepseekV4ROCMAiterMLAAttention` (F1); #464 asks about generic files carrying DSv4 changes. G1 originated in this project's own gap analysis in `a59f6c0b` and was written up as a reviewer request |
+| "D1 should be held until G1 lands" | **false** | consequence of the above. D1 *is* what gxd3 asked for, it has been unsubmitted since 2026-08-14, and nothing gates it |
 | "`lsof /dev/vfio/*` reliably shows whether the TPU is held" | **false** | it reported zero holders while a server was demonstrably running. Use `pgrep -af entrypoints.openai.api_server \| grep -v shell-snapshots` |
 | "The `tpu_compiler.py` hardening is still owed as a standalone PR" | **false** | `git diff origin/main HEAD` on that file is empty; the earlier delta came from diffing against a stale local `main` |
 
@@ -368,6 +382,11 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | kvprobe092 @ `7744ac9b` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** in KV init, and the G5 measurement: planned 6,721,536 B/block against a 5,083,136 B/block budget — **1.3223×**. See "G5 measured" below |
 | kvprobe092 @ `36abf661` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **KV init passes** — overlay 42 of 43, planned 5,001,216 B/block, ratio **0.9839**, KV 151,990 tokens. Then **START_FAIL in compile**: HLO temporaries 106.41 G vs 94.74 G available. A different wall, driven by `max-num-batched-tokens=8192` (A10), not by KV |
 | gate_36abf661 | 1024 | 0.48 | 16 | 1024 | compiled | yes | **PASS** — `tracebacks=0 sweeps=13 raises=0 compile_lines=78`, needle exact, generations and token IDs **byte-identical** to `gate_09f6c694c.sub`. The SWA overlay fix changes no output |
+| ceiling 9216 @ `36abf661` | 9216 | 0.55 | 8 | 1024 | compiled | yes | **PASS** — KV 309,223 tokens (was 308,292), 33.55×, overlay 42 of 43, request served. Long context is unaffected by the overlay change |
+| util092_b1024 @ `36abf661` | 10240 | 0.92 | 512 | **1024** | compiled | yes | **START_FAIL in compile**, temporaries **106.38G** — statistically the same as the 106.41G at 8192 batched. KV was fine: 702,983 tokens, 68.65×, ratio 0.9839. Refutes batched tokens as the driver |
+| util092_s32 @ `36abf661` | 10240 | 0.92 | **32** | 1024 | compiled | yes | **START_FAIL in compile**, temporaries **106.43G**. KV 703,473 tokens, 68.70×. Refutes seqs as the driver too |
+| util092_ctx9216 @ `36abf661` | 9216 | 0.92 | 8 | 1024 | compiled | yes | **START_FAIL in compile**, temporaries **106.45G**. The ceiling probe's exact passing config with only util changed, so context is exonerated and utilization is the driver |
+| util075_ctx9216 @ `36abf661` | 9216 | **0.75** | 8 | 1024 | compiled | yes | **READY** — KV **485,612** tokens, **52.69×**. This same config failed before the fix (row C, 103.09G) |
 | bench 0.92 | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** — DSv4 KV init wanted 2.19 G, 1.60 G free |
 | bench 0.85 | 10240 | 0.85 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 1009.6 M, 986.5 M free (short 23 M). KV 136,847 |
 | bench 0.83 | 10240 | 0.83 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 978.4 M, **420.1 M** free (short 558 M). KV 132,611 |
@@ -426,14 +445,48 @@ overlay 42 of 43, `planned_per_block=5,001,216`, `ratio=0.9839`,
 `block_stride=5,083,136`, and the KV allocation that killed the previous run
 completed with no error.
 
-### What still caps utilization at 0.92 is compile, not KV
+### What still caps the bench config is compile scratch, and it is not KV
 
-With the overlay fixed, `10240 / 8192 batched / 512 seqs / util 0.92` gets
-through KV init and then dies in `fx_to_mlir`: *HLO temporaries (106.41G)
-exceeds available HBM (94.74G)*. That is the same class as run-log row C and it
-is driven by `max-num-batched-tokens`, which A10 already identified as the
-memory driver — a higher utilization leaves less HBM for compile scratch, so
-the two compete directly. The KV accounting no longer contributes to it.
+With the overlay fixed, `10240 ctx / 512 seqs / util 0.92` gets through KV init
+and then dies in `fx_to_mlir`: *HLO temporaries (106.41G) exceeds available HBM
+(94.74G)*.
+
+Dropping `max-num-batched-tokens` from 8192 to 1024 moved the temporaries from
+106.41G to **106.38G** — 0.03%. So batched tokens is *not* the driver of this
+compile OOM, and the "A10 says batched tokens is the memory driver" reading does
+not extend to compile scratch (A10 measured KV cache size, which is a different
+budget). Both failing runs held `max-num-seqs=512`; the gate that passes uses
+16 and the ceiling probe uses 8. Seqs is the remaining suspect — under test.
+
+Seqs is not the driver either: 512 → 32 moved the temporaries 106.38G →
+**106.43G**. So at `ctx 10240 / util 0.92` the compile needs ~106.4G no matter
+how the batch is shaped.
+
+**The usable ceiling moved 0.55 → 0.75.** At ctx 9216 the fix takes KV from
+309,223 tokens (0.55) to **485,612** (0.75), 33.55× → **52.69×** concurrency —
+1.57× more KV capacity, on a config that failed outright before the fix.
+
+What the data points leave standing:
+
+| ctx | util | seqs | batched | temporaries | outcome |
+|---|---|---|---|---|---|
+| 1024 | 0.48 | 16 | 1024 | — | PASS (the gate) |
+| 9216 | 0.55 | 8 | 1024 | — | PASS (ceiling probe) |
+| 9216 | 0.75 | 8 | 1024 | 103.09G | FAIL — but *before* the fix (row C) |
+| 9216 | **0.75** | 8 | 1024 | — | **PASS after the fix** |
+| 9216 | 0.92 | 8 | 1024 | 106.45G | FAIL |
+| 10240 | 0.92 | 32–512 | 1024–8192 | 106.4G | FAIL |
+
+Utilization is the driver, established by one-variable comparison: the ceiling
+probe's exact passing config fails at 0.92 and passes at 0.75. Context is
+exonerated — 9216 both passes and fails depending only on util.
+
+"Available HBM (94.74G)" is printed identically in all three failures despite
+utilizations of 0.75 and 0.92, so it is not a free-memory figure that
+utilization shrinks — most likely a fixed per-chip compiler budget, unverified.
+
+The KV side at util 0.92 is now healthy: 702,983 tokens, 68.65× concurrency,
+ratio 0.9839.
 
 ### The utilization shortfall is non-monotonic
 
@@ -488,6 +541,79 @@ compile failure in run-log row C — which happened with the recursion limit
 removed, at util 0.75 and seqs 16. As of 2026-08-16 18:36 the compiled probe at
 9216 on the corrected tree has passed KV sizing (308,292 tokens, 33.45×
 concurrency), which is well past where row C died. Provisional, pending verdict.
+
+## Flag audit, 2026-08-16 — what we control and what we don't
+
+Prompted by "are we missing a flag that fixes the compile OOM". Answer: no flag
+we were missing explains it, but the audit corrected several beliefs.
+
+**Reading the real flag values.** `XLA_FLAGS=--xla_dump_to=<dir>` emits a
+`*.tpu_comp_env.txt` per module listing **all 1,530 TPU flags with their live
+values**. That is the way to read defaults; no help text is compiled into
+`libtpu.so`, and `--xla_tpu_log_flags` is not needed. `libtpu.so` exposes 1,708
+`xla_*` names in total.
+
+Values that matter for the 106.4G compile OOM:
+
+| flag | value | consequence |
+|---|---|---|
+| `xla_tpu_user_reserved_hbm_bytes` | -1 | nothing reserved — the 94.74G ceiling is real HBM |
+| `xla_tpu_max_hbm_size_mib` | 0 | not capped; **no knob raises the budget** |
+| `xla_tpu_rematerialization_use_host_memory_offload` | false | remat cannot spill to host |
+| `xla_tpu_rematerialization_min_size_in_bytes` | 10485760 | buffers under 10 MiB are never remat candidates |
+| `xla_jf_rematerialization_percent_shared_memory_limit` | 95 | remat engages only at 95% |
+| `xla_tpu_always_spill_to_default_memory` | false | |
+| `xla_enable_megacore_hbm_spill` | true | already on |
+
+Rematerialization is the untried lever and is currently half-disabled. Nothing
+has been tried; picking one of 1,708 flags by reading names is how the previous
+session lost time.
+
+**The OOM is not batch-shaped.** It fires on the *first and smallest* compile
+range, `(16, 16)`. Together with the batched-tokens and seqs refutations, the
+106.4G is the static graph, not the batch.
+
+**Two flags in our own config do nothing.**
+
+- `NEW_MODEL_DESIGN=1` and `MODEL_IMPL_TYPE=vllm`
+  (`configs/deepseek-v4-flash-tp8-ep.sh:33-34`, `examples/run_dsv4_inference.py:3-4`)
+  are **tpu-inference** env vars (`tpu_inference/envs.py:20-22`). Nothing under
+  `src/` reads them. They read as a model-implementation switch and are not one.
+- `ATTENTION_BACKEND="CUSTOM"` is **inert for DSv4**: `tpu_platform.py:711-712`
+  overrides `selected_backend` to `FLASH_ATTN_MLA` whenever `use_mla`, before
+  the supported-backend check.
+
+**Flags that are genuinely applied**, and needed no action: `--async-scheduling`
+(auto-enabled when unset, `config/vllm.py:1107`; every run logs "Asynchronous
+scheduling is enabled"), `--quantization` (auto-detected to `deepseek_v4_fp8`),
+`USE_MOE_SPARSE_CORE` (defaults True, `envs.py:38`), and the root README's
+`TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false` /
+`TORCHINDUCTOR_AUTOGRAD_CACHE=0`, both already set by `env_override.py:30` and
+`src/sitecustomize.py:8-10` — **the README's "set these workarounds" step is
+stale.** Note that despite its name that flag is not a memory knob: it disables
+a torch_tpu graph-break guardrail so collectives compile under SPMD
+(`env_override.py:25-29`).
+
+Do **not** adopt `ONEHOT_MOE_PERMUTE_THRESHOLD=32768` (used by qwen3.5-397b): it
+forces MoE permute onto the one-hot TensorCore path, materializing a
+`[rows, num_experts]` matrix (`fused_moe_gmm.py:50-77`), which grows temporaries.
+
+**Noise, not ours:** JAX's `cloud_tpu_init.py:104-109` injects
+`--xla_tpu_use_enhanced_launch_barrier=true`; libtpu warns it "can cause
+distributed hangs" and rewrites it to false, 8x per run, in every log.
+
+**Do not cap `--xla_dump_max_hlo_modules`.** It counts modules in creation order
+and the backbone compiles late, so a cap of 20 dumped 3,293 files of small
+utility graphs and none of the module that OOM'd. The buffer-assignment
+breakdown of the 106.4G is therefore **still unmeasured**.
+
+**Documentation gaps.** `deepseek-v4-flash-tp8-ep` is absent from
+`scripts/vllm/benchmarking/README.md`'s config table and from every CI tier.
+
+**Disk, measured 2026-08-16.** `~/workspace` is a separate 2.0T NVMe with 681G
+free; `/` has 80G free; `/dev/shm` 281G free. `~/.cache/vllm` is a symlink into
+`~/workspace`, so `torch_compile_cache` (312G), `hf_cache` (149G) and
+`dsv4_quant_cache` (132G) all live on the NVMe, not on `/`.
 
 ## Measuring memory properly
 

@@ -13,12 +13,36 @@ against the reference's 0.7786 ± 0.0154. What remains is structural.
 Not in scope: byte-level parity with tpu-inference, its memory characteristics,
 DP attention, or the perf gap against it.
 
-## The five items
+## Status, 2026-08-16 evening
 
-Ordered by value, not by size. G5 is first because it is the only one that costs
-serving capacity; the rest cost idiomaticity and review friction.
+G5 fixed and gated. G1 dropped. G2/G3/G4 untouched.
 
-### G5 — fold DSv4 KV allocation into the shared path
+| item | state |
+|---|---|
+| G5 — KV allocation | **done** (`36abf661`), util 0.55 -> 0.75 |
+| G1 — MHC `register_oot` | **dropped**, misattributed to the reviewer |
+| G2 + G3 — inline head, split module | open, one gate, low risk |
+| G4 — move attention into the model package | deferred, raise with gxd3 first |
+| D1 — submit the nine-commit stack | **open and ungated** |
+
+### G5 — fixed 2026-08-16 (`36abf661`)
+
+Root cause was not the allocation but the overlay plan: host selection used one
+global `taken` set, so with 21 compressed-KV layers only 21 of 43 sliding-window
+caches could overlay and the other 22 took standalone `num_blocks` arrays —
+1.3223x the budget vLLM sized. Cache groups have disjoint block-id namespaces,
+so one array hosts one layer per group, which is what the reference does.
+Result: overlay 42 of 43, ratio 0.9839, gate byte-identical, ceiling 9216
+passes, and utilization 0.55 -> 0.75 (KV 309,223 -> 485,612 tokens).
+
+"Fold `_is_ds_v4` into the shared tail" turned out to be inapplicable: that path
+computes `num_blocks = tensor_size // total_group_page_size` per tensor, but
+under vLLM's packed layout `tensor_size` is the whole slab. The TODO at
+`tpu_runner.py:5364` stands as tidiness only.
+
+Full measurement in the tracker.
+
+### Superseded: the original G5 plan
 
 *Why it matters:* DSv4 cannot exceed ~0.83 `gpu-memory-utilization` while every
 other model on this hardware runs 0.92–0.95. That is lost KV capacity on every
@@ -54,37 +78,18 @@ target is parity with the house standard, 0.92.
 subtle breakage on this model. Do not attempt it in the same change as anything
 else.
 
-### G1 — replace the MHC monkey-patch with `register_oot`
+### G1 — dropped 2026-08-16
 
-*Why it matters:* `model.py:147` does
-`HCHeadOp.forward_native = mhc_hc_head_native`. Patching a vLLM class is the
-pattern gxd3 asked us to leave on PR #462, and it is still present in the model
-we would submit as the fix for that review.
+G1 claimed `model.py:147`'s `HCHeadOp.forward_native = ...` was "the pattern
+gxd3 asked us to leave on PR #462". Verified against the threads: it is not.
+gxd3's #462 comment asks for a native `model.py` plus a registry entry, which is
+D1 and is already implemented. No comment on #459, #462 or #464 mentions MHC,
+`forward_native` or `register_oot`.
 
-*Not a mistake to have reimplemented:* vLLM's `HCHeadOp.forward_native` raises
-`NotImplementedError`; only `forward_cuda` and `forward_xpu` exist. The
-arithmetic has to come from us. The reference simply registers it properly.
-
-*Steps:*
-
-1. Add `src/vllm_torchtpu/layers/vllm/custom_ops/mhc.py`, mirroring
-   `tpu_inference/layers/vllm/custom_ops/mhc.py` (131 lines): four subclasses,
-   `@MHCPreOp.register_oot`, `@MHCPostOp.register_oot`, `@HCHeadOp.register_oot`,
-   `@MHCFusedPostPreOp.register_oot`, each defining `forward_tpu`.
-2. Move the bodies of `mhc_pre_torch`, `mhc_post_torch`, `mhc_hc_head_native`
-   (`model.py:57-146`) into those methods verbatim — no numerics change.
-3. Delete the patch line at `model.py:147` and the three free functions.
-4. Hold `self.mhc_pre = MHCPreOp()` / `self.mhc_post = MHCPostOp()` on the
-   decoder layer and call them, as the reference does at `deepseek_v4.py:368-370`.
-5. Import the new module where the platform registers custom ops —
-   `platforms/tpu_platform.py:366` notes that `register_oot` only takes effect
-   once the module is imported.
-
-*Verify:* compiled gate. Generations should be byte-identical to
-`gate_09f6c694c.sub`; a diff means the bodies did not transfer cleanly.
-
-*Precedent in this repo:* `gdn_attention_op.py`, `mla_attention_op.py` and
-`vision_attention.py` already use `register_oot`. DSv4's MHC is the outlier.
+The difference from the reference is real but cosmetic and gates nothing. See
+the tracker's "G1 was dropped" section for what the reviewer did ask for, and
+for the one finding worth keeping: our HC-head body is higher precision than the
+reference's, so a future port must move ours rather than copy theirs.
 
 ### G2 + G3 — inline the head, split the module
 
@@ -126,16 +131,10 @@ Nine commits, `ff1033a2..HEAD`, absent from `origin/main`. This is the refactor
 gxd3 asked for on PR #462 and it has never been sent. No longer blocked: A8 was
 refuted, and PR11 was dropped as a consideration on 2026-08-16.
 
-**The open decision is ordering**, and it is Pate's:
-
-- *Submit now.* Gets the largest piece of promised work in front of a reviewer
-  sooner, at the cost of reviewing code we already intend to restructure — G1 in
-  particular is a pattern that reviewer specifically objected to.
-- *Submit after G1–G3.* Sends something already idiomatic, at the cost of
-  further delay on work that has been outstanding since 2026-08-14.
-
-A reasonable middle: send the stack once G1 lands, since G1 is the one gxd3
-would notice, and treat G2/G3 as follow-ups.
+**Nothing gates it.** The earlier advice to "send the stack once G1 lands"
+rested on the misattribution corrected above: D1 *is* what gxd3 asked for on
+PR #462, and G1 is not something he raised. G2/G3 are layout cleanups that can
+follow.
 
 ## Verification standard
 
