@@ -456,9 +456,6 @@ def fused_moe_func(
         # topk_ids are already local (experts_start remap happened above).
         # For EP, zero-weight entries are already masked above.
         cn_topk_ids = topk_ids
-        if skip_padded_tokens:
-            # Also zero padding rows' ids so they route to expert 0.
-            cn_topk_ids = jnp.where(topk_weights == 0.0, 0, topk_ids)
         # Pipelined path only supports a single K/I tile (NUM_K=NUM_I=1);
         # fall back to the working kernel outside that shape regardless of
         # the opt-in flag, so an unsupported shape can't silently break
