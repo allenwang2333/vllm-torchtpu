@@ -3,7 +3,9 @@ import os
 os.environ["NEW_MODEL_DESIGN"] = "1"
 os.environ["MODEL_IMPL_TYPE"] = "vllm"
 os.environ["VLLM_NO_USAGE_STATS"] = "1"
-os.environ.setdefault("VLLM_FP4_CACHE_DIR", "/dev/shm/dsv4-flash-real-fp4")
+os.environ.setdefault(
+    "VLLM_QUANT_WEIGHT_CACHE_DIR",
+    "/home/patemotter_google_com/workspace/dsv4_quant_cache")
 
 from vllm import LLM, SamplingParams
 
