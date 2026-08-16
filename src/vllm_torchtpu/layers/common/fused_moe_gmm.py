@@ -86,7 +86,7 @@ def routed_buffer_capacity(
     alpha: float,
     beta: float = 7.0,
     c0: int = 16,
-    quantum: int = 512,
+    quantum: int = 2048,
 ) -> int:
     """Rows to reserve in the per-rank routed buffer.
 
@@ -99,10 +99,20 @@ def routed_buffer_capacity(
     The slack is multiplicative *and* additive: the relative fluctuation of the
     rank total scales as ``1/sqrt(mean)``, so a constant ``alpha`` is wrong --
     the alpha needed for a 1e-12 drop bound runs from 2.15 at 32 tokens to
-    1.046 at 16384. ``alpha`` therefore buys margin against *routing skew* and
-    ``beta``/``c0`` against sampling noise; ``quantum`` matches the GMM m-tile
-    so the capacity never adds a ragged tail. Tail derivation:
-    ``$AMPLIO_ARTIFACT_DIR/w5/notes/capacity-stats.md``.
+    1.046 at 16384. ``beta``/``c0`` price the sampling noise exactly; ``alpha``
+    is the margin for everything the iid model gets wrong, and at the 16384
+    bucket it buys almost exactly its face value: ``alpha - 1`` of systematic
+    per-rank load skew, or correlated routing blocks of ~``((alpha-1)*mean /
+    (7.3*sd))^2`` tokens. Tail derivation and the tolerance tables:
+    ``$AMPLIO_ARTIFACT_DIR/p6/TAIL.md``.
+
+    ``quantum`` is 2048 because that is the SparseCore gather's block, not
+    because of the GMM: ``ragged_gather_v2`` rounds its output rows up to
+    ``num_lanes * num_cores * num_subcores * max_row_subchunks`` (2048 on
+    tpu7x) and slices back, so a capacity that is not a whole number of blocks
+    materialises a full extra copy of the routed buffer -- 344 MB/layer at
+    C=21504. 2048 is also a whole number of GMM m-tiles (512) and of lhs
+    sublanes (16), so no consumer pads.
     """
     routed_rows = num_tokens * topk
     if ep_size <= 1:
@@ -253,7 +263,9 @@ def prepare_routed_gmm_inputs(
     sorted_indices = jnp.argsort(sort_keys)
     argsort_revert_indices = jnp.argsort(sorted_indices)
 
-    if routed_capacity is not None and routed_capacity < sort_keys.size:
+    compacted = (routed_capacity is not None
+                 and routed_capacity < sort_keys.size)
+    if compacted:
         # Valid rows sort ahead of invalid ones, so a valid row's destination
         # `argsort_revert_indices` is already its index in the compacted
         # buffer; rows past the capacity are the overflow and are dropped by
@@ -266,14 +278,45 @@ def prepare_routed_gmm_inputs(
         sorted_indices = sorted_indices[:routed_capacity]
 
     token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
+    # Name both arms, so an op table distinguishes "the control ran the control"
+    # from "the control silently ran the treatment".
+    with jax.named_scope("moe_routed_capacity" if compacted else
+                         "moe_routed_full"):
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
+
+        if compacted:
+            # INVARIANT: group_sizes_local must sum to the number of rows
+            # actually present in the routed buffer. gmm_v2 walks m offsets
+            # from it with no clamp to size_m and no bounds checks
+            # (megablox/gmm_v2.py:725, :1388, :1450), so an unclamped histogram
+            # runs the grouped matmul past both its row buffers and its SMEM
+            # metadata array. Clamp here, after every branch that can produce
+            # the histogram, not inside one of them.
+            #
+            # The sort is stable and keyed by expert, so group `e` owns the
+            # contiguous destination slots [offset[e], offset[e] + n[e]); the
+            # clipped difference is exactly |that range intersect [0,
+            # capacity)|, i.e. the same count `kept_mask` above leaves behind.
+            offsets = jnp.cumsum(group_sizes_local) - group_sizes_local
+            group_sizes_local = (
+                jnp.clip(offsets + group_sizes_local, 0, routed_capacity) -
+                jnp.clip(offsets, 0, routed_capacity))
 
     if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+        # The threshold selects the *algorithm*, so it is compared against the
+        # uncompacted routed-row count: a capacity must change the size of the
+        # buffer, never which kernel runs. `sort_keys.size` is
+        # `num_tokens_local * topk` whether or not a capacity is in force, so
+        # this is byte-identical with the capacity off. (Whether the threshold
+        # should instead see the compacted count is a live question, but it is
+        # only answerable once the threshold's own value is re-derived -- the
+        # shipped recipe sets 32768 routed rows, which is 3-6x past the
+        # measured crossover.)
+        if sort_keys.size <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
             onehot = jax.nn.one_hot(token_indices_sorted,
@@ -354,7 +397,11 @@ def moe_gmm(
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
-        if gmm2_res.shape[0] <= onehot_moe_permute_threshold:
+        # Selection is on the uncompacted routed-row count -- see the matching
+        # comment in `prepare_routed_gmm_inputs`. `argsort_revert_indices` is
+        # destination-major and is never truncated by a capacity, so its size
+        # is `num_tokens * topk` in every configuration.
+        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
             if skip_padded_tokens:
