@@ -1238,6 +1238,7 @@ def _fused_ep_moe_kernel(
         "bd1c",
         "bd2c",
         "ep_axis_name",
+        "collective_id",
     ],
 )
 def fused_ep_moe(
@@ -1271,6 +1272,10 @@ def fused_ep_moe(
     bd1c: int | None = None,
     bd2c: int | None = None,
     ep_axis_name: str = "model",
+    # Local: upstream hard-codes 0. Parameterized so this kernel can share a
+    # program with another barrier-semaphore kernel (all_gather_matmul also
+    # defaults to 0).
+    collective_id: int = 0,
 ):
     # TODO(jevinjiang): move all these assertions to validation function.
     if len(mesh.shape) != 2:
@@ -1630,7 +1635,7 @@ def fused_ep_moe(
             ]),
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=0,
+            collective_id=collective_id,
             vmem_limit_bytes=100 * 1024 * 1024,
         ),
         name=scope_name,
