@@ -154,6 +154,76 @@ def test_dp4tp2_is_supported_only_with_the_matching_replica_group(monkeypatch):
     assert "not dp_size" in fused_moe_ep.unsupported_reason(_layer(dp_size=8))
 
 
+def _per_channel_scale(out):
+    """[experts, blocks, 1, out] as the FP8 MoE loader stores it."""
+    return torch.zeros(4, 1, 1, out)
+
+
+@pytest.mark.parametrize("name,out", [("w13_weight_scale_inv", 16),
+                                      ("w2_weight_scale_inv", 8)])
+def test_blockwise_weight_scales_are_refused(tp1, name, out):
+    """MOE_REQUANTIZE_BLOCK_SIZE, caught here instead of inside the kernel.
+
+    ``_fused_ep_kernel_config`` sets ``subc_quant_*`` to the whole contracting
+    extent, so a block-quantized checkpoint reaches the kernel and dies at
+    trace time with ``Expected w1_scale.shape=(512, 32, 1, 2048) to be
+    (512, 1, 1, 2048)`` -- measured, at the Qwen3.5 geometry.
+    """
+    layer = _layer(w13_weight=torch.zeros(4, 8, 16, dtype=torch.float8_e4m3fn),
+                   w13_weight_scale_inv=_per_channel_scale(16),
+                   w2_weight_scale_inv=_per_channel_scale(8))
+    assert fused_moe_ep.unsupported_reason(layer) is None
+
+    setattr(layer, name, torch.zeros(4, 32, 1, out))
+    reason = fused_moe_ep.unsupported_reason(layer)
+    assert reason is not None
+    assert "MOE_REQUANTIZE_BLOCK_SIZE" in reason and name in reason
+
+
+def test_the_shipping_weight_dtype_stays_allowed():
+    """Guard the guard: refusing float8_e4m3fn would disable the only path."""
+    assert torch.float8_e4m3fn in fused_moe_ep._SUPPORTED_WEIGHT_DTYPES
+
+
+@pytest.mark.parametrize("dtype",
+                         [torch.float8_e4m3fn, torch.float8_e5m2, torch.int8])
+def test_the_eight_bit_weight_dtypes_are_allowed(tp1, dtype):
+    """All three MOE_REQUANTIZE_WEIGHT_DTYPE values the loader can produce.
+
+    Compile-verified at the Qwen3.5 geometry, not numerics-verified; see the
+    commit message.
+    """
+    layer = _layer(w13_weight=torch.zeros(4, 8, 16).to(dtype),
+                   w13_weight_scale_inv=_per_channel_scale(16))
+    assert fused_moe_ep.unsupported_reason(layer) is None
+
+
+def test_a_sub_byte_weight_dtype_is_refused(tp1):
+    """w13_slice() slices an element column; packed weights would mis-address."""
+    packed = torch.zeros(4, 8, 16, dtype=torch.float4_e2m1fn_x2)
+    layer = _layer(w13_weight=packed,
+                   w13_weight_scale_inv=_per_channel_scale(16))
+    reason = fused_moe_ep.unsupported_reason(layer)
+    assert reason is not None
+    assert "MOE_REQUANTIZE_WEIGHT_DTYPE" in reason
+    assert "float4_e2m1fn_x2" in reason and "float8_e4m3fn" in reason
+
+
+def test_the_requantization_refusals_need_the_flag(monkeypatch):
+    """Neither refusal can change behaviour with USE_MOE_EP_KERNEL unset.
+
+    ``unsupported_reason`` is only ever reached through ``is_enabled``, which
+    returns before consulting it when the flag is off.
+    """
+    monkeypatch.delenv("USE_MOE_EP_KERNEL", raising=False)
+
+    def _explode(_layer):
+        raise AssertionError("unsupported_reason ran with the flag unset")
+
+    monkeypatch.setattr(fused_moe_ep, "unsupported_reason", _explode)
+    assert fused_moe_ep.is_enabled(_layer()) is False
+
+
 def test_routing_simulation_disables_the_kernel(tp1, monkeypatch):
     monkeypatch.setenv("VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
                        "uniform_random")

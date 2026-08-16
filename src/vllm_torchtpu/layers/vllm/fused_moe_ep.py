@@ -64,6 +64,40 @@ def _replica_group() -> tuple[int, int]:
     ), get_tensor_model_parallel_rank()
 
 
+# 8-bit only. ``w13_slice`` addresses the concatenated gate|up array by element
+# column, which a sub-byte packed dtype does not index correctly. These three
+# are what MOE_REQUANTIZE_WEIGHT_DTYPE can produce today; all three lower (AOT,
+# at the serving geometry) and all three run in
+# tests/kernels/fused_moe/test_fused_ep_v1_upstream.py::test_w13_concat_layout.
+_SUPPORTED_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+
+
+def _requantization_reason(layer) -> str | None:
+    """Refuse the MOE_REQUANTIZE_* settings the kernel config cannot express.
+
+    Read off the loaded weights rather than the env vars, so a checkpoint that
+    already carries this layout is caught too. Both checks run at weight-load
+    time; without them the block-size case surfaces as a scale-shape ValueError
+    from inside the kernel, at trace time.
+    """
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        # The loader stores [experts, blocks, 1, out]; per-output-channel is
+        # blocks == 1, which is what _fused_ep_kernel_config assumes.
+        shape = getattr(getattr(layer, name, None), "shape", None)
+        if shape is not None and len(shape) == 4 and shape[1] != 1:
+            return (f"{name} has {shape[1]} scale blocks along the "
+                    "contracting axis (MOE_REQUANTIZE_BLOCK_SIZE); this path "
+                    "configures the kernel for one scale per output channel")
+    dtype = getattr(getattr(layer, "w13_weight", None), "dtype", None)
+    if dtype is not None and dtype not in _SUPPORTED_WEIGHT_DTYPES:
+        supported = ", ".join(str(d) for d in _SUPPORTED_WEIGHT_DTYPES)
+        return (f"w13_weight is {dtype} (MOE_REQUANTIZE_WEIGHT_DTYPE); this "
+                f"path is gated for {supported} only, because w13_slice() "
+                "addresses the gate|up array by element column and would "
+                "mis-address a sub-byte packed dtype")
+    return None
+
+
 def unsupported_reason(layer) -> str | None:
     """Why the fused EP kernel cannot serve ``layer``, or None if it can."""
     moe = layer.moe_config
@@ -104,7 +138,7 @@ def unsupported_reason(layer) -> str | None:
     if moe.num_experts % moe.ep_size:
         return (f"num_experts={moe.num_experts} is not divisible by "
                 f"ep_size={moe.ep_size}")
-    return None
+    return _requantization_reason(layer)
 
 
 def is_enabled(layer) -> bool:
