@@ -736,6 +736,9 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Dynamo's AOT capture of the 61-layer backbone recurses past CPython's
+        # default 1000 frames at long context; without this, tracing at 8192
+        # dies inside inspect.getsourcelines with "lineno is out of bounds".
         sys.setrecursionlimit(50000)
         config = vllm_config.model_config.hf_config
         self.config = config
