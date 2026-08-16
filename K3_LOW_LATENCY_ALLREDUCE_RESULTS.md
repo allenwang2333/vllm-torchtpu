@@ -1,524 +1,303 @@
 # Low-latency all-reduce kernels in the K3 forward pass
 
-Results for `TPU_LOW_LATENCY_ALLREDUCE`, branch
-`gnovack/low-latency-allreduce-k3` (the low-latency kernels of `9d7a638` plus
-the integration in `9dcf7ca`).
+Branch `gnovack/low-latency-allreduce-k3`. Whether the custom Pallas
+collectives in `kernels/collectives/low_latency_all_reduce.py`, which beat
+XLA's ring by 1.1-2.5x in JAX microbenchmarks (`docs/low_latency_allreduce.md`),
+deliver on K3's critical path at TP=32.
 
-The kernels in `kernels/collectives/low_latency_all_reduce.py` beat XLA's ring
-all-reduce by 1.1-2.5x at decode payloads in JAX microbenchmarks
-(`docs/low_latency_allreduce.md`). This is what happens when they are put on
-K3's actual critical path.
+## The answer
 
-## Why this was worth trying
+**They do, but only two-shot, and only where XLA was not already fusing.**
 
-All-reduce is a large, well-measured share of K3 decode. From the
-latent-projection traces (`results/k3-hier-latent-v4`, rank 0, decode-only):
-**79.80 ms of 257.06 ms device time, 31%**, and at `compile_sizes=[1]`
-72.97 ms of 232.20 ms, still 31%. A per-collective saving lands directly on
-that.
+* **two-shot works in production.** On the post-attention reduction it costs
+  **13.32 us/occ against XLA's 19.35 (-31%)**, and that 13.32 is essentially
+  its isolated bench number of 12.67 -- a 5% production tax. The
+  microbenchmark transfers.
+* **one-shot is out at any arrangement.** Its egress is `M(N-1)`, so it only
+  wins below ~16 KiB at 32 devices. Every arrangement that avoids the fusion
+  penalty requires a *larger* payload, which is exactly where it loses.
+* **The first attempt regressed for a reason unrelated to kernel speed.**
+  Routing the 14 KiB reduction to a kernel broke XLA's collective combiner,
+  and the lost fusion cost more than the faster kernel gained.
 
-The doc's own recommendation was to confirm section 4 first -- torchtpu
-appeared to add ~139 us per collective, which would dwarf a 2x win on a 9 us
-op. That is now answered, twice over, and it was a microbenchmark artifact:
-the K3 traces show ~34 us per TP32 all-reduce, and the integration benchmark
-below measures the kernels at their JAX-level speed through the torch path.
+The best measured arm is still slower than the control, because it runs with
+the combiner disabled to isolate the kernel. The arrangement projected to beat
+the control -- a single two-shot over the concatenated pair -- is in
+[next steps](#next-steps), not yet built.
 
-## Getting the kernels to run at all
+## Every number in one place
 
-This was most of the work, and none of it was in the kernels. Four things had
-to line up, each discovered by hitting it:
+Isolated harness (`scripts/debug/profile_ll_allreduce_shapes.py`), device self
+time us/occ, bfloat16, through `torch.compile` and the real dispatcher.
 
-| what | why it fails | resolution |
-|---|---|---|
-| A mesh spanning peers | vLLM gives each worker a **single-device** JAX mesh; the kernels need `shard_map` over all 32 | `jax.devices()` exposes the whole slice inside a worker even though `jax.local_devices()` is one core, so a mesh is built over the group's TPU global device ids. **Rank order is not device-id order** (rank 2 sits on device 4), so the map is gathered |
-| Skipping `shard_map` entirely | JAX refuses: `Cannot use communication in pallas_call without shard_map` | not available; the mesh form is mandatory |
-| Operand partition specs | `P("tp")` makes the module entry the *global* shape and torch_tpu then refuses the rank's local tensor: `invalid refinement ... tensor<32x7168> -> tensor<1x7168>` | declare the operands **replicated**, so global == local; `shard_map` still hands the body each rank's own buffer |
-| `has_side_effects=True` | XLA's partitioner rejects a side-effecting custom call inside the manual region a shard_map lowers to: `Side-effect HLO must have sharding` | isolated to exactly this flag by a three-variant probe; the kernels now take it as a parameter and the integration passes `False` |
+**32 devices**
 
-Turning off `has_side_effects` on a *collective* deserves the suspicion it
-attracts. It is safe for these kernels because the three properties the flag
-protects are already guaranteed by other means: the output is consumed so
-nothing can be dead-code eliminated, each call site gets its own
-`collective_id` so two sites cannot be CSE'd together, and the aliased
-`ws`/`step` chain orders successive calls that share a workspace. It would
-not be safe for a stateless collective, and the kernel docstring says so.
-
-A dead end worth recording: the PCP streaming attention kernel looks like a
-precedent for a cross-device Pallas kernel under `shard_map`, and is not one.
-Its pallas_calls are pure compute; the communication around them is ordinary
-JAX collectives. Nothing in this repo had run a side-effecting Pallas
-collective through torch_tpu before.
-
-## Correctness
-
-`scripts/debug/test_low_latency_all_reduce.py`, 8 devices, driving the
-dispatcher exactly as `TpuDeviceCommunicator.all_reduce` does. Each shape runs
-a **six-round chain** whose input depends on the previous output, with a
-per-round twist, so a dropped, stale or duplicated round shows up as a value
-mismatch instead of hiding inside an idempotent mean -- the workspace parity
-is the part of the design most exposed to going wrong.
-
-| dtype | result |
-|---|---|
-| float32 | **exact**: `max|diff| = 0.00000` on every shape, both kernels |
-| bfloat16 | 0.0113-0.0150 relative, ~3 ulps -- summation order, confirmed by the float32 run |
-
-Every shape also routed exactly as the gate specifies, including the ones that
-must fall through to XLA.
-
-## Latency through the torch path
-
-Same two-point slope methodology as the microbenchmarks, but through
-`torch.compile(backend="tpu")` and the dispatcher:
-
-| payload | XLA | one-shot | speedup | JAX-level (doc) |
-|--------:|----:|---------:|--------:|----------------:|
-| 2 KiB | 7.87 us | **3.94 us** | **2.00x** | 2.13x |
-| 4 KiB | 9.70 us | **4.94 us** | **1.96x** | 2.22x |
-
-The win survives the bridge essentially intact. **This is the result that
-retires section 4's open question**: if torchtpu really added ~139 us per
-collective, a 4 us kernel and a 9 us kernel would be indistinguishable here.
-They are not.
-
-## two-shot is off by default
-
-two-shot is *correct* -- exact against `funcol` in float32 across every shape
-and chain length -- but not yet *reliable*. A 256 KiB reduction that had
-passed twice took the core down on the third run with
-`RuntimeUnexpectedCoreHalt`. That nondeterminism has the same shape as the
-semaphore-overlap fragility in `docs/low_latency_allreduce.md` section 3a and
-has not been root-caused for this call path.
-
-It costs little to leave off here: K3 decode at TP=32 reduces 7-28 KiB, which
-is one-shot's band. Set `TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1` to include it.
-
-## End-to-end on K3, TP=32
-
-**It does not translate. Decode is 5.8% slower at concurrency 1, not faster.**
-Jobs 88 (treatment) and 63 (control), same flags but for
-`TPU_LOW_LATENCY_ALLREDUCE`, both through `arm_check.sh`.
-
-| conc | control TPOT | treatment TPOT | delta | control tok/s | treatment tok/s |
-|-----:|-------------:|---------------:|------:|--------------:|----------------:|
-| 1    | 16.80 ms | **17.77 ms** | **+5.8%** | 58.9  | 55.4  |
-| 2    | 17.95 ms | 18.86 ms | +5.1% | 110.3 | 105.1 |
-| 4    | 23.82 ms | 24.00 ms | +0.8% | 166.0 | 161.9 |
-| 8    | 26.99 ms | 26.96 ms | -0.1% | 292.1 | 292.6 |
-
-Correctness is not the issue: GSM8K 100/100 on both arms, and the canary text
-is byte-identical between them.
-
-Coverage was as designed -- `routed: one_shot=4 two_shot=0 xla=17`, with
-`(2,3584)` at 14 KiB on the kernel and `(2,7168)` at 28 KiB correctly left on
-XLA.
-
-### Why, from the trace
-
-`diff_arms.py`, rank 0, decode-only, identical 16-step windows:
-
-| category | control | treatment | delta |
-|---|--------:|----------:|------:|
-| all-reduce   | 79.03 ms | 60.29 ms | **-18.74 ms (-23.7%)** |
-| custom-call  | 32.33 ms | 70.84 ms | **+38.51 ms (+119.1%)** |
-| **total device self time** | **259.92 ms** | **275.61 ms** | **+15.69 ms (+6.0%)** |
-
-+6.0% device against +5.8% TPOT: wall clock and hardware counters agree, so
-this is the mechanism and not something off-device.
-
-The kernel really did displace XLA all-reduce work -- that category fell by a
-quarter. It lost anyway, for two separate reasons, and the second is the
-interesting one.
-
-**1. The kernel costs more in production than on the bench.** The +38.51 ms of
-custom-call over 1472 occurrences is **~26 us per one-shot call**, against
-15.14 us for the same 16 KiB payload at 32 devices in the microbenchmark, and
-against XLA's ~20 us here. Production collectives carry roughly 10 us of
-per-collective overhead that the bench does not, and the Pallas kernel pays it
-too -- so a kernel that wins on a 17 us baseline can lose on a 27 us one. The
-microbenchmark's ratio is not transportable.
-
-**2. XLA had already fused two collectives into one, and the kernel broke it.**
-Read the per-occurrence rows:
-
-| arm | collective | ms | occ | us/occ |
-|---|---|---:|---:|---:|
-| control   | all-reduce `bf16[2,3584], bf16[2,7168]` | 50.00 | 1472 | **34.0** |
-| control   | all-reduce `bf16[2,7168]` | 29.03 | 1520 | 19.1 |
-| treatment | all-reduce `bf16[2,7168]` | 60.29 | **2992** | 20.1 |
-
-The control reduces the 3584-wide and 7168-wide payloads **in a single
-collective** costing 34.0 us for both. Pulling the 3584 half out into a kernel
-leaves the 7168 half as its own XLA all-reduce -- the occurrence count rises by
-exactly 1472, from 1520 to 2992 -- so the same work now costs 20.1 us of XLA
-plus ~26 us of kernel, about 46 us where it used to cost 34 us. That is
-+12 us x 1472 = +18 ms, which is the regression.
-
-This is the part no op-level benchmark could have predicted: the kernel was
-measured against a *standalone* all-reduce, but the all-reduce it actually
-replaces was not standalone. Displacing one member of a fused collective costs
-the fusion.
-
-### Step 0: is the microbenchmark wrong, or is production different?
-
-Before pursuing any kernel variant, the 26 us and the 15.14 us had to be
-reconciled. Three things could have accounted for the gap -- the *metric* (a
-wall-clock slope vs device self time), the *shape* (16x1024 vs 2x3584, same
-bytes, eight times the rows), or the *context*. `profile_ll_allreduce_shapes.py`
-measures all three at once: it drives the real dispatcher under
-`torch.compile`, at K3's shapes, and reports device self time from the same
-profiler and the same xprof tool a production trace uses.
-
-**Device self time per occurrence, 32 devices, isolated:**
-
-| shape | payload | XLA | one-shot | speedup |
-|---|--:|--:|--:|--:|
-| 2x3584 | 14 KiB | 17.33 | **13.61** | 1.27x |
-| 2x7168 | 28 KiB | 17.97 | 22.37 | 0.80x |
-| 16x1024 | 32 KiB | 17.96 | 25.33 | 0.71x |
-| 16x3584 | 112 KiB | 21.86 | 89.70 | 0.24x |
-| 16x7168 | 224 KiB | 23.26 | 178.67 | 0.13x |
-
-**The metric was never the problem.** Slope and device self time agree to
-within 0.3 us at every shape (8 devices: 6.00 vs 6.11, 4.90 vs 4.86, 10.03 vs
-10.36). The two-point slope *is* the device self time. Section 2b's numbers
-stand.
-
-**The shape was not the problem either.** At 8 devices the kernel is *faster*
-at 2x3584 (4.84 us) than at 16x1024 (6.11 us), tracking payload as it should.
-Two rows is not too few.
-
-**Production is different, and only for the kernel.** Reading each
-implementation's per-op distribution out of the treatment trace, against the
-same op in the isolated harness:
-
-| | harness | prod min | prod p50 | prod max | p50 tax |
-|---|--:|--:|--:|--:|--:|
-| XLA `bf16[2,7168]` | 17.97 | 17.96 | 20.06 | 24.89 | **+12%** |
-| kernel `bf16[2,3584]` | 13.61 | 12.67 | 25.71 | 34.98 | **+89%** |
-
-Both implementations hit the harness number *exactly* at their production
-minimum -- 17.96 against 17.97, and 12.67 against 13.61. So the harness is
-faithful, and the kernel really is the faster op: its floor beats XLA's floor
-by 5 us. What sinks it is the spread. XLA's per-op cost stays within 7 us of
-its floor; the kernel's runs 22 us above its own, and the median sits at
-double its harness cost.
-
-Neither is async -- both lower to a synchronous `all-reduce(...)` / custom
-call whose self time includes whatever it waits on -- so this is not an
-artifact of one being overlappable.
-
-The leading explanation is **egress**, and it is the same property that makes
-one-shot fast in isolation. One-shot pushes its whole buffer to every peer:
-`M(N-1)` = 14 KiB x 31 = **434 KiB per device**. XLA's ring moves
-`2M(N-1)/N` = **27 KiB**, sixteen times less. In an empty harness that trade
-is free -- bandwidth is idle and one hop beats `2(N-1)`. In a K3 decode step
-it is not: hierarchical EP is moving expert activations across the same ICI
-links, and a collective that wants 16x the bandwidth pays 16x the contention.
-That is a hypothesis, not a measurement; what is measured is that the penalty
-is 7x larger for the kernel than for XLA at the same point in the same model.
-
-### Step 1: the counterfactual, and a correction
-
-Everything above compares `kernel@[2,3584]` against `XLA@[2,7168]`. Those are
-**different collectives at different points in the graph**, and the comparison
-is invalid. It produced a "the kernel is 7x more sensitive to production than
-XLA's ring" claim and an egress dose-response story to explain it. Both were
-artifacts of the mismatch. What was missing was XLA's cost at *the kernel's own
-collective*, which no arm had ever measured -- in the control that reduction is
-fused into a larger op and not separable.
-
-A third arm supplies it: the control's flags, plus
-`--xla_jf_crs_combiner_threshold_count=1 --xla_jf_crs_combiner_threshold_in_bytes=1`
-to disable XLA's CRS combiner. That breaks the fusion **without** introducing
-the kernel. The flag did exactly one thing and nothing else -- collective
-occurrences went 5968 -> 7440, exactly the +1472 expected from unfusing 92 ops
-over 16 steps, with every all-gather count unchanged.
-
-| | harness | production | tax |
-|---|--:|--:|--:|
-| XLA `[2,3584]` | 17.33 | **32.66** | +88% |
-| kernel `[2,3584]` | 13.61 | **25.19** | +85% |
-
-**The kernel is not more sensitive to production than XLA. It pays the same
-tax, and it is ~24% faster than XLA at the same collective in production, just
-as it was in the harness.** Egress does not predict cost either: the
-434 KiB-egress kernel beats the 27 KiB-egress ring at the same site.
-
-End to end, per arm:
-
-| arm | device time | vs control | TPOT c1 | vs control |
-|---|--:|--:|--:|--:|
-| control (fused) | 259.92 ms | -- | 16.80 ms | -- |
-| **unfused XLA** | **280.30 ms** | **+20.38 (+7.8%)** | **18.11 ms** | **+7.8%** |
-| kernel | 275.61 ms | +15.69 (+6.0%) | 17.77 ms | +5.8% |
-
-Unfusing *alone* costs more than unfusing *and* switching to the kernel. So the
-entire regression is the lost fusion, and the kernel is a genuine -4.69 ms win
-on top of it. Device deltas track TPOT deltas to within 0.2 points in both
-arms, so this is fully accounted for on-device.
-
-### What the fusion is actually worth, and why
-
-The two reductions at that site cost, unfused, 32.66 + 19.35 = **52.01 us**.
-Fused into one op they cost **33.97 us**. Fusing saves 18 us per layer.
-
-The reason is visible in the numbers: the *smaller* payload is the expensive
-one. `[2,3584]` is 14 KiB and costs 32.66 us; `[2,7168]` is 28 KiB and costs
-19.35 us. That is backwards for anything bandwidth-bound, and it is uniform
-across ranks (CV 1.5%, so not imbalance) and independent of implementation
-(the kernel pays it too). Both ops carry identical `replica_groups`, ordering
-and `channel_id`, so it is not topology.
-
-So the 3584 site carries a large fixed **wait** -- roughly 13-15 us, on top of
-a collective that costs ~17 us in isolation. A combined collective pays that
-wait once for both reductions; any scheme that splits them pays it twice. That
-is the whole mechanism, and it is why a faster collective still loses: the
-kernel is 7.5 us cheaper per call and the split costs 18 us.
-
-### Step 2: can one fused kernel call replace the fused XLA collective?
-
-If splitting the pair costs 18 us, the only kernel arrangement that can win is
-one call covering both widths. The concatenated shape is `[2,10752]` --
-21504 elements, **42 KiB** at bf16. (An earlier draft called this 21.5 KiB by
-conflating elements with bytes, which flattered one-shot by a factor of two.)
-
-Measured at 32 devices, device self time:
-
-| shape | payload | XLA | one-shot | **two-shot** |
+| shape | payload | XLA | one-shot | two-shot |
 |---|--:|--:|--:|--:|
 | `2x3584` | 14 KiB | 17.31 | 13.59 | **12.36** |
 | `2x7168` | 28 KiB | 17.97 | 22.39 | **12.67** |
-| `2x10752` **fused** | 42 KiB | 18.93 | 33.20 | **13.20** |
+| `2x10752` | 42 KiB | 18.93 | 33.20 | **13.20** |
+| `16x1024` | 32 KiB | 17.96 | 25.33 | -- |
+| `16x3584` | 112 KiB | 21.86 | 89.70 | -- |
+| `16x7168` | 224 KiB | 23.26 | 178.67 | -- |
 
-**One-shot cannot do it.** At the fused shape it is 1.75x *slower* than XLA
-before the site's wait is added. Its egress is `M(N-1)` -- 31 copies of the
-payload per device -- so it only wins below ~16 KiB at 32 devices, and fusing
-necessarily triples the payload. The two constraints point in opposite
-directions: the split penalty rules out keeping the pair apart, and one-shot's
-crossover rules out putting it together. One-shot is out at any arrangement.
+**8 devices**
 
-**Two-shot can.** Its egress is `2M(N-1)/N ~ 2M`, independent of device count
-and nearly flat in payload -- sync-bound, not bandwidth-bound -- and the
-measurement shows exactly that: 12.36 -> 13.20 us across 3x the payload, while
-one-shot goes 13.59 -> 33.20. At the fused shape it is **1.43x faster than
-XLA** (13.20 vs 18.93).
+| shape | payload | XLA | one-shot | two-shot |
+|---|--:|--:|--:|--:|
+| `2x3584` | 14 KiB | 10.12 | **4.84** | 7.76 |
+| `2x7168` | 28 KiB | 10.36 | **5.93** | -- |
+| `16x1024` | 32 KiB | 10.37 | **6.11** | -- |
+| `2x10752` | 42 KiB | 10.61 | -- | 8.21 |
+| `16x3584` | 112 KiB | 14.83 | 12.53 | -- |
 
-Projecting to production against XLA's fused 33.97 us, using the site tax
-calibrated from the two collectives measured both ways (XLA `[2,3584]`
-17.31->32.66, one-shot `[2,3584]` 13.59->25.19): the multiplicative reading
-fits those two tightly (1.887 and 1.854) and gives ~25 us; the additive
-reading (+15 us) gives ~28 us. Either is a win of 6-9 us per layer, order
-**-3% to -5% TPOT** against the control. **This projection is not measured**;
-it needs the integration below.
+one-shot's advantage is real but narrow, and collapses with device count and
+payload. two-shot is nearly flat in payload (`2M(N-1)/N` egress) and is the
+only variant that survives past ~16 KiB at 32 devices.
 
-Three side findings:
+Production, K3 TP=32, rank 0, decode-only, us/occ:
 
-* **Fusing remains mandatory even for two-shot.** Kept split it costs
-  12.36 + ~15 and 12.67 + ~1.4 = ~41.8 us, worse than XLA's fused 33.97. The
-  18 us split penalty is indifferent to which kernel is used.
-* **The gate is wrong.** `_GATE[32]` confines two-shot to 64 KiB-256 KiB and
-  prefers one-shot under 16 KiB, but two-shot beats one-shot at *every* shape
-  here, 14 KiB included. Section 2b could not see this because plain two-shot
-  needs `rows % 32 == 0`; `_build_two_shot` reshapes to `(N, numel/N)` and the
-  constraint becomes `numel % N == 0`, which these shapes satisfy.
-* **The reliability blocker did not reproduce** -- no `RuntimeUnexpectedCoreHalt`
-  at 8 or 32 devices, correctness exact. One clean run is not proof, but it is
-  no longer a reason to hold off.
+| collective | control | unfused XLA | one-shot@3584 | two-shot@7168 |
+|---|--:|--:|--:|--:|
+| fused `[2,3584]+[2,7168]`, 92 ops | **33.97** | -- | -- | -- |
+| `[2,3584]`, 92 ops | -- | 32.66 | **25.19** (kernel) | 31.36 |
+| `[2,7168]`, 95/187 ops | 19.10 | 19.35 | 20.15 | **13.32** (kernel) |
 
-What the integration needs: intercept *both* reductions and concatenate rather
-than replacing one of them, and carry two-shot's three workspace buffers
-(`rs`, `ag`, `step`) where the shipped entry op is hardwired to one-shot's
-two. `scripts/debug/profile_ll_allreduce_shapes.py --kernel-type two_shot`
-already does the latter with a local 4-arg custom op, as a template.
+End to end, TPOT ms, via `arm_check.sh`:
 
-### What this implies for the follow-ups
+| arm | c1 | c2 | c4 | c8 | device |
+|---|--:|--:|--:|--:|--:|
+| control (XLA, fused) | **16.80** | 17.95 | 23.82 | 26.99 | 259.92 ms |
+| one-shot @ `[2,3584]` | 17.77 | 18.86 | 24.00 | 26.96 | 275.61 ms |
+| unfused XLA (combiner off) | 18.11 | 19.21 | 24.46 | 27.61 | 280.30 ms |
+| unfused + two-shot @ `[2,7168]` | 17.63 | 18.76 | 24.55 | 27.56 | 274.11 ms |
 
-Steps 0 and 1 together re-rank these, and the ranking is nearly the reverse of
-what the first pass concluded.
+GSM8K 100/100 and a byte-identical canary on every arm. Device deltas track
+TPOT deltas within 0.2 points throughout, so nothing here is off-device.
 
-* **One kernel call covering both widths is now the indicated path**, not a
-  dead end. The earlier verdict ("dead by measurement") rested on the invalid
-  cross-position comparison and on costing it as *two* kernel calls, which
-  still pays the split penalty twice. The point is to pay it once: a single
-  one-shot over the concatenated 21.5 KiB, replacing the fused XLA op rather
-  than half of it. Rough arithmetic -- one-shot interpolates to ~17.5 us at
-  21.5 KiB in the harness, and the site adds ~13-15 us once -- puts it near
-  30 us against XLA's fused 33.97, so perhaps -4 us/layer, order -2% TPOT.
-  Marginal, and the estimate is soft, but it is the only variant that does not
-  start 18 us behind.
-* **Padding-awareness** is still not the lever: it shrinks a transfer cost at a
-  site whose cost is dominated by a fixed wait.
-* **`compile_sizes=[1]`** still addresses neither.
+## Why the first attempt regressed
 
-**The bigger prize is not the kernel at all.** The 3584 site's ~13-15 us wait
-costs the *control* about 1.4 ms per decode step, and no all-reduce
-implementation can touch it -- XLA pays it, the kernel pays it, and it is
-uniform across ranks. Finding out what that site is waiting on is worth more
-than any collective swap measured here, and it is the natural next
-investigation.
+XLA's CRS combiner merges the latent-MoE `[2,3584]` reduction and the
+`[2,7168]` beside it into **one** collective costing 33.97 us. Unfused they
+cost 32.66 + 19.35 = **52.01 us**. The combiner is worth 18 us per layer.
 
-The superseded step-0 verdicts, for the record:
+Inserting a kernel on either half forfeits that. The kernel was 7.5 us cheaper
+per call and the split cost 18, so the arm lost by the difference. Proven by
+running the control's flags with the combiner disabled and no kernel at all:
+that arm is **slower** (18.11 ms TPOT) than the kernel arm (17.77 ms). The
+whole regression was the lost fusion, and the kernel was a net -4.69 ms on top
+of it.
 
-* **Wiring both widths to kernels** is dead, and now by measurement rather than
-  estimate. The pair has to beat the 34.0 us that XLA's *fused*
-  `[2,3584]+[2,7168]` collective costs. Two kernels cost **13.61 + 22.37 =
-  35.98 us in the isolated harness** -- already a loss before any production
-  tax, and the tax on two kernels would be roughly double the one that produced
-  the +5.8% regression. The 28 KiB half is past one-shot's crossover at 32
-  devices (0.80x vs XLA) and there is no variant that fixes that: one-shot's
-  egress grows as `M(N-1)`, which is exactly what the crossover is.
-* **Padding-awareness** would lower the kernel's *floor* -- 7 KiB instead of
-  14 -- and the floor is not the problem. The kernel's floor already beats
-  XLA's by 5 us and it still lost. The term that matters is the +12 us the
-  kernel picks up between its floor and its production median, and reducing
-  the payload does not touch it. Worse, the idea's appeal was that it also
-  shrinks the 7168-wide half, and that half is past the crossover anyway.
-* **`compile_sizes=[1]`** does not address the fusion or the spread. Dropped.
+## The `[2,3584]` penalty, which no kernel can fix
 
-What step 0 leaves is one question, not a menu: **why does the kernel pay
-+89% in production where XLA pays +12%?** If that is ICI contention with the
-hierarchical-EP all-to-all traffic, it is a property of one-shot's `M(N-1)`
-egress and no amount of tuning fixes it at TP=32 -- the honest conclusion is
-that this class of kernel is the wrong tool for a bandwidth-contended decode
-step, and it should be shelved. Two-shot moves `2M(N-1)/N`, the same order as
-XLA's ring, so it is the only variant whose egress is not the problem; but it
-is 22-28 us at these payloads in section 2b (slower than XLA's 17-18 here),
-and it still takes the slice down nondeterministically.
+At the same site, with identical `replica_groups`, ordering and `channel_id`:
 
-The cheap test of the contention hypothesis, if it is ever worth doing: re-run
-the isolated harness with a synthetic all-to-all running alongside the chain.
-If the kernel's cost climbs toward 26 us and XLA's stays near 18, the
-mechanism is confirmed and the conclusion above is final.
+| collective | payload | isolated | production | tax |
+|---|--:|--:|--:|--:|
+| `[2,3584]` | 14 KiB | 17.31 | 32.66 | **+88%** |
+| `[2,7168]` | 28 KiB | 17.97 | 19.35 | +8% |
 
-### A methodology cost worth recording
+The *smaller* payload costs 69% more. It is uniform across ranks (CV 1.5%, so
+not expert imbalance) and implementation-independent -- XLA pays +88%,
+one-shot +85%. So `[2,3584]` carries a fixed ~13-15 us **wait**, not a transfer
+cost: it is the first consumer of the latent-MoE result.
 
-Seven K3 bring-ups were spent on this, six of them on integration bugs rather
-than measurement. Five were failures that a faithful local reproduction would
-have caught in ten minutes; the TP8 harness used plain `torch.compile`, while
-every failure lived in vLLM's own stack. `scripts/k3/slurm_kimi_linear_tp8_hier_ep.sbatch`
-with `ARMS=hier-b2` now serves as that reproduction -- Kimi-Linear-48B at TP=8,
-same dynamo/AOT/piecewise path, ~10 minutes.
+This is worth more than any collective swap here: ~1.4 ms per decode step,
+which the control pays too. Note that the `[2,7168]` ops at that same site cost
+~13.3 us under the kernel where XLA paid ~21, so the penalty attaches to the
+`[2,3584]` reduction specifically and **not** to the site.
 
-The sixth failure was not a code bug at all: `VLLM_XLA_CACHE_PATH` is one
-persistent tree shared by every run, so the treatment loaded an executable the
-*control* had compiled and died with `execution supplied 2135 arguments but
-compiled program expected 2133` -- off by exactly the two workspace tensors.
-A persistent executable cache is a correctness hazard for A/B work, not just a
-speed optimization; the launcher now tags the path when the flag is on.
+## Getting the kernels to run at all
+
+Most of the original work, none of it in the kernels:
+
+| what | why it fails | resolution |
+|---|---|---|
+| A mesh spanning peers | vLLM gives each worker a **single-device** JAX mesh; the kernels need `shard_map` over all 32 | `jax.devices()` exposes the whole slice inside a worker, so a mesh is built over the group's TPU global device ids. **Rank order is not device-id order**, so the map is gathered |
+| Skipping `shard_map` | `Cannot use communication in pallas_call without shard_map` | not available; the mesh form is mandatory |
+| Operand partition specs | `P("tp")` makes the module entry the *global* shape and torch_tpu refuses the rank's local tensor | declare operands **replicated**, so global == local |
+| `has_side_effects=True` | XLA's partitioner rejects a side-effecting custom call inside a shard_map's manual region: `Side-effect HLO must have sharding` | parameterised; the integration passes `False` |
+| Shape read in traced code | reading dims pins vLLM's dynamic token dimension: `ConstraintViolationError` | dispatch behind an opaque `torch.library.custom_op` |
+| Lazy op registration | `infer_schema` is on dynamo's skip list | register in `warmup()`, before tracing |
+| `mutates_args` declared | AOTAutograd adds buffers to graph outputs: `expected 3 outputs, got 1` | leave undeclared; safe because the buffers are private, unaliased and never CSE-able |
+| Workspaces captured | `identified an argument that was not provided: DeviceBufferRef` | pass them as op *arguments* |
+
+Turning off `has_side_effects` on a collective is safe here only because the
+three properties it protects hold by other means: the output is consumed, each
+call site has its own `collective_id`, and the aliased workspace chain orders
+successive calls. It would not be safe for a stateless collective.
+
+two-shot needs three workspace buffers where one-shot needs two, so
+`get_entry_op` fixes the op's arity from the plan chosen at warmup -- a branch
+at call time is a branch dynamo would have to trace.
+
+## Correctness
+
+`scripts/debug/test_low_latency_all_reduce.py` drives the dispatcher exactly as
+`TpuDeviceCommunicator.all_reduce` does, running each shape as a **six-round
+chain** whose input depends on the previous output, so a dropped, stale or
+duplicated round shows up as a value mismatch rather than hiding inside an
+idempotent mean -- the workspace parity is what is most exposed.
+
+| dtype | result |
+|---|---|
+| float32 | **exact**, `max|diff| = 0` on every shape, both kernels |
+| bfloat16 | ~3 ulps, summation order, confirmed by the float32 run |
+
+Tolerance must scale with device count: bf16 reordering drifts to 0.024 at 32
+devices, which a fixed 0.02 threshold reports as corruption.
+
+two-shot's `RuntimeUnexpectedCoreHalt` did **not** reproduce at 8 or 32 devices
+in this session, with correctness exact throughout. One clean run is not proof
+it is gone, and it has not been root-caused.
+
+## Methodology learnings
+
+The technical result took four arms; the wrong conclusions in between are the
+reusable part.
+
+**1. A/B an op only against the same op.** For four rounds the comparison was
+`kernel@[2,3584]` against `XLA@[2,7168]` -- different collectives at different
+graph positions. It produced a confident, well-evidenced and entirely wrong
+mechanism ("the kernel is 7x more sensitive to production", with an egress
+dose-response to explain it). More analysis of the same data would never have
+caught it; building the arm that made the comparison like-for-like did, and
+reversed the conclusion in one run.
+
+**2. A microbenchmark can be perfectly accurate and still mispredict.** Slope
+and device self time agreed within 0.3 us everywhere, so the methodology was
+sound. It measured a *standalone* collective; production fuses collectives. The
+gap was in what was benchmarked, not how.
+
+**3. Inserting an opaque custom call forfeits XLA's collective combiner.** A
+generic hazard for any kernel replacing one member of a fusable group. Check
+whether the op being replaced is fused before costing the replacement.
+
+**4. Shape-based routing cannot express site-based intent.** `(2,7168)` is both
+the post-attention reduction and the MoE-output half of the fused pair.
+Dispatching on `(shape, dtype)` hits both, which is why "just do the
+post-attention one" needed the combiner disabled instead.
+
+**5. Distinguish across-rank from across-call-site variance.** A rank CV of 2%
+with a call-site spread of 12.67-34.98 us ruled out arrival skew and pointed at
+position. Same trace, two different reductions, opposite conclusions.
+
+**6. Cheap faithful reproduction before expensive runs.** The earlier six K3
+integration failures all lived in vLLM's dynamo/AOT/piecewise stack, which the
+plain-`torch.compile` harness did not exercise. The Kimi-Linear TP8 vLLM smoke
+test (~10 min) caught nothing this time only because it was run first.
+
+**7. Check payload arithmetic.** Calling the concatenated pair "21.5 KiB"
+(elements mistaken for bytes; it is 42 KiB) flattered one-shot twofold and
+briefly made a dead approach look indicated.
+
+**8. Loop-invariant work is silently hoisted.** The first spacing experiment
+put `gap_a @ gap_a` between chained collectives; XLA CSE'd it out of the loop
+and the slope did not move, which reads exactly like "spacing does not matter".
+Injected work must depend on the loop variable.
+
+**9. Shared mutable cluster state is a correctness hazard, not just a speed
+one.** `VLLM_XLA_CACHE_PATH` served one arm's executable to another
+(`execution supplied 2135 arguments but compiled program expected 2133`), and
+the Tier-2 cache's default `/dev/shm` namespace is owned by whichever user
+creates it first. Both are now namespaced per arm and per job.
+
+**10. Estimates are cheap to falsify, so falsify them.** The 42 KiB one-shot
+projection (~33 us) matched measurement (33.20) exactly; two earlier estimates
+were wrong enough to invert a recommendation.
+
+## Next steps
+
+Ranked by value per unit of work.
+
+**1. Donate `rs`/`ag` instead of copying them back.** two-shot writes back two
+workspace buffers per call where one-shot writes one: +6096 data-formatting ops
+(+3.47 ms) and +2992 reduce ops (+1.43 ms), so ~5 ms of the ~20 ms collective
+saving is handed straight back. The aliasing is already set up for donation.
+Cheap, and it inflates every future measurement until fixed.
+
+**2. One two-shot call over the concatenated pair.** The only arrangement that
+both keeps the fusion's amortisation and uses the faster collective. Against
+the control:
+
+* control: 92 x 33.97 + 95 x 19.10 = 4940 us/step
+* fused two-shot + post-attention two-shot: 92 x ~26 + 95 x 13.32 = 3657 us/step
+* about **-20 ms device, order -5% TPOT**, less the writeback leak from (1)
+
+Needs the dispatcher to intercept *both* reductions and concatenate, rather
+than replacing one of them.
+
+**3. Find what `[2,3584]` waits on.** ~13-15 us per layer, ~1.4 ms per decode
+step, roughly 8% of TPOT -- paid by the control, and untouchable by any
+all-reduce implementation. Independent of all the kernel work and plausibly the
+largest single win available. Start from what feeds that reduction: in the
+treatment trace its operand arrives via an async `copy-done`.
+
+**4. Validate the corrected gate.** two-shot's floor is now 16 KiB at 16/32
+devices, justified by the table above, but it is unmeasured below 14 KiB where
+one-shot still holds the small end. One harness run closes that.
+
+**5. Root-cause `RuntimeUnexpectedCoreHalt`.** It did not reproduce, so it no
+longer blocks; still unexplained, and it takes the slice down when it fires.
+
+Closed by measurement, not worth pursuing:
+
+* **one-shot in any arrangement at TP=32** -- the split penalty forbids keeping
+  the pair apart, and its crossover forbids putting it together.
+* **`compile_sizes=[1]`** -- addresses neither the fusion nor the site wait.
+* **Padding-awareness** -- shrinks a transfer cost at a site whose cost is a
+  fixed wait; the kernel's floor was never the problem.
 
 ## Reproducing
 
 ```bash
-# treatment
+# K3 arms (control = TPU_LOW_LATENCY_ALLREDUCE=0)
 TPU_MOE_HIERARCHICAL_EP=1 TPU_LATENT_PROJ_INTRA_CHIP_TP=1 \
-TPU_LOW_LATENCY_ALLREDUCE=1 \
-  PROFILE_DIR=$PWD/results/<name>/traces KIMI_K3_LOG_ROOT=$PWD/results/<log> \
-  sbatch --job-name=<name> scripts/k3/slurm_launch_k3_tp32_tp.sbatch
-# control: same line with TPU_LOW_LATENCY_ALLREDUCE=0
+TPU_LOW_LATENCY_ALLREDUCE=1 TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1 \
+TPU_LOW_LATENCY_ALLREDUCE_SHAPE=2x7168 \
+VLLM_XLA_CACHE_PATH=/mnt/scratch/users/$USER/vllm-xla-cache/<arm> \
+PROFILE_DIR=$PWD/results/<arm>/traces KIMI_K3_LOG_ROOT=$PWD/results/<arm>-log \
+  sbatch --job-name=<arm> scripts/k3/slurm_launch_k3_tp32_tp.sbatch
 
-ENDPOINT=<url> ARM=<name> OUT=results/<name> scripts/k3/arm_check.sh
-python scripts/k3/diff_arms.py results/<control> results/<treatment>
+# ENDPOINT is the BARE host -- arm_check appends /v1 itself. Passing the
+# banner's URL (which includes /v1) 404s every request while /health stays 200.
+ENDPOINT=http://<ip>:8000 ARM=<arm> OUT=results/<arm> scripts/k3/arm_check.sh
+python scripts/k3/diff_arms.py results/<control> results/<arm>
+python scripts/k3/rank_spread.py results/<arm>      # skew vs position
 ```
 
-The sbatch pins the flag with a default and echoes back **what the dispatcher
-actually did** -- how many shapes went to each kernel, read out of the server's
-own log -- not what was requested. The dispatcher falls back to XLA silently
-whenever a shape sits outside the measured crossover or an op fails to build,
-so "the flag was set" is not evidence that a single all-reduce changed.
+To break XLA's fusion without a kernel, add to `LIBTPU_INIT_ARGS`:
+`--xla_jf_crs_combiner_threshold_count=1 --xla_jf_crs_combiner_threshold_in_bytes=1`.
+Verify it did only that: collective occurrences should rise by exactly the
+number of unfused ops, with all-gather counts unchanged.
 
-The 8-device correctness and latency harness:
-
-```bash
-sbatch scripts/debug/slurm_test_ll_allreduce_tp8.sbatch --dtype float32 --skip-timing
-sbatch scripts/debug/slurm_test_ll_allreduce_tp8.sbatch --rows 1,2,4,8,16
-```
-
-Step 0 -- device self time at K3's shapes, comparable to a production trace:
+Isolated harness, device self time comparable to a production trace:
 
 ```bash
-sbatch scripts/debug/slurm_profile_ll_allreduce_tp8.sbatch   #  8 devices
-sbatch scripts/debug/slurm_profile_ll_allreduce_32.sbatch    # 32 devices
+sbatch scripts/debug/slurm_profile_ll_allreduce_tp8.sbatch --kernel-type two_shot
+LL_SHAPES="2x3584,2x7168,2x10752" LL_EXTRA_ARGS="--kernel-type two_shot" \
+  sbatch scripts/debug/slurm_profile_ll_allreduce_32.sbatch
 python scripts/allreduce_profile_stats.py results/ll-ar-shapes-32-<job>/traces
 ```
 
-Two operational notes, both learned by hitting them:
+Integration smoke test before any K3 run (~10 min, same dynamo/AOT/piecewise
+path):
 
-* The **Tier-2 compilation cache** lives in `/dev/shm` under a *namespace*
-  directory, and the default namespace is shared by every user on the node.
-  Whoever creates it first owns it and everyone else dies with `Check failed:
-  lock_fd_.valid() ... Permission denied`. Both launchers namespace it per
-  user and job. This is the same class of hazard as the shared
-  `VLLM_XLA_CACHE_PATH` above -- machine-wide caches are a correctness and
-  reliability problem for A/B work, not just a speed optimization.
-* `jax.profiler.trace` **segfaults** in this venv (`Unexpected
-  PLUGIN_Profiler_Api size: expected 80, got 104` -- libtpu 0.0.44.1 against
-  xprof 2.22.3), so the JAX bench cannot profile itself. The torch harness
-  goes through `torch.profiler` + `TpuProfilerConfig`, which is what
-  production uses and what works.
+```bash
+ARMS=hier COMPILE_SIZES="2,16,1024" TPU_LOW_LATENCY_ALLREDUCE=1 \
+TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1 TPU_LOW_LATENCY_ALLREDUCE_SHAPE=16x2304 \
+DOCS=20 sbatch scripts/k3/slurm_kimi_linear_tp8_hier_ep.sbatch
+```
 
-## Step 3: the kernel does deliver, with the fusion held constant
+Two environment notes. `jax.profiler.trace` segfaults against this libtpu
+(`Unexpected PLUGIN_Profiler_Api size`), so the JAX bench cannot profile
+itself -- the torch harness uses `torch.profiler` + `TpuProfilerConfig`, which
+is what production uses. And the launchers namespace the Tier-2 cache per user
+and job, without which a foreign `/dev/shm/torch_tpu_cache/default` kills the
+run.
 
-The post-attention `[2,7168]` reduction is a better target than the latent-MoE
-one: it is already standalone (no fusion to forfeit) and it carries almost no
-site penalty. But it cannot be targeted by shape alone -- the same `[2,7168]`
-shape also appears as the MoE-output half of the fused pair (92 ops), so
-routing it to a kernel would strand the 3584 half exactly as before. Routing
-by shape hits both sites: +14.6 us/layer lost at the MoE site against
--5.3 us/layer gained post-attention, a net regression.
-
-So the arm runs with the CRS combiner disabled in *both* itself and its
-baseline (the nocombine arm above), holding fusion constant so that the only
-variable is XLA vs two-shot on all 187 `[2,7168]` collectives.
-
-| | XLA | two-shot | delta |
-|---|--:|--:|--:|
-| `[2,7168]` us/occ | 19.35 | **13.32** | **-31%** |
-| collective time | 105.98 ms | 86.03 ms | **-19.95 ms** |
-| total device | 280.30 ms | 274.11 ms | -6.19 ms |
-| TPOT @ c1 | 18.11 ms | **17.63 ms** | **-2.7%** |
-
-GSM8K 100/100, canary byte-identical. Concurrency 4 and 8 are unchanged, which
-is the control: only `(2,7168)` is wired, and those buckets are `(16, ...)`.
-
-**The kernel's production cost is its bench cost.** 13.32 us against 12.67 in
-the isolated harness -- a 5% tax, where XLA's `[2,3584]` pays 88%. Once the
-collective is not entangled with the fused pair, the microbenchmark transfers
-essentially intact. That is the claim this whole investigation was trying to
-test, and it is the first arm in which it holds.
-
-**Two thirds of the win leaks back**, and part of it is addressable:
-
-| category | delta | occ delta | cause |
-|---|--:|--:|---|
-| data formatting | +3.47 ms | **+6096** | two `copy_` writebacks per call (`rs`, `ag`) |
-| reduce | +1.43 ms | **+2992** | one per call, from the flatten/reshape |
-
-two-shot writes back *two* workspace buffers where one-shot writes one, which
-is +2 ops per call over 2992 calls. The remaining ~9 ms sits in categories
-whose occurrence counts did not move at all (convolution fusion +2.56, custom
-fusion +3.26, sort +0.72), so it reads as scheduling and run-to-run variance
-rather than a mechanism; the device delta (-2.2%) and the TPOT delta (-2.7%)
-agree closely enough to support that.
-
-### What this says about the fused pair
-
-One number reframes the "site tax". The `[2,7168]` collectives at the *MoE
-site* also cost ~13.3 us under the kernel, where XLA paid ~21. So the penalty
-is not a property of the site -- it attaches specifically to the `[2,3584]`
-reduction, and it hits XLA and one-shot alike (32.66 and 25.19 against harness
-17.31 and 13.59).
-
-Projecting a fused two-shot over the 42 KiB pair, which must still wait on
-that data:
-
-* control: 92 x 33.97 + 95 x 19.10 = 4940 us/step
-* fused two-shot + post-attention two-shot: 92 x ~26 + 95 x 13.32 = 3657 us/step
-* about **-20 ms device**, less the ~5 ms writeback leak, so order **-5% TPOT
-  against the control**
-
-This arm is still slower than the control (17.63 vs 16.80) by design, since it
-and its baseline both run unfused. It isolates the kernel, and the kernel
-passed. Two things to fix alongside the concatenation work: donate `rs`/`ag`
-instead of copying them back, and the gate's preference for one_shot below
-16 KiB, which the measurements contradict.
+The banner reports what the dispatcher *did* -- how many shapes took each
+kernel, and which one was wired -- read out of the server's own log. The
+dispatcher silently falls back to XLA, so "the flag was set" is not evidence
+that a single all-reduce changed. `warmup` defaults to the smallest
+kernel-taking shape, which is rarely the one you want.
