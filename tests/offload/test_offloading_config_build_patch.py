@@ -46,6 +46,8 @@ def _vllm_config(*, pcp: int, block_size: int = 4096):
             prefill_context_parallel_size=pcp,
             decode_context_parallel_size=1,
             data_parallel_index=0,
+            data_parallel_size=1,
+            data_parallel_rank_local=0,
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="test-engine",

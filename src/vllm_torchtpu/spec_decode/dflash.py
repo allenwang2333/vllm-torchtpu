@@ -25,7 +25,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings,
-                                             maybe_share_lm_head)
+                                             maybe_share_lm_head,
+                                             normalize_draft_config)
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -50,14 +51,10 @@ class DFlashProposer:
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
 
-        # Read DFlash specific configurations
+        # Read and normalize draft configurations
         hf_config = self.speculative_config.draft_model_config.hf_config
-        hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
-        self.dflash_config = hf_dict.get("dflash_config", {})
-        self.mask_token_id = self.dflash_config.get("mask_token_id")
-        assert self.mask_token_id is not None, (
-            "DFlash requires `mask_token_id` to be defined in the draft model's config.json "
-            "under the `dflash_config` dictionary.")
+        self.dflash_config = normalize_draft_config(hf_config)
+        self.mask_token_id = self.dflash_config["mask_token_id"]
 
         draft_tp = self.speculative_config.draft_tensor_parallel_size
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size

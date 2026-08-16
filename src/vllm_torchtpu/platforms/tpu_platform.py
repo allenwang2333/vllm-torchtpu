@@ -364,7 +364,6 @@ def apply_tpu_patches() -> None:
     _patch_vllm_force_v1_runner_tpu()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
-    _patch_vllm_force_v1_runner_tpu()
     from vllm_torchtpu.model_loader_patches import \
         patch_runai_sharded_expert_streaming
     patch_runai_sharded_expert_streaming()

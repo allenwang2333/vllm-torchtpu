@@ -23,65 +23,12 @@ from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.utils import normalize_draft_config
 
 logger = init_logger(__name__)
 
-# Noise-token id resolution order, mirroring upstream
-# vllm/v1/worker/gpu/spec_decode/utils.py.
-_NOISE_TOKEN_KEYS = ("mask_token_id", "dspark_noise_token_id", "pard_token",
-                     "ptd_token_id")
-
-
-def _resolve_target_layer_ids(hf_dict: dict) -> list[int]:
-    """Target layer indices whose hidden states feed the drafter.
-
-    Mirrors upstream eagle3_utils.get_eagle3_aux_layers_from_config:
-    ``eagle_aux_hidden_state_layer_ids`` stores aux ids (target + 1);
-    ``dspark_target_layer_ids`` / ``target_layer_ids`` store target ids.
-    """
-    aux_ids = hf_dict.get("eagle_aux_hidden_state_layer_ids")
-    if aux_ids:
-        return [idx - 1 for idx in aux_ids]
-    for key in ("dspark_target_layer_ids", "target_layer_ids"):
-        ids = hf_dict.get(key)
-        if ids:
-            return list(ids)
-    raise ValueError(
-        "DSpark requires target layer ids in the draft config (one of "
-        "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
-        "target_layer_ids, or dflash_config.target_layer_ids).")
-
-
-def normalize_dspark_draft_config(hf_config) -> dict:
-    """Resolve DSpark config spellings into ``dflash_config``. Idempotent.
-
-    DFlashProposer.__init__ reads dflash_config.mask_token_id and
-    load_model reads dflash_config.target_layer_ids; feed both the
-    resolved values so the whole base machinery applies unchanged.
-
-    This must also run BEFORE GPUModelRunner.__init__: the upstream V1
-    runner transiently constructs its own EagleProposer for any
-    use_eagle() method (the TPU runner replaces it afterwards), and its
-    _init_parallel_drafting_params only knows pard_token / ptd_token_id /
-    dflash_config.mask_token_id — not dspark_noise_token_id.
-    """
-    hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
-
-    noise_id = hf_dict.get("dflash_config", {}).get("mask_token_id")
-    for key in _NOISE_TOKEN_KEYS:
-        if noise_id is not None:
-            break
-        noise_id = hf_dict.get(key)
-    if noise_id is None:
-        raise ValueError(
-            "DSpark requires a noise/mask token id in the draft config "
-            f"(one of dflash_config.mask_token_id, {_NOISE_TOKEN_KEYS}).")
-    dflash_config = dict(hf_dict.get("dflash_config", {}))
-    dflash_config["mask_token_id"] = noise_id
-    if not dflash_config.get("target_layer_ids"):
-        dflash_config["target_layer_ids"] = _resolve_target_layer_ids(hf_dict)
-    hf_config.dflash_config = dflash_config
-    return dflash_config
+# Alias for backwards compatibility
+normalize_dspark_draft_config = normalize_draft_config
 
 
 class DSparkProposer(DFlashProposer):
@@ -90,9 +37,14 @@ class DSparkProposer(DFlashProposer):
         hf_config = (
             vllm_config.speculative_config.draft_model_config.hf_config)
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
-        normalize_dspark_draft_config(hf_config)
 
         super().__init__(runner, vllm_config)
+
+        if not self.dflash_config.get("target_layer_ids"):
+            raise ValueError(
+                "DSpark requires target layer ids in the draft config (one of "
+                "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
+                "target_layer_ids, or dflash_config.target_layer_ids).")
 
         self.sample_from_anchor = not hf_dict.get("dspark_bonus_anchor", False)
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
