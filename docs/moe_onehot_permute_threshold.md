@@ -52,9 +52,19 @@ Two terms, measured separately, then intersected:
   across node-wide T = 256…1024, which is exactly the plateau the block model predicts (one 2048-row
   block covers the balanced valid count over that whole range).
 
+That the *padding* is what is being charged — and not merely the occupancy — is testable on the
+same eight cells, because the two hypotheses have different functional forms:
+
+| model | fit | R² |
+|---|---|--:|
+| cost ∝ `ceil(valid/block)·block` padded rows | `t = 15.5 µs + 0.0458·padded_rows` | **0.943** |
+| cost ∝ valid rows (occupancy) | `t = 57.8 µs + 0.0511·valid_rows` | 0.438 |
+
+The staircase as `num_row_subchunks` climbs 1→4 is visible in the device data.
+
 Fitting a single free parameter (the achieved MXU fraction) reproduces **all eight** measured
 `prod1h` cells of that ladder within 8%, six of eight within 3%, including the sign flip between
-T=512 and T=1024. The crossover is **T\* ≈ 690-700 node-wide tokens ≈ 6,900-7,000 routed rows**,
+T=512 and T=1024. The crossover is **T\* ≈ 700 node-wide tokens ≈ 7,000 routed rows**,
 and it is insensitive to how the shared sort cost is attributed (690 vs 697) because that choice
 moves both terms together. A ±20% error in *either* term moves T\* by only √1.2 ≈ 10%.
 
@@ -70,8 +80,17 @@ bucket is far from that boundary, so the choice is not sensitive to the last 10%
 
 The one-hot cost depends only on `T` and is routing-independent. The SparseCore cost depends on
 `valid_rows`, which under a skewed expert load rises on the busiest rank — and a step is bound by
-its slowest rank. Skew therefore *raises* the SparseCore cost and pushes the crossover **up**, so a
-threshold set from a balanced-routing measurement is the conservative choice.
+its slowest rank. But because the cost is quantised in blocks, **skew moves the crossover only when
+the busiest rank crosses a block boundary**, and at the crossover the balanced busiest-rank count is
+884 rows against a 2048-row block:
+
+| skew multiplier | ×1.0 | ×1.5 | ×2.0 | ×2.37 | ×3.0 | ×8.0 |
+|---|--:|--:|--:|--:|--:|--:|
+| node-wide T\* | 707 | 707 | 707 | 964 | 964 | 1338 |
+
+So the crossover is **exactly unchanged up to 2.37x skew** and moves **up** beyond it. A balanced
+measurement is a lower bound on the true crossover, and a threshold set from it is safe under any
+routing.
 
 ## Reproducing it
 
