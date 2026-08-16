@@ -148,7 +148,9 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
             hidden_size=HIDDEN_SIZE,
             q_lora_rank=Q_LORA_RANK,
             quant_config=None,
-            cache_config=None,
+            # Upstream Indexer.__init__ asserts a non-None cache_config before
+            # constructing the (stubbed) DeepseekV32IndexerCache.
+            cache_config=object(),
             topk_indices_buffer=topk_indices_buffer,
             prefix="model.layers.0.self_attn.indexer",
         )
