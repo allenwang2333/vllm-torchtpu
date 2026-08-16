@@ -6,10 +6,7 @@ from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 
 class _DummyDeepseekV4Fp8Config(Fp8Config):
     """Stands in for VllmDeepseekV4Fp8Config's get_name() without pulling in
-    its real construction (which needs a live vllm_config for is_scale_e8m0).
-    The per-channel-FP8-for-dense-layers override in VllmFp8LinearMethodTPU
-    is gated on get_name() == DEEPSEEK_V4_FP8, since it's DSV4-specific
-    behavior, not something every FP8 model/caller should get by default."""
+    its real construction (which needs a live vllm_config for is_scale_e8m0)."""
 
     @classmethod
     def get_name(cls) -> str:
@@ -24,31 +21,19 @@ def test_linear_weight_loading_quant_config_resolving():
         weight_block_size=[1, 32],
     )
 
-    # 1. Test Dense/Non-Expert layer (attention/projections)
-    dense_prefix = "model.layers.0.self_attn.fused_wqa_wkv"
-    dense_method = VllmFp8LinearMethodTPU(
-        quant_config=dummy_quant_config,
-        prefix=dense_prefix,
-    )
-
-    # Non-expert layer MUST have block_quant disabled
-    assert dense_method.block_quant is False, f"Expected block_quant to be False for prefix {dense_prefix!r}"
-    assert dense_method.weight_block_size is None, f"Expected weight_block_size to be None for prefix {dense_prefix!r}"
-    assert dense_method._linear_quant_config[
-        2] is None, f"Expected requant_block_size to be None for prefix {dense_prefix!r}"
-
-    # 2. Test Routed Expert layer
-    expert_prefix = "model.layers.0.mlp.experts.0.w13"
-    expert_method = VllmFp8LinearMethodTPU(
-        quant_config=dummy_quant_config,
-        prefix=expert_prefix,
-    )
-
-    # Expert layer MUST have block_quant enabled
-    assert expert_method.block_quant is True, f"Expected block_quant to be True for prefix {expert_prefix!r}"
-    assert expert_method.weight_block_size == [
-        1, 32
-    ], f"Expected weight_block_size to be [1, 32] for prefix {expert_prefix!r}"
+    # block_quant follows the checkpoint's weight_block_size, and the prefix
+    # does not change it: dense and routed-expert layers resolve identically,
+    # matching tpu-inference.
+    for prefix in ("model.layers.0.self_attn.fused_wqa_wkv",
+                   "model.layers.0.mlp.experts.0.w13"):
+        method = VllmFp8LinearMethodTPU(
+            quant_config=dummy_quant_config,
+            prefix=prefix,
+        )
+        assert method.block_quant is True, f"Expected block_quant True for {prefix!r}"
+        assert method.weight_block_size == [
+            1, 32
+        ], f"Expected weight_block_size [1, 32] for {prefix!r}"
 
     print(
         "VllmFp8LinearMethodTPU weight loading quant config resolving test passed successfully!"

@@ -50,8 +50,6 @@ from vllm.sequence import IntermediateTensors
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention import \
     VllmDeepseekV4MLAAttention
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.deepseek_v4_requant import \
-    attention_requantizer_generator
 
 logger = init_logger(__name__)
 
@@ -788,10 +786,6 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         import safetensors.torch  # pyrefly: ignore
         safetensors.torch._TYPES["F8_E8M0"] = torch.uint8
 
-        # `_o_proj` and the FP8 linear kernels read `weight_scale` as a 1-D
-        # per-channel vector, so rebase the block scales before loading.
-        # TODO(patemotter): no tpu-inference equivalent; see the #462 review.
-        weights = attention_requantizer_generator(weights)
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights,
                                             mapper=self.hf_to_vllm_mapper)
