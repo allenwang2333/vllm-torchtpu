@@ -15,8 +15,8 @@ Priority is what to spend the next TPU run on, not what is most interesting.
 DSv4, expressed in the structure `kimi_k3` already uses in this repo. *Not*
 exact parity with tpu-inference, and not its memory or compile characteristics.
 Accuracy parity is met (A6). The remaining work is design parity — the G rows.
-The compile-ceiling question (A8) is a capability limit, not an accuracy or
-design defect, and is demoted accordingly.
+The compile-ceiling question is closed: A8 was refuted on 2026-08-16 and
+compiled serving works at 9216 (A14).
 
 ## Picking this up cold
 
@@ -73,7 +73,8 @@ compiled reference. A `.sub` file is the extracted substantive lines from a
 setsid nohup scratchpad/gate_dsv4_compile.sh . <tag> > scratchpad/<tag>_wrapper.log 2>&1 &
 # Pass: tracebacks=0 sweeps=13 raises=0, needle exact, generations match baseline.
 
-# Eager gate — same but VLLM_ENFORCE_EAGER=1, 26 sweeps.
+# Eager gate — same but VLLM_ENFORCE_EAGER=1, 26 sweeps. Slower; use only to
+# isolate a compile-specific suspicion. Serving should always be compiled (A13).
 setsid nohup scratchpad/gate_dsv4.sh . <tag> > ... &
 
 # MMLU-Pro accuracy, ~100 min at limit 20. Server-based.
@@ -101,11 +102,11 @@ renames its workers to `VLLM::Worker_TP0_EP0` and orphans keep no trace of the
 parent command line. Both of those misled this session repeatedly.
 
 **Cleaning up after a kill.** `pkill -9 -f "VLLM::"`, then remove
-`/dev/shm/psm_*` and `/tmp/libtpu_lockfile*`. `run_dsv4_mmlupro.sh` does this in
-a trap; `gate_dsv4_compile.sh` does **not**, so a hard-killed run poisons the
-next gate with `PjRtClient is not initialized` /
-`Device or resource busy; Couldn't open iommu group`. That error looks like a
-code bug and is not one.
+`/dev/shm/psm_*` and `/tmp/libtpu_lockfile*`. `run_dsv4_mmlupro.sh` does this in a trap, and `gate_dsv4_compile.sh` now does
+it at startup too (added 2026-08-16 after it cost two gate attempts). Without
+it a hard-killed run poisons the next gate with `PjRtClient is not initialized`
+/ `Device or resource busy; Couldn't open iommu group` — an error that looks
+like a code bug and is not one.
 
 **Never run `pytest` while anything is serving** — it takes the chips.
 
@@ -120,9 +121,10 @@ the same category of problem as the weight cache that was moved to disk.
 **In scope now:** design parity — the G rows. Accuracy parity is met and needs
 no further work unless something changes.
 
-**Out of scope, deliberately:** exact parity with tpu-inference; its memory and
-compile characteristics; the compile ceiling above 1024 tokens (A8/A9, paused);
-DP attention (E2); the perf gap (E1). None of these block the current objective.
+**Out of scope, deliberately:** exact parity with tpu-inference; its memory
+characteristics; DP attention (E2); the perf gap vs tpu-inference (E1). None of
+these block the current objective. The compile ceiling is no longer out of
+scope because it is no longer a question — see A14.
 
 **Never done by the agent:** opening PRs, posting review comments, merging.
 Draft and hand over.
@@ -136,13 +138,13 @@ Draft and hand over.
 | A5 | Inferred mechanism: `continue_final_message` is not stitched through the `local-chat-completions` → vLLM chat path, so the model answers a prompt that already ended | inferred | P3 | 50/50 identical output is degenerate even for a mis-primed prompt, so the mechanism is still unproven — but A6 rules out the model, so the fault is in that path | Only worth chasing if we need `mmlu_llama` specifically; MMLU-Pro is the working harness |
 | A6 | MMLU-Pro on this branch: **0.7893 ± 0.0241** over 280 samples vs the baseline's 0.7786 ± 0.0154 — 0.37σ apart, no regression | verified | — | `scratchpad/mmlupro_results/.../results_2026-08-16T08-09-35.json`, `limit 20`, eager. Per-subject shape matches: physics/biology 0.95, law/history/philosophy 0.65 | Closes A2, A3, A5. The model is fine; `mmlu_llama`'s serving path is the only broken thing |
 | A7 | MMLU-Pro runner: `lm_eval` flags from `scratch/run_mmlu_limit100.sh`, server and env from `gate_dsv4_compile.sh` | written | — | the four `scratch/run_mmlu*.sh` all export `LIBTPU_INIT_ARGS` and `MOE_REQUANTIZE_*`, the env behind the repeating-output harness bug, so they are not safe to run verbatim | Reuse `scratchpad/run_dsv4_mmlupro.sh` for future MMLU-Pro runs |
-| A8 | Compiled serving failed once at 9216 with 103.09 GB of HLO temporaries vs 94.74 GB HBM | **observed once, not reproduced** | **P1** | `scratchpad/mmlupro_server.log` 04:42, all 8 workers, `Failed to traverse and compile`. Run-log row C: that run had **no recursion limit**, util 0.75, seqs 8 — two variables differing from the probe | Re-test at the probe's settings with the limit restored (step 2 of the open question). Do not attribute it to `de8a5a1c` until an XLA buffer dump says so |
-| A11 | `de8a5a1c` sits inside the D1 stack, so *if* it proves to be A8's cause, shipping the refactor ships the regression | conditional | P2 | `de8a5a1c` is one of the 9 commits in `ff1033a2..e8ecf947`. But the reference compiles the backbone as one graph too, so the structure alone is not evidence | Resolve A8 first. This row means nothing until then |
+| A8 | ~~Compiled serving fails at 9216~~ — **REFUTED** | **refuted 2026-08-16** | — | `PASS 9216 18:52:02` on `d4f8c153`: compiled, KV 308,292 tokens, 33.45× concurrency, served a request. The 103.09 GB failure in run-log row C happened only on a tree with `sys.setrecursionlimit(50000)` removed — a defect I introduced and have since reverted | Nothing. There is no compile ceiling at production context |
+| A11 | ~~`de8a5a1c` ships a regression~~ — **moot**, A8 refuted | closed | — | compiled serves at 9216 with that commit in place. The reference compiles its backbone as one graph too | Nothing. D1 is not blocked by the compile question |
 | A12 | gxd3 agreed to the refactor "after PR11", but PR11 was never opened | dropped | — | no kv-admission PR in `gh pr list --author @me --state all`. Pate's call 2026-08-16: PR11 is not relevant to the refactor and is not a gate on it | Nothing. Do not re-raise this as a blocker |
-| A9 | The compiled gate never exercises this: it runs `DSV4_MAX_MODEL_LEN=1024` | verified | P1 | `scratchpad/gate_dsv4_compile.sh:26` | Add a large-context case to the compiled gate, or A8 recurs unnoticed |
+| A9 | The compiled gate runs only `DSV4_MAX_MODEL_LEN=1024` | verified | P2 | `scratchpad/gate_dsv4_compile.sh:26`. It missed both of today's long-context failures — the real one and the self-inflicted one | Still worth a large-context case: 1024 did not catch the recursion-limit removal that broke 8192 |
 | A10 | `max-num-batched-tokens` is the memory driver, not eager vs compiled | verified | — | at 9216 batched, eager KV was 126,516 tokens and execution OOM'd; at 1024 batched, eager 486,321 and compiled 485,523 | Keep 1024 for any long-context serving config |
 | A13 | **Eager costs ~3× on generation** — 6.9 vs 20.4 tok/s median, and ~2× on prefill | verified | **P1** | median `Avg ... throughput` lines from `scratchpad/mmlupro_server.log` (eager) and `eval_results/phase3_limit50/vllm_server.log` (compiled). Matches the 3.6× end-to-end ratio | Stop using eager once A14 lands. This is the efficiency case for the single-graph backbone |
-| A14 | Compiled at 9216 on the corrected tree passed KV sizing — 308,292 tokens, 33.45× | **in progress** | **P1** | `scratchpad/ceiling_9216_server.log` 18:36:09, commit `d4f8c153`. Row C died before this point | Await verdict. If PASS, A8 was an artifact of the removed recursion limit and eager is retired |
+| A14 | **Compiled PASSES at 9216** on `d4f8c153` — KV 308,292 tokens, 33.45× concurrency, request served | **verified** | — | `PASS 9216 18:52:02`, `scratchpad/ceiling_9216_server.log` | Switch every serving script off `--enforce-eager`. Expect ~3× on generation (A13) |
 | A15 | Probe cost is not weight loading: startup is 8.8 min and diffuse, largest milestone gap 30 s | verified | — | gap analysis over `mmlupro_server.log`, 16:26:35 → 16:35:22 | `--load-format dummy` would save little; do not expect it to speed up probing |
 | B1 | Task 1 — temporary `[SCALE_PROBE]` logging in the FP8 linear path | verified | P2 | `fp8.py:234-244`, `:987-996` | Run 1, then grep `[SCALE_PROBE]` |
 | B2 | Task 3 — removing `sys.setrecursionlimit(50000)` was **wrong and is reverted** | **refuted, then restored** | — | Run 1 passed at `DSV4_MAX_MODEL_LEN=1024` and I called it verified. At 8192 the compiled path dies in Dynamo AOT capture: repeating `forward_model → aot_compile → package.add_code → inspect.getsourcelines`, ending in `IndexError`/`OSError: lineno is out of bounds` (`scratchpad/ceiling_8192_server.log` 15:25:40). gxd3 was right on PR #464 | Restored with a comment naming the failure. True depth still unmeasured — the 50000 is inherited, not derived |
@@ -302,6 +304,7 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | gate_09f6c694 | 1024 | 0.48 | 16 | 1024 | compiled | yes | **environmental failure, not code**: `PjRtClient is not initialized`. Eight orphaned `VLLM::Worker_*` from the killed ceiling probe still held the chips |
 | gate_09f6c694b | 1024 | 0.48 | 16 | 1024 | compiled | yes | same, after clearing `psm_*` only — the orphans were the cause, not the segments |
 | gate_09f6c694c | 1024 | 0.48 | 16 | 1024 | compiled | yes | **`tracebacks=0 sweeps=13 raises=0 compile_lines=72`, needle exact.** Generations **differ** from `gate_cache_compile.sub` — see below |
+| ceiling 9216 | 9216 | 0.55 | 8 | 1024 | **compiled** | yes | **PASS** — KV 308,292, 33.45×, request served. Refutes A8 |
 | mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | **0.7821 ± 0.0243** over 280. Matches 0.7893 (morning) and 0.7786 (08-12) within a fraction of a stderr. 114 min; one item hung ~35 min on a retry under `timeout=1800` |
 
 ### Why `09f6c694` moved generations
