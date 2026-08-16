@@ -18,6 +18,115 @@ Accuracy parity is met (A6). The remaining work is design parity — the G rows.
 The compile-ceiling question (A8) is a capability limit, not an accuracy or
 design defect, and is demoted accordingly.
 
+## Picking this up cold
+
+Everything below is on host `alynie-v7x-8`, a single Google Cloud TPU v7x-8:
+**eight chips, one tenant at a time**. There is no second machine.
+
+| What | Where |
+|---|---|
+| Repo, working branch | `~/workspace/vllm-torchtpu`, branch `patemotter/dsv4-native-model` |
+| Reference implementation | `~/workspace/tpu-inference` (pinned `f329f3480`) |
+| Python env for everything | `~/workspace/uv_venv_dsv4/bin/python` |
+| Model weights | `~/workspace/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1` |
+| Quantized-weight cache | `~/workspace/dsv4_quant_cache` (132 GB, on disk — **never** `/dev/shm`) |
+| Run logs, gate scripts | `~/workspace/vllm-torchtpu/scratchpad/` (untracked; not in git) |
+| Historical eval artifacts | `~/workspace/eval_results/` (untracked) |
+| `ruff` | not installed; use `uvx ruff@latest` |
+
+Read `scratchpad/chain_progress.log` first — it is the append-only record of
+every run, in order, with verdicts.
+
+## File map
+
+Model, in dependency order:
+
+- `src/vllm_torchtpu/models/vllm/deepseek_v4/model.py` — the whole model:
+  `DeepseekV4MLP`, `MoE`, `DecoderLayer`, `Head`, `Model`, `ForCausalLM`, the
+  weights mapper, and the `mhc_*` helpers. 30 KB, not yet split (see G3).
+- `src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/` — attention,
+  compressor, indexer. Note this is a *different tree* from the model (G4).
+- `src/vllm_torchtpu/layers/vllm/quantization/deepseek_v4_fp8.py` — the
+  `deepseek_v4_fp8` quant config; dispatches linear vs MoE methods.
+- `src/vllm_torchtpu/layers/vllm/quantization/fp8.py` — `VllmFp8LinearMethodTPU`
+  and `VllmFp8MoEMethodTPU`. Shared with every other FP8 model, so DSv4-specific
+  behavior here needs justifying.
+- `src/vllm_torchtpu/kernels/deepseek_v4/` — Pallas kernels: `mla`, `mla_swa`,
+  `compressor`, `compress_norm_rope`, `streamindex_topk`. **Trusted by default**
+  per the working agreement; suspect our code first.
+
+Tests: `tests/kernels/test_dsv4_*`, `tests/layers/vllm/test_dsv4_*`,
+`tests/models/vllm/test_dsv4_model.py`.
+
+Gate prompts: `tools/dsv4_debug/prompts/` — a 10-prompt `pool/`, plus
+`needle_250.txt` (the in-window recall control, answer `7391-QUARTZ-4408`),
+`short.txt`, `xla_llvm_prompt.txt`.
+
+Baselines to diff against: `scratchpad/gate_cache_compile.sub` is the current
+compiled reference. A `.sub` file is the extracted substantive lines from a
+`.log`; diff the `Generated text:` and `Generated token IDs:` lines.
+
+## Running things
+
+```bash
+# Compiled gate — the standard correctness check. ~30 min. 1024 context.
+setsid nohup scratchpad/gate_dsv4_compile.sh . <tag> > scratchpad/<tag>_wrapper.log 2>&1 &
+# Pass: tracebacks=0 sweeps=13 raises=0, needle exact, generations match baseline.
+
+# Eager gate — same but VLLM_ENFORCE_EAGER=1, 26 sweeps.
+setsid nohup scratchpad/gate_dsv4.sh . <tag> > ... &
+
+# MMLU-Pro accuracy, ~100 min at limit 20. Server-based.
+setsid nohup scratchpad/run_dsv4_mmlupro.sh > scratchpad/mmlupro_wrapper.log 2>&1 &
+
+# Scale-equivalence proof, CPU only, safe while a gate runs.
+JAX_PLATFORMS=cpu ~/workspace/uv_venv_dsv4/bin/python scratchpad/compare_scale_equivalence.py
+```
+
+Name the tag after the commit being gated, and commit before gating — see the
+provenance warning under Run log for why.
+
+## Operating the TPU — hazards that cost time
+
+**Is the TPU free?** The only check that works:
+
+```bash
+for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q vfio && \
+  echo "$p: $(tr '\0' ' ' < $p/cmdline | cut -c1-80)"; done
+```
+
+`lsof /dev/vfio/*` reports zero holders while a server is running — it is
+useless here. `pgrep -f entrypoints.openai.api_server` also misses, because vLLM
+renames its workers to `VLLM::Worker_TP0_EP0` and orphans keep no trace of the
+parent command line. Both of those misled this session repeatedly.
+
+**Cleaning up after a kill.** `pkill -9 -f "VLLM::"`, then remove
+`/dev/shm/psm_*` and `/tmp/libtpu_lockfile*`. `run_dsv4_mmlupro.sh` does this in
+a trap; `gate_dsv4_compile.sh` does **not**, so a hard-killed run poisons the
+next gate with `PjRtClient is not initialized` /
+`Device or resource busy; Couldn't open iommu group`. That error looks like a
+code bug and is not one.
+
+**Never run `pytest` while anything is serving** — it takes the chips.
+
+**`LOAD_FORMAT=dummy`** is valid for shape, sizing and compile questions only.
+Never for anything depending on weight values.
+
+`/dev/shm/torch_tpu_cache` currently holds 109 GB of RAM. Not urgent, but it is
+the same category of problem as the weight cache that was moved to disk.
+
+## Scope
+
+**In scope now:** design parity — the G rows. Accuracy parity is met and needs
+no further work unless something changes.
+
+**Out of scope, deliberately:** exact parity with tpu-inference; its memory and
+compile characteristics; the compile ceiling above 1024 tokens (A8/A9, paused);
+DP attention (E2); the perf gap (E1). None of these block the current objective.
+
+**Never done by the agent:** opening PRs, posting review comments, merging.
+Draft and hand over.
+
 | # | Item | Status | Pri | Evidence / reference | Next step |
 |---|---|---|---|---|---|
 | A1 | MMLU-Pro 0.7786 ± 0.0154 over 700 samples, per-subject spread from law 0.54 to math 0.92 | verified | — | `eval_results/phase3_limit50/.../results_2026-08-12T15-49-05.json`, `limit: 50`, filter `custom-extract` | Nothing; this is the working-model reference point |
@@ -49,7 +158,7 @@ design defect, and is demoted accordingly.
 | E2 | DP attention — sharding change through runner and KV cache manager | deferred | P3 | tpu-inference hard-validates MLA + DP, so no DP-off reference control exists | Needs its own planning pass |
 | E3 | No genuine ours-vs-reference comparison has ever run — every "identical" compares us to ourselves | open | P3 | consequence of E2 | Unblocked only by E2 |
 | F1 | `"DeepseekV4ROCMAiterMLAAttention"` string at `deepseek_v4_attention.py:253` | open | P3 | gxd3 asked on PR #459 to drop the ROCm dependency; the module-level import and `getattr` fallback he commented on are already gone | Remove if the tuple's other names can be shown not to match |
-| G1 | **We still monkey-patch vLLM**: `model.py:147` does `HCHeadOp.forward_native = mhc_hc_head_native` | verified | **P1** | the reference instantiates `MHCPreOp()`, `MHCPostOp()`, `MHCFusedPostPreOp()` as decoder-layer members (`deepseek_v4.py:368-370`) and never patches. Ours uses free functions `mhc_pre_torch`/`mhc_post_torch` plus this patch | Adopt the reference's op objects. This is the pattern gxd3 asked us to leave on PR #462, still present in the "native" model |
+| G1 | **We still monkey-patch vLLM**: `model.py:147` does `HCHeadOp.forward_native = mhc_hc_head_native` | verified, **fully scoped** | **P1** | vLLM's `HCHeadOp.forward_native` raises `NotImplementedError` (only `forward_cuda`/`forward_xpu` exist), so a reimplementation *is* needed — but the reference does it through vLLM's supported out-of-tree hook: `tpu_inference/layers/vllm/custom_ops/mhc.py`, 131 lines, four `@X.register_oot` subclasses each defining `forward_tpu`. We already use `register_oot` in `gdn_attention_op.py`, `mla_attention_op.py`, `vision_attention.py` — DSv4's MHC is the lone outlier | See the G1 plan below |
 | G2 | No `Head` class in the reference — it inlines `hc_head_op(...)` then `norm(...)` at the tail of `Model.forward` | verified | P2 | reference `deepseek_v4.py:656-664`; ours has a `DeepseekV4Head` class at `model.py:418` | Inline it to match, removing the extra class |
 | G3 | File layout does not match `kimi_k3`: DSv4 is one 30 KB `model.py`, kimi splits into `layers.py`/`moe.py`/`model.py`/`attention.py` | verified | P2 | `ls models/vllm/kimi_k3/` vs `models/vllm/deepseek_v4/` | Split: `DeepseekV4MLP` + head + `mhc_*` → `layers.py`; `DeepseekV4MoE` → `moe.py`; keep decoder/model/causal-LM in `model.py`. Pure moves, but needs a re-gate |
 | G4 | DSv4 attention lives in `layers/vllm/custom_ops/deepseek_v4/`, while kimi keeps its attention inside the model package | verified | P3 | `models/vllm/kimi_k3/attention.py` vs `layers/vllm/custom_ops/deepseek_v4/deepseek_v4_attention.py` | Larger move than G3; decide whether kimi's placement is the target |
@@ -86,6 +195,31 @@ The next three steps, in order, each answering one thing:
    the largest live buffers. That names the cause instead of inferring it.
 
 Do not conclude anything about `de8a5a1c` before step 3.
+
+## G1 plan — replace the MHC monkey-patch with `register_oot`
+
+Copy the reference's structure; the math is already ours and stays unchanged.
+
+1. Add `src/vllm_torchtpu/layers/vllm/custom_ops/mhc.py` with four subclasses,
+   mirroring `tpu_inference/layers/vllm/custom_ops/mhc.py`:
+   `@MHCPreOp.register_oot class VllmMHCPreOp(MHCPreOp)` with `forward_tpu`, and
+   the same for `MHCPostOp`, `HCHeadOp`, `MHCFusedPostPreOp`.
+2. Move the bodies of `mhc_pre_torch`, `mhc_post_torch` and
+   `mhc_hc_head_native` (`model.py:57-146`) into those `forward_tpu` methods
+   verbatim. No numerics change is intended.
+3. Delete `HCHeadOp.forward_native = mhc_hc_head_native` (`model.py:147`) and
+   the three free functions.
+4. In `DeepseekV4DecoderLayer.__init__`, hold `self.mhc_pre = MHCPreOp()` and
+   `self.mhc_post = MHCPostOp()` and call them, as the reference does at
+   `deepseek_v4.py:368-370, 379, 399`.
+5. Ensure the new module is imported where the platform registers custom ops —
+   see `platforms/tpu_platform.py:366`, which explains that `register_oot` only
+   takes effect once the module is imported.
+
+Risk: dispatch changes from a patched `forward_native` to `forward_tpu`, so the
+call path differs even though the arithmetic does not. Needs a compiled gate;
+generations are expected identical, and a diff would mean the bodies did not
+transfer cleanly.
 
 ## Refuted — do not re-raise these
 
@@ -162,6 +296,28 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | run 1 gate | 1024 | 0.48 | 16 | 1024 | compiled | no | **PASS**, generations byte-identical to baseline |
 | ceiling 8192 | 8192 | 0.55 | 8 | 1024 | compiled | **no** | START_FAIL — Dynamo recursion, not memory |
 | ceiling 8192b | 8192 | 0.55 | 8 | 1024 | compiled | **yes** | **stopped at 15:37 before a verdict** (Pate: ceiling work paused). No data |
+| gate_09f6c694 | 1024 | 0.48 | 16 | 1024 | compiled | yes | **environmental failure, not code**: `PjRtClient is not initialized`. Eight orphaned `VLLM::Worker_*` from the killed ceiling probe still held the chips |
+| gate_09f6c694b | 1024 | 0.48 | 16 | 1024 | compiled | yes | same, after clearing `psm_*` only — the orphans were the cause, not the segments |
+| gate_09f6c694c | 1024 | 0.48 | 16 | 1024 | compiled | yes | **`tracebacks=0 sweeps=13 raises=0 compile_lines=72`, needle exact.** Generations **differ** from `gate_cache_compile.sub` — see below |
+| mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | running — accuracy check on the committed tree |
+
+### Why `09f6c694` moved generations
+
+Commit `83abd731` was predicted to be byte-identical and was not. The prediction
+was wrong for a reason the equivalence script could not see: the **old** path
+quantized twice. `deepseek_v4_requant` converted block scales to per-channel over
+the weight iterator, and then `_process_fp8_linear_weights` ran again on that
+result — `block_quant` was False, so the per-channel branch dequantized to
+float32 and requantized to fp8 a second time. The new path does one conversion.
+
+So the change removed a redundant lossy round-trip. The new weights should be
+*more* accurate, not merely different, but that is an argument and the drift is
+real. The generations remain coherent and the needle control is exact.
+
+The measurement that settles it is MMLU-Pro on this commit against the
+0.7893 ± 0.0241 of the morning run — in flight. Do not treat byte-identity
+against `gate_cache_compile.sub` as the criterion for this commit; that baseline
+predates the round-trip removal.
 
 Two confounds this log makes visible, both mine:
 
