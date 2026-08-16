@@ -23,7 +23,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings)
-from vllm_torchtpu.utils import synchronize_device
+from vllm_torchtpu.utils import synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -1033,8 +1033,8 @@ class Eagle3Proposer:
                                 dtype=runner._hidden_states_dtype,
                                 device=runner.device) for _ in range(3)
                 ]
-                self._draft_combine_hidden_states(*aux)
-                synchronize_device()
+                out = self._draft_combine_hidden_states(*aux)
+                synchronize_tensors(out)
                 logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
@@ -1064,8 +1064,8 @@ class Eagle3Proposer:
                     nti = torch.zeros(p,
                                       dtype=torch.int32,
                                       device=runner.device)
-                    self._draft_seed_input_ids(ids, lti, nti)
-                    synchronize_device()
+                    out = self._draft_seed_input_ids(ids, lti, nti)
+                    synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -1093,8 +1093,8 @@ class Eagle3Proposer:
                     dtype=runner._hidden_states_dtype,
                     device=runner.device,
                 )
-                self._draft_propose_token(dummy_hidden)
-                synchronize_device()
+                out = self._draft_propose_token(dummy_hidden)
+                synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
@@ -1232,7 +1232,7 @@ class Eagle3Proposer:
                 num_tokens_padded=bucket,
             )
             with set_model_tag("eagle_head"):
-                self._draft_propose_token(first_pass_carry)
+                tok = self._draft_propose_token(first_pass_carry)
             # Mirror the K-1 loop steps: forward @p -> lm head @p.
             for step in range(1, K):
                 last_hidden, _ = self._forward_draft(
@@ -1248,7 +1248,7 @@ class Eagle3Proposer:
                     loop_request_distribution=loop_reqdist,
                 )
                 with set_model_tag("eagle_head"):
-                    self._draft_propose_token(last_hidden)
+                    tok = self._draft_propose_token(last_hidden)
             # Force the chunk to execute so its collectives fire in lockstep
             # with the peer ranks' real propose (nothing consumes the result).
-            synchronize_device()
+            synchronize_tensors(tok)

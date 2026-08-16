@@ -3067,10 +3067,10 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs = bool(
                 scheduler_output.scheduled_encoder_inputs)
             if has_encoder_inputs:
-                synchronize_device()
+                synchronize_tensors()
             self._execute_mm_encoder(scheduler_output)
             if has_encoder_inputs:
-                synchronize_device()
+                synchronize_tensors()
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
@@ -4264,7 +4264,7 @@ class TPUModelRunner(GPUModelRunner):
                                    dtype=torch.int32,
                                    device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
-            synchronize_device()
+            synchronize_tensors(out)
         self._hidden_states_dtype = out.dtype
 
     @contextlib.contextmanager
@@ -4293,8 +4293,8 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs,
                                           dtype=torch.int32,
                                           device=self.device)
-                    self.compute_selected_logits(dummy_hidden, indices)
-                    synchronize_device()
+                    out = self.compute_selected_logits(dummy_hidden, indices)
+                    synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
@@ -4307,8 +4307,8 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_hidden = torch.zeros((num_reqs, hsize),
                                            device=self.device,
                                            dtype=self._hidden_states_dtype)
-                self.compute_logits_from_hidden_states(dummy_hidden)
-                synchronize_device()
+                out = self.compute_logits_from_hidden_states(dummy_hidden)
+                synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
@@ -4316,7 +4316,7 @@ class TPUModelRunner(GPUModelRunner):
             arange = self.structured_decoding_manager.structured_decode_arange.to(
                 self.device)
             for num_reqs in self.num_reqs_paddings:
-                self.structured_decoding_manager.structured_decode(
+                out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.
                     require_structured_out_cpu[:num_reqs].to(self.device),
                     self.structured_decoding_manager.
@@ -4324,7 +4324,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._dummy_logits(num_reqs),
                     arange,
                 )
-                synchronize_device()
+                synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_sample_from_logits(self) -> None:
@@ -4343,24 +4343,24 @@ class TPUModelRunner(GPUModelRunner):
                                          dtype=torch.float32,
                                          device=self.device)
                 for all_greedy in [False, True]:
-                    self.sample_from_logits_func(dummy_logits,
-                                                 dummy_temperatures,
-                                                 dummy_u,
-                                                 dummy_top_k,
-                                                 dummy_top_p,
-                                                 all_greedy=all_greedy)
-                    synchronize_device()
+                    out = self.sample_from_logits_func(dummy_logits,
+                                                       dummy_temperatures,
+                                                       dummy_u,
+                                                       dummy_top_k,
+                                                       dummy_top_p,
+                                                       all_greedy=all_greedy)
+                    synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_gather_logprobs(self) -> None:
         with self._precompile_timed("gather_logprobs"):
             for num_reqs in self.num_reqs_paddings:
-                self.gather_logprobs(
+                out = self.gather_logprobs(
                     self._dummy_logits(num_reqs),
                     torch.zeros((num_reqs, 1),
                                 dtype=torch.int64).to(self.device),
                 )
-                synchronize_device()
+                synchronize_tensors(out.logprobs)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_substitute_placeholder_token(self) -> None:
@@ -4393,10 +4393,10 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens = torch.zeros(nlen,
                                               dtype=torch.int64,
                                               device=self.device)
-                    _substitute_placeholder_token(input_ids, cur_input_indices,
-                                                  pre_next_tokens_indices,
-                                                  next_tokens)
-                    synchronize_device()
+                    out = _substitute_placeholder_token(
+                        input_ids, cur_input_indices, pre_next_tokens_indices,
+                        next_tokens)
+                    synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d",
                                 num_tokens, nlen)
 
@@ -4464,7 +4464,7 @@ class TPUModelRunner(GPUModelRunner):
                         self.spec_bonus_and_target_logits(
                             dummy_logits, bonus_logits_indices,
                             target_logits_indices))
-                    self.rejection_sampler(
+                    out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
                         target_logits=target_logits_warm,
@@ -4473,7 +4473,7 @@ class TPUModelRunner(GPUModelRunner):
                         group_indices=group_indices,
                         max_draft_tokens=k,
                     )
-                    synchronize_device()
+                    synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
                     _, target_logits_ng = (
                         self.spec_gather_bonus_and_target_logits(
@@ -4494,7 +4494,7 @@ class TPUModelRunner(GPUModelRunner):
                     warm_recover_u = torch.zeros((num_tokens, self.vocab_size),
                                                  dtype=torch.float32,
                                                  device=self.device)
-                    self.rejection_sampler(
+                    out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
                         target_logits=target_logits_ng,
@@ -4509,7 +4509,7 @@ class TPUModelRunner(GPUModelRunner):
                         recover_u=warm_recover_u,
                         do_sampling=True,
                     )
-                    synchronize_device()
+                    synchronize_tensors(out)
                     logger.info("  -- padded_logits_length: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):

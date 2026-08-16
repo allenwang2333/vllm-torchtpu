@@ -237,7 +237,7 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
-        "vllm_torchtpu.runner.tpu_runner.synchronize_device",
+        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
         lambda *_args, **_kwargs: None,
     )
 
