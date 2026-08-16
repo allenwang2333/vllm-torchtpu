@@ -91,6 +91,10 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
+# The GMM MoE path, explicitly. Matches tpu-inference's own recipe
+# (tests/e2e/benchmarking/inferencex/qwen3.5/server.sh). Set to 1 to run the
+# fused EP kernel instead; it is slower on this geometry.
+export USE_MOE_EP_KERNEL=0
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8
