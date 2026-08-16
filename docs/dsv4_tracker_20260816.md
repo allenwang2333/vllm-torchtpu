@@ -365,7 +365,9 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | ceiling 9216 | 9216 | 0.55 | 8 | 1024 | **compiled** | yes | **PASS** — KV 308,292, 33.45×, request served. Refutes A8 |
 | mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | **0.7821 ± 0.0243** over 280. Matches 0.7893 (morning) and 0.7786 (08-12) within a fraction of a stderr. 114 min; one item hung ~35 min on a retry under `timeout=1800` |
 
-| kvprobe092 @ `7744ac9b` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL**, and the G5 measurement: planned 6,721,536 B/block against a 5,083,136 B/block budget — **1.3223×**. See "G5 measured" below |
+| kvprobe092 @ `7744ac9b` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** in KV init, and the G5 measurement: planned 6,721,536 B/block against a 5,083,136 B/block budget — **1.3223×**. See "G5 measured" below |
+| kvprobe092 @ `36abf661` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **KV init passes** — overlay 42 of 43, planned 5,001,216 B/block, ratio **0.9839**, KV 151,990 tokens. Then **START_FAIL in compile**: HLO temporaries 106.41 G vs 94.74 G available. A different wall, driven by `max-num-batched-tokens=8192` (A10), not by KV |
+| gate_36abf661 | 1024 | 0.48 | 16 | 1024 | compiled | yes | **PASS** — `tracebacks=0 sweeps=13 raises=0 compile_lines=78`, needle exact, generations and token IDs **byte-identical** to `gate_09f6c694c.sub`. The SWA overlay fix changes no output |
 | bench 0.92 | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** — DSv4 KV init wanted 2.19 G, 1.60 G free |
 | bench 0.85 | 10240 | 0.85 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 1009.6 M, 986.5 M free (short 23 M). KV 136,847 |
 | bench 0.83 | 10240 | 0.83 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 978.4 M, **420.1 M** free (short 558 M). KV 132,611 |
@@ -417,8 +419,21 @@ With per-group hosts the two SWA groups are 22 and 21 layers (inferred from the
 163,840 bucket holding 22 slots against 21 CSA layers), so 42 of 43 overlay and
 one standalone array remains: 21×163,840 + 1×81,920 = 3,522,560 against the
 bucket's 3,604,480 budget. Predicted total 5,001,216 B/block, **ratio 0.9839** —
-under budget. The `[KV_PROBE] TOTAL ... ratio=` line is the instrument that
-confirms or refutes this.
+under budget.
+
+**Confirmed on hardware** by `kvprobe092_36abf661`, every prediction exact:
+overlay 42 of 43, `planned_per_block=5,001,216`, `ratio=0.9839`,
+`block_stride=5,083,136`, and the KV allocation that killed the previous run
+completed with no error.
+
+### What still caps utilization at 0.92 is compile, not KV
+
+With the overlay fixed, `10240 / 8192 batched / 512 seqs / util 0.92` gets
+through KV init and then dies in `fx_to_mlir`: *HLO temporaries (106.41G)
+exceeds available HBM (94.74G)*. That is the same class as run-log row C and it
+is driven by `max-num-batched-tokens`, which A10 already identified as the
+memory driver — a higher utilization leaves less HBM for compile scratch, so
+the two compete directly. The KV accounting no longer contributes to it.
 
 ### The utilization shortfall is non-monotonic
 
