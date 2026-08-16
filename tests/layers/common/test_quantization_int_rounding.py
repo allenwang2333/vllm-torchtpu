@@ -39,7 +39,9 @@ def _truncating_quantize(tensor: torch.Tensor, quant_dtype: torch.dtype,
                                block_size=block_size)
     info = torch.iinfo(quant_dtype)
     blocks = tensor.reshape(*tensor.shape[:-1], scale.shape[-1], -1)
-    q = torch.clamp(blocks / scale.unsqueeze(-1),
+    # Reciprocal multiply, not division -- `quantize_tensor` does this
+    # deliberately and it moves tie points by an ULP.
+    q = torch.clamp(blocks * (1.0 / scale).unsqueeze(-1),
                     min=float(info.min),
                     max=float(info.max)).to(quant_dtype)
     return q.reshape_as(tensor), scale
@@ -88,9 +90,8 @@ def test_rounding_is_strictly_closer_than_truncation(block_size):
     q_trunc, scale_trunc = _truncating_quantize(tensor, torch.int8, block_size)
 
     assert torch.equal(scale, scale_trunc), "only the cast may differ"
-    axis = (-1,) if block_size is None else (-1,)
-    rounded = _rel_l2(tensor, dequantize_tensor(q, scale, axis=axis))
-    truncated = _rel_l2(tensor, dequantize_tensor(q_trunc, scale, axis=axis))
+    rounded = _rel_l2(tensor, dequantize_tensor(q, scale, axis=(-1, )))
+    truncated = _rel_l2(tensor, dequantize_tensor(q_trunc, scale, axis=(-1, )))
     assert rounded < truncated
     assert truncated / rounded == pytest.approx(2.0, abs=0.05)
 
@@ -101,7 +102,7 @@ def test_integer_error_matches_the_uniform_half_lsb_bound():
     tensor = torch.randn(4, 8192)
 
     q, scale = quantize_tensor(tensor, quant_dtype=torch.int8, axis=-1)
-    err_lsb = (tensor - dequantize_tensor(q, scale, axis=(-1,))) / scale
+    err_lsb = (tensor - dequantize_tensor(q, scale, axis=(-1, ))) / scale
 
     assert err_lsb.abs().max().item() <= 0.5 + 1e-3
     assert err_lsb.mean().abs().item() < 0.01  # truncation gives ~0.5
@@ -115,7 +116,9 @@ def test_float_targets_keep_the_sub_unit_grid():
     # the fractional values are exactly representable in fp8.
     tensor = torch.tensor([[448.0, 0.5, 1.5, 2.5]])
 
-    q, scale = quantize_tensor(tensor, quant_dtype=torch.float8_e4m3fn, axis=-1)
+    q, scale = quantize_tensor(tensor,
+                               quant_dtype=torch.float8_e4m3fn,
+                               axis=-1)
 
     assert scale.item() == 1.0
     torch.testing.assert_close(q.float(), tensor)
