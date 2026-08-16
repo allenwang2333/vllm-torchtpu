@@ -115,12 +115,26 @@ def routed_buffer_capacity(
     sublanes (16), so no consumer pads.
     """
     routed_rows = num_tokens * topk
-    if ep_size <= 1:
+    # `alpha <= 0` is the off switch, and it must return the full size rather
+    # than the sqrt term alone -- otherwise "disabled" is the *tightest*
+    # capacity this function can produce.
+    if ep_size <= 1 or alpha <= 0:
         return routed_rows
     mean = routed_rows / ep_size
     target = alpha * mean + beta * (mean**0.5) + c0
-    capacity = int(-(-target // quantum)) * quantum
-    return min(capacity, routed_rows)
+    capacity = min(int(-(-target // quantum)) * quantum, routed_rows)
+    # Loud, because nothing in the output values shows it: a capacity that is
+    # not a whole gather block (2048) or a whole lhs sublane (16) makes a
+    # consumer materialise a full extra copy of the routed buffer.
+    # `ragged_gather_v2` pads its output to the block and slices back, and
+    # `gmm_v2` pads its whole lhs when `size_m % size_lhs_sublane != 0`
+    # (megablox/gmm_v2.py:1344-1348) -- eight rows of misalignment measured
+    # 769 MB of extra traffic per grouped-matmul pair at the prefill point.
+    assert capacity == routed_rows or (capacity % quantum == 0
+                                       and quantum % 16 == 0), (
+                                           f"{capacity=} must be a whole "
+                                           f"{quantum=}-row block")
+    return capacity
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -307,15 +321,16 @@ def prepare_routed_gmm_inputs(
                 jnp.clip(offsets, 0, routed_capacity))
 
     if use_ep and use_sparse_core:
-        # The threshold selects the *algorithm*, so it is compared against the
-        # uncompacted routed-row count: a capacity must change the size of the
-        # buffer, never which kernel runs. `sort_keys.size` is
-        # `num_tokens_local * topk` whether or not a capacity is in force, so
-        # this is byte-identical with the capacity off. (Whether the threshold
-        # should instead see the compacted count is a live question, but it is
-        # only answerable once the threshold's own value is re-derived -- the
-        # shipped recipe sets 32768 routed rows, which is 3-6x past the
-        # measured crossover.)
+        # RULE: a capacity flag changes the *size* of a buffer, never which
+        # kernel runs. The threshold selects an algorithm, so it is compared
+        # against the uncompacted routed-row count; `sort_keys.size` is
+        # `num_tokens_local * topk` whether or not a capacity is in force.
+        # Do not "simplify" this back to the compacted count: the serving
+        # recipe sets 32768 routed rows, so at the 16384-token prefill point a
+        # capacity of 22528 would silently swap in the O(rows*tokens) one-hot
+        # path, measured at 58.7 ms/layer against 1.29. Whether the threshold
+        # *should* see the compacted count is a real question, answerable only
+        # once its own value is re-derived from the measured crossover.
         if sort_keys.size <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
