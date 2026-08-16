@@ -57,7 +57,10 @@ from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
                                                          Fp8MoEMethod)
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
-from vllm.model_executor.parameter import ChannelQuantScaleParameter
+from vllm.model_executor.parameter import (BlockQuantScaleParameter,
+                                            ChannelQuantScaleParameter)
+from vllm.model_executor.layers import linear as vllm_linear
+from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
@@ -862,6 +865,92 @@ class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
             loaded_weight = loaded_weight.view(-1, 1)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
+
+
+def _safe_block_quant_load_merged_col(self, loaded_weight: torch.Tensor, **kwargs):
+    output_sizes = kwargs.get("output_sizes")
+    shard_id = kwargs.get("shard_id")
+    weight_block_size = kwargs.get("weight_block_size")
+
+    if output_sizes is not None and shard_id is not None:
+        block_n = weight_block_size[0] if weight_block_size is not None else 128
+        tp_size = self.tp_size
+        tp_rank = self.tp_rank
+        output_dim = self.output_dim
+
+        s = output_sizes[shard_id]
+        s_local = s // tp_size
+        local_row_offset = sum(output_sizes[:shard_id]) // tp_size
+
+        block_start_ckpt = (tp_rank * s_local) // block_n
+        num_blocks_ckpt = max(1, (s_local + block_n - 1) // block_n)
+
+        local_block_start = min(local_row_offset // block_n, self.data.shape[output_dim] - 1)
+        num_blocks_local = max(1, min(self.data.shape[output_dim] - local_block_start, (s_local + block_n - 1) // block_n))
+
+        ckpt_slice = loaded_weight.narrow(output_dim, block_start_ckpt, num_blocks_ckpt)
+        local_slice = self.data.narrow(output_dim, local_block_start, num_blocks_local)
+
+        if local_slice.shape == ckpt_slice.shape:
+            local_slice.copy_(ckpt_slice)
+        else:
+            min_dim = min(local_slice.shape[output_dim], ckpt_slice.shape[output_dim])
+            local_slice.narrow(output_dim, 0, min_dim).copy_(
+                ckpt_slice.narrow(output_dim, 0, min_dim)
+            )
+        return
+
+    # Safe fallback with bounds check
+    shard_offset: int = kwargs.get("shard_offset", 0)
+    shard_size: int = kwargs.get("shard_size", 1)
+    param_data = self.data
+
+    max_param_offset = param_data.shape[self.output_dim]
+    if shard_offset >= max_param_offset:
+        shard_offset = max(0, max_param_offset - shard_size)
+    if shard_offset + shard_size > max_param_offset:
+        shard_size = max(1, max_param_offset - shard_offset)
+
+    max_loaded_offset = loaded_weight.shape[self.output_dim]
+    loaded_offset = self.tp_rank * shard_size
+    if loaded_offset >= max_loaded_offset:
+        loaded_offset = max(0, max_loaded_offset - shard_size)
+    if loaded_offset + shard_size > max_loaded_offset:
+        shard_size = min(shard_size, max_loaded_offset - loaded_offset)
+
+    param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+    loaded_weight = loaded_weight.narrow(
+        self.output_dim, loaded_offset, shard_size
+    )
+    if param_data.shape == loaded_weight.shape:
+        param_data.copy_(loaded_weight)
+    else:
+        min_dim = min(param_data.shape[self.output_dim], loaded_weight.shape[self.output_dim])
+        param_data.narrow(self.output_dim, 0, min_dim).copy_(
+            loaded_weight.narrow(self.output_dim, 0, min_dim)
+        )
+
+
+if not getattr(vllm_parameter.BlockQuantScaleParameter, "_tpu_patched", False):
+    vllm_parameter.BlockQuantScaleParameter.load_merged_column_weight = _safe_block_quant_load_merged_col
+    vllm_parameter.BlockQuantScaleParameter._tpu_patched = True
+
+if not getattr(vllm_linear.MergedColumnParallelLinear, "_tpu_loader_patched", False):
+    _orig_weight_loader_v2 = vllm_linear.MergedColumnParallelLinear.weight_loader_v2
+
+    def _patched_weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None):
+        if loaded_shard_id is not None and isinstance(param, vllm_parameter.BlockQuantScaleParameter):
+            param.load_merged_column_weight(
+                loaded_weight=loaded_weight,
+                shard_id=loaded_shard_id,
+                output_sizes=self.output_sizes,
+                weight_block_size=getattr(self, "weight_block_size", None),
+            )
+        else:
+            _orig_weight_loader_v2(self, param, loaded_weight, loaded_shard_id)
+
+    vllm_linear.MergedColumnParallelLinear.weight_loader_v2 = _patched_weight_loader_v2
+    vllm_linear.MergedColumnParallelLinear._tpu_loader_patched = True
 
 
 @register_weight_loader_v2_supported_method
