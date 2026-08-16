@@ -99,9 +99,9 @@ def _routing_layer(topk=10, renormalize=True):
                            moe_config=SimpleNamespace(experts_per_token=topk))
 
 
-def test_router_topk_env_defaults_to_sort():
+def test_router_topk_env_defaults_to_rowmax():
     import vllm_torchtpu.envs as envs
-    assert envs.environment_variables["TPU_MOE_ROUTER_TOPK"]() == "sort"
+    assert envs.environment_variables["TPU_MOE_ROUTER_TOPK"]() == "rowmax"
 
 
 def test_router_topk_env_rejects_unknown_value(monkeypatch):
