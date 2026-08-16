@@ -159,20 +159,99 @@ measured against a *standalone* all-reduce, but the all-reduce it actually
 replaces was not standalone. Displacing one member of a fused collective costs
 the fusion.
 
+### Step 0: is the microbenchmark wrong, or is production different?
+
+Before pursuing any kernel variant, the 26 us and the 15.14 us had to be
+reconciled. Three things could have accounted for the gap -- the *metric* (a
+wall-clock slope vs device self time), the *shape* (16x1024 vs 2x3584, same
+bytes, eight times the rows), or the *context*. `profile_ll_allreduce_shapes.py`
+measures all three at once: it drives the real dispatcher under
+`torch.compile`, at K3's shapes, and reports device self time from the same
+profiler and the same xprof tool a production trace uses.
+
+**Device self time per occurrence, 32 devices, isolated:**
+
+| shape | payload | XLA | one-shot | speedup |
+|---|--:|--:|--:|--:|
+| 2x3584 | 14 KiB | 17.33 | **13.61** | 1.27x |
+| 2x7168 | 28 KiB | 17.97 | 22.37 | 0.80x |
+| 16x1024 | 32 KiB | 17.96 | 25.33 | 0.71x |
+| 16x3584 | 112 KiB | 21.86 | 89.70 | 0.24x |
+| 16x7168 | 224 KiB | 23.26 | 178.67 | 0.13x |
+
+**The metric was never the problem.** Slope and device self time agree to
+within 0.3 us at every shape (8 devices: 6.00 vs 6.11, 4.90 vs 4.86, 10.03 vs
+10.36). The two-point slope *is* the device self time. Section 2b's numbers
+stand.
+
+**The shape was not the problem either.** At 8 devices the kernel is *faster*
+at 2x3584 (4.84 us) than at 16x1024 (6.11 us), tracking payload as it should.
+Two rows is not too few.
+
+**Production is different, and only for the kernel.** Reading each
+implementation's per-op distribution out of the treatment trace, against the
+same op in the isolated harness:
+
+| | harness | prod min | prod p50 | prod max | p50 tax |
+|---|--:|--:|--:|--:|--:|
+| XLA `bf16[2,7168]` | 17.97 | 17.96 | 20.06 | 24.89 | **+12%** |
+| kernel `bf16[2,3584]` | 13.61 | 12.67 | 25.71 | 34.98 | **+89%** |
+
+Both implementations hit the harness number *exactly* at their production
+minimum -- 17.96 against 17.97, and 12.67 against 13.61. So the harness is
+faithful, and the kernel really is the faster op: its floor beats XLA's floor
+by 5 us. What sinks it is the spread. XLA's per-op cost stays within 7 us of
+its floor; the kernel's runs 22 us above its own, and the median sits at
+double its harness cost.
+
+Neither is async -- both lower to a synchronous `all-reduce(...)` / custom
+call whose self time includes whatever it waits on -- so this is not an
+artifact of one being overlappable.
+
+The leading explanation is **egress**, and it is the same property that makes
+one-shot fast in isolation. One-shot pushes its whole buffer to every peer:
+`M(N-1)` = 14 KiB x 31 = **434 KiB per device**. XLA's ring moves
+`2M(N-1)/N` = **27 KiB**, sixteen times less. In an empty harness that trade
+is free -- bandwidth is idle and one hop beats `2(N-1)`. In a K3 decode step
+it is not: hierarchical EP is moving expert activations across the same ICI
+links, and a collective that wants 16x the bandwidth pays 16x the contention.
+That is a hypothesis, not a measurement; what is measured is that the penalty
+is 7x larger for the kernel than for XLA at the same point in the same model.
+
 ### What this implies for the follow-ups
 
-- **`compile_sizes=[1]`** would improve the kernel's own numbers (7 KiB is
-  1.65x on the bench rather than 1.14x) but does nothing about the fusion,
-  which is the larger term. Not worth running on its own.
-- **Wiring both widths to kernels** now looks more attractive than it did, not
-  less: if both halves of the fused pair go to kernels, nothing is left behind
-  to need a separate XLA collective. It needs a second workspace pair, and it
-  has to beat 34.0 us for the pair, which at ~26 us per kernel call is not
-  obviously achievable.
-- **Padding-awareness** (reducing only the valid rows, which XLA cannot do
-  because its collective shape is static) remains the one idea here with a
-  structural rather than constant-factor advantage, and it is the only one that
-  would also shrink the 7168-wide half.
+Step 0 settles all three of these, and none survive.
+
+- **Wiring both widths to kernels** is dead, and now by measurement rather than
+  estimate. The pair has to beat the 34.0 us that XLA's *fused*
+  `[2,3584]+[2,7168]` collective costs. Two kernels cost **13.61 + 22.37 =
+  35.98 us in the isolated harness** -- already a loss before any production
+  tax, and the tax on two kernels would be roughly double the one that produced
+  the +5.8% regression. The 28 KiB half is past one-shot's crossover at 32
+  devices (0.80x vs XLA) and there is no variant that fixes that: one-shot's
+  egress grows as `M(N-1)`, which is exactly what the crossover is.
+- **Padding-awareness** would lower the kernel's *floor* -- 7 KiB instead of
+  14 -- and the floor is not the problem. The kernel's floor already beats
+  XLA's by 5 us and it still lost. The term that matters is the +12 us the
+  kernel picks up between its floor and its production median, and reducing
+  the payload does not touch it. Worse, the idea's appeal was that it also
+  shrinks the 7168-wide half, and that half is past the crossover anyway.
+- **`compile_sizes=[1]`** does not address the fusion or the spread. Dropped.
+
+What step 0 leaves is one question, not a menu: **why does the kernel pay
++89% in production where XLA pays +12%?** If that is ICI contention with the
+hierarchical-EP all-to-all traffic, it is a property of one-shot's `M(N-1)`
+egress and no amount of tuning fixes it at TP=32 -- the honest conclusion is
+that this class of kernel is the wrong tool for a bandwidth-contended decode
+step, and it should be shelved. Two-shot moves `2M(N-1)/N`, the same order as
+XLA's ring, so it is the only variant whose egress is not the problem; but it
+is 22-28 us at these payloads in section 2b (slower than XLA's 17-18 here),
+and it still takes the slice down nondeterministically.
+
+The cheap test of the contention hypothesis, if it is ever worth doing: re-run
+the isolated harness with a synthetic all-to-all running alongside the chain.
+If the kernel's cost climbs toward 26 us and XLA's stays near 18, the
+mechanism is confirmed and the conclusion above is final.
 
 ### A methodology cost worth recording
 
@@ -216,3 +295,26 @@ The 8-device correctness and latency harness:
 sbatch scripts/debug/slurm_test_ll_allreduce_tp8.sbatch --dtype float32 --skip-timing
 sbatch scripts/debug/slurm_test_ll_allreduce_tp8.sbatch --rows 1,2,4,8,16
 ```
+
+Step 0 -- device self time at K3's shapes, comparable to a production trace:
+
+```bash
+sbatch scripts/debug/slurm_profile_ll_allreduce_tp8.sbatch   #  8 devices
+sbatch scripts/debug/slurm_profile_ll_allreduce_32.sbatch    # 32 devices
+python scripts/allreduce_profile_stats.py results/ll-ar-shapes-32-<job>/traces
+```
+
+Two operational notes, both learned by hitting them:
+
+- The **Tier-2 compilation cache** lives in `/dev/shm` under a *namespace*
+  directory, and the default namespace is shared by every user on the node.
+  Whoever creates it first owns it and everyone else dies with `Check failed:
+  lock_fd_.valid() ... Permission denied`. Both launchers namespace it per
+  user and job. This is the same class of hazard as the shared
+  `VLLM_XLA_CACHE_PATH` above -- machine-wide caches are a correctness and
+  reliability problem for A/B work, not just a speed optimization.
+- `jax.profiler.trace` **segfaults** in this venv (`Unexpected
+  PLUGIN_Profiler_Api size: expected 80, got 104` -- libtpu 0.0.44.1 against
+  xprof 2.22.3), so the JAX bench cannot profile itself. The torch harness
+  goes through `torch.profiler` + `TpuProfilerConfig`, which is what
+  production uses and what works.

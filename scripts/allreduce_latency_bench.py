@@ -54,9 +54,23 @@ def _parse_args(argv=None):
         default="1,2,4,8,16,32,64,128,256,512,1024,2048",
         help="Comma-separated leading dims to sweep. Payload bytes = "
         "rows * cols * itemsize.")
+    p.add_argument(
+        "--shapes",
+        default=None,
+        help="Explicit 'ROWSxCOLS' payloads, e.g. '2x3584,2x7168'. Overrides "
+        "--rows/--cols. Use this to measure a model's actual shapes rather "
+        "than byte-equivalents at a fixed cols: the kernel grids over rows, "
+        "so (2,3584) and (16,1024) are the same 14/16 KiB but not the same "
+        "amount of parallelism.")
     p.add_argument("--impls",
                    default="xla,oneshot,twoshot",
                    help="Comma-separated subset of xla,oneshot,twoshot.")
+    # No --profile-dir here: jax.profiler.trace segfaults in this venv
+    # ("Unexpected PLUGIN_Profiler_Api size: expected 80, got 104" -- libtpu
+    # 0.0.44.1 against xprof 2.22.3). For device self time per op, which is
+    # what a production trace reports, use
+    # scripts/debug/profile_ll_allreduce_shapes.py: it goes through
+    # torch.profiler + TpuProfilerConfig, the path production uses.
     p.add_argument("--iters-lo", type=int, default=20)
     p.add_argument("--iters-hi", type=int, default=60)
     p.add_argument("--repeats",
@@ -304,9 +318,15 @@ def main():
     dtype = {"bfloat16": jnp.bfloat16, "float32": jnp.float32}[ARGS.dtype]
     itemsize = np.dtype(ARGS.dtype).itemsize
     device_counts = [int(d) for d in ARGS.devices.split(",")]
-    row_sweep = [int(r) for r in ARGS.rows.split(",")]
     impls = [s.strip() for s in ARGS.impls.split(",") if s.strip()]
     cols = ARGS.cols
+    if ARGS.shapes:
+        shape_sweep = []
+        for tok in ARGS.shapes.split(","):
+            r, _, c = tok.strip().lower().partition("x")
+            shape_sweep.append((int(r), int(c)))
+    else:
+        shape_sweep = [(int(r), cols) for r in ARGS.rows.split(",")]
 
     rprint(f"jax {jax.__version__} | {len(jax.devices())} devices "
            f"({jax.process_count()} process(es)) | "
@@ -324,15 +344,17 @@ def main():
         sharding = NamedSharding(mesh, P(AXIS, None, None))
         rprint(f"=== {num_devices} devices "
                f"({[d.id for d in mesh.devices.flatten()]}) ===")
-        rprint(f"{'rows':>6} {'KiB':>9} " + "".join(f"{i + ' us':>13}"
-                                                    for i in impls) +
+        rprint(f"{'shape':>12} {'KiB':>9} " + "".join(f"{i + ' us':>13}"
+                                                      for i in impls) +
                f"  {'best vs xla':>12}")
 
-        for rows in row_sweep:
+        for rows, cols in shape_sweep:
             payload = rows * cols * itemsize
+            sharding = NamedSharding(mesh, P(AXIS, None, None))
             x_dev = make_input(num_devices, rows, cols, dtype, sharding)
 
             lat = {}
+            absolute = {}
             for impl in impls:
                 if (impl in ("twoshot", "twoshot_ws")
                         and rows % num_devices != 0):
@@ -361,6 +383,12 @@ def main():
                     t_lo = time_fn(lo, x_dev, ARGS.repeats, ARGS.warmup)
                     t_hi = time_fn(hi, x_dev, ARGS.repeats, ARGS.warmup)
                     lat[impl] = (t_hi - t_lo) / (ARGS.iters_hi - ARGS.iters_lo)
+                    # Wall time per call *without* cancelling fixed cost. The
+                    # slope is the marginal cost of one more collective; this
+                    # is what a caller actually waits for, amortized. A large
+                    # gap between them means the fixed cost the slope discards
+                    # is not small relative to the op.
+                    absolute[impl] = t_hi / ARGS.iters_hi
                 except Exception as e:  # noqa: BLE001 - report and keep sweeping
                     rprint(
                         f"  !! {impl} rows={rows} failed: "
@@ -380,7 +408,11 @@ def main():
                        default=None)
             ratio = (f"{lat['xla'] / best:>11.2f}x"
                      if best and lat.get("xla") else f"{'-':>12}")
-            rprint(f"{rows:>6} {payload / 1024:>9.2f} {cells}  {ratio}")
+            rprint(f"{f'{rows}x{cols}':>12} {payload / 1024:>9.2f} {cells}"
+                   f"  {ratio}")
+            rprint(f"{'(absolute)':>12} {'':>9} " +
+                   "".join(f"{absolute[i] * 1e6:>13.2f}" if absolute.
+                           get(i) else f"{'-':>13}" for i in impls))
 
             for impl in impls:
                 rows_out.append({
@@ -397,6 +429,8 @@ def main():
                     "impl":
                     impl,
                     "latency_us": (lat[impl] * 1e6) if lat.get(impl) else "",
+                    "absolute_us":
+                    (absolute[impl] * 1e6) if absolute.get(impl) else "",
                 })
         rprint()
 
