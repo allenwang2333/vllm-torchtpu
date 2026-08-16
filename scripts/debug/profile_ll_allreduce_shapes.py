@@ -90,6 +90,17 @@ def parse_args():
                    action="store_true",
                    help="Build a one-shot kernel even where the gate routes "
                    "to XLA, so shapes past the crossover are measurable.")
+    p.add_argument("--gap-dim",
+                   type=int,
+                   default=0,
+                   help="Put a DxD matmul between consecutive collectives. 0 "
+                   "(default) chains them back-to-back, which is what the "
+                   "microbenchmarks do and what a decode step does NOT: there "
+                   "a collective is separated from the next by a layer of "
+                   "compute. Back-to-back calls leave every peer already "
+                   "sitting at the barrier, so a barrier-heavy kernel is "
+                   "measured at its most favourable. 2048 is roughly 20 us "
+                   "of matmul here, 4096 roughly 150 us.")
     return p.parse_args()
 
 
@@ -125,6 +136,14 @@ def main() -> int:
     def lead(*a):
         if rank == 0:
             print(*a, flush=True)
+
+    # Optional compute between collectives. gap_eps holds 0.0 but is a runtime
+    # tensor, so the matmul survives DCE while the reduced values do not move.
+    gap_a = gap_eps = None
+    if args.gap_dim:
+        gap_a = torch.randn(args.gap_dim, args.gap_dim,
+                            dtype=torch.float32).to(dtype).to(device)
+        gap_eps = torch.zeros((), dtype=torch.float32).to(device)
 
     lead(f"world_size={world_size} dtype={args.dtype} "
          f"force_kernel={args.force_kernel}")
@@ -226,6 +245,23 @@ def main() -> int:
                         x = funcol_all_reduce(x, "sum",
                                               list(range(world_size)))
                     x = x * (1.0 / world_size)
+                    if gap_a is not None:
+                        # Separate this collective from the next by real
+                        # compute, on the dependency chain rather than beside
+                        # it: the matmul consumes this round's x and its result
+                        # feeds the next collective, exactly as a decoder layer
+                        # sits between two all-reduces.
+                        #
+                        # It must depend on x. A loop-invariant `gap_a @ gap_a`
+                        # is identical every iteration, so XLA hoists it out by
+                        # CSE and the chain stays back-to-back -- measured, and
+                        # the slope did not move.
+                        #
+                        # gap_eps is a runtime tensor holding 0.0, so the result
+                        # cannot be folded away but the values reaching the next
+                        # collective are bit-unchanged.
+                        g = (gap_a * x.sum().to(gap_a.dtype)) @ gap_a
+                        x = x + (g.sum() * gap_eps).to(x.dtype)
                 return x
 
             return torch.compile(f,

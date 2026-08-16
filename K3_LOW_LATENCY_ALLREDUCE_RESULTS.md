@@ -218,9 +218,91 @@ links, and a collective that wants 16x the bandwidth pays 16x the contention.
 That is a hypothesis, not a measurement; what is measured is that the penalty
 is 7x larger for the kernel than for XLA at the same point in the same model.
 
+### Step 1: the counterfactual, and a correction
+
+Everything above compares `kernel@[2,3584]` against `XLA@[2,7168]`. Those are
+**different collectives at different points in the graph**, and the comparison
+is invalid. It produced a "the kernel is 7x more sensitive to production than
+XLA's ring" claim and an egress dose-response story to explain it. Both were
+artifacts of the mismatch. What was missing was XLA's cost at *the kernel's own
+collective*, which no arm had ever measured -- in the control that reduction is
+fused into a larger op and not separable.
+
+A third arm supplies it: the control's flags, plus
+`--xla_jf_crs_combiner_threshold_count=1 --xla_jf_crs_combiner_threshold_in_bytes=1`
+to disable XLA's CRS combiner. That breaks the fusion **without** introducing
+the kernel. The flag did exactly one thing and nothing else -- collective
+occurrences went 5968 -> 7440, exactly the +1472 expected from unfusing 92 ops
+over 16 steps, with every all-gather count unchanged.
+
+| | harness | production | tax |
+|---|--:|--:|--:|
+| XLA `[2,3584]` | 17.33 | **32.66** | +88% |
+| kernel `[2,3584]` | 13.61 | **25.19** | +85% |
+
+**The kernel is not more sensitive to production than XLA. It pays the same
+tax, and it is ~24% faster than XLA at the same collective in production, just
+as it was in the harness.** Egress does not predict cost either: the
+434 KiB-egress kernel beats the 27 KiB-egress ring at the same site.
+
+End to end, per arm:
+
+| arm | device time | vs control | TPOT c1 | vs control |
+|---|--:|--:|--:|--:|
+| control (fused) | 259.92 ms | -- | 16.80 ms | -- |
+| **unfused XLA** | **280.30 ms** | **+20.38 (+7.8%)** | **18.11 ms** | **+7.8%** |
+| kernel | 275.61 ms | +15.69 (+6.0%) | 17.77 ms | +5.8% |
+
+Unfusing *alone* costs more than unfusing *and* switching to the kernel. So the
+entire regression is the lost fusion, and the kernel is a genuine -4.69 ms win
+on top of it. Device deltas track TPOT deltas to within 0.2 points in both
+arms, so this is fully accounted for on-device.
+
+### What the fusion is actually worth, and why
+
+The two reductions at that site cost, unfused, 32.66 + 19.35 = **52.01 us**.
+Fused into one op they cost **33.97 us**. Fusing saves 18 us per layer.
+
+The reason is visible in the numbers: the *smaller* payload is the expensive
+one. `[2,3584]` is 14 KiB and costs 32.66 us; `[2,7168]` is 28 KiB and costs
+19.35 us. That is backwards for anything bandwidth-bound, and it is uniform
+across ranks (CV 1.5%, so not imbalance) and independent of implementation
+(the kernel pays it too). Both ops carry identical `replica_groups`, ordering
+and `channel_id`, so it is not topology.
+
+So the 3584 site carries a large fixed **wait** -- roughly 13-15 us, on top of
+a collective that costs ~17 us in isolation. A combined collective pays that
+wait once for both reductions; any scheme that splits them pays it twice. That
+is the whole mechanism, and it is why a faster collective still loses: the
+kernel is 7.5 us cheaper per call and the split costs 18 us.
+
 ### What this implies for the follow-ups
 
-Step 0 settles all three of these, and none survive.
+Steps 0 and 1 together re-rank these, and the ranking is nearly the reverse of
+what the first pass concluded.
+
+- **One kernel call covering both widths is now the indicated path**, not a
+  dead end. The earlier verdict ("dead by measurement") rested on the invalid
+  cross-position comparison and on costing it as *two* kernel calls, which
+  still pays the split penalty twice. The point is to pay it once: a single
+  one-shot over the concatenated 21.5 KiB, replacing the fused XLA op rather
+  than half of it. Rough arithmetic -- one-shot interpolates to ~17.5 us at
+  21.5 KiB in the harness, and the site adds ~13-15 us once -- puts it near
+  30 us against XLA's fused 33.97, so perhaps -4 us/layer, order -2% TPOT.
+  Marginal, and the estimate is soft, but it is the only variant that does not
+  start 18 us behind.
+- **Padding-awareness** is still not the lever: it shrinks a transfer cost at a
+  site whose cost is dominated by a fixed wait.
+- **`compile_sizes=[1]`** still addresses neither.
+
+**The bigger prize is not the kernel at all.** The 3584 site's ~13-15 us wait
+costs the *control* about 1.4 ms per decode step, and no all-reduce
+implementation can touch it -- XLA pays it, the kernel pays it, and it is
+uniform across ranks. Finding out what that site is waiting on is worth more
+than any collective swap measured here, and it is the natural next
+investigation.
+
+The superseded step-0 verdicts, for the record:
 
 - **Wiring both widths to kernels** is dead, and now by measurement rather than
   estimate. The pair has to beat the 34.0 us that XLA's *fused*

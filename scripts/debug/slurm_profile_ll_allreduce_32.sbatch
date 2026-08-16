@@ -79,6 +79,9 @@ export TPU_WORKER_HOSTNAMES="${HOSTLIST}"
 # different one per host and split the trace across four runs.
 export TORCH_TPU_XPROF_SESSION_ID="${SLURM_JOB_ID}"
 export LL_SHAPES="${LL_SHAPES:-16x1024,2x3584,2x7168,16x3584,16x7168}"
+# e.g. LL_EXTRA_ARGS="--gap-dim 4096" to separate the collectives by compute
+# instead of chaining them back-to-back.
+export LL_EXTRA_ARGS="${LL_EXTRA_ARGS:-}"
 export REPO_DIR PYTHON RUN_DIR
 
 echo "== hosts: ${HOSTS[*]}"
@@ -109,7 +112,8 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --unbuffered --export=ALL \
       scripts/debug/profile_ll_allreduce_shapes.py \
       --shapes "${LL_SHAPES}" \
       --force-kernel \
-      --profile-dir "${RUN_DIR}/traces"
+      --profile-dir "${RUN_DIR}/traces" \
+      ${LL_EXTRA_ARGS}
   '
 status=$?
 
