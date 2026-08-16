@@ -141,6 +141,9 @@ Draft and hand over.
 | A12 | gxd3 agreed to the refactor "after PR11", but PR11 was never opened | dropped | — | no kv-admission PR in `gh pr list --author @me --state all`. Pate's call 2026-08-16: PR11 is not relevant to the refactor and is not a gate on it | Nothing. Do not re-raise this as a blocker |
 | A9 | The compiled gate never exercises this: it runs `DSV4_MAX_MODEL_LEN=1024` | verified | P1 | `scratchpad/gate_dsv4_compile.sh:26` | Add a large-context case to the compiled gate, or A8 recurs unnoticed |
 | A10 | `max-num-batched-tokens` is the memory driver, not eager vs compiled | verified | — | at 9216 batched, eager KV was 126,516 tokens and execution OOM'd; at 1024 batched, eager 486,321 and compiled 485,523 | Keep 1024 for any long-context serving config |
+| A13 | **Eager costs ~3× on generation** — 6.9 vs 20.4 tok/s median, and ~2× on prefill | verified | **P1** | median `Avg ... throughput` lines from `scratchpad/mmlupro_server.log` (eager) and `eval_results/phase3_limit50/vllm_server.log` (compiled). Matches the 3.6× end-to-end ratio | Stop using eager once A14 lands. This is the efficiency case for the single-graph backbone |
+| A14 | Compiled at 9216 on the corrected tree passed KV sizing — 308,292 tokens, 33.45× | **in progress** | **P1** | `scratchpad/ceiling_9216_server.log` 18:36:09, commit `d4f8c153`. Row C died before this point | Await verdict. If PASS, A8 was an artifact of the removed recursion limit and eager is retired |
+| A15 | Probe cost is not weight loading: startup is 8.8 min and diffuse, largest milestone gap 30 s | verified | — | gap analysis over `mmlupro_server.log`, 16:26:35 → 16:35:22 | `--load-format dummy` would save little; do not expect it to speed up probing |
 | B1 | Task 1 — temporary `[SCALE_PROBE]` logging in the FP8 linear path | verified | P2 | `fp8.py:234-244`, `:987-996` | Run 1, then grep `[SCALE_PROBE]` |
 | B2 | Task 3 — removing `sys.setrecursionlimit(50000)` was **wrong and is reverted** | **refuted, then restored** | — | Run 1 passed at `DSV4_MAX_MODEL_LEN=1024` and I called it verified. At 8192 the compiled path dies in Dynamo AOT capture: repeating `forward_model → aot_compile → package.add_code → inspect.getsourcelines`, ending in `IndexError`/`OSError: lineno is out of bounds` (`scratchpad/ceiling_8192_server.log` 15:25:40). gxd3 was right on PR #464 | Restored with a comment naming the failure. True depth still unmeasured — the 50000 is inherited, not derived |
 | B3 | Task 4 — weight cache moved off `/dev/shm` onto disk in 3 scripts | verified | P2 | `quant_weight_cache.py:56-62` resolves primary before legacy; last RAM run hit 162 GB | Run 1 |
@@ -320,18 +323,48 @@ treat byte-identity against `gate_cache_compile.sub` as the criterion for this
 commit or later ones — that baseline predates the round-trip removal, and
 `gate_09f6c694c.sub` supersedes it.
 
-## Eager is not a considered choice — revisit it
+## Eager costs 3× — measured
 
-Every MMLU-Pro run uses `enforce_eager`, and it is **3.6× slower**: 6.6 s/sample
-compiled on 08-12 versus 23.7 s/sample eager today. That is the difference
-between a 30-minute run and a 110-minute one, and the long client timeouts added
-to survive the slowness are what let a single item hang for 35 minutes.
+Median throughput, from the servers' own `Avg ... throughput` lines:
 
-The only justification is the one unreproduced compile failure in run-log row C,
-which happened with the recursion limit removed at util 0.75 and seqs 16 — a
-tree since fixed and settings since changed. **Compiled at 9216 has never been
-tried on a correct tree.** One run either restores compiled serving and cuts
-every future accuracy run to a third, or reproduces the failure properly.
+| | prompt | generation | generation max |
+|---|---|---|---|
+| eager, `09f6c694`, 9216 ctx, 8 concurrent | 145.8 tok/s | **6.9 tok/s** | 9.6 |
+| compiled, 08-12 baseline, 9216 ctx | 306.1 tok/s | **20.4 tok/s** | 53.5 |
+
+**~3× on generation, ~2× on prefill.** The gap is larger on decode because
+per-layer Python dispatch is paid 61 times per token with no large matmul to
+hide behind; prefill does enough work per layer to dilute it. This is the
+efficiency argument for compiling the backbone as one graph, and it matches the
+3.6× end-to-end ratio (6.6 s/sample compiled vs 23.7 s/sample eager).
+
+Every MMLU-Pro run so far has paid that, justified only by the one unreproduced
+compile failure in run-log row C — which happened with the recursion limit
+removed, at util 0.75 and seqs 16. As of 2026-08-16 18:36 the compiled probe at
+9216 on the corrected tree has passed KV sizing (308,292 tokens, 33.45×
+concurrency), which is well past where row C died. Provisional, pending verdict.
+
+## Measuring memory properly
+
+Running whole servers for a pass/fail bit is the wrong instrument. Better:
+
+- **`XLA_FLAGS=--xla_dump_to=<dir>`** emits buffer-assignment output on
+  *successful* compiles too, not only failures. That turns each probe into a
+  measurement — peak bytes and the largest live buffers at a given context —
+  instead of one bit. Already used in `tests/compilation/test_tpu_compiler.py:99`,
+  so the flag works in this stack; the file contents are unread so far.
+- **Fit, don't bisect.** With peak memory at three context sizes, fit
+  `peak(ctx) = c + m·ctx` and solve for the 94.74 GB crossing. The slope-vs-
+  intercept split is itself diagnostic: large `m` means activations scaling with
+  context, large `c` means something fixed grew.
+- **Harvest what is already printed.** Every startup logs `Available KV cache
+  memory`, `GPU KV cache size` and `Maximum concurrency` — a free second
+  measurement of the same budget.
+
+Not a lever, though it looked like one: `--load-format dummy` would save little.
+Startup is 8.8 min and **diffuse** — the largest gap between logged milestones is
+30 s, spread across eight worker spawns, TPU init, weight read, profiling and KV
+sizing. With a warm cache, requantization is not in the path at all.
 
 Two confounds this log makes visible, both mine:
 
