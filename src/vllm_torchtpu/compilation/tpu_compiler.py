@@ -20,6 +20,7 @@ from typing import Any, Callable
 import torch
 import torch._guards
 import torch.fx as fx
+import vllm.envs as vllm_envs
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
@@ -246,6 +247,82 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+def _unwrap_single_output(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Undo the tuple wrapping that _ensure_tuple_output added to the graph."""
+
+    def unwrap_fn(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, (tuple, list)) and len(result) == 1:
+            return result[0]
+        return result
+
+    return unwrap_fn
+
+
+class _TpuAotArtifact:
+    """Adapts a TpuBackend result to vLLM's mega-AOT artifact contract.
+
+    ``PiecewiseBackend.to_bytes`` calls ``serialize()`` on whatever
+    ``CompilerInterface.compile`` returned and expects bytes that
+    ``AOTCompiledArtifact.deserialize`` can read back;
+    ``InductorStandaloneAdaptor`` satisfies that by returning an
+    ``AOTCompiledArtifact``. TpuBackend instead returns a raw aot_autograd
+    callable whose ``serialize()`` yields a ``BundledAOTAutogradResult``
+    object, so wrap it the same way inductor does. Without this the bundle
+    stores a pickled ``BundledAOTAutogradResult`` and loading it fails with
+    "a bytes-like object is required, not 'BundledAOTAutogradResult'",
+    silently forcing a full recompile on every start.
+    """
+
+    def __init__(self, compiled_fn: Callable[..., Any],
+                 unwrap_single_output: bool):
+        from torch._inductor.standalone_compile import AOTCompiledArtifact
+
+        self._artifact = AOTCompiledArtifact(compiled_fn)
+        self._unwrap_single_output = unwrap_single_output
+
+    def __call__(self, *args: Any) -> Any:
+        result = self._artifact(*args)
+        if (self._unwrap_single_output and isinstance(result, (tuple, list))
+                and len(result) == 1):
+            return result[0]
+        return result
+
+    def serialize(self) -> bytes:
+        return self._artifact.serialize()
+
+
+def _make_aot_artifact(
+    compiled_fn: Callable[..., Any],
+    was_wrapped: bool,
+    returns_tuple: bool,
+) -> _TpuAotArtifact | None:
+    """Wrap ``compiled_fn`` for the mega-AOT bundle, or None if it can't be.
+
+    Returning None leaves this graph out of the bundle, which makes the next
+    warm start fail its assertion and recompile — correct, just not cached.
+    """
+    if not hasattr(compiled_fn, "serialize"):
+        # TpuBackend skips serialization for dynamic shapes and debug mode.
+        logger.warning(
+            "[TpuCompilerAdaptor] Compiled function has no serialize(); "
+            "this graph will be missing from the AOT artifact bundle.")
+        return None
+
+    if was_wrapped and returns_tuple:
+        # On a warm start vLLM unwraps the artifact's output using
+        # returns_tuple alone (PiecewiseBackend.get_compiled_graph_wrapper),
+        # so with returns_tuple=True the tuple we added here would survive
+        # and change the graph's output structure.
+        logger.warning(
+            "[TpuCompilerAdaptor] Graph returns a multi-output node that "
+            "needed tuple wrapping; excluding it from the AOT artifact "
+            "bundle to keep its output structure intact.")
+        return None
+
+    return _TpuAotArtifact(compiled_fn, unwrap_single_output=was_wrapped)
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -289,6 +366,11 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
+        # Must be read before _ensure_tuple_output rewrites the output node;
+        # this is the same value PiecewiseBackend uses to unwrap our result.
+        from torch._inductor.compile_fx import graph_returns_tuple
+        returns_tuple = graph_returns_tuple(graph)
+
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
@@ -313,16 +395,17 @@ class TpuCompilerAdaptor(CompilerInterface):
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
-        if was_wrapped:
-            inner_fn = compiled_fn
+        aot_artifact = None
+        if vllm_envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            aot_artifact = _make_aot_artifact(compiled_fn, was_wrapped,
+                                              returns_tuple)
 
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
-
-            compiled_fn = unwrap_fn
+        if aot_artifact is not None:
+            # Keeps serialize() intact for PiecewiseBackend.to_bytes(); the
+            # artifact does the single-output unwrapping itself.
+            compiled_fn = aot_artifact
+        elif was_wrapped:
+            compiled_fn = _unwrap_single_output(compiled_fn)
 
         # Save the per-shape PjRt executable to disk.
         # When Tier-3 C++ persistent cache is active, torch_tpu handles PJRT
@@ -424,14 +507,6 @@ class TpuCompilerAdaptor(CompilerInterface):
             )(graph, example_inputs)
 
         if was_wrapped:
-            inner_fn = compiled_fn
-
-            def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
-                if isinstance(result, (tuple, list)) and len(result) == 1:
-                    return result[0]
-                return result
-
-            compiled_fn = unwrap_fn
+            compiled_fn = _unwrap_single_output(compiled_fn)
 
         return compiled_fn
