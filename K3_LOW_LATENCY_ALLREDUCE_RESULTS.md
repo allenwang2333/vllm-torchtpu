@@ -276,12 +276,68 @@ wait once for both reductions; any scheme that splits them pays it twice. That
 is the whole mechanism, and it is why a faster collective still loses: the
 kernel is 7.5 us cheaper per call and the split costs 18 us.
 
+### Step 2: can one fused kernel call replace the fused XLA collective?
+
+If splitting the pair costs 18 us, the only kernel arrangement that can win is
+one call covering both widths. The concatenated shape is `[2,10752]` --
+21504 elements, **42 KiB** at bf16. (An earlier draft called this 21.5 KiB by
+conflating elements with bytes, which flattered one-shot by a factor of two.)
+
+Measured at 32 devices, device self time:
+
+| shape | payload | XLA | one-shot | **two-shot** |
+|---|--:|--:|--:|--:|
+| `2x3584` | 14 KiB | 17.31 | 13.59 | **12.36** |
+| `2x7168` | 28 KiB | 17.97 | 22.39 | **12.67** |
+| `2x10752` **fused** | 42 KiB | 18.93 | 33.20 | **13.20** |
+
+**One-shot cannot do it.** At the fused shape it is 1.75x *slower* than XLA
+before the site's wait is added. Its egress is `M(N-1)` -- 31 copies of the
+payload per device -- so it only wins below ~16 KiB at 32 devices, and fusing
+necessarily triples the payload. The two constraints point in opposite
+directions: the split penalty rules out keeping the pair apart, and one-shot's
+crossover rules out putting it together. One-shot is out at any arrangement.
+
+**Two-shot can.** Its egress is `2M(N-1)/N ~ 2M`, independent of device count
+and nearly flat in payload -- sync-bound, not bandwidth-bound -- and the
+measurement shows exactly that: 12.36 -> 13.20 us across 3x the payload, while
+one-shot goes 13.59 -> 33.20. At the fused shape it is **1.43x faster than
+XLA** (13.20 vs 18.93).
+
+Projecting to production against XLA's fused 33.97 us, using the site tax
+calibrated from the two collectives measured both ways (XLA `[2,3584]`
+17.31->32.66, one-shot `[2,3584]` 13.59->25.19): the multiplicative reading
+fits those two tightly (1.887 and 1.854) and gives ~25 us; the additive
+reading (+15 us) gives ~28 us. Either is a win of 6-9 us per layer, order
+**-3% to -5% TPOT** against the control. **This projection is not measured**;
+it needs the integration below.
+
+Three side findings:
+
+* **Fusing remains mandatory even for two-shot.** Kept split it costs
+  12.36 + ~15 and 12.67 + ~1.4 = ~41.8 us, worse than XLA's fused 33.97. The
+  18 us split penalty is indifferent to which kernel is used.
+* **The gate is wrong.** `_GATE[32]` confines two-shot to 64 KiB-256 KiB and
+  prefers one-shot under 16 KiB, but two-shot beats one-shot at *every* shape
+  here, 14 KiB included. Section 2b could not see this because plain two-shot
+  needs `rows % 32 == 0`; `_build_two_shot` reshapes to `(N, numel/N)` and the
+  constraint becomes `numel % N == 0`, which these shapes satisfy.
+* **The reliability blocker did not reproduce** -- no `RuntimeUnexpectedCoreHalt`
+  at 8 or 32 devices, correctness exact. One clean run is not proof, but it is
+  no longer a reason to hold off.
+
+What the integration needs: intercept *both* reductions and concatenate rather
+than replacing one of them, and carry two-shot's three workspace buffers
+(`rs`, `ag`, `step`) where the shipped entry op is hardwired to one-shot's
+two. `scripts/debug/profile_ll_allreduce_shapes.py --kernel-type two_shot`
+already does the latter with a local 4-arg custom op, as a template.
+
 ### What this implies for the follow-ups
 
 Steps 0 and 1 together re-rank these, and the ranking is nearly the reverse of
 what the first pass concluded.
 
-- **One kernel call covering both widths is now the indicated path**, not a
+* **One kernel call covering both widths is now the indicated path**, not a
   dead end. The earlier verdict ("dead by measurement") rested on the invalid
   cross-position comparison and on costing it as *two* kernel calls, which
   still pays the split penalty twice. The point is to pay it once: a single
@@ -291,9 +347,9 @@ what the first pass concluded.
   30 us against XLA's fused 33.97, so perhaps -4 us/layer, order -2% TPOT.
   Marginal, and the estimate is soft, but it is the only variant that does not
   start 18 us behind.
-- **Padding-awareness** is still not the lever: it shrinks a transfer cost at a
+* **Padding-awareness** is still not the lever: it shrinks a transfer cost at a
   site whose cost is dominated by a fixed wait.
-- **`compile_sizes=[1]`** still addresses neither.
+* **`compile_sizes=[1]`** still addresses neither.
 
 **The bigger prize is not the kernel at all.** The 3584 site's ~13-15 us wait
 costs the *control* about 1.4 ms per decode step, and no all-reduce
@@ -304,7 +360,7 @@ investigation.
 
 The superseded step-0 verdicts, for the record:
 
-- **Wiring both widths to kernels** is dead, and now by measurement rather than
+* **Wiring both widths to kernels** is dead, and now by measurement rather than
   estimate. The pair has to beat the 34.0 us that XLA's *fused*
   `[2,3584]+[2,7168]` collective costs. Two kernels cost **13.61 + 22.37 =
   35.98 us in the isolated harness** -- already a loss before any production
@@ -312,13 +368,13 @@ The superseded step-0 verdicts, for the record:
   the +5.8% regression. The 28 KiB half is past one-shot's crossover at 32
   devices (0.80x vs XLA) and there is no variant that fixes that: one-shot's
   egress grows as `M(N-1)`, which is exactly what the crossover is.
-- **Padding-awareness** would lower the kernel's *floor* -- 7 KiB instead of
+* **Padding-awareness** would lower the kernel's *floor* -- 7 KiB instead of
   14 -- and the floor is not the problem. The kernel's floor already beats
   XLA's by 5 us and it still lost. The term that matters is the +12 us the
   kernel picks up between its floor and its production median, and reducing
   the payload does not touch it. Worse, the idea's appeal was that it also
   shrinks the 7168-wide half, and that half is past the crossover anyway.
-- **`compile_sizes=[1]`** does not address the fusion or the spread. Dropped.
+* **`compile_sizes=[1]`** does not address the fusion or the spread. Dropped.
 
 What step 0 leaves is one question, not a menu: **why does the kernel pay
 +89% in production where XLA pays +12%?** If that is ICI contention with the
@@ -388,14 +444,14 @@ python scripts/allreduce_profile_stats.py results/ll-ar-shapes-32-<job>/traces
 
 Two operational notes, both learned by hitting them:
 
-- The **Tier-2 compilation cache** lives in `/dev/shm` under a *namespace*
+* The **Tier-2 compilation cache** lives in `/dev/shm` under a *namespace*
   directory, and the default namespace is shared by every user on the node.
   Whoever creates it first owns it and everyone else dies with `Check failed:
   lock_fd_.valid() ... Permission denied`. Both launchers namespace it per
   user and job. This is the same class of hazard as the shared
   `VLLM_XLA_CACHE_PATH` above -- machine-wide caches are a correctness and
   reliability problem for A/B work, not just a speed optimization.
-- `jax.profiler.trace` **segfaults** in this venv (`Unexpected
+* `jax.profiler.trace` **segfaults** in this venv (`Unexpected
   PLUGIN_Profiler_Api size: expected 80, got 104` -- libtpu 0.0.44.1 against
   xprof 2.22.3), so the JAX bench cannot profile itself. The torch harness
   goes through `torch.profiler` + `TpuProfilerConfig`, which is what

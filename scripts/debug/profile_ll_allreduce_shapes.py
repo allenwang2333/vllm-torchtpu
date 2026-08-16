@@ -90,6 +90,14 @@ def parse_args():
                    action="store_true",
                    help="Build a one-shot kernel even where the gate routes "
                    "to XLA, so shapes past the crossover are measurable.")
+    p.add_argument("--kernel-type",
+                   default="one_shot",
+                   choices=["one_shot", "two_shot"],
+                   help="two_shot's egress is 2M(N-1)/N ~ 2M -- flat in "
+                   "payload and independent of device count -- so it is the "
+                   "only variant that can survive the 42 KiB fused shape, "
+                   "where one_shot is 1.75x slower than XLA. Note two_shot "
+                   "has taken the slice down with RuntimeUnexpectedCoreHalt.")
     p.add_argument("--gap-dim",
                    type=int,
                    default=0,
@@ -211,29 +219,69 @@ def main() -> int:
         # a traced region fails in dynamo.
         probe = torch.empty((rows, cols), dtype=dtype, device=device)
         plan = dispatcher._build_plan(probe, ((rows, cols), dtype))
-        if plan.kernel == "xla" and args.force_kernel:
+        want = args.kernel_type
+        if (plan.kernel != want) and args.force_kernel:
             try:
                 # _build_plan short-circuits the mesh lookup when the gate
                 # already said "xla", so self._mesh is unset for exactly the
-                # shapes worth forcing. _build_one_shot reads it directly.
+                # shapes worth forcing. The builders read it directly.
                 if dispatcher._get_mesh() is None:
                     raise RuntimeError("no mesh; cannot force a kernel")
-                op, buffers = dispatcher._build_one_shot((rows, cols), dtype)
-                plan = _Plan("one_shot", op, buffers, (rows, cols), dtype)
+                if want == "one_shot":
+                    op, buffers = dispatcher._build_one_shot((rows, cols),
+                                                             dtype)
+                else:
+                    # _build_two_shot reshapes to (N, numel//N) internally, so
+                    # the rows % N == 0 limit in the docs does not apply on
+                    # this path -- only numel % N == 0, which 2x10752 (21504
+                    # = 32 x 672) satisfies.
+                    if (rows * cols) % world_size:
+                        raise RuntimeError(
+                            f"numel {rows * cols} not divisible by "
+                            f"{world_size}")
+                    op, buffers = dispatcher._build_two_shot((rows, cols),
+                                                             dtype)
+                plan = _Plan(want, op, buffers, (rows, cols), dtype)
                 dispatcher._plans[((rows, cols), dtype)] = plan
             except Exception as e:  # noqa: BLE001
-                lead(f"  !! forced one_shot {rows}x{cols} failed: "
+                lead(f"  !! forced {want} {rows}x{cols} failed: "
                      f"{type(e).__name__}: {e}")
+                plan = _Plan("xla", None, ())
         del probe
         if plan.kernel == "xla":
             lead(f"{f'{rows}x{cols}':>10} {payload / 1024:>8.1f} {gate:>9} "
                  f"  (no kernel built; pass --force-kernel to measure one)")
             continue
-        dispatcher.primary_plan = plan
-        ws, step = plan.buffers
+        if plan.kernel == "one_shot":
+            dispatcher.primary_plan = plan
+            ws, step = plan.buffers
 
-        def kernel_reduce(t):
-            return entry_op(t.contiguous(), ws, step)
+            def kernel_reduce(t):
+                return entry_op(t.contiguous(), ws, step)
+        else:
+            # two_shot carries three buffers (rs, ag, step); the shipped entry
+            # op is hardwired to the one_shot pair, so drive it through an
+            # equivalent 4-arg op. Same contract as get_entry_op: opaque to
+            # dynamo, buffers as arguments rather than captures, mutation
+            # undeclared because declaring it makes AOTAutograd add them to
+            # the graph outputs and the runtime wrapper then expects more
+            # outputs than the artifact returns.
+            rs, ag, step = plan.buffers
+            ts_name = f"vllm_torchtpu::ll_two_shot_probe_{rows}_{cols}"
+
+            def _ts_impl(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
+                         step: torch.Tensor) -> torch.Tensor:
+                out, nrs, nag, nstep = plan.op(x, rs, ag, step)
+                rs.copy_(nrs)
+                ag.copy_(nag)
+                step.copy_(nstep)
+                return out
+
+            ts_op = torch.library.custom_op(ts_name, _ts_impl, mutates_args=())
+            ts_op.register_fake(lambda x, rs, ag, step: torch.empty_like(x))
+
+            def kernel_reduce(t):
+                return ts_op(t.contiguous(), rs, ag, step)
 
         def build(n_ops: int, use_kernel: bool):
 
