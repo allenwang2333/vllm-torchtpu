@@ -465,6 +465,15 @@ class TPUModelRunner(GPUModelRunner):
         # TPU uses AOT bucket precompile (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        # DSpark checkpoints spell the mask token dspark_noise_token_id;
+        # the parent __init__ transiently builds an upstream EagleProposer
+        # that raises unless dflash_config.mask_token_id resolves.
+        if (vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.method == "dspark"):
+            from vllm_torchtpu.spec_decode.dspark import \
+                normalize_dspark_draft_config
+            normalize_dspark_draft_config(
+                vllm_config.speculative_config.draft_model_config.hf_config)
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
