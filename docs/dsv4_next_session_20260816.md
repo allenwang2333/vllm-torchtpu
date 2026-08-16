@@ -75,3 +75,53 @@ Start with G5, the KV allocation divergence. Confirm the cause with the one log
 line described in that row before changing anything, and tell me what you find
 before you start editing.
 ```
+
+## Opening prompt — unattended variant
+
+Use this instead when Pate is away and work should proceed without check-ins.
+
+```
+Read docs/dsv4_tracker_20260816.md, docs/dsv4_design_parity_plan_20260816.md and
+this file first. They are the source of truth and supersede any memory of
+earlier sessions — several recorded claims that were later disproved, see the
+Refuted table. Branch is patemotter/dsv4-native-model, tree clean, TPU idle.
+
+I am asleep. Work unattended until I'm back. You have standing authorization to
+edit, commit, and run TPU jobs. Do NOT push, open PRs, post review comments, or
+merge.
+
+Work the design-parity plan in order, starting with G5:
+
+1. G5 step 1 is a MEASUREMENT, not an edit. Log num_blocks × actual page bytes
+   against kv_cache_tensor.size at tpu_runner.py:5239, run once, and read it.
+   Most of the previous session's waste came from acting on inferences that were
+   never checked — do not skip this.
+2. If the measurement shows the accounting disagreement, fix it and fold the
+   _is_ds_v4 branch into the shared tail per the TODO at tpu_runner.py:5364.
+   Then find the highest gpu-memory-utilization that starts, target 0.92.
+3. Then G1: the register_oot port for MHC, five steps in the plan.
+4. Then G2+G3 together, as one change sharing one gate.
+
+Discipline, because TPU time is cheap and round-trips are not:
+- Batch edits, then one validation chain. Never edit-gate-edit-gate.
+- Commit BEFORE gating and tag the run with the short SHA. A dirty tree makes
+  the SHA meaningless.
+- Gate pass: tracebacks=0 sweeps=13 raises=0, needle exact 7391-QUARTZ-4408,
+  generations diffed against scratchpad/gate_09f6c694c.sub — NOT
+  gate_cache_compile.sub.
+- The gate runs at 1024 tokens and proves nothing about long context. For
+  anything touching compile or memory, also run probe_compile_ceiling.sh 9216.
+- One run at a time. Check the TPU is free by scanning /proc/*/fd for vfio;
+  lsof and pgrep on the server name both lie. Free it with
+  scripts/vllm/benchmarking/cleanup_server.sh.
+- Never run pytest while serving.
+
+Record every run in the tracker's run log with its config dimensions, and add
+anything disproved to the Refuted table. If something is inferred rather than
+measured, label it inferred in the same sentence.
+
+Stop and wait for me if: a gate fails twice for the same reason, accuracy moves
+outside 0.78 ± 0.03 on MMLU-Pro, or a change would touch kernels or the
+attention numerics path. Leave the TPU idle and the tree clean whenever you
+pause.
+```
