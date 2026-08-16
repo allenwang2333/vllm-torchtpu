@@ -115,6 +115,30 @@ def test_partial_nan_row_selects_k_distinct_finite_experts():
         assert min(row.tolist()) >= 5
 
 
+@pytest.mark.parametrize("bad", [
+    pytest.param(np.nan, id="nan"),
+    pytest.param(-np.inf, id="neg_inf"),
+    pytest.param(np.finfo(np.float32).min, id="neg_flt_max"),
+])
+def test_row_at_or_below_the_sentinel_selects_k_distinct_experts(bad):
+    """Kernel half of the same property, for all three spellings.
+
+    ``NEG`` is above ``-inf`` and above ``-FLT_MAX``, so before the clamp a
+    masked column outranked a genuine one and the row collapsed onto expert 0
+    ``TOPK`` times -- measured at 1 distinct expert where ``lax.sort`` takes
+    10. The torch twin is asserted alongside, because fixing one and not the
+    other leaves the two agreeing with each other and wrong together.
+    """
+    scores = np.full((3, EXPERTS), bad, dtype=np.float32)
+    kw, ki = select(jnp.asarray(scores), TOPK, interpret=True)
+    assert np.isnan(np.asarray(kw)).all()
+    for row in np.asarray(ki):
+        assert sorted(row.tolist()) == list(range(TOPK))
+    tw, ti = rowmax_topk(torch.from_numpy(scores), TOPK)
+    assert np.array_equal(np.asarray(ki), ti.numpy())
+    assert np.isnan(tw.numpy()).all()
+
+
 def test_kernel_ties_and_nan_match_the_reference():
     scores = np.zeros((4, EXPERTS), dtype=np.float32)
     scores[0] = 1.0 / EXPERTS  # padded token: all tied
