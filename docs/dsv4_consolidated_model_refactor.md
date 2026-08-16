@@ -1,5 +1,16 @@
 # DeepSeek-V4 native model
 
+> **PARTLY WRONG as of 2026-08-16.** Two sections below were disproved; see
+> `dsv4_tracker_20260816.md`.
+>
+> - *"Attention requantization is required"* — it is not. The requantizer was
+>   deleted in `83abd731`; the standard FP8 block path produces bit-identical
+>   scales, and the old path quantized twice.
+> - The recursion-limit experiment it proposes ("remove the call, run the
+>   compile gate") **cannot detect the failure**: the compile gate runs at 1024
+>   tokens and tracing only blows the stack at long context. Removing it broke
+>   8192 and was reverted.
+
 DeepSeek-V4 now runs from a real model module registered in vLLM's
 `ModelRegistry` instead of a context manager that monkey-patched upstream AMD
 classes at load time. This follows the pattern `kimi_k3` already uses in this
@@ -29,7 +40,7 @@ post+pre op can be swapped in; we return a bare tensor, so restoring
 Expert weights are recorded under their mapped name only when the loader
 reports success, rather than unconditionally after the mapping loop.
 
-## Attention requantization is required
+## ~~Attention requantization is required~~ — REFUTED 2026-08-16
 
 `attention_requantizer_generator` rebases DSv4 attention weights from
 128x128 block scales to per-channel FP8 scales. Its only call site used to be

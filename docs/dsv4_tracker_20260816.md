@@ -1,6 +1,20 @@
 # DeepSeek-V4: everything in flight
 
-One table, current as of August 16, 2026.
+> **Written 2026-08-16, last updated 19:41 UTC.** This file is the source of
+> truth for DSv4 as of that timestamp.
+>
+> **Supersedes and replaces** the earlier handoff docs, which were deleted on
+> 2026-08-16 because they contradicted each other: `dsv4_remaining_work.md`,
+> `dsv4_next_session_prompt.md`, `handoff_refactor.md`, `possible_prompt.md`,
+> `pr_review_tracking.md`, `docs/dsv4/`, and
+> `../scratchpad/HANDOFF_20260814_evening.md`.
+>
+> `dsv4_handoff_20260806.md` survives only because `quant_weight_cache.py:28`
+> cites its section 7c; it is historical and where it disagrees with this file,
+> it is wrong. Several older docs record claims disproved on 2026-08-16 — see
+> the Refuted table.
+>
+> **Companion:** `dsv4_next_session_20260816.md` holds the pickup prompt.
 
 Nothing counts as finished until it is **written**, **verified**, **pushed** and
 **merged**, in that order. The status column names the last stage an item has
@@ -116,6 +130,16 @@ Never for anything depending on weight values.
 `/dev/shm/torch_tpu_cache` currently holds 109 GB of RAM. Not urgent, but it is
 the same category of problem as the weight cache that was moved to disk.
 
+**Utilization.** Every other model on this hardware runs `gpu-memory-utilization`
+at 0.92–0.95; every working DSv4 config sits at 0.48–0.55. That is not
+conservatism — at 0.92 the DSv4 KV init fails asking for 2.19 GB with 1.60 GB
+free. See G5. Until that is fixed, treat high utilization as unavailable for
+DSv4 and record the highest value observed to work.
+
+**Use `scripts/vllm/benchmarking/cleanup_server.sh`** to free the chips. It
+already handles `vllm serve`, `vllm.entrypoints`, `VLLM::` workers and
+`/dev/vfio`, and it succeeded where an ad-hoc `pkill` left orphans behind.
+
 ## Scope
 
 **In scope now:** design parity — the G rows. Accuracy parity is met and needs
@@ -166,6 +190,7 @@ Draft and hand over.
 | G1 | **We still monkey-patch vLLM**: `model.py:147` does `HCHeadOp.forward_native = mhc_hc_head_native` | verified, **fully scoped** | **P1** | vLLM's `HCHeadOp.forward_native` raises `NotImplementedError` (only `forward_cuda`/`forward_xpu` exist), so a reimplementation *is* needed — but the reference does it through vLLM's supported out-of-tree hook: `tpu_inference/layers/vllm/custom_ops/mhc.py`, 131 lines, four `@X.register_oot` subclasses each defining `forward_tpu`. We already use `register_oot` in `gdn_attention_op.py`, `mla_attention_op.py`, `vision_attention.py` — DSv4's MHC is the lone outlier | See the G1 plan below |
 | G2 | No `Head` class in the reference — it inlines `hc_head_op(...)` then `norm(...)` at the tail of `Model.forward` | verified | P2 | reference `deepseek_v4.py:656-664`; ours has a `DeepseekV4Head` class at `model.py:418` | Inline it to match, removing the extra class |
 | G3 | File layout does not match `kimi_k3`: DSv4 is one 30 KB `model.py`, kimi splits into `layers.py`/`moe.py`/`model.py`/`attention.py` | verified | P2 | `ls models/vllm/kimi_k3/` vs `models/vllm/deepseek_v4/` | Split: `DeepseekV4MLP` + head + `mhc_*` → `layers.py`; `DeepseekV4MoE` → `moe.py`; keep decoder/model/causal-LM in `model.py`. Pure moves, but needs a re-gate |
+| G5 | **DSv4 allocates KV outside the profiler's envelope**, unlike the shared path kimi uses | verified (divergence); cause of the util ceiling **inferred** | **P1** | `tpu_runner.py:5169-5258` takes `num_blocks` from the profiler and allocates `get_kv_cache_shape(num_blocks, spec.storage_block_size, …)` with no check that it fits `kv_cache_tensor.size`. The shared path at `:5375-5405` reconciles against `PallasAttentionBackend.get_kv_cache_page_size_bytes`, commenting that `spec.real_page_size_bytes` is 2× off on fp8. Symptom: at util 0.92 the DSv4 KV init asked for 2.19 GB with 1.60 GB free | Log `num_blocks × actual page bytes` vs `kv_cache_tensor.size` to confirm. Then fold DSv4 into the shared tail — Pate's own TODO at `:5364` says the same |
 | G4 | DSv4 attention lives in `layers/vllm/custom_ops/deepseek_v4/`, while kimi keeps its attention inside the model package | verified | P3 | `models/vllm/kimi_k3/attention.py` vs `layers/vllm/custom_ops/deepseek_v4/deepseek_v4_attention.py` | Larger move than G3; decide whether kimi's placement is the target |
 
 ## Where the MMLU question stands — closed
@@ -225,6 +250,37 @@ Risk: dispatch changes from a patched `forward_native` to `forward_tpu`, so the
 call path differs even though the arithmetic does not. Needs a compiled gate;
 generations are expected identical, and a diff would mean the bodies did not
 transfer cleanly.
+
+## Gap analysis, 2026-08-16
+
+### A. Ours vs tpu-inference's DSv4
+
+| Area | tpu-inference | ours | Verdict |
+|---|---|---|---|
+| Model classes | 5: `MLP`, `MoE`, `DecoderLayer`, `Model`, `ForCausalLM` | 6 — adds `DeepseekV4Head` | **G2** |
+| MHC ops | four `@X.register_oot` subclasses with `forward_tpu`, in `layers/vllm/custom_ops/mhc.py` (131 lines) | monkey-patches `HCHeadOp.forward_native`, plus three module-level `mhc_*` functions in `model.py` | **G1** |
+| KV cache allocation | shared path | bespoke `_initialize_ds_v4_kv_cache` branch that skips the profiler reconciliation | **G5** |
+| Attention weight requant | none | none — deleted in `83abd731` | closed |
+| Custom ops | `deepseek_v4_{attention,compressor,indexer}.py` | same three, same names | aligned |
+| Kernels | 8 entries | 5 | **not a gap** — `compress_and_store/`, `compressor_v1.py` and `proj_and_save_state.py` form a self-contained cluster nothing outside it imports, in the reference either |
+| Quant config | `deepseek_v4_fp8.py`, dispatches linear vs MoE | same file, same shape | aligned |
+| Backbone compile | whole backbone precompiled (`_precompile_backbone_helper`, JAX) | whole backbone via `support_torch_compile` | aligned in intent |
+
+### B. Ours vs `kimi_k3` in this repo
+
+| Aspect | `kimi_k3` | DSv4 | Verdict |
+|---|---|---|---|
+| Files in model package | 5: `attention.py`, `layers.py`, `model.py`, `moe.py`, `kimi_vit.py` | 1: `model.py` | **G3** |
+| `model.py` | 637 lines, 4 classes | 795 lines, 6 classes | **G3** |
+| Attention location | inside the model package | `layers/vllm/custom_ops/deepseek_v4/` | **G4** |
+| KV cache path | shared, via the general `_unified_kv_layout` flag | bespoke `_is_ds_v4` branch — the only model-specific allocation branch in the runner | **G5** |
+| `gpu-memory-utilization` | 0.92–0.95 house standard | ≤0.83 | consequence of G5 |
+
+**Distance summary.** Against the reference the remaining gaps are three: how MHC
+is registered (G1), one extra class (G2), and KV allocation (G5). Everything
+else is aligned, and the apparent kernel gap is illusory. Against `kimi_k3` the
+gaps are layout (G3, G4) plus the same G5. G5 is the only one that costs
+capacity rather than tidiness.
 
 ## Refuted — do not re-raise these
 
@@ -306,6 +362,24 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | gate_09f6c694c | 1024 | 0.48 | 16 | 1024 | compiled | yes | **`tracebacks=0 sweeps=13 raises=0 compile_lines=72`, needle exact.** Generations **differ** from `gate_cache_compile.sub` — see below |
 | ceiling 9216 | 9216 | 0.55 | 8 | 1024 | **compiled** | yes | **PASS** — KV 308,292, 33.45×, request served. Refutes A8 |
 | mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | **0.7821 ± 0.0243** over 280. Matches 0.7893 (morning) and 0.7786 (08-12) within a fraction of a stderr. 114 min; one item hung ~35 min on a retry under `timeout=1800` |
+
+| bench 0.92 | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** — DSv4 KV init wanted 2.19 G, 1.60 G free |
+| bench 0.85 | 10240 | 0.85 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 1009.6 M, 986.5 M free (short 23 M). KV 136,847 |
+| bench 0.83 | 10240 | 0.83 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 978.4 M, **420.1 M** free (short 558 M). KV 132,611 |
+
+### The utilization shortfall is non-monotonic
+
+Lowering `gpu-memory-utilization` from 0.85 to 0.83 left *less* memory free at
+the point of failure — 986 MB down to 420 MB — because a smaller budget shrinks
+`num_blocks`, which shrinks the allocation, which chases the shrinking headroom.
+There is no threshold to find by nudging, which is why DSv4 works at 0.55 and
+fails at 0.83. Bisecting is the wrong instrument here; measure the accounting
+disagreement instead (G5 step 1).
+
+**No DSv4 throughput number was ever obtained.** The benchmark config exists at
+`scripts/vllm/benchmarking/configs/deepseek-v4-flash-tp8-ep.sh` and has never
+completed a run. The only throughput figures we have are the medians in A13,
+harvested from serving logs.
 
 ### Why `09f6c694` moved generations
 
