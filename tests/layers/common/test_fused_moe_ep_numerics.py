@@ -145,6 +145,11 @@ def test_fused_kernel_semantics_track_the_gmm_path(capsys):
         agree, rel_l2, rel_l2_same = _report("fused vs gmm", fused, gmm,
                                              ker_route, gmm_route)
 
+    # All three bounds are one-sided in the safe direction -- more agreement or
+    # less error can never trip them -- and each has room for a backend's
+    # rounding to move the measurement. Measured CPU / CI TPU: agree 1.0 / 1.0,
+    # rel_l2 0.04407 / 0.04427.
+    #
     # Both paths score in fp32, so the routing agrees; the floor is here to
     # catch a regression, not to license a gap.
     assert agree > 0.90
@@ -166,14 +171,32 @@ def test_kernel_routing_matches_topk_exactly_when_scored_in_fp32(sigma):
                                   np.asarray(jnp.sort(ker_ids, axis=-1)))
 
 
-@pytest.mark.parametrize("sigma,floor", [(1.0, 0.99), (0.25, 0.90),
-                                         (0.05, 0.40)])
-def test_bf16_scoring_would_reorder_near_ties(sigma, floor, capsys):
+# Measured agreement, CPU here / CI TPU: 99.90% / 100.00% at sigma 1.0,
+# 94.34% / 94.04% at 0.25, 42.09% / 45.80% at 0.05. Each floor sits far enough
+# below the lower of the two that a backend's rounding cannot reach it: the
+# sigma=0.05 floor is 0.25 rather than 0.40 because the cross-backend spread
+# there (3.7pp) is wider than a 0.40 floor would have left as headroom (2.1pp).
+@pytest.mark.parametrize("sigma,floor,expect_a_reordered_row", [
+    (1.0, 0.99, False),
+    (0.25, 0.90, False),
+    (0.05, 0.25, True),
+])
+def test_bf16_scoring_would_reorder_near_ties(sigma, floor,
+                                              expect_a_reordered_row, capsys):
     """Why the kernel widens the router block to fp32 before scoring.
 
     Softmax in the token dtype collapses near-ties among 512 experts, and the
     top-10 set then disagrees with the torch router on a growing fraction of
     tokens as the logits get more concentrated.
+
+    The floor is asserted at every sigma. The *upper* bound -- "this sample
+    contains at least one reordered row" -- is asserted at sigma=0.05 only, and
+    deliberately so: it is a property of one stochastic draw under one
+    backend's rounding, not of the code under test. At sigma=1.0 the effect is
+    about one row in a thousand, and the two backends land on either side of it
+    (99.90% here, 100.00% on CI's TPU) -- asserting it there is what made this
+    flake. Only sigma=0.05, where ~550 of 1024 rows reorder, is far enough from
+    zero to be safe. Do not tighten the other two.
     """
     rng = np.random.default_rng(2)
     logits = jnp.asarray(rng.normal(0, sigma, (1024, NUM_EXPERTS)),
@@ -185,4 +208,6 @@ def test_bf16_scoring_would_reorder_near_ties(sigma, floor, capsys):
     with capsys.disabled():
         print(f"[bf16 scoring, sigma={sigma}] top-k set agreement "
               f"{agree * 100:.2f}%")
-    assert floor <= agree < 1.0
+    assert agree >= floor
+    if expect_a_reordered_row:
+        assert agree < 1.0
