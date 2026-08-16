@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for DeepSeek-V4 model registration and CUDA stream stubs."""
+"""Unit tests for DeepSeek-V4 model registration."""
 
-import torch
 from vllm.model_executor.models import ModelRegistry
 
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v4 import DeepseekV4ForCausalLM
-from vllm_torchtpu.models.vllm.deepseek_v4_stubs import patch_cuda_stubs
 
 
 def test_deepseek_v4_model_registration():
@@ -26,17 +24,3 @@ def test_deepseek_v4_model_registration():
     register_models()
     model_cls, _ = ModelRegistry.resolve_model_cls("DeepseekV4ForCausalLM")
     assert model_cls is DeepseekV4ForCausalLM
-
-
-def test_deepseek_v4_cuda_stubs_patching():
-    """Verify patch_cuda_stubs installs dummy CUDA stream and event objects."""
-    patch_cuda_stubs()
-    stream = torch.cuda.Stream()
-    assert stream is not None
-    assert hasattr(stream, "synchronize")
-    assert hasattr(stream, "wait")
-
-    event = torch.cuda.Event()
-    assert event is not None
-    assert hasattr(event, "record")
-    assert hasattr(event, "wait")
