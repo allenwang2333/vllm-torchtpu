@@ -1389,29 +1389,27 @@ class TPUModelRunner(GPUModelRunner):
                 f"{[n for g in swa_groups for n in g]}")
 
         overlay: dict[str, str] = {}
-        # One host per SWA cache, tracked globally: layers in a group share a
-        # block table, and resetting per group would reuse hosts[0] everywhere.
-        taken: set[str] = set()
+        # Hosts are chosen per cache group: within a group the layers share a
+        # block table, so each needs its own host, but two groups' block-id
+        # namespaces are disjoint and may share one array.
         for swa_layers in swa_groups:
             swa_spec = per_layer_spec(swa_layers[0])
             swa_entry_bytes = (swa_spec.num_kv_heads * swa_spec.head_size *
                                swa_spec.dtype.itemsize)
-            for layer_name in swa_layers:
-                for host_name in mla_layers:
-                    if host_name in taken:
-                        continue
-                    host_spec = per_layer_spec(host_name)
-                    shape = cache_shape_of(host_spec)
-                    # 4-D packed MLA layout:
-                    # (pages, rows/packing, packing, width).
-                    page_entries = shape[1] * shape[2]
-                    entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
-                    if (host_spec.dtype == swa_spec.dtype
-                            and entry_width_bytes >= swa_entry_bytes
-                            and page_entries >= swa_spec.storage_block_size):
-                        overlay[layer_name] = host_name
-                        taken.add(host_name)
-                        break
+            hosts: list[str] = []
+            for host_name in mla_layers:
+                host_spec = per_layer_spec(host_name)
+                shape = cache_shape_of(host_spec)
+                # 4-D packed MLA layout: (pages, rows/packing, packing, width).
+                page_entries = shape[1] * shape[2]
+                entry_width_bytes = shape[-1] * host_spec.dtype.itemsize
+                if (host_spec.dtype == swa_spec.dtype
+                        and entry_width_bytes >= swa_entry_bytes
+                        and page_entries >= swa_spec.storage_block_size):
+                    hosts.append(host_name)
+            for position, layer_name in enumerate(swa_layers):
+                if position < len(hosts):
+                    overlay[layer_name] = hosts[position]
         return overlay
 
     def _update_attention_page_size_padded(
@@ -5180,7 +5178,13 @@ class TPUModelRunner(GPUModelRunner):
         printed before the first allocation, which is where startup dies at
         high `gpu_memory_utilization`.
         """
-        budget_total = 0
+        # Under vLLM's packed layout every KVCacheTensor spans the same slab,
+        # so the budget is one `size`/`block_stride` pair, not their sum.
+        slab_bytes = max((t.size for t in kv_cache_config.kv_cache_tensors),
+                         default=0)
+        block_stride = max(
+            ((t.block_stride or 0) for t in kv_cache_config.kv_cache_tensors),
+            default=0)
         planned_total = 0
         for tensor_index, kv_cache_tensor in enumerate(
                 kv_cache_config.kv_cache_tensors):
@@ -5218,21 +5222,20 @@ class TPUModelRunner(GPUModelRunner):
                     getattr(spec, "real_page_size_bytes", None), tuple(shape),
                     array_bytes, array_bytes / max(num_blocks, 1))
             tensor_planned = sum(entry[0] for entry in planned.values())
-            budget_total += kv_cache_tensor.size
             planned_total += tensor_planned
             logger.info(
-                "[KV_PROBE] t%d budget=%d planned=%d ratio=%.4f shared_by=%d "
-                "overlaid=%d distinct_arrays=%d groups=%s", tensor_index,
-                kv_cache_tensor.size, tensor_planned,
-                tensor_planned / max(kv_cache_tensor.size, 1),
+                "[KV_PROBE] t%d planned=%d shared_by=%d overlaid=%d "
+                "distinct_arrays=%d groups=%s", tensor_index, tensor_planned,
                 len(kv_cache_tensor.shared_by), num_overlaid, len(planned),
                 [(entry[0], len(entry[1])) for entry in planned.values()])
         logger.info(
-            "[KV_PROBE] TOTAL num_blocks=%d tensors=%d budget=%d planned=%d "
-            "ratio=%.4f excess=%.2f MiB", num_blocks,
-            len(kv_cache_config.kv_cache_tensors), budget_total, planned_total,
-            planned_total / max(budget_total, 1),
-            (planned_total - budget_total) / 2**20)
+            "[KV_PROBE] TOTAL num_blocks=%d tensors=%d slab_bytes=%d "
+            "block_stride=%d planned=%d planned_per_block=%.1f ratio=%.4f "
+            "excess=%.2f MiB", num_blocks,
+            len(kv_cache_config.kv_cache_tensors), slab_bytes, block_stride,
+            planned_total, planned_total / max(num_blocks, 1),
+            planned_total / max(slab_bytes, 1),
+            (planned_total - slab_bytes) / 2**20)
 
     def _initialize_ds_v4_kv_cache(
         self,

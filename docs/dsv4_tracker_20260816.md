@@ -190,7 +190,7 @@ Draft and hand over.
 | G1 | **We still monkey-patch vLLM**: `model.py:147` does `HCHeadOp.forward_native = mhc_hc_head_native` | verified, **fully scoped** | **P1** | vLLM's `HCHeadOp.forward_native` raises `NotImplementedError` (only `forward_cuda`/`forward_xpu` exist), so a reimplementation *is* needed — but the reference does it through vLLM's supported out-of-tree hook: `tpu_inference/layers/vllm/custom_ops/mhc.py`, 131 lines, four `@X.register_oot` subclasses each defining `forward_tpu`. We already use `register_oot` in `gdn_attention_op.py`, `mla_attention_op.py`, `vision_attention.py` — DSv4's MHC is the lone outlier | See the G1 plan below |
 | G2 | No `Head` class in the reference — it inlines `hc_head_op(...)` then `norm(...)` at the tail of `Model.forward` | verified | P2 | reference `deepseek_v4.py:656-664`; ours has a `DeepseekV4Head` class at `model.py:418` | Inline it to match, removing the extra class |
 | G3 | File layout does not match `kimi_k3`: DSv4 is one 30 KB `model.py`, kimi splits into `layers.py`/`moe.py`/`model.py`/`attention.py` | verified | P2 | `ls models/vllm/kimi_k3/` vs `models/vllm/deepseek_v4/` | Split: `DeepseekV4MLP` + head + `mhc_*` → `layers.py`; `DeepseekV4MoE` → `moe.py`; keep decoder/model/causal-LM in `model.py`. Pure moves, but needs a re-gate |
-| G5 | **DSv4 allocates KV outside the profiler's envelope**, unlike the shared path kimi uses | verified (divergence); cause of the util ceiling **inferred** | **P1** | `tpu_runner.py:5169-5258` takes `num_blocks` from the profiler and allocates `get_kv_cache_shape(num_blocks, spec.storage_block_size, …)` with no check that it fits `kv_cache_tensor.size`. The shared path at `:5375-5405` reconciles against `PallasAttentionBackend.get_kv_cache_page_size_bytes`, commenting that `spec.real_page_size_bytes` is 2× off on fp8. Symptom: at util 0.92 the DSv4 KV init asked for 2.19 GB with 1.60 GB free | Log `num_blocks × actual page bytes` vs `kv_cache_tensor.size` to confirm. Then fold DSv4 into the shared tail — Pate's own TODO at `:5364` says the same |
+| G5 | **DSv4 over-allocates KV by 1.3223×** — 22 of 43 sliding-window caches find no overlay host and take standalone `num_blocks` arrays | cause **measured**; fix written, ungated | **P1** | measurement in "G5 measured" below, from `kvprobe092_7744ac9b`. Root cause: `_plan_ds_v4_swa_overlay` kept one global `taken` set where the reference rebuilds the host list per cache group (`tpu-inference/runner/kv_cache_manager.py:1159-1178`) | Gate the per-group fix, then raise `gpu-memory-utilization` toward 0.92 |
 | G4 | DSv4 attention lives in `layers/vllm/custom_ops/deepseek_v4/`, while kimi keeps its attention inside the model package | verified | P3 | `models/vllm/kimi_k3/attention.py` vs `layers/vllm/custom_ops/deepseek_v4/deepseek_v4_attention.py` | Larger move than G3; decide whether kimi's placement is the target |
 
 ## Where the MMLU question stands — closed
@@ -296,6 +296,8 @@ recorded so the same ground is not re-covered.
 | "`de8a5a1c` (one graph for the backbone) is the cause of the 9216 compile OOM" | **unproven, weakened** | the reference also compiles the whole backbone as one graph (`compilation_manager.py:_precompile_backbone_helper`). Structure alone does not explain it |
 | "The 9216 run that worked was tpu-inference" | **false** | `eval_results/phase3_limit50/vllm_server.log` shows `Loading plugin torchtpu` and `vllm_torchtpu`, zero `tpu_inference`. It was our own 08-12 branch |
 | "tpu-inference is not comparable because it doesn't use torch.compile" | **wrong framing** | it is the design being emulated and serves this model on this hardware. Its graph boundaries are a legitimate model to copy, even though it is JAX-jitted |
+| "G5 is fixed by folding `_is_ds_v4` into the shared allocation tail" | **inapplicable as written** | the shared tail computes `num_blocks = tensor_size // total_group_page_size` per tensor, but under the packed layout `tensor_size` is the whole slab, so that formula yields nonsense per-tensor block counts — and DSv4's layers must share one block-ID space. The allocation was never the problem: the overlay plan was. The TODO at `tpu_runner.py:5364` stands as tidiness, not as the G5 fix |
+| "DSv4's bespoke KV allocation is a deviation from tpu-inference" | **false** | the reference has the same bespoke overlay, the same 43-vs-21 shortfall and the same standalone-array overflow (`kv_cache_manager.py:1015-1053`). It is a deviation from the *shared vLLM path*, not from the reference. Fixing the host selection makes our memory behavior better than the reference's, which is fine — memory parity with it is out of scope |
 | "`lsof /dev/vfio/*` reliably shows whether the TPU is held" | **false** | it reported zero holders while a server was demonstrably running. Use `pgrep -af entrypoints.openai.api_server \| grep -v shell-snapshots` |
 | "The `tpu_compiler.py` hardening is still owed as a standalone PR" | **false** | `git diff origin/main HEAD` on that file is empty; the earlier delta came from diffing against a stale local `main` |
 
@@ -363,9 +365,60 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | ceiling 9216 | 9216 | 0.55 | 8 | 1024 | **compiled** | yes | **PASS** — KV 308,292, 33.45×, request served. Refutes A8 |
 | mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | **0.7821 ± 0.0243** over 280. Matches 0.7893 (morning) and 0.7786 (08-12) within a fraction of a stderr. 114 min; one item hung ~35 min on a retry under `timeout=1800` |
 
+| kvprobe092 @ `7744ac9b` | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL**, and the G5 measurement: planned 6,721,536 B/block against a 5,083,136 B/block budget — **1.3223×**. See "G5 measured" below |
 | bench 0.92 | 10240 | 0.92 | 512 | 8192 | compiled | yes | **START_FAIL** — DSv4 KV init wanted 2.19 G, 1.60 G free |
 | bench 0.85 | 10240 | 0.85 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 1009.6 M, 986.5 M free (short 23 M). KV 136,847 |
 | bench 0.83 | 10240 | 0.83 | 512 | 8192 | compiled | yes | **START_FAIL** — wanted 978.4 M, **420.1 M** free (short 558 M). KV 132,611 |
+
+### G5 measured — the SWA overlay misses 22 of 43 caches
+
+Run `kvprobe092_7744ac9b` (`scratchpad/kvprobe092_7744ac9b_server.log`, util
+0.92, 10240 ctx, 8192 batched, 512 seqs, compiled) logged the whole allocation
+plan before the first `torch.zeros`. Per worker:
+
+- `num_blocks` 14,324; 63 `KVCacheTensor`s, every one reporting
+  `size = 72,810,840,064` — under vLLM's packed layout that is the whole slab,
+  not a per-tensor share (`vllm/v1/core/kv_cache_utils.py:1305-1341`,
+  `_get_kv_cache_config_packed`: `size = total_size`,
+  `block_stride = total_num_bytes_per_block`).
+- vLLM's budget: `total_num_bytes_per_block` = 21×65,536 + 22×163,840 +
+  20×5,120 = **5,083,136 B/block**, so available KV memory was
+  14,324 × 5,083,136 = 67.81 GiB.
+- What we plan to allocate: 21×65,536 + 21×163,840 + 22×81,920 + 20×5,120 =
+  **6,721,536 B/block** = 89.67 GiB. **1.3223× the budget**, +22.4 GiB.
+
+The four distinct shapes, all `torch.uint8`:
+
+| layer | block/storage | head | spec page | real page | array bytes |
+|---|---|---|---|---|---|
+| `*.attn.indexer.k_cache` (21) | 1024/256 | 256 | 65,536 | 65,536 | 938,737,664 |
+| `*.attn` CSA main (21) | 1024/256 | 640 | 163,840 | 163,840 | 2,346,844,160 |
+| `*.attn` dense (20) | 1024/8 | 640 | 5,120 | 5,120 | 73,338,880 |
+| `*.attn.swa_cache` (43) | 128/128 | 640 | 163,840 | **81,920** | 1,173,422,080 |
+
+Every byte of the excess is sliding-window caches that found no host:
+`DeepSeek-V4 SWA cache overlay: 21 of 43` (`ceiling_9216_server.log` 18:36:31).
+The 22 unhosted ones each take a full `num_blocks` array of 81,920 B/block that
+vLLM budgeted to alias inside the CSA main-latent pages.
+
+**Root cause: our host selection uses one global `taken` set, the reference
+rebuilds the host list per cache group.** `_plan_ds_v4_swa_overlay` marked each
+CSA layer taken across all groups, so with 21 CSA layers only 21 of 43 SWA
+caches could overlay. The reference builds `hosts` fresh inside the per-group
+loop (`tpu-inference/runner/kv_cache_manager.py:1159-1178`) and indexes it by
+position within the group, so one CSA array hosts one SWA layer *from each
+group* — legal because "layers from different groups at the same `slot_idx`
+share an underlying tensor (they have independent block tables so block-id
+namespaces never collide)" (`kv_cache_utils.py:_bucket_layers_by_page_size`).
+The comment defending the global set had the invariant backwards: distinctness
+is required *within* a group, not across them.
+
+With per-group hosts the two SWA groups are 22 and 21 layers (inferred from the
+163,840 bucket holding 22 slots against 21 CSA layers), so 42 of 43 overlay and
+one standalone array remains: 21×163,840 + 1×81,920 = 3,522,560 against the
+bucket's 3,604,480 budget. Predicted total 5,001,216 B/block, **ratio 0.9839** —
+under budget. The `[KV_PROBE] TOTAL ... ratio=` line is the instrument that
+confirms or refutes this.
 
 ### The utilization shortfall is non-monotonic
 
