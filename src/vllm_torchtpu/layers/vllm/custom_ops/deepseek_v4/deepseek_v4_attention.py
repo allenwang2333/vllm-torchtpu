@@ -796,17 +796,3 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         out = self._o_proj(attn_output, positions)
         return out
-
-
-def patch_deepseek_v4_mla_cls() -> None:
-    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention
-    dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
-    if hasattr(ds_v4_amd_model, "DeepseekV4SWACache"):
-        ds_v4_amd_model.DeepseekV4SWACache = VllmDeepseekV4SWACache
-    if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
-        DeepseekSparseSWABackend.get_min_page_size = classmethod(
-            lambda cls, vllm_config: 1)
-    logger.info(
-        "Patched DeepseekV4ROCMAiterMLAAttention and DeepseekV4SWACache for TPU."
-    )
