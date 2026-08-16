@@ -441,40 +441,31 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    # Fast path for low-concurrency decode: a specialized C=N Pallas MoE kernel
-    # that skips the gather/scatter permutation of the general gmm path. Only
-    # engaged for small decode batches with topk == CN_MOE_TOP_K.
-    # In vllm-torchtpu, fused_moe_func is called per-device by the torch
-    # bridge, so weights are already local — no shard_map needed.
+    # Fast path for low-concurrency decode under Tensor Parallelism (TP): a specialized
+    # C=N Pallas MoE kernel with pipelined weight streaming that skips the gather/scatter
+    # permutation of the general gmm path. Only engaged for small decode batches with
+    # topk == CN_MOE_TOP_K under TP.
     import logging as _logging
     _lc_logger = _logging.getLogger(__name__)
     low_conc_threshold = envs.MOE_LOW_CONC_THRESHOLD
-    if 1 <= num_tokens <= low_conc_threshold and topk == CN_MOE_TOP_K:
-        _lc_logger.info("Taking fast low-concurrency C=N Pallas MoE path for "
-                        f"BS={num_tokens} decode (use_ep={use_ep}, "
-                        f"threshold={low_conc_threshold}).")
-        # topk_ids are already local (experts_start remap happened above).
-        # For EP, zero-weight entries are already masked above.
-        cn_topk_ids = topk_ids
-        # Pipelined path only supports a single K/I tile (NUM_K=NUM_I=1);
-        # fall back to the working kernel outside that shape regardless of
-        # the opt-in flag, so an unsupported shape can't silently break
-        # correctness.
-        k_dim = w1.shape[1]
-        id_dim = w1.shape[2] // 2
-        use_pipelined = (_USE_PIPELINED_CN and k_dim <= _CN_K_TILE
-                         and id_dim <= _CN_I_TILE)
-        cn_fn = cn_moe_full_pipelined if use_pipelined else cn_moe_full
-        _lc_logger.info(
-            f"CN kernel variant: {'pipelined' if use_pipelined else 'original'}")
-        out = cn_fn(hidden_states,
-                    w1,
-                    w1_scale,
-                    w2,
-                    w2_scale,
-                    cn_topk_ids,
-                    topk_weights,
-                    use_ep=use_ep)
+    k_dim = w1.shape[1]
+    id_dim = w1.shape[2] // 2
+    if (1 <= num_tokens <= low_conc_threshold
+            and topk == CN_MOE_TOP_K
+            and not use_ep
+            and k_dim <= _CN_K_TILE
+            and id_dim <= _CN_I_TILE):
+        _lc_logger.info("Taking fast low-concurrency Pallas MoE pipelined path for "
+                        f"BS={num_tokens} decode (TP-only, threshold={low_conc_threshold}).")
+        out = cn_moe_full_pipelined(
+            hidden_states,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            topk_ids,
+            topk_weights,
+        )
         return out[:num_tokens, :hidden_size]
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,

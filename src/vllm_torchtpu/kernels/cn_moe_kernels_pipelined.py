@@ -9,6 +9,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 TOP_K = 10
+_CN_K_TILE = 4096
+_CN_I_TILE = 2048
 _CN_NBUF = 4
 
 
@@ -151,25 +153,25 @@ def cn_moe_full_pipelined(
     interpret=False,
     **kwargs,
 ):
-  del kwargs
+  """Unified low-concurrency MoE kernel with pipelined weight streaming (TP-only).
 
-  """Unified low-concurrency MoE kernel with pipelined weight streaming.
-
-  Args:
-    hidden_state: The input hidden state.
-    w1: The first weight matrix.
-    w1_scale: The first weight scale matrix.
-    w2: The second weight matrix.
-    w2_scale: The second weight scale matrix.
-    active_ids: The active token ids.
-    topk_weights: The topk weights.
-    interpret: Whether to interpret the kernel.
+  Optimized specifically for Tensor Parallelism (TP) where all experts are
+  resident on each TPU core. Processes expert slots in natural token-major
+  order without argsort or scatter/gather overhead.
   """
+  if kwargs.get("use_ep", False):
+    raise ValueError(
+        "cn_moe_full_pipelined currently only supports Tensor Parallelism (TP)."
+    )
+
   C = hidden_state.shape[0]  # concurrency / num_tokens
   G, K, N1 = w1.shape
   ID = N1 // 2
   _, ID2, H = w2.shape
-  assert ID == ID2
+  if w1_scale.ndim == 3:
+    w1_scale = jnp.expand_dims(w1_scale, axis=2)
+  if w2_scale.ndim == 3:
+    w2_scale = jnp.expand_dims(w2_scale, axis=2)
   K_BLOCKS = w1_scale.shape[1]
   I_BLOCKS = w2_scale.shape[1]
 
