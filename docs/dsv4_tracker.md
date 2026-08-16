@@ -299,7 +299,7 @@ Outcomes below. "RL" is whether `sys.setrecursionlimit(50000)` was present.
 | gate_09f6c694 | 1024 | 0.48 | 16 | 1024 | compiled | yes | **environmental failure, not code**: `PjRtClient is not initialized`. Eight orphaned `VLLM::Worker_*` from the killed ceiling probe still held the chips |
 | gate_09f6c694b | 1024 | 0.48 | 16 | 1024 | compiled | yes | same, after clearing `psm_*` only — the orphans were the cause, not the segments |
 | gate_09f6c694c | 1024 | 0.48 | 16 | 1024 | compiled | yes | **`tracebacks=0 sweeps=13 raises=0 compile_lines=72`, needle exact.** Generations **differ** from `gate_cache_compile.sub` — see below |
-| mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | running — accuracy check on the committed tree |
+| mmlupro @ 09f6c694 | 9216 | 0.55 | 8 | 1024 | eager | yes | **0.7821 ± 0.0243** over 280. Matches 0.7893 (morning) and 0.7786 (08-12) within a fraction of a stderr. 114 min; one item hung ~35 min on a retry under `timeout=1800` |
 
 ### Why `09f6c694` moved generations
 
@@ -314,10 +314,24 @@ So the change removed a redundant lossy round-trip. The new weights should be
 *more* accurate, not merely different, but that is an argument and the drift is
 real. The generations remain coherent and the needle control is exact.
 
-The measurement that settles it is MMLU-Pro on this commit against the
-0.7893 ± 0.0241 of the morning run — in flight. Do not treat byte-identity
-against `gate_cache_compile.sub` as the criterion for this commit; that baseline
-predates the round-trip removal.
+Settled: MMLU-Pro on `09f6c694` scores **0.7821 ± 0.0243**, against 0.7893 the
+same morning and 0.7786 on 08-12. The drift costs nothing in accuracy. Do not
+treat byte-identity against `gate_cache_compile.sub` as the criterion for this
+commit or later ones — that baseline predates the round-trip removal, and
+`gate_09f6c694c.sub` supersedes it.
+
+## Eager is not a considered choice — revisit it
+
+Every MMLU-Pro run uses `enforce_eager`, and it is **3.6× slower**: 6.6 s/sample
+compiled on 08-12 versus 23.7 s/sample eager today. That is the difference
+between a 30-minute run and a 110-minute one, and the long client timeouts added
+to survive the slowness are what let a single item hang for 35 minutes.
+
+The only justification is the one unreproduced compile failure in run-log row C,
+which happened with the recursion limit removed at util 0.75 and seqs 16 — a
+tree since fixed and settings since changed. **Compiled at 9216 has never been
+tried on a correct tree.** One run either restores compiled serving and cuts
+every future accuracy run to a third, or reproduces the failure properly.
 
 Two confounds this log makes visible, both mine:
 
