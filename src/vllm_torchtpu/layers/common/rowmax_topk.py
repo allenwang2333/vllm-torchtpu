@@ -45,11 +45,14 @@ def rowmax_topk(scores: torch.Tensor,
     sort path's tie order is whatever the sort network does, since torch_tpu
     emits ``is_stable=false`` (``topk_aten_kernels.cc:78-81``).
 
-    NaN is flushed to the sentinel before the first pass, so every returned
-    index is a real expert even for a poisoned row; a row that is *entirely*
-    NaN keeps its poison in the weights, and still names ``k`` distinct
-    experts (0..k-1, as the sort path does) so the MoE gathers what it would
-    have gathered for any other row.
+    Every score at or below the sentinel is clamped up to it before the first
+    pass, so every returned index is a real expert even for a poisoned row; a
+    row made *entirely* of such scores keeps its poison in the weights, and
+    still names ``k`` distinct experts (0..k-1, as the sort path does) so the
+    MoE gathers what it would have gathered for any other row. The clamp is
+    written as ``scores > neg`` rather than ``isnan(scores)`` so that NaN,
+    ``-inf`` and ``-FLT_MAX`` -- three spellings of the same hazard -- are all
+    caught.
     """
     n = scores.shape[-1]
     if k > n:
@@ -62,7 +65,7 @@ def rowmax_topk(scores: torch.Tensor,
                           device=scores.device)
     last = torch.tensor(n - 1, dtype=torch.int32, device=scores.device)
 
-    cur = torch.where(torch.isnan(scores), neg, scores)
+    cur = torch.where(scores > neg, scores, neg)
     values, indices = [], []
     for _ in range(k):
         m = torch.amax(cur, dim=-1, keepdim=True)
@@ -77,9 +80,9 @@ def rowmax_topk(scores: torch.Tensor,
 
     weights = torch.cat(values, dim=-1)
     ids = torch.cat(indices, dim=-1)
-    # An all-NaN row has no real maximum: its "top" score is the sentinel.
-    # Restore the NaN so the caller's renormalization propagates it, matching
-    # what the sort path does with a row of NaN scores.
+    # A row with no score above the sentinel has no real maximum: its "top"
+    # score is the sentinel. Restore the NaN so the caller's renormalization
+    # propagates it, matching what the sort path does with a row of NaN.
     all_nan = weights[..., :1] <= NEG
     weights = torch.where(all_nan, torch.full_like(weights, float("nan")),
                           weights)

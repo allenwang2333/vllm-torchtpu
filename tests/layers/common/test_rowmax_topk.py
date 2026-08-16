@@ -237,6 +237,39 @@ def test_partial_nan_row_selects_k_distinct_finite_experts():
         assert min(row.tolist()) >= 5, "NaN columns must never be selected"
 
 
+# Three spellings of one hazard: a row whose maximum is at or below the mask
+# value. Only NaN was covered before; ``-inf`` and ``-FLT_MAX`` collapsed the
+# same way, and ``-inf`` is reachable through an ``-inf``
+# ``e_score_correction_bias``, the standard idiom for masking an expert out.
+SENTINELS = pytest.mark.parametrize("bad", [
+    pytest.param(float("nan"), id="nan"),
+    pytest.param(float("-inf"), id="neg_inf"),
+    pytest.param(torch.finfo(torch.float32).min, id="neg_flt_max"),
+])
+
+
+@SENTINELS
+def test_row_at_or_below_the_sentinel_selects_k_distinct_experts(bad):
+    """The mask must never outrank a real column. See ``_select_kernel``."""
+    scores = torch.full((3, EXPERTS), bad)
+    v, i = rowmax_topk(scores, TOPK)
+    for row in i:
+        assert sorted(row.tolist()) == list(range(TOPK))
+    assert torch.isnan(v).all(), "no real maximum: the row stays poisoned"
+
+
+@SENTINELS
+def test_partial_row_at_or_below_the_sentinel_keeps_k_distinct(bad):
+    """Nine finite scores and the rest unusable still names ten experts."""
+    torch.manual_seed(11)
+    scores = torch.rand(2, EXPERTS)
+    scores[:, :EXPERTS - 9] = bad
+    v, i = rowmax_topk(scores, TOPK)
+    for row in i:
+        assert len(set(row.tolist())) == TOPK
+    assert not torch.isnan(v[:, 0]).any(), "a finite maximum is not poisoned"
+
+
 def test_masking_is_below_the_flush_sentinel():
     """The property the two must not share, stated once."""
     assert torch.finfo(torch.float32).min < NEG

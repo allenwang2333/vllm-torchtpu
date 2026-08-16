@@ -51,16 +51,20 @@ def block_rows_for(rows: int, cap: int = MAX_BLOCK_ROWS) -> int:
 def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     """One block of rows: top ``topk`` by repeated max-and-mask.
 
-    NaN is flushed to the sentinel before the first max so every row has a
-    maximum that some column equals, and every index written is a real
-    expert. Ties resolve to the lowest expert id.
+    Every score at or below the sentinel is clamped up to it before the first
+    max, so every row has a maximum that some column equals and every index
+    written is a real expert. Ties resolve to the lowest expert id.
 
-    Masking uses a value strictly *below* that sentinel. ``NEG`` is a score a
-    whole row can be made of (a fully-NaN row is nothing else), so masking
-    with ``NEG`` would leave every column still equal to the row max and every
-    pass would return column 0 -- one expert selected ``topk`` times.
+    The clamp is written as ``x > NEG`` rather than ``isnan(x)`` because it
+    has to catch three spellings of the same hazard, not one: NaN, ``-inf``
+    and ``-FLT_MAX`` are all values a whole row can be made of. Masking uses
+    ``finfo.min``, strictly *below* the sentinel; if a row's own maximum could
+    equal or fall below the mask, every column would stay tied with the row
+    max and every pass would return column 0 -- one expert selected ``topk``
+    times. The clamp makes that invariant hold by construction instead of
+    trusting the caller's scores to satisfy it.
     """
-    x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])
+    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
     masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
@@ -71,9 +75,10 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
         w_ref[:, j] = m[:, 0]
         i_ref[:, j] = idx.astype(jnp.int32)
         x = jnp.where(iota == idx[:, None], masked, x)
-    # A row that was entirely NaN has no real maximum, only the sentinel:
-    # keep it poisonous rather than routing it to experts 0..k-1 with a
-    # weight the renormalization would turn into something plausible.
+    # A row with no score above the sentinel has no real maximum, only the
+    # sentinel itself: keep it poisonous rather than routing it to experts
+    # 0..k-1 with a weight the renormalization would turn into something
+    # plausible.
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
