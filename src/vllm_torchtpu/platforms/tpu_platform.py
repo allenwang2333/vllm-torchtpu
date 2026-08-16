@@ -609,6 +609,8 @@ class TpuPlatform(Platform):
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
+    # TPU_MOE_ROUTER_TOPK is read inside the worker, so a Ray executor has to
+    # copy it or the `sort` escape hatch silently does not reach the engines.
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
@@ -618,7 +620,7 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
