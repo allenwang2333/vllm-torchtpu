@@ -456,3 +456,69 @@ Two operational notes, both learned by hitting them:
   xprof 2.22.3), so the JAX bench cannot profile itself. The torch harness
   goes through `torch.profiler` + `TpuProfilerConfig`, which is what
   production uses and what works.
+
+## Step 3: the kernel does deliver, with the fusion held constant
+
+The post-attention `[2,7168]` reduction is a better target than the latent-MoE
+one: it is already standalone (no fusion to forfeit) and it carries almost no
+site penalty. But it cannot be targeted by shape alone -- the same `[2,7168]`
+shape also appears as the MoE-output half of the fused pair (92 ops), so
+routing it to a kernel would strand the 3584 half exactly as before. Routing
+by shape hits both sites: +14.6 us/layer lost at the MoE site against
+-5.3 us/layer gained post-attention, a net regression.
+
+So the arm runs with the CRS combiner disabled in *both* itself and its
+baseline (the nocombine arm above), holding fusion constant so that the only
+variable is XLA vs two-shot on all 187 `[2,7168]` collectives.
+
+| | XLA | two-shot | delta |
+|---|--:|--:|--:|
+| `[2,7168]` us/occ | 19.35 | **13.32** | **-31%** |
+| collective time | 105.98 ms | 86.03 ms | **-19.95 ms** |
+| total device | 280.30 ms | 274.11 ms | -6.19 ms |
+| TPOT @ c1 | 18.11 ms | **17.63 ms** | **-2.7%** |
+
+GSM8K 100/100, canary byte-identical. Concurrency 4 and 8 are unchanged, which
+is the control: only `(2,7168)` is wired, and those buckets are `(16, ...)`.
+
+**The kernel's production cost is its bench cost.** 13.32 us against 12.67 in
+the isolated harness -- a 5% tax, where XLA's `[2,3584]` pays 88%. Once the
+collective is not entangled with the fused pair, the microbenchmark transfers
+essentially intact. That is the claim this whole investigation was trying to
+test, and it is the first arm in which it holds.
+
+**Two thirds of the win leaks back**, and part of it is addressable:
+
+| category | delta | occ delta | cause |
+|---|--:|--:|---|
+| data formatting | +3.47 ms | **+6096** | two `copy_` writebacks per call (`rs`, `ag`) |
+| reduce | +1.43 ms | **+2992** | one per call, from the flatten/reshape |
+
+two-shot writes back *two* workspace buffers where one-shot writes one, which
+is +2 ops per call over 2992 calls. The remaining ~9 ms sits in categories
+whose occurrence counts did not move at all (convolution fusion +2.56, custom
+fusion +3.26, sort +0.72), so it reads as scheduling and run-to-run variance
+rather than a mechanism; the device delta (-2.2%) and the TPOT delta (-2.7%)
+agree closely enough to support that.
+
+### What this says about the fused pair
+
+One number reframes the "site tax". The `[2,7168]` collectives at the *MoE
+site* also cost ~13.3 us under the kernel, where XLA paid ~21. So the penalty
+is not a property of the site -- it attaches specifically to the `[2,3584]`
+reduction, and it hits XLA and one-shot alike (32.66 and 25.19 against harness
+17.31 and 13.59).
+
+Projecting a fused two-shot over the 42 KiB pair, which must still wait on
+that data:
+
+* control: 92 x 33.97 + 95 x 19.10 = 4940 us/step
+* fused two-shot + post-attention two-shot: 92 x ~26 + 95 x 13.32 = 3657 us/step
+* about **-20 ms device**, less the ~5 ms writeback leak, so order **-5% TPOT
+  against the control**
+
+This arm is still slower than the control (17.63 vs 16.80) by design, since it
+and its baseline both run unfused. It isolates the kernel, and the kernel
+passed. Two things to fix alongside the concatenation work: donate `rs`/`ag`
+instead of copying them back, and the gate's preference for one_shot below
+16 KiB, which the measurements contradict.

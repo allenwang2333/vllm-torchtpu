@@ -98,8 +98,23 @@ _GATE: dict[int, tuple[int, int, int]] = {
     2: (256 * 1024, 0, 0),
     4: (128 * 1024, 0, 0),
     8: (32 * 1024, 64 * 1024, 512 * 1024),
-    16: (16 * 1024, 64 * 1024, 256 * 1024),
-    32: (16 * 1024, 64 * 1024, 256 * 1024),
+    # two_shot's floor starts well below the 64 KiB the original sweep began
+    # at. That sweep could not measure lower because plain two_shot scatters
+    # along rows and needs rows % N == 0; _build_two_shot reshapes to
+    # (N, numel/N) instead, so the real constraint is numel % N == 0 and
+    # decode shapes qualify. Measured at 32 devices, device self time:
+    #
+    #   payload   XLA    one_shot   two_shot
+    #    14 KiB  17.31     13.59     12.36
+    #    28 KiB  17.97     22.39     12.67
+    #    42 KiB  18.93     33.20     13.20
+    #
+    # two_shot wins everywhere in that band and is nearly flat in payload
+    # (egress 2M(N-1)/N), where one_shot's M(N-1) egress makes it lose past
+    # ~16 KiB. Below 14 KiB two_shot is unmeasured, so one_shot keeps the
+    # small end.
+    16: (16 * 1024, 16 * 1024, 256 * 1024),
+    32: (16 * 1024, 16 * 1024, 256 * 1024),
 }
 
 
@@ -451,7 +466,15 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
     Anything that is not that shape reduces through XLA, which is always
     correct.
     """
-    name = f"vllm_torchtpu::ll_all_reduce_{dispatcher.op_suffix}"
+    # one_shot carries (ws, step); two_shot carries (rs, ag, step). A custom
+    # op's schema is fixed at registration, so the arity is chosen here from
+    # the plan that warmup already selected -- registering both and picking at
+    # call time would put a branch in front of the op, which is exactly what
+    # dynamo must not see.
+    plan0 = dispatcher.primary_plan
+    n_buffers = len(plan0.buffers) if plan0 is not None else 2
+    name = (f"vllm_torchtpu::ll_all_reduce_{dispatcher.op_suffix}"
+            f"{'_ts' if n_buffers == 3 else ''}")
     existing = _ENTRY_OPS.get(name)
     if existing is not None:
         return existing
@@ -469,6 +492,24 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
             step.copy_(new_step)
             return out
         return dispatcher.xla_all_reduce(x)
+
+    def _impl_two_shot(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
+                       step: torch.Tensor) -> torch.Tensor:
+        plan = dispatcher.primary_plan
+        if (plan is not None and tuple(x.shape) == plan.shape
+                and x.dtype == plan.dtype and x.is_contiguous()):
+            out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
+            rs.copy_(new_rs)
+            ag.copy_(new_ag)
+            step.copy_(new_step)
+            return out
+        return dispatcher.xla_all_reduce(x)
+
+    if n_buffers == 3:
+        op = torch.library.custom_op(name, _impl_two_shot, mutates_args=())
+        op.register_fake(lambda x, rs, ag, step: torch.empty_like(x))
+        _ENTRY_OPS[name] = op
+        return op
 
     # mutates_args stays empty even though the implementation writes the
     # workspace in place. Declaring the mutation makes AOTAutograd add both
@@ -596,9 +637,12 @@ def warmup(vllm_config) -> None:
     # read and an opaque op call -- no lookups, no string work, nothing that
     # can register or allocate.
     if chosen is not None:
+        # get_entry_op reads primary_plan to fix the op's arity, so it must be
+        # set first. The buffers go through positionally -- two for one_shot,
+        # three for two_shot -- because they have to be op *arguments* to
+        # reach the compiled program at all.
         entry_op = get_entry_op(dispatcher)
-        ws, step = chosen.buffers
-        communicator._ll_entry = (entry_op, ws, step)
+        communicator._ll_entry = (entry_op, *chosen.buffers)
     else:
         communicator._ll_entry = None
 

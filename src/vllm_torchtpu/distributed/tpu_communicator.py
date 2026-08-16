@@ -49,10 +49,14 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # reading the payload shape, looking up an op, registering one --
         # fails compilation outright: shapes pin vLLM's dynamic token
         # dimension, and registration calls into code dynamo will not trace.
+        # Unpacked positionally rather than by name: one_shot wires two
+        # workspace buffers and two_shot three, and the arity is fixed at
+        # warmup. A branch on len() here would be a branch dynamo has to
+        # trace, so the tuple is simply splatted.
         entry = getattr(self, "_ll_entry", None)
         if entry is not None:
-            op, ws, step = entry
-            return op(input_, ws, step)
+            op, *buffers = entry
+            return op(input_, *buffers)
         return super().all_reduce(input_)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
