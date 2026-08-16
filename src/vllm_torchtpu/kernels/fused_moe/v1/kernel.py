@@ -248,6 +248,7 @@ def _fused_ep_moe_kernel(
         scoring_fn: str,
         subc_quant_w1_sz: int | None = None,
         subc_quant_w2_sz: int | None = None,
+        w13_concat_layout: bool = False,
         # Kernel tuning params.
         bt: int,  # Block size of local_num_tokens.
         bf: int,  # Block size of intermediate_size.
@@ -586,32 +587,43 @@ def _fused_ep_moe_kernel(
             sem=a2a_gather_sem,
         ).wait()
 
+    def w13_slice(local_e_id, half, offset, bf_id):
+        """One [bd1c_per_t_packing, bf] weight tile of gate (half 0) / up (1).
+
+        Local: the weights arrive either in the kernel's own
+        (E, 2, hidden, intermediate) layout or in the GMM path's
+        (E, hidden, 2*intermediate) layout, where the two halves are columns of
+        one array. Reading the second layout in place is what lets one set of
+        loaded weights serve both MoE paths.
+        """
+        rows = pl.ds(offset, bd1_per_t_packing)
+        if w13_concat_layout:
+            cols = pl.ds(half * intermediate_size + bf_id * bf, bf)
+            return w1_hbm.at[local_e_id, rows, cols]
+        return w1_hbm.at[local_e_id, half, rows, pl.ds(bf_id * bf, bf)]
+
+    def w13_scale_slice(local_e_id, half, offset, bf_id):
+        blocks = pl.ds(offset // subc_quant_w1_sz,
+                       cdiv(bd1_per_t_packing, subc_quant_w1_sz))
+        if w13_concat_layout:
+            cols = pl.ds(half * intermediate_size + bf_id * bf, bf)
+            return w1_scale_hbm.at[local_e_id, blocks, pl.ds(0, 1), cols]
+        return w1_scale_hbm.at[local_e_id, half, blocks,
+                               pl.ds(0, 1),
+                               pl.ds(bf_id * bf, bf)]
+
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
             pltpu.make_async_copy(
-                src_ref=w1_hbm.at[
-                    local_e_id,
-                    0,
-                    pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(bf_id * bf, bf),
-                ],
+                src_ref=w13_slice(local_e_id, 0, offset, bf_id),
                 dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
                 sem=local_sems.at[bw1_sem_id, 1],
             ).start()
             if w1_scale_hbm is not None:
                 assert subc_quant_w1_sz is not None
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_hbm.at[
-                        local_e_id,
-                        0,
-                        pl.ds(
-                            offset // subc_quant_w1_sz,
-                            cdiv(bd1_per_t_packing, subc_quant_w1_sz),
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(bf_id * bf, bf),
-                    ],
+                    src_ref=w13_scale_slice(local_e_id, 0, offset, bf_id),
                     dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
                     sem=local_sems.at[bw1_sem_id, 1],
                 ).start()
@@ -666,30 +678,14 @@ def _fused_ep_moe_kernel(
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
             pltpu.make_async_copy(
-                src_ref=w1_hbm.at[
-                    local_e_id,
-                    1,
-                    pl.ds(offset, bd1_per_t_packing),
-                    pl.ds(bf_id * bf, bf),
-                ],
+                src_ref=w13_slice(local_e_id, 1, offset, bf_id),
                 dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
                 sem=local_sems.at[bw3_sem_id, 3],
             ).start()
             if w1_scale_hbm is not None:
                 assert subc_quant_w1_sz is not None
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_hbm.at[
-                        local_e_id,
-                        1,
-                        pl.ds(
-                            offset //
-                            subc_quant_w1_sz,  # 0 for per-channel quantization
-                            cdiv(bd1_per_t_packing, subc_quant_w1_sz
-                                 ),  # 1 for per-channel quantization
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(bf_id * bf, bf),
-                    ],
+                    src_ref=w13_scale_slice(local_e_id, 1, offset, bf_id),
                     dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).start()
@@ -1229,6 +1225,7 @@ def _fused_ep_moe_kernel(
         "scoring_fn",
         "subc_quant_w1_sz",
         "subc_quant_w2_sz",
+        "w13_concat_layout",
         "bt",
         "bf",
         "bd1",
@@ -1254,6 +1251,9 @@ def fused_ep_moe(
     scoring_fn: str = "softmax",
     subc_quant_w1_sz: int | None = None,
     subc_quant_w2_sz: int | None = None,
+    # w1 as (E, hidden, 2*intermediate) -- the layout the GMM path stores --
+    # instead of the kernel's own (E, 2, hidden, intermediate).
+    w13_concat_layout: bool = False,
     w1_scale: (
         jax.Array | None
     ) = None,  # F32(num_experts, 2, hidden_size // subc_quant_w1_sz, 1, intermediate_size)
@@ -1294,14 +1294,20 @@ def fused_ep_moe(
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
 
-    if w1.shape != (num_experts, 2, hidden_size, intermediate_size):
-        raise ValueError(
-            f"Expected {w1.shape=} to be"
-            f" {(num_experts, 2, hidden_size, intermediate_size)}.")
+    if w13_concat_layout:
+        expected_w1_shape = (num_experts, hidden_size, 2 * intermediate_size)
+    else:
+        expected_w1_shape = (num_experts, 2, hidden_size, intermediate_size)
+    if w1.shape != expected_w1_shape:
+        raise ValueError(f"Expected {w1.shape=} to be {expected_w1_shape}.")
 
     if w2.shape != (num_experts, intermediate_size, hidden_size):
         raise ValueError(f"Expected {w2.shape=} to be"
                          f" {(num_experts, intermediate_size, hidden_size)}.")
+
+    if w13_concat_layout and b1 is not None:
+        raise NotImplementedError(
+            "w13_concat_layout does not carry the per-expert w1/w3 biases.")
 
     if gating_output.shape != (num_tokens, num_experts):
         raise ValueError(
@@ -1422,13 +1428,14 @@ def fused_ep_moe(
     # checkpoint offline or reshape right after weight loading.
     if w1_scale is not None:
         assert subc_quant_w1_sz is not None
-        expected_w1_scale_shape = (
-            num_experts,
-            2,
-            hidden_size // subc_quant_w1_sz,
-            1,
-            intermediate_size,
-        )
+        if w13_concat_layout:
+            expected_w1_scale_shape = (num_experts,
+                                       hidden_size // subc_quant_w1_sz, 1,
+                                       2 * intermediate_size)
+        else:
+            expected_w1_scale_shape = (num_experts, 2,
+                                       hidden_size // subc_quant_w1_sz, 1,
+                                       intermediate_size)
         if w1_scale.shape != expected_w1_scale_shape:
             raise ValueError(
                 f"Expected {w1_scale.shape=} to be {expected_w1_scale_shape}.")
@@ -1488,6 +1495,7 @@ def fused_ep_moe(
             scoring_fn=scoring_fn,
             subc_quant_w1_sz=subc_quant_w1_sz,
             subc_quant_w2_sz=subc_quant_w2_sz,
+            w13_concat_layout=w13_concat_layout,
             bt=bt,
             bf=bf,
             bd1=bd1,
