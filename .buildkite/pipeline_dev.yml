@@ -68,60 +68,36 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
+  # Perf Test: GLM-5.2 FP8 DP16 EP on Ray (TPU v7x-16)
   # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  - label: "Perf: Test glm-5.2-fp8-dp16-ep Ray (TPU v7x-16)"
+    key: test_glm_ray
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: tpu_v7x_16_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+      BENCHMARK_WARMUP_RUNS: "1"
     commands:
-      - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
 
   # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
+  # Perf Test: GLM-5.2 FP8 DP16 EP on MP (TPU v7x-16)
   # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
+  - label: "Perf: Test glm-5.2-fp8-mp-dp16-ep MP (TPU v7x-16)"
+    key: test_glm_mp
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: tpu_v7x_16_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+      BENCHMARK_WARMUP_RUNS: "1"
+      DATA_PARALLELISM_LOCAL: "8"
     commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+      - "bash .buildkite/scripts/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
