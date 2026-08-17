@@ -1252,6 +1252,12 @@ class TPURaidenConnectorWorker:
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
         self.transfer_stats = TpuKVConnectorStats()
+        try:
+            from tpu_raiden.api import telemetry
+            telemetry.configure_telemetry(["buffered"])
+            logger.info("Configured TPU Raiden telemetry with buffered backend.")
+        except Exception as e:
+            logger.warning("Failed to configure TPU Raiden telemetry: %s", e)
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",

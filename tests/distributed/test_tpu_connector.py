@@ -3423,6 +3423,7 @@ class TestTPUConnectorStats(unittest.TestCase):
                 per_engine_labelvalues={0: ["my_model", "0"]},
             )
 
+            mock_telemetry.configure_telemetry.assert_called_once_with(["buffered"])
             assert "vllm:tpu_raiden_dma_latency_ms" in metrics.dynamic_metrics
 
             mock_data = {
