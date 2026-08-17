@@ -26,7 +26,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
-    BATCH_AXIS, VllmDeepseekV4SWACache, _attention_jax, _attn_op_cache)
+    BATCH_AXIS, VllmDeepseekV4SWACache, _attention_jax)
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_indexer import \
@@ -40,6 +40,9 @@ from vllm.model_executor.layers.attention_layer_base import (  # isort: skip
     AttentionBackend, AttentionLayerBase)
 
 logger = init_logger(__name__)
+
+# Attention ops, memoized by name; this module is the only reader and writer.
+_attn_op_cache = {}
 
 
 class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
@@ -272,7 +275,6 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                    f"{'_aliased' if two_caches_same_buffer else ''}"
                    f"{'' if built_from_real_caches else '_prof'}")
 
-        global _attn_op_cache
         if op_name in _attn_op_cache:
             return _attn_op_cache[op_name], built_from_real_caches
 

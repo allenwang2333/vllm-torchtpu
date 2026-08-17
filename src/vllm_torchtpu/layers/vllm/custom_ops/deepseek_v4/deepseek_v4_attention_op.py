@@ -30,8 +30,6 @@ from vllm_torchtpu.utils import align_to
 
 logger = init_logger(__name__)
 
-_attn_op_cache = {}
-
 BATCH_AXIS = None
 
 
