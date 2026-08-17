@@ -383,9 +383,19 @@ an MHC cleanup rested on a misattribution (below). Splitting it into reviewable
 PRs and sending it is the highest-value remaining action, and it needs Pate —
 the agent never opens PRs.
 
-**The generic weight cache.** PR #468 closed unmerged 2026-08-15T03:01;
-`quant_weight_cache.py` is absent from `origin/main` and exists only on this
-branch. Decide resubmit vs drop.
+**The generic weight cache — not an open decision.** PR #468
+(`feat/generic-weight-cache`) was opened by an agent **without Pate's consent**
+and he closed it immediately, unmerged, with zero comments. It is not a pending
+"resubmit vs drop" question and must not be recorded as one; whether it is ever
+sent again is entirely his call and should not be raised unprompted.
+
+The code itself is live on this branch and is a real dependency, not dormant:
+`layers/common/quant_weight_cache.py` is imported by `mxfp4.py`, covered by
+`tests/layers/test_quant_weight_cache.py`, and is what every DSv4 run uses via
+`VLLM_QUANT_WEIGHT_CACHE_DIR` (the 132 GB `dsv4_quant_cache`). It is absent from
+`origin/main`, so the refactor stack carries it either way. Its claimed ~9
+minutes of startup saving is unverifiable today because the cache logs neither
+hits nor misses.
 
 **Nothing is owed on `tpu_compiler.py`.** `git diff origin/main HEAD` on that
 file is empty. The earlier "54+/26− still on the branch" came from diffing
