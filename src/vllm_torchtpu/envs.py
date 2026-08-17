@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     TPU_RAIDEN_TELEMETRY_BACKENDS: str = "buffered"
     USE_MOE_SPARSE_CORE: bool = True
-    ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_PARALLEL_PRECOMPILE: bool = False
 
 
 def env_with_choices(
@@ -129,22 +130,6 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
     return _get_optional_bool_env
 
 
-def env_optional_int(env_name: str) -> Callable[[], int | None]:
-    """
-    Integer parsing where, like ``env_optional_bool``, an unset or empty
-    variable reads as ``None`` so callers can tell "explicitly set" from
-    "not configured".
-    """
-
-    def _get_optional_int_env() -> int | None:
-        value = os.getenv(env_name)
-        if value is None or value == "":
-            return None
-        return int(value)
-
-    return _get_optional_int_env
-
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
@@ -169,9 +154,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID":
     lambda: os.getenv("TPU_WORKER_ID", None),
-    # Backend for multi-host communication on TPU
+    # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
+    # used whenever --nnodes > 1 and this isn't set to "ray"; set explicitly
+    # to "mp" to force it (e.g. to silence the auto-detection log line).
     "TPU_MULTIHOST_BACKEND":
-    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
+    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray", "mp"]),
     # Check for XLA recompilation during execution
     "VLLM_XLA_CHECK_RECOMPILATION":
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")),
@@ -248,15 +235,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
-    # Use one-hot matmuls for MoE permute and unpermute when the routed row
-    # count (num_tokens * topk) is <= this threshold. Unset or empty means
-    # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
-    # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
-    # size on the SparseCore path; a positive value forces that
-    # threshold. The knob and its row-count semantics come from
-    # tpu-inference PR #2674.
+    # Use Onehot+Matmul for permute and unpermute before and after moe
+    # when the batch size <= this threshold. When set to 0, this feature
+    # is effectively disabled.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
-    env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD") or "0"),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
@@ -315,6 +298,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Enable pre-compile rotation to speed up the startup time.
+    "TPU_PARALLEL_PRECOMPILE":
+    env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
 }
 
 

@@ -35,10 +35,23 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadata, AttentionMetadataBuilder,
     AttentionMetadataBuilderContext)
+from vllm_torchtpu.layers.vllm.attention import PallasAttentionBackend
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def _attention_layer_mock():
+    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
+
+    `get_kv_cache_spec` measures page padding through the backend the layer
+    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
+    and silently makes that arithmetic meaningless.
+    """
+    layer = MagicMock(spec=Attention)
+    layer.get_attn_backend.return_value = PallasAttentionBackend
+    return layer
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -532,7 +545,7 @@ class TestTPURunner:
                                            mock_get_page_size):
         layers = {}
         for i in range(1):
-            mock_attn = MagicMock(spec=Attention)
+            mock_attn = _attention_layer_mock()
             mock_attn.num_kv_heads = 2
             mock_attn.head_size = 128
             layers[f'attn_{i}'] = mock_attn
@@ -574,7 +587,7 @@ class TestTPURunner:
         to the uniform layout, which pads every block to the mamba page and
         silently shrinks the block pool ~50x."""
         layers = {}
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
         layers['attn_0'] = mock_attn
@@ -604,7 +617,7 @@ class TestTPURunner:
         self.runner.vllm_config.kv_transfer_config = kv_tc
 
         layers = {}
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
         layers['attn_0'] = mock_attn
@@ -819,7 +832,7 @@ class TestTPURunner:
                                                   mock_get_layers):
         layers = {}
 
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.attn_type = AttentionType.DECODER
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
@@ -886,7 +899,7 @@ class TestTPURunner:
         return_value=4096)
     def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(
             self, mock_get_page_size, mock_get_layers):
-        mock_attn = MagicMock(spec=Attention)
+        mock_attn = _attention_layer_mock()
         mock_attn.attn_type = AttentionType.DECODER
         mock_attn.num_kv_heads = 2
         mock_attn.head_size = 128
@@ -907,7 +920,7 @@ class TestTPURunner:
         return_value=4096)
     def test_get_kv_cache_spec_records_shared_layers(self, mock_get_page_size,
                                                      mock_get_layers):
-        owner = MagicMock(spec=Attention)
+        owner = _attention_layer_mock()
         owner.attn_type = AttentionType.DECODER
         owner.num_kv_heads = 2
         owner.head_size = 128
@@ -915,7 +928,7 @@ class TestTPURunner:
         owner.sliding_window = None
         owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
-        shared = MagicMock(spec=Attention)
+        shared = _attention_layer_mock()
         shared.attn_type = AttentionType.DECODER
         shared.num_kv_heads = 2
         shared.head_size = 128
@@ -934,14 +947,14 @@ class TestTPURunner:
         assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
 
     def _make_shared_pair(self, attn_window, target_window):
-        attn = MagicMock(spec=Attention)
+        attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
         attn.num_kv_heads = 2
         attn.head_size = 128
         attn.sliding_window = attn_window
         attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
 
-        target = MagicMock(spec=Attention)
+        target = _attention_layer_mock()
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
@@ -989,7 +1002,7 @@ class TestTPURunner:
                               target_quant,
                               attn_scale=1.0,
                               target_scale=1.0):
-        attn = MagicMock(spec=Attention)
+        attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
         attn.num_kv_heads = 2
         attn.head_size = 128
@@ -998,7 +1011,7 @@ class TestTPURunner:
         attn._v_scale_float = attn_scale
         attn.impl = MagicMock(kv_cache_quantized_dtype=attn_quant)
 
-        target = MagicMock(spec=Attention)
+        target = _attention_layer_mock()
         target.attn_type = AttentionType.DECODER
         target.num_kv_heads = 2
         target.head_size = 128
@@ -2097,3 +2110,477 @@ class TestUnifiedReadOffsetMigration:
         runner.mamba_slot_read_offsets[9] = 1
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[5]) == 1
+
+
+def test_dsv4_swa_overlay_plan():
+    """SWA caches overlay compatible compressed-KV arrays, positionally.
+
+    Mirrors the reference (`tpu_inference/runner/kv_cache_manager.py:1155-1178`):
+    a CSA page (256 rows) can host a 128-row SWA logical page; an HCA page
+    (8 rows) cannot. Layers of one group must land on *distinct* hosts because
+    they share a block table, and any overflow beyond the available hosts stays
+    unmapped so it gets its own array.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+
+    def mla(compress_ratio, head_size=640):
+        return MLAAttentionSpec(block_size=1024,
+                                num_kv_heads=1,
+                                head_size=head_size,
+                                dtype=torch.uint8,
+                                compress_ratio=compress_ratio,
+                                alignment=None)
+
+    def swa():
+        return SlidingWindowMLASpec(block_size=128,
+                                    num_kv_heads=1,
+                                    head_size=640,
+                                    dtype=torch.uint8,
+                                    sliding_window=128,
+                                    alignment=None)
+
+    specs = {
+        "m.layers.0.attn": mla(4),  # CSA host, 256 rows
+        "m.layers.1.attn": mla(4),  # CSA host, 256 rows
+        "m.layers.2.attn": mla(128),  # HCA, 8 rows -> too small
+        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),  # too narrow
+        "m.layers.0.attn.swa_cache": swa(),
+        "m.layers.1.attn.swa_cache": swa(),
+        "m.layers.2.attn.swa_cache": swa(),  # overflow: only 2 hosts fit
+    }
+
+    mla_group = SimpleNamespace(layer_names=[
+        "m.layers.0.attn", "m.layers.1.attn", "m.layers.2.attn",
+        "m.layers.0.attn.indexer.k_cache"
+    ])
+    swa_group = SimpleNamespace(layer_names=[
+        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache",
+        "m.layers.2.attn.swa_cache"
+    ])
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[mla_group, swa_group])
+
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
+
+    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
+        runner,
+        kv_cache_config,
+        specs.__getitem__,
+        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+            10,
+            spec.storage_block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+            head_size_is_packed_width=True),
+    )
+
+    # Two CSA hosts available -> two SWA layers map, third overflows.
+    assert len(overlay) == 2
+    # Distinct hosts: same-group layers share a block table, so two SWA caches
+    # on one array would be handed the same block id.
+    assert len(set(overlay.values())) == 2
+    # Never the HCA array (too few rows) or the indexer (too narrow).
+    assert "m.layers.2.attn" not in overlay.values()
+    assert "m.layers.0.attn.indexer.k_cache" not in overlay.values()
+    assert set(overlay.values()) <= {"m.layers.0.attn", "m.layers.1.attn"}
+
+
+def test_dsv4_swa_overlay_hosts_are_distinct_across_groups():
+    """A host must back at most one SWA cache, even across cache groups.
+
+    Regression test: assigning positionally *within* each group restarts at
+    hosts[0] for every group, so when the SWA layers are spread across many
+    groups (which is what vLLM actually produces here, not one group holding
+    all of them) every group piles onto the same array.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+
+    specs = {}
+    groups = []
+    for i in range(3):
+        specs[f"m.layers.{i}.attn"] = MLAAttentionSpec(block_size=1024,
+                                                       num_kv_heads=1,
+                                                       head_size=640,
+                                                       dtype=torch.uint8,
+                                                       compress_ratio=4,
+                                                       alignment=None)
+        specs[f"m.layers.{i}.attn.swa_cache"] = SlidingWindowMLASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None)
+        # One SWA layer per group -- the layout that exposed the bug.
+        groups.append(
+            SimpleNamespace(layer_names=[
+                f"m.layers.{i}.attn", f"m.layers.{i}.attn.swa_cache"
+            ]))
+
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
+
+    overlay = TPUModelRunner._plan_ds_v4_swa_overlay(
+        runner,
+        SimpleNamespace(kv_cache_groups=groups),
+        specs.__getitem__,
+        lambda spec: PallasMLAttentionBackend.get_kv_cache_shape(
+            10,
+            spec.storage_block_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+            head_size_is_packed_width=True),
+    )
+
+    assert len(overlay) == 3, overlay
+    assert len(set(
+        overlay.values())) == 3, (f"hosts reused across groups: {overlay}")
+
+
+def test_dsv4_specs_are_exempt_from_tpu_normalization():
+    """DSv4 specs must reach vLLM verbatim.
+
+    Without the exemption these specs get a `page_size_padded` derived from the
+    logical 1024-token `block_size` rather than `storage_block_size`. (The
+    packed `uint8` dtype is separately preserved by `_normalize_one_spec`'s
+    integer-MLA carve-out, so dtype alone does not distinguish the two paths.)
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.kv_cache_spec_normalizer import \
+        normalize_kv_cache_specs_for_tpu
+
+    # A DSv4-shaped compressed main-latent spec: 1024-token logical block
+    # compressed 4:1, packed as uint8.
+    ds_v4_spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        alignment=None,
+    )
+    ds_v4_swa_spec = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        sliding_window=128,
+        alignment=None,
+    )
+    specs = {
+        "model.layers.0.attn": ds_v4_spec,
+        "model.layers.0.attn.swa_cache": ds_v4_swa_spec,
+    }
+
+    out = normalize_kv_cache_specs_for_tpu(
+        specs,
+        torch.float8_e4m3fn,
+        exempt_layers=set(specs),
+    )
+
+    for name, original in specs.items():
+        assert out[name] is original, f"{name} was normalized"
+        assert out[name].dtype == torch.uint8
+        assert out[name].page_size_padded is None
+
+    # Without the exemption the same specs are rewritten -- guards against the
+    # exemption silently becoming a no-op.
+    unexempt = normalize_kv_cache_specs_for_tpu(specs, torch.float8_e4m3fn)
+    assert unexempt["model.layers.0.attn"] is not ds_v4_spec
+    assert unexempt["model.layers.0.attn"].page_size_padded is not None
+    # A page sized from the logical block, not from the compressed rows: this
+    # is exactly the over-allocation the exemption avoids.
+    assert (unexempt["model.layers.0.attn"].page_size_padded
+            > ds_v4_spec.block_size // ds_v4_spec.compress_ratio * 640)
+
+
+def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
+    """vLLM hands DSv4 its groups wrapped in `UniformTypeKVCacheSpecs`.
+
+    Two consequences for `initialize_kv_cache`, both exercised here: the group
+    spec must be unwrapped before any `isinstance` type test, and block size is
+    not uniform across groups, so it cannot be asserted equal.
+    """
+    from vllm.v1.core.kv_cache_utils import group_and_unify_kv_cache_specs
+    from vllm.v1.kv_cache_interface import (AttentionSpec, MambaSpec,
+                                            SlidingWindowMLASpec,
+                                            UniformTypeKVCacheSpecs)
+
+    # DSv4's real shape: a 1024-token main latent block compressed 4:1, and
+    # SWA caches whose block size is that compressed row count (256), capped
+    # by the window. Two window sizes give two distinct SWA groups.
+    specs: dict = {}
+    for i in range(2):
+        specs[f"m.layers.{i}.attn"] = MLAAttentionSpec(
+            block_size=1024,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            compress_ratio=4,
+            cache_dtype_str="fp8_ds_mla",
+            model_version="deepseek_v4",
+            alignment=None)
+        for window, block in ((256, 256), (128, 128)):
+            specs[f"m.layers.{i}.attn.swa_cache_w{window}"] = (
+                SlidingWindowMLASpec(block_size=block,
+                                     num_kv_heads=1,
+                                     head_size=640,
+                                     dtype=torch.uint8,
+                                     sliding_window=window,
+                                     cache_dtype_str="fp8_ds_mla",
+                                     model_version="deepseek_v4",
+                                     alignment=None))
+
+    grouped = group_and_unify_kv_cache_specs(specs)
+    assert grouped is not None, (
+        "vLLM did not take its DeepseekV4 grouping path for DSv4-shaped specs")
+    assert all(
+        isinstance(g, UniformTypeKVCacheSpecs)
+        for g in grouped), (f"expected UniformTypeKVCacheSpecs groups, got "
+                            f"{[type(g).__name__ for g in grouped]}")
+
+    # A bare isinstance test against the group spec sees neither AttentionSpec
+    # nor MambaSpec, which is why the representative spec is peeked at.
+    assert not any(isinstance(g, (AttentionSpec, MambaSpec)) for g in grouped)
+
+    block_sizes = {g.block_size for g in grouped}
+    assert len(block_sizes) > 1, (
+        f"expected mixed block sizes across DSv4 groups, got {block_sizes}")
+
+
+def test_dsv4_is_cache_for_ds_v4_predicate():
+    """The exemption must cover all four DSv4 cache-owning module types."""
+    from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
+                                                   DeepseekV4IndexerCache)
+    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    from vllm_torchtpu.runner.tpu_runner import is_cache_for_ds_v4
+
+    for cls in (DeepseekV4Attention, DeepseekV4SWACache,
+                DeepseekV4IndexerCache, CompressorStateCache):
+        assert is_cache_for_ds_v4(MagicMock(spec=cls)), cls.__name__
+
+    assert not is_cache_for_ds_v4(MagicMock(spec=Attention))
+    assert not is_cache_for_ds_v4(MagicMock(spec=MLAAttention))
+
+
+def test_dsv4_compressor_state_cache_aliasing():
+    """Verify compressor state caches are planned as overlays and aliased.
+
+    The overlay must be planned from layer NAMES alone, before any allocation:
+    an overlaid cache that gets its own array still costs its HBM at peak, even
+    though the alias frees it immediately afterwards.
+    """
+    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+
+    mock_runner = MagicMock()
+    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+
+    layer_name = "model.layers.0.self_attn.compressor.state_cache"
+    host_name = "model.layers.0.self_attn"
+    compressor_mock = MagicMock(spec=CompressorStateCache)
+
+    mock_runner.vllm_config.compilation_config.static_forward_context[
+        layer_name] = compressor_mock
+
+    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
+        mock_runner, [layer_name, host_name])
+    assert overlay == {layer_name: host_name}
+
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    def _spec(block_size):
+        return SlidingWindowMLASpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        )
+
+    # A CSA host page: (pages, rows/packing, packing, packed width) -> 256
+    # entries of 640 B.
+    host_tensor = torch.zeros(10, 64, 4, 640, dtype=torch.uint8)
+    kv_caches = {host_name: host_tensor}
+
+    TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner, kv_caches,
+                                                 overlay, lambda _: _spec(16))
+    assert kv_caches[layer_name] is host_tensor
+
+    # The state cache is packed into the host's page, so a block size that
+    # does not fit must fail here rather than corrupt the neighbouring page.
+    with pytest.raises(ValueError, match="B per page"):
+        TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner,
+                                                     {host_name: host_tensor},
+                                                     overlay,
+                                                     lambda _: _spec(1024))
+    # ...and one that fits but does not divide the host's entries.
+    with pytest.raises(ValueError, match="does not divide"):
+        TPUModelRunner._alias_ds_v4_auxiliary_caches(mock_runner,
+                                                     {host_name: host_tensor},
+                                                     overlay,
+                                                     lambda _: _spec(24))
+
+
+def test_dsv4_indexer_state_cache_overlay_targets_k_cache():
+    """An indexer's compressor state cache overlays the indexer's k_cache."""
+    mock_runner = MagicMock()
+    mock_runner.vllm_config.compilation_config.static_forward_context = {}
+
+    layer_name = "model.layers.0.attn.indexer.compressor.state_cache"
+    host_name = "model.layers.0.attn.indexer.k_cache"
+
+    overlay = TPUModelRunner._plan_ds_v4_auxiliary_overlay(
+        mock_runner, [layer_name, host_name])
+    assert overlay == {layer_name: host_name}
+
+
+def _block_size_for(architecture, backend_page_size=256, preferred=None):
+    """Run update_block_size_for_backend for one model architecture.
+
+    `preferred` mimics a backend whose get_preferred_block_size ignores its
+    argument, as DeepseekSparseSWABackend's hardcoded 256 does.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            user_specified_block_size=False,
+            block_size_unaligned=16,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_hybrid=False,
+            architecture=architecture,
+            hf_config=SimpleNamespace(architectures=[architecture]),
+        ),
+    )
+    backend_mock = MagicMock()
+    backend_mock.get_min_page_size.return_value = 1
+    backend_mock.get_page_size.return_value = backend_page_size
+    backend_mock.get_preferred_block_size.side_effect = ((
+        lambda d: preferred) if preferred is not None else (lambda d: d))
+    with patch.object(TpuPlatform,
+                      "_find_non_ssm_backend",
+                      return_value=backend_mock):
+        TpuPlatform.update_block_size_for_backend(vllm_config)
+    return vllm_config.cache_config.block_size
+
+
+def test_tpu_platform_block_size_override_is_dsv4_only():
+    """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
+
+    DSv4's own backend does not define get_page_size, so its size comes from
+    PallasMLAttentionBackend. Applying that to every `use_mla` model would
+    silently re-size DeepSeek-V2/V3 caches too.
+    """
+    assert _block_size_for("DeepseekV4ForCausalLM") == 1024
+    assert _block_size_for("DeepseekV2ForCausalLM") == 256
+    assert _block_size_for("DeepseekV32ForCausalLM") == 256
+
+    # DSv4's own backend hardcodes get_preferred_block_size to 256, which does
+    # not fit the packed latent record; DSv4 must not be clamped by it.
+    assert _block_size_for("DeepseekV4ForCausalLM", preferred=256) == 1024
+
+
+def test_spec_token_room_guard_caps_writes_at_context_limit():
+    """The wrapped update_req_spec_token_ids caps scheduled drafts to the
+    exact remaining token-buffer room at call time; unchecked, the write
+    overflows and kills the engine for requests near max_model_len."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
+            num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
+            req_id_to_index={
+                "roomy": 0,
+                "edge": 1,
+                "full": 2
+            },
+        ),
+        requests={},
+    )
+    calls = []
+    runner.input_batch.update_req_spec_token_ids = (
+        lambda request, scheduled: calls.append(
+            (request.req_id, list(scheduled[request.req_id]))))
+    TPUModelRunner._install_spec_token_room_guard(runner)
+
+    scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
+    for rid in ("roomy", "edge", "full"):
+        runner.input_batch.update_req_spec_token_ids(
+            SimpleNamespace(req_id=rid), scheduled)
+    assert [(r, len(ids)) for r, ids in calls] \
+        == [("roomy", 15), ("edge", 10), ("full", 0)]
+    # in-place dict trim keeps downstream consumers consistent
+    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
+        == [15, 10, 0]
+
+
+class TestUpdateAttentionPageSizePadded:
+    """_update_attention_page_size_padded must size pages with the caller's
+    block_size instead of self.block_size, which is initialized at __init__
+    time. This is because for hybrid models the update is skipped during that
+    time. It only gets updated after the model is loaded, so using
+    self.block_size will cause the unify_kv_cache_spec_page_size
+    `page_size_padded >= real_page_size_bytes` assertion.
+    """
+
+    @staticmethod
+    def _attn(num_kv_heads, head_size):
+        layer = MagicMock(spec=Attention)
+        layer.num_kv_heads = num_kv_heads
+        layer.head_size = head_size
+        return layer
+
+    @staticmethod
+    def _stub(stale_block_size=16):
+        return SimpleNamespace(
+            block_size=stale_block_size,
+            kv_cache_dtype=torch.bfloat16,
+            cache_config=SimpleNamespace(mamba_page_size_padded=None),
+            _hybrid_uniform_page_size_bytes=None,
+        )
+
+    def test_uses_caller_block_size_not_stale_snapshot(self):
+        # gemma-4 E4B geometry: sliding head_dim 256 vs global head_dim 512.
+        layers = {
+            "sliding": self._attn(num_kv_heads=2, head_size=256),
+            "full": self._attn(num_kv_heads=2, head_size=512),
+        }
+        stub = self._stub(stale_block_size=16)
+
+        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+
+        expected = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            256, 2, 512, torch.bfloat16)
+        stale = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 2, 512, torch.bfloat16)
+        assert stub._hybrid_uniform_page_size_bytes == expected
+        assert stub._hybrid_uniform_page_size_bytes != stale
+        assert stub.cache_config.mamba_page_size_padded == expected
+
+    def test_uniform_layers_leave_pinning_unset(self):
+        layers = {
+            "a": self._attn(num_kv_heads=2, head_size=256),
+            "b": self._attn(num_kv_heads=2, head_size=256),
+        }
+        stub = self._stub()
+
+        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
+
+        assert stub._hybrid_uniform_page_size_bytes is None
+        assert stub.cache_config.mamba_page_size_padded == \
+            PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                256, 2, 256, torch.bfloat16)

@@ -190,9 +190,12 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.nnodes = 1
+        vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1
         vllm_config.parallel_config.world_size_across_dp = 1
         vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size_local = 1
         vllm_config.parallel_config.enable_expert_parallel = False
         vllm_config.parallel_config.pipeline_parallel_size = 1
         vllm_config.parallel_config.tensor_parallel_size = 1
@@ -315,6 +318,10 @@ class TestTpuPlatform:
         # Attention-DP runs the split layout; async+APC is only rejected
         # there (the pool's seed copies support async scheduling).
         vllm_config.parallel_config.data_parallel_size = 8
+        # Single-host DP: every replica is local, so this reaches
+        # _prepare_singlehost_tpu_env rather than the multi-host DP
+        # rendezvous (which needs data_parallel_size_local < data_parallel_size).
+        vllm_config.parallel_config.data_parallel_size_local = 8
         # The non-raising row reaches the single-host DP env setup; a falsy
         # master ip takes the code's "localhost" fallback.
         vllm_config.parallel_config.data_parallel_master_ip = ""
@@ -357,20 +364,6 @@ class TestTpuPlatform:
         vllm_config.kv_transfer_config = MagicMock()
         vllm_config.kv_transfer_config.kv_connector = connector_name
         vllm_config.cache_config.block_size = 16
-
-        TpuPlatform.check_and_update_config(vllm_config)
-
-    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1"})
-    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
-    @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
-    )
-    def test_check_and_update_config_accepts_v2_connector_with_unified_pool(
-            self, mock_prepare_env, mock_apply_patches, vllm_config):
-        vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = "TPUConnectorV2"
-        vllm_config.cache_config.block_size = 16
-        vllm_config.cache_config.cache_dtype = "auto"
 
         TpuPlatform.check_and_update_config(vllm_config)
 
@@ -437,8 +430,9 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
-    def test_multimodal_forces_disable_chunked_mm_input(
-            self, mock_prepare_env, mock_apply_patches, vllm_config):
+    def test_multimodal_keeps_chunked_mm_input(self, mock_prepare_env,
+                                               mock_apply_patches,
+                                               vllm_config):
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             language_model_only=False, limit_per_prompt={"image": 1})
         vllm_config.cache_config.block_size = 16
@@ -447,7 +441,7 @@ class TestTpuPlatform:
 
         TpuPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
