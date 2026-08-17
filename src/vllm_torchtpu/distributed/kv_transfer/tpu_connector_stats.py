@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 
+import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -259,17 +260,25 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         # Dynamically load TPU Raiden C++ metric schema descriptors
         try:
             from tpu_raiden.api import telemetry
-            descriptors = telemetry.get_metric_descriptors()
+            dist_utils.configure_raiden_telemetry()
+            if hasattr(telemetry, "get_metric_metadata"):
+                descriptors = telemetry.get_metric_metadata()
+            elif hasattr(telemetry, "get_metric_descriptors"):
+                descriptors = telemetry.get_metric_descriptors()
+            else:
+                descriptors = []
+            print(descriptors)
         except Exception as e:
             logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
             descriptors = []
 
         for desc in descriptors:
             name = desc.name
-            help_str = desc.help
+            help_str = getattr(desc, "description", getattr(desc, "help", ""))
             mtype = desc.type
+            mtype_str = getattr(mtype, "name", str(mtype)).split(".")[-1].lower()
 
-            if mtype == "histogram":
+            if mtype_str == "histogram":
                 buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
                 metric_obj = self._histogram_cls(
                     name=name,
@@ -277,13 +286,13 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                     buckets=buckets_val,
                     labelnames=labelnames,
                 )
-            elif mtype == "counter":
+            elif mtype_str == "counter":
                 metric_obj = self._counter_cls(
                     name=name,
                     documentation=help_str,
                     labelnames=labelnames,
                 )
-            elif mtype == "gauge":
+            elif mtype_str == "gauge":
                 metric_obj = self._gauge_cls(
                     name=name,
                     documentation=help_str,
@@ -293,7 +302,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 continue
 
             self.dynamic_metrics[name] = (
-                mtype,
+                mtype_str,
                 create_metric_per_engine(metric_obj, self.per_engine_labelvalues)
             )
 

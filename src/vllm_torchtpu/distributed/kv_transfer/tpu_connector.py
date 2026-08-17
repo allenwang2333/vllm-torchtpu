@@ -1274,6 +1274,7 @@ class TPURaidenConnectorWorker:
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
         self.transfer_stats = TpuKVConnectorStats()
+        dist_utils.configure_raiden_telemetry()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
@@ -1283,7 +1284,12 @@ class TPURaidenConnectorWorker:
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         try:
             from tpu_raiden.api import telemetry
-            raiden_samples = telemetry.get_metric_samples()
+            dist_utils.configure_raiden_telemetry()
+            if hasattr(telemetry, "get_and_reset_metric_samples"):
+                raiden_samples = telemetry.get_and_reset_metric_samples()
+            else:
+                raiden_samples = telemetry.get_metric_samples()
+            print(raiden_samples)
             for metric_name, values in raiden_samples.items():
                 if metric_name not in self.transfer_stats.data:
                     self.transfer_stats.data[metric_name] = []
