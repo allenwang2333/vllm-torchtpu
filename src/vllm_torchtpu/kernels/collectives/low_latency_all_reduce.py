@@ -767,12 +767,44 @@ def two_shot_all_reduce_pair_ws(a: jax.Array,
                                 has_side_effects: bool = True):
     """One two-shot all-reduce over two operands, joined inside the kernel.
 
+    **Measured, and it loses. Not wired into production; kept for the probe arm
+    that measured it.** The kernel is fine -- what defeats it is the reshape at
+    its boundary. See the note below before reaching for this again.
+
     Reduces ``a`` and ``b`` as a single collective and returns them separately,
     without either the caller or XLA ever building a concatenation. That is the
     difference from doing it with ``torch.cat`` or ``jnp.concatenate``: both of
     those materialise a joined tensor in HBM, which measured the same either way
     (job 142) because relocating a concatenate does not remove it. Here the join
     is a VMEM store inside the kernel and the tensor never exists.
+
+    It still loses, by 10.3 us/layer. Job 151, 32 devices, K3's pair at a
+    single-token bucket:
+
+        arm            us/layer   vs xla   pair kernel   data formatting
+        concat           100.64    -4.84     12.98 us          0.11 ms
+        concat_pair      110.98    +5.50     13.53 us          0.62 ms
+
+    The collective is healthy -- Mosaic accepts the aligned stores and the
+    +0.55 us is just the padding -- but ``data formatting`` went *up* 5.6x,
+    which is the cost this was built to remove.
+
+    The reason is that the ~1.1 us per formatting op is **relayout**, not
+    dispatch overhead. This kernel wants ``(N, 1, numel/N)``, and reshaping
+    ``(1, 3584) -> (32, 1, 112)`` is a physical retiling rather than a view:
+    112 lanes against a 128-lane register, 224 against two. ``concat`` pays that
+    once on one joined tensor; this pays it four times, two operands in and two
+    out, at the worst widths. The clue was already in the earlier data --
+    formatting is 0.15 ms at a two-token bucket and 0.11 at one, and pure
+    per-op overhead would not move when the payload halves.
+
+    So the 301 us/step is not the concatenation at all, and no amount of not
+    concatenating will reach it. It is the cost of getting into the flat view
+    two-shot scatters over. Removing it means teaching two-shot to scatter along
+    a lane-aligned column split of the *natural* ``(rows, cols)`` shape, which
+    for ``(1, 7168)`` over 32 devices is 224 columns per device and therefore
+    unaligned by construction -- a redesign of the collective, not a wrapper
+    change, and worth a feasibility sweep before any of it is written.
 
     See :func:`two_shot_pair_layout` for why the operands are interleaved per
     device rather than concatenated end-to-end, and what the padding is for.
