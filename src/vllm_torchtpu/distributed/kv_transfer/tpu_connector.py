@@ -59,6 +59,11 @@ from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     ZmqShmKvConnectorBase, _CoordRecvEntry, _CoordSendEntry)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.startup_logging import (
+    process_startup_identity,
+    startup_logged,
+    startup_span,
+)
 
 logger = init_logger(__name__)
 
@@ -97,6 +102,11 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 # (FA first = H2D order rank 0).
 _STAGE3_TRANSFER_POOL_TAGS = ("fa", )
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
+
+
+def _connector_startup_identity(
+        _connector: object) -> tuple[int | None, int | None]:
+    return process_startup_identity()
 
 
 def _select_committed_mamba_blocks(
@@ -1300,6 +1310,7 @@ class TPURaidenConnectorWorker:
         return bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
                     and tpu_envs.TPU_RAIDEN_QWEN35_ADMISSION)
 
+    @startup_logged("raiden_pool_admission", _connector_startup_identity)
     def _admit_raiden_qwen35_kv_cache(self, runner: TPUModelRunner) -> None:
         """Constructs the v1 Raiden engine over the explicit Qwen3.5 pools."""
         if self._raiden_transfer_engine is not None:
@@ -1548,16 +1559,21 @@ class TPURaidenConnectorWorker:
         unit = self._new_raiden_id(
             self._raiden_work_unit_fields(transfer_rank))
         facade = self._new_raiden_controller_facade(controller_address)
-        facade.register_work_unit(
-            unit=unit,
-            shards=[data_address],
-            control_plane_rpc_address=listener_address,
-            pool_manifest=manifest.pool_dicts(),
-            layout_fingerprint=fingerprint,
-            page_tokens=page_tokens,
-            transfer_parallelism=transfer_parallelism,
-            transfer_rank=transfer_rank,
-        )
+        startup_rank, startup_world_size = process_startup_identity()
+        with startup_span(
+                "raiden_work_unit_register",
+                rank=startup_rank,
+                world_size=startup_world_size):
+            facade.register_work_unit(
+                unit=unit,
+                shards=[data_address],
+                control_plane_rpc_address=listener_address,
+                pool_manifest=manifest.pool_dicts(),
+                layout_fingerprint=fingerprint,
+                page_tokens=page_tokens,
+                transfer_parallelism=transfer_parallelism,
+                transfer_rank=transfer_rank,
+            )
 
         self._raiden_controller_facade = facade
         self._raiden_controller_address = controller_address

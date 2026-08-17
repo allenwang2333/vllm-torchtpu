@@ -31,10 +31,28 @@ from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.startup_logging import startup_logged, startup_span
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
 DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
+
+
+def _process_startup_identity(
+        worker: "TPUWorker") -> tuple[int, int]:
+    binding = get_tpu_worker_binding(
+        worker.parallel_config,
+        worker.rank,
+        worker.local_rank,
+        env=os.environ,
+        use_spawned_pcp_local_rank=True,
+    )
+    return binding.rank, binding.world_size
+
+
+def _worker_startup_identity(
+        worker: "TPUWorker") -> tuple[int, int]:
+    return worker.profile_rank, worker.profile_world_size
 
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
@@ -144,6 +162,7 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    @startup_logged("tpu_worker_init", _process_startup_identity)
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -420,6 +439,7 @@ class TPUWorker(WorkerBase):
             return
         jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
+    @startup_logged("memory_profile", _worker_startup_identity)
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
         # setup, users can run vllm without this flag, and collect the
@@ -608,12 +628,14 @@ class TPUWorker(WorkerBase):
         self.profile_session_index += 1
         return key
 
+    @startup_logged("model_load", _worker_startup_identity)
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu.platforms.tpu_platform import \
             _apply_model_specific_patches
         _apply_model_specific_patches(self.model_config)
         self.model_runner.load_model()
 
+    @startup_logged("model_compile", _worker_startup_identity)
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
@@ -666,8 +688,14 @@ class TPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
-        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        self.model_runner.initialize_kv_cache(kv_cache_config)
+        rank, world_size = _worker_startup_identity(self)
+        with startup_span(
+                "kv_transfer_init", rank=rank, world_size=world_size):
+            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        with startup_span("kv_cache_init",
+                          rank=rank,
+                          world_size=world_size):
+            self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()

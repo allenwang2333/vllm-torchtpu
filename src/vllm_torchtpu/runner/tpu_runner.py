@@ -104,6 +104,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.startup_logging import startup_logged, startup_span
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import extract_request_ids_for_tracing
@@ -171,6 +172,11 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+def _runner_startup_identity(
+        runner: "TPUModelRunner") -> tuple[int, int]:
+    return runner._profiler_rank, runner._profiler_world_size
 
 
 def _spec_warmup_all_token_ids(
@@ -4273,12 +4279,17 @@ class TPUModelRunner(GPUModelRunner):
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
         """Common boilerplate for each AOT bucket precompile pass."""
-        logger.info("Compiling %s with different input shapes.", name)
-        start = time.perf_counter()
-        yield
-        logger.info("Compilation finished in %.2f [secs].",
-                    time.perf_counter() - start)
-        self._update_num_xla_graphs(name)
+        rank, world_size = _runner_startup_identity(self)
+        with startup_span("compile_subgraph",
+                          rank=rank,
+                          world_size=world_size,
+                          detail=name):
+            logger.info("Compiling %s with different input shapes.", name)
+            start = time.perf_counter()
+            yield
+            logger.info("Compilation finished in %.2f [secs].",
+                        time.perf_counter() - start)
+            self._update_num_xla_graphs(name)
 
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
         return torch.zeros((num_reqs, self.vocab_size),
@@ -4925,6 +4936,7 @@ class TPUModelRunner(GPUModelRunner):
         finally:
             cc.cache_dir = saved_cache_dir
 
+    @startup_logged("profile_run", _runner_startup_identity)
     def profile_run(
         self,
         num_tokens: int,

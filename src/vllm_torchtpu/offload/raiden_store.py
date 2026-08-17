@@ -75,6 +75,12 @@ from vllm.v1.kv_offload.base import (CanonicalKVCaches, LoadStoreSpec,
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.startup_logging import (
+    begin_startup_span,
+    finish_startup_span,
+    process_startup_identity,
+    startup_span,
+)
 
 logger = init_logger(__name__)
 
@@ -223,22 +229,25 @@ class RaidenOffloadingManager(OffloadingManager):
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
                 "until %d worker(s) register", world_size)
-            store = store_types.KVCacheStore(
-                capacity=kernel_physical_blocks_capacity,
-                raiden_id=store_types.RaidenId(raiden_job_name, "0",
-                                               "kv_cache", 0),
-                # Transfer fanout is dynamically driven by registered workers.
-                num_shards=1,
-                shard_size_bytes=1,
-                raiden_controller_port=raiden_controller_port,
-                global_registry_address=global_registry_address,
-                # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
-                store_server_ip=store_server_ip or "127.0.0.1",
-                # Construction blocks in RaidenController::Init() until every
-                # rank registers, and raises on timeout
-                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
-                expected_worker_count=world_size,
-            )
+            with startup_span("raiden_store_barrier",
+                              rank=None,
+                              world_size=world_size):
+                store = store_types.KVCacheStore(
+                    capacity=kernel_physical_blocks_capacity,
+                    raiden_id=store_types.RaidenId(raiden_job_name, "0",
+                                                   "kv_cache", 0),
+                    # Transfer fanout is dynamically driven by registered workers.
+                    num_shards=1,
+                    shard_size_bytes=1,
+                    raiden_controller_port=raiden_controller_port,
+                    global_registry_address=global_registry_address,
+                    # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
+                    store_server_ip=store_server_ip or "127.0.0.1",
+                    # Construction blocks in RaidenController::Init() until every
+                    # rank registers, and raises on timeout
+                    # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+                    expected_worker_count=world_size,
+                )
             logger.info(
                 "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d kernel blocks "
                 "(%d offloaded blocks x %d), namespace=%s, controller at "
@@ -1095,11 +1104,25 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._rank = rank
         self._mgr = None
         self._stop_registration = threading.Event()
+        startup_rank, startup_world_size = process_startup_identity()
+        self._startup_registration_span = begin_startup_span(
+            "raiden_worker_register",
+            rank=startup_rank,
+            world_size=startup_world_size,
+        )
         self._register_thread = threading.Thread(
             target=self._register_loop,
             name=f"raiden-offload-register-rank{rank}",
             daemon=True)
-        self._register_thread.start()
+        try:
+            self._register_thread.start()
+        except BaseException as error:
+            finish_startup_span(
+                self._startup_registration_span,
+                "error",
+                error_type=type(error).__name__,
+            )
+            raise
 
     def _controller_reachable(self) -> bool:
         """TCP-probe the controller endpoint (a listening server is a
@@ -1141,6 +1164,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         "controller at %s (%d host kernel blocks)", self._rank,
                         self._controller_address,
                         self._host_blocks_to_allocate)
+                    finish_startup_span(self._startup_registration_span)
                     return
                 except Exception:
                     # A persistent failure escalates via the

@@ -275,6 +275,8 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.cache_config = MagicMock(num_gpu_blocks=None)
     worker.vllm_config = MagicMock()
     worker.model_runner = MagicMock()
+    worker.profile_rank = 0
+    worker.profile_world_size = 1
     kv_cache_config = MagicMock(num_blocks=2048)
 
     with patch("vllm_torchtpu.worker.tpu_worker."
