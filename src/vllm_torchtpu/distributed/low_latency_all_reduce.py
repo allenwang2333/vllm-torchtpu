@@ -496,47 +496,47 @@ class LowLatencyAllReduce:
 
     def _build_two_shot_pair(self, shape_a: tuple[int, ...],
                              shape_b: tuple[int, ...], dtype: torch.dtype):
-        """One two-shot over two operands, joined *inside* the jitted region.
-
-        **Measured, and it does not pay. Kept for the probe arm that measured
-        it; not wired into production.** Do not reach for this again without new
-        evidence -- the numbers below are the reason.
+        """One two-shot over two operands, joined inside the Pallas kernel.
 
         Reducing K3's latent-MoE pair as one collective needs both halves in a
         single payload. Doing that with ``torch.cat`` on the caller's side works
         -- measured on K3 job 139 at -3.3% TPOT -- but hands back 301 us per
         decode step, because the cat plus the two slices become ~4400 standalone
         data-formatting ops at roughly 1.1 us each. Copying 42 KiB costs about
-        0.04 us, which read as op overhead rather than bandwidth and suggested
-        the win would come from removing ops rather than bytes.
+        0.04 us, so that cost is op *overhead*: it is the number of ops that
+        matters, not the bytes, which is why it barely shrinks with the payload
+        and why it is proportionally worse at a single-token bucket, where the
+        collective it sits beside is smaller.
 
-        That reading was wrong. Joining here instead, onto jax arrays inside the
-        same jit as the kernel, does not remove the concatenation: XLA
-        materialises it either way and merely accounts it in the same
-        ``data formatting`` bucket. Job 142 ran both arms with every other
+        Two ways to remove it were tried. Moving the join into the jitted region
+        as a ``jnp.concatenate`` does *not* work: XLA materialises the
+        concatenation to HBM either way and merely accounts it in the same
+        ``data formatting`` bucket. Job 142, both arms with every other
         collective identical --
 
             arm                    us/layer   pair kernel   data formatting
             concat (caller cat)      100.59      15.19 us         0.15 ms
             concat_pair (in-jit)     101.53      15.24 us         0.15 ms
 
-        -- formatting unchanged to two decimals, kernel 0.05 us slower, 0.94
-        us/layer worse overall. (An earlier run made this look like a 0.58
-        us/call saving, but that run routed ``p`` to XLA in one arm only, so it
-        was comparing different collectives.) Removing the concatenation
-        therefore needs a kernel that never materialises it -- two input refs
-        staged into one VMEM buffer inside the Pallas kernel -- rather than a
-        change of where it is written.
+        -- formatting unchanged to two decimals, 0.94 us/layer worse overall.
+        Relocating a concatenate does not remove it.
+
+        So this builds on ``two_shot_all_reduce_pair_ws`` instead, which takes
+        the two operands as separate refs and joins them with a VMEM store
+        inside the kernel. No joined tensor is ever materialised, in HBM or
+        anywhere else, and the caller passes two tensors and gets two back.
+        See ``two_shot_pair_layout`` for the per-device interleave that makes
+        the join lane-aligned, and what its ~14% padding buys.
 
         Both operands must divide across the mesh *independently* -- ``numel %
         n`` for each, not merely for the sum -- so every device's chunk is a
-        clean piece of both. K3 qualifies: 7168 = 32 x 224, 14336 = 32 x 448.
+        clean piece of both. K3 qualifies at either decode bucket: 3584 and 7168
+        at one token, 7168 and 14336 at two.
         """
         import jax
-        import jax.numpy as jnp
 
-        from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
-            two_shot_all_reduce_ws
+        from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import (
+            two_shot_all_reduce_pair_ws, two_shot_pair_layout)
         from vllm_torchtpu.kernels.collectives.sharded_jax_op import \
             sharded_jax_op
 
@@ -553,12 +553,8 @@ class LowLatencyAllReduce:
         numel_b = 1
         for d in shape_b:
             numel_b *= d
-        if numel_a % n or numel_b % n:
-            raise ValueError(
-                f"both operands must divide across {n} devices, got "
-                f"{numel_a} and {numel_b}")
-        cols = (numel_a + numel_b) // n
-        chunk = 1
+        # Raises if either operand does not divide across the mesh.
+        _, _, _, cols = two_shot_pair_layout(numel_a, numel_b, n)
 
         def _fn(
             a: jax.Array, b: jax.Array, rs: jax.Array, ag: jax.Array,
@@ -566,20 +562,15 @@ class LowLatencyAllReduce:
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
 
             def body(a, b, rs, ag, step):
-                joined = jnp.concatenate([a.reshape(-1),
-                                          b.reshape(-1)]).reshape(n, cols)
-                out, rs, ag, step = two_shot_all_reduce_ws(
-                    joined,
-                    rs,
-                    ag,
-                    step,
-                    axis_name=axis,
-                    num_devices=n,
-                    collective_id=collective_id,
-                    has_side_effects=False)
-                flat = out.reshape(-1)
-                return (flat[:numel_a].reshape(a.shape),
-                        flat[numel_a:].reshape(b.shape), rs, ag, step)
+                return two_shot_all_reduce_pair_ws(a,
+                                                   b,
+                                                   rs,
+                                                   ag,
+                                                   step,
+                                                   axis_name=axis,
+                                                   num_devices=n,
+                                                   collective_id=collective_id,
+                                                   has_side_effects=False)
 
             return jax.shard_map(body,
                                  mesh=mesh,
@@ -597,8 +588,11 @@ class LowLatencyAllReduce:
             donate_argnums=(2, 3, 4) if donation_enabled() else None,
         )
         device = self._comm.device
-        rs = torch.zeros((2, n - 1, chunk, cols), dtype=dtype, device=device)
-        ag = torch.zeros((2, n, chunk, cols), dtype=dtype, device=device)
+        # Sized on the padded per-device width: the workspaces carry what the
+        # kernel exchanges, which is the interleaved-and-padded layout rather
+        # than the bare sum of the two operands.
+        rs = torch.zeros((2, n - 1, 1, cols), dtype=dtype, device=device)
+        ag = torch.zeros((2, n, 1, cols), dtype=dtype, device=device)
         step = torch.zeros(1, dtype=torch.int32, device=device)
         return op, (rs, ag, step)
 
