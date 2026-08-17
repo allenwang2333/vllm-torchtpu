@@ -76,10 +76,9 @@ asked for on PR #462 and it has never been sent.
 the earlier advice to hold it until the MHC cleanup landed rested on a
 misattribution — the MHC item was never something gxd3 raised.
 
-Open ordering question, Pate's: send the nine commits as they stand, or
-restructure the package first and send the result. The restructure is one gate
-and makes the submitted layout the final one, which avoids asking a reviewer to
-read a 795-line file we already intend to split.
+Ordering is settled: the package was restructured first (`421698f0`), so what
+gets submitted is already the final layout rather than a 795-line file a
+reviewer would be asked to read and then re-review after a split.
 
 The agent never opens PRs. It can draft the split and the PR bodies.
 
@@ -105,7 +104,7 @@ point at different flags.
 
 ## Dropped: MHC op registration
 
-`model.py:147` assigns `HCHeadOp.forward_native` onto a vLLM class at import
+`layers.py:116` assigns `HCHeadOp.forward_native` onto a vLLM class at import
 time, where the reference registers four subclasses through vLLM's out-of-tree
 hook. The item claimed this was "the pattern gxd3 asked us to leave on PR #462".
 Verified against the threads on 2026-08-16: it is not. His #462 comment asks for

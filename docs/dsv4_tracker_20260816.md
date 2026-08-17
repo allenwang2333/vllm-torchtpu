@@ -453,9 +453,9 @@ What gxd3 actually asked, verified against the threads on 2026-08-16:
 None mentions MHC, `HCHeadOp`, `forward_native` or `register_oot`.
 
 One measurement worth keeping from the attempt: our `mhc_pre_torch` and
-`mhc_post_torch` (`model.py:57-125`) are line-for-line identical to vLLM's
+`mhc_post_torch` (`layers.py:26-95`) are line-for-line identical to vLLM's
 `model_executor/kernels/mhc/torch.py`, so they could delegate. Our
-`mhc_hc_head_native` (`model.py:128-144`) is **not** identical to the
+`mhc_hc_head_native` (`layers.py:97-113`) is **not** identical to the
 reference's `forward_tpu`: ours keeps float32 through the linear and the
 weighted sum, the reference downcasts to bfloat16 first. Ours is the
 higher-precision path and is what the 0.78 MMLU-Pro results were measured with,
