@@ -46,6 +46,48 @@ Arms, and what each answers:
               combiner was providing and uses the faster collective for it.
               Turns the ~27 us projection into a measurement.
 
+``--intra-chip-latent`` is the Tier-2 probe for the ``[2,3584]`` site wait, the
+largest single number in the investigation: that reduction costs 17.31 us
+isolated and 32.66 in production, +88%, while the *larger* ``[2,7168]`` pays only
++8%. A smaller payload cannot take longer on the same network, so ~15 us of it is
+the collective blocked at its barrier rather than working -- and it is uniform
+across ranks (CV 1.5%, so not skew) and implementation-independent (XLA +88%,
+one-shot +85%), which is why no kernel touches it. At 92 layers it is ~1.4 ms per
+decode step, roughly 8% of TPOT, and the control pays it too.
+
+A plain matmul producer does not reproduce it: this probe's standalone
+``[2,3584]`` reads 17.60, i.e. the isolated cost. The K3 trace says why -- its
+operand arrives via an async ``copy-done``, and there are all-gathers at
+``bf16[1,2,1792]`` / ``bf16[2,2,1792]`` right beside the reduction, where
+1792 = 3584/2. That is the latent projection sharded across a chip's two cores
+and gathered before the TP reduce. So the flag models the real producer chain:
+a half-width matmul, an intra-chip all-gather over a 2-rank subgroup, then the
+TP all-reduce.
+
+**Measured, and the intra-chip gather is exonerated.** Paired runs (132 plain,
+133 with the flag):
+
+    collective us/occ        plain   intra-chip   K3 production
+    standalone [2,3584]      17.74        16.28           32.66
+    fused pair               21.16        18.85           33.97
+    intra-chip all-gather        -      2.0-2.3         1.8-1.9
+
+The reduction got *faster* with the sharded-and-gathered producer, not slower,
+and nowhere near production's 32.66. The model is not too weak to show the
+effect either -- its all-gather reproduces K3's within 0.4 us. So the wait does
+not come from the gather-to-reduce handoff, and the
+``TPU_LATENT_PROJ_INTRA_CHIP_TP=0`` arm that would have tested the same
+hypothesis on K3 is unnecessary.
+
+What is left is upstream of anything modelled here. The reduction is the first
+consumer of the latent-*MoE* result, so its operand waits on the expert
+computation -- routing, dispatch, the EP combine across chips, and whatever
+SparseCore does in that path -- not on a projection. Uniform per-rank self time
+(CV 1.5%) says each rank blocks the same amount on a local dependency rather
+than on a straggler peer, which fits an operand that simply is not ready ~15 us
+after the collective is scheduled. Modelling that needs a real MoE layer
+(Tier 3), not a producer stub.
+
 **Read the collective rows from the trace, not the us/layer slope.** Across two
 runs of identical code (jobs 129 and 130) the per-collective self time
 reproduced to within 0.07 us while the whole-layer slope moved up to 7 us for
@@ -73,6 +115,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch_tpu  # noqa: F401  -- registers the 'tpu' device and backends
+from torch.distributed._functional_collectives import \
+    all_gather_tensor as funcol_all_gather
 from torch.distributed._functional_collectives import \
     all_reduce as funcol_all_reduce
 from torch_tpu._internal.profiler import TpuProfilerConfig
@@ -130,6 +174,13 @@ def parse_args():
         "purpose: the workspace slot parity alternates per call, so "
         "a single call cannot catch a workspace that goes stale "
         "between calls.")
+    p.add_argument(
+        "--intra-chip-latent",
+        action="store_true",
+        help="Produce the latent operand the way K3 does: the projection "
+        "sharded across a chip's two cores and all-gathered before the TP "
+        "reduce, instead of one replicated matmul. This is the Tier-2 probe "
+        "for the [2,3584] site wait -- see the module docstring.")
     p.add_argument("--profile-dir", default=None)
     p.add_argument("--profile-reps", type=int, default=3)
     return p.parse_args()
@@ -236,11 +287,46 @@ def main() -> int:
     def xla_reduce(t):
         return funcol_all_reduce(t, "sum", list(range(world_size)))
 
+    # The intra-chip group, for --intra-chip-latent. Adjacent ranks share a
+    # chip: the dispatcher's rank-in-group -> device-id map came out
+    # [8, 9, 12, 13, ...], so rank pairs land on consecutive device ids, which
+    # are the two cores of one chip.
+    #
+    # Every rank creates every group, in the same order, and keeps its own.
+    # new_group is collective -- a rank that builds only its own pair deadlocks
+    # the others -- and the uniform order is what keeps the per-rank graphs
+    # structurally identical, which this repo needs for the collectives to get
+    # matching XLA channel ids.
+    chip_group = None
+    if args.intra_chip_latent:
+        if world_size % 2:
+            lead(f"!! --intra-chip-latent needs an even world_size, "
+                 f"got {world_size}")
+            dist.destroy_process_group()
+            return 2
+        for base in range(0, world_size, 2):
+            grp = dist.new_group(ranks=[base, base + 1])
+            if rank // 2 == base // 2:
+                chip_group = grp
+        lead(f"intra-chip latent: 2-core subgroups, latent shard "
+             f"{R}x{L // 2}, gathered to {R}x{L}")
+
     # Producers. Real matmuls so each reduction's operand arrives rather than
     # being resident, which is the other thing the old benches never modelled.
     g = torch.Generator().manual_seed(1234)
-    w_latent = (torch.randn(H, L, generator=g,
-                            dtype=torch.float32).to(dtype).to(device))
+    w_latent_full = torch.randn(H, L, generator=g, dtype=torch.float32)
+    if args.intra_chip_latent:
+        # Column-sharded across the chip's two cores, so this core computes
+        # half the latent width and the gather reassembles it. Seeded
+        # identically on every rank, then sliced, so the two halves compose
+        # back into exactly the replicated weight -- which is what lets the
+        # gathered result be compared against the unsharded reference.
+        half = L // 2
+        which = rank % 2
+        w_latent = (w_latent_full[:, which * half:(which + 1) *
+                                  half].contiguous().to(dtype).to(device))
+    else:
+        w_latent = w_latent_full.to(dtype).to(device)
     w_shared = (torch.randn(H, H, generator=g,
                             dtype=torch.float32).to(dtype).to(device))
     w_back = (torch.randn(L, H, generator=g,
@@ -267,7 +353,17 @@ def main() -> int:
             h2 = h + ((p @ gap_w) @ gap_w2)
 
             # a and b -- independent of each other, both downstream of p.
-            lat = h2 @ w_latent
+            if chip_group is not None:
+                # K3's real producer chain: a half-width matmul on each of the
+                # chip's two cores, then an intra-chip all-gather to reassemble
+                # the latent, and only then the TP all-reduce. The reduce
+                # therefore waits on the gather's copy rather than reading a
+                # resident tensor, which is the arrangement the +88% site wait
+                # is suspected to come from.
+                lat_shard = h2 @ w_latent
+                lat = funcol_all_gather(lat_shard, 1, chip_group)
+            else:
+                lat = h2 @ w_latent
             sh = h2 @ w_shared
             if arm == "concat":
                 # One reduction over both, which is what the combiner was

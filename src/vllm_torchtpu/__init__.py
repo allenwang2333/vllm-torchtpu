@@ -396,6 +396,8 @@ def _patch_rowparallel_defer_bias() -> None:
                                   tensor_model_parallel_all_reduce)
     from vllm.model_executor.layers.linear import RowParallelLinear
 
+    from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
+
     # Preserve the genuine upstream forward once so re-application (e.g. a
     # test that re-applies after mocking the all-reduce) never captures an
     # already-patched forward as the trunk reference.
@@ -423,7 +425,24 @@ def _patch_rowparallel_defer_bias() -> None:
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if do_all_reduce:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            # Under TPU_LOW_LATENCY_ALLREDUCE_SITE=rowparallel the low-latency
+            # kernel is delivered *here* rather than through the communicator,
+            # so it reaches this site and not the reduction inside the MoE
+            # block that XLA's combiner fuses with the latent one beside it.
+            # Both carry the same shape, so the communicator -- which routes by
+            # shape -- cannot tell them apart; see _ROWPARALLEL_ENTRY.
+            #
+            # Read at trace time, when warmup() has already made it final, so
+            # dynamo folds it away instead of emitting a branch. The op checks
+            # the shape itself and falls back to XLA for anything it was not
+            # built for, so sending every row-parallel reduction through it is
+            # safe.
+            entry = _llar._ROWPARALLEL_ENTRY
+            if entry is not None:
+                op, *buffers = entry
+                output = op(output_parallel, *buffers)
+            else:
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
