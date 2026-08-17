@@ -669,11 +669,34 @@ were committed before gating. Reference tree: `tpu-inference` at `f329f3480`.
 | xla dump attempt 1 | 9216 | 0.92 | 8 | 1024 | compiled | yes | died in 36 s: `--xla_dump_hlo_memory_schedule_info` is not an `XLA_FLAGS` name |
 | xla dump attempt 2 | 9216 | 0.92 | 8 | 1024 | compiled | yes | reached the failure, 106.45G. Flag table captured; **buffer breakdown lost to `--xla_dump_max_hlo_modules=20`** |
 
-**No DSv4 throughput number has ever been obtained.** The benchmark config at
-`scripts/vllm/benchmarking/configs/deepseek-v4-flash-tp8-ep.sh` has never
-completed a run — every attempt died on the allocation failure now fixed. The
-only throughput figures are the serving-log medians above. Its
-`GPU_MEMORY_UTILIZATION=0.55` can now be raised to 0.75.
+**No DSv4 throughput number had ever been obtained**, and the benchmark config
+turned out to carry three separate defects, each of which alone prevented it
+running. All fixed 2026-08-17:
+
+1. `GPU_MEMORY_UTILIZATION=0.55` — a workaround for the KV over-allocation,
+   obsolete once that was fixed. Now 0.75, the highest verified to serve.
+2. `MAX_MODEL_LEN=10240` — at util 0.75 the profiler leaves 51.71 GiB for KV
+   and 10240 needs 53.11, so startup failed outright with a `ValueError`
+   naming 9968 as the achievable maximum. Now 9216, which is exactly
+   8192+1024 and 1024+8192 so every combo fits.
+3. `RANGE_RATIO_STYLE` unset — the default *symmetric* reading of
+   `RANDOM_RANGE_RATIO=0.8` samples input lengths in `[(1-r)L, (1+r)L]`, i.e.
+   up to **14,746 tokens** at ISL 8192, past any context this model serves.
+   Now `"min"` (`[rL, L]`), which is what the other large configs use.
+
+The sweep also lacked `1024:8192`, the decode-heavy case every other large
+config runs — and the case that matters most here, since the gap against
+tpu-inference widens on decode (1.45x at batch 8 to 3.34x at batch 128) and
+decode is what the recovered KV capacity buys. Added, and listed second so a
+timeout truncates the prefill-heavy case instead.
+
+**Reading the results.** At the benchmark's dimensions the probe measured KV
+115,565 tokens, 12.54x concurrency at 9216 — far below the 485,612 seen at
+seqs 8 / batched 1024, confirming `max-num-batched-tokens` as the dominant
+consumer. So on the `1024:8192` combo only ~12 requests are resident at once:
+at `CONCURRENCY_OPTIONS=256` the rest queue, and median TTFT becomes
+queue-position noise rather than latency. Throughput stays valid; TTFT at 256
+does not.
 
 ## Standing caveats
 
