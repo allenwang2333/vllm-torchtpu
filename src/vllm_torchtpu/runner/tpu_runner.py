@@ -314,6 +314,21 @@ def _torch_tpu_wrapper():
                 setattr(torch.cuda, k, v)
 
 
+def _make_attention_spec(spec_cls, **kwargs):
+    import inspect
+    try:
+        sig = inspect.signature(spec_cls.__init__)
+        params = sig.parameters
+        has_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if not has_var_kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+    except (ValueError, TypeError):
+        pass
+    return spec_cls(**kwargs)
+
+
 def _warn_if_kv_cache_is_padded(
     backend: type[AttentionBackend],
     block_size: int,
@@ -1094,7 +1109,8 @@ class TPUModelRunner(GPUModelRunner):
                             self.kv_cache_dtype,
                         ))
                     if attn_module.sliding_window is not None:
-                        kv_cache_spec[layer_name] = SlidingWindowSpec(
+                        kv_cache_spec[layer_name] = _make_attention_spec(
+                            SlidingWindowSpec,
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
@@ -1104,7 +1120,8 @@ class TPUModelRunner(GPUModelRunner):
                             indexes_kv_by_block_stride=True,
                         )
                     else:
-                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                        kv_cache_spec[layer_name] = _make_attention_spec(
+                            FullAttentionSpec,
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
@@ -1136,7 +1153,8 @@ class TPUModelRunner(GPUModelRunner):
                         attn_module.head_size,
                         self.kv_cache_dtype,
                     ))
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                kv_cache_spec[layer_name] = _make_attention_spec(
+                    MLAAttentionSpec,
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=attn_module.head_size,

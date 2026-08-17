@@ -1272,6 +1272,12 @@ class TPURaidenConnectorWorker:
                 if metric_name not in self.transfer_stats.data:
                     self.transfer_stats.data[metric_name] = []
                 self.transfer_stats.data[metric_name].extend(values)
+                alt_name = (metric_name.removeprefix("tpu_raiden_")
+                            if metric_name.startswith("tpu_raiden_")
+                            else f"tpu_raiden_{metric_name}")
+                if alt_name not in self.transfer_stats.data:
+                    self.transfer_stats.data[alt_name] = []
+                self.transfer_stats.data[alt_name].extend(values)
         except Exception as e:
             logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
 

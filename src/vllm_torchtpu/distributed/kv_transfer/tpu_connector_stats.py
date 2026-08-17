@@ -267,8 +267,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
 
         for desc in descriptors:
             name = desc.name
-            help_str = desc.help
-            mtype = desc.type
+            help_str = getattr(desc, "help", getattr(desc, "description", ""))
+            mtype = str(getattr(desc.type, "name", desc.type)).lower()
 
             if mtype == "histogram":
                 buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
@@ -344,8 +344,12 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
 
         # Dynamic metric observations
         for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
-            if name in transfer_stats_data and transfer_stats_data[name]:
-                for val in transfer_stats_data[name]:
+            vals = (transfer_stats_data.get(name) or
+                    transfer_stats_data.get(f"tpu_raiden_{name}") or
+                    (transfer_stats_data.get(name.removeprefix("tpu_raiden_"))
+                     if name.startswith("tpu_raiden_") else None))
+            if vals:
+                for val in vals:
                     if mtype == "histogram":
                         per_engine_obj[engine_idx].observe(val)
                     elif mtype == "counter":

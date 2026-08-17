@@ -607,8 +607,11 @@ def _patch_vllm_offloading_config_build() -> None:
     import sys
     from dataclasses import replace
 
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
-        config as offloading_config_module
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import \
+            config as offloading_config_module
+    except (ImportError, AttributeError):
+        return
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch",
                False):
@@ -683,8 +686,11 @@ def _patch_vllm_offloading_connector_spec() -> None:
     hand the spec all three. Non-TPU specs keep the stock construction
     path untouched.
     """
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
-        OffloadingConnector
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import \
+            OffloadingConnector
+    except (ImportError, AttributeError):
+        return
 
     if getattr(OffloadingConnector, "_tpu_offloading_spec_patch", False):
         return
