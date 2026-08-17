@@ -22,7 +22,8 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
-    fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
+    fused_moe_func, quantize_to_native_fp4_kmajor,
+    quantize_to_native_int8_kmajor, requant_unpack_kmajor,
     resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
@@ -30,6 +31,7 @@ _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[int, Callable] = {}
+_quantize_native_int8_kmajor_ops: dict[int, Callable] = {}
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -96,6 +98,23 @@ def quantize_native_fp4_kmajor(
             f"pallas::nvfp4_quantize_native_kmajor_b{block}",
             functools.partial(quantize_to_native_fp4_kmajor, block=block))
         _quantize_native_fp4_kmajor_ops[block] = op
+    return op(w)
+
+
+def quantize_native_int8_kmajor(
+        w: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an already-dequantized, K-major float weight to int8.
+
+    The int8 analogue of ``quantize_native_fp4_kmajor``. int8 crosses the
+    PyTorch/JAX bridge as itself, so the result needs no unpacking step on the
+    torch side.
+    """
+    op = _quantize_native_int8_kmajor_ops.get(block)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::int8_quantize_native_kmajor_b{block}",
+            functools.partial(quantize_to_native_int8_kmajor, block=block))
+        _quantize_native_int8_kmajor_ops[block] = op
     return op(w)
 
 

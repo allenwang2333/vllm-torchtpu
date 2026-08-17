@@ -149,6 +149,38 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     return packed, scale
 
 
+def quantize_to_native_int8_kmajor(w: jax.Array,
+                                   block: int) -> tuple[jax.Array, jax.Array]:
+    """Quantize K-major float weight ([..., K, N]) to int8 and per-block FP32 scale.
+
+    The int8 counterpart of ``quantize_to_native_fp4_kmajor``: same blocking
+    along K and the same ``[..., K/block, 1, N]`` scale layout, so gmm_v2 reads
+    both through one code path. int8 needs no bit-packing -- ``get_packing_factor``
+    returns 1 when the quant dtype is the storage dtype -- so the values are
+    returned in place rather than two to a byte.
+
+    Unlike the fp4 cast, ``astype(int8)`` truncates toward zero, so the round to
+    nearest is explicit here.
+    """
+
+    size_k = w.shape[-2]
+    num_blocks = size_k // block
+    blocked = w.astype(jnp.float32).reshape(*w.shape[:-2], num_blocks, block,
+                                            w.shape[-1])
+    int8_info = jnp.iinfo(jnp.int8)
+    abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
+    scale = abs_max / float(int8_info.max)
+    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+    quantized = jnp.clip(jnp.round(blocked * scale_inv),
+                         float(int8_info.min),
+                         float(int8_info.max)).astype(jnp.int8)
+    quantized = quantized.reshape(*w.shape[:-2], size_k,
+                                  w.shape[-1])  # [..., K, N]
+
+    scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
+    return quantized, scale
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,

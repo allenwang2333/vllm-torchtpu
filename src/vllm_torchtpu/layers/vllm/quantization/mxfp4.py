@@ -45,6 +45,8 @@ scaling.
    - Returns output tensor
 """
 
+import functools
+import os
 import types
 from typing import Any, Optional
 
@@ -70,13 +72,16 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import \
+    get_tpu_version
 from vllm_torchtpu.layers.common.quant_methods import (MXFP4,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.common.quantization import dequantize_mxfp4_packed
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
-                                                 quantize_native_fp4_kmajor)
+                                                 quantize_native_fp4_kmajor,
+                                                 quantize_native_int8_kmajor)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
 
@@ -307,6 +312,52 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
                           if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512)
 
+# Weight dtypes the DeepSeek-V4 expert path can requantize to. Both are read by
+# gmm_v2 through the same blocked-scale layout; they differ in which MXU path
+# the kernel can then use.
+_DSV4_MOE_WEIGHT_DTYPES: dict[str, Any] = {
+    "fp4": jnp.float4_e2m1fn,
+    "float4_e2m1fn": jnp.float4_e2m1fn,
+    "int8": jnp.int8,
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _dsv4_moe_weight_dtype() -> Any:
+    """Resolve the expert weight dtype for the DeepSeek-V4 MoE path.
+
+    fp4 weights are deliberately paired with bf16 activations
+    (``gmm_wrapper`` sets ``maybe_quantize_lhs=False`` for a 4-bit float rhs),
+    so on a TPU generation without an fp4 MXU path the experts fall back to a
+    bf16 matmul. int8 weights keep the lhs quantized to int8 and stay on the
+    integer MXU, which is the only quantized compute path pre-v7. Default
+    accordingly, and let an operator override either way.
+
+    ``MOE_REQUANTIZE_WEIGHT_DTYPE`` is read from the environment rather than
+    from ``envs``: the envs module supplies a ``float8_e4m3fn`` default meant
+    for the sibling fp8 path, and an fp8 rhs is not something this path
+    produces. Only an explicitly set, recognized value overrides the default.
+    """
+    default = (jnp.float4_e2m1fn
+               if get_tpu_version() >= 7 or get_tpu_version() < 0 else jnp.int8)
+
+    requested = os.environ.get("MOE_REQUANTIZE_WEIGHT_DTYPE")
+    if not requested:
+        dtype = default
+    else:
+        dtype = _DSV4_MOE_WEIGHT_DTYPES.get(requested.lower())
+        if dtype is None:
+            supported = ", ".join(sorted(_DSV4_MOE_WEIGHT_DTYPES))
+            logger.warning(
+                "MOE_REQUANTIZE_WEIGHT_DTYPE=%r is not a DeepSeek-V4 expert "
+                "weight dtype (supported: %s); using %s.", requested, supported,
+                jnp.dtype(default).name)
+            dtype = default
+
+    logger.info_once("DeepSeek-V4 expert weights requantize to %s on TPU v%s.",
+                     jnp.dtype(dtype).name, get_tpu_version())
+    return dtype
+
 
 def _dsv4_weight_loader(self,
                         param,
@@ -320,7 +371,8 @@ def _dsv4_weight_loader(self,
     DeepSeek-V4 checkpoints store w1/w3/w2 as separate tensors, whereas vLLM
     allocates fused w13/w2 parameters. This loader stages raw w1/w3/w2 shards
     into w1_temp/w3_temp/w2_temp buffers per layer instance so they can be
-    concatenated, re-quantized to native FP4, and padded in process_weights_after_loading.
+    concatenated, re-quantized to the resolved expert weight dtype, and padded
+    in process_weights_after_loading.
     """
     orig_tp_rank = self.moe_config.moe_parallel_config.tp_rank
     self.moe_config.moe_parallel_config.tp_rank = 0
@@ -362,7 +414,12 @@ def _dsv4_weight_loader(self,
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
-    rhs_quant_dtype = jnp.float4_e2m1fn
+
+    @property
+    def rhs_quant_dtype(self) -> Any:
+        # Resolved once per process, and read by the forward, the requantize
+        # and the kernel prebuild alike so the three cannot disagree.
+        return _dsv4_moe_weight_dtype()
 
     def create_weights(
         self,
@@ -488,6 +545,39 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         return (w13_weight_processed, w2_weight_processed, w13_weight_scale,
                 w2_weight_scale)
 
+    def _requantize_native_int8(
+        self,
+        w13_weight_padded: torch.Tensor,
+        w2_weight_padded: torch.Tensor,
+        orig_intermediate_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize padded tensors to int8 K-major layout on TPU."""
+        w13_block_size = REQUANTIZED_BLOCK_SIZE
+        w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
+
+        w13_weight_processed, w13_weight_scale = quantize_native_int8_kmajor(
+            w13_weight_padded.to(device), block=w13_block_size)
+        w2_weight_processed, w2_weight_scale = quantize_native_int8_kmajor(
+            w2_weight_padded.to(device), block=w2_block_size)
+
+        return (w13_weight_processed, w2_weight_processed, w13_weight_scale,
+                w2_weight_scale)
+
+    def _requantize(
+        self,
+        w13_weight_padded: torch.Tensor,
+        w2_weight_padded: torch.Tensor,
+        orig_intermediate_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Requantize the padded bf16 weights to the resolved expert dtype."""
+        requantize = (self._requantize_native_int8
+                      if self.rhs_quant_dtype == jnp.int8 else
+                      self._requantize_native_fp4)
+        return requantize(w13_weight_padded, w2_weight_padded,
+                          orig_intermediate_size, device)
+
     def _cleanup_temp_buffers(self, layer: RoutedExperts):
         del layer.w1_temp, layer.w3_temp, layer.w2_temp
         del layer.w13_weight, layer.w2_weight
@@ -509,8 +599,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)
         (w13_weight_processed, w2_weight_processed, w13_weight_scale,
-         w2_weight_scale) = self._requantize_native_fp4(
-             w13_weight_padded, w2_weight_padded, orig_intermediate, device)
+         w2_weight_scale) = self._requantize(w13_weight_padded,
+                                             w2_weight_padded,
+                                             orig_intermediate, device)
         self._cleanup_temp_buffers(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed,
@@ -535,8 +626,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             sync.synchronize(layer.w2_bias, wait=True)
 
         logger.info(
-            "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
-            "for GMM kernel.")
+            "DeepSeek-V4 MXFP4 weights processed and stored as native %s "
+            "for GMM kernel.",
+            jnp.dtype(self.rhs_quant_dtype).name)
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)
@@ -544,5 +636,5 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
+            rhs_quant_dtype=self.rhs_quant_dtype,
         )
