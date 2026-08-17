@@ -19,7 +19,10 @@ ENABLE_EP=true
 QUANTIZATION=""
 KV_CACHE_DTYPE="fp8"
 
-MAX_MODEL_LEN=10240
+# 9216, not 10240: at util 0.75 the profiler leaves 51.71 GiB for KV and 10240
+# needs 53.11, so startup fails outright (measured 2026-08-17). 9216 is also
+# exactly 8192+1024 and 1024+8192, so every combo below fits.
+MAX_MODEL_LEN=9216
 MAX_NUM_BATCHED_TOKENS=8192
 MAX_NUM_SEQS=512
 GPU_MEMORY_UTILIZATION=0.75
@@ -35,6 +38,10 @@ CONCURRENCY_OPTIONS="64 256"
 # what this sweep exists to find out. 128 bounds the unknown.
 NUM_PROMPTS=128
 RANDOM_RANGE_RATIO="0.8"
+# "min" gives [rL, L]; the default "symmetric" gives [(1-r)L, (1+r)L], which at
+# ISL 8192 samples up to 14746 tokens and exceeds max-model-len. The other large
+# configs set this for the same reason.
+RANGE_RATIO_STYLE="min"
 
 export VLLM_QUANT_WEIGHT_CACHE_DIR="/home/patemotter_google_com/workspace/dsv4_quant_cache"
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
