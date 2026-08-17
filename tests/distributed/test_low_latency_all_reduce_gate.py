@@ -93,3 +93,30 @@ def test_one_shot_still_owns_the_small_end_at_8_devices(monkeypatch):
     # Lowering two_shot's floor to one_shot_max must not steal the range where
     # one_shot is nearly twice as fast (4.84 vs 7.76 us at 14 KiB).
     assert _route(8, 14 * KIB, numel=7168) == "one_shot"
+
+
+@pytest.mark.parametrize("payload,numel", [
+    (224 * KIB, 16 * 7168),
+    (336 * KIB, 16 * 10752),
+    (448 * KIB, 16 * 14336),
+])
+def test_two_shot_ceiling_excludes_the_payloads_it_loses(
+        monkeypatch, payload, numel):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # two_shot is only locally flat in payload. Measured at 32 devices (job
+    # 143, device self time): 0.91x XLA at 224 KiB, 0.75x at 336 KiB, 0.61x at
+    # 448 KiB -- it is bandwidth-bound past ~112 KiB while the ring amortises.
+    # The ceiling was 256 KiB, which was the top of the original sweep's range
+    # rather than a measurement, and it let 224 KiB take a kernel 9% slower
+    # than the XLA it replaced.
+    assert _route(32, payload, numel=numel) == "xla"
+
+
+@pytest.mark.parametrize("devices", [16, 32])
+def test_two_shot_keeps_the_band_it_wins(monkeypatch, devices):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # Bringing the ceiling down must not cut into the measured winning region:
+    # 42 KiB is 1.44x XLA and 112 KiB -- K3's (16,3584) at decode bucket 16 --
+    # is still 1.26x.
+    assert _route(devices, 42 * KIB, numel=21504) == "two_shot"
+    assert _route(devices, 112 * KIB, numel=16 * 3584) == "two_shot"

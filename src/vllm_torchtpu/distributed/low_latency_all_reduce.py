@@ -126,8 +126,36 @@ _GATE: dict[int, tuple[int, int, int]] = {
     # (egress 2M(N-1)/N), where one_shot's M(N-1) egress makes it lose past
     # ~16 KiB. Below 14 KiB two_shot is unmeasured, so one_shot keeps the
     # small end.
-    16: (16 * 1024, 16 * 1024, 256 * 1024),
-    32: (16 * 1024, 16 * 1024, 256 * 1024),
+    #
+    # The ceiling is 128 KiB because two_shot is only *locally* flat in
+    # payload. Extending the same sweep upwards (job 143, 32 devices, device
+    # self time; the slope metric agrees to within 4%):
+    #
+    #     shape        payload   XLA   two_shot   ratio
+    #     (2,10752)     42 KiB  18.95    13.19    1.44x
+    #     (16,3584)    112 KiB  21.88    17.38    1.26x
+    #     (16,7168)    224 KiB  23.27    25.69    0.91x
+    #     (16,10752)   336 KiB  25.99    34.49    0.75x
+    #     (16,14336)   448 KiB  26.78    43.71    0.61x
+    #     (32,10752)   672 KiB  34.48    65.41    0.53x
+    #
+    # Past ~112 KiB two_shot is linear in payload (+8.5 us per 112 KiB) while
+    # XLA's ring is nearly flat -- 21.88 to 26.78 across four times the bytes.
+    # two_shot is bandwidth-bound there and the ring amortises, so they cross
+    # at roughly 150 KiB and two_shot loses by more the further past it goes.
+    # 128 KiB sits inside the measured winning region rather than on the
+    # crossover.
+    #
+    # This ceiling used to be 256 KiB, which was not a measurement: it was the
+    # top of the original sweep's range, exactly as the 64 KiB floor above was
+    # the bottom of it. At 256 KiB (16,7168) took a kernel 9% slower than the
+    # XLA it replaced, which is the opposite of what this gate exists to do.
+    #
+    # The 8-device entry is deliberately left alone: it is measured only up to
+    # 42 KiB, so its 512 KiB ceiling is an extrapolation of the same kind and
+    # should be swept before being relied on above ~64 KiB.
+    16: (16 * 1024, 16 * 1024, 128 * 1024),
+    32: (16 * 1024, 16 * 1024, 128 * 1024),
 }
 
 
@@ -640,7 +668,51 @@ _ENTRY_OPS: dict[str, Any] = {}
 # already final and dynamo folds it to a constant with a guard. A flag that
 # changed *during* the forward would be a branch dynamo has to trace, which is
 # the thing this whole module is arranged to avoid.
+#
+# Shape is ``(rows, op, buffers)``: the token bucket the kernel was compiled
+# for, then what to call. See ``bucket_matches`` for what the rows are for.
 _ROWPARALLEL_ENTRY: tuple | None = None
+
+
+def bucket_matches(entry: tuple) -> bool:
+    """Whether this step's padded token count is the one ``entry`` was built for.
+
+    A kernel is compiled for exactly one shape, and warmup can only wire one of
+    them, so on any other token bucket the reduction has to go somewhere else.
+    The op already checks its own shape and falls back to ``xla_all_reduce``,
+    which is *correct* but not free: the fallback happens inside an opaque
+    custom op, so XLA sees a call it cannot fuse, combine, or reorder, and the
+    caller has already done whatever work it does to prepare the payload. On
+    K3's latent-MoE tail that preparation is a ``torch.cat`` plus two slices per
+    layer, which is pure loss when the kernel does not run -- the c4/c8 arms of
+    job 139 regressed 5.2% and 4.0% on TPOT for exactly this reason, while c1,
+    the bucket the kernel *was* wired for, improved 3.3%.
+
+    So the caller needs to know before it commits, and the token count is the
+    one thing it cannot ask for: reading a dim of a traced tensor pins vLLM's
+    dynamic token dimension and fails compilation outright (see
+    ``get_entry_op``). The forward context is the way around it. The TPU runner
+    passes ``num_tokens=num_tokens_padded`` into ``set_forward_context`` --
+    already rounded up to a compile bucket, a plain Python int, set *outside*
+    anything traced -- so this reads an int and compares it to an int, and
+    dynamo folds the whole thing to a constant. It never touches a tensor.
+
+    Reading the forward context from inside a traced forward is upstream's own
+    pattern on this exact path: ``MoERunner._encode_layer_name``, called by the
+    ``forward`` this guards, branches on
+    ``get_forward_context().all_moe_layers is not None``.
+
+    Missing context or a missing descriptor means "cannot tell", which resolves
+    to False -- the caller keeps the path it would have had without any of this.
+    """
+    from vllm.forward_context import (get_forward_context,
+                                      is_forward_context_available)
+
+    if not is_forward_context_available():
+        return False
+    descriptor = get_forward_context().batch_descriptor
+    return descriptor is not None and descriptor.num_tokens == entry[0]
+
 
 # Set by warmup() when TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT=1, and read by the
 # patched latent-MoE tail in vllm_torchtpu/__init__.py.
@@ -1002,14 +1074,20 @@ def warmup(vllm_config) -> None:
     _MOE_CONCAT_ENTRY = None
     communicator._ll_entry = None
 
+    # Entries carry the token bucket they were compiled for as element 0, so a
+    # caller can ask bucket_matches() *before* preparing a payload the kernel
+    # will not accept. See bucket_matches for why the op's own shape check is
+    # not enough on its own.
     if concat_plan is not None:
         # Registered here, with everything else, because registration calls
         # infer_schema, which dynamo refuses to trace -- doing it on first use
         # would put it inside the traced forward and abort compilation.
-        _MOE_CONCAT_ENTRY = (get_moe_concat_op(dispatcher, concat_plan),
-                             *concat_plan.buffers)
+        _MOE_CONCAT_ENTRY = (concat_plan.shape[0],
+                             get_moe_concat_op(dispatcher, concat_plan),
+                             concat_plan.buffers)
         logger.info(
-            "Low-latency all-reduce: latent-MoE pair wired to one %s over %s.",
+            "Low-latency all-reduce: latent-MoE pair wired to one %s over %s; "
+            "other token buckets keep upstream's two reductions.",
             concat_plan.kernel, concat_plan.shape)
 
     if chosen is not None:
@@ -1018,7 +1096,7 @@ def warmup(vllm_config) -> None:
         # three for two_shot -- because they have to be op *arguments* to
         # reach the compiled program at all.
         entry_op = get_entry_op(dispatcher)
-        entry = (entry_op, *chosen.buffers)
+        entry = (chosen.shape[0], entry_op, chosen.buffers)
         if site == "rowparallel":
             _ROWPARALLEL_ENTRY = entry
         else:

@@ -433,13 +433,16 @@ def _patch_rowparallel_defer_bias() -> None:
             # shape -- cannot tell them apart; see _ROWPARALLEL_ENTRY.
             #
             # Read at trace time, when warmup() has already made it final, so
-            # dynamo folds it away instead of emitting a branch. The op checks
-            # the shape itself and falls back to XLA for anything it was not
-            # built for, so sending every row-parallel reduction through it is
-            # safe.
+            # dynamo folds it away instead of emitting a branch.
+            #
+            # bucket_matches keeps every token bucket but the wired one off the
+            # op. The op would fall back to XLA there and be correct, but from
+            # inside an opaque custom call XLA cannot fuse or reorder, so on
+            # other buckets this asks for a plain reduction instead. It compares
+            # two Python ints out of the forward context and folds away too.
             entry = _llar._ROWPARALLEL_ENTRY
-            if entry is not None:
-                op, *buffers = entry
+            if entry is not None and _llar.bucket_matches(entry):
+                _, op, buffers = entry
                 output = op(output_parallel, *buffers)
             else:
                 output = tensor_model_parallel_all_reduce(output_parallel)
@@ -549,7 +552,6 @@ def _patch_latent_moe_concat_allreduce() -> None:
                 "patch on MoERunner.forward applies.", name)
 
     MoERunner.__init__ = patched_init
-    original_forward = MoERunner.forward
 
     def forward(self,
                 hidden_states,
@@ -581,9 +583,6 @@ def _patch_latent_moe_concat_allreduce() -> None:
                      and not self.moe_config.is_sequence_parallel
                      and (self.moe_config.tp_size > 1
                           or self.moe_config.ep_size > 1))
-        if not mergeable:
-            return original_forward(self, hidden_states, router_logits,
-                                    input_ids, shared_experts_input)
 
         entry = _llar._MOE_CONCAT_ENTRY
         if entry is None:
@@ -597,22 +596,49 @@ def _patch_latent_moe_concat_allreduce() -> None:
                 "the two_shot band for this device count and that "
                 "TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1.")
 
-        n_latent = fused_output.numel()
-        pair = torch.cat([fused_output.reshape(-1), shared_output.reshape(-1)])
-        op, *buffers = entry
-        reduced = op(
-            pair.reshape(shared_output.shape[0], -1).contiguous(), *buffers)
-        flat = reduced.reshape(-1)
-        fused_output = flat[:n_latent].reshape(fused_output.shape)
-        shared_output = flat[n_latent:].reshape(shared_output.shape)
+        # A bucket mismatch, unlike a missing plan, is expected and must be
+        # silent: warmup can wire only one token bucket, and every other one has
+        # to keep upstream's pair so XLA's combiner can fuse it. Concatenating
+        # anyway is what regressed job 139's c4/c8 arms by 5.2% and 4.0% -- the
+        # cat and its two slices cost ~300 us per decode step and bought a
+        # kernel that never ran, because at K3's bucket 16 the pair is 336 KiB
+        # and two_shot is 0.75x XLA there (job 143). No ceiling change rescues
+        # that: two_shot is bandwidth-bound past ~112 KiB and only gets worse.
+        if mergeable and _llar.bucket_matches(entry):
+            n_latent = fused_output.numel()
+            pair = torch.cat(
+                [fused_output.reshape(-1),
+                 shared_output.reshape(-1)])
+            _, op, buffers = entry
+            reduced = op(
+                pair.reshape(shared_output.shape[0], -1).contiguous(),
+                *buffers)
+            flat = reduced.reshape(-1)
+            fused_output = flat[:n_latent].reshape(fused_output.shape)
+            shared_output = flat[n_latent:].reshape(shared_output.shape)
+            # Both halves are now reduced, which is what upstream's flag means,
+            # so the late all-reduce below must be skipped.
+            fused_output_is_reduced = True
+        else:
+            # Upstream's own sequencing, inlined rather than delegated. Handing
+            # control back to the unpatched forward here would re-enter it from
+            # the top and run the entire expert compute a second time, on
+            # already-padded, already-transformed inputs -- self._forward_entry
+            # is above this point, not below it.
+            fused_output_is_reduced = self._fused_output_is_reduced
+            fused_output, fused_output_is_reduced = (
+                self._maybe_reduce_routed_output_before_transform(
+                    fused_output, fused_output_is_reduced))
+            shared_output = self._maybe_reduce_shared_expert_output(
+                shared_output, fused_output_is_reduced)
 
-        # Both halves are now reduced, which is what upstream's flag means; the
-        # late all-reduce in _maybe_reduce_final_output must therefore be skipped.
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output)
         fused_output = self.apply_routed_output_transform(fused_output)
-        out = shared_output + fused_output
-        out = self._maybe_reduce_final_output(out, og_post, True)
+        out = (shared_output +
+               fused_output) if shared_output is not None else fused_output
+        out = self._maybe_reduce_final_output(out, og_post,
+                                              fused_output_is_reduced)
         return self._maybe_add_zero_expert_output(out)
 
     MoERunner.forward = forward

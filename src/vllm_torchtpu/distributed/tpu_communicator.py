@@ -19,6 +19,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
+from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -39,9 +41,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         """TP all-reduce, optionally through a low-latency Pallas kernel.
 
         Only the tensor-parallel group is ever rerouted, and only for the one
-        payload shape wired up at warmup; the op itself sends anything else to
-        XLA. Restricting it this way keeps every other group (DP, EP, world)
-        on the path it has always used.
+        payload shape wired up at warmup; anything else goes to XLA.
+        Restricting it this way keeps every other group (DP, EP, world) on the
+        path it has always used.
         """
         # `_ll_entry` is set by low_latency_all_reduce.warmup(), before
         # torch.compile traces anything, and is None unless the kernels are
@@ -53,9 +55,17 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # workspace buffers and two_shot three, and the arity is fixed at
         # warmup. A branch on len() here would be a branch dynamo has to
         # trace, so the tuple is simply splatted.
+        #
+        # bucket_matches keeps the *other* token buckets off the op entirely.
+        # The op would fall back to XLA for them anyway and be correct, but
+        # inside an opaque custom call, where XLA can no longer fuse, combine,
+        # or reorder the collective -- so on every bucket but the wired one this
+        # asks for a plain reduction instead. It compares two Python ints from
+        # the forward context and folds away at trace time; see
+        # low_latency_all_reduce.bucket_matches.
         entry = getattr(self, "_ll_entry", None)
-        if entry is not None:
-            op, *buffers = entry
+        if entry is not None and _llar.bucket_matches(entry):
+            _, op, buffers = entry
             return op(input_, *buffers)
         return super().all_reduce(input_)
 
