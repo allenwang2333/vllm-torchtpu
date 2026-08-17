@@ -110,6 +110,8 @@ def load(
     requires each tensor's (shape, dtype) to match.
     """
     if path is None or not path.exists():
+        if path is not None:
+            logger.info("[QUANT_CACHE] miss (absent) %s", path.name)
         return None
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -146,6 +148,7 @@ def load(
                     tensor.dtype, tuple(shape), dtype)
                 return None
 
+    logger.info("[QUANT_CACHE] hit %s (%d tensors)", path.name, len(tensors))
     if device is not None:
         return [t.to(device) for t in tensors]
     return list(tensors)
