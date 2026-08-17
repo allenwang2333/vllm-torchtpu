@@ -75,6 +75,77 @@ End to end, TPOT ms, via `arm_check.sh`:
 GSM8K 100/100 and a byte-identical canary on every arm. Device deltas track
 TPOT deltas within 0.2 points throughout, so nothing here is off-device.
 
+## What the 12.65 us is made of, and how close to the floor it is
+
+`scripts/debug/two_shot_ablation.py`, jobs 118/119, `[2,7168]` bf16 at 32
+devices. A ladder of kernels identical to the production one in signature,
+scratch, aliasing, compiler params, shard_map and torch wrapper -- only the
+body differs -- so adjacent rungs subtract. Device self time, us/occ, 300
+occurrences each:
+
+| rung | us/occ | adds |
+|---|--:|---|
+| `noop` | 1.42 | launch + VMEM in/out |
+| `barrier1` | 4.35 | one all-to-all barrier |
+| `barrier2` | 7.27 | the second barrier |
+| `p1` | 8.00 | reduce-scatter |
+| **`full`** | **12.65** | all-gather |
+| `full_1bar` | 11.08 | (full, single barrier) |
+| `full_bf` | 16.77 | (full, barrier not overlapped) |
+| `xla` | 17.99 | reference |
+
+`full` reproduces the 12.67 measured by the other harness and `xla` reproduces
+17.97, both to within 0.03 us, which is what makes the subtractions worth
+anything. `barrier1` reproduced at 4.35 across two independent jobs.
+
+| component | us | share |
+|---|--:|--:|
+| launch + VMEM in/out | 1.42 | 11% |
+| barrier #1 | 2.93 | 23% |
+| barrier #2 | 2.92 | 23% |
+| phase 1 (reduce-scatter), net | 0.73 | 6% |
+| phase 2 (all-gather), net | 4.65 | 37% |
+
+**A 32-device all-to-all barrier costs 2.93 us**, derived twice by independent
+subtraction and agreeing to 0.01 us. The two barriers are 46% of the kernel and
+move no data at all. The bandwidth floor for the 54 KiB of egress is ~0.5 us,
+confirming that essentially none of this is transfer.
+
+So the floor is `launch + one barrier + measured transit` = **9.73 us**, against
+11.08 for the best configuration actually measured and 12.65 today. The kernel
+is within 30% of a floor it cannot go below, and the only removable piece is the
+second barrier -- worth 2.92 us standalone but **1.57 us in place**, because the
+overlap already hides the rest.
+
+Two further readings:
+
+* **The overlap is load-bearing, not a micro-optimization.** `full_bf` puts the
+  barrier back ahead of the sends and costs 16.77, within noise of XLA's 17.99.
+  The 4.12 us the overlap buys is the entire margin that makes this worth
+  shipping.
+* **Phase 2 is the expensive half of the data path** -- 4.65 us against phase
+  1's 0.73 net, for the same bytes. The all-gather is 31 small DMAs fanning out
+  from one source plus the copy-out; phase 1's arrivals spread across peers.
+
+Read the table additively with care. The barrier rungs put the barrier first
+(nothing to overlap) while `p1`/`full` put it after the sends, so `p1 -
+barrier2 = 0.73` is the net of adding phase 1 *and* hiding it under the barrier,
+not phase 1's raw cost. The telescoping sum equals `full` by construction and is
+not an independent check; `full` matching 12.67 is.
+
+Caveat on `noop`: it ran 180 occurrences where every other rung ran 300, so XLA
+eliminated 120 of its calls -- an identity kernel with no `collective_id` and no
+side effects has DCE freedom the other rungs do not. Its 1.42 us is therefore
+approximate. It is probably close, since barrier #1 and barrier #2 both lean on
+it and land 0.01 us apart, which they would not if it were far off.
+
+**Consequence for where effort goes.** Perfect kernel tuning is worth 1.5-2.5 us
+per call, or 0.14-0.24 ms per step across the 95 post-attention reductions. The
+kernel *already* beats XLA by 5.34 us per call, or 0.51 ms per step. Tuning buys
+less than half of what shipping the current version buys, so the post-attention
+integration should land as it stands and the kernel internals should be left
+alone.
+
 ## Why the first attempt regressed
 
 XLA's CRS combiner merges the latent-MoE `[2,3584]` reduction and the
@@ -247,6 +318,11 @@ Closed by measurement, not worth pursuing:
 * **`compile_sizes=[1]`** -- addresses neither the fusion nor the site wait.
 * **Padding-awareness** -- shrinks a transfer cost at a site whose cost is a
   fixed wait; the kernel's floor was never the problem.
+* **Tuning the two-shot kernel itself** -- the ablation puts it within 30% of a
+  9.73 us floor that is 45% barrier. The single largest lever, merging the two
+  barriers, is worth 1.57 us in place and requires solving the re-entrancy
+  hazard the double barrier exists for. Every remaining optimisation is smaller
+  than that. Spend the effort on call *count* instead, per (2).
 
 ## Reproducing
 
@@ -278,6 +354,15 @@ sbatch scripts/debug/slurm_profile_ll_allreduce_tp8.sbatch --kernel-type two_sho
 LL_SHAPES="2x3584,2x7168,2x10752" LL_EXTRA_ARGS="--kernel-type two_shot" \
   sbatch scripts/debug/slurm_profile_ll_allreduce_32.sbatch
 python scripts/allreduce_profile_stats.py results/ll-ar-shapes-32-<job>/traces
+```
+
+Decompose the kernel's cost into launch / barriers / phase 1 / phase 2:
+
+```bash
+sbatch --partition=ici-2x2x4-b scripts/debug/two_shot_ablation.sbatch
+# one rung, or a different shape:
+TS_MODES="noop,barrier1" TS_SHAPE=2x7168 \
+  sbatch --partition=ici-2x2x4-b scripts/debug/two_shot_ablation.sbatch
 ```
 
 Integration smoke test before any K3 run (~10 min, same dynamo/AOT/piecewise
