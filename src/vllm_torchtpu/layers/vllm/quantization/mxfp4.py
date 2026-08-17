@@ -358,6 +358,55 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             **extra_weight_attrs,
         )
 
+    def _padded_moe_shapes(
+        self,
+        layer: RoutedExperts,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], int, int, int]:
+        """Padded w13/w2 shapes derived from the packed shapes alone.
+
+        Mirrors the padding arithmetic in `_dequantize_and_pad` so the cache
+        key can be built before that work runs. The miss path asserts the two
+        agree, so a divergence fails loudly instead of missing forever.
+        """
+        num_experts, orig_hidden_size, w2_in_packed = layer.w2_weight.shape
+        # mxfp4 packs two values per byte along the contracting axis.
+        orig_intermediate_size = w2_in_packed * 2
+        intermediate_padded = -(-orig_intermediate_size // 128) * 128
+        hidden_padded = (-(-orig_hidden_size // REQUANTIZED_BLOCK_SIZE) *
+                         REQUANTIZED_BLOCK_SIZE)
+        return (
+            (num_experts, hidden_padded, intermediate_padded * 2),
+            (num_experts, intermediate_padded, hidden_padded),
+            orig_intermediate_size,
+            intermediate_padded - orig_intermediate_size,
+            hidden_padded - orig_hidden_size,
+        )
+
+    def _pad_biases(
+        self,
+        layer: RoutedExperts,
+        orig_intermediate_size: int,
+        pad_intermediate: int,
+        pad_hidden: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Pad the MoE biases, which the weight cache does not store."""
+        _w13_bias = getattr(layer, "w13_bias", None)
+        _w2_bias = getattr(layer, "w2_bias", None)
+        w13_bias_padded = w2_bias_padded = None
+        if _w13_bias is not None:
+            w13_bias = _w13_bias.data.to("cpu")
+            b1, b3 = (w13_bias[:, :orig_intermediate_size],
+                      w13_bias[:, orig_intermediate_size:])
+            w13_bias_padded = torch.cat([
+                torch.nn.functional.pad(b1, (0, pad_intermediate)),
+                torch.nn.functional.pad(b3, (0, pad_intermediate)),
+            ],
+                                        dim=1).unsqueeze(1)
+        if _w2_bias is not None:
+            w2_bias_padded = torch.nn.functional.pad(
+                _w2_bias.data.to("cpu"), (0, pad_hidden)).unsqueeze(1)
+        return w13_bias_padded, w2_bias_padded
+
     def _dequantize_and_pad(
         self,
         layer: RoutedExperts,
@@ -471,18 +520,36 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
-        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
-         orig_intermediate) = self._dequantize_and_pad(layer)
-        cache_key = _fp4_cache_key(layer, w13_weight_padded.shape,
-                                   w2_weight_padded.shape, orig_intermediate,
-                                   activation_str, self.rhs_quant_dtype)
+        # The key comes from the packed shapes, so a cache hit skips the
+        # dequantize-and-pad as well as the requantize. Only the biases, which
+        # are not cached, are rebuilt -- they are two orders of magnitude
+        # smaller than the weights.
+        (w13_shape, w2_shape, orig_intermediate, pad_intermediate,
+         pad_hidden) = self._padded_moe_shapes(layer)
+        cache_key = _fp4_cache_key(layer, w13_shape, w2_shape,
+                                   orig_intermediate, activation_str,
+                                   self.rhs_quant_dtype)
         cache_file = quant_weight_cache.cache_path(_FP4_CACHE_NAMESPACE,
                                                    cache_key)
         cached = quant_weight_cache.load(cache_file, cache_key, device=device)
         if cached is not None:
             (w13_weight_processed, w2_weight_processed, w13_weight_scale,
              w2_weight_scale) = cached
+            w13_bias_padded, w2_bias_padded = self._pad_biases(
+                layer, orig_intermediate, pad_intermediate, pad_hidden)
         else:
+            (w13_weight_padded, w2_weight_padded, w13_bias_padded,
+             w2_bias_padded,
+             dequant_intermediate) = self._dequantize_and_pad(layer)
+            assert (tuple(w13_weight_padded.shape) == w13_shape
+                    and tuple(w2_weight_padded.shape) == w2_shape
+                    and dequant_intermediate == orig_intermediate), (
+                        "cache key shapes disagree with the padded weights: "
+                        f"derived w13={w13_shape} w2={w2_shape} "
+                        f"intermediate={orig_intermediate}, actual "
+                        f"w13={tuple(w13_weight_padded.shape)} "
+                        f"w2={tuple(w2_weight_padded.shape)} "
+                        f"intermediate={dequant_intermediate}")
             (w13_weight_processed, w2_weight_processed, w13_weight_scale,
              w2_weight_scale) = self._requantize_native_fp4(
                  w13_weight_padded, w2_weight_padded, orig_intermediate,
