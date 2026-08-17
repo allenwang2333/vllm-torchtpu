@@ -37,6 +37,48 @@ across A/B/C/D and anatomy goes 0.05 to 0.90. Proven by a one-server A/B.
 sequence that is ~1 s/token, against tpu-inference's 1.39 s/token at batch 128,
 so it is not something this port introduced.
 
+## Open questions for the next session
+
+Ordered by value. The first two are new findings from today, not carry-over.
+
+**1. Why does DSv4 take ~1 second per decode step?** Throughput is pinned at
+~54 tok/s and *nothing* in the serving config moves it: concurrency 64 vs 256,
+batched tokens 1024 vs 8192, KV cache 115K vs 485K tokens all give the same
+answer. Throughput equals batch exactly, so per-sequence rate is 1.00 tok/s and
+step time is batch-independent — a weight-bound step. A profile is the only way
+in from here. `deepseek-v4-flash-tp8-ep-profile` is committed and fixed; it was
+launched at 16:00 and stopped at wind-down, so it has never produced a trace.
+Budget ~35 min. Note tpu-inference measures 1.39 s/token at batch 128, so this
+may be the model rather than the port.
+
+**2. The unexplained 3.35x swing in per-request KV charge.** Changing only
+`max-num-batched-tokens` 8192 -> 1024 raises reported cache 4.2x but per-request
+charge 3.35x, so concurrency only moves 64 -> 74. Same block size (1024), same
+workload, blocks fully released between combos. Two candidate causes refuted
+(unreleased blocks, differing block size); the third — multi-group block
+accounting — is untested. The `[KV_PROBE]` pre-pass removed in `adda8b23`
+logged exactly this and would settle it in one startup. A 1.32x over-allocation
+was found in this same subsystem on 2026-08-16, so this deserves a look.
+
+**3. Bound or relocate `/dev/shm/torch_tpu_cache`.** It grew 192 GB -> 348 GB in
+one day, against a 473 GB tmpfs, and being RAM it evicts the page cache holding
+the 149 GB of weights — safetensors loading degraded from 2.27 shards/second to
+17.8 s/shard over the same period. The default path is hardcoded in
+`torch_tpu/common/libpywrap_torch_tpu_common.so`; the same binary contains
+`TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT`, which is *probably* the
+override but has not been verified to be read. Pointing it at the NVMe is a
+one-line change if it works.
+
+**4. Cache reuse.** 1,517 distinct config-hash groups have accumulated. The key
+(`compute_tpu_compilation_hash`) includes `gpu_memory_utilization`,
+`num_gpu_blocks`, `max_model_len`, `max_num_batched_tokens`, `max_num_seqs`,
+every non-ignored `vllm_torchtpu` env var, and the bytes of every kernel-reload
+source file. That precision is deliberate — `ca5bf0585` added it so
+configurations stop serving each other's artifacts — so reuse means varying
+less, not hashing less. Highest-leverage idea, untested: pin
+`--num-gpu-blocks-override` so utilization stops changing the key, since
+`num_gpu_blocks` and `gpu_memory_utilization` are redundant in it.
+
 ## What to pick up
 
 1. **Submit the stack.** ~40 commits absent from `origin/main`. This is what
