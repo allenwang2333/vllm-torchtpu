@@ -26,15 +26,44 @@ def _route(devices: int, payload: int, numel: int | None = None) -> str:
                           numel if numel is not None else devices * 1024)
 
 
-@pytest.mark.parametrize("payload", [2 * KIB, 8 * KIB, 16 * KIB])
+@pytest.mark.parametrize("payload", [2 * KIB, 8 * KIB, 13 * KIB])
 def test_small_payloads_use_one_shot_at_32_devices(payload):
+    # one_shot owns everything up to 13 KiB, below where two_shot is measured.
     assert _route(32, payload) == "one_shot"
 
 
 def test_32kib_at_32_devices_stays_on_xla():
-    # One-shot is bandwidth-bound at 31 peers here (0.70x vs XLA) and
-    # two-shot's measured range starts at 64 KiB. Neither wins, so neither runs.
+    # With two_shot off, one_shot is bandwidth-bound at 31 peers here (0.70x vs
+    # XLA), so nothing runs.
     assert _route(32, 32 * KIB) == "xla"
+
+
+def test_two_shot_takes_14kib_from_one_shot_at_32_devices(monkeypatch):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # 14 KiB is the smallest payload where both are measured, and two_shot wins
+    # it: 12.36 against one_shot's 13.59. A 16 KiB one_shot boundary handed it
+    # to the slower kernel, which made K3's post-attention reduce *slower* at a
+    # single-token bucket (one_shot 13.59) than at a two-token one (two_shot
+    # 12.67) -- a smaller batch reducing slower.
+    assert _route(32, 14 * KIB, numel=7168) == "two_shot"
+
+
+def test_lowering_the_one_shot_boundary_leaves_no_gap(monkeypatch):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # one_shot_max and two_shot_min must move together. Leaving the floor at 16
+    # KiB while dropping the boundary to 13 opens a 13-16 KiB hole to XLA --
+    # the same bug that sent K3's 42 KiB pair to XLA at 8 devices.
+    for kib in (13, 14, 15, 16, 17):
+        assert _route(32, kib * KIB, numel=kib * 512) != "xla", f"{kib} KiB"
+
+
+def test_16_devices_keeps_its_own_one_shot_boundary(monkeypatch):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # The sweep behind the 13 KiB boundary is at 32 devices. one_shot's egress
+    # is M(N-1) and two_shot's 2M(N-1)/N, so the crossover really does move with
+    # the device count; extrapolating it across counts is how the 42 KiB hole at
+    # 8 devices got there.
+    assert _route(16, 14 * KIB, numel=7168) == "one_shot"
 
 
 @pytest.mark.parametrize("payload", [2 * KIB, 16 * KIB, 32 * KIB])

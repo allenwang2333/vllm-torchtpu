@@ -32,7 +32,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           kv_transfer_state)
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.layers.attention import (Attention,
                                                   ChunkedLocalAttention,
                                                   MLAAttention)
@@ -3376,6 +3376,19 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens=num_tokens_padded,
                     num_tokens_across_dp=self._dp_num_tokens_across_dp(
                         num_tokens_padded),
+                    # Upstream only synthesises this when CUDA graphs are on
+                    # (forward_context.py: "if cudagraph_runtime_mode !=
+                    # CUDAGraphMode.NONE"), so on TPU it would stay None and
+                    # anything keying off the token bucket inside the traced
+                    # forward would see nothing. Every consumer of it in vLLM is
+                    # CUDA-graph machinery, inert here, so setting it costs
+                    # nothing and gives the compiled forward an honest
+                    # description of the batch it was traced for. _dummy_run
+                    # sets the same thing for the same shape; they must agree or
+                    # the precompiled graph guards against the real one and TPU
+                    # recompiles at serving time.
+                    batch_descriptor=BatchDescriptor(
+                        num_tokens=num_tokens_padded),
             ), set_vllm_model_wrapper_context(mesh=self.mesh,
                                               vllm_config=self.vllm_config):
                 hidden_states, aux_hidden_states = self.forward_model(
@@ -4423,7 +4436,16 @@ class TPUModelRunner(GPUModelRunner):
                     self.vllm_config,
                     num_tokens=num_tokens if dp_lockstep else 0,
                     num_tokens_across_dp=self._dp_num_tokens_across_dp(
-                        num_tokens) if dp_lockstep else None),
+                        num_tokens) if dp_lockstep else None,
+                    # Keyed on the shape being compiled, deliberately *not* on
+                    # the dp_lockstep-conditional num_tokens above. This is the
+                    # run that precompiles the graph for `num_tokens`, and the
+                    # real forward will describe that same shape as
+                    # BatchDescriptor(num_tokens=num_tokens); if the two
+                    # disagree, dynamo's guard fails at serving time and TPU
+                    # recompiles mid-request, which is what precompilation
+                    # exists to prevent.
+                    batch_descriptor=BatchDescriptor(num_tokens=num_tokens)),
                 set_vllm_model_wrapper_context(mesh=self.mesh,
                                                vllm_config=self.vllm_config),
         ):

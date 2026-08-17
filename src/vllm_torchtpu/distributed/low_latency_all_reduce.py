@@ -124,8 +124,24 @@ _GATE: dict[int, tuple[int, int, int]] = {
     #
     # two_shot wins everywhere in that band and is nearly flat in payload
     # (egress 2M(N-1)/N), where one_shot's M(N-1) egress makes it lose past
-    # ~16 KiB. Below 14 KiB two_shot is unmeasured, so one_shot keeps the
-    # small end.
+    # ~16 KiB.
+    #
+    # The one_shot boundary is 13 KiB, just under the smallest payload where
+    # two_shot is measured, because at 14 KiB two_shot is the faster of the two
+    # -- 12.36 against one_shot's 13.59, 9% -- and a 16 KiB boundary handed that
+    # payload to one_shot. 14 KiB is not a corner case: it is K3's
+    # post-attention reduction at a single-token compile bucket, and it is the
+    # same kernel invocation as the (2,3584) the row was measured at, since
+    # _build_two_shot flattens both to (32, 224). The effect was backwards --
+    # halving the tokens from bucket 2 to bucket 1 moved that collective from
+    # two_shot at 12.67 to one_shot at 13.59, so a smaller batch reduced
+    # *slower*. Below 13 KiB two_shot is genuinely unmeasured and one_shot keeps
+    # the small end.
+    #
+    # two_shot_min moves with it, and must: leaving the floor at 16 KiB while
+    # dropping one_shot_max to 13 opens a 13-16 KiB hole that falls through to
+    # XLA. That is exactly the gap that sent K3's 42 KiB pair to XLA at 8
+    # devices and left the pruned-K3 proxy unable to exercise the concat path.
     #
     # The ceiling is 128 KiB because two_shot is only *locally* flat in
     # payload. Extending the same sweep upwards (job 143, 32 devices, device
@@ -154,8 +170,14 @@ _GATE: dict[int, tuple[int, int, int]] = {
     # The 8-device entry is deliberately left alone: it is measured only up to
     # 42 KiB, so its 512 KiB ceiling is an extrapolation of the same kind and
     # should be swept before being relied on above ~64 KiB.
+    #
+    # 16 devices keeps the 16 KiB one_shot boundary rather than inheriting 32's
+    # 13 KiB. The table above is a 32-device sweep, one_shot's egress is M(N-1)
+    # and two_shot's 2M(N-1)/N, so the crossover between them genuinely moves
+    # with the device count -- and extrapolating a threshold across device
+    # counts is how the 42 KiB hole at 8 devices got there.
     16: (16 * 1024, 16 * 1024, 128 * 1024),
-    32: (16 * 1024, 16 * 1024, 128 * 1024),
+    32: (13 * 1024, 13 * 1024, 128 * 1024),
 }
 
 
