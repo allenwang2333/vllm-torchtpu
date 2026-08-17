@@ -367,44 +367,45 @@ The instrumentation that produced this (`_probe_ds_v4_kv_budget`, printing
 `[KV_PROBE]` lines) is still in `tpu_runner.py`. **Strip it before submitting
 the refactor.**
 
-## Open: memory utilization above 0.75
+## Solved 2026-08-17: what caps utilization at 0.75
 
-At 0.92 startup still fails, but no longer in cache allocation — the cache side
-is healthy there (702,983 tokens, 68.65x concurrency, ratio 0.9839). It fails in
-compilation: *HLO temporaries (106.4G) exceeds available HBM (94.74G)*, raised
-from `fx_to_mlir`.
+**The compile OOM is the KV cache itself, not recomputable activations.** The
+buffer-assignment dump (`scratchpad/xladump_full_xla`, 5,827 files, 2.6 GB,
+captured with no `--xla_dump_max_hlo_modules` cap) names the failing module:
 
-**Utilization is the driver, established by a one-variable test.** The
-long-context probe's exact passing configuration (ctx 9216, 8 seqs, 1024 batched
-tokens) fails at 0.92 and passes at 0.75. Context is exonerated — 9216 both
-passes and fails depending only on utilization.
+```
+Total bytes: 114309400896 (106.46GiB)
+```
 
-**Batch shape is irrelevant**, measured twice:
+which matches the error's *HLO temporaries (106.45G)* exactly. Its largest
+allocations are KV cache arrays -- `num_blocks` is 14,362 and appears in every
+shape:
 
-| varied | from → to | temporaries |
+| share | size | contents |
 |---|---|---|
-| `max-num-batched-tokens` | 8192 → 1024 | 106.41G → 106.38G |
-| `max-num-seqs` | 512 → 32 | 106.38G → 106.43G |
+| 20% | 7.06 GiB | `42xu8[14362,256,512]`, `21xu32[14362,256,128]`, `21xu8[14362,64,4,256]` |
+| +7% | 2.19 GiB | `21xu8[3676672,640]`, `42xu8[14362,256,640]` |
 
-The failure also fires on the **first and smallest compile range, (16, 16)**, so
-the 106.4 GB is the static graph, not the batch.
+`u8[14362,256,640]` is 2.19 GiB each; `u8[14362,256,512]` is 1.75 GiB. At the
+measured 5,001,216 B/block the KV cache is **66.9 GiB, 63% of the module**.
 
-**There is no knob that raises the budget.** From the flag dump:
-`xla_tpu_user_reserved_hbm_bytes = -1` and `xla_tpu_max_hbm_size_mib = 0`, so
-94.74 GB is genuine physical memory. Demand has to come down.
+**Consequences:**
 
-**Rematerialization is the untried lever** — having the compiler recompute
-intermediate values instead of holding them. It is currently half-disabled:
-`xla_tpu_rematerialization_use_host_memory_offload = false` and
-`xla_tpu_rematerialization_min_size_in_bytes = 10485760`, so nothing under 10 MB
-is ever a candidate, and spilling to host memory is off.
+- The compiled graph holds the whole KV cache live, so compile memory scales
+  directly with `gpu-memory-utilization`. That is why the same configuration
+  passes at 0.75 and fails at 0.92 with context, seqs and batched tokens all
+  held fixed.
+- **Rematerialization would not help**, which retires the lever this file
+  previously called the untried option. Remat trades compute for memory by
+  recomputing values; KV cache is state read back across steps, not a
+  recomputable intermediate. `xla_tpu_rematerialization_min_size_in_bytes` and
+  `_use_host_memory_offload` are irrelevant to a 67 GiB block of cache.
+- The only levers that move this number are the ones that make the KV cache
+  smaller: utilization, `max-num-batched-tokens`, or context.
 
-**What is still unmeasured:** which buffers make up the 106.4 GB. A diagnostic
-run with `--xla_dump_buffer_assignment_analysis` produced 3,293 files of small
-utility graphs and none of the module that failed, because
-`--xla_dump_max_hlo_modules=20` counts modules in creation order and the
-backbone compiles late. **Do not cap that flag.** Measure before turning any
-rematerialization knob.
+This supersedes the earlier inferred explanation and closes the question. 0.75
+is not a workaround for an unknown; it is the utilization at which the KV cache
+plus activations fit the compiler's 94.74 GiB.
 
 ## Open: work written but never submitted
 
