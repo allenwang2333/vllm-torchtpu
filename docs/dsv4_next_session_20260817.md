@@ -32,10 +32,11 @@ intermediate. The only levers shrink the cache.
 assistant turn the task ends with. Through `/v1/completions` the answers spread
 across A/B/C/D and anatomy goes 0.05 to 0.90. Proven by a one-server A/B.
 
-**Serving throughput is KV-capped.** 53.8 tok/s at concurrency 64, 54.7 at 256
-— saturated. KV usage 99.9%, batch capped at ~56 by 115,565 tokens. Per
-sequence that is ~1 s/token, against tpu-inference's 1.39 s/token at batch 128,
-so it is not something this port introduced.
+**Serving throughput is ~54 tok/s and no config changes it.** 53.8 at
+concurrency 64, 54.7 at 256, 54.2 and 54.6 with 4.2x the KV cache. Per sequence
+that is ~1 s/token, against tpu-inference's 1.39 s/token at batch 128, so it is
+not something this port introduced. Throughput equals batch exactly, so the
+decode step is weight-bound and batch-independent.
 
 ## Open questions for the next session
 
@@ -84,12 +85,10 @@ less, not hashing less. Highest-leverage idea, untested: pin
 1. **Submit the stack.** ~40 commits absent from `origin/main`. This is what
    gxd3 asked for on PR #462, it has been sitting since 2026-08-14, and nothing
    gates it. The agent never opens PRs — draft and hand over.
-2. **Finish the throughput question.** Under test at handoff:
-   `deepseek-v4-flash-tp8-ep-b1024`, identical to the sweep except
-   `max-num-batched-tokens` 8192 to 1024, which should give 4.2x the KV room. If
-   throughput scales, it is a configuration win; if not, the bottleneck is
-   per-step compute and the next step is the profile config
-   (`deepseek-v4-flash-tp8-ep-profile`).
+2. **The throughput question is answered and closed.** The
+   `max-num-batched-tokens` test ran: 54.6 tok/s at c=256 against the sweep's
+   54.7. No configuration lever moves throughput. See open question 1 — the
+   remaining work is the profile, not another config sweep.
 3. **Size evals realistically.** Full MMLU projects **26.8 hours** at the
    measured rate; MMLU-Pro is worse per sample because outputs are longer. Both
    need subsets. MMLU-Pro at concurrency 32 measured 10.7 s/sample.
