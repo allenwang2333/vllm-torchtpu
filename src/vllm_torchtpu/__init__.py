@@ -1045,21 +1045,11 @@ def _patch_vllm_piecewise_backend() -> None:
                 f"{self.compile_ranges}")
         elif len(self.range_entries) > 1 or (self.compile_sizes
                                              and len(self.compile_sizes) > 1):
-            # Dynamic token count from tensor dimension 0. Prefer a 2D+ tensor
-            # whose dim 0 matches a compile range, falling back to 1D.
-            tensor_arg = next(
-                (x for x in args if isinstance(x, torch.Tensor) and x.ndim >= 2
-                 and self._find_range_for_shape(x.shape[0]) is not None), None)
-            if tensor_arg is None:
-                tensor_arg = next(
-                    (x for x in args if isinstance(x, torch.Tensor)
-                     and self._find_range_for_shape(x.shape[0]) is not None),
-                    None)
-            if tensor_arg is None:
-                tensor_arg = next(
-                    (x for x in args if isinstance(x, torch.Tensor)), None)
-            if tensor_arg is not None:
-                runtime_shape = tensor_arg.shape[0]
+            # Dynamic token count from tensor dimension 0
+            first_tensor = next(
+                (x for x in args if isinstance(x, torch.Tensor)), None)
+            if first_tensor is not None:
+                runtime_shape = first_tensor.shape[0]
                 range_entry = self._find_range_for_shape(runtime_shape)
                 assert range_entry is not None, (
                     f"Shape: {runtime_shape} out of considered ranges: "
