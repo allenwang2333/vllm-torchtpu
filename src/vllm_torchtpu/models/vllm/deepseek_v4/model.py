@@ -25,292 +25,27 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
-from vllm.model_executor.layers.activation import (SiluAndMul,
-                                                   SiluAndMulWithClamp)
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoE, GateLinear, fused_moe_make_expert_params_mapping)
+from vllm.model_executor.layers.fused_moe import \
+    fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import HCHeadOp
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, WeightsMapper,
-                                              extract_layer_index,
                                               is_pp_missing_parameter,
                                               make_layers, maybe_prefix)
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_attention import \
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import \
     VllmDeepseekV4MLAAttention
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
-
-
-def mhc_pre_torch(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure PyTorch implementation of the Manifold-Harmonized Coupling (MHC) pre-op."""
-    hc_mult = residual.shape[-2]
-    hidden_size = residual.shape[-1]
-    outer_shape = residual.shape[:-2]
-
-    residual_flat = residual.view(-1, hc_mult, hidden_size)
-    num_tokens = residual_flat.shape[0]
-
-    x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn.t())
-    sqrsum = x.square().sum(dim=-1, keepdim=True)
-    mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
-
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
-
-    post_logits = (mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] +
-                   hc_base[hc_mult:2 * hc_mult])
-    post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
-
-    comb_logits = mixes[:, 2 * hc_mult:].view(
-        num_tokens, hc_mult,
-        hc_mult) * hc_scale[2] + hc_base[2 * hc_mult:].view(
-            1, hc_mult, hc_mult)
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) +
-                           hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) +
-                               hc_sinkhorn_eps)
-        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) +
-                               hc_sinkhorn_eps)
-
-    layer_input = torch.sum(pre_mix.unsqueeze(-1) *
-                            residual_flat.to(torch.float32),
-                            dim=1).to(torch.bfloat16)
-    return (
-        post_mix.view(*outer_shape, hc_mult, 1),
-        comb_mix.view(*outer_shape, hc_mult, hc_mult),
-        layer_input.view(*outer_shape, hidden_size),
-    )
-
-
-def mhc_post_torch(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-) -> torch.Tensor:
-    """Pure PyTorch implementation of the Manifold-Harmonized Coupling (MHC) post-op."""
-    mixed_residual = torch.einsum(
-        "...ij,...ih->...jh",
-        comb_res_mix.to(torch.float32),
-        residual.to(torch.float32),
-    )
-    post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(
-        torch.float32)
-    return (mixed_residual + post_term).to(residual.dtype)
-
-
-def mhc_hc_head_native(
-    self,
-    hidden_states: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_norm_eps: float,
-    hc_eps: float,
-) -> torch.Tensor:
-    """Pure PyTorch head projection for Manifold-Harmonized Coupling (MHC)."""
-    residual_flat = hidden_states.flatten(-2).float()
-    residual_norm = residual_flat * torch.rsqrt(
-        residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps)
-    pre_mix = torch.nn.functional.linear(residual_norm, hc_fn)
-    pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
-    return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(),
-                     dim=-2).to(hidden_states.dtype)
-
-
-HCHeadOp.forward_native = mhc_hc_head_native
-
-
-class DeepseekV4MLP(nn.Module):
-    """DeepSeek-V4 feed-forward layer for dense/shared expert projections."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        swiglu_limit: float | None = None,
-        quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = True,
-        is_sequence_parallel: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
-            prefix=f"{prefix}.down_proj",
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        if swiglu_limit is not None:
-            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
-        else:
-            self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
-class DeepseekV4MoE(nn.Module):
-    """DeepSeek-V4 MoE layer with dynamic hash routing and fused routed experts."""
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.prefix = prefix
-
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor",
-                                             1.0)
-        self.hidden_size = config.hidden_size
-        self.n_routed_experts = config.n_routed_experts
-        self.n_activated_experts = config.num_experts_per_tok
-        self.moe_intermediate_size = config.moe_intermediate_size
-        self.swiglu_limit = config.swiglu_limit
-        self.renormalize = config.norm_topk_prob
-        self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
-
-        self.gate = GateLinear(
-            input_size=config.hidden_size,
-            output_size=config.n_routed_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
-        )
-
-        self.gate.e_score_correction_bias = None
-        self.gate.tid2eid = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
-        self.hash_indices_dtype = torch.int32
-        if is_hash_moe:
-            self.gate.tid2eid = nn.Parameter(
-                torch.randint(
-                    0,
-                    config.n_routed_experts,
-                    (config.vocab_size, config.num_experts_per_tok),
-                    dtype=self.hash_indices_dtype,
-                ),
-                requires_grad=False,
-            )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
-                requires_grad=False,
-            )
-
-        if config.n_shared_experts is None:
-            self.shared_experts = None
-        else:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV4MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                swiglu_limit=self.swiglu_limit,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
-            )
-
-        self.tp_rank = get_tensor_model_parallel_rank()
-        assert config.n_routed_experts % self.tp_size == 0
-
-        self.n_local_experts = config.n_routed_experts // self.tp_size
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-
-        self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
-            gate=self.gate,
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
-            swiglu_limit=self.swiglu_limit,
-            router_logits_dtype=torch.float32,
-            apply_routed_scale_to_output=True,
-        )
-        self.experts.routed_experts.hash_indices_table = self.gate.tid2eid
-
-    def forward(self,
-                hidden_states: torch.Tensor,
-                input_ids: torch.Tensor | None = None) -> torch.Tensor:
-        if self.gate.tid2eid is not None and input_ids is None:
-            raise ValueError(
-                "DeepSeek V4 hash MoE routing requires input_ids.")
-
-        org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
-
-        return final_hidden_states.view(org_shape)
+from vllm_torchtpu.models.vllm.deepseek_v4.layers import (mhc_post_torch,
+                                                          mhc_pre_torch)
+from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -415,44 +150,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x
 
 
-class DeepseekV4Head(nn.Module):
-    """Output projection head applying HCHead and RMSNorm."""
-
-    def __init__(
-        self,
-        hc_head_op: HCHeadOp,
-        hc_head_fn: nn.Parameter,
-        hc_head_scale: nn.Parameter,
-        hc_head_base: nn.Parameter,
-        norm: nn.Module,
-        rms_norm_eps: float,
-        hc_eps: float,
-    ):
-        super().__init__()
-        self.prefix = "model.head"
-        self.hc_head_op = hc_head_op
-        self.hc_head_fn = hc_head_fn
-        self.hc_head_scale = hc_head_scale
-        self.hc_head_base = hc_head_base
-        self.norm = norm
-        self.rms_norm_eps = rms_norm_eps
-        self.hc_eps = hc_eps
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.hc_head_op(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
-        return self.norm(hidden_states)
-
-
 @support_torch_compile(dynamic_arg_dims={
     "input_ids": 0,
     "positions": 0,
@@ -518,15 +215,6 @@ class DeepseekV4Model(nn.Module):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
-        self.head = DeepseekV4Head(
-            hc_head_op=self.hc_head_op,
-            hc_head_fn=self.hc_head_fn,
-            hc_head_scale=self.hc_head_scale,
-            hc_head_base=self.hc_head_base,
-            norm=self.norm,
-            rms_norm_eps=self.rms_norm_eps,
-            hc_eps=self.hc_eps,
-        )
 
         if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
@@ -582,7 +270,15 @@ class DeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        return self.head(hidden_states)
+        hidden_states = self.hc_head_op(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+        )
+        return self.norm(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
