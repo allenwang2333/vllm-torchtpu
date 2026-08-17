@@ -171,17 +171,51 @@ The 2026-08-12 figure is the reference point:
 `eval_results/phase3_limit50/.../results_2026-08-12T15-49-05.json`, `limit: 50`,
 filter `custom-extract`.
 
-**The `mmlu_llama` score of 0.238 is a harness artifact, not the model.** That
-task ends its prompt with a partial *assistant* turn (`"The best answer is"`)
-plus `continue_final_message: true`, expecting the model to continue it with one
-letter. It does not: **50 of 60 responses are the literal letter `C`** — zero A,
-B or D — and the other 10 open a fresh `# Explanation` block
-(`samples_mmlu_llama_astronomy_2026-08-16T02-37-45.jsonl`). A constant `C`
-scores ~0.25 by accident against 0.25 chance. The inferred cause is that
-`continue_final_message` is not stitched through the `local-chat-completions` →
-vLLM chat path; that mechanism is **unproven**, but MMLU-Pro rules out the
-model, so the fault is in that path. Only worth chasing if `mmlu_llama`
-specifically is needed.
+**The `mmlu_llama` score of 0.238 was a harness artifact — solved 2026-08-17.**
+The task ends its prompt with a partial *assistant* turn (`"The best answer
+is"`) plus `continue_final_message: true`, expecting the model to continue it
+with one letter. Routed through `/v1/chat/completions` that turn is closed and a
+new one started, so the model answers a prompt that has already ended.
+
+**Proven by a one-server A/B** (`scratchpad/run_dsv4_mmlu_endpoint_ab.sh`,
+2026-08-17): same server, same weights, same three subjects, only the endpoint
+differs.
+
+| endpoint | A | B | C | D | junk |
+|---|---|---|---|---|---|
+| `/v1/chat/completions` | 0 | 0 | **50** | 0 | 10 |
+| `/v1/completions` | 10 | 13 | 22 | 15 | 0 |
+
+| subject | chat | completions |
+|---|---|---|
+| abstract_algebra | 0.40 | **0.80** |
+| anatomy | **0.05** | **0.90** |
+| astronomy | 0.35 | **0.95** |
+
+The junk in the chat arm is the same signature seen before: `# Explanation`
+blocks and stray Chinese text. This supersedes the earlier "inferred, unproven"
+status of the `continue_final_message` explanation.
+
+**Use `--model local-completions` for MMLU.** `scratchpad/run_dsv4_mmlu_full.sh`
+does. tpu-inference reaches the same place from a different direction: its MMLU
+job does not use `lm_eval` at all, but its own forked `benchmark_serving.py`
+with a 1-shot HELM-format prompt and no chat template
+(`tests/e2e/benchmarking/mmlu.sh:337-344`). A number from our harness is
+therefore still not directly comparable to their CI figure.
+
+**Do not switch MMLU-Pro to the completions endpoint.** It scores 0.7821 through
+chat and is the accuracy baseline; changing its harness would break
+comparability with the 2026-08-12 result.
+
+**Concurrency scales.** MMLU-Pro at `--limit 20` (280 samples) takes ~104 min at
+`num_concurrent=8` and **49 min at 32** — 10.7 s/sample, roughly 2x, with the
+server confirmed running 32 concurrent requests. The KV headroom recovered by
+the overlay fix is what makes that possible. Full MMLU-Pro (12,032 questions) is
+therefore still a ~35 h job; size any run accordingly.
+
+**Stragglers cost more than the tail they represent.** That same run reached
+278/280 in 49 min, then spent ~50 min in `TimeoutError` retry loops on two
+requests. Use `timeout=900,max_retries=2`, not `1800,5`.
 
 Use `scratchpad/run_dsv4_mmlupro.sh` for future accuracy runs. The four
 `scratch/run_mmlu*.sh` scripts export `LIBTPU_INIT_ARGS` and `MOE_REQUANTIZE_*`
