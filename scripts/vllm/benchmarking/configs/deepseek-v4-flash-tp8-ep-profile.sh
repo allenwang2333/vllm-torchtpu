@@ -11,14 +11,16 @@ ENABLE_EP=true
 QUANTIZATION=""
 KV_CACHE_DTYPE="fp8"
 
-MAX_MODEL_LEN=10240
+MAX_MODEL_LEN=9216
 MAX_NUM_BATCHED_TOKENS=8192
 MAX_NUM_SEQS=512
 GPU_MEMORY_UTILIZATION=0.75
 
 # One decode-heavy combo, few prompts: the trace only needs enough steady-state
 # decode to be representative, and a long run makes the trace harder to read.
-ISL_OSL_CONFIGS="1024:2048"
+# 512 output tokens is ~512 decode steps at the measured 1 tok/s -- ample for a
+# representative trace, and it fits the time available where 2048 would not.
+ISL_OSL_CONFIGS="1024:512"
 CONCURRENCY_OPTIONS="64"
 NUM_PROMPTS=32
 RANDOM_RANGE_RATIO="0.8"
