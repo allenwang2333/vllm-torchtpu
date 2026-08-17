@@ -16,6 +16,7 @@ WORKDIR /root/torchtpu-vllm
 
 # Copy pyproject.toml to extract dependencies and read settings
 COPY pyproject.toml .
+COPY docker/wheels /root/torchtpu-vllm/docker/wheels
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
@@ -34,7 +35,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      -r pyproject.toml; \
+    if ls /root/torchtpu-vllm/docker/wheels/*.whl 1> /dev/null 2>&1; then \
+      uv pip install --system --force-reinstall --no-deps /root/torchtpu-vllm/docker/wheels/*.whl; \
+    fi; \
+    if [ -f /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so ]; then \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_11_0_common.so; \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_12_0_common.so; \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_13_0_common.so; \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_torch_tpu_common.so; \
+      ldconfig; \
+    fi
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -104,6 +115,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
     VLLM_TARGET_DEVICE=empty uv pip install --system .
 
+RUN echo "/usr/local/lib/python3.12/site-packages/torch_tpu/common" > /etc/ld.so.conf.d/torch_tpu.conf && \
+    mkdir -p /usr/local/lib/python3.12/site-packages/torch_tpu/common && \
+    if [ -f /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so ]; then \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_2_11_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_2_12_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_2_13_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_11_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_12_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_2_13_0_common.so && \
+      ln -sf /usr/local/lib/python3.12/site-packages/torch_tpu/common/libpywrap_torch_tpu_common.so /usr/local/lib/libpywrap_torch_tpu_common.so; \
+    fi && \
+    ldconfig
+
 RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
 ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/site-packages/torch_tpu/common:/usr/local/lib"
 CMD ["/bin/bash"]
