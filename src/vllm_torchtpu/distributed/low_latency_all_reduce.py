@@ -97,7 +97,20 @@ def _replicated_spec():
 _GATE: dict[int, tuple[int, int, int]] = {
     2: (256 * 1024, 0, 0),
     4: (128 * 1024, 0, 0),
-    8: (32 * 1024, 64 * 1024, 512 * 1024),
+    # two_shot's floor was 64 KiB only because the original sweep started
+    # there, the same stale bound already corrected for 16/32 devices below.
+    # Measured at 8 devices, device self time:
+    #
+    #   payload   XLA    one_shot   two_shot
+    #    14 KiB  10.12       4.84       7.76
+    #    42 KiB  10.61          -       8.21
+    #
+    # two_shot beats XLA at 42 KiB and one_shot still wins under 32 KiB, so
+    # dropping the floor to one_shot_max closes the gap with no overlap. The
+    # gap mattered: K3's concatenated latent-MoE pair is 42 KiB and fell
+    # straight through it to XLA, which made the 8-device pruned-K3 proxy
+    # unable to exercise the concat path at all.
+    8: (32 * 1024, 32 * 1024, 512 * 1024),
     # two_shot's floor starts well below the 64 KiB the original sweep began
     # at. That sweep could not measure lower because plain two_shot scatters
     # along rows and needs rows % N == 0; _build_two_shot reshapes to

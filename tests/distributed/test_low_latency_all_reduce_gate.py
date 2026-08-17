@@ -76,3 +76,20 @@ def test_two_shot_needs_a_divisible_element_count(monkeypatch):
     # two-shot scatters the flattened payload across devices; an element count
     # that does not divide cannot be expressed and must not be forced.
     assert _route(32, 128 * KIB, numel=65537) == "xla"
+
+
+def test_concat_payload_takes_two_shot_at_8_devices(monkeypatch):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # K3's concatenated latent-MoE pair is 2x10752 bf16 = 42 KiB. The 8-device
+    # band used to start at 64 KiB purely because the original sweep did, so
+    # this fell through to XLA and the single-host pruned-K3 proxy could not
+    # exercise the concat path. Measured at 8 devices two_shot is 8.21 us here
+    # against XLA's 10.61, so the band starts at one_shot_max instead.
+    assert _route(8, 42 * KIB, numel=21504) == "two_shot"
+
+
+def test_one_shot_still_owns_the_small_end_at_8_devices(monkeypatch):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1")
+    # Lowering two_shot's floor to one_shot_max must not steal the range where
+    # one_shot is nearly twice as fast (4.84 vs 7.76 us at 14 KiB).
+    assert _route(8, 14 * KIB, numel=7168) == "one_shot"
