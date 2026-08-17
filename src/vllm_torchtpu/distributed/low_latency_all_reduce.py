@@ -521,6 +521,38 @@ _ENTRY_OPS: dict[str, Any] = {}
 # the thing this whole module is arranged to avoid.
 _ROWPARALLEL_ENTRY: tuple | None = None
 
+# Set by warmup() when TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT=1, and read by the
+# patched latent-MoE tail in vllm_torchtpu/__init__.py.
+#
+# K3's MoE block reduces twice: the routed experts' output at the latent width
+# and the shared experts' at the hidden width. They are independent, so XLA's
+# combiner merges them into one 42 KiB collective costing 33.97 us -- and that
+# amortisation is why every attempt to put a kernel on one half lost. Doing the
+# same job with one kernel over the concatenated pair is the only arrangement
+# that keeps the amortisation and gets the faster collective, measured in
+# scripts/debug/fusion_probe.py at 15.07 us against the combiner's 21.14, or
+# -10.5 us/layer of collective time reproduced across three runs.
+#
+# Delivered through its own global rather than the communicator for the same
+# reason as _ROWPARALLEL_ENTRY: the call site is explicit, so nothing has to
+# infer which reduction this is. Note what that buys -- because the
+# concatenated payload is a *different shape* from the post-attention one, the
+# communicator can keep routing by shape with no ambiguity, so this needs none
+# of the call-site patching that halted the SparseCore.
+_MOE_CONCAT_ENTRY: tuple | None = None
+
+
+def moe_concat_enabled() -> bool:
+    """Whether to reduce K3's latent-MoE pair as one concatenated collective.
+
+    Off by default: it replaces two upstream reductions with one, which is a
+    real change to vLLM's latent-MoE tail, and it only pays off where the
+    combiner was already fusing the pair.
+    """
+    import os
+
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT", "0") == "1"
+
 
 def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
     """An opaque torch op that reduces a tensor, built once per group.
@@ -618,6 +650,72 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
     return op
 
 
+def get_moe_concat_op(dispatcher: LowLatencyAllReduce, plan: _Plan) -> Any:
+    """An opaque op that reduces the concatenated latent-MoE pair.
+
+    Bound to one plan directly, rather than reading ``primary_plan`` the way
+    ``get_entry_op`` does, because two shapes are wired at once here and each op
+    must know which is its own. Two ops rather than one shape-dispatching op for
+    the reason the whole module is arranged around: choosing between them would
+    mean reading a dim in traced Python, which pins vLLM's dynamic token
+    dimension and fails compilation outright.
+
+    two-shot only. The concatenated payload is 42 KiB at K3's widths, well past
+    one-shot's crossover, so a one-shot plan here would be a bug rather than a
+    fallback -- and its arity differs, which a fixed op schema cannot express.
+    """
+    if len(plan.buffers) != 3:
+        raise ValueError(
+            f"the concatenated MoE reduction needs a two_shot plan with three "
+            f"buffers, got {plan.kernel} with {len(plan.buffers)}")
+
+    name = f"vllm_torchtpu::ll_all_reduce_moe_concat_{dispatcher.op_suffix}"
+    existing = _ENTRY_OPS.get(name)
+    if existing is not None:
+        return existing
+
+    donate = donation_enabled()
+
+    def _impl(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
+              step: torch.Tensor) -> torch.Tensor:
+        if (tuple(x.shape) == plan.shape and x.dtype == plan.dtype
+                and x.is_contiguous()):
+            out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
+            if not donate:
+                rs.copy_(new_rs)
+                ag.copy_(new_ag)
+                step.copy_(new_step)
+            return out
+        # Any other shape is a token count this plan was not built for. XLA is
+        # always correct, and the caller has already concatenated, so this still
+        # produces the pair's sum -- just without the kernel.
+        return dispatcher.xla_all_reduce(x)
+
+    op = torch.library.custom_op(name, _impl, mutates_args=())
+    op.register_fake(lambda x, rs, ag, step: torch.empty_like(x))
+    _ENTRY_OPS[name] = op
+    return op
+
+
+def _moe_concat_width(vllm_config) -> int | None:
+    """Width of the concatenated latent-MoE pair, or None if the model has none.
+
+    The two reductions carry the hidden size and the routed-expert latent width,
+    so reducing them together means one payload of their sum. Returns None
+    unless the model actually has both, which is what makes it a latent MoE.
+    """
+    model_config = vllm_config.model_config
+    hf = getattr(model_config, "hf_text_config",
+                 None) or model_config.hf_config
+    hidden = getattr(hf, "hidden_size", None)
+    latent = getattr(hf, "routed_expert_hidden_size", None)
+    if not (isinstance(hidden, int) and hidden > 0):
+        return None
+    if not (isinstance(latent, int) and latent > 0):
+        return None
+    return hidden + latent
+
+
 def _candidate_shapes(vllm_config) -> tuple[list[tuple[int, int]], Any]:
     """(rows, cols) an all-reduce might carry, derived from the config.
 
@@ -638,6 +736,13 @@ def _candidate_shapes(vllm_config) -> tuple[list[tuple[int, int]], Any]:
         value = getattr(hf, attr, None)
         if isinstance(value, int) and value > 0 and value not in widths:
             widths.append(value)
+
+    # The concatenated pair, when the tail is going to reduce them together.
+    # Generated unconditionally rather than behind the flag so that turning the
+    # flag on never has to build a plan late, inside a traced region.
+    concat = _moe_concat_width(vllm_config)
+    if concat is not None and concat not in widths:
+        widths.append(concat)
 
     rows = []
     compile_sizes = getattr(vllm_config.compilation_config, "compile_sizes",
@@ -696,10 +801,43 @@ def warmup(vllm_config) -> None:
         if plan.kernel != "xla":
             kernel_plans.append(plan)
 
-    # Exactly one shape can be wired to the entry op (its workspaces are op
-    # arguments), so pick the smallest payload that takes a kernel: that is
-    # the low-concurrency decode reduction this is aimed at. Everything else
-    # reduces through XLA.
+    # The concatenated latent-MoE pair, wired separately from the
+    # communicator's shape. Its call site is explicit -- the patched MoE tail --
+    # so it gets its own op and its own workspaces, and the two never compete.
+    #
+    # Held out of the primary selection below on purpose. It is the largest
+    # payload that takes a kernel, so "smallest" would not pick it anyway, but
+    # more importantly the communicator must never route to it: a token count
+    # whose hidden-width payload happened to equal the concat width would
+    # otherwise reduce the wrong pair.
+    concat_width = _moe_concat_width(vllm_config)
+    concat_plan = None
+    if moe_concat_enabled() and concat_width is not None:
+        candidates = [p for p in kernel_plans if p.shape[1] == concat_width]
+        concat_plan = min(candidates,
+                          key=lambda p: p.shape[0] * p.shape[1],
+                          default=None)
+        if concat_plan is None:
+            logger.warning(
+                "TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT is set but no width-%d "
+                "shape takes a kernel (candidates %s); the MoE tail keeps its "
+                "two separate reductions.", concat_width,
+                [p.shape for p in kernel_plans])
+        elif concat_plan.kernel != "two_shot":
+            logger.warning(
+                "The concatenated MoE shape %s chose %s, not two_shot; at this "
+                "payload one-shot loses badly, so the tail keeps its two "
+                "separate reductions. Is "
+                "TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT set?", concat_plan.shape,
+                concat_plan.kernel)
+            concat_plan = None
+    if concat_width is not None:
+        kernel_plans = [p for p in kernel_plans if p.shape[1] != concat_width]
+
+    # Exactly one *other* shape can be wired to the communicator's entry op (its
+    # workspaces are op arguments), so pick the smallest payload that takes a
+    # kernel: that is the low-concurrency decode reduction this is aimed at.
+    # Everything else reduces through XLA.
     override = os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_SHAPE", "").strip()
     chosen = None
     if override:
@@ -738,9 +876,21 @@ def warmup(vllm_config) -> None:
             "'rowparallel'; using 'all'.", site)
         site = "all"
 
-    global _ROWPARALLEL_ENTRY
+    global _ROWPARALLEL_ENTRY, _MOE_CONCAT_ENTRY
     _ROWPARALLEL_ENTRY = None
+    _MOE_CONCAT_ENTRY = None
     communicator._ll_entry = None
+
+    if concat_plan is not None:
+        # Registered here, with everything else, because registration calls
+        # infer_schema, which dynamo refuses to trace -- doing it on first use
+        # would put it inside the traced forward and abort compilation.
+        _MOE_CONCAT_ENTRY = (get_moe_concat_op(dispatcher, concat_plan),
+                             *concat_plan.buffers)
+        logger.info(
+            "Low-latency all-reduce: latent-MoE pair wired to one %s over %s.",
+            concat_plan.kernel, concat_plan.shape)
+
     if chosen is not None:
         # get_entry_op reads primary_plan to fix the op's arity, so it must be
         # set first. The buffers go through positionally -- two for one_shot,

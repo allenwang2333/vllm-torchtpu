@@ -459,6 +459,112 @@ def _patch_rowparallel_defer_bias() -> None:
         "Applied TPU patch: defer RowParallelLinear bias past TP all_reduce.")
 
 
+def _patch_latent_moe_concat_allreduce() -> None:
+    """Reduce K3's latent-MoE pair as one collective instead of two.
+
+    ``LatentMoERunner._fused_forward`` reduces twice, on two independent locals
+    ten lines apart: the routed experts' output at the latent width, and the
+    shared experts' at the hidden width. Being independent is why XLA's CRS
+    combiner merges them into a single 42 KiB collective -- and that
+    amortisation is what defeated every attempt to put a kernel on one half.
+    Splitting the pair costs 18 us per layer, more than the faster collective
+    saves, measured twice on K3 (+5.5% device time) and reproduced in two
+    minutes by scripts/debug/fusion_probe.py.
+
+    So this does the combiner's job explicitly: concatenate, reduce once with
+    the low-latency kernel, split. Measured in the probe at 15.07 us against the
+    combiner's 21.14, worth -10.5 us/layer of collective time across three runs.
+
+    Ordering is preserved exactly. Both reductions are plain sums over the same
+    TP group, and an all-reduce is elementwise, so reducing the concatenation
+    and slicing it apart gives each half bit-identical values to reducing it
+    alone. The RMS norm still runs *after* the latent half's reduce, as
+    upstream, because upstream reduces then norms too.
+
+    Left alone unless the kernel is wired: with no plan the tail keeps its two
+    upstream reductions and the combiner keeps fusing them, which is the
+    behaviour every non-K3 model wants.
+    """
+    import torch
+    from vllm.model_executor.layers.fused_moe.runner import latent_moe_runner
+    from vllm.model_executor.layers.fused_moe.runner.latent_moe_runner import \
+        LatentMoERunner
+
+    from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
+
+    if getattr(LatentMoERunner, "_tpu_moe_concat_patch", False):
+        return
+    LatentMoERunner._tpu_moe_concat_patch = True
+
+    original = LatentMoERunner._fused_forward
+
+    def _fused_forward(self,
+                       hidden_states,
+                       router_logits,
+                       input_ids=None,
+                       shared_experts_input=None):
+        entry = _llar._MOE_CONCAT_ENTRY
+        if entry is None:
+            return original(self, hidden_states, router_logits, input_ids,
+                            shared_experts_input)
+        return _concat_fused_forward(self, hidden_states, router_logits,
+                                     input_ids, shared_experts_input, entry)
+
+    def _concat_fused_forward(self, hidden_states, router_logits, input_ids,
+                              shared_experts_input, entry):
+        # Mirrors upstream _fused_forward up to the two reductions, then does
+        # them as one. Kept as a copy rather than hooked into: the two
+        # tensor_model_parallel_all_reduce calls are ordinary statements inside
+        # a longer function, with no seam to intercept between them.
+        if shared_experts_input is None:
+            hidden_states, shared_experts_input = (
+                self.apply_routed_input_transform(hidden_states))
+        (hidden_states, og_pre,
+         og_post) = self._maybe_pad_hidden_states(shared_experts_input,
+                                                  hidden_states)
+
+        result = self._forward_entry(
+            hidden_states, router_logits, shared_experts_input, input_ids,
+            self._encode_layer_name(), self.moe_config.hidden_dim_unpadded
+            if self._quant_method.has_unpadded_output else 0)
+
+        shared_output, fused_output = latent_moe_runner._unpack(result)
+        assert shared_output is not None
+        if og_pre is not None:
+            fused_output = fused_output[..., :og_pre]
+
+        transform = self.routed_output_transform
+        assert transform is not None
+
+        # The one reduction. Flattened and concatenated so the payload is a
+        # single contiguous buffer of exactly the width the plan was built for;
+        # the halves are sliced back out by element count.
+        n_latent = fused_output.numel()
+        pair = torch.cat([fused_output.reshape(-1), shared_output.reshape(-1)])
+        op, *buffers = entry
+        reduced = op(
+            pair.reshape(shared_output.shape[0], -1).contiguous(), *buffers)
+        flat = reduced.reshape(-1)
+        fused_latent = flat[:n_latent].reshape(fused_output.shape)
+        shared_output = flat[n_latent:].reshape(shared_output.shape)
+
+        # Norm after the reduce, as upstream. Its own all-reduce is gone, so
+        # only the norm is left to apply.
+        if transform.norm is not None:
+            fused_latent = transform.norm(fused_latent)
+
+        out = torch.mm(fused_latent, transform.up_proj.weight.t())
+        out.add_(shared_output)
+        out = self._maybe_reduce_final_output(out,
+                                              og_post,
+                                              output_is_reduced=True)
+        return self._maybe_add_zero_expert_output(out)
+
+    LatentMoERunner._fused_forward = _fused_forward
+    logger.info("Applied TPU patch: latent-MoE pair reduced as one "
+                "collective when the low-latency kernel is wired.")
+
+
 def _patch_disable_sequence_parallel_moe() -> None:
     """Disable vLLM's sequence-parallel MoE on TPU.
 
