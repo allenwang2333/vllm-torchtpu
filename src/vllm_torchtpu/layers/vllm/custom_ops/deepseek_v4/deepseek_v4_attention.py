@@ -13,17 +13,16 @@
 # limitations under the License.
 
 import functools
-from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import torch
-import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
+from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import (KVCacheSpec, MLAAttentionSpec,
@@ -42,7 +41,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.utils import align_to
 
 from vllm.model_executor.layers.attention_layer_base import (  # isort: skip
-    AttentionBackend, AttentionLayerBase)
+    AttentionBackend)
 
 logger = init_logger(__name__)
 
@@ -213,18 +212,23 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         return VllmDeepseekSparseSWABackend
 
 
-# The AMD model constructs this class directly (amd/model.py:250);
-# `patch_deepseek_v4_mla_cls` swaps the name to our TPU subclass.
-# TODO(patemotter): drop this dependency once bringup is done, by subclassing
-# the generic DeepseekV4Attention ABC and implementing its platform hooks.
-_orig_ds_v4_attention_cls = ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention
+class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
+    """Sparse MLA attention on TPU, over the SWA and compressed-KV caches.
 
+    Derives from the platform-neutral ``DeepseekV4Attention`` ABC, whose
+    ``__init__`` builds the whole MLA parameter tree (``fused_wqa_wkv``,
+    ``wq_b``, ``wo_a``/``wo_b``, norms, sinks, compressor, indexer) and whose
+    only device-specific hooks are the three abstract methods implemented
+    below: ``get_padded_num_q_heads``, ``forward_mqa`` and ``_o_proj``.
 
-# DeepseekV4Attention must come first: it may already inherit
-# AttentionLayerBase, and the reverse order is an unresolvable MRO.
-class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
-                                 AttentionLayerBase):
-    """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+    ``backend_cls`` -- the fourth hook -- is deliberately left unset: it exists
+    so the base's ``get_attn_backend`` can return a class attribute, and that
+    method is overridden here to import the Pallas backend lazily instead
+    (importing it at module scope would be circular).
+
+    ``AttentionLayerBase`` is not listed as a base: ``DeepseekV4Attention``
+    already inherits it.
+    """
 
     def __init__(
         self,
@@ -233,18 +237,21 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
     ) -> None:
+        # The base constructor looks these three up as module globals of
+        # `vllm.models.deepseek_v4.attention`, so they are swapped for the TPU
+        # implementations for the duration of the call. Same idiom the decoder
+        # layer no longer needs for the attention class itself, now that it
+        # constructs this class directly.
         orig_indexer = dsv4_attention.DeepseekV4Indexer
-        orig_amd_indexer = getattr(ds_v4_amd_model, "DeepseekV4Indexer", None)
         orig_compressor = dsv4_attention.DeepseekCompressor
         orig_swa_cache = dsv4_attention.DeepseekV4SWACache
         dsv4_attention.DeepseekV4Indexer = VllmDeepseekV4Indexer
-        if orig_amd_indexer is not None:
-            ds_v4_amd_model.DeepseekV4Indexer = VllmDeepseekV4Indexer
         dsv4_attention.DeepseekCompressor = VllmDeepseekCompressor
         dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
+        orig_cuda_event = torch.cuda.Event
+        torch.cuda.Event = lambda *args, **kwargs: None
         try:
-            cast(Any, _orig_ds_v4_attention_cls).__init__(
-                self,
+            super().__init__(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
@@ -263,15 +270,13 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
                 if module is not self and hasattr(module, "get_kv_cache_spec"):
                     if module.__class__.__name__ in (
                             "DeepseekV4MultiHeadLatentAttentionWrapper",
-                            "DeepseekV4MLAAttention", "DeepseekV4Attention",
-                            "DeepseekV4ROCMAiterMLAAttention"):
+                            "DeepseekV4MLAAttention", "DeepseekV4Attention"):
                         module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
-            if orig_amd_indexer is not None:
-                ds_v4_amd_model.DeepseekV4Indexer = orig_amd_indexer
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
+            torch.cuda.Event = orig_cuda_event
         if hasattr(self.mla_attn,
                    "compressor") and self.mla_attn.compressor is not None:
             if self.compress_ratio <= 1:
@@ -802,17 +807,3 @@ class VllmDeepseekV4MLAAttention(_orig_ds_v4_attention_cls,
 
         out = self._o_proj(attn_output, positions)
         return out
-
-
-def patch_deepseek_v4_mla_cls() -> None:
-    import vllm.models.deepseek_v4.amd.model as ds_v4_amd_model
-    ds_v4_amd_model.DeepseekV4ROCMAiterMLAAttention = VllmDeepseekV4MLAAttention
-    dsv4_attention.DeepseekV4SWACache = VllmDeepseekV4SWACache
-    if hasattr(ds_v4_amd_model, "DeepseekV4SWACache"):
-        ds_v4_amd_model.DeepseekV4SWACache = VllmDeepseekV4SWACache
-    if not hasattr(DeepseekSparseSWABackend, "get_min_page_size"):
-        DeepseekSparseSWABackend.get_min_page_size = classmethod(
-            lambda cls, vllm_config: 1)
-    logger.info(
-        "Patched DeepseekV4ROCMAiterMLAAttention and DeepseekV4SWACache for TPU."
-    )

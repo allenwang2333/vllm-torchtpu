@@ -389,6 +389,31 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
     return False
 
 
+def _ensure_tpu_models_registered() -> None:
+    """Register this plugin's model implementations, plugin filter or not.
+
+    Registration normally happens through the ``torchtpu_layers`` entry point
+    in the ``vllm.general_plugins`` group. That group is filtered by
+    ``VLLM_PLUGINS``, so a command line naming only some plugins silently drops
+    it -- and then vLLM builds its own CUDA/ROCm class for an architecture this
+    plugin means to replace, which fails somewhere deep inside model
+    construction with no hint that a registration was missed.
+
+    Doing it again here is idempotent (``register_model`` overwrites the same
+    key with the same lazy target) and runs in every process before the model
+    class is resolved out of the registry.
+    """
+    from vllm_torchtpu.models.vllm import register_models
+    register_models()
+
+    # The resolver memoizes the class it found for an architecture, so a
+    # registration made after a lookup would otherwise not take effect.
+    from vllm.model_executor.model_loader import utils as _ml_utils
+    from vllm.model_executor.models.registry import _try_load_model_cls
+    _ml_utils._MODEL_ARCH_BY_HASH.clear()
+    _try_load_model_cls.cache_clear()
+
+
 def _apply_model_specific_patches(
         model_config: Optional["ModelConfig"] = None) -> None:
     if not _is_qwen3_vl_model(model_config):
@@ -793,6 +818,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
+        _ensure_tpu_models_registered()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()
 

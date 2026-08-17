@@ -61,8 +61,7 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.common.quant_methods import (DEEPSEEK_V4_FP8, FP8,
-                                                       get_tpu_quant_method)
+from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
@@ -881,8 +880,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
 
     def __init__(self,
                  quant_config: Fp8Config,
-                 linear_config: VllmQuantLinearConfig | None = None,
-                 prefix: str = ""):
+                 linear_config: VllmQuantLinearConfig | None = None):
         # Skip Fp8LinearMethod.__init__ which has GPU-specific code
         # (CUDA capability, Marlin, cutlass, W8A8BlockFp8LinearOp).
         # Set only the attributes that create_weights() reads.
@@ -902,23 +900,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
-
-        # For DSV4, non-expert dense linears use per-channel FP8 rather than block-quantized FP8.
-        # Gated on config name so generic FP8 models/tests without 'experts' prefixes are unaffected.
-        is_dsv4 = getattr(quant_config, "get_name", lambda: None)() == \
-            DEEPSEEK_V4_FP8
-        is_routed_expert = bool(prefix and ("experts" in prefix)
-                                and ("shared_experts" not in prefix))
-        if is_dsv4 and not is_routed_expert:
-            # Non-expert dense linear layers (attention and shared experts) use per-channel FP8
-            self.weight_block_size = None
-            self.block_quant = False
-            self._linear_quant_config = ("fp8", torch.float8_e4m3fn, None,
-                                         False)
-            self.is_channel_quant = True
-        else:
-            self._linear_quant_config = _get_linear_quant_config(
-                self.linear_config)
+        self._linear_quant_config = _get_linear_quant_config(
+            self.linear_config)
 
     def create_weights(self, layer, input_size_per_partition,
                        output_partition_sizes, input_size, output_size,
