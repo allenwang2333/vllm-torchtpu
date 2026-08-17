@@ -2315,12 +2315,28 @@ class TPUModelRunner(GPUModelRunner):
         self._pre_async_results = None
 
     def _install_spec_token_room_guard(self) -> None:
-        """Wrap InputBatch.update_req_spec_token_ids with an exact room cap.
+        """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
 
-        The write position is num_tokens_no_spec[req_index] at call time;
-        capping against it there cannot go stale, unlike any earlier-stage
-        bound. The scheduler-output dict is trimmed in place so downstream
-        consumers (spec metadata, verify sizing) see the same count.
+        Upstream stages the scheduled drafts at num_tokens_no_spec[req_index].
+        Under async scheduling that position is optimistic -- every in-flight
+        step charges 1+K assuming full acceptance, and the over-count is only
+        rolled back by _modify_prev_results, which runs later (sample_tokens)
+        than this call (execute_model -> _update_states). Near max_model_len
+        the inflated position leaves fewer slots than K, and the unclamped
+        write runs off the end of token_ids_cpu, killing the engine.
+
+        Only the write may be clamped; the scheduled draft *count* must stay
+        exactly what the scheduler charged. num_scheduled_tokens is already
+        fixed at 1+K, and get_spec_decode_metadata anchors each request's
+        logits window at the END of its query
+        (cu_num_scheduled_tokens - num_sampled_tokens). Trimming the count
+        slides that window forward by the trimmed amount, so the rejection
+        sampler verifies the LAST `room` drafts while the tokens actually
+        staged are the first ones -- silent greedy divergence instead of a
+        crash. Dropping only the tail of the write is safe because these
+        slots are placeholders under async: the substitution rewrites every
+        scheduled slot from the device [bonus, draft_1..K] source, and
+        draft_token_ids is re-extracted from the post-substitution input_ids.
         """
         input_batch = self.input_batch
         if getattr(input_batch, "_tpu_spec_room_guard", False):
@@ -2331,18 +2347,35 @@ class TPUModelRunner(GPUModelRunner):
             req_id = request.req_id
             ids = scheduled_spec_tokens.get(req_id)
             idx = input_batch.req_id_to_index.get(req_id)
-            if ids and idx is not None:
-                room = (input_batch.token_ids_cpu.shape[1] -
-                        int(input_batch.num_tokens_no_spec[idx]))
-                if len(ids) > room:
-                    # Fires routinely for a request's final steps near
-                    # max_model_len: async placeholder accounting overshoots
-                    # the scheduler-side bound there.
-                    logger.debug(
-                        "Trimming %d scheduled draft tokens to %d for %s at "
-                        "the context limit.", len(ids), max(0, room), req_id)
-                    scheduled_spec_tokens[req_id] = ids[:max(0, room)]
-            return orig(request, scheduled_spec_tokens)
+            if not ids or idx is None:
+                return orig(request, scheduled_spec_tokens)
+
+            room = max(
+                0, input_batch.token_ids_cpu.shape[1] -
+                int(input_batch.num_tokens_no_spec[idx]))
+            if len(ids) <= room:
+                return orig(request, scheduled_spec_tokens)
+
+            # Fires routinely for a request's final steps near max_model_len:
+            # async placeholder accounting overshoots the scheduler-side bound
+            # there. Stage only the drafts that fit, then restore the full
+            # scheduled list so every downstream count is untouched.
+            logger.debug(
+                "Clamping the draft-token write for %s to %d of %d slots at "
+                "the context limit.", req_id, room, len(ids))
+            scheduled_spec_tokens[req_id] = ids[:room]
+            try:
+                orig(request, scheduled_spec_tokens)
+            finally:
+                scheduled_spec_tokens[req_id] = ids
+
+            # orig() recorded the clamped length; restore the scheduled one.
+            request.prev_num_draft_len = len(ids)
+            cur_spec_token_ids = getattr(input_batch, "spec_token_ids", None)
+            if cur_spec_token_ids is not None:
+                cur_spec_token_ids[idx].clear()
+                cur_spec_token_ids[idx].extend(ids)
+            return None
 
         input_batch.update_req_spec_token_ids = guarded
         input_batch._tpu_spec_room_guard = True
