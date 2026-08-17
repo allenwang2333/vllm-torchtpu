@@ -462,82 +462,100 @@ def _patch_rowparallel_defer_bias() -> None:
 def _patch_latent_moe_concat_allreduce() -> None:
     """Reduce K3's latent-MoE pair as one collective instead of two.
 
-    ``LatentMoERunner._fused_forward`` reduces twice, on two independent locals
-    ten lines apart: the routed experts' output at the latent width, and the
-    shared experts' at the hidden width. Being independent is why XLA's CRS
-    combiner merges them into a single 42 KiB collective -- and that
-    amortisation is what defeated every attempt to put a kernel on one half.
-    Splitting the pair costs 18 us per layer, more than the faster collective
-    saves, measured twice on K3 (+5.5% device time) and reproduced in two
-    minutes by scripts/debug/fusion_probe.py.
+    ``MoERunner.forward`` reduces twice for a latent MoE, on two independent
+    locals in consecutive statements: the routed experts' output at the latent
+    width, and the shared experts' at the hidden width. Upstream says so
+    itself -- "there are two all-reduce points below, they are mutually
+    exclusive, controlled by _fused_output_is_reduced". On K3 with TP the first
+    fires and flips that flag, the second fires to match, and the late reduce
+    is skipped.
 
-    So this does the combiner's job explicitly: concatenate, reduce once with
-    the low-latency kernel, split. Measured in the probe at 15.07 us against the
-    combiner's 21.14, worth -10.5 us/layer of collective time across three runs.
+    Being independent is why XLA's CRS combiner merges them into a single 42 KiB
+    collective, and that amortisation is what defeated every attempt to put a
+    kernel on one half: splitting the pair costs 18 us per layer, more than the
+    faster collective saves (+5.5% device time on K3, reproduced in two minutes
+    by scripts/debug/fusion_probe.py). So this does the combiner's job
+    explicitly -- concatenate, reduce once with the kernel, split -- measured in
+    the probe at 15.07 us against the combiner's 21.14, worth -10.5 us/layer of
+    collective time across three runs.
+
+    **It must be MoERunner, not LatentMoERunner.** The obvious-looking target is
+    ``LatentMoERunner._fused_forward``, whose docstring even mentions merging the
+    two reductions. That class is instantiated in exactly one place in vLLM --
+    ``vllm/models/kimi_k3/nvidia/model.py``, via ``runner_cls=`` -- and our TPU
+    K3 builds its FusedMoEFactory without ``runner_cls``, so it gets the base
+    class and ``_fused_forward`` is dead code here. Patching it produced a run
+    where warmup logged the pair as wired, the kernel was built, and the concat
+    op never executed once; the trace still showed the latent all-reduce at
+    31.3 us and no [2,10752] custom call. Same reason
+    ``enable_k3_latent_moe_tail_fusion`` never applies: it lives in that same
+    NVIDIA file.
 
     Ordering is preserved exactly. Both reductions are plain sums over the same
-    TP group, and an all-reduce is elementwise, so reducing the concatenation
-    and slicing it apart gives each half bit-identical values to reducing it
-    alone. The RMS norm still runs *after* the latent half's reduce, as
-    upstream, because upstream reduces then norms too.
+    TP group and an all-reduce is elementwise, so slicing the concatenation apart
+    gives each half bit-identical values. The latent half is still reduced
+    *before* ``apply_routed_output_transform``, which is required rather than
+    incidental -- that transform contains an RMS norm, and TP partials have to be
+    summed before a non-linearity. That constraint is also why the two reductions
+    cannot simply be deferred and merged later: the concatenation has to happen
+    while both are still unreduced, which is exactly where they are adjacent.
 
-    Left alone unless the kernel is wired: with no plan the tail keeps its two
-    upstream reductions and the combiner keeps fusing them, which is the
-    behaviour every non-K3 model wants.
+    Installed only when the feature is on. The wrapper is a closure in this file,
+    so installing it unconditionally would put it in the *traced* path of every
+    model, and vLLM's source_info.add_code calls inspect.getsourcelines on each
+    traced code object -- if this file changes on disk after a worker imported it
+    (a lint pass, a branch switch mid-run) compilation dies with
+    "IndexError: list index out of range" from inspect.findsource, 25 minutes in
+    and nowhere near the real cause. That is how K3 job 137 died.
     """
     import torch
-    from vllm.model_executor.layers.fused_moe.runner import latent_moe_runner
-    from vllm.model_executor.layers.fused_moe.runner.latent_moe_runner import \
-        LatentMoERunner
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import \
+        MoERunner
 
     from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
 
-    if getattr(LatentMoERunner, "_tpu_moe_concat_patch", False):
+    if getattr(MoERunner, "_tpu_moe_concat_patch", False):
         return
-
-    # Install nothing unless the feature is on. Wrapping unconditionally and
-    # delegating when it is off looks free, and is not: the wrapper is a closure
-    # in *this* file, so it joins the traced path, and vLLM's
-    # source_info.add_code calls inspect.getsourcelines on every traced code
-    # object. Should this file change on disk after a worker imported it -- a
-    # lint pass, a pre-commit stash/restore, a branch switch mid-run -- the
-    # cached line numbers go stale and compilation dies with
-    #
-    #     IndexError: list index out of range   (inspect.findsource)
-    #
-    # twenty-five minutes in and nowhere near the real cause. That is how K3
-    # job 137 died: the worktree was checked out to another branch while its 32
-    # workers were compiling, and the traceback printed source lines belonging
-    # to entirely different functions. Keeping the wrapper out of runs that do
-    # not want it removes the exposure for every other model; K3 runs should
-    # additionally be launched from a dedicated git worktree so the tree cannot
-    # move underneath them.
     if not _llar.moe_concat_enabled():
         logger.info("Skipping TPU patch: latent-MoE concat all-reduce is off.")
         return
+    MoERunner._tpu_moe_concat_patch = True
 
-    LatentMoERunner._tpu_moe_concat_patch = True
+    # Verification, deliberately outside anything traced. __init__ runs at model
+    # build, so logging the concrete class here is safe, and it is the check
+    # whose absence cost a 45-minute run: the patch above can only work if the
+    # class it patched is the class actually built.
+    original_init = MoERunner.__init__
+    seen: set = set()
 
-    original = LatentMoERunner._fused_forward
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        name = type(self).__name__
+        if name in seen:
+            return
+        seen.add(name)
+        # A subclass that defines its own forward does not inherit the patch, so
+        # the concat path would silently not run -- which is exactly what went
+        # wrong before, undetectable without a trace post-mortem. Say so.
+        if type(self).forward is not MoERunner.forward:
+            logger.warning(
+                "Low-latency all-reduce: MoE runner %s overrides forward, so "
+                "the latent-MoE concat patch on MoERunner.forward will NOT "
+                "run and the pair keeps its two separate reductions.", name)
+        else:
+            logger.info(
+                "Low-latency all-reduce: MoE runner in use is %s; the concat "
+                "patch on MoERunner.forward applies.", name)
 
-    def _fused_forward(self,
-                       hidden_states,
-                       router_logits,
-                       input_ids=None,
-                       shared_experts_input=None):
-        entry = _llar._MOE_CONCAT_ENTRY
-        if entry is None:
-            return original(self, hidden_states, router_logits, input_ids,
-                            shared_experts_input)
-        return _concat_fused_forward(self, hidden_states, router_logits,
-                                     input_ids, shared_experts_input, entry)
+    MoERunner.__init__ = patched_init
+    original_forward = MoERunner.forward
 
-    def _concat_fused_forward(self, hidden_states, router_logits, input_ids,
-                              shared_experts_input, entry):
-        # Mirrors upstream _fused_forward up to the two reductions, then does
-        # them as one. Kept as a copy rather than hooked into: the two
-        # tensor_model_parallel_all_reduce calls are ordinary statements inside
-        # a longer function, with no seam to intercept between them.
+    def forward(self,
+                hidden_states,
+                router_logits,
+                input_ids=None,
+                shared_experts_input=None):
         if shared_experts_input is None:
             hidden_states, shared_experts_input = (
                 self.apply_routed_input_transform(hidden_states))
@@ -550,41 +568,56 @@ def _patch_latent_moe_concat_allreduce() -> None:
             self._encode_layer_name(), self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output else 0)
 
-        shared_output, fused_output = latent_moe_runner._unpack(result)
-        assert shared_output is not None
+        shared_output, fused_output = _mr._unpack(result)
         if og_pre is not None:
             fused_output = fused_output[..., :og_pre]
 
-        transform = self.routed_output_transform
-        assert transform is not None
+        # Only the two-reduction shape is ours to merge. Anything else -- no
+        # shared experts, no output transform, a combine kernel that already
+        # reduced, sequence parallelism -- keeps upstream's own sequencing.
+        mergeable = (shared_output is not None
+                     and self.routed_output_transform is not None
+                     and not self._fused_output_is_reduced
+                     and not self.moe_config.is_sequence_parallel
+                     and (self.moe_config.tp_size > 1
+                          or self.moe_config.ep_size > 1))
+        if not mergeable:
+            return original_forward(self, hidden_states, router_logits,
+                                    input_ids, shared_experts_input)
 
-        # The one reduction. Flattened and concatenated so the payload is a
-        # single contiguous buffer of exactly the width the plan was built for;
-        # the halves are sliced back out by element count.
+        entry = _llar._MOE_CONCAT_ENTRY
+        if entry is None:
+            # Loud, not a silent fallback. This patch is installed only when the
+            # feature was explicitly requested, and the previous failure mode was
+            # precisely a run that looked wired and quietly did the old thing --
+            # only a trace post-mortem found it.
+            raise RuntimeError(
+                "latent-MoE concat all-reduce is enabled and patched, but no "
+                "concatenated plan was wired at warmup. Check the payload is in "
+                "the two_shot band for this device count and that "
+                "TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1.")
+
         n_latent = fused_output.numel()
         pair = torch.cat([fused_output.reshape(-1), shared_output.reshape(-1)])
         op, *buffers = entry
         reduced = op(
             pair.reshape(shared_output.shape[0], -1).contiguous(), *buffers)
         flat = reduced.reshape(-1)
-        fused_latent = flat[:n_latent].reshape(fused_output.shape)
+        fused_output = flat[:n_latent].reshape(fused_output.shape)
         shared_output = flat[n_latent:].reshape(shared_output.shape)
 
-        # Norm after the reduce, as upstream. Its own all-reduce is gone, so
-        # only the norm is left to apply.
-        if transform.norm is not None:
-            fused_latent = transform.norm(fused_latent)
-
-        out = torch.mm(fused_latent, transform.up_proj.weight.t())
-        out.add_(shared_output)
-        out = self._maybe_reduce_final_output(out,
-                                              og_post,
-                                              output_is_reduced=True)
+        # Both halves are now reduced, which is what upstream's flag means; the
+        # late all-reduce in _maybe_reduce_final_output must therefore be skipped.
+        shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
+            shared_output, fused_output)
+        fused_output = self.apply_routed_output_transform(fused_output)
+        out = shared_output + fused_output
+        out = self._maybe_reduce_final_output(out, og_post, True)
         return self._maybe_add_zero_expert_output(out)
 
-    LatentMoERunner._fused_forward = _fused_forward
-    logger.info("Applied TPU patch: latent-MoE pair reduced as one "
-                "collective when the low-latency kernel is wired.")
+    MoERunner.forward = forward
+    logger.info("Applied TPU patch: latent-MoE pair reduced as one collective "
+                "on MoERunner.forward.")
 
 
 def _patch_disable_sequence_parallel_moe() -> None:
