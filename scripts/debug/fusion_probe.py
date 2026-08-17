@@ -123,7 +123,7 @@ from torch_tpu._internal.profiler import TpuProfilerConfig
 
 from vllm_torchtpu import profiler_trace
 
-ARMS = ("xla", "shape7168", "p_only", "concat")
+ARMS = ("xla", "shape7168", "p_only", "concat", "concat_pair")
 
 
 class _StubCommunicator:
@@ -257,6 +257,19 @@ def main() -> int:
             lead(f"!! could not build two_shot for {name} {shapes[name]}: "
                  f"{type(e).__name__}: {e}")
 
+    # The two-operand variant, which joins the halves inside the jitted region
+    # instead of making the caller torch.cat them. Same collective, same bytes;
+    # what differs is whether ~4400 standalone data-formatting ops per step
+    # exist at all. On K3 those cost 301 us/step, which is op overhead rather
+    # than bandwidth -- 42 KiB copies in 0.04 us.
+    pair_op = None
+    try:
+        pair_op, pair_buffers = dispatcher._build_two_shot_pair(
+            shapes["a"], shapes["b"], dtype)
+    except Exception as e:  # noqa: BLE001
+        lead(f"!! could not build the two-operand two_shot: "
+             f"{type(e).__name__}: {e}")
+
     def kernel_reduce(name):
         """A torch op for one payload, wired like the production entry op."""
         op, buffers = ops[name]
@@ -283,6 +296,31 @@ def main() -> int:
         return call
 
     kcall = {name: kernel_reduce(name) for name in ops}
+
+    pair_call = None
+    if pair_op is not None:
+        p_rs, p_ag, p_step = pair_buffers
+
+        def _pair_impl(
+                a: torch.Tensor, b: torch.Tensor, rs: torch.Tensor,
+                ag: torch.Tensor,
+                step: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            oa, ob, nrs, nag, nstep = pair_op(a, b, rs, ag, step)
+            if not donate:
+                rs.copy_(nrs)
+                ag.copy_(nag)
+                step.copy_(nstep)
+            return oa, ob
+
+        _pair_top = torch.library.custom_op("vllm_torchtpu::fusion_probe_pair",
+                                            _pair_impl,
+                                            mutates_args=())
+        _pair_top.register_fake(lambda a, b, rs, ag, step:
+                                (torch.empty_like(a), torch.empty_like(b)))
+
+        def pair_call(a, b):
+            return _pair_top(a.contiguous(), b.contiguous(), p_rs, p_ag,
+                             p_step)
 
     def xla_reduce(t):
         return funcol_all_reduce(t, "sum", list(range(world_size)))
@@ -341,7 +379,10 @@ def main() -> int:
 
         def layer(h):
             # p -- the standalone reduction, post-attention's analogue.
-            if arm in ("shape7168", "p_only", "concat"):
+            # Every kernel arm must route p through the kernel, or its arm total is
+            # not comparable: a missing entry here sent concat_pair's p to XLA
+            # and made the arm look 4.3 us/layer worse than it was.
+            if arm in ("shape7168", "p_only", "concat", "concat_pair"):
                 p = kcall["p"](h)
             else:
                 p = xla_reduce(h)
@@ -365,7 +406,14 @@ def main() -> int:
             else:
                 lat = h2 @ w_latent
             sh = h2 @ w_shared
-            if arm == "concat":
+            if arm == "concat_pair":
+                # Same one collective as `concat`, but the halves are joined
+                # inside the op rather than by the caller, so no cat and no
+                # slices appear in this graph at all.
+                a, b = pair_call(lat, sh)
+                a = a * inv
+                b = b * inv
+            elif arm == "concat":
                 # One reduction over both, which is what the combiner was
                 # doing for XLA and what the kernel has to do itself.
                 pair = torch.cat([lat.reshape(-1), sh.reshape(-1)])

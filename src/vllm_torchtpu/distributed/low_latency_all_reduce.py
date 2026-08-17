@@ -444,6 +444,114 @@ class LowLatencyAllReduce:
         step = torch.zeros(1, dtype=torch.int32, device=device)
         return op, (rs, ag, step)
 
+    def _build_two_shot_pair(self, shape_a: tuple[int, ...],
+                             shape_b: tuple[int, ...], dtype: torch.dtype):
+        """One two-shot over two operands, joined *inside* the jitted region.
+
+        **Measured, and it does not pay. Kept for the probe arm that measured
+        it; not wired into production.** Do not reach for this again without new
+        evidence -- the numbers below are the reason.
+
+        Reducing K3's latent-MoE pair as one collective needs both halves in a
+        single payload. Doing that with ``torch.cat`` on the caller's side works
+        -- measured on K3 job 139 at -3.3% TPOT -- but hands back 301 us per
+        decode step, because the cat plus the two slices become ~4400 standalone
+        data-formatting ops at roughly 1.1 us each. Copying 42 KiB costs about
+        0.04 us, which read as op overhead rather than bandwidth and suggested
+        the win would come from removing ops rather than bytes.
+
+        That reading was wrong. Joining here instead, onto jax arrays inside the
+        same jit as the kernel, does not remove the concatenation: XLA
+        materialises it either way and merely accounts it in the same
+        ``data formatting`` bucket. Job 142 ran both arms with every other
+        collective identical --
+
+            arm                    us/layer   pair kernel   data formatting
+            concat (caller cat)      100.59      15.19 us         0.15 ms
+            concat_pair (in-jit)     101.53      15.24 us         0.15 ms
+
+        -- formatting unchanged to two decimals, kernel 0.05 us slower, 0.94
+        us/layer worse overall. (An earlier run made this look like a 0.58
+        us/call saving, but that run routed ``p`` to XLA in one arm only, so it
+        was comparing different collectives.) Removing the concatenation
+        therefore needs a kernel that never materialises it -- two input refs
+        staged into one VMEM buffer inside the Pallas kernel -- rather than a
+        change of where it is written.
+
+        Both operands must divide across the mesh *independently* -- ``numel %
+        n`` for each, not merely for the sum -- so every device's chunk is a
+        clean piece of both. K3 qualifies: 7168 = 32 x 224, 14336 = 32 x 448.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
+            two_shot_all_reduce_ws
+        from vllm_torchtpu.kernels.collectives.sharded_jax_op import \
+            sharded_jax_op
+
+        mesh = self._mesh
+        axis = self._axis
+        n = self._world_size
+        _REPLICATED = _replicated_spec()
+        collective_id = self._next_collective_id
+        self._next_collective_id += 1
+
+        numel_a = 1
+        for d in shape_a:
+            numel_a *= d
+        numel_b = 1
+        for d in shape_b:
+            numel_b *= d
+        if numel_a % n or numel_b % n:
+            raise ValueError(
+                f"both operands must divide across {n} devices, got "
+                f"{numel_a} and {numel_b}")
+        cols = (numel_a + numel_b) // n
+        chunk = 1
+
+        def _fn(
+            a: jax.Array, b: jax.Array, rs: jax.Array, ag: jax.Array,
+            step: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+
+            def body(a, b, rs, ag, step):
+                joined = jnp.concatenate([a.reshape(-1),
+                                          b.reshape(-1)]).reshape(n, cols)
+                out, rs, ag, step = two_shot_all_reduce_ws(
+                    joined,
+                    rs,
+                    ag,
+                    step,
+                    axis_name=axis,
+                    num_devices=n,
+                    collective_id=collective_id,
+                    has_side_effects=False)
+                flat = out.reshape(-1)
+                return (flat[:numel_a].reshape(a.shape),
+                        flat[numel_a:].reshape(b.shape), rs, ag, step)
+
+            return jax.shard_map(body,
+                                 mesh=mesh,
+                                 in_specs=(_REPLICATED, ) * 5,
+                                 out_specs=(_REPLICATED, ) * 5,
+                                 check_vma=False)(a, b, rs, ag, step)
+
+        name = (f"vllm_torchtpu::ll_all_reduce_two_shot_pair_{collective_id}")
+        op = sharded_jax_op(
+            name,
+            _fn,
+            mesh=mesh,
+            input_partition_specs=(_REPLICATED, ) * 5,
+            output_partition_specs=(_REPLICATED, ) * 5,
+            donate_argnums=(2, 3, 4) if donation_enabled() else None,
+        )
+        device = self._comm.device
+        rs = torch.zeros((2, n - 1, chunk, cols), dtype=dtype, device=device)
+        ag = torch.zeros((2, n, chunk, cols), dtype=dtype, device=device)
+        step = torch.zeros(1, dtype=torch.int32, device=device)
+        return op, (rs, ag, step)
+
     # Everything this builds -- a process group gather, a torch custom-op
     # registration, persistent workspace buffers, a log line -- is a side
     # effect, and it runs the first time a shape is seen, which is *during*

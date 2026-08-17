@@ -61,13 +61,16 @@ export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="${RUN_DIR}/torch_tpu_tie
 export TORCH_TPU_TOPOLOGY="${TORCH_TPU_TOPOLOGY:-2,2,4,2}"
 export TPU_WORKER_HOSTNAMES="${HOSTLIST}"
 export TORCH_TPU_XPROF_SESSION_ID="${SLURM_JOB_ID}"
-export FP_ARMS="${FP_ARMS:-xla,shape7168,p_only,concat}"
+# Empty by default so the arm list lives in ONE place, the script's ARMS
+# tuple. Hardcoding it here instead silently dropped a newly added arm from
+# a run that otherwise looked complete.
+export FP_ARMS="${FP_ARMS:-}"
 export FP_EXTRA_ARGS="${FP_EXTRA_ARGS:-}"
 export REPO_DIR PYTHON RUN_DIR
 
 echo "== hosts: ${HOSTS[*]}"
 echo "== results: ${RUN_DIR}"
-echo "== arms: ${FP_ARMS}"
+echo "== arms: ${FP_ARMS:-<script default>}"
 
 cd "${REPO_DIR}"
 
@@ -92,7 +95,7 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --unbuffered --export=ALL \
       --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}" \
       --nproc_per_node=8 \
       scripts/debug/fusion_probe.py \
-      --arms "${FP_ARMS}" \
+      ${FP_ARMS:+--arms "${FP_ARMS}"} \
       --profile-dir "${RUN_DIR}/traces" \
       ${FP_EXTRA_ARGS}
   '
