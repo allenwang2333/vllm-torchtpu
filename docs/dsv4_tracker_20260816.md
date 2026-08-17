@@ -468,10 +468,13 @@ so any future port must move our body, not copy the reference's.
 consistent with a warm read, not proof. `quant_weight_cache.py` logs no
 hit/miss. Add one before anyone quotes a speedup.
 
-**The ROCm class-name string.** `"DeepseekV4ROCMAiterMLAAttention"` at
-`deepseek_v4_attention.py:253`. The module-level import and `getattr` fallback
-gxd3 commented on are already gone. Remove the string if the tuple's other names
-can be shown not to match.
+**The ROCm class-name string — removed 2026-08-17.** The spec-override loop
+tested four class names; searching the installed vLLM showed
+`DeepseekV4MultiHeadLatentAttentionWrapper` and `DeepseekV4MLAAttention` do not
+exist at all, and `DeepseekV4ROCMAiterMLAAttention` exists only in
+`vllm/models/deepseek_v4/amd/rocm.py`, never imported on TPU. Only
+`DeepseekV4Attention` can match, so the tuple became a single comparison. This
+discharges gxd3's PR #459 ask.
 
 **Performance against tpu-inference.** Recorded as 1.27x slower at batch 1 and
 3.34x at batch 128, but that is **from memory of a 2026-08-09 run and
@@ -513,16 +516,17 @@ accepts only `DebugOptions` proto fields; TPU-side flags go through
 `LIBTPU_INIT_ARGS`. An unknown name in either is **fatal within ~36 seconds** of
 startup, well before weight loading, so validating a flag name is cheap.
 
-**Two settings in our own config do nothing.**
+**Two settings in our own config did nothing; both removed 2026-08-17.**
 
-- `NEW_MODEL_DESIGN=1` and `MODEL_IMPL_TYPE=vllm`
-  (`configs/deepseek-v4-flash-tp8-ep.sh:33-34`,
-  `examples/run_dsv4_inference.py:3-4`) are **tpu-inference** environment
-  variables (`tpu_inference/envs.py:20-22`). Nothing under `src/` reads them.
-  They read as a model-implementation switch and are not one.
-- `ATTENTION_BACKEND="CUSTOM"` is **inert for DSv4**: `tpu_platform.py:711-712`
-  overrides the selected backend to `FLASH_ATTN_MLA` whenever MLA is in use,
-  before the supported-backend check.
+- `NEW_MODEL_DESIGN=1` and `MODEL_IMPL_TYPE=vllm` were **tpu-inference**
+  environment variables (`tpu_inference/envs.py:20-22`). Nothing under `src/`
+  reads them. They read as a model-implementation switch and were not one.
+- `ATTENTION_BACKEND="CUSTOM"` is **inert for any MLA model**:
+  `tpu_platform.py:711-712` overrides the selected backend to
+  `FLASH_ATTN_MLA` whenever MLA is in use, before the supported-backend check.
+  Removed from the DSv4 config; still present in other models' configs, where
+  it is only inert for the MLA ones (`deepseek-v2-tp8-ep.sh` looks like the
+  same case, unverified).
 
 **Applied already, no action needed:** `--async-scheduling` (auto-enabled when
 unset, `config/vllm.py:1107`; every run logs "Asynchronous scheduling is
@@ -543,9 +547,6 @@ temporaries.
 **Noise, not ours:** JAX's `cloud_tpu_init.py:104-109` injects
 `--xla_tpu_use_enhanced_launch_barrier=true`; libtpu warns it "can cause
 distributed hangs" and rewrites it to false, eight times per run, in every log.
-
-**Documentation gap.** `deepseek-v4-flash-tp8-ep` is absent from
-`scripts/vllm/benchmarking/README.md`'s config table and from every CI tier.
 
 ## Measuring memory properly
 

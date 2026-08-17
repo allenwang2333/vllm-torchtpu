@@ -79,10 +79,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             object.__setattr__(self, "mla_attn", self)
             for module in self.modules():
                 if module is not self and hasattr(module, "get_kv_cache_spec"):
-                    if module.__class__.__name__ in (
-                            "DeepseekV4MultiHeadLatentAttentionWrapper",
-                            "DeepseekV4MLAAttention", "DeepseekV4Attention",
-                            "DeepseekV4ROCMAiterMLAAttention"):
+                    if module.__class__.__name__ == "DeepseekV4Attention":
                         module.get_kv_cache_spec = self.get_kv_cache_spec
         finally:
             dsv4_attention.DeepseekV4Indexer = orig_indexer
