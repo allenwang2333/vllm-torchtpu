@@ -22,7 +22,7 @@ data-parallel attention, or the performance gap against it.
 | Item | State |
 |---|---|
 | KV cache over-allocation | **Done** (`36abf661`). Utilization 0.55 → 0.75 |
-| Restructure the model package like `kimi_k3` | **Open, directed by Pate 2026-08-17** |
+| Restructure the model package like `kimi_k3` | **Done** (`421698f0`), gate byte-identical |
 | Submit the native model refactor | **Open, ungated.** Needs Pate |
 | Memory utilization above 0.75 | Open. Cause is compile scratch, unmeasured |
 | MHC op registration | **Dropped** — misattributed to the reviewer |
@@ -51,56 +51,21 @@ stands as tidiness only.
 
 Full measurement in the tracker.
 
-## Open: restructure the model package like `kimi_k3`
+## Done: the model package mirrors `kimi_k3`
 
-**One 795-line file with six classes is not acceptable as the shipped
-structure** (Pate, 2026-08-17). It should mirror `kimi_k3`, which is the pattern
-this repo already follows.
+Split in `421698f0`: `layers.py` (164), `moe.py` (142), `attention.py` (628),
+`model.py` (491), and `custom_ops/.../deepseek_v4_attention_op.py` (207) for the
+weightless half of attention. `DeepseekV4Head` was inlined into `Model.forward`
+in the same change. Compiled gate passed with generations byte-identical to
+`gate_09f6c694c.sub`; imports re-verified on the real TPU backend.
 
-`kimi_k3` today:
+The rule applied, and worth reusing: **the model package holds what holds
+weights.** Kernel dispatch, backend subclasses and cache subclasses stay in
+`custom_ops/`. That is what `kimi_k3` does — its `attention.py` imports
+`custom_ops/kda_attention_op.py` rather than absorbing it.
 
-| file | lines | contents |
-|---|---|---|
-| `layers.py` | 112 | `SituAndMul`, `KimiMLP`, `AttentionResidual` |
-| `moe.py` | 161 | `KimiRoutedOutputTransform`, `KimiMoE` |
-| `attention.py` | 667 | `MixedParallelMergedLinear`, `MultiHeadLatentAttention`, `CausalDepthwiseConv1d`, `KimiDeltaAttention` |
-| `model.py` | 637 | `KimiDecoderLayer`, `KimiModel`, `KimiLinearForCausalLM`, `KimiK3ForConditionalGeneration` |
-| `kimi_vit.py` | 35 | model-specific vision piece |
-
-Target for `models/vllm/deepseek_v4/`:
-
-| file | contents |
-|---|---|
-| `layers.py` | `DeepseekV4MLP`, the `mhc_*` helpers, and the output-head math once inlined |
-| `moe.py` | `DeepseekV4MoE` |
-| `attention.py` | `VllmDeepseekV4MLAAttention`, moved in from `layers/vllm/custom_ops/deepseek_v4/` |
-| `model.py` | `DeepseekV4DecoderLayer`, `DeepseekV4Model`, `DeepseekV4ForCausalLM`, `_make_deepseek_v4_weights_mapper` |
-
-Two things fold into this rather than being separate:
-
-**Inline the output head.** The reference has no `Head` class; it calls
-`hc_head_op(...)` then `norm(...)` inline at the tail of `Model.forward`
-(`deepseek_v4.py:656-664`). Ours wraps that in `DeepseekV4Head`
-(`model.py:418`). Inlining it removes a class we have and neither the reference
-nor `kimi_k3` does — do it while the file is being split, not as a second pass.
-
-**Move attention into the package.** `kimi_k3` keeps `attention.py` inside its
-model package; matching it means moving
-`layers/vllm/custom_ops/deepseek_v4/deepseek_v4_attention.py` in. This is the
-largest diff of the set. Open question to settle before doing it: the compressor
-and indexer live in that same custom-ops directory and are genuinely custom ops
-rather than model code, so decide whether they follow attention or stay. Worth a
-note to gxd3 given he reviewed that directory on PR #459, but the structure is
-Pate's call and it has been made.
-
-*Sequencing:* one change, one gate. Splitting the file and inlining the head are
-pure moves; doing them separately costs two 30-minute gates for no benefit. Move
-attention in the same change only if the import churn stays reviewable —
-otherwise split it into a second commit on the same branch and gate once at the
-end.
-
-*Verify:* compiled gate, generations byte-identical to `gate_09f6c694c.sub`.
-These are pure moves; any drift means something was not a pure move.
+Details and the one deliberate wart (`_attn_op_cache` crossing the new module
+boundary) are in the tracker.
 
 ## Open: submit the native model refactor
 

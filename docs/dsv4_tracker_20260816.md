@@ -35,7 +35,7 @@ thing a human needs to do.
 | KV cache over-allocation | **Fixed** 2026-08-16 (`36abf661`), gated |
 | Memory utilization | **0.75 verified** (was 0.55). 0.92 still fails, in compilation, cause unmeasured |
 | Native model refactor | **Written, never submitted.** Nothing gates it |
-| Model package structure | **Open.** One 795-line file; must mirror `kimi_k3` (Pate, 2026-08-17) |
+| Model package structure | **Done** (`421698f0`). Split like `kimi_k3`, gate byte-identical |
 
 ## Picking this up cold
 
@@ -60,11 +60,15 @@ every run, in order, with verdicts.
 
 Model, in dependency order:
 
-- `src/vllm_torchtpu/models/vllm/deepseek_v4/model.py` — the whole model:
-  `DeepseekV4MLP`, `MoE`, `DecoderLayer`, `Head`, `Model`, `ForCausalLM`, the
-  weights mapper, and the `mhc_*` helpers. 795 lines, not yet split.
-- `src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/` — attention,
-  compressor, indexer. Note this is a *different tree* from the model.
+- `src/vllm_torchtpu/models/vllm/deepseek_v4/` — split like `kimi_k3` since
+  `421698f0`: `layers.py` (164; `DeepseekV4MLP`, the `mhc_*` helpers),
+  `moe.py` (142; `DeepseekV4MoE`), `attention.py` (628;
+  `VllmDeepseekV4MLAAttention`), `model.py` (491; decoder, model, weights
+  mapper, causal-LM). The package exports only `DeepseekV4ForCausalLM`.
+- `src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/` — the weightless
+  half: `deepseek_v4_attention_op.py` (207; `_attention_jax`, the backend and
+  SWA-cache subclasses), plus `deepseek_v4_compressor.py` and
+  `deepseek_v4_indexer.py`.
 - `src/vllm_torchtpu/layers/vllm/quantization/deepseek_v4_fp8.py` — the
   `deepseek_v4_fp8` quant config; dispatches linear vs MoE methods.
 - `src/vllm_torchtpu/layers/vllm/quantization/fp8.py` — `VllmFp8LinearMethodTPU`
@@ -388,37 +392,44 @@ file is empty. The earlier "54+/26− still on the branch" came from diffing
 against a stale local `main` (`4b87cff5`) instead of `origin/main`
 (`46a6a94b`). Whether the hardening landed elsewhere or was dropped is unknown.
 
-## Open: the model package is one file, and should not be
+## Done 2026-08-17: the model package is split like `kimi_k3`
 
-**Directed by Pate, 2026-08-17:** a single 795-line `model.py` with six classes
-is not the shipped structure. It should mirror `kimi_k3`, which is the pattern
-this repo already follows — `layers.py` (112 lines), `moe.py` (161),
-`attention.py` (667), `model.py` (637). Ours has one file and keeps attention in
-a different tree entirely (`layers/vllm/custom_ops/deepseek_v4/`).
+`model.py` was one 795-line file with six classes. Split in `421698f0`:
 
-Two smaller differences fold into that work rather than standing alone:
+| file | lines | contents |
+|---|---|---|
+| `layers.py` | 164 | `DeepseekV4MLP`, `mhc_pre_torch`, `mhc_post_torch`, `mhc_hc_head_native` |
+| `moe.py` | 142 | `DeepseekV4MoE` |
+| `attention.py` | 628 | `VllmDeepseekV4MLAAttention` |
+| `model.py` | 491 | `DecoderLayer`, `Model`, weights mapper, `ForCausalLM` |
+| `custom_ops/.../deepseek_v4_attention_op.py` | 207 | `_attention_jax`, `VllmDeepseekSparseSWABackend`, `VllmDeepseekV4SWACache` |
 
-- **An extra output-head class.** The reference has no `Head` class — it calls
-  `hc_head_op(...)` then `norm(...)` inline at the tail of `Model.forward`
-  (`deepseek_v4.py:656-664`). Ours wraps it in `DeepseekV4Head`
-  (`model.py:418`).
-- **Attention lives outside the model package**, unlike `kimi_k3`. The
-  compressor and indexer share that directory and are genuinely custom ops, so
-  whether they follow attention is the open sub-question.
+Against `kimi_k3`'s 112 / 161 / 667 / 637 the proportions line up.
 
-Target layout and sequencing are in `dsv4_design_parity_plan_20260816.md`.
+**The dividing line for attention is whether the code holds weights**, which is
+what `kimi_k3` does: its `attention.py` holds `MultiHeadLatentAttention` and
+imports kernel dispatch from `custom_ops/kda_attention_op.py`. So
+`VllmDeepseekV4MLAAttention` moved into the package; `_attention_jax` and the
+backend/cache subclasses stayed behind. Compressor and indexer stayed put
+untouched — attention pulls them in by rebinding upstream's module globals
+during `__init__`, which is by name at call time and so is location-independent.
 
-**Not a gap:** the kernel count. The reference has 8 entries to our 5, but
-`compress_and_store/`, `compressor_v1.py` and `proj_and_save_state.py` form a
-self-contained cluster nothing outside it imports, in the reference either. The
-quant config, the three custom ops, and whole-backbone compilation are aligned.
+`DeepseekV4Head` is gone, inlined into `Model.forward` as the reference does
+(`deepseek_v4.py:656-664`). It held no parameters of its own — it aliased the
+model's — so `named_parameters` is unchanged.
 
-**Also open, and unrelated to layout:** MHC op registration. `model.py:147`
-assigns `HCHeadOp.forward_native = mhc_hc_head_native` onto a vLLM class at
-import time, where the reference registers four subclasses through vLLM's
-out-of-tree hook and this repo already registers `gdn_attention_op`,
-`kda_attention_op` and `mla_attention_op` that way. **Dropped 2026-08-17** —
-see below.
+**Verified:** compiled gate at `421698f0` passed `tracebacks=0 sweeps=13
+raises=0`, needle exact, generations and token IDs **byte-identical** to
+`gate_09f6c694c.sub`. Imports re-checked on the real TPU backend (8 devices),
+including that `_attn_op_cache` remains one shared object across the new module
+boundary.
+
+**One wart left deliberately.** `_attn_op_cache` is a module-level mutable dict
+defined in the op module and read/written by the attention class in the package.
+It works because the dict is only mutated by item assignment, never rebound. The
+`global _attn_op_cache` statement inside the method is now misleading — it names
+the imported binding, not the defining module's. Left alone to keep the commit a
+pure move; worth cleaning up separately.
 
 ## The MHC cleanup was dropped — what the reviewer actually asked
 
