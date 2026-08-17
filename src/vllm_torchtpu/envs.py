@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
     USE_MOE_SPARSE_CORE: bool = True
-    FORCE_MOE_RANDOM_ROUTING: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -46,6 +45,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_PARALLEL_PRECOMPILE: bool = False
 
 
 def env_with_choices(
@@ -169,9 +169,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Worker ID for multi-host TPU setups
     "TPU_WORKER_ID":
     lambda: os.getenv("TPU_WORKER_ID", None),
-    # Backend for multi-host communication on TPU
+    # Backend for multi-host communication on TPU. "" auto-detects: "mp" is
+    # used whenever --nnodes > 1 and this isn't set to "ray"; set explicitly
+    # to "mp" to force it (e.g. to silence the auto-detection log line).
     "TPU_MULTIHOST_BACKEND":
-    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
+    env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray", "mp"]),
     # Check for XLA recompilation during execution
     "VLLM_XLA_CHECK_RECOMPILATION":
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")),
@@ -246,12 +248,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
-    # Route MoE tokens to uniformly random experts instead of using the gate.
-    # Balances expert load so a single-device profile represents the whole EP
-    # mesh (see moe_routing.maybe_force_random_routing). Produces meaningless
-    # output -- for profiling only, never serving. Disabled by default.
-    "FORCE_MOE_RANDOM_ROUTING":
-    env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
@@ -319,6 +315,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Enable pre-compile rotation to speed up the startup time.
+    "TPU_PARALLEL_PRECOMPILE":
+    env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
 }
 
 

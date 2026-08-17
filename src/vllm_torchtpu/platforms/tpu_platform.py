@@ -42,6 +42,17 @@ else:
 
 logger = init_logger(__name__)
 
+# Every map below is keyed on the number of devices in the slice, which is
+# what world_size counts and what the slice builder sizes its worker address
+# list against. How that key relates to the topology string differs by
+# generation, so the maps cannot be merged:
+#
+#   - 2D Torus (v5e, v6e): one core per chip, T=1, so key == X*Y.
+#   - 3D Torus (v4, v5p): two cores per chip, but megacore presents the pair
+#     as a single device, so key == X*Y*Z and the trailing T=2 is not counted.
+#   - 3D Torus (v7x / Ironwood): two cores per chip exposed as two separate
+#     devices, so key == X*Y*Z*T, twice the chip count.
+#
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     4: "2,2,1",
@@ -53,7 +64,7 @@ TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "16,16,1",
 }
 
-# Multi-host TPU slice mesh topologies for 3D Torus architectures.
+# Multi-host TPU slice mesh topologies for TPU v4 / v5p (4 devices per host).
 TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     8: "2,2,2,2",
     16: "2,2,4,2",
@@ -63,9 +74,26 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "4,8,8,2",
 }
 
+# Multi-host TPU slice mesh topologies for TPU v7x / Ironwood, which exposes
+# both cores of a chip as separate devices (8 devices per host). Same meshes
+# as above, addressed by twice as many devices.
+TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    16: "2,2,2,2",
+    32: "2,2,4,2",
+    64: "2,4,4,2",
+    128: "4,4,4,2",
+    256: "4,4,8,2",
+    512: "4,8,8,2",
+}
+
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
 # TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
+
+# 3D Torus generations that expose two devices per chip. The device name
+# surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
+# device-kind path, so both spellings have to match.
+_TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 
 def get_tpu_multihost_topology(
@@ -73,6 +101,10 @@ def get_tpu_multihost_topology(
     device_name: Optional[str] = None,
 ) -> str:
     """Return the multi-host mesh topology string for a TPU cluster.
+
+    `world_size` is the number of devices in the slice (one per worker), which
+    is what the fallback maps are keyed on. The map is selected by generation
+    because devices-per-chip varies; see the maps above.
 
     Resolution order:
     1. `TORCH_TPU_TOPOLOGY` environment variable (set by GKE).
@@ -89,15 +121,18 @@ def get_tpu_multihost_topology(
         except Exception:
             device_name = ""
 
-    is_2d_torus = any(gen in device_name.lower()
-                      for gen in _TPU_2D_TORUS_GENERATIONS)
-    topo_map = (TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
-                if is_2d_torus else TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP)
+    device_name = device_name.lower()
+    if any(gen in device_name for gen in _TPU_2D_TORUS_GENERATIONS):
+        topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
+        topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
+    else:
+        topo_map = TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP
 
     topo = topo_map.get(world_size)
     if topo is None:
         raise ValueError(
-            f"Cannot find topology for {world_size} chips in {topo_map}. "
+            f"Cannot find topology for {world_size} devices in {topo_map}. "
             "Please export TORCH_TPU_TOPOLOGY in your environment.")
     return topo
 
@@ -118,13 +153,7 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_patches_applied = False
-
-
-def _is_language_model_only_config(model_config: "ModelConfig") -> bool:
-    multimodal_config = model_config.multimodal_config
-    if multimodal_config is None:
-        return False
-    return bool(multimodal_config.language_model_only)
+_tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -239,6 +268,39 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _register_tpu_kv_connectors() -> None:
+    """Register TPU-specific KV connectors in vLLM's factory name registry.
+
+    Ensures connectors loaded dynamically via module paths (e.g., TPURaidenConnector,
+    TPUMultiConnector, TPURaidenOffloadingConnector) are discoverable by name.
+
+    Required for the API server metrics pipeline: TPUMultiConnector aggregates child
+    connector statistics by looking up classes via get_connector_class_by_name().
+    Without registry registration, the first metrics collection triggers an unhandled
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+
+    Invoked from check_and_update_config() in every process that builds a VllmConfig
+    (including the API server). Defers imports lazily until connector names are accessed.
+    """
+    global _tpu_kv_connectors_registered
+    if _tpu_kv_connectors_registered:
+        return
+    _tpu_kv_connectors_registered = True
+
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+
+    for name, module_path in (
+        ("TPURaidenConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        ("TPUMultiConnector",
+         "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"),
+        ("TPURaidenOffloadingConnector",
+         "vllm_torchtpu.offload.raiden_connector"),
+    ):
+        KVConnectorFactory.register_connector(name, module_path, name)
+
+
 def apply_tpu_patches() -> None:
     """Apply all module-level patches required for TorchTPU.
 
@@ -257,6 +319,7 @@ def apply_tpu_patches() -> None:
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
+                               _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_hybrid_producer_prefix_hits,
                                _patch_vllm_tpu_group_custom_ops)
@@ -268,12 +331,14 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
+    tpu_plugin._patch_vllm_pcp_v2_validation()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
     _patch_vllm_disable_compile_ranges()
+    _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
@@ -285,9 +350,18 @@ def apply_tpu_patches() -> None:
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     from vllm_torchtpu import (_patch_disable_dp_ubatch,
-                               _patch_multiproc_worker_global_rank_env)
+                               _patch_multiproc_worker_global_rank_env,
+                               _patch_vllm_compile_prefix_isolation,
+                               _patch_vllm_piecewise_backend,
+                               _patch_vllm_reset_compile_wrapper)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
+    _patch_vllm_reset_compile_wrapper()
+    _patch_vllm_piecewise_backend()
+    _patch_vllm_compile_prefix_isolation()
+    from vllm_torchtpu.model_loader_patches import \
+        patch_runai_sharded_expert_streaming
+    patch_runai_sharded_expert_streaming()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -528,7 +602,8 @@ class TpuPlatform(Platform):
     _is_hybrid: bool = False
 
     supported_quantization: list[str] = [
-        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4", "modelopt_fp4"
+        "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
+        "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
@@ -549,6 +624,27 @@ class TpuPlatform(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         return
+
+    @classmethod
+    def device_count(cls) -> int:
+        """Local physical chip count on this host, stable across contexts.
+
+        Without this override, `device_count()` resolves dynamically to
+        `torch.tpu.device_count()` (see torch_tpu's device module), which
+        returns the *local* chip count outside any torch.distributed group
+        but drops to 1 (chips bound to this rank) once a real multi-host
+        `tpu_dist` process group is active — vLLM workers are one-process-
+        per-chip, so every rank observes exactly 1 there. Callers like
+        MessageQueue.create_from_process_group_single_reader use this value
+        as "how many ranks share this host" (the CUDA convention, where
+        device_count() stays host-wide regardless of the process's own
+        device binding), so the dynamic proxy silently breaks cross-host
+        same-node detection for every rank but the reader itself. Scanning
+        /dev/vfio (or /dev/accel*) directly sidesteps the distributed
+        context entirely and always returns the true local chip count.
+        """
+        from vllm_torchtpu.tpu_info import get_num_chips
+        return get_num_chips()
 
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
@@ -587,7 +683,16 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
                 f"localhost:{p}" for p in sb_ports)
 
-        os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
+        # A per-engine DP config copy (data_parallel_size collapsed to 1,
+        # see the caller) re-enters this function in a child process that
+        # inherits TORCH_TPU_TOPOLOGY already computed for the *real* multi-
+        # host slice by prepare_mp_multihost_dp_env. Only the single-host
+        # PCI-scan lookup below needs a fresh call, and re-running it here
+        # would fail: this process only has world_size's local share of
+        # chips, not the whole cross-host slice.
+        if "TORCH_TPU_TOPOLOGY" not in os.environ:
+            os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(
+                world_size)
 
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
@@ -689,6 +794,7 @@ class TpuPlatform(Platform):
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
+        _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -804,18 +910,37 @@ class TpuPlatform(Platform):
                         "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
-        if not multihost_backend:  # Single host
+        if multihost_backend != "ray" and parallel_config.nnodes > 1:
+            # Genuine multi-host run without Ray: each host runs its own
+            # `vllm serve --nnodes N --node-rank R [--headless]` process and
+            # spawns its local TP-slice workers via TpuMultiprocExecutor.
+            # Unlike the Ray path there's no actor system to discover peer
+            # hosts, so a short TCPStore rendezvous fills in the TORCH_TPU_*
+            # env vars (slicebuilder addresses spanning every host, full
+            # ICI topology, TPU_NUM_HOSTS/NODE_RANK) before workers are
+            # forked. This must be checked before the "not multihost_backend"
+            # single-host branch below: an unset TPU_MULTIHOST_BACKEND still
+            # means "mp" whenever --nnodes > 1 was actually passed.
+            from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                prepare_mp_multihost_env
+            prepare_mp_multihost_env(parallel_config)
+            logger.info(
+                "Force using TpuMultiprocExecutor for TPU multi-host "
+                "(nnodes=%d, node_rank=%d).", parallel_config.nnodes,
+                parallel_config.node_rank)
+            from vllm_torchtpu.executors.tpu_multiproc_executor import \
+                TpuMultiprocExecutor
+            parallel_config.distributed_executor_backend = TpuMultiprocExecutor
+        elif multihost_backend == "mp" or not multihost_backend:
+            # Single host, or genuine multi-host DP without --nnodes (this
+            # host owns only a slice of data_parallel_size via
+            # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
                 if pcp_size > 1:
                     ensure_pcp_local_rank_remap(
                         parallel_config.world_size_across_dp,
                         get_topology=cls._get_tpu_topology)
-                # Single-host DP uses one torch_tpu slice across all DP*TP
-                # workers; the worker spawn shim exposes a DP-adjusted chip
-                # ordinal to TorchTPU for physical binding.
-                cls.device_control_env_var = \
-                    "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -828,9 +953,23 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_master_ip or "localhost")
                 os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT",
                                       str(portpicker.pick_unused_port()))
-                # Full-slice slicebuilder list + topology (TP*PP*DP), once.
-                cls._prepare_singlehost_tpu_env(
-                    parallel_config.world_size_across_dp)
+                if parallel_config.enable_expert_parallel:
+                    # EP's expert-combine collective genuinely spans every
+                    # DP*TP worker, so torch_tpu needs one shared slice
+                    # across all of them; the worker spawn shim exposes a
+                    # DP-adjusted chip ordinal to TorchTPU for physical
+                    # binding.
+                    cls.device_control_env_var = \
+                        "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+                # Genuine multi-host DP (this host only owns a slice of the
+                # DP ranks) needs a TCPStore rendezvous across hosts instead
+                # of the single-host localhost/PCI-scan bootstrap below.
+                from vllm_torchtpu.distributed.tpu_mp_multihost import \
+                    prepare_mp_multihost_dp_env
+                if not prepare_mp_multihost_dp_env(
+                        parallel_config, parallel_config.world_size_across_dp):
+                    cls._prepare_singlehost_tpu_env(
+                        parallel_config.world_size_across_dp)
             else:
                 # vLLM hands each DP engine a ParallelConfig with
                 # data_parallel_size collapsed to 1, so the inherited
@@ -862,6 +1001,15 @@ class TpuPlatform(Platform):
                     TpuMultiprocExecutor
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
+            if parallel_config.data_parallel_size > 1:
+                if pcp_size > 1:
+                    raise NotImplementedError(
+                        "Prefill context parallelism is not supported "
+                        "together with multihost data parallelism.")
+                if not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+                    raise NotImplementedError(
+                        "Multihost data parallelism requires the Ray V2 "
+                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1.")
             if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import \
                     RayDistributedExecutorV2
@@ -881,14 +1029,6 @@ class TpuPlatform(Platform):
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
-        if (scheduler_config.is_multimodal_model
-                and not _is_language_model_only_config(model_config)
-                and not scheduler_config.disable_chunked_mm_input):
-            logger.warning("TPU does not support running Multimodal models"\
-            " without setting `--disable_chunked_mm_input`. " \
-            "Forcing --disable_chunked_mm_input.")
-            scheduler_config.disable_chunked_mm_input = True
-
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
             if scheduler_config.scheduler_cls != dp_sched_cls:
@@ -904,11 +1044,10 @@ class TpuPlatform(Platform):
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
                 "TPUConnector",
-                "TPUConnectorV2",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "TPUConnectorHMA",
                 "OffloadingConnector",
+                "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
                 _TPU_SUPPORTED_KV_CONNECTORS, (
@@ -916,31 +1055,46 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
-            if (kv_transfer_config.kv_connector == "TPUConnectorV2"
-                    and not unified_kv_layout_enabled(vllm_config)):
-                raise ValueError("TPUConnectorV2 requires "
-                                 "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    == "OffloadingConnector" and is_hybrid)
+                                    in ("OffloadingConnector",
+                                        "TPURaidenOffloadingConnector")
+                                    and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):
-                # Hybrid CPU offloading transfers whole pool rows; the
-                # typed-view layout has no uniform per-block row to copy.
+                # Hybrid model offloading transfers uniform pool rows; the non-unified
+                # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
-                    "CPU offloading (OffloadingConnector) on hybrid "
-                    "attention+Mamba models requires the unified block "
-                    "pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
+                    f"CPU offloading ({kv_transfer_config.kv_connector}) "
+                    "on hybrid attention+Mamba models requires the unified "
+                    "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
         backend_cls = cls._find_non_ssm_backend(vllm_config)
 
-        is_hybrid = vllm_config.model_config.is_hybrid
-        if not is_hybrid and not cache_config.user_specified_block_size:
-            default = backend_cls.get_page_size(vllm_config)
+        if backend_cls is None:
+            return
+
+        architectures = getattr(
+            getattr(vllm_config.model_config, "hf_config", None),
+            "architectures", None) or []
+        is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+
+        if is_ds_v4 and not cache_config.user_specified_block_size:
+            # DSv4 pages hold compressed rows. Its backend's
+            # get_preferred_block_size is a hardcoded 256, which does not fit
+            # the packed latent record, so take the MLA page size directly.
+            from vllm_torchtpu.layers.vllm.attention import \
+                PallasMLAttentionBackend
             cache_config.block_size = (  # type: ignore[assignment]
-                backend_cls.get_preferred_block_size(default))
+                PallasMLAttentionBackend.get_page_size(vllm_config))
+        else:
+            is_hybrid = vllm_config.model_config.is_hybrid
+            if not is_hybrid and not cache_config.user_specified_block_size:
+                default = backend_cls.get_page_size(vllm_config)
+                cache_config.block_size = (  # type: ignore[assignment]
+                    backend_cls.get_preferred_block_size(default))
         if unified_kv_layout_enabled(vllm_config):
             update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

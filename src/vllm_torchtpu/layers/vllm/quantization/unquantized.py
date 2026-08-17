@@ -37,7 +37,6 @@ and uses our native TorchTPU + Pallas kernels.
 from typing import Any, Optional
 
 import torch
-from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (RoutedExperts,
                                                   UnquantizedFusedMoEMethod)
@@ -57,6 +56,7 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -211,11 +211,11 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
         if layer.w13_weight.device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
+            to_sync = [layer.w13_weight, layer.w2_weight]
             if self.moe.has_bias:
-                sync.synchronize(layer.w13_bias, wait=True)
-                sync.synchronize(layer.w2_bias, wait=True)
+                to_sync.append(layer.w13_bias)
+                to_sync.append(layer.w2_bias)
+            synchronize_tensors(to_sync)
 
         logger.info_once("Unquantized weights transposed for GMM kernel: "
                          f"w13={list(layer.w13_weight.shape)}, "
@@ -240,26 +240,10 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
         # Step 1: Routing
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            # custom_routing_fn bypasses select_experts, so apply the
-            # random-routing profiling override here too (a no-op by default).
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-                layer=layer,
-            )
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
