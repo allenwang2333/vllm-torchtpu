@@ -109,3 +109,54 @@ less, not hashing less. Highest-leverage idea, untested: pin
   invisible to a stall detector entirely — check projected ETA.
 - Fixing a value in a config file does not fix it where it is hardcoded
   elsewhere. Grep for the old value before relaunching.
+
+## Opening prompt
+
+```
+Read docs/dsv4_next_session_20260817.md and docs/dsv4_tracker_20260816.md first.
+They are the source of truth and supersede any memory of earlier sessions.
+
+Branch patemotter/dsv4-native-model, 27 commits ahead of origin/main, tree
+clean, TPU idle.
+
+Settled on 2026-08-17, do not re-open without new evidence:
+- KV over-allocation fixed (36abf661): utilization 0.55 -> 0.75, gate
+  byte-identical.
+- The compile OOM at 0.92 is the KV cache itself, 63% of a 106.46 GiB module.
+  Rematerialization cannot help.
+- MMLU's constant-C is the chat endpoint. Use --model local-completions.
+- Serving throughput is ~54 tok/s and no config lever moves it: concurrency
+  64 vs 256, batched tokens 1024 vs 8192, KV cache 115K vs 485K all give the
+  same answer.
+
+Work the open questions in that doc in order. Number 1 is the decode step:
+throughput equals batch exactly, so step time is ~1 s regardless of batch and
+only a profile gets further. deepseek-v4-flash-tp8-ep-profile is committed and
+fixed but has never produced a trace; budget ~35 min.
+
+Discipline that cost real time on 2026-08-17:
+- Verify any tracker claim against code, a log line, or a PR thread before
+  repeating it. Four claims were asserted as fact and were wrong, including
+  ones written by an agent. docs/archive/ is historical and twice described
+  behaviour that had since changed.
+- Watch runs actively. Arm a monitor on forward progress -- a request counter,
+  a result-file count -- not on log activity: a hung eval keeps printing
+  throughput lines, and a run that advances steadily toward a 26-hour finish
+  looks healthy to a stall detector.
+- pgrep -f <pattern> matches the shell running it when the pattern appears in
+  its own command line. Match a path, exclude $$.
+- ls -t <dir>/*.json | tail -1 returns the OLDEST file.
+- run_benchmarks.sh probes for the CLI with bare python3, which has no vLLM.
+  Put ${VENV}/bin on PATH.
+- When changing a value in a config, grep for the old value everywhere before
+  relaunching.
+- Run on the TPU. Never JAX_PLATFORMS=cpu, never interpret mode.
+
+One run at a time; check the chips with the /proc/*/fd vfio scan, since lsof
+and pgrep both lie. Never pytest while serving. Commit before gating and tag
+the run with the short SHA. Gate pass is tracebacks=0 sweeps=13 raises=0,
+needle exact 7391-QUARTZ-4408, generations diffed against
+scratchpad/gate_09f6c694c.sub.
+
+I never push, open PRs, post review comments, or merge. Draft and hand over.
+```
