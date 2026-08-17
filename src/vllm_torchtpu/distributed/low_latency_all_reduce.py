@@ -157,6 +157,56 @@ def _two_shot_enabled() -> bool:
     return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "0") == "1"
 
 
+def donation_enabled() -> bool:
+    """Whether to donate the workspace instead of copying it back.
+
+    The ``_ws`` kernels thread a workspace call-to-call. The entry op has always
+    updated it with ``copy_`` on the returned buffer, on the assumption -- taken
+    from the RPA kernel's KV cache -- that XLA aliases the donation and the copy
+    compiles away. In a small graph it does: the ablation harness shows 0.01 ms
+    of data formatting across 300 calls. In a real graph it does not. Production
+    paid 5.45 ms, 1.82 us per call, and the fusion probe shows the concatenated
+    arm saving 10.16 us of collective time per layer while delivering only 5.38
+    -- about half of it handed back here.
+
+    ``sharded_jax_op`` already accepts ``donate_argnums``; nothing passed it. So
+    this asks JAX to donate the workspace buffers, and the entry op then skips
+    the writeback because the buffers were updated in place.
+
+    **Measured, and it is a regression. Leave this off.** Paired fusion-probe
+    runs at 32 devices (jobs 130 without, 131 with) put every kernel call 3-4 us
+    *slower* and nearly tripled data formatting:
+
+        kernel                no donate   donate
+        concat [2,10752]          15.02    18.30
+        concat [2,7168]           13.45    16.57
+        p_only [2,7168]           14.25    18.01
+        data formatting (ms)       0.15     0.44
+
+    So donation adds copies instead of removing them -- presumably XLA
+    inserting defensive ones to keep the donated buffer valid for the tensor the
+    caller still holds. The xla arm was unchanged across the pair (109.13 vs
+    109.03), so the effect is confined to the kernel arms.
+
+    Kept, gated and off, because the hypothesis is an obvious one to retry and
+    this records that it was tried. It also disproves the theory it was built to
+    test: the gap between concat's collective saving (-10.41 us/layer) and its
+    realised layer saving (-5.15) is *not* the copy_ writeback, so that gap is
+    still unattributed.
+
+    Correctness held in both runs, so donation is slow rather than unsafe here.
+    That was not a given, and it is why the probe's check runs a multi-call
+    chain: donation invalidates the donated array in JAX's semantics, and if
+    torch_tpu freed the buffer and allocated a fresh one, the workspace the
+    caller keeps handing in would go stale -- silent corruption, not an error,
+    since the kernel would simply read the wrong slot. The round counter
+    alternates slots, so a single call cannot exercise the parity that breaks.
+    """
+    import os
+
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_DONATE", "0") == "1"
+
+
 def _choose_kernel(num_devices: int, payload_bytes: int, numel: int) -> str:
     """Pick a kernel from the measured table, or ``"xla"`` to leave it alone."""
     gate = _GATE.get(num_devices)
@@ -313,6 +363,8 @@ class LowLatencyAllReduce:
             mesh=mesh,
             input_partition_specs=(_REPLICATED, ) * 3,
             output_partition_specs=(_REPLICATED, ) * 3,
+            # ws, step -- args 1..2. See donation_enabled().
+            donate_argnums=(1, 2) if donation_enabled() else None,
         )
         device = self._comm.device
         ws = torch.zeros((2, n - 1, *shape), dtype=dtype, device=device)
@@ -370,6 +422,8 @@ class LowLatencyAllReduce:
             mesh=mesh,
             input_partition_specs=(_REPLICATED, ) * 4,
             output_partition_specs=(_REPLICATED, ) * 4,
+            # rs, ag, step -- args 1..3. See donation_enabled().
+            donate_argnums=(1, 2, 3) if donation_enabled() else None,
         )
         device = self._comm.device
         rs = torch.zeros((2, n - 1, chunk, cols), dtype=dtype, device=device)
@@ -442,6 +496,31 @@ class LowLatencyAllReduce:
 
 _ENTRY_OPS: dict[str, Any] = {}
 
+# Set by warmup() when TPU_LOW_LATENCY_ALLREDUCE_SITE=rowparallel, and read by
+# the patched RowParallelLinear.forward in vllm_torchtpu/__init__.py.
+#
+# Why a second delivery path exists at all. The communicator's ``_ll_entry``
+# routes by *shape*, and on K3 two different reductions share the shape
+# [2, 7168]: the post-attention output projection, which is standalone in the
+# graph, and the one inside the MoE block, which XLA's combiner fuses with the
+# latent [2, 3584] beside it. Wiring the shape captures both, the fused pair
+# splits, and the lost fusion costs more than the faster kernel gains -- +5.5%
+# device time, measured. Shape cannot separate them because they have the same
+# shape; only the call site can.
+#
+# RowParallelLinear is that discriminator on K3: it issues the 95 standalone
+# reductions per decode step and none of the 92 fused ones, which come from
+# FusedMoE's reduce_results instead. Delivering the entry op here rather than
+# through the communicator therefore reaches exactly the site the kernel helps
+# and leaves the combiner's pair untouched.
+#
+# A module global rather than a context manager or a flag toggled mid-forward:
+# warmup() runs before torch.compile traces anything, so by trace time this is
+# already final and dynamo folds it to a constant with a guard. A flag that
+# changed *during* the forward would be a branch dynamo has to trace, which is
+# the thing this whole module is arranged to avoid.
+_ROWPARALLEL_ENTRY: tuple | None = None
+
 
 def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
     """An opaque torch op that reduces a tensor, built once per group.
@@ -479,17 +558,25 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
     if existing is not None:
         return existing
 
+    # Read once, here, rather than per call: the value is fixed before anything
+    # is traced, and reading it inside the implementation would put an env
+    # lookup on the critical path of every reduction.
+    donate = donation_enabled()
+
     def _impl(x: torch.Tensor, ws: torch.Tensor,
               step: torch.Tensor) -> torch.Tensor:
         plan = dispatcher.primary_plan
         if (plan is not None and tuple(x.shape) == plan.shape
                 and x.dtype == plan.dtype and x.is_contiguous()):
             out, new_ws, new_step = plan.op(x, ws, step)
-            # Donation + copy_ writeback, as the RPA kernel does for the KV
-            # cache: XLA aliases the donated buffer onto the output, so this
-            # updates the workspace in place and keeps its identity stable.
-            ws.copy_(new_ws)
-            step.copy_(new_step)
+            # Without donation the workspace has to be written back explicitly:
+            # the op returns fresh buffers, and the kernel needs the *same*
+            # buffer next call for its slot parity to mean anything. With
+            # donation the op wrote through them already, and copying would
+            # only pay for it twice. See donation_enabled().
+            if not donate:
+                ws.copy_(new_ws)
+                step.copy_(new_step)
             return out
         return dispatcher.xla_all_reduce(x)
 
@@ -499,9 +586,10 @@ def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
         if (plan is not None and tuple(x.shape) == plan.shape
                 and x.dtype == plan.dtype and x.is_contiguous()):
             out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
-            rs.copy_(new_rs)
-            ag.copy_(new_ag)
-            step.copy_(new_step)
+            if not donate:
+                rs.copy_(new_rs)
+                ag.copy_(new_ag)
+                step.copy_(new_step)
             return out
         return dispatcher.xla_all_reduce(x)
 
@@ -636,21 +724,40 @@ def warmup(vllm_config) -> None:
     # what dynamo sees in TpuDeviceCommunicator.all_reduce is an attribute
     # read and an opaque op call -- no lookups, no string work, nothing that
     # can register or allocate.
+    # Which call sites the kernel is delivered to. "all" routes every
+    # reduction on this group through the communicator, which is what the
+    # kernels were first wired up as; "rowparallel" routes only
+    # RowParallelLinear's, leaving XLA's collective combiner free to fuse the
+    # MoE pair. See _ROWPARALLEL_ENTRY for why shape alone cannot separate the
+    # two sites. Defaults to "all" so this changes nothing until asked for.
+    site = os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_SITE",
+                          "all").strip().lower()
+    if site not in ("all", "rowparallel"):
+        logger.warning(
+            "TPU_LOW_LATENCY_ALLREDUCE_SITE=%s is not 'all' or "
+            "'rowparallel'; using 'all'.", site)
+        site = "all"
+
+    global _ROWPARALLEL_ENTRY
+    _ROWPARALLEL_ENTRY = None
+    communicator._ll_entry = None
     if chosen is not None:
         # get_entry_op reads primary_plan to fix the op's arity, so it must be
         # set first. The buffers go through positionally -- two for one_shot,
         # three for two_shot -- because they have to be op *arguments* to
         # reach the compiled program at all.
         entry_op = get_entry_op(dispatcher)
-        communicator._ll_entry = (entry_op, *chosen.buffers)
-    else:
-        communicator._ll_entry = None
+        entry = (entry_op, *chosen.buffers)
+        if site == "rowparallel":
+            _ROWPARALLEL_ENTRY = entry
+        else:
+            communicator._ll_entry = entry
 
     logger.info(
         "Low-latency all-reduce warmup: %d of %d candidate shapes take a "
-        "kernel; wired to %s (%s). Every other shape uses XLA.",
+        "kernel; wired to %s (%s) at site=%s. Every other shape uses XLA.",
         len(kernel_plans), len(shapes), chosen.shape if chosen else None,
-        chosen.kernel if chosen else "none")
+        chosen.kernel if chosen else "none", site)
 
 
 def get_dispatcher(communicator) -> LowLatencyAllReduce:

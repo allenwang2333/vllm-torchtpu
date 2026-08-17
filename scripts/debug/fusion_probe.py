@@ -46,6 +46,21 @@ Arms, and what each answers:
               combiner was providing and uses the faster collective for it.
               Turns the ~27 us projection into a measurement.
 
+**Read the collective rows from the trace, not the us/layer slope.** Across two
+runs of identical code (jobs 129 and 130) the per-collective self time
+reproduced to within 0.07 us while the whole-layer slope moved up to 7 us for
+the same arm:
+
+    arm         129 layer  130 layer   129 coll  130 coll
+    p_only         106.27     113.42      33.22     33.29
+    concat         103.98     103.98      28.60     28.47
+    shape7168      116.35     119.12      43.80     43.72
+
+The slope subtracts two wall-clock medians and so carries the producers' jitter
+across four hosts; the collective rows are device self time for the ops actually
+under test. On collectives the arms are shape7168 +4.84, p_only -5.59, concat
+-10.41 us/layer against xla. Quote those.
+
 Run (32 devices, 4 hosts):
     sbatch --partition=ici-2x2x4-b scripts/debug/fusion_probe.sbatch
 """
@@ -107,6 +122,14 @@ def parse_args():
                    help="Width of the matmul separating p from the pair. Its "
                    "job is to put real work on the dependency chain so p "
                    "cannot join the pair's fusion group.")
+    p.add_argument(
+        "--check-layers",
+        type=int,
+        default=4,
+        help="Layers in the correctness chain. More than one on "
+        "purpose: the workspace slot parity alternates per call, so "
+        "a single call cannot catch a workspace that goes stale "
+        "between calls.")
     p.add_argument("--profile-dir", default=None)
     p.add_argument("--profile-reps", type=int, default=3)
     return p.parse_args()
@@ -126,11 +149,12 @@ def main() -> int:
                             world_size=world_size)
     gloo = dist.new_group(ranks=list(range(world_size)), backend="gloo")
 
-    from vllm_torchtpu.distributed.low_latency_all_reduce import \
-        LowLatencyAllReduce
+    from vllm_torchtpu.distributed.low_latency_all_reduce import (
+        LowLatencyAllReduce, donation_enabled)
 
     comm = _StubCommunicator(gloo, dist.group.WORLD, rank, world_size)
     dispatcher = LowLatencyAllReduce(comm)
+    donate = donation_enabled()
 
     device = torch.device("tpu")
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
@@ -191,9 +215,12 @@ def main() -> int:
         def _impl(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
                   step: torch.Tensor) -> torch.Tensor:
             out, nrs, nag, nstep = op(x, rs, ag, step)
-            rs.copy_(nrs)
-            ag.copy_(nag)
-            step.copy_(nstep)
+            # Mirrors the production entry op, donation included, so what this
+            # measures is what production would pay. See donation_enabled().
+            if not donate:
+                rs.copy_(nrs)
+                ag.copy_(nag)
+                step.copy_(nstep)
             return out
 
         top = torch.library.custom_op(oname, _impl, mutates_args=())
@@ -313,22 +340,30 @@ def main() -> int:
 
     h0 = (torch.randn(R, H, dtype=torch.float32).to(dtype).to(device))
 
-    # Correctness: one layer, every arm against the xla arm. The arms differ
-    # only in which implementation reduces which tensor, so they must agree.
-    ref = build(1, "xla")(h0).float()
+    # Correctness: every arm against the xla arm, over a chain of several
+    # layers rather than one.
+    #
+    # The length matters. The _ws kernels alternate workspace slots on a round
+    # counter, so a single call only ever exercises slot 0 and round 0's
+    # barrier placement. A workspace that goes stale between calls -- the exact
+    # risk donation introduces -- gives the right answer on call 1 and the
+    # wrong one on call 2, which a one-layer check cannot see. Several layers
+    # put both parities and the steady-state barrier on the critical path.
+    ref = build(args.check_layers, "xla")(h0).float()
     ref_scale = max(1.0, ref.abs().max().cpu().item())
     tol = 1e-5 if dtype == torch.float32 else 0.02 * world_size**0.5
     failures = []
     for arm in [a for a in args.arms.split(",") if a.strip() and a != "xla"]:
         try:
-            got = build(1, arm)(h0).float()
+            got = build(args.check_layers, arm)(h0).float()
         except Exception as e:  # noqa: BLE001
             failures.append(
                 f"{arm}: build/run failed: {type(e).__name__}: {e}")
             continue
         d = (got - ref).abs().max().cpu().item() / ref_scale
         if d >= tol:
-            failures.append(f"{arm}: rel={d:.5f} tol={tol:.5f}")
+            failures.append(f"{arm}: rel={d:.5f} tol={tol:.5f} over "
+                            f"{args.check_layers} layers")
 
     lead(f"{'arm':>12} {'us/layer':>10} {'vs xla':>9}")
     results = {}
