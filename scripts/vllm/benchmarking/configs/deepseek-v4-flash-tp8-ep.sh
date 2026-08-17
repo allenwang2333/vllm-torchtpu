@@ -24,8 +24,16 @@ MAX_NUM_BATCHED_TOKENS=8192
 MAX_NUM_SEQS=512
 GPU_MEMORY_UTILIZATION=0.75
 
-ISL_OSL_CONFIGS="1024:1024 8192:1024"
+# Decode-heavy (1024:8192) is listed second deliberately: ISL/OSL is the outer
+# loop, so a timeout truncates the tail, and decode is where this model is
+# weakest -- the gap against tpu-inference widens from 1.45x at batch 8 to
+# 3.34x at batch 128 -- and where the recovered KV capacity is spent.
+ISL_OSL_CONFIGS="1024:1024 1024:8192 8192:1024"
 CONCURRENCY_OPTIONS="64 256"
+# 320 (the default) x 8192 output tokens is 2.6M tokens per combo, and this
+# model's aggregate decode rate at these concurrencies is unmeasured -- that is
+# what this sweep exists to find out. 128 bounds the unknown.
+NUM_PROMPTS=128
 RANDOM_RANGE_RATIO="0.8"
 
 export VLLM_QUANT_WEIGHT_CACHE_DIR="/home/patemotter_google_com/workspace/dsv4_quant_cache"
