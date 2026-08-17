@@ -154,8 +154,23 @@ Never for anything depending on weight values.
 681 GB free; `/` has 80 GB free; `/dev/shm` 281 GB free. `~/.cache/vllm` is a
 symlink into `~/workspace`, so `torch_compile_cache` (312 GB), `hf_cache`
 (149 GB) and `dsv4_quant_cache` (132 GB) all live on the NVMe, not on `/`.
-`/dev/shm/torch_tpu_cache` holds 192 GB of RAM — the same category of problem as
-the weight cache that was moved to disk.
+**`/dev/shm/torch_tpu_cache` is unbounded and is slowing every startup.**
+Measured 2026-08-17: 192 GB at 04:40, 314 GB at 14:06, **334 GB at 14:14** —
+about 15 GB/hour, against a 473 GB tmpfs, so it reaches the limit in ~9 hours of
+running. It is RAM, so it evicts the page cache that holds the 149 GB of model
+weights, and safetensors loading degraded in step with it:
+
+| tmpfs | shard rate |
+|---|---|
+| ~192 GB (gates, early) | 2.27 shards/**second** |
+| ~314 GB (sweep, 08:50) | 9.99 s/shard |
+| 334 GB (14:12) | 17.8 s/shard |
+
+That is ~40x slower loading, and it compounds: a 46-shard load went from ~20 s
+to ~14 min. This is the same failure already fixed once for the quantized-weight
+cache, which was moved off `/dev/shm` onto disk; the torch_tpu **compile** cache
+was not. It should be moved to disk or bounded. Clearing it forces
+recompilation, so do it between runs, not during one.
 
 ## Settled — do not re-open without new evidence
 
