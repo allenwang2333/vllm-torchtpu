@@ -1,3 +1,7 @@
+> **SUPERSEDED 2026-08-17 by `dsv4_next_session_20260817.md`.** Kept only
+> because it records the state at that handoff. Its item codes (G1-G5, D1)
+> no longer exist; the mapping is at the end of the tracker.
+
 # Start here — DeepSeek-V4, next session
 
 > **Written 2026-08-16 19:41 UTC.** Valid until superseded by a later-dated
