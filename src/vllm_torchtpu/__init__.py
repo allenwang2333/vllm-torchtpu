@@ -494,6 +494,28 @@ def _patch_latent_moe_concat_allreduce() -> None:
 
     if getattr(LatentMoERunner, "_tpu_moe_concat_patch", False):
         return
+
+    # Install nothing unless the feature is on. Wrapping unconditionally and
+    # delegating when it is off looks free, and is not: the wrapper is a closure
+    # in *this* file, so it joins the traced path, and vLLM's
+    # source_info.add_code calls inspect.getsourcelines on every traced code
+    # object. Should this file change on disk after a worker imported it -- a
+    # lint pass, a pre-commit stash/restore, a branch switch mid-run -- the
+    # cached line numbers go stale and compilation dies with
+    #
+    #     IndexError: list index out of range   (inspect.findsource)
+    #
+    # twenty-five minutes in and nowhere near the real cause. That is how K3
+    # job 137 died: the worktree was checked out to another branch while its 32
+    # workers were compiling, and the traceback printed source lines belonging
+    # to entirely different functions. Keeping the wrapper out of runs that do
+    # not want it removes the exposure for every other model; K3 runs should
+    # additionally be launched from a dedicated git worktree so the tree cannot
+    # move underneath them.
+    if not _llar.moe_concat_enabled():
+        logger.info("Skipping TPU patch: latent-MoE concat all-reduce is off.")
+        return
+
     LatentMoERunner._tpu_moe_concat_patch = True
 
     original = LatentMoERunner._fused_forward
