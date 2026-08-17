@@ -367,6 +367,52 @@ The instrumentation that produced this (`_probe_ds_v4_kv_budget`, printing
 `[KV_PROBE]` lines) is still in `tpu_runner.py`. **Strip it before submitting
 the refactor.**
 
+## First DSv4 throughput numbers, 2026-08-17 — and they are KV-capped
+
+The benchmark completed for the first time. Two combos before the 2.5 h timeout
+(`scratchpad/bench_20260817/`), 1024:1024, 128 prompts, util 0.75, ctx 9216,
+`max-num-batched-tokens` 8192, `max-num-seqs` 512:
+
+| metric | concurrency 64 | concurrency 256 |
+|---|---|---|
+| output throughput | **53.8 tok/s** | **54.7 tok/s** |
+| median TPOT | 1079 ms | 1086 ms |
+| median ITL | 999 ms | 1015 ms |
+| median TTFT | 11.3 s | 131.2 s |
+| median end-to-end | 1011 s | 1231 s |
+
+**One token per second per sequence**, corroborated three ways: the server's own
+generation throughput (median 64 tok/s, max 73, over 644 intervals), the batch
+actually running (356 intervals at exactly 64 concurrent), and 64 tok/s / 64
+sequences. Zero preemptions.
+
+**Concurrency past 64 buys nothing** — 53.8 to 54.7 tok/s (+1.7%) while TTFT
+goes 11 s to 131 s. Everything above 64 queues.
+
+**The run was KV-capped, not compute-capped.** GPU KV cache usage peaked at
+**99.9%**. 115,565 tokens divided by 2048 per request caps the batch at ~56,
+which is exactly what was observed. The cache is small *because of the
+benchmark's own config*: at `max-num-batched-tokens=1024` the same utilization
+yields 485,612 tokens, 4.2x more.
+
+**Context before calling this a defect.** tpu-inference measured 92.20 tok/s at
+batch 128 (`eval_results/perf_ref.log`, 4096 ctx, util 0.67, offline), which is
+0.72 tok/s per sequence — **1.39 s per token**. Per sequence we are slightly
+faster; they get more aggregate by running twice the batch. Different configs,
+so not a clean comparison, but ~1 s per token appears to be what this model does
+on this hardware in both implementations rather than something this port broke.
+
+Under test: `deepseek-v4-flash-tp8-ep-b1024`, identical except
+`max-num-batched-tokens=1024`. If decode is weight-bound, throughput should
+scale with the extra batch room.
+
+### Full MMLU is infeasible at this decode rate
+
+`mmlu_llama` through `/v1/completions` reached 879 of 14,042 in 1 h 52 m —
+**7.32 s per request, projecting 26.8 hours**. Killed. The endpoint fix makes
+MMLU *correct*; it does not make it fast. Size any MMLU run as a subset, and
+expect MMLU-Pro (long outputs) to be worse per sample.
+
 ## Solved 2026-08-17: what caps utilization at 0.75
 
 **The compile OOM is the KV cache itself, not recomputable activations.** The
