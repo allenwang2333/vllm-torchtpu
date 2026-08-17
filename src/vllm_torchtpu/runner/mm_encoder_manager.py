@@ -1,12 +1,13 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import synchronize_tensors, tp_all_gather_materialized
 
 logger = init_logger(__name__)
 
@@ -183,6 +184,106 @@ class MMEncoderManager(EncoderCudaGraphManager):
         for path, templates in self.budget_templates.items():
             for budget in templates:
                 self._capture_budget_graph(budget, path=path)
+
+    # -- encoder data parallelism (--mm-encoder-tp-mode data) --
+
+    def _mm_embed_bucket(self, num_tokens: int) -> int:
+        """Padded row count the model keeps a ``num_tokens`` item at."""
+        bucket_fn = getattr(self.model, "mm_embed_bucket", None)
+        if bucket_fn is None or not envs.TPU_MM_BUCKET_SCATTER:
+            return num_tokens
+        return bucket_fn(num_tokens)
+
+    def _dp_gather(
+        self,
+        local_outputs: List[torch.Tensor],
+        per_item_out_tokens: List[int],
+        image_rank_assignment: List[int],
+        images_per_rank: List[int],
+        max_output_tokens_per_rank: int,
+    ) -> List[torch.Tensor]:
+        """Collect every rank's encoder outputs and restore the batch order.
+
+        Replaces the base implementation for two TPU-specific reasons.
+
+        The collective: the base version all-gathers a freshly built lazy
+        tensor, which drags each rank's local encoder graph into the
+        collective's program. Ranks that ran different image shapes then
+        disagree on what to execute and the device halts. Everything here goes
+        through ``tp_all_gather_materialized`` instead.
+
+        The layout: ``postprocess_encoder_output`` pads each item up to a
+        bucket, so a rank's outputs are longer than ``per_item_out_tokens``
+        says and the base version's slice offsets land mid-item. Offsets are
+        recomputed from the padded lengths, which every rank can derive from
+        the global ``per_item_out_tokens`` without communicating. The
+        extraction is index-based rather than sliced so the programs stay
+        keyed on the buckets rather than on this batch's offsets.
+        """
+        # The base version's send length assumes unpadded items; recomputed
+        # below from the padded lengths instead.
+        del max_output_tokens_per_rank
+
+        hidden_size = self.config.out_hidden_size
+        padded_lens = [self._mm_embed_bucket(t) for t in per_item_out_tokens]
+
+        # Original item indices handled by each rank, in that rank's order --
+        # the same order _dp_shard fed to _execute_local.
+        items_by_rank: List[List[int]] = []
+        cursor = 0
+        for count in images_per_rank:
+            items_by_rank.append(image_rank_assignment[cursor:cursor + count])
+            cursor += count
+
+        # One send length for every rank. Bucketing it keeps the collective's
+        # shape off the critical path of "new image size -> new program".
+        send_len = self._mm_embed_bucket(
+            max((sum(padded_lens[i] for i in items)
+                 for items in items_by_rank),
+                default=0))
+
+        local_items = items_by_rank[self._dp_rank()]
+        send = torch.zeros((send_len, hidden_size),
+                           dtype=self.dtype,
+                           device=self.device)
+        offset = 0
+        for item_idx, out in zip(local_items, local_outputs):
+            rows = padded_lens[item_idx]
+            # Every rank derives this layout from the global token counts, so
+            # a local output of the wrong height would silently shift all the
+            # items behind it -- and the receiving ranks could not tell.
+            if out.shape[0] != rows:
+                raise RuntimeError(
+                    f"encoder output for item {item_idx} has {out.shape[0]} "
+                    f"rows, expected {rows}; the model's postprocess_encoder_"
+                    f"output must pad to mm_embed_bucket for DP gather to "
+                    f"agree across ranks")
+            # Host-built indices: the copy is keyed on the bucket, and the
+            # varying offset arrives as data instead of as a slice bound.
+            dst = torch.arange(offset, offset + rows, dtype=torch.long)
+            send.index_copy_(0, dst.to(self.device), out.to(self.dtype))
+            offset += rows
+
+        gathered = tp_all_gather_materialized(send, dim=0)
+
+        last_row = gathered.shape[0] - 1
+        result: List[torch.Tensor | None] = [None] * len(per_item_out_tokens)
+        for rank, items in enumerate(items_by_rank):
+            offset = rank * send_len
+            for item_idx in items:
+                rows = padded_lens[item_idx]
+                src = torch.arange(offset, offset + rows, dtype=torch.long)
+                src.clamp_(max=last_row)
+                result[item_idx] = gathered.index_select(
+                    0, src.to(self.device))
+                offset += rows
+
+        return [t for t in result if t is not None]
+
+    @staticmethod
+    def _dp_rank() -> int:
+        from vllm.distributed import get_tensor_model_parallel_rank
+        return get_tensor_model_parallel_rank()
 
 
 def maybe_create_mm_encoder_manager(

@@ -319,3 +319,22 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def tp_all_gather_materialized(input_: torch.Tensor,
+                               dim: int = -1) -> torch.Tensor:
+    """All-gather across the TP group without a lazy tensor as the operand.
+
+    A collective fed a deferred tensor pulls whatever rank-local graph produced
+    it into the collective's own program. Ranks that traced different local
+    graphs then disagree about what to run and the device stalls. Materializing
+    first, and again on the result, keeps the collective a self-contained
+    operation over concrete buffers.
+    """
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    materialized = torch.empty_like(input_).copy_(input_)
+    synchronize_tensors(materialized)
+    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
+    synchronize_tensors(gathered)
+    return gathered

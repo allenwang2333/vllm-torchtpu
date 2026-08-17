@@ -12,7 +12,6 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -49,7 +48,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import synchronize_tensors, tp_all_gather_materialized
 
 from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
                         kda_state_dtype)
@@ -449,15 +448,6 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return loaded_experts | ordinary_loaded
 
 
-def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Gather a materialized encoder output without leaving the TPU."""
-    materialized = torch.empty_like(input_).copy_(input_)
-    synchronize_tensors(materialized)
-    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
-    synchronize_tensors(gathered)
-    return gathered
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     KimiK3MultiModalProcessor,
     info=KimiK3ProcessingInfo,
@@ -583,7 +573,7 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
             with patch.object(
                     vision_utils,
                     "tensor_model_parallel_all_gather",
-                    _tpu_tp_all_gather,
+                    tp_all_gather_materialized,
             ):
                 return vision_tower_forward(
                     self.vision_tower,
