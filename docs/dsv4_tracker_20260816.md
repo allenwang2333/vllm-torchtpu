@@ -426,6 +426,35 @@ Under test: `deepseek-v4-flash-tp8-ep-b1024`, identical except
 `max-num-batched-tokens=1024`. If decode is weight-bound, throughput should
 scale with the extra batch room.
 
+### max-num-batched-tokens is not a throughput lever — refuted 2026-08-17
+
+Single-variable test (`deepseek-v4-flash-tp8-ep-b1024`), 8192 -> 1024, all else
+identical:
+
+| | sweep (8192) | b1024 (1024) |
+|---|---|---|
+| reported KV cache | 115,565 tokens | 484,992 (4.2x) |
+| c=64 output throughput | 53.8 tok/s | **54.2** |
+| c=256 output throughput | 54.7 tok/s | **54.6** |
+| c=256 median TTFT | 131 s | **146 s** |
+
+Steady-state batch did rise, 64 to 74 (+15%), but admission slowed by the same
+amount and average throughput moved 0.2%. **Nothing in the serving config moves
+DSv4 off ~54 tok/s** — not concurrency (64 vs 256), not batched tokens, not
+cache size. The wall is the decode step itself: throughput equals batch exactly
+(64 -> 64.0, 74 -> 74.0 tok/s), so per-sequence rate is pinned at 1.00 tok/s and
+step time is ~1 s regardless of batch. That is a weight-bound step, and the next
+question is what makes it take a second.
+
+**Unexplained, and worth chasing.** The same change raises reported cache 4.2x
+but per-request charge 3.35x, so realized concurrency barely moves. Same block
+size (1024) in both, same workload, and blocks fully release between combos
+(`GPU KV cache usage: 0.0%` observed at the transition). Two candidate causes
+refuted, a third — multi-group block accounting — untested. The `[KV_PROBE]`
+pre-pass removed in `adda8b23` logged exactly this and would settle it in one
+startup. Given a 1.32x over-allocation was found in this same subsystem the same
+morning, a 3.35x swing deserves a look.
+
 ### Full MMLU is infeasible at this decode rate
 
 `mmlu_llama` through `/v1/completions` reached 879 of 14,042 in 1 h 52 m —
