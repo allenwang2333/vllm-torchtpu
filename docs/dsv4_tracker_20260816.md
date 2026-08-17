@@ -367,9 +367,14 @@ The instrumentation that produced this (`_probe_ds_v4_kv_budget`, printing
 `[KV_PROBE]` lines) is still in `tpu_runner.py`. **Strip it before submitting
 the refactor.**
 
-## First DSv4 throughput numbers, 2026-08-17 — and they are KV-capped
+## Serving-mode throughput, 2026-08-17 — KV-capped
 
-The benchmark completed for the first time. Two combos before the 2.5 h timeout
+**Not the first DSv4 throughput measurement.** Offline batch throughput was
+measured 2026-08-09 (`eval_results/perf_offline.log`,
+`perf_offline_nosync.log`, and `perf_ref.log` for tpu-inference), and serving
+medians exist from every gate. What is new here is the first *completed run of
+the benchmark harness*, i.e. serving-mode numbers with TTFT/TPOT/ITL/E2EL
+percentiles at controlled concurrency. Two combos before the 2.5 h timeout
 (`scratchpad/bench_20260817/`), 1024:1024, 128 prompts, util 0.75, ctx 9216,
 `max-num-batched-tokens` 8192, `max-num-seqs` 512:
 
@@ -673,6 +678,7 @@ Running whole servers for a pass/fail bit is the wrong instrument.
 | "Context length drives the compile-temporaries OOM" | **false** | ctx 9216 passes at 0.75 and fails at 0.92, all else identical |
 | "gxd3 asked us to drop the MHC monkey-patch" | **false** | no comment on PR #459, #462 or #464 mentions `HCHeadOp`, `forward_native`, `register_oot` or MHC. The item originated in this project's own gap analysis in `a59f6c0b` |
 | "The native model refactor should wait for the MHC cleanup" | **false** | consequence of the above. The refactor *is* what gxd3 asked for, it has been unsubmitted since 2026-08-14, and nothing gates it |
+| "No DSv4 throughput number has ever been obtained" | **false** | offline batch throughput was measured 2026-08-09 (`perf_offline.log`, `perf_offline_nosync.log`, `perf_ref.log`) and serving medians exist from every gate. Only the *benchmark harness* had never completed a run. This phrase was in the tracker and was repeated on 2026-08-17 even after those same logs had been re-derived that morning |
 | "`lsof /dev/vfio/*` reliably shows whether the TPU is held" | **false** | it reported zero holders while a server was demonstrably running |
 | "The `tpu_compiler.py` hardening is still owed as a standalone PR" | **false** | `git diff origin/main HEAD` on that file is empty; the earlier delta came from diffing against a stale local `main` |
 | "PR11 gates the refactor" | **dropped** | no kv-admission PR exists in `gh pr list --author @me --state all`. Pate's call 2026-08-16: not relevant and not a gate |
@@ -716,7 +722,8 @@ were committed before gating. Reference tree: `tpu-inference` at `f329f3480`.
 | xla dump attempt 1 | 9216 | 0.92 | 8 | 1024 | compiled | yes | died in 36 s: `--xla_dump_hlo_memory_schedule_info` is not an `XLA_FLAGS` name |
 | xla dump attempt 2 | 9216 | 0.92 | 8 | 1024 | compiled | yes | reached the failure, 106.45G. Flag table captured; **buffer breakdown lost to `--xla_dump_max_hlo_modules=20`** |
 
-**No DSv4 throughput number had ever been obtained**, and the benchmark config
+**The benchmark config had never completed a run** — though throughput itself
+was measured offline on 2026-08-09 and from serving-log medians. The config
 turned out to carry three separate defects, each of which alone prevented it
 running. All fixed 2026-08-17:
 
