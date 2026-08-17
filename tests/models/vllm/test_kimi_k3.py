@@ -9,9 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import vllm.model_executor.layers.linear as vllm_linear
+import vllm.model_executor.parameter as vllm_parameter
 from torch import nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -19,6 +21,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.common.mm_preprocess import navit_resize_image
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
@@ -31,6 +34,7 @@ from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiLinearForCausalLM,
                                                KimiModel,
                                                MultiHeadLatentAttention)
+from vllm_torchtpu.models.vllm.kimi_k3 import layers as kimi_layers
 from vllm_torchtpu.models.vllm.kimi_k3.layers import SituAndMul
 
 
@@ -779,3 +783,134 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     torch.testing.assert_close(sconv_cache, torch.ones_like(sconv_cache))
     torch.testing.assert_close(recurrent_cache,
                                torch.ones_like(recurrent_cache))
+
+
+def _attn_res_torch_reference(layer, prefix_sum, block_residuals):
+    values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)), dim=-2)
+    scores, _ = layer.proj(layer.norm(values))
+    probabilities = scores.float().softmax(dim=-2)
+    return (probabilities * values.float()).sum(dim=-2).to(values.dtype)
+
+
+def _attn_res_vllm_config(monkeypatch: pytest.MonkeyPatch) -> VllmConfig:
+    """Build a ``VllmConfig`` that can actually construct on this host.
+
+    A bare ``VllmConfig()`` does not construct here: ``TpuPlatform`` is
+    registered out-of-tree (``tpu_platform.py``'s ``_enum =
+    PlatformEnum.OOT``), so pydantic's default-factory ``DeviceConfig()``
+    asks torch for a ``"tpu"`` device before ``check_and_update_config`` ever
+    runs. torch_tpu only registers that backend name when it can see real
+    TPU hardware (``hardware.get_tpu_device_count() > 0``), which this CPU
+    host lacks -- so forcing ``device_config=DeviceConfig(device="cpu")``
+    (in addition to stubbing ``check_and_update_config`` the way
+    ``test_kimi_linear_mla_keeps_its_checkpoint_layout`` does) is required
+    for construction to succeed at all.
+
+    ``AttentionResidual`` also builds a real (unmocked) ``ReplicatedLinear``,
+    unlike the MLA tests above that replace every linear with a fake, so its
+    parameters still ask ``vllm.model_executor.layers.linear`` and
+    ``vllm.model_executor.parameter`` for the tensor-parallel rank/world
+    size. Stub those the same way
+    ``test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices``
+    stubs them, rather than standing up a real 1-process torch.distributed
+    group (which would hit the same unregistered-"tpu"-device wall inside
+    ``GroupCoordinator``).
+    """
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    monkeypatch.setattr(vllm_linear, "get_tensor_model_parallel_rank",
+                        lambda: 0)
+    monkeypatch.setattr(vllm_linear, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank",
+                        lambda: 0)
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    return VllmConfig(device_config=DeviceConfig(device="cpu"))
+
+
+def test_attention_residual_defaults_to_torch_path(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_layers, "use_attn_res_kernel", lambda: False)
+    with set_current_vllm_config(_attn_res_vllm_config(monkeypatch)):
+        layer = kimi_layers.AttentionResidual(64, 1e-6, prefix="res")
+    # ReplicatedLinear allocates its weight as `torch.empty(...)` (see
+    # `UnquantizedLinearMethod.create_weights`) -- real deployments always
+    # overwrite it from a checkpoint before use, but nothing does that here.
+    # Leaving it uninitialized risks a stray NaN in that garbage memory,
+    # which would make both sides of the comparison below independently
+    # NaN; `assert_close` still calls NaN != NaN, so pin a finite value.
+    with torch.no_grad():
+        layer.proj.weight.copy_(torch.randn(1, 64) * 0.02)
+    layer.process_weights_after_loading()
+    assert not layer._use_mix_kernel
+    prefix = torch.randn(4, 64)
+    blocks = torch.randn(4, 3, 64)
+    torch.testing.assert_close(
+        layer(prefix, blocks),
+        _attn_res_torch_reference(layer, prefix, blocks))
+
+
+def test_attention_residual_dispatches_to_mix_kernel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_layers, "use_attn_res_kernel", lambda: True)
+    # A real model load wraps layer construction in the model's compute
+    # dtype; without that, RMSNorm/ReplicatedLinear default to fp32 weights,
+    # which cannot multiply against the bf16 activations below.
+    with set_current_vllm_config(_attn_res_vllm_config(monkeypatch)), \
+            set_default_torch_dtype(torch.bfloat16):
+        layer = kimi_layers.AttentionResidual(64, 1e-6, prefix="res")
+    with torch.no_grad():
+        layer.norm.weight.copy_(torch.rand(64) + 0.5)
+        layer.proj.weight.copy_(torch.randn(1, 64) * 0.02)
+
+    op_calls: list[tuple[int, float, bool]] = []
+
+    def fake_build(n: int, eps: float, exact_emulation: bool):
+
+        def op(prefix_sum, block_residuals, w_score, w_norm, w_proj):
+            op_calls.append((n, eps, exact_emulation))
+            torch.testing.assert_close(w_score,
+                                       w_norm.float() * w_proj.float())
+            return prefix_sum
+
+        return op
+
+    monkeypatch.setattr(kimi_layers, "build_k3_attn_res_mix_op", fake_build)
+    layer.process_weights_after_loading()
+    assert layer._use_mix_kernel
+    torch.testing.assert_close(layer.w_score,
+                               (layer.norm.weight.float() *
+                                layer.proj.weight[0].float()).reshape(1, 64))
+
+    prefix = torch.randn(4, 64).bfloat16()
+    blocks = torch.randn(4, 3, 64).bfloat16()
+    out = layer(prefix, blocks)
+    assert op_calls[-1] == (3, 1e-6, False)
+    assert out is prefix
+
+    # Preconditions fall back to the torch path: n > 8 and non-bf16 dtype.
+    # Both probes below hit the *real* (unmocked) norm/proj torch path, so
+    # each needs the layer's weights in that probe's own activation dtype --
+    # a real deployment only ever sees one uniform compute dtype, but this
+    # single `layer` instance is reused for both to keep exercising the same
+    # `_use_mix_kernel`/`_mix_ops` state built above.
+    op_calls.clear()
+    layer(prefix, torch.randn(4, 9, 64).bfloat16())
+    with torch.no_grad():
+        layer.norm.weight.data = layer.norm.weight.float()
+        layer.proj.weight.data = layer.proj.weight.float()
+    layer(prefix.float(), blocks.float())
+    assert not op_calls
+
+
+def test_model_level_hook_finalizes_attention_residual(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_layers, "use_attn_res_kernel", lambda: True)
+    monkeypatch.setattr(kimi_layers, "build_k3_attn_res_mix_op",
+                        lambda n, eps, exact_emulation: lambda *args: args[0])
+    with set_current_vllm_config(_attn_res_vllm_config(monkeypatch)):
+        holder = nn.Module()
+        holder.res = kimi_layers.AttentionResidual(64, 1e-6, prefix="res")
+    KimiLinearForCausalLM.process_weights_after_loading(holder)
+    assert holder.res._use_mix_kernel
