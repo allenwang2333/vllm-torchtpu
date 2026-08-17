@@ -5164,79 +5164,6 @@ class TPUModelRunner(GPUModelRunner):
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
-    def _probe_ds_v4_kv_budget(
-        self,
-        kv_cache_config: KVCacheConfig,
-        per_layer_spec: Callable[[str], KVCacheSpec],
-        num_blocks: int,
-        swa_overlay: dict[str, str],
-        aux_overlay: dict[str, str],
-    ) -> None:
-        """Log the planned DSv4 KV allocation against the profiler's budget.
-
-        Temporary G5 instrumentation. Runs as a pre-pass so the whole plan is
-        printed before the first allocation, which is where startup dies at
-        high `gpu_memory_utilization`.
-        """
-        # Under vLLM's packed layout every KVCacheTensor spans the same slab,
-        # so the budget is one `size`/`block_stride` pair, not their sum.
-        slab_bytes = max((t.size for t in kv_cache_config.kv_cache_tensors),
-                         default=0)
-        block_stride = max(
-            ((t.block_stride or 0) for t in kv_cache_config.kv_cache_tensors),
-            default=0)
-        planned_total = 0
-        for tensor_index, kv_cache_tensor in enumerate(
-                kv_cache_config.kv_cache_tensors):
-            planned: dict[tuple, list] = {}
-            num_overlaid = 0
-            for layer_name in kv_cache_tensor.shared_by:
-                if layer_name in swa_overlay or layer_name in aux_overlay:
-                    num_overlaid += 1
-                    continue
-                spec = per_layer_spec(layer_name)
-                if not isinstance(spec,
-                                  (MLAAttentionSpec, SlidingWindowMLASpec)):
-                    continue
-                shape = PallasMLAttentionBackend.get_kv_cache_shape(
-                    num_blocks,
-                    spec.storage_block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    spec.dtype,
-                    head_size_is_packed_width=True,
-                )
-                array_bytes = math.prod(shape) * spec.dtype.itemsize
-                key = (tuple(shape), spec.dtype)
-                planned.setdefault(key,
-                                   [array_bytes, []])[1].append(layer_name)
-                logger.info(
-                    "[KV_PROBE] t%d layer=%s spec=%s block_size=%s "
-                    "storage_block_size=%s num_kv_heads=%s head_size=%s "
-                    "dtype=%s spec_page_bytes=%s real_page_bytes=%s "
-                    "shape=%s array_bytes=%d actual_page_bytes=%.1f",
-                    tensor_index, layer_name,
-                    type(spec).__name__, spec.block_size,
-                    spec.storage_block_size, spec.num_kv_heads, spec.head_size,
-                    spec.dtype, getattr(spec, "page_size_bytes", None),
-                    getattr(spec, "real_page_size_bytes", None), tuple(shape),
-                    array_bytes, array_bytes / max(num_blocks, 1))
-            tensor_planned = sum(entry[0] for entry in planned.values())
-            planned_total += tensor_planned
-            logger.info(
-                "[KV_PROBE] t%d planned=%d shared_by=%d overlaid=%d "
-                "distinct_arrays=%d groups=%s", tensor_index, tensor_planned,
-                len(kv_cache_tensor.shared_by), num_overlaid, len(planned),
-                [(entry[0], len(entry[1])) for entry in planned.values()])
-        logger.info(
-            "[KV_PROBE] TOTAL num_blocks=%d tensors=%d slab_bytes=%d "
-            "block_stride=%d planned=%d planned_per_block=%.1f ratio=%.4f "
-            "excess=%.2f MiB", num_blocks,
-            len(kv_cache_config.kv_cache_tensors), slab_bytes, block_stride,
-            planned_total, planned_total / max(num_blocks, 1),
-            planned_total / max(slab_bytes, 1),
-            (planned_total - slab_bytes) / 2**20)
-
     def _initialize_ds_v4_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -5277,9 +5204,6 @@ class TPUModelRunner(GPUModelRunner):
                 head_size_is_packed_width=True,
             ),
         )
-
-        self._probe_ds_v4_kv_budget(kv_cache_config, per_layer_spec,
-                                    num_blocks, swa_overlay, aux_overlay)
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # One array per KVCacheTensor, shared by the layers that name it:
