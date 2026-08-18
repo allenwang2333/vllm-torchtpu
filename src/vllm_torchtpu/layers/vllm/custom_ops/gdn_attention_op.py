@@ -259,6 +259,20 @@ def _localize_gdn_mamba_spec_for_pcp(
     )
 
 
+def promote_tpu_gdn_state_dtypes(
+        conv_state_dtype: torch.dtype,
+        temporal_state_dtype: torch.dtype) -> tuple[torch.dtype, torch.dtype]:
+    """The TPU GDN kernel keeps the conv state in fp32 (TODO: bf16 conv).
+
+    Every consumer of the GDN state dtypes must apply this promotion: the
+    platform's page-size derivation sizes the pooled state from the model
+    classmethod's dtypes, and an unpromoted conv there under-budgets the
+    page and trips MambaSpec's page_size_padded assert at startup.
+    """
+    del conv_state_dtype
+    return torch.float32, temporal_state_dtype
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
@@ -285,10 +299,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                                 _get_pcp_size(vllm_config))
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        # TODO: Support bf16 conv state
-        conv_state_dtype = torch.float32
-        return conv_state_dtype, temporal_state_dtype
+        return promote_tpu_gdn_state_dtypes(*super().get_state_dtype())
 
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         conv_state_shape, temporal_state_shape = super().get_state_shape()

@@ -122,6 +122,12 @@ def _hybrid_mamba_state_layout(
     # attention-shaped page, even when attention prefill is context-parallel.
     shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
     dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
+    # The TPU GDN op promotes the conv state to fp32 at runtime; size the
+    # pooled page with the same promotion or the page under-budgets the
+    # conv region and MambaSpec's page_size_padded assert kills startup.
+    from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import \
+        promote_tpu_gdn_state_dtypes
+    dtypes = promote_tpu_gdn_state_dtypes(*dtypes)
     if len(shapes) != 2 or len(dtypes) != 2:
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state regions "
