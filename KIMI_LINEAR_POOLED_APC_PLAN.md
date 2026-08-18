@@ -127,8 +127,17 @@ floor 214 tokens.
       smoke OK, contamination 0/6; the correctness smoke's one failure is the
       uncached translate_cn strict-string case (cached_tokens=0, model-content
       artifact), so the script runs it last and non-fatally. CI wiring pending.
-- [ ] 3.3 GSM8K spot check, prefix caching on vs off
+- [x] 3.3 GSM8K spot check, prefix caching on vs off
       (`scripts/eval_kimi_k3_gsm8k.py`).
+
+      Result (200 problems, temperature 0, TP8): pooled+APC 95% cold and 95%
+      warm with 200/200 responses bitwise-identical between cold and warm at
+      concurrency 1 (cache-hit restore is deterministic); the 7/200
+      cold-vs-warm diffs at concurrency 8 are batching nondeterminism, not
+      restore errors. Dense no-APC reference: 93%, with 189/200 identical
+      predictions and balanced correctness flips (3 dense-better, 6
+      pooled-better) — the pooled path changes fusion-level numerics, not
+      model behavior. No quality regression.
 
 ## Phase 4 - Enablement
 
