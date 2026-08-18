@@ -4,21 +4,11 @@ import os
 
 import torch
 from vllm.logger import init_logger
+from vllm_omni.platforms.interface import (  # type: ignore[missing-import]
+    OmniPlatform, OmniPlatformEnum)
 
 from vllm_torchtpu import utils
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
-# Note: vllm_omni.platforms.interface is a leaf ABC module; importing it here does
-# not trigger plugin discovery or create circular dependencies.
-try:
-    from vllm_omni.platforms.interface import (  # type: ignore[missing-import]
-        OmniPlatform, OmniPlatformEnum)
-except ImportError:
-
-    class OmniPlatform:  # type: ignore
-        pass
-
-    OmniPlatformEnum = None  # type: ignore
 
 logger = init_logger(__name__)
 
@@ -30,8 +20,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     Omni-specific interfaces from OmniPlatform.
     """
 
-    if OmniPlatformEnum is not None:
-        _omni_enum = OmniPlatformEnum.OOT
+    _omni_enum = OmniPlatformEnum.OOT
 
     dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"

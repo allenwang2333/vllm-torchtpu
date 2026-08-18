@@ -3,17 +3,8 @@
 from typing import Any
 
 import torch
-
-try:
-    from vllm_omni.diffusion.attention.backends.sdpa import (  # type: ignore[missing-import]
-        SDPABackend, SDPAImpl)
-except ImportError:
-
-    class SDPABackend:  # type: ignore
-        pass
-
-    class SDPAImpl:  # type: ignore
-        pass
+from vllm_omni.diffusion.attention.backends.sdpa import (  # type: ignore[missing-import]
+    SDPABackend, SDPAImpl)
 
 
 class TpuSDPAImpl(SDPAImpl):

@@ -8,20 +8,10 @@ import traceback
 import torch
 import torch.distributed
 from vllm.logger import init_logger
-
-try:
-    from vllm_omni.diffusion.executor.multiproc_executor import \
-        MultiprocDiffusionExecutor  # type: ignore[missing-import]
-    from vllm_omni.diffusion.worker.diffusion_worker import \
-        WorkerProc  # type: ignore[missing-import]
-except ImportError:
-
-    class MultiprocDiffusionExecutor:  # type: ignore
-        pass
-
-    class WorkerProc:  # type: ignore
-        pass
-
+from vllm_omni.diffusion.executor.multiproc_executor import \
+    MultiprocDiffusionExecutor  # type: ignore[missing-import]
+from vllm_omni.diffusion.worker.diffusion_worker import \
+    WorkerProc  # type: ignore[missing-import]
 
 logger = init_logger(__name__)
 

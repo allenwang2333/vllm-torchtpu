@@ -1,8 +1,6 @@
 # Omni compatibility module
 from functools import cache as run_once
 
-import torch
-
 from vllm_torchtpu.logger import init_logger
 
 from .model_patch import apply_omni_rope_patch
@@ -58,32 +56,6 @@ def apply_omni_patches():
 
     # 3. Model and IPC patches
     apply_omni_rope_patch()
-    apply_omni_ipc_patch()
-
-
-@run_once
-def apply_omni_ipc_patch():
-    """Safety net: Ensure large intermediate tensors serialized via Omni IPC are CPU-backed.
-
-    While TpuDiffusionModelRunner converts primary output tensors to CPU, this patch
-    acts as defense-in-depth for any auxiliary tensors passed across Omni IPC channels.
-    """
-    try:
-        import vllm_omni.diffusion.ipc as ipc
-        orig_pack = ipc._pack_tensor_if_large
-
-        def _tpu_patched_pack_tensor(val: torch.Tensor):
-            ret = orig_pack(val)
-            if isinstance(ret, torch.Tensor):
-                return ret.detach().cpu()
-            return ret
-
-        ipc._pack_tensor_if_large = _tpu_patched_pack_tensor
-        logger.info(
-            "Applied TPU patch: diffusion.ipc pack_tensor returns CPU tensors."
-        )
-    except ImportError:
-        pass
 
 
 def register_omni_tpu_platform() -> str:
