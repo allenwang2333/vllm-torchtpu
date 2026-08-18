@@ -583,6 +583,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
+    _patch_vllm_unify_page_sizes()
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -1051,3 +1052,26 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     from vllm_torchtpu.logger import init_logger
     init_logger(__name__).info(
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+
+
+def _patch_vllm_unify_page_sizes() -> None:
+    """Clear stale page_size_padded fields from AttentionSpec layers before
+    unification, preventing AssertionError: self.page_size_padded >= real_page_size
+    when scaling up block_size for multi-group KV caches.
+    """
+    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    _orig = kv_cache_utils.unify_kv_cache_spec_page_size
+
+    def _wrapped(kv_cache_spec):
+        from dataclasses import replace
+        new_specs = {}
+        for name, spec in kv_cache_spec.items():
+            if isinstance(spec,
+                          AttentionSpec) and spec.page_size_padded is not None:
+                spec = replace(spec, page_size_padded=None)
+            new_specs[name] = spec
+        return _orig(new_specs)
+
+    kv_cache_utils.unify_kv_cache_spec_page_size = _wrapped

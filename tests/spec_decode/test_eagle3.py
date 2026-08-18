@@ -957,3 +957,94 @@ def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert proposer.propose([], [], None, None) == []
     assert proposer._draft_md_cache == {}
+
+
+def test_eagle3_mtp_gemma4_constant_draft_positions():
+    """Verify that constant_draft_positions is set correctly for Gemma 4 MTP."""
+    speculative_config = SimpleNamespace(
+        draft_tensor_parallel_size=1,
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+    )
+    parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    vllm_config = SimpleNamespace(speculative_config=speculative_config,
+                                  parallel_config=parallel_config)
+    proposer = Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+    assert proposer.constant_draft_positions is True
+
+
+def test_eagle3_mtp_kv_sharing_setup():
+    """Verify that _setup_gemma4_kv_sharing correctly maps target layers to draft layers."""
+    speculative_config = SimpleNamespace(
+        draft_tensor_parallel_size=1,
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(layer_types=["full_attention"]))))
+    parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                layer_types=["full_attention", "full_attention"],
+                num_kv_shared_layers=0,
+            ))))
+    proposer = Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+
+    # Mock draft model structure
+    draft_layer = SimpleNamespace(self_attn=SimpleNamespace(
+        attn=SimpleNamespace(kv_sharing_target_layer_name=None)))
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        layers=[draft_layer]))
+
+    target_attn_layer_names = {
+        "model.layers.0.self_attn.attn",
+        "model.layers.1.self_attn.attn",
+    }
+
+    # Execute
+    proposer._setup_gemma4_kv_sharing(target_attn_layer_names)
+
+    # Should map to the last target layer (index 1)
+    assert draft_layer.self_attn.attn.kv_sharing_target_layer_name == "model.layers.1.self_attn.attn"
+
+
+def test_eagle3_mtp_kv_caches_binding():
+    """Verify that _bind_gemma4_shared_kv_caches correctly binds target KV caches to draft layers."""
+    speculative_config = SimpleNamespace(
+        draft_tensor_parallel_size=1,
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(layer_types=["full_attention"]))))
+    parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                layer_types=["full_attention", "full_attention"],
+                num_kv_shared_layers=0,
+            ))))
+    proposer = Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+
+    # Mock draft model structure
+    draft_layer = SimpleNamespace(self_attn=SimpleNamespace(
+        attn=SimpleNamespace(kv_sharing_target_layer_name=None,
+                             kv_cache=None)))
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        layers=[draft_layer]))
+
+    # Mock get_layers_from_vllm_config to return target layers
+    target_layer = SimpleNamespace(kv_cache=mock.sentinel.target_kv_cache)
+    with mock.patch(
+            "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config"
+    ) as mock_get_layers:
+        mock_get_layers.return_value = {
+            "model.layers.1.self_attn.attn": target_layer
+        }
+        proposer._bind_gemma4_shared_kv_caches()
+
+    # The draft layer's kv_cache should now point directly to target layer's kv_cache sentinel!
+    assert draft_layer.self_attn.attn.kv_cache is mock.sentinel.target_kv_cache

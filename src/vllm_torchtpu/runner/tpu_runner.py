@@ -163,6 +163,9 @@ def _substitute_placeholder_token(
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
     new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    # Clamp any negative values (like rejection/padding -1 sentinels) to 0
+    # to prevent out-of-bounds index access in downstream Embedding layers on SparseCore.
+    new_token_values = torch.clamp_min(new_token_values, 0)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
@@ -182,7 +185,7 @@ def _spec_warmup_all_token_ids(
     # The current sampled token is not computed yet, so the complete sequence
     # contains num_computed + 1 tokens at scheduler handoff.
     return {
-        req_id: [0] * (num_computed + 1)
+        req_id: [(i * 13) % 20000 + 10 for i in range(num_computed + 1)]
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
 
@@ -327,6 +330,8 @@ class TPUModelRunner(GPUModelRunner):
         if not self.speculative_config:
             return False
         return (self.speculative_config.use_eagle()
+                or (getattr(self.speculative_config, "use_gemma4_mtp", None)
+                    is not None and self.speculative_config.use_gemma4_mtp())
                 or self.speculative_config.method == "dflash")
 
     def __init__(
@@ -4634,7 +4639,8 @@ class TPUModelRunner(GPUModelRunner):
                 lo = top - (j + 1) * nblk
                 new_reqs.append(
                     NewRequestData(req_id=rid,
-                                   prompt_token_ids=[0] * P,
+                                   prompt_token_ids=[(i * 13) % 20000 + 10
+                                                     for i in range(P)],
                                    mm_features=[],
                                    sampling_params=sp,
                                    pooling_params=None,
@@ -4673,7 +4679,7 @@ class TPUModelRunner(GPUModelRunner):
                 so.num_scheduled_tokens = {rid: 1 + K for rid in rids}
                 so.total_num_scheduled_tokens = R * (1 + K)
                 so.scheduled_spec_decode_tokens = {
-                    rid: [0] * K
+                    rid: [(i * 13) % 20000 + 10 for i in range(K)]
                     for rid in rids
                 }
                 assert self.execute_model(so) is None
@@ -4735,7 +4741,8 @@ class TPUModelRunner(GPUModelRunner):
         try:
             # ---- prefill ----
             new_req = NewRequestData(req_id=rid,
-                                     prompt_token_ids=[0] * P,
+                                     prompt_token_ids=[(i * 13) % 20000 + 10
+                                                       for i in range(P)],
                                      mm_features=[],
                                      sampling_params=sp,
                                      pooling_params=None,
@@ -4749,7 +4756,11 @@ class TPUModelRunner(GPUModelRunner):
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()
-            cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
+            cur = [
+                max(0, min(int(x), self.vocab_size - 1))
+                for x in d.draft_token_ids[0]
+            ] if d and d.draft_token_ids else [(i * 13) % 20000 + 10
+                                               for i in range(K)]
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
                 all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
@@ -4771,7 +4782,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.sample_tokens(None)
                 d = self.take_draft_token_ids()
                 if d and d.draft_token_ids:
-                    cur = d.draft_token_ids[0]
+                    cur = [
+                        max(0, min(int(x), self.vocab_size - 1))
+                        for x in d.draft_token_ids[0]
+                    ]
         except Exception:
             if quiet:
                 # First attempt: a SymInt from the draft forward's cold compile
@@ -5341,6 +5355,10 @@ class TPUModelRunner(GPUModelRunner):
             if len(shared_by) > 1:
                 total_group_page_size = 0
                 for name in shared_by:
+                    if name in self.shared_kv_cache_layers:
+                        # This layer aliases the target layer's cache and
+                        # does not consume its own physical blocks.
+                        continue
                     spec = layer_name_to_spec[name]
                     # Use the per-layer *TPU-actual* per-block bytes so the
                     # sum equals the `page_size_padded` that
