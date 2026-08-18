@@ -438,21 +438,35 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
             f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}")
     num_blocks = raw_nbytes // manager_page_bytes
 
-    # The conv region starts after the SSM region's padded token extent, not
-    # its raw byte size; a state that does not divide the FA token row leaves
-    # the tail of its last row as padding (derive_pooled_gdn_state_layout).
-    fa_token_bytes, remainder = divmod(manager_page_bytes,
-                                       int(spec.block_size))
-    if fa_token_bytes <= 0 or remainder:
+    # The conv region starts after the SSM region's padded extent, not its
+    # raw byte size; a state that does not divide the pool row leaves the
+    # tail of its last row as padding (derive_pooled_gdn_state_layout). The
+    # row quantum is the pool's own shape[1] row — for token-axis-packed
+    # caches (MLA) that is a packed multi-token row, wider than one token —
+    # so derive it from the pool's trailing dims rather than the manager's
+    # token count.
+    pool_shape = tuple(int(dim) for dim in getattr(pool, "shape", ()))
+    if len(pool_shape) < 3:
+        raise ManifestError(
+            f"pooled GDN cache {layer_name} has an invalid pool shape: "
+            f"{pool_shape}")
+    fa_row_bytes = (math.prod(pool_shape[2:]) *
+                    _dtype_itemsize(getattr(pool, "dtype", None)))
+    rows_per_page, remainder = divmod(manager_page_bytes, fa_row_bytes)
+    if fa_row_bytes <= 0 or remainder:
         raise ManifestError(
             f"manager page bytes {manager_page_bytes} for {layer_name} are "
-            f"not token-linear over block_size={spec.block_size}")
+            f"not a whole number of pool rows ({fa_row_bytes} B)")
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
         conv_bytes=conv_bytes,
-        token_bytes=fa_token_bytes,
+        token_bytes=fa_row_bytes,
     )
-    ssm_extent_bytes = layout.ssm_tokens * fa_token_bytes
+    if layout.required_tokens > rows_per_page:
+        raise ManifestError(
+            f"GDN state regions for {layer_name} exceed one manager page: "
+            f"{layout.required_tokens} rows > {rows_per_page}")
+    ssm_extent_bytes = layout.ssm_tokens * fa_row_bytes
 
     states: list[_PooledStateView] = []
     # The PR #106 pooled ABI places SSM first and conv immediately after it,

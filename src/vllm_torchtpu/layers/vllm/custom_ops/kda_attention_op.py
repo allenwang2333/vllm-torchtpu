@@ -988,8 +988,36 @@ def build_kimi_pooled_kda_op(
     state caches are replaced by the single attention-shaped pool buffer.
     """
 
-    def pooled_core(*args):
-        return _pooled_kda_core(*args, lower_bound=lower_bound, eps=eps)
+    def pooled_core(
+        mixed_qkv: jax.Array,
+        raw_gate: jax.Array,
+        beta: jax.Array,
+        output_gate: jax.Array,
+        pool: jax.Array,
+        conv_weight: jax.Array,
+        a_log: jax.Array,
+        dt_bias: jax.Array,
+        norm_weight: jax.Array,
+        query_start_loc: jax.Array,
+        state_indices: jax.Array,
+        seq_lens: jax.Array,
+        distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return _pooled_kda_core(mixed_qkv,
+                                raw_gate,
+                                beta,
+                                output_gate,
+                                pool,
+                                conv_weight,
+                                a_log,
+                                dt_bias,
+                                norm_weight,
+                                query_start_loc,
+                                state_indices,
+                                seq_lens,
+                                distribution,
+                                lower_bound=lower_bound,
+                                eps=eps)
 
     op_name = f"pallas::kimi_pooled_kda_{prefix.replace('.', '_')}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))

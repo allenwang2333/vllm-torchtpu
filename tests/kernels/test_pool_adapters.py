@@ -588,8 +588,9 @@ class TestKimiLinearMlaPoolGeometry:
     KIMI_LINEAR_POOLED_APC_PLAN.md.
     """
 
-    # Real MLA pool shape: (blocks, block_size, kv_packing, padded_kv_dim),
-    # bf16 — block_size 107 is what the block-size derivation picks.
+    # Real MLA pool shape: (blocks, packed_rows, kv_packing, padded_kv_dim),
+    # bf16 — the derivation picks a 214-token manager block, which the
+    # token-axis packing (2 tokens per row) stores as 107 packed rows.
     NB, BS, PACK, LANES = 2, 107, 2, 640
     TOK_BYTES = PACK * LANES * 2
     # (heads, d_k, d_v) fp32 and (taps, qkv, heads, head_dim) bf16 per shard.
