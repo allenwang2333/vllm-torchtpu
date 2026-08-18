@@ -87,6 +87,12 @@ class DFlashProposer:
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[int, tuple[torch.Tensor,
                                                          torch.Tensor]] = {}
+        # Keyed by (num_tokens, hidden_dim, dtype, num_reqs); one entry per
+        # lockstep replay bucket, see `_dummy_kv_update_inputs`.
+        self._dummy_kv_input_cache: dict[tuple,
+                                         tuple[torch.Tensor,
+                                               "AttentionMetadata"]] = {}
+        self._dummy_kv_hidden_spec: tuple[int, torch.dtype] | None = None
 
     def _get_static_attn_tensors(
             self, padded_num_reqs: int,
@@ -256,7 +262,7 @@ class DFlashProposer:
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
-        if self._dp_lockstep_sharded():
+        if self.runner._dp_lockstep_enabled():
             # EP-DP lockstep: every rank must emit identical collective
             # shapes, and num_reqs is rank-local. Pad to the step's DP-wide
             # max per-chunk request count, coordinated by the same
@@ -403,7 +409,7 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         extra_chunks = 0
-        if self._dp_lockstep_sharded():
+        if runner._dp_lockstep_enabled():
             extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
@@ -427,8 +433,15 @@ class DFlashProposer:
                 chunk, padded_len, seq_lens)
 
             with (
-                    set_forward_context(draft_attn_metadata, self.vllm_config,
-                                        0),
+                    # Precomputed so set_forward_context does not run its
+                    # own cross-DP CPU all_reduce per draft forward; must
+                    # pair exactly with the idle replay's calls.
+                    set_forward_context(
+                        draft_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=padded_len,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            padded_len)),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
@@ -513,13 +526,24 @@ class DFlashProposer:
                         use_max_model_len=False,
                     )
 
-    def _dummy_precompute_and_update_kv_cache(
+    def _dummy_kv_update_inputs(
         self,
         num_tokens: int,
         hidden_dim: int,
         dtype: torch.dtype,
         num_reqs: int,
-    ) -> None:
+    ) -> tuple[torch.Tensor, "AttentionMetadata"]:
+        """Reusable `(hidden, metadata)` for one KV-update replay shape.
+
+        Under lockstep this runs once per padding chunk per step, so build
+        the constant dummies once per bucket instead of reallocating six
+        tensors and re-issuing two scalar H2D writes every idle step.
+        """
+        key = (num_tokens, hidden_dim, dtype, num_reqs)
+        entry = self._dummy_kv_input_cache.get(key)
+        if entry is not None:
+            return entry
+
         runner = self.runner
         dummy_hidden = torch.zeros((num_tokens, hidden_dim),
                                    dtype=dtype,
@@ -554,6 +578,21 @@ class DFlashProposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
         )
+        entry = (dummy_hidden, dummy_attn_metadata)
+        self._dummy_kv_input_cache[key] = entry
+        return entry
+
+    def _dummy_precompute_and_update_kv_cache(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        num_reqs: int,
+    ) -> None:
+        runner = self.runner
+        dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
+            num_tokens, hidden_dim, dtype, num_reqs)
+        dummy_positions = dummy_attn_metadata.input_positions
 
         with set_vllm_model_wrapper_context(mesh=runner.mesh):
             out = self._tpu_precompute_and_update_kv_cache(
@@ -625,16 +664,23 @@ class DFlashProposer:
                     for layer_name in runner._attn_layer_names
                 }
             else:
-                # Must match _build_draft_attn_metadata so warmup compiles the
-                # same dispatch sequence used during live inference.
+                # Must match `_build_draft_attn_metadata` exactly: torch-tpu
+                # fuses programs by dispatch sequence, so precompiling a
+                # different sequence leaves the real one to compile live.
                 assert self._draft_attn_layer_names is not None, (
                     "load_model() must run before precompile()")
                 per_layer_attn_metadata = (
                     runner.build_attention_metadata_for_layers(
                         self._draft_attn_layer_names, actual_num_reqs))
             with (
-                    set_forward_context(per_layer_attn_metadata,
-                                        self.vllm_config, 0),
+                    # Same contract as propose(): precomputed DP metadata,
+                    # no hidden per-forward cross-DP all_reduce.
+                    set_forward_context(
+                        per_layer_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            num_tokens)),
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh, ),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
@@ -659,10 +705,14 @@ class DFlashProposer:
         runner = self.runner
         bucket = runner._dp_target_bucket
         assert bucket is not None, "_dp_target_bucket unset in lockstep step"
-        fc_layer = getattr(self.draft_model.model, "fc", None)
-        hidden_dim = (fc_layer.weight.shape[1] if fc_layer is not None else
-                      self.vllm_config.model_config.get_hidden_size())
-        dtype = self.draft_model.model.embed_tokens.weight.dtype
+        # Model-static: resolve once, not once per padding chunk per step.
+        if self._dummy_kv_hidden_spec is None:
+            fc_layer = getattr(self.draft_model.model, "fc", None)
+            self._dummy_kv_hidden_spec = (
+                fc_layer.weight.shape[1] if fc_layer is not None else
+                self.vllm_config.model_config.get_hidden_size(),
+                self.draft_model.model.embed_tokens.weight.dtype)
+        hidden_dim, dtype = self._dummy_kv_hidden_spec
         self._dummy_precompute_and_update_kv_cache(
             num_tokens=bucket,
             hidden_dim=hidden_dim,
