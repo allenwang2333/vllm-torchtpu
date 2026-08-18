@@ -13,11 +13,9 @@
 # limitations under the License.
 """Torch bridge for the sort-free MoE router top-k.
 
-On TPU the selection runs as the Pallas kernel in
-``kernels/router_topk.py``; anywhere else (CPU tests, meta tracing) it runs
-the identical algorithm in plain torch ops from
-``layers/common/rowmax_topk.py``, which is also the numerics oracle the tests
-compare both against.
+On TPU the selection runs as the Pallas kernel in ``kernels/router_topk.py``,
+elsewhere as the identical plain-torch algorithm in
+``layers/common/rowmax_topk.py``.
 """
 
 import torch
@@ -35,11 +33,8 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
             torch.empty((rows, topk), dtype=torch.int32, device=scores.device))
 
 
-# Registered at import, not on first call: this op is invoked from inside the
-# MoE forward, which vLLM compiles with Dynamo, and Dynamo cannot trace a lazy
-# registration -- a `with lock:` in that path aborts the compile with
-# "Unsupported context manager". There is nothing runtime-dependent to wait
-# for; the op takes one array and one static int.
+# Registered at import, not lazily: this op is called from inside the MoE
+# forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
 

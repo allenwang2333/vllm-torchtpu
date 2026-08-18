@@ -138,14 +138,8 @@ def test_select_experts_rowmax_matches_sort(monkeypatch):
 
 
 def test_router_topk_op_is_registered_at_import():
-    """The op must exist before the first call.
-
-    A lazy `pallas.jax_op` registration behind a lock is invisible to CPU
-    tests and fatal on device: the MoE forward is compiled by Dynamo, which
-    refuses to trace `with _op_lock:` ("Unsupported context manager") and
-    aborts the whole compile. Registering at import is what keeps the traced
-    path a bare call.
-    """
+    """The op must exist before the first call: a lazy, lock-guarded
+    registration is untraceable by Dynamo and aborts the MoE compile."""
     import torch
 
     from vllm_torchtpu.layers.vllm import router_topk
@@ -155,13 +149,17 @@ def test_router_topk_op_is_registered_at_import():
 
 @pytest.mark.parametrize("impl", ["sort", "rowmax"])
 def test_routing_path_compiles_fullgraph(monkeypatch, impl):
-    """No graph break, no Dynamo error, on the path vLLM compiles."""
+    """No graph break, no Dynamo error, on the path vLLM compiles.
+
+    The tensors have to be on device: torch_tpu owns the default compile
+    backend, so CPU inputs abort the compile before the router is reached.
+    """
     torch = pytest.importorskip("torch")
     torch._dynamo.reset()
     monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", impl)
     layer = _routing_layer()
-    hidden = torch.randn(16, 8, dtype=torch.bfloat16)
-    logits = torch.randn(16, 512)
+    hidden = torch.randn(16, 8, dtype=torch.bfloat16).to("tpu")
+    logits = torch.randn(16, 512).to("tpu")
 
     def run(h, r):
         return moe_routing.select_experts(hidden_states=h,

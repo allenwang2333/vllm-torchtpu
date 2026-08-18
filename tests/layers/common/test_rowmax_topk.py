@@ -11,21 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Numerics gate for the sort-free router top-k.
+"""Numerics gate for the sort-free router top-k, against ``torch.topk``.
 
-The contract against ``torch.topk`` (the path `TPU_MOE_ROUTER_TOPK=sort`
-keeps) is:
-
-* **values are bit-identical, always** -- any correct top-k returns the same
-  multiset of values, and both paths return it in descending order, so the
-  weight tensor cannot differ even when scores tie;
-* **ids are identical whenever the k-boundary is tie-free**;
-* where ids differ, the differing scores are *equal*, so the two selected
-  experts are interchangeable as far as the router is concerned. This is the only
-  freedom either path has: torch_tpu emits ``is_stable=false``
-  (``topk_aten_kernels.cc:78-81``), which leaves the tie order unspecified.
-
-Every test here runs on CPU.
+The contract: values are bit-identical always; ids are identical wherever the
+k-boundary is tie-free; and where ids differ the scores are equal, which is
+the only freedom either path has -- torch_tpu emits ``is_stable=false``.
 """
 
 import pytest
@@ -92,12 +82,8 @@ def test_matches_torch_topk_uniform(rows, k):
 
 
 def test_matches_torch_topk_on_real_routing_distribution():
-    """The model's own path: bf16 gate logits -> f32 softmax -> top-k.
-
-    bf16 logits make exact ties common (8-bit mantissa over 512 experts), so
-    this is the case that exercises the tie contract at scale, not the
-    tie-free uniform one.
-    """
+    """The model's own path: bf16 gate logits -> f32 softmax -> top-k, where
+    the 8-bit mantissa makes exact ties common."""
     torch.manual_seed(1234)
     for sigma in (0.5, 1.0, 2.0, 4.0):
         logits = (torch.randn(2048, EXPERTS) * sigma).to(torch.bfloat16)
@@ -107,12 +93,10 @@ def test_matches_torch_topk_on_real_routing_distribution():
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_expert_set_identical_where_the_top_k_is_unique(seed):
-    """The contract, stated positively.
+    """Where the top-k is well posed, the two paths must agree exactly.
 
-    ~11% of realistic rows tie across the k-boundary (measured on the real
-    Qwen3.5 gate weights, see w6/ties.md), and on those rows *neither* path
-    is defined -- torch_tpu's sort is ``is_stable=false``. Where the top-k is
-    a well-posed question, the two paths must agree exactly.
+    About 11% of realistic rows tie across the k-boundary, and on those rows
+    neither path is defined.
     """
     torch.manual_seed(seed)
     logits = torch.randn(4096, EXPERTS).to(torch.bfloat16)
@@ -152,8 +136,7 @@ def test_all_equal_row_selects_lowest_experts():
 def test_adversarial_ties_straddling_the_boundary():
     """Blocks of equal scores, including one that straddles rank k-1/k."""
     scores = torch.zeros(1, EXPERTS)
-    # ranks 0-4: five clear winners; ranks 5-14: ten equal scores for the
-    # remaining five slots; the rest strictly lower.
+    # Five clear winners, then ten equal scores for the remaining five slots.
     scores[0, 100:105] = torch.tensor([9.0, 8.0, 7.0, 6.0, 5.0])
     scores[0, 200:210] = 4.0
     scores[0, 300:] = 1.0

@@ -609,8 +609,6 @@ class TpuPlatform(Platform):
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
-    # TPU_MOE_ROUTER_TOPK is read inside the worker, so a Ray executor has to
-    # copy it or the `sort` escape hatch silently does not reach the engines.
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",

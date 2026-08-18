@@ -22,10 +22,8 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Resolved once, at import, so the compiled forward pass never reads the
-# environment. "sort" keeps torch.topk, which torch_tpu lowers to a full
-# stablehlo.sort of all 512 experts; "rowmax" selects the same k with k
-# max-and-mask passes (layers/vllm/router_topk.py).
+# Resolved once, at import, so the compiled forward never reads the
+# environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
