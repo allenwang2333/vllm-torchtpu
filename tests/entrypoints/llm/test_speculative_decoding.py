@@ -412,12 +412,7 @@ def test_dflash_correctness_greedy(
             "method": "dflash",
             "model": "z-lab/Qwen3-4B-DFlash-b16",
             "num_speculative_tokens": 15,
-            # draft_tensor_parallel_size deliberately unset -> sharded draft
-            # (draft tp == target tp), the production default. A sharded
-            # draft is rank-consistent by construction (its internal
-            # all-reduce); a replicated draft (tp=1) needs the runner's
-            # rank-0 draft pinning under async scheduling to stay coherent
-            # across TP ranks.
+            "draft_tensor_parallel_size": 1,
         },
         max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
@@ -613,8 +608,7 @@ def test_dflash_performance_greedy(
             "method": "dflash",
             "model": "z-lab/Qwen3-4B-DFlash-b16",
             "num_speculative_tokens": 15,
-            # Unset -> sharded draft (draft tp == target tp), the production
-            # default; see test_dflash_correctness_greedy.
+            "draft_tensor_parallel_size": 1,
         },
         min_acceptance_rate=min_acceptance_rate,
         max_num_seqs=max_num_seqs,
