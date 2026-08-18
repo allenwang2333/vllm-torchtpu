@@ -79,6 +79,14 @@ class GDNConfig:
     return self.mode.get_chunk_size(self.tile_size)
 
   @property
+  def triangular_block_size(self) -> int:
+    # Tradeoff between MXU + XLU usage (block_size inc -> MXU dec, XLU inc).
+    # Increasing num_v_heads increases XLU ops, so we reduce block_size to compensate.
+    if self.num_v_heads == 64:
+      return 2
+    return 16
+
+  @property
   def seq_tile_size(self) -> int:
     return self.mode.get_seq_tile_size(self.tile_size)
 
