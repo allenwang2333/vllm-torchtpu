@@ -33,6 +33,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
 from .tags import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
@@ -437,18 +438,28 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
             f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}")
     num_blocks = raw_nbytes // manager_page_bytes
 
+    # The conv region starts after the SSM region's padded token extent, not
+    # its raw byte size; a state that does not divide the FA token row leaves
+    # the tail of its last row as padding (derive_pooled_gdn_state_layout).
+    fa_token_bytes, remainder = divmod(manager_page_bytes,
+                                       int(spec.block_size))
+    if fa_token_bytes <= 0 or remainder:
+        raise ManifestError(
+            f"manager page bytes {manager_page_bytes} for {layer_name} are "
+            f"not token-linear over block_size={spec.block_size}")
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=ssm_bytes,
+        conv_bytes=conv_bytes,
+        token_bytes=fa_token_bytes,
+    )
+    ssm_extent_bytes = layout.ssm_tokens * fa_token_bytes
+
     states: list[_PooledStateView] = []
     # The PR #106 pooled ABI places SSM first and conv immediately after it,
     # while the public/canonical manifest order remains conv then SSM.
-    for shape, dtype, itemsize, state_bytes, offset_bytes in ((conv_shape,
-                                                               conv_dtype,
-                                                               conv_itemsize,
-                                                               conv_bytes,
-                                                               ssm_bytes),
-                                                              (ssm_shape,
-                                                               ssm_dtype,
-                                                               ssm_itemsize,
-                                                               ssm_bytes, 0)):
+    for shape, dtype, itemsize, state_bytes, offset_bytes in (
+        (conv_shape, conv_dtype, conv_itemsize, conv_bytes, ssm_extent_bytes),
+        (ssm_shape, ssm_dtype, ssm_itemsize, ssm_bytes, 0)):
         absolute_offset_bytes = pool_offset_bytes + offset_bytes
         if (manager_page_bytes % itemsize != 0
                 or absolute_offset_bytes % itemsize != 0):

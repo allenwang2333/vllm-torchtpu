@@ -35,7 +35,8 @@ def _pooled_gdn_group(layer_names, *, shapes, dtypes, page_size_bytes):
         layer_names=tuple(layer_names),
         kv_cache_spec=types.SimpleNamespace(shapes=tuple(shapes),
                                             dtypes=tuple(dtypes),
-                                            page_size_bytes=page_size_bytes),
+                                            page_size_bytes=page_size_bytes,
+                                            block_size=128),
     )
 
 
