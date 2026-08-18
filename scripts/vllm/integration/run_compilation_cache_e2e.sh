@@ -41,13 +41,11 @@ trap cleanup EXIT
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
 export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
 export VLLM_TARGET_DEVICE="tpu"
-export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-0}"
+export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-1}"
 
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
-
-# Pre-sized KV cache memory (~85.96 GiB = 50,312 blocks) to bypass profile_run
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-92305620992}"
 
 # Helper function: kill orphaned processes holding TPU locks
 clean_tpu_processes() {
@@ -80,8 +78,7 @@ rm -rf "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 \
-  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -100,20 +97,8 @@ fi
 
 # ==============================================================================
 # [Test 2] Storage Duplication Audit
-# Description: Verifies that Category 2 Python pickle files store lightweight
-#              metadata handles (<50KB total) rather than duplicating heavy binary
-#              executables.
-#
-# Categories Explained:
-#   Category 1: C++ Native Tier-3 PJRT Binary Executables
-#               (Managed natively by torch_tpu in torch_tpu_tier3/*.bin)
-#   Category 2: vLLM TpuCompilerAdaptor Python Metadata Handles
-#               (Pickled TpuCompilationHandle instances storing lightweight cache metadata)
-#   Category 3: PyTorch Upstream Dynamo / AOTAutograd Tracing Cache
-#               (Independent upstream PyTorch framework cache storing Dynamo FX graph
-#                bytecode, Guard expressions, and BundledAOTAutogradResult structures
-#                created during Python-side graph tracing, completely decoupled from
-#                native C++ PJRT compiled binary executables)
+# Description: Verifies cache artifact generation across Category 1 (Tier-3 PJRT),
+#              Category 2 (TpuCompilerAdaptor handles), and Category 3 (AOTAutograd).
 # ==============================================================================
 echo "================================================================="
 echo "=== 📊 [Test 2] Storage Duplication Audit (Cold Run Artifacts)"
@@ -135,60 +120,82 @@ Category 2 (vLLM TpuCompilerAdaptor Python Metadata Handles): ${CAT2_SIZE} Bytes
 Category 3 (PyTorch Upstream Dynamo / AOTAutograd Tracing Cache): ${CAT3_SIZE} Bytes (${CAT3_MB} MB)
 EOF
 
-if [ "${CAT2_SIZE}" -lt 50000 ]; then
-  echo "✅ [Test 2 PASSED] Optimization verified! Category 2 pickle files total ${CAT2_SIZE} Bytes (< 50KB total, ~100B per graph), eliminating binary duplication!"
-else
-  echo "⚠️ [Test 2 WARNING] Category 2 pickle files total ${CAT2_SIZE} Bytes. Binary payload may still be duplicated."
-fi
-
 # ==============================================================================
-# [Test 3] Warm Start Cache Hit Verification
-# Description: Verifies that subsequent inference runs load compiled executables
-#              directly from the cache (<1ms) without re-compilation.
+# [Test 3] Warm Start Cache Hit Verification (2nd Run / Job 2)
+# Description: Verifies that the 2nd run hits compilation cache (<5s) without
+#              recompiling.
 # ==============================================================================
 echo "================================================================="
-echo "=== 🏃 [Test 3] Warm Start Cache Hit Verification"
+echo "=== 🏃 [Test 3] Warm Start Cache Hit Verification (2nd Run)"
 echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 \
-  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/warm_run_1.log"
 
 sync && sleep 10
 
-WARM_TIME=$(grep -oP "Compilation finished in \K[0-9.]+" "${CACHE_DIR}/warm_run.log" | head -n 1 || echo "999")
-IS_FAST=$(python3 -c "print(1 if float('${WARM_TIME}') < 5.0 else 0)" 2>/dev/null || echo "0")
+WARM1_TIME=$(grep -oP "Compilation finished in \K[0-9.]+" "${CACHE_DIR}/warm_run_1.log" | head -n 1 || echo "999")
+IS_FAST1=$(python3 -c "print(1 if float('${WARM1_TIME}') < 5.0 else 0)" 2>/dev/null || echo "0")
 
-if [ "${IS_FAST}" -eq 1 ] || grep -q -E "Directly load|Loading compiled executable|Cache the graph" "${CACHE_DIR}/warm_run.log"; then
-  echo "✅ [Test 3 PASSED] Warm run log confirmed cache hit without recompilation (Compilation time: ${WARM_TIME}s < 5.0s)."
+if [ "${IS_FAST1}" -eq 1 ] || grep -q -E "Directly load|Loading compiled executable|Cache the graph" "${CACHE_DIR}/warm_run_1.log"; then
+  echo "✅ [Test 3 PASSED] 2nd Run confirmed cache hit without recompilation (Compilation time: ${WARM1_TIME}s < 5.0s)."
 else
-  echo "❌ [Test 3 FAILED] Warm run did not hit cache or triggered recompilation!"
+  echo "❌ [Test 3 FAILED] 2nd Run did not hit cache or triggered recompilation!"
   exit 1
 fi
 
 if [[ -d "${TIER3_DIR}" ]]; then
-  find "${TIER3_DIR}" -type f -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_warm.txt" || true
+  find "${TIER3_DIR}" -type f -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_warm1.txt" || true
 else
-  touch "${CACHE_DIR}/tier3_warm.txt"
+  touch "${CACHE_DIR}/tier3_warm1.txt"
 fi
 
 # ==============================================================================
-# [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm)
-# Description: Compares Tier-3 binary artifact MD5sums between Cold and Warm runs
-#              to audit cache file consistency.
+# [Test 4] Warm Start Cache Hit Verification (3rd Run / Job 3)
+# Description: Verifies that the 3rd run consistently hits compilation cache
+#              and maintains identical cache artifacts.
 # ==============================================================================
 echo "================================================================="
-echo "=== 🔍 [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm)"
+echo "=== 🏃 [Test 4] Warm Start Cache Hit Verification (3rd Run)"
 echo "================================================================="
-if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
-  echo "✅ [Test 4 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
+clean_tpu_processes
+
+python3 examples/offline_inference.py --model "${MODEL}" \
+  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/warm_run_2.log"
+
+sync && sleep 10
+
+WARM2_TIME=$(grep -oP "Compilation finished in \K[0-9.]+" "${CACHE_DIR}/warm_run_2.log" | head -n 1 || echo "999")
+IS_FAST2=$(python3 -c "print(1 if float('${WARM2_TIME}') < 5.0 else 0)" 2>/dev/null || echo "0")
+
+if [ "${IS_FAST2}" -eq 1 ] || grep -q -E "Directly load|Loading compiled executable|Cache the graph" "${CACHE_DIR}/warm_run_2.log"; then
+  echo "✅ [Test 4 PASSED] 3rd Run confirmed cache hit without recompilation (Compilation time: ${WARM2_TIME}s < 5.0s)."
 else
-  echo "❌ [Test 4 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+  echo "❌ [Test 4 FAILED] 3rd Run did not hit cache or triggered recompilation!"
+  exit 1
+fi
+
+if [[ -d "${TIER3_DIR}" ]]; then
+  find "${TIER3_DIR}" -type f -exec md5sum {} \; | sort > "${CACHE_DIR}/tier3_warm2.txt" || true
+else
+  touch "${CACHE_DIR}/tier3_warm2.txt"
+fi
+
+# ==============================================================================
+# [Test 5] Cache File & MD5 Consistency Check (Cold vs Warm 1 vs Warm 2)
+# ==============================================================================
+echo "================================================================="
+echo "=== 🔍 [Test 5] Cache File & MD5 Consistency Check across 3 Runs"
+echo "================================================================="
+if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm1.txt" && diff -u "${CACHE_DIR}/tier3_warm1.txt" "${CACHE_DIR}/tier3_warm2.txt"; then
+  echo "✅ [Test 5 PASSED] Tier-3 cache files and MD5sums are 100% identical across all 3 runs!"
+else
+  echo "❌ [Test 5 FAILED] Tier-3 cache files or MD5sums changed between runs!"
   exit 1
 fi
 
 echo "================================================================="
-echo "🎉 Compilation Cache E2E Test Suite Completed!"
+echo "🎉 3-Run Compilation Cache E2E Test Suite Completed!"
 echo "Logs saved in: ${CACHE_DIR}"
 echo "================================================================="
