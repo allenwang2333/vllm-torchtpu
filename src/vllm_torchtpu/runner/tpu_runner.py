@@ -3336,9 +3336,9 @@ class TPUModelRunner(GPUModelRunner):
                     "total_num_scheduled_tokens": "total_num_scheduled_tokens",
                     "padded_total_num_scheduled_tokens":
                     "padded_total_num_scheduled_tokens",
-                    "min_kv_length": "min_kv_len",
+                    "min_kv_len": "min_kv_length",
                 }
-                for target_key, src_key in stats_map.items():
+                for src_key, target_key in stats_map.items():
                     trace_kwargs[target_key] = batch_composition_stats.get(
                         src_key, "UNKNOWN" if src_key == "phase" else 0)
 
