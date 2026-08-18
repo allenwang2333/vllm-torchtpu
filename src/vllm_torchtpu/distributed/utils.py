@@ -273,10 +273,9 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
             if backends is None:
                 backends_str = getattr(envs, "TPU_RAIDEN_TELEMETRY_BACKENDS", "buffered")
                 backends = [b.strip() for b in backends_str.split(",") if b.strip()]
-            backend_set = set(backends)
-            telemetry.configure_telemetry(backend_set)
+            telemetry.configure_telemetry(backends)
             _RAIDEN_TELEMETRY_CONFIGURED = True
-            logger.info("Configured TPU Raiden C++ telemetry backends: %s", backend_set)
+            logger.info("Configured TPU Raiden C++ telemetry backends: %s", backends)
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
 
