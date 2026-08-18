@@ -3407,8 +3407,8 @@ class TestTPUConnectorStats(unittest.TestCase):
 
         with patch.dict(
             "sys.modules", {
-                "tpu_raiden": MagicMock(),
-                "tpu_raiden.api": mock_api,
+                "tpu_sync": MagicMock(),
+                "tpu_sync.api": mock_api,
             }):
             registry = CollectorRegistry()
             metric_types = {

@@ -259,21 +259,22 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
 
         # Dynamically load TPU Raiden C++ metric schema descriptors
         try:
-            from tpu_raiden.api import telemetry
             dist_utils.configure_raiden_telemetry()
-            if hasattr(telemetry, "get_metric_metadata"):
-                descriptors = telemetry.get_metric_metadata()
-            elif hasattr(telemetry, "get_metric_descriptors"):
-                descriptors = telemetry.get_metric_descriptors()
+            telemetry = dist_utils.get_raiden_telemetry_module()
+            if telemetry is not None:
+                if hasattr(telemetry, "get_metric_metadata"):
+                    descriptors = telemetry.get_metric_metadata()
+                else:
+                    descriptors = []
+                print(f"Descriptors{descriptors}")
             else:
                 descriptors = []
-            print(descriptors)
         except Exception as e:
             logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
             descriptors = []
 
         for desc in descriptors:
-            name = desc.name
+            name =  f"tpu_raiden_{desc.name}"
             help_str = getattr(desc, "description", getattr(desc, "help", ""))
             mtype = desc.type
             mtype_str = getattr(mtype, "name", str(mtype)).split(".")[-1].lower()

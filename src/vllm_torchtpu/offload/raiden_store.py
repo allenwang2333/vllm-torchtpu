@@ -218,8 +218,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 "and cross-instance lookups can never hit.")
 
         if store is None:
-            from tpu_raiden.api.torch.kv_cache_manager import _torch_impl
-            store_types = _torch_impl()
+            import vllm_torchtpu.distributed.utils as dist_utils
+            dist_utils.configure_raiden_telemetry()
+            from tpu_sync.api.torch import kv_cache_manager as _kcm
+            store_types = _kcm._torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
                 "until %d worker(s) register", world_size)
@@ -252,7 +254,7 @@ class RaidenOffloadingManager(OffloadingManager):
                  if self._enable_global else ""))
         else:
             # Injected store (tests): the caller supplies the module holding
-            # BlockStatus / RaidenBlockID so tpu_raiden isn't imported.
+            # BlockStatus / RaidenBlockID so tpu_sync isn't imported.
             assert store_types is not None
         self._store = store
         self._block_status = store_types.BlockStatus
@@ -1126,7 +1128,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         while not self._stop_registration.is_set():
             if self._controller_reachable():
                 try:
-                    from tpu_raiden.api.torch import kv_cache_manager as _kcm
+                    from tpu_sync.api.torch import kv_cache_manager as _kcm
                     self._mgr = _kcm.KVCacheManager(
                         kv_caches=self._device_tensors,
                         local_control_port=0,

@@ -89,7 +89,7 @@ class _Call:
 
 
 class FakeKVCacheStore:
-    """In-memory stand-in for tpu_raiden's KVCacheStore python wrapper."""
+    """In-memory stand-in for tpu_sync's KVCacheStore python wrapper."""
 
     def __init__(self):
         self.entries: dict[bytes, _Entry] = {}

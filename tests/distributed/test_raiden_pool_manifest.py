@@ -552,7 +552,7 @@ def test_pool_dicts_round_trip():
 
 
 def test_pool_dicts_coerce_into_raiden_pool_specs():
-    pool_layout = pytest.importorskip("tpu_raiden.api.torch.pool_layout")
+    pool_layout = pytest.importorskip("tpu_sync.api.torch.pool_layout")
 
     _, manifest = _build_tp2dp4()
     for pool_dict, entry in zip(manifest.pool_dicts(), manifest.pools):
@@ -561,3 +561,41 @@ def test_pool_dicts_coerce_into_raiden_pool_specs():
         assert spec.tag == entry.tag
         assert spec.block_stride_bytes == entry.block_stride_bytes
         assert spec.live_bytes_per_block == entry.live_bytes_per_block
+
+
+def test_gdn_conv_4d_shape_handling():
+    geometry = rpm.GdnHeadGeometry(local_key_heads=16,
+                                   local_value_heads=64,
+                                   key_head_dim=128,
+                                   value_head_dim=128)
+    # 4D conv shape as produced by TPU runner: (16, 3, 1, 12288)
+    conv_dim = 2 * 16 * 128 + 64 * 128  # 12288
+    conv_shape_4d = (16, 3, 1, conv_dim)
+    regions = rpm._gdn_conv_regions(conv_shape=conv_shape_4d,
+                                   itemsize=2,
+                                   geometry=geometry)
+    assert len(regions) in (2, 3)
+    assert regions[0].num_units == 3  # taps
+
+    # Test full build_qwen35_pool_manifest with 4D conv shape materialization
+    named = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, conv_dim),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    groups = _qwen35_groups(named,
+                            block_size=4096,
+                            num_kv_heads=2,
+                            head_size=256)
+    manifest = rpm.build_qwen35_pool_manifest(named_kv_caches=named,
+                                              kv_cache_groups=groups,
+                                              raw_tensors=(),
+                                              gdn_geometry=geometry)
+    assert manifest.binding == rpm.BINDING_PRIVATE_TYPED
+    conv_pool = next(p for p in manifest.pools if p.tag == rpm.TAG_GDN_CONV)
+    assert conv_pool.num_blocks == 16
+
