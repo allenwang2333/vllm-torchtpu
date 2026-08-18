@@ -297,10 +297,12 @@ def fused_conv1d_gdn(
     d_k: int,
     d_v: int,
     kernel_size: int,
+    num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    **kwargs,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
   """Perform conv1d and gdn in a single fused kernel.
 
