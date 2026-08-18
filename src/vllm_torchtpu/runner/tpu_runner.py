@@ -173,7 +173,6 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
-
 def _spec_warmup_all_token_ids(
         req_ids: list[str],
         num_computed_tokens: list[int]) -> dict[str, list[int]]:
