@@ -319,6 +319,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # torch.topk, which torch_tpu lowers to a full stablehlo.sort of every
     # expert plus a slice, and is kept as a diagnostic escape hatch. Read once,
     # at MoE-routing import.
+    # MoE router top-k implementation: "rowmax" (default) is the sort-free
+    # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
 

@@ -14,15 +14,9 @@
 """Sort-free top-k expert selection for the MoE router (Pallas).
 
 ``torch.topk`` lowers to a full ``stablehlo.sort`` of every expert plus a
-slice (``torch_tpu/ops/topk/topk.cc:55-86``). At 512 experts that is a
-45-stage bitonic network moving three arrays (scores + a 64-bit index
-payload) to keep 10 values. This kernel selects the same 10 with ``k``
-max-and-mask passes over a VMEM-resident block, which is ~7x fewer issue
-cycles at 8192x512 (see ``impl/w6-topk.md``).
-
-Port of tpu-inference PR #3346 ``kernels/fused_moe/v2/router_ops.py``, with
-the block size raised after a cycle sweep: at 512 experts the 256-row block
-the original uses leaves the pipeline half empty.
+slice, so at 512 experts it runs a 45-stage bitonic network over three arrays
+to keep 10 values. This kernel selects the same 10 with ``k`` max-and-mask
+passes over one VMEM-resident block: ``O(k*N)`` instead of ``O(N*log^2 N)``.
 """
 
 import functools
@@ -31,75 +25,60 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-# Below any real routing score (softmax/sigmoid/sqrtsoftplus are all >= 0) and
-# above -FLT_MAX, which is what a column is masked with: the two must differ,
-# or a row that is entirely sentinel cannot advance past its first column.
+# Clamp floor. Below any real routing score (softmax, sigmoid and sqrtsoftplus
+# are all >= 0) and strictly above the dtype minimum used to mask a selected
+# column, so a row's maximum is always above the mask.
 NEG = -3.0e38
 
-# Rows per grid step. 512 measured fastest at 512 experts at 8192 and 16384
-# rows (119,811 / 224,805 issue cycles vs 172,093 / 331,951 for the 256 of
-# tpu-inference PR #3346). The grid rounds up rather than requiring the block
-# to divide the row count -- see ``select``.
+# Rows per grid step, measured fastest at 512 experts. The grid rounds up, so
+# this does not have to divide the row count.
 MAX_BLOCK_ROWS = 512
-
-
-def block_rows_for(rows: int, cap: int = MAX_BLOCK_ROWS) -> int:
-    """Rows per grid step: the tuned block, or the whole input if smaller."""
-    return min(cap, rows)
 
 
 def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     """One block of rows: top ``topk`` by repeated max-and-mask.
 
-    Every score at or below the sentinel is clamped up to it before the first
-    max, so every row has a maximum that some column equals and every index
-    written is a real expert. Ties resolve to the lowest expert id.
+    Scores at or below ``NEG`` are clamped up to it first, so every row has a
+    maximum some column equals and every index written is a real expert. Ties
+    go to the lowest id.
 
-    The clamp is written as ``x > NEG`` rather than ``isnan(x)`` because it
-    has to catch three spellings of the same hazard, not one: NaN, ``-inf``
-    and ``-FLT_MAX`` are all values a whole row can be made of. Masking uses
-    ``finfo.min``, strictly *below* the sentinel; if a row's own maximum could
-    equal or fall below the mask, every column would stay tied with the row
-    max and every pass would return column 0 -- one expert selected ``topk``
-    times. The clamp makes that invariant hold by construction instead of
-    trusting the caller's scores to satisfy it.
+    The clamp tests ``x > NEG`` rather than ``isnan(x)`` to catch all three
+    spellings of the hazard -- NaN, ``-inf``, ``-FLT_MAX`` -- any of which a
+    whole row can be made of. Without it such a row would stay tied with the
+    ``finfo.min`` mask and every pass would return column 0.
     """
     x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
     masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
-        # Lowest column attaining the max; non-matching columns fill with the
-        # last expert so the min never selects a phantom.
+        # Lowest column attaining the max; the rest fill with the last expert
+        # so the min never selects a phantom.
         idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
         w_ref[:, j] = m[:, 0]
         i_ref[:, j] = idx.astype(jnp.int32)
         x = jnp.where(iota == idx[:, None], masked, x)
-    # A row with no score above the sentinel has no real maximum, only the
-    # sentinel itself: keep it poisonous rather than routing it to experts
-    # 0..k-1 with a weight the renormalization would turn into something
-    # plausible.
+    # No score above the sentinel means no real maximum: keep the row
+    # poisonous rather than letting renormalization make it plausible.
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
 def select(scores: jax.Array,
            topk: int,
            interpret: bool = False) -> tuple[jax.Array, jax.Array]:
-    """Top-k over ``[rows, experts]`` f32 scores.
+    """Top-k over ``[rows, experts]`` f32 scores, values descending.
 
     Returns ``(weights f32, indices int32)`` of shape ``[rows, topk]``, values
-    descending. ``interpret`` runs the kernel on the host, which is how the
-    unit tests check it without a TPU.
+    descending. ``interpret`` runs the kernel on the host, for tests without a
+    TPU.
 
-    The grid rounds up, so ``rows`` need not be a multiple of the block: the
-    last step reads a partial block and Mosaic discards the stores past
-    ``rows``. Every reduction here is along the expert axis, so those surplus
-    rows cannot perturb a real one. Requiring divisibility instead -- halving
-    the block until it divided -- collapsed the tuned 512 to 32 on the shipped
-    ``--max-num-batched-tokens=4384`` bucket, and to 1 on a prime one.
+    The last grid step reads a partial block when ``rows`` is not a multiple
+    of the block; Mosaic discards the stores past ``rows``, and every
+    reduction is along the expert axis, so surplus rows cannot perturb a real
+    one.
     """
     rows, n = scores.shape
-    block = block_rows_for(rows)
+    block = min(MAX_BLOCK_ROWS, rows)
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
         grid=(pl.cdiv(rows, block), ),
