@@ -16,12 +16,21 @@ from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from .raiden_test_utils import FakeTensor
 
 
-def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
+def _fa_group(layer_names,
+              *,
+              block_size,
+              num_kv_heads,
+              head_size,
+              token_bytes,
+              kv_lora_rank=None):
     return types.SimpleNamespace(
         layer_names=tuple(layer_names),
         kv_cache_spec=types.SimpleNamespace(block_size=block_size,
                                             num_kv_heads=num_kv_heads,
-                                            head_size=head_size),
+                                            head_size=head_size,
+                                            page_size_bytes=block_size *
+                                            token_bytes,
+                                            kv_lora_rank=kv_lora_rank),
     )
 
 
@@ -58,14 +67,15 @@ def _qwen35_materialization(*, fa_shape, fa_esz, fa_dtype, conv_shape,
     return named
 
 
-def _qwen35_groups(named, *, block_size, num_kv_heads, head_size):
+def _qwen35_groups(named, *, block_size, num_kv_heads, head_size, token_bytes):
     fa_names = [n for n in named if "self_attn" in n]
     gdn_names = [n for n in named if "linear_attn" in n]
     return (
         _fa_group(fa_names,
                   block_size=block_size,
                   num_kv_heads=num_kv_heads,
-                  head_size=head_size),
+                  head_size=head_size,
+                  token_bytes=token_bytes),
         _gdn_group(gdn_names[:15]),
         _gdn_group(gdn_names[15:30]),
         _gdn_group(gdn_names[30:]),
@@ -95,7 +105,8 @@ def _build_pcp8():
     groups = _qwen35_groups(named,
                             block_size=4096,
                             num_kv_heads=2,
-                            head_size=256)
+                            head_size=256,
+                            token_bytes=1024)
     manifest = rpm.build_qwen35_pool_manifest(named_kv_caches=named,
                                               kv_cache_groups=groups,
                                               raw_tensors=(),
@@ -116,7 +127,8 @@ def _build_tp2dp4():
     groups = _qwen35_groups(named,
                             block_size=1024,
                             num_kv_heads=1,
-                            head_size=256)
+                            head_size=256,
+                            token_bytes=1024)
     manifest = rpm.build_qwen35_pool_manifest(named_kv_caches=named,
                                               kv_cache_groups=groups,
                                               raw_tensors=(),
@@ -253,7 +265,8 @@ def test_variant_geometry_derives_from_tensors():
         _fa_group(["model.layers.1.self_attn.attn"],
                   block_size=64,
                   num_kv_heads=2,
-                  head_size=64),
+                  head_size=64,
+                  token_bytes=512),
         _gdn_group(["model.layers.0.linear_attn"]),
     )
     manifest = rpm.build_qwen35_pool_manifest(named_kv_caches=named,
@@ -373,7 +386,8 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
         _fa_group(["model.layers.1.self_attn.attn"],
                   block_size=128,
                   num_kv_heads=2,
-                  head_size=256),
+                  head_size=256,
+                  token_bytes=1024),
     )
     manifest = rpm.build_qwen35_pool_manifest(
         named_kv_caches=named,
@@ -406,6 +420,58 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops():
                                          manager_page_bytes)
     assert max(region.extent_end_bytes
                for region in conv.regions) + conv.base_offset_bytes < \
+        manager_page_bytes
+    rpm.verify_storage_binding(manifest, named, raw_tensors=(pool, ))
+
+
+def test_unified_pool_manifest_kimi_linear_padded_ssm_extent():
+    """Kimi-Linear TP8 on the MLA pool: the f32 KDA state (2^18 B) does not
+    divide the packed 2560 B pool row, so the conv region must start after
+    the padded 103-row SSM extent (263,680 B), not at ssm_bytes (262,144 B).
+    """
+    # KDA conv dim per tap is q + k + v channels: 2 * (4 * 128) + 4 * 128.
+    geometry = rpm.GdnHeadGeometry(local_key_heads=4,
+                                   local_value_heads=4,
+                                   key_head_dim=128,
+                                   value_head_dim=128)
+    conv_shape = (3, 3, 4, 128)
+    ssm_shape = (4, 128, 128)
+    manager_page_bytes = 107 * 2560
+    pool = FakeTensor((4, 107, 2, 640), 2, dtype="torch.bfloat16")
+    named = {
+        "model.layers.0.linear_attn": [pool],
+        "model.layers.1.self_attn.attn": pool,
+    }
+    groups = (
+        _pooled_gdn_group(["model.layers.0.linear_attn"],
+                          shapes=(conv_shape, ssm_shape),
+                          dtypes=("torch.bfloat16", "torch.float32"),
+                          page_size_bytes=manager_page_bytes),
+        _fa_group(["model.layers.1.self_attn.attn"],
+                  block_size=214,
+                  num_kv_heads=1,
+                  head_size=576,
+                  token_bytes=1280,
+                  kv_lora_rank=512),
+    )
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(pool, ),
+        gdn_geometry=geometry,
+        mamba_group_ordinal_by_layer={"model.layers.0.linear_attn": 0},
+    )
+
+    conv, ssm, fa = manifest.pools
+    ssm_bytes = 4 * 128 * 128 * 4
+    ssm_extent_bytes = 103 * 2560  # padded up from ssm_bytes
+    assert (ssm.base_offset_bytes, ssm.dtype_tag,
+            ssm.live_bytes_per_block) == (0, "float32", ssm_bytes)
+    assert (conv.base_offset_bytes, conv.dtype_tag,
+            conv.live_bytes_per_block) == (ssm_extent_bytes, "bfloat16",
+                                           3 * 3 * 4 * 128 * 2)
+    assert max(region.extent_end_bytes
+               for region in conv.regions) + conv.base_offset_bytes <= \
         manager_page_bytes
     rpm.verify_storage_binding(manifest, named, raw_tensors=(pool, ))
 
@@ -489,7 +555,8 @@ def test_mixed_binding_is_rejected():
         _fa_group(["model.layers.3.self_attn.attn"],
                   block_size=4096,
                   num_kv_heads=2,
-                  head_size=256),
+                  head_size=256,
+                  token_bytes=1024),
     )
     with pytest.raises(rpm.ManifestError, match="mixed KV cache binding"):
         rpm.build_qwen35_pool_manifest(named_kv_caches=named,

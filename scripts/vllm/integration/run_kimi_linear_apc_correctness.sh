@@ -23,10 +23,10 @@ PORT="${PORT:-8000}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-2700}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Kimi-Linear is not in POOLED_GDN_ARCHITECTURES yet, so the pool stays an
-# explicit opt-in here. max_num_seqs=1 removes batching nondeterminism, so a
-# cold/warm difference is the cache and nothing else.
-TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1 vllm serve "$MODEL" \
+# Kimi-Linear defaults to the unified pool (POOLED_GDN_ARCHITECTURES).
+# max_num_seqs=1 removes batching nondeterminism, so a cold/warm difference is
+# the cache and nothing else.
+vllm serve "$MODEL" \
   --tensor-parallel-size "${TP:-8}" \
   --enable-expert-parallel \
   --max-model-len "${MAX_MODEL_LEN:-4096}" \

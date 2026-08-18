@@ -141,11 +141,19 @@ floor 214 tokens.
 
 ## Phase 4 - Enablement
 
-- [ ] 4.1 Add `KimiLinearForCausalLM` (and `KimiK3ForConditionalGeneration` if
-      shared) to `POOLED_GDN_ARCHITECTURES`; keep
-      `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0` as escape hatch.
-- [ ] 4.2 Raiden/disagg manifest test with Kimi geometry (offset fix already
-      generalizes).
+- [x] 4.1 Add `KimiLinearForCausalLM` to `POOLED_GDN_ARCHITECTURES`
+      (Kimi-K3 stays opt-in until TP32 geometry is validated). Pooled KDA
+      rejects speculative decoding (`mamba_slot_read_offsets` present) and
+      PCP streaming up front. `test_unified_kv_layout_enablement_contract`
+      now uses Bamba as the unpooled example; a layer-level dispatch test
+      pins the singleton-cache -> pooled-op routing.
+- [x] 4.2 Raiden/disagg manifest with Kimi geometry. Needed more than the
+      offset fix: `_gdn_conv_regions` learned the KDA 5-D conv shape
+      (taps, qkv, heads, head_dim), and the FA view now derives block counts
+      from spec page bytes (not the pool's row axis — packed rows are not
+      tokens) and describes MLA latent rows (one per token, no K+V pair).
+      `test_unified_pool_manifest_kimi_linear_padded_ssm_extent` pins the
+      padded-extent conv offset; all Qwen golden manifests unchanged.
 
 ## Later, separate workstream - partial hits (RFC #45702)
 
