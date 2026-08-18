@@ -110,9 +110,18 @@ floor 214 tokens.
 
 ## Phase 3 - Validation
 
-- [ ] 3.1 Kernel parity test mirroring `test_gdn_pooled_prefill_parity.py`:
+- [x] 3.1 Kernel parity test mirroring `test_gdn_pooled_prefill_parity.py`:
       pooled vs dense two-tensor path, multi-step prefill+decode, byte-exact
       state comparison.
+
+      Result: `test_pooled_kda_matches_dense_bitwise` (mixed / decode-only /
+      prefill-fresh batches, complement preservation) and
+      `test_pooled_kda_multistep_state_evolution` (two prefill chunks + three
+      decodes threading the state through the pool each step). Outputs and
+      conv state are bitwise-exact; the f32 SSM state matches within bf16
+      tolerance (fusion reassociation across the two graphs). The timing arm
+      of the GDN parity test is deferred to Phase 1.3: the gather/scatter
+      path is correctness-first by design.
 - [ ] 3.2 Serve smoke: `scripts/vllm/integration/run_kimi_linear_apc_correctness.sh`
       added (mirrors the Qwen3.5 gate). Manually validated on TP8: divergence
       smoke OK, contamination 0/6; the correctness smoke's one failure is the
