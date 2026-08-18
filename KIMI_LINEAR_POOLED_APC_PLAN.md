@@ -37,10 +37,24 @@ SSM state 262,144 B fp32 (2^18), conv state 9,216 B bf16, MLA token row
 
 ## Phase 1 - Pooled KDA op (core kernel work)
 
-- [ ] 1.1 Correctness-first: gather/scatter the conv+ssm state out of the pool
+- [x] 1.1 Correctness-first: gather/scatter the conv+ssm state out of the pool
       via `pool_adapters.gather_region`/`scatter_region` (currently uncalled)
       around the existing KDA ops (`build_kimi_kda_op`, `chunk_kda`,
       `dispatched_kda`). Isolates layout bugs from kernel bugs.
+
+      Result: `build_kimi_pooled_kda_op`
+      (`src/vllm_torchtpu/layers/vllm/custom_ops/kda_attention_op.py`) gathers
+      both regions into dense batch-local buffers, prepends a scratch null
+      slot (the kernels' slot-0 writes are all idempotent), runs the
+      unmodified dispatched KDA core with identity indices, and scatters back.
+      `gather_region`/`scatter_region` learned unaligned regions (`tok0 %
+      ntok != 0`, needed for the conv region at token 103) as gcd-sized chunks
+      on a flattened (request, chunk) grid inside ONE pallas_call — chaining
+      aliased per-chunk calls corrupts earlier chunks (observed: first chunk's
+      values re-read with bf16-word rounding). Parity vs the dense path:
+      outputs and conv state bitwise-equal; SSM state equal to bf16 tolerance
+      (fusion reassociation). Tests: `tests/kernels/test_kimi_pooled_kda.py`,
+      `test_unaligned_region_gcd_decomposition_roundtrip`.
 - [ ] 1.2 Define the KDA pool view: KDA conv layout
       `(kernel-1, 3, heads, head_dim)` differs from GDN; write the
       `v3_state_source`-equivalent plan for KDA shapes (possibly `rows_perm`
