@@ -46,8 +46,6 @@ export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
 
-# Pre-sized KV cache memory (~85.96 GiB = 50,312 blocks) to bypass profile_run
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-92305620992}"
 
 # Helper function: kill orphaned processes holding TPU locks
 clean_tpu_processes() {
@@ -80,8 +78,7 @@ rm -rf "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 \
-  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
 
@@ -152,8 +149,7 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 256 \
-  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --max-model-len 256 --max-num-batched-tokens 256 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
 
