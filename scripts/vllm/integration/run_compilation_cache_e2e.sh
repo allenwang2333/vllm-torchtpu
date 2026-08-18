@@ -97,20 +97,17 @@ fi
 
 # ==============================================================================
 # [Test 2] Storage Duplication Audit
-# Description: Verifies that Category 2 Python pickle files store lightweight
-#              metadata handles (<50KB total) rather than duplicating heavy binary
-#              executables.
+# Description: Verifies that Python-level compile caches (Category 2 pickle handles
+#              and Category 3 AOTAutograd files) are completely bypassed (0 Bytes)
+#              in favor of native C++ Tier-3 PJRT binary executables.
 #
 # Categories Explained:
 #   Category 1: C++ Native Tier-3 PJRT Binary Executables
 #               (Managed natively by torch_tpu in torch_tpu_tier3/*.bin)
 #   Category 2: vLLM TpuCompilerAdaptor Python Metadata Handles
-#               (Pickled TpuCompilationHandle instances storing lightweight cache metadata)
+#               (Bypassed on TPU with VLLM_DISABLE_COMPILE_CACHE=1: 0 Bytes)
 #   Category 3: PyTorch Upstream Dynamo / AOTAutograd Tracing Cache
-#               (Independent upstream PyTorch framework cache storing Dynamo FX graph
-#                bytecode, Guard expressions, and BundledAOTAutogradResult structures
-#                created during Python-side graph tracing, completely decoupled from
-#                native C++ PJRT compiled binary executables)
+#               (Bypassed on TPU with VLLM_DISABLE_COMPILE_CACHE=1: 0 Bytes)
 # ==============================================================================
 echo "================================================================="
 echo "=== 📊 [Test 2] Storage Duplication Audit (Cold Run Artifacts)"
@@ -132,8 +129,10 @@ Category 2 (vLLM TpuCompilerAdaptor Python Metadata Handles): ${CAT2_SIZE} Bytes
 Category 3 (PyTorch Upstream Dynamo / AOTAutograd Tracing Cache): ${CAT3_SIZE} Bytes (${CAT3_MB} MB)
 EOF
 
-if [ "${CAT2_SIZE}" -lt 50000 ]; then
-  echo "✅ [Test 2 PASSED] Optimization verified! Category 2 pickle files total ${CAT2_SIZE} Bytes (< 50KB total, ~100B per graph), eliminating binary duplication!"
+if [ "${CAT2_SIZE}" -eq 0 ] && [ "${CAT3_SIZE}" -eq 0 ]; then
+  echo "✅ [Test 2 PASSED] Optimization verified! Category 2 and Category 3 Python caches are completely bypassed (0 Bytes), with 100% compilation handled by native Tier-3 C++ cache!"
+elif [ "${CAT2_SIZE}" -lt 50000 ]; then
+  echo "✅ [Test 2 PASSED] Category 2 pickle files total ${CAT2_SIZE} Bytes (< 50KB total)."
 else
   echo "⚠️ [Test 2 WARNING] Category 2 pickle files total ${CAT2_SIZE} Bytes. Binary payload may still be duplicated."
 fi

@@ -199,7 +199,7 @@ def make_config(splitting_ops=None) -> VllmConfig:
 def prepare(cache_root: str, splitting_ops=None):
     """What the pipeline needs, set up inside the child process."""
     os.environ.update(VLLM_CACHE_ROOT=cache_root,
-                      VLLM_DISABLE_COMPILE_CACHE="0",
+                      VLLM_DISABLE_COMPILE_CACHE="1",
                       VLLM_USE_AOT_COMPILE="1",
                       VLLM_USE_MEGA_AOT_ARTIFACT="0")
     # The cache keys hash a ModelConfig these tests do not build.

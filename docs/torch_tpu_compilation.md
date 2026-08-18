@@ -8,16 +8,16 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
 
 ## Cache Architecture & Environment Variables
 
-`vllm-torchtpu` separates Python-level framework tracing cache from native C++ compiled binary executables:
+`vllm-torchtpu` unifies compilation caching into a single native C++ pipeline powered by TorchTPU and OpenXLA PJRT:
 
-1. **`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`** (C++ Native PJRT Binaries):
+1. **`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`** (C++ Native PJRT Binaries & Tier-2 In-Memory FX/MLIR Cache):
    - **Purpose**: Controls the persistent root directory for native C++ PJRT compiled binary executables (`.bin` files).
-   - **Scope**: Native `torch_tpu` C++ backend. This is the primary driver variable required to enable persistent executable binary caching on TPU.
+   - **Scope**: Native `torch_tpu` C++ backend. Setting this variable automatically activates in-memory Tier-2 caching (for intermediate FX graph and MLIR modules) and Tier-3 persistent caching on disk.
+   - **Performance**: Subsequent warm runs load compiled executables directly from disk (<1ms), bypassing recompilation.
 
-2. **`VLLM_CACHE_ROOT`** (vLLM Python-Level Framework Artifacts):
-   - **Purpose**: Controls the root directory for vLLM Python-level framework tracing artifacts.
-   - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
-   - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
+2. **`VLLM_DISABLE_COMPILE_CACHE`** (Enforced `1` by Default on TPU):
+   - **Purpose**: Disables redundant vLLM Python-level compile caches (Category 2 pickle handles and Category 3 AOTAutograd files) which were designed for GPU Inductor.
+   - **Behavior**: Enforced by default on TPU. Attempting to set `VLLM_DISABLE_COMPILE_CACHE=0` will immediately fail-fast with a `RuntimeError`. All compilation caching is managed natively in C++ via Tier-2 and Tier-3.
 
 ## Compilation Debugging & Telemetry
 

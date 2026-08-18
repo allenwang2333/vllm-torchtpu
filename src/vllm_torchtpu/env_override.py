@@ -13,6 +13,20 @@ if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
     os.environ.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
                           "tpu_tier2_cache")
 
+# Enforce native C++ compilation cache (Tier-2/Tier-3) and disable vLLM Python-level cache.
+# vLLM's Python compile cache (Category 2 pickle handles and Category 3 AOTAutograd files)
+# is GPU/Inductor-centric. On TPU, OpenXLA natively manages Tier-2 and Tier-3 caches in C++.
+_disable_cache_env = os.getenv("VLLM_DISABLE_COMPILE_CACHE")
+if _disable_cache_env is not None and _disable_cache_env.lower() in ("0",
+                                                                     "false",
+                                                                     "no"):
+    raise RuntimeError(
+        "Enabling vLLM Python-level compilation cache (VLLM_DISABLE_COMPILE_CACHE=0) "
+        "is not supported on TPU. TPU natively uses C++ Tier-2/Tier-3 compilation caching "
+        "(via TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT). Please unset VLLM_DISABLE_COMPILE_CACHE "
+        "or set VLLM_DISABLE_COMPILE_CACHE=1.")
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
 
