@@ -31,7 +31,7 @@ from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_ssm_state_bytes)
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
-from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.experimental.gdn_dynamic import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
