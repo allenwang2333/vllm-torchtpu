@@ -2495,14 +2495,9 @@ class TPUModelRunner(GPUModelRunner):
             self, drafts: torch.Tensor | None) -> torch.Tensor | None:
         """Pin a replicated drafter's device proposal to rank 0's on every rank.
 
-        Emulates a rank-0 broadcast with the collective the TPU backend
-        actually implements (tpu_dist has no broadcast; issuing one hangs the
-        workers): zero the tensor on every rank but 0, then all_reduce. The
-        payload is num_reqs x K int32 token ids (~600 bytes at bs10/K=15),
-        entirely on device -- no D2H, no host sync.
-
-        No-ops for a sharded drafter (rank-consistent by construction), TP=1,
-        the sync host-list return form, and steps that proposed nothing.
+        Broadcast emulated as mask + all_reduce (tpu_dist has no broadcast);
+        tiny (num_reqs x K int32), fully on device. No-ops for a sharded
+        drafter, TP=1, the sync host-list form, and empty steps.
         """
         if drafts is None or not isinstance(drafts, torch.Tensor):
             return drafts
@@ -2523,12 +2518,10 @@ class TPUModelRunner(GPUModelRunner):
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_pin_drafts_to_rank0(self, drafts: torch.Tensor,
                                  rank0_mask: torch.Tensor) -> torch.Tensor:
-        # Collectives on the TPU backend are only supported inside compiled
-        # graphs (the TP layers' all_reduce runs there); an eager collective
-        # wedges the cores. The rank must enter as runtime DATA (the 0/1
-        # mask), not a trace-time constant: XLA pairs collectives across
-        # ranks by channel id, which presumes every rank runs the identical
-        # program -- rank-specialized graphs deadlock the cores.
+        # Must be compiled (eager collectives wedge the TPU cores), and the
+        # rank must enter as runtime data (the 0/1 mask), not a trace-time
+        # constant: XLA pairs collectives by channel id, so every rank must
+        # compile the identical program.
         from vllm.distributed import tensor_model_parallel_all_reduce
         return tensor_model_parallel_all_reduce(drafts * rank0_mask)
 
@@ -3991,18 +3984,11 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed))
 
         if self.scheduler_config.async_scheduling:
-            # A REPLICATED drafter (draft_tp=1) runs independently on every TP
-            # rank, and the per-rank compiled executables are not bit-identical
-            # numerically: from bit-identical inputs the ranks' draft logits
-            # carry ~1e-5 jitter, which flips near-tie argmaxes often (measured
-            # at TP=2/K=15: differing proposals on ~25% of decode steps, from
-            # the first step). Sync scheduling absorbs this by round-tripping
-            # drafts through the driver-authoritative scheduler each step; the
-            # async path substitutes each rank's OWN device drafts, so the
-            # ranks verify different tokens and their outputs diverge as wrong
-            # text. Pin every rank to rank 0's proposal, on device -- a
-            # sharded drafter is rank-consistent by construction (its internal
-            # all-reduce), so it skips this.
+            # A replicated (draft_tp=1) drafter proposes independently per TP
+            # rank and the proposals are not bit-identical; async verifies
+            # each rank's OWN drafts (no driver round-trip like sync), so the
+            # ranks drift apart and the output corrupts. Pin every rank to
+            # rank 0's proposal; sharded drafters skip this.
             eagle3_drafts = self._sync_replicated_drafts_across_tp(
                 eagle3_drafts)
 
