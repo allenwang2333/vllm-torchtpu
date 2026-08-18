@@ -17,7 +17,6 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 import functools
 import math
-from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +27,9 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.experimental.gdn_dynamic import \
+    wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
-from vllm_torchtpu.kernels.experimental.gdn_dynamic import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
@@ -42,14 +42,14 @@ def run_jax_gdn_attention(
     conv_state: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
+    j_conv_bias: jnp.ndarray | None,
     j_A_log: jnp.ndarray,
     j_dt_bias: jnp.ndarray,
     state_indices: jnp.ndarray,
     query_start_loc: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
-    slot_read_offsets: Optional[jnp.ndarray] = None,
+    slot_read_offsets: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -58,7 +58,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
-) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
     Args:
@@ -464,7 +464,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     conv_state: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
+    j_conv_bias: jnp.ndarray | None,
     j_A_log: jnp.ndarray,
     j_dt_bias: jnp.ndarray,
     state_indices: jnp.ndarray,
@@ -479,7 +479,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
-) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """GDN PCP prefill using an op-local PCP mesh.
 
     The enclosing vLLM worker is already TP-local. This function only adds PCP
@@ -762,15 +762,15 @@ def run_jax_gdn_attention_pooled_local(
     a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     conv_weight: jnp.ndarray,
-    conv_bias: Optional[jnp.ndarray],
+    conv_bias: jnp.ndarray | None,
     A_log: jnp.ndarray,
     dt_bias: jnp.ndarray,
     query_start_loc: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
-    read_offsets: Optional[jnp.ndarray] = None,
-    ckpt_indices: Optional[jnp.ndarray] = None,
+    read_offsets: jnp.ndarray | None = None,
+    ckpt_indices: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -779,7 +779,7 @@ def run_jax_gdn_attention_pooled_local(
     kernel_size: int,
     pool_block_tokens: int,
     num_spec_tokens: int = 0,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
@@ -843,15 +843,15 @@ def run_jax_gdn_attention_pooled(
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
+    j_conv_bias: jnp.ndarray | None,
     j_A_log: jnp.ndarray,
     j_dt_bias: jnp.ndarray,
     state_indices: jnp.ndarray,
     query_start_loc: jnp.ndarray,
     distribution: jnp.ndarray,
     seq_lens: jnp.ndarray,
-    slot_read_offsets: Optional[jnp.ndarray] = None,
-    ckpt_indices: Optional[jnp.ndarray] = None,
+    slot_read_offsets: jnp.ndarray | None = None,
+    ckpt_indices: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -861,7 +861,7 @@ def run_jax_gdn_attention_pooled(
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -994,7 +994,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
+    j_conv_bias: jnp.ndarray | None,
     j_A_log: jnp.ndarray,
     j_dt_bias: jnp.ndarray,
     state_indices: jnp.ndarray,
@@ -1196,7 +1196,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
     j_conv_weight: jnp.ndarray,
-    j_conv_bias: Optional[jnp.ndarray],
+    j_conv_bias: jnp.ndarray | None,
     j_A_log: jnp.ndarray,
     j_dt_bias: jnp.ndarray,
     state_indices: jnp.ndarray,
@@ -1212,7 +1212,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
     Pooled counterpart of ``run_jax_gdn_attention_pcp_tp_prefill``: the same
