@@ -272,20 +272,13 @@ class TestTpuCompilerCache:
         assert loaded_dict.get("tier3_cache_active") is True
 
     def test_compiler_initialize_cache(self):
-        """Verify that TpuCompilerAdaptor sets cache_dir with disable_cache=True and raises on False."""
-        import pytest
-
+        """Verify that TpuCompilerAdaptor sets cache_dir and always keeps _disable_cache=True."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir",
-                                  disable_cache=True)
+                                  disable_cache=False)
         assert compiler.cache_dir == "/tmp/test_cache_dir"
         assert compiler._disable_cache is True
-
-        # Must raise RuntimeError if disable_cache is False
-        with pytest.raises(RuntimeError, match="not supported on TPU"):
-            compiler.initialize_cache(cache_dir="/tmp/test_cache_dir",
-                                      disable_cache=False)
 
     def test_compiler_load_raises_not_implemented(self):
         """Verify that TpuCompilerAdaptor.load raises NotImplementedError."""

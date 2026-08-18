@@ -269,14 +269,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                          cache_dir: str,
                          disable_cache: bool = False,
                          prefix: str = "") -> None:
-        if not disable_cache:
-            raise RuntimeError(
-                "[TpuCompilerAdaptor] Enabling vLLM Python-level compilation cache "
-                "(VLLM_DISABLE_COMPILE_CACHE=0) is not supported on TPU. TPU natively "
-                "uses C++ Tier-2/Tier-3 compilation caching via OpenXLA PJRT "
-                "(TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT). Please ensure "
-                "VLLM_DISABLE_COMPILE_CACHE=1.")
         self.cache_dir = cache_dir
+        # On TPU, Python-level compile caches (Category 2/3) are always bypassed
+        # in favor of native C++ Tier-2/Tier-3 compilation caching.
         self._disable_cache = True
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:

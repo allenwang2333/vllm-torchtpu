@@ -26,6 +26,11 @@ if _disable_cache_env is not None and _disable_cache_env.lower() in ("0",
         "(via TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT). Please unset VLLM_DISABLE_COMPILE_CACHE "
         "or set VLLM_DISABLE_COMPILE_CACHE=1.")
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+try:
+    import vllm.envs as _vllm_envs
+    _vllm_envs.VLLM_DISABLE_COMPILE_CACHE = True
+except Exception:
+    pass
 
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
