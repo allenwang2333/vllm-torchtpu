@@ -11,9 +11,6 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 import portpicker
 import torch
 import vllm.envs as vllm_envs
-# Ensure the "tpu" torch.compile backend is registered before vllm
-# tries to use it (e.g. in @torch.compile decorators at import time).
-from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
@@ -358,6 +355,9 @@ def apply_tpu_patches() -> None:
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
+    from vllm_torchtpu.env_override import _patch_jax_pallas_fori_lowering
+    _patch_jax_pallas_fori_lowering()
+    from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
     _patch_dflash_bypass_v2_runner_check()
@@ -739,7 +739,30 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                device = torch.device(f"tpu:{device_id}")
+                _, total = torch.accelerator.get_memory_info(device)
+                return total
+            except Exception:
+                pass
+        return 32 * 1024 * 1024 * 1024
+
+    @classmethod
+    def get_current_memory_usage(
+        cls,
+        device: torch.types.Device | None = None,
+    ) -> float:
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                free, total = torch.accelerator.get_memory_info(device)
+                return float(total - free)
+            except Exception:
+                try:
+                    return float(torch.accelerator.max_memory_allocated(device))
+                except Exception:
+                    pass
+        return 0.0
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
@@ -791,6 +814,8 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if getattr(vllm_config, "model_config", None) is None:
+            return
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
@@ -863,7 +888,10 @@ class TpuPlatform(Platform):
         compilation_config.compile_ranges_split_points = []
 
         model_config = vllm_config.model_config
-        if model_config is not None and model_config.dtype in (
+        if model_config is None:
+            return
+
+        if model_config.dtype in (
                 torch.float16,
                 torch.float32,
         ):

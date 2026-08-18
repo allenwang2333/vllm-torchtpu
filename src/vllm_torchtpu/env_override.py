@@ -16,6 +16,169 @@ if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
 
+import torch
+
+try:
+    from torch_tpu._internal.device import _device_ops_backend
+    from torch_tpu._internal.device._device_module import (
+        TpuDeviceModule,
+        _DefaultGeneratorsProperty,
+    )
+
+    _orig_default_generators_get = _DefaultGeneratorsProperty.__get__
+
+    def _safe_default_generators_get(self, instance, owner):
+        if owner is None or not getattr(owner, "is_initialized", lambda: False)():
+            return ()
+        return _orig_default_generators_get(self, instance, owner)
+
+    _DefaultGeneratorsProperty.__get__ = _safe_default_generators_get
+
+    _orig_get_default_gen = getattr(_device_ops_backend, "get_default_generator", None)
+    if _orig_get_default_gen is not None:
+        def _safe_get_default_generator(device_id: int):
+            if not TpuDeviceModule.is_initialized():
+                return torch.default_generator
+            return _orig_get_default_gen(device_id)
+        _device_ops_backend.get_default_generator = _safe_get_default_generator
+
+    _orig_current_device = TpuDeviceModule.current_device
+
+    @classmethod
+    def _safe_current_device(cls) -> int:
+        if cls._current_device is not None:
+            return cls._current_device
+        if not cls.is_initialized():
+            return 0
+        return _orig_current_device()
+
+    TpuDeviceModule.current_device = _safe_current_device
+
+    @classmethod
+    def _safe_get_generator(cls, device: torch.device) -> torch.Generator:
+        if not cls.is_initialized():
+            return torch.default_generator
+        idx = device.index if device.index is not None else cls.current_device()
+        gens = cls.default_generators
+        if idx < len(gens):
+            return gens[idx]
+        return torch.default_generator
+
+    TpuDeviceModule._get_generator = _safe_get_generator
+
+    _orig_get_local_device_attrs = TpuDeviceModule.get_local_device_attributes
+
+    @classmethod
+    def _safe_get_local_device_attributes(cls):
+        if not cls.is_initialized():
+            return {}
+        return _orig_get_local_device_attrs()
+
+    TpuDeviceModule.get_local_device_attributes = _safe_get_local_device_attributes
+
+    _orig_manual_seed_all = TpuDeviceModule.manual_seed_all
+
+    @classmethod
+    def _safe_manual_seed_all(cls, seed: int) -> None:
+        if not cls.is_initialized():
+            return
+        _orig_manual_seed_all(seed)
+
+    TpuDeviceModule.manual_seed_all = _safe_manual_seed_all
+
+    _orig_synchronize = TpuDeviceModule.synchronize
+
+    @classmethod
+    def _safe_synchronize(cls, device: int | None = None) -> None:
+        if not cls.is_initialized():
+            return
+        _orig_synchronize(device)
+
+    TpuDeviceModule.synchronize = _safe_synchronize
+
+    @classmethod
+    def _safe_init_runtime_options(cls) -> None:
+        pass
+
+    TpuDeviceModule._init_runtime_options = _safe_init_runtime_options
+
+    import torch.amp.autocast_mode
+
+    _orig_is_autocast_available = torch.amp.autocast_mode.is_autocast_available
+
+    def _tpu_is_autocast_available(device_type: str) -> bool:
+        if device_type in ("tpu", "privateuseone"):
+            return True
+        return _orig_is_autocast_available(device_type)
+
+    torch.amp.autocast_mode.is_autocast_available = _tpu_is_autocast_available
+    torch.amp.is_autocast_available = _tpu_is_autocast_available
+
+    _orig_get_autocast_dtype = torch.get_autocast_dtype
+
+    def _tpu_get_autocast_dtype(device_type: str):
+        if device_type in ("tpu", "privateuseone"):
+            return TpuDeviceModule._get_autocast_dtype() or torch.bfloat16
+        return _orig_get_autocast_dtype(device_type)
+
+    torch.get_autocast_dtype = _tpu_get_autocast_dtype
+
+    _orig_is_autocast_enabled = torch.is_autocast_enabled
+
+    def _tpu_is_autocast_enabled(device_type: str) -> bool:
+        if device_type in ("tpu", "privateuseone"):
+            return TpuDeviceModule._is_autocast_enabled()
+        return _orig_is_autocast_enabled(device_type)
+
+    torch.is_autocast_enabled = _tpu_is_autocast_enabled
+
+    _orig_set_autocast_enabled = torch.set_autocast_enabled
+
+    def _tpu_set_autocast_enabled(device_type: str, enabled: bool) -> None:
+        if device_type in ("tpu", "privateuseone"):
+            TpuDeviceModule._set_autocast_enabled(enabled)
+            return
+        _orig_set_autocast_enabled(device_type, enabled)
+
+    torch.set_autocast_enabled = _tpu_set_autocast_enabled
+
+    _orig_set_autocast_dtype = torch.set_autocast_dtype
+
+    def _tpu_set_autocast_dtype(device_type: str, dtype) -> None:
+        if device_type in ("tpu", "privateuseone"):
+            TpuDeviceModule._set_autocast_dtype(dtype)
+            return
+        _orig_set_autocast_dtype(device_type, dtype)
+
+    torch.set_autocast_dtype = _tpu_set_autocast_dtype
+except Exception:
+    pass
+
+if hasattr(torch, "accelerator"):
+    _orig_acc_sync = getattr(torch.accelerator, "synchronize", None)
+    if _orig_acc_sync is not None:
+        def _safe_acc_sync(*args, **kwargs):
+            if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+                return _orig_acc_sync(*args, **kwargs)
+            return None
+        torch.accelerator.synchronize = _safe_acc_sync
+
+_orig_torch_generator = torch.Generator
+
+
+class _SafeTorchGenerator(_orig_torch_generator):
+
+    def __new__(cls, *args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None and str(device).lower() in ("tpu", "privateuseone"):
+            kwargs["device"] = "cpu"
+        elif args and str(args[0]).lower() in ("tpu", "privateuseone"):
+            args = ("cpu",) + args[1:]
+        return _orig_torch_generator(*args, **kwargs)
+
+
+torch.Generator = _SafeTorchGenerator
+
 # Disable CUDA-specific shared experts stream for TPU
 # This prevents errors when trying to create CUDA streams on TPU hardware
 # The issue was introduced by vllm-project/vllm#26440
@@ -255,4 +418,5 @@ def _patch_jax_pallas_fori_lowering() -> None:
     _lowering._torchtpu_fori_patch_applied = True
 
 
-_patch_jax_pallas_fori_lowering()
+# Deferred: called inside apply_tpu_patches() so importing env_override does not eagerly import JAX.
+# _patch_jax_pallas_fori_lowering()
