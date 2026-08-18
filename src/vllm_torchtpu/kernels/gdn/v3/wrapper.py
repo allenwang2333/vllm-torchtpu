@@ -20,7 +20,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
-                                          memory_ref, metadata, vmem_ldst)
+                                          memory_ref, metadata, tiling,
+                                          vmem_ldst)
 
 
 def inner_kernel(
@@ -337,9 +338,8 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
-    decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    decode_tile_size: int | None = None,
+    mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
                                                            jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
@@ -454,9 +454,31 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, batch_size)
-    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+
+    conv_state_dim_size = dim if pooled else conv_state.shape[-1]
+    conv_state_dtype = jnp.float32.dtype if pooled else conv_state.dtype
+    recurrent_state_dtype = (
+        jnp.float32.dtype if pooled else recurrent_state.dtype)
+
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=padded_batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=conv_state_dim_size,
+        act_in_dtype=act_in_dtype,
+        act_out_dtype=act_out_dtype,
+        conv_state_dtype=conv_state_dtype,
+        recurrent_state_dtype=recurrent_state_dtype,
+        num_lanes=num_lanes,
+        decode_tile_size=decode_tile_size,
+        mixed_tile_size=mixed_tile_size,
+    )
+    aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
 
     if num_spec_tokens > 0:
         # A verify window holds one state checkpoint per window position per
@@ -627,20 +649,65 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    # Pre-allocate zero output buffer when zero_initialize_out is enabled.
+    out_act_init = (
+        jnp.zeros((padded_batch_size, n_v, d_v), dtype=act_out_dtype)
+        if zero_initialize_out else None)
+
+    def call_kernel_if_active(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+        is_active: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        """Conditionally launches Pallas kernel if the pass has active sequences."""
+
+        def _execute():
+            return call_kernel(in_conv_state, in_recurrent_state, in_act, mode)
+
+        def _skip():
+            act = in_act if in_act is not None else out_act_init
+            return act, in_conv_state, in_recurrent_state
+
+        return jax.lax.cond(is_active, _execute, _skip)
+
     if pooled:
-        out_act, out_source, _ = call_kernel(state_source, None, None,
-                                             config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        out_act, out_source, _ = call_kernel_if_active(
+            state_source,
+            None,
+            None,
+            config.GDNMode.BATCHED,
+            distribution[0] > 0,
+        )
+        out_act, out_source, _ = call_kernel_if_active(
+            out_source,
+            None,
+            out_act,
+            config.GDNMode.PER_SEQ,
+            distribution[-1] > distribution[0],
+        )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
-    # The first segment holds verify windows of up to `num_spec_tokens + 1`
-    # tokens, or plain 1-token decodes without speculative decoding.
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    # Phase 1: Decode pass over sequences [0, distribution[0])
+    out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+        conv_state,
+        recurrent_state,
+        None,
+        config.GDNMode.BATCHED,
+        distribution[0] > 0,
+    )
+
+    # Phase 2: Prefill/mixed pass over sequences
+    # [distribution[0], distribution[-1])
+    out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+        out_conv_state,
+        out_recurrent_state,
+        out_act,
+        config.GDNMode.PER_SEQ,
+        distribution[-1] > distribution[0],
+    )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
