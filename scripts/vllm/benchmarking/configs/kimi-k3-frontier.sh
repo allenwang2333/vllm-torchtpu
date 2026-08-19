@@ -19,6 +19,14 @@
 
 FRONTIER_ARGS=""
 
+# Env-var levers, applied the same way. Most of what has moved this model is
+# selected by environment variable rather than by a serve flag -- the MoE
+# token-movement kernels, the GMM tiling override, the token-bucket floor -- so
+# a frontier that could only carry serve args could not carry the frontier.
+# Format: space-separated KEY=VALUE, exported by bench_k3.sh before the server
+# starts. Same promotion rule and same citation requirement as FRONTIER_ARGS.
+FRONTIER_ENV=""
+
 # ---------------------------------------------------------------- pending ----
 # Under test, NOT yet promoted:
 #
@@ -43,6 +51,22 @@ FRONTIER_ARGS=""
 #
 #   fused o_norm epilogue       v021. Parity verified at max|diff|=0.0 on v6e.
 #                               Timing pending on v7x.
+#
+#   TPU_MOE_HIERARCHICAL_EP=1   v026 arm B. -2.4% TPOT at c1 and -4.1% at c4 on
+#                               the 12L rig, throughput +3.1%/+3.3%. Its own
+#                               docstring names this operating point: low
+#                               concurrency, weight-bandwidth-bound MoE,
+#                               imbalanced per-device expert load. Also reduces
+#                               cross-chip token movement, which is the right
+#                               shape of fix for a latency-bound collective
+#                               (F15). Awaiting full-model confirmation before
+#                               promotion -- the 12L rig has mispredicted a
+#                               full-model result once already (F2a).
+#
+#   compile_sizes floor < 16    v030. Every decode step pads 1-4 real tokens to
+#                               16 because _get_token_paddings takes
+#                               min_token_size=16. No floor is enforced when
+#                               compile_sizes is passed explicitly.
 #
 # ---------------------------------------------------------------- refuted ----
 # Do not re-propose without new evidence:

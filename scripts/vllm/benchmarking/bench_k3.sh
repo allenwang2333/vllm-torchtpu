@@ -54,6 +54,13 @@ if [ "${USE_FRONTIER:-1}" = "1" ] && [ -f "$SCRIPT_DIR/configs/kimi-k3-frontier.
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/configs/kimi-k3-frontier.sh"
   [ -n "${FRONTIER_ARGS:-}" ] && echo "[frontier] $FRONTIER_ARGS"
+  # Exported before the server starts: the kernel-selection env vars are read
+  # at import and at compile time, so setting them later selects nothing.
+  if [ -n "${FRONTIER_ENV:-}" ]; then
+    echo "[frontier-env] $FRONTIER_ENV"
+    # shellcheck disable=SC2163
+    for kv in $FRONTIER_ENV; do export "$kv"; done
+  fi
 fi
 mkdir -p "$RESULTS_DIR"
 
