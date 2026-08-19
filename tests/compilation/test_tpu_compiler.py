@@ -263,15 +263,8 @@ class TestTpuCompilerCache:
         assert loaded_exe_handle.executable == "mock_exe"
 
     def test_compiler_initialize_cache(self):
-        """Verify that TpuCompilerAdaptor sets cache_dir and _disable_cache accurately."""
+        """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
         compiler = TpuCompilerAdaptor()
-        compiler.initialize_cache(cache_dir="/tmp/test_cache_dir",
-                                  disable_cache=False)
+        compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
-        assert compiler._disable_cache is False
-
-        compiler.initialize_cache(cache_dir="/tmp/test_cache_dir_2",
-                                  disable_cache=True)
-        assert compiler.cache_dir == "/tmp/test_cache_dir_2"
-        assert compiler._disable_cache is True
