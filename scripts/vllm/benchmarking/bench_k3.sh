@@ -23,7 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_NAME=""; RANK="${JOB_COMPLETION_INDEX:-0}"; NNODES=4; LEADER=""
 LEADER_ADDR=""
 RESULTS_DIR="/tmp/out/bench"; PORT=8000
-RECORD_IDENTITY=0; SKIP_EVAL=0; EXTRA_SERVE=""
+RECORD_IDENTITY=0; SKIP_EVAL=0; EXTRA_SERVE=""; CAPTURE=0
+CAPTURE_DIR="/tmp/profiles"; HLO_DIR="/tmp/hlo"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -34,6 +35,8 @@ while [[ $# -gt 0 ]]; do
     --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
     --port)          PORT="$2"; shift 2 ;;
     --record-identity) RECORD_IDENTITY=1; shift ;;
+    --capture)       CAPTURE=1; shift ;;   # xprof trace + HLO dump
+    --capture-dir)   CAPTURE_DIR="$2"; shift 2 ;;
     --no-frontier)   USE_FRONTIER=0; shift ;;
     --skip-eval)     SKIP_EVAL=1; shift ;;
     --extra-serve)   EXTRA_SERVE="$2"; shift 2 ;;   # the knob under test
@@ -77,6 +80,19 @@ fi
 # the knob under test goes LAST so it can override a frontier setting
 # shellcheck disable=SC2206
 [ -n "$EXTRA_SERVE" ] && SERVE+=($EXTRA_SERVE)
+
+# ---- profile capture. Armed BEFORE the server starts because --xla_dump_to is
+# read at compile time and the profiler dir is a serve-time flag. The bench
+# passes below stay unarmed; only the short capture pass at the end is armed, so
+# the reported numbers are never profiling-polluted (~+11% TTFT / -4% tput).
+if [ "$CAPTURE" = "1" ]; then
+  mkdir -p "$CAPTURE_DIR" "$HLO_DIR"
+  export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=$HLO_DIR --xla_dump_hlo_as_text"
+  SERVE+=(--profiler-config.profiler=torch
+          --profiler-config.torch_profiler_dir="$CAPTURE_DIR"
+          --profiler-config.ignore_frontend=true
+          --profiler-config.torch_profiler_with_stack=false)
+fi
 
 TARGET="${MODEL_URI:-$MODEL}"
 [ -n "${MODEL_URI:-}" ] && SERVE+=(--load-format runai_streamer)
@@ -164,6 +180,34 @@ for cell in ${ISL_OSL_CONFIGS}; do
     bench "$isl" "$osl" "$conc" "isl${isl}_osl${osl}_c${conc}"
   done
 done
+
+# ---- Capture pass: ARMED, short, numbers discarded. Two bracketed windows so
+# prefill and decode land in separate xprof runs (they have different bucket
+# profiles and one merged window hides both).
+if [ "$CAPTURE" = "1" ]; then
+  CISL="${CAPTURE_ISL:-8192}"; COSL="${CAPTURE_OSL:-1024}"
+  echo "########## CAPTURE — prefill window ##########"
+  curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null; sleep 2
+  bench "$CISL" 1 1 "capture_prefill" >/dev/null 2>&1
+  sleep 2; curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null; sleep 30
+
+  echo "########## CAPTURE — decode window ##########"
+  curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null; sleep 2
+  bench 128 "$COSL" 1 "capture_decode" >/dev/null 2>&1
+  sleep 2; curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null; sleep 30
+
+  tar czf "$CAPTURE_DIR/hlo.tar.gz" -C "$(dirname $HLO_DIR)" "$(basename $HLO_DIR)" 2>/dev/null && rm -rf "$HLO_DIR"
+  cp "$RESULTS_DIR/server.log" "$CAPTURE_DIR/" 2>/dev/null
+  echo "CAPTURE local $(du -sh "$CAPTURE_DIR" 2>/dev/null | cut -f1) in $CAPTURE_DIR"
+  # Upload is best-effort: a pod without a GCS-writable SA must not fail the run.
+  if [ -n "${CAPTURE_GCS:-}" ]; then
+    if gsutil -q -m cp -r "$CAPTURE_DIR"/* "$CAPTURE_GCS/rank${RANK}/" 2>&1 | tail -3; then
+      echo "CAPTURE uploaded $CAPTURE_GCS/rank${RANK}/"
+    else
+      echo "CAPTURE upload FAILED -- artifacts remain in the pod at $CAPTURE_DIR"
+    fi
+  fi
+fi
 
 # ---- Tier 0: output identity (own probe -- vllm bench serve --save-result
 # strips the per-request lists, so the result JSON carries no generated text)
