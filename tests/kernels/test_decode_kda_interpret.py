@@ -163,6 +163,95 @@ def test_first_step_ignores_slot_contents() -> None:
         _assert_close(name, a, b)
 
 
+def _step(inp, token, state_indices, has_initial, conv_state, state,
+          read_offsets, write_offsets):
+    return decode_kda(token,
+                      inp["g"][:1],
+                      inp["beta"][:1],
+                      conv_state,
+                      inp["conv_weight"],
+                      state,
+                      inp["a_log"],
+                      inp["dt_bias"],
+                      state_indices,
+                      has_initial,
+                      read_offsets,
+                      write_offsets,
+                      lower_bound=None,
+                      compute_dtype=jnp.float32,
+                      scale=SCALE)
+
+
+def test_checkpoint_window_matches_sequential_decode() -> None:
+    """A verify window's checkpoints equal sequential decode at each position.
+
+    Walks a 3-token window for one request whose slot group starts at 1,
+    reading `base + read_offset` and writing `base + t`, then checks that slot
+    `base + t` holds exactly what decoding `t + 1` tokens in place would have
+    produced. This is the invariant rollback-by-selection rests on.
+    """
+    window = 3
+    base = 1
+    inp = _inputs(seed=17)
+    slots = 8
+    tokens = [
+        jax.random.normal(jax.random.PRNGKey(100 + t),
+                          (1, 3 * NUM_HEADS * HEAD_DIM)) * 0.5
+        for t in range(window)
+    ]
+
+    conv_shape = (slots, KERNEL_SIZE - 1, 3, NUM_HEADS, HEAD_DIM)
+    state_shape = (slots, NUM_HEADS, HEAD_DIM, HEAD_DIM)
+    conv_win = jax.random.normal(jax.random.PRNGKey(3), conv_shape) * 0.5
+    state_win = jax.random.normal(jax.random.PRNGKey(4), state_shape) * 0.1
+    conv_seq, state_seq = conv_win, state_win
+
+    idx = jnp.array([base], jnp.int32)
+    carried = jnp.array([1], jnp.int32)
+    zero = jnp.array([0], jnp.int32)
+
+    for t in range(window):
+        # Windowed: resume from the previous position, lay down checkpoint t.
+        _, conv_win, state_win = _step(inp, tokens[t], idx, carried, conv_win,
+                                       state_win,
+                                       jnp.array([max(t - 1, 0)], jnp.int32),
+                                       jnp.array([t], jnp.int32))
+        # Sequential: no window, everything in the group's base slot.
+        _, conv_seq, state_seq = _step(inp, tokens[t], idx, carried, conv_seq,
+                                       state_seq, zero, zero)
+
+        _assert_close(f"state@ckpt{t}", state_win[base + t], state_seq[base])
+        _assert_close(f"conv@ckpt{t}", conv_win[base + t], conv_seq[base])
+
+
+def test_checkpoint_window_leaves_other_groups_untouched() -> None:
+    """Writing checkpoint t must not disturb a neighbouring request's group."""
+    inp = _inputs(seed=23)
+    slots = 8
+    conv = jax.random.normal(jax.random.PRNGKey(3),
+                             (slots, KERNEL_SIZE - 1, 3, NUM_HEADS,
+                              HEAD_DIM)) * 0.5
+    state = jax.random.normal(
+        jax.random.PRNGKey(4),
+        (slots, NUM_HEADS, HEAD_DIM, HEAD_DIM)) * 0.1
+    base, write_offset = 1, 2
+
+    _, _, state_out = _step(inp, inp["mixed_qkv"][:1],
+                            jnp.array([base], jnp.int32),
+                            jnp.array([1], jnp.int32), conv, state,
+                            jnp.array([0], jnp.int32),
+                            jnp.array([write_offset], jnp.int32))
+
+    # Exactly one slot moves: the group's checkpoint `write_offset`.
+    for slot in range(state.shape[0]):
+        if slot == base + write_offset:
+            assert not jnp.array_equal(state_out[slot], state[slot]), (
+                f"checkpoint slot {slot} should have been written")
+        else:
+            assert jnp.array_equal(state_out[slot], state[slot]), (
+                f"slot {slot} should be untouched")
+
+
 def test_null_slot_emits_zeros_and_leaves_state() -> None:
     """Slot 0 is the reserved null block: emit nothing, write nothing."""
     inp = _inputs(seed=9)

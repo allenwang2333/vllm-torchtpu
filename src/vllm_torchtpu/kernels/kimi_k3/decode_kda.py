@@ -107,6 +107,8 @@ def _kernel(
     # Scalar prefetch.
     state_indices_ref,  # [num_seqs] int32
     has_initial_state_ref,  # [num_seqs] int32
+    read_offsets_ref,  # [num_seqs] int32, checkpoint to resume from
+    write_offsets_ref,  # [num_seqs] int32, checkpoint to write
     # Inputs.
     mixed_qkv_ref,  # [1, 3, n_v, d_k]
     g_ref,  # [1, n_v, d_k]  raw gate
@@ -220,6 +222,8 @@ def decode_kda(
     dt_bias: jax.Array | None,  # [n_v, d_k]
     state_indices: jax.Array,  # [num_seqs] int32, <=0 means null
     has_initial_state: jax.Array,  # [num_seqs] int32/bool
+    read_offsets: jax.Array | None = None,  # [num_seqs] int32
+    write_offsets: jax.Array | None = None,  # [num_seqs] int32
     *,
     lower_bound: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
@@ -272,6 +276,16 @@ def decode_kda(
             f"dt_bias must be [n_v, d_k] = {(n_v, d_k)} for the decode kernel "
             f"(chunk_kda takes it flat as [n_v * d_k]); got {dt_bias.shape}.")
 
+    if read_offsets is None:
+        read_offsets = jnp.zeros((num_seqs, ), jnp.int32)
+    if write_offsets is None:
+        write_offsets = jnp.zeros((num_seqs, ), jnp.int32)
+    if read_offsets.shape != (num_seqs, ) or write_offsets.shape != (num_seqs,
+                                                                     ):
+        raise ValueError(
+            f"read/write offsets must be [num_seqs] = {(num_seqs, )}, got "
+            f"{read_offsets.shape} and {write_offsets.shape}.")
+
     a_log_2d = a_log.reshape(n_v, 1)
 
     kernel = functools.partial(
@@ -296,35 +310,54 @@ def decode_kda(
 
     # Per-sequence activations are indexed by grid step; the state pool is
     # indexed by that step's slot. Weights are resident (index_map -> 0).
-    def seq_map(s, si, hi):
+    def seq_map(s, si, hi, ro, wo):
         return (s, 0, 0)
 
+    # Speculative decoding gives each request a group of `num_spec + 1`
+    # consecutive slots. A verify window resumes from the checkpoint of its last
+    # accepted token (`read_offsets`) and lays down one checkpoint per window
+    # position (`write_offsets`), so a rejected draft is rolled back by
+    # selecting a slot rather than by copying or recomputing state. Both are
+    # zero without speculation, where the group is one slot wide and this
+    # reduces to reading and writing `state_indices[s]`.
+    def state_in_map(s, si, hi, ro, wo):
+        return (si[s] + ro[s], 0, 0, 0)
+
+    def state_out_map(s, si, hi, ro, wo):
+        return (si[s] + wo[s], 0, 0, 0)
+
+    def conv_in_map(s, si, hi, ro, wo):
+        return (si[s] + ro[s], 0, 0, 0, 0)
+
+    def conv_out_map(s, si, hi, ro, wo):
+        return (si[s] + wo[s], 0, 0, 0, 0)
+
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
+        num_scalar_prefetch=4,
         grid=(num_seqs, ),
         in_specs=[
-            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi: (s, 0, 0, 0)),
+            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi, ro, wo:
+                         (s, 0, 0, 0)),
             pl.BlockSpec((1, n_v, d_k), seq_map),  # g
             # beta is carried as [num_seqs, n_v, 1]: Pallas requires a block's
             # last two dims to be divisible by (8, 128) or match the array, and
             # a 2-D [num_seqs, n_v] array blocked as [1, n_v] satisfies neither.
             pl.BlockSpec((1, n_v, 1), seq_map),  # beta
-            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
-                         (si[s], 0, 0, 0, 0)),  # convolution state
-            pl.BlockSpec((kernel_size, 3, n_v, d_k), lambda s, si, hi:
+            pl.BlockSpec((1, state_len, 3, n_v, d_k),
+                         conv_in_map),  # convolution state
+            pl.BlockSpec((kernel_size, 3, n_v, d_k), lambda s, si, hi, ro, wo:
                          (0, 0, 0, 0)),  # convolution weight
-            pl.BlockSpec((n_v, 1), lambda s, si, hi: (0, 0)),  # a_log
-            pl.BlockSpec((n_v, d_k), lambda s, si, hi: (0, 0)),  # dt_bias
+            pl.BlockSpec((n_v, 1), lambda s, si, hi, ro, wo: (0, 0)),  # a_log
+            pl.BlockSpec((n_v, d_k), lambda s, si, hi, ro, wo:
+                         (0, 0)),  # dt_bias
             # Paged state: this is the gather, expressed as a DMA.
-            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
-                         (si[s], 0, 0, 0)),
+            pl.BlockSpec((1, n_v, d_k, d_v), state_in_map),
         ],
         out_specs=[
             pl.BlockSpec((1, n_v, d_v), seq_map),  # out
-            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
-                         (si[s], 0, 0, 0, 0)),  # convolution state
-            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
-                         (si[s], 0, 0, 0)),  # state
+            pl.BlockSpec((1, state_len, 3, n_v, d_k),
+                         conv_out_map),  # convolution state
+            pl.BlockSpec((1, n_v, d_k, d_v), state_out_map),  # state
         ],
     )
 
@@ -349,8 +382,8 @@ def decode_kda(
         grid_spec=grid_spec,
         out_shape=out_shapes,
         input_output_aliases={
-            5: 1,
-            9: 2
+            7: 1,
+            11: 2
         },
         name="kda_decode_fused_conv_recurrent",
         compiler_params=compiler_params,
@@ -358,6 +391,8 @@ def decode_kda(
     )(
         state_indices.astype(jnp.int32),
         has_initial_state.astype(jnp.int32),
+        read_offsets.astype(jnp.int32),
+        write_offsets.astype(jnp.int32),
         mixed_qkv,
         g,
         beta.reshape(num_seqs, n_v, 1),
