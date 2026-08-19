@@ -38,12 +38,6 @@ from vllm_torchtpu.layers.common.utils import \
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 
-def _fused_conv1d_gdn(*args, **kwargs):
-    wrapper = (gdn_dynamic_wrapper
-               if tpu_envs.TPU_ENABLE_GDN_DYNAMIC_TILING else gdn_v3_wrapper)
-    return wrapper.fused_conv1d_gdn(*args, **kwargs)
-
-
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -137,9 +131,11 @@ def run_jax_gdn_attention(
     )
 
     tp_size = get_mesh_shape_product(mesh, "model")
+    wrapper = (gdn_dynamic_wrapper
+               if tpu_envs.TPU_ENABLE_GDN_DYNAMIC_TILING else gdn_v3_wrapper)
 
     p_run_jax_gdn_attention_local = functools.partial(
-        _fused_conv1d_gdn,
+        wrapper.fused_conv1d_gdn,
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,
