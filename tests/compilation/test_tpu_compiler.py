@@ -347,3 +347,89 @@ class TestTpuCompilerCache:
                 compile_range=(512, 512),
             )
             assert loaded_tier3_fn(15) == 30
+
+    def test_patch_vllm_compile_all_ranges(self):
+        """Verify that TPU_PARALLEL_PRECOMPILE patches PiecewiseBackend and partitions ranges across ranks."""
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from vllm_torchtpu import _patch_vllm_compile_all_ranges
+
+        class MockRange:
+
+            def __init__(self, size):
+                self.start = size
+                self.end = size
+
+            def is_single_size(self):
+                return True
+
+        class MockRangeEntry:
+
+            def __init__(self, size):
+                self.compile_range = MockRange(size)
+                self.compiled = False
+                self.runnable = None
+
+        class MockPiecewiseBackend:
+
+            def __init__(self):
+                self.graph = MagicMock()
+                self.range_entries = {
+                    512: MockRangeEntry(512),
+                    1024: MockRangeEntry(1024),
+                    2048: MockRangeEntry(2048),
+                    4096: MockRangeEntry(4096),
+                }
+                self.piecewise_compile_index = 0
+                self.total_piecewise_compiles = 1
+                self.vllm_backend = MagicMock()
+                self.compilation_config = MagicMock()
+                self.returns_tuple = False
+
+            def _log_compile_start(self, r):
+                pass
+
+        compiled_order = []
+
+        def mock_compile(graph, args, inductor_config, compilation_config,
+                         compile_range, **kwargs):
+            compiled_order.append(compile_range.start)
+            return MagicMock()
+
+        with patch("vllm_torchtpu.envs.TPU_PARALLEL_PRECOMPILE", True):
+            _patch_vllm_compile_all_ranges()
+
+            from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+            # Test Rank 0 partition
+            backend_rank0 = MockPiecewiseBackend()
+            backend_rank0.vllm_backend.compiler_manager.compile = mock_compile
+            compiled_order.clear()
+
+            with patch.dict(os.environ, {
+                    "LOCAL_RANK": "0",
+                    "WORLD_SIZE": "4"
+            }):
+                PiecewiseBackend.compile_all_ranges(backend_rank0)
+                # First compiled should be 512 (index 0)
+                assert compiled_order[0] == 512
+                assert len(compiled_order) == 4
+                assert all(e.compiled
+                           for e in backend_rank0.range_entries.values())
+
+            # Test Rank 1 partition
+            backend_rank1 = MockPiecewiseBackend()
+            backend_rank1.vllm_backend.compiler_manager.compile = mock_compile
+            compiled_order.clear()
+
+            with patch.dict(os.environ, {
+                    "LOCAL_RANK": "1",
+                    "WORLD_SIZE": "4"
+            }):
+                PiecewiseBackend.compile_all_ranges(backend_rank1)
+                # First compiled should be 1024 (index 1)
+                assert compiled_order[0] == 1024
+                assert len(compiled_order) == 4
+                assert all(e.compiled
+                           for e in backend_rank1.range_entries.values())
