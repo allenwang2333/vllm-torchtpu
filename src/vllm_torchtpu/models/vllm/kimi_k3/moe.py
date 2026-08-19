@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu import _k3_probe
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
@@ -64,6 +65,18 @@ class KimiMoE(nn.Module):
                               if routed_expert_hidden_size is not None else
                               hidden_size)
 
+        _k3_probe.emit(
+            "MOE_CONFIG",
+            once_key="moe_config",
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_token,
+            hidden_size=hidden_size,
+            moe_intermediate=config.moe_intermediate_size,
+            latent_hidden=routed_expert_hidden_size,
+            latent_use_norm=getattr(config, "latent_moe_use_norm", False),
+            use_ep=self.use_ep,
+            tp_size=self.tp_size,
+        )
         self.gate = GateLinear(
             input_size=hidden_size,
             output_size=config.num_experts,

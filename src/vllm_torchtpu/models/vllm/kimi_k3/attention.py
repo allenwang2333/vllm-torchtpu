@@ -29,7 +29,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import _k3_probe, envs
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
     build_kimi_chunk_kda_op, build_kimi_dispatched_kda_op, build_kimi_kda_op,
@@ -361,9 +361,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         prefix: str,
     ) -> None:
         super().__init__()
+        _k3_probe.emit_versions()
         if vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "TPU KDA does not support speculative decode")
+            spec = vllm_config.speculative_config
+            _k3_probe.emit(
+                "SPEC_GUARD",
+                once_key="spec_guard",
+                method=getattr(spec, "method", "?"),
+                num_spec=getattr(spec, "num_speculative_tokens", "?"),
+                bypassed=_k3_probe.allow_spec(),
+            )
+            if not _k3_probe.allow_spec():
+                raise NotImplementedError(
+                    "TPU KDA does not support speculative decode")
         kda_config = config.linear_attn_config
         if kda_config is None:
             raise ValueError("KDA requires linear_attn_config")
@@ -381,6 +391,17 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_size = int(kda_config["short_conv_kernel_size"])
         self.gate_lower_bound = kda_config.get("gate_lower_bound")
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
+        _k3_probe.emit(
+            "KDA_CONFIG",
+            once_key="kda_config",
+            total_heads=self.total_heads,
+            head_dim=self.head_dim,
+            tp_size=self.tp_size,
+            local_heads=self.num_heads,
+            conv_size=self.conv_size,
+            gate_lower_bound=self.gate_lower_bound,
+            full_rank_gate=self.use_full_rank_gate,
+        )
         quant_config = vllm_config.quant_config
 
         self.fused_qkvb_proj = MergedColumnParallelLinear(

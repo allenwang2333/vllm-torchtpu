@@ -66,7 +66,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import _k3_probe, envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
@@ -478,6 +478,14 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_slot_stride: int = num_ckpts
         self._mamba_ckpt_window: int = (num_ckpts if unified_kv_layout_enabled(
             self.vllm_config) else 1)
+        _k3_probe.emit(
+            "MAMBA_SLOTS",
+            once_key="mamba_slots",
+            num_ckpts=num_ckpts,
+            slot_stride=self._mamba_slot_stride,
+            ckpt_window=self._mamba_ckpt_window,
+            unified_pool=unified_kv_layout_enabled(self.vllm_config),
+        )
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
