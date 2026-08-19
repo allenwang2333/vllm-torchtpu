@@ -272,7 +272,7 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
         if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
             telemetry.configure_telemetry(backends)
             _RAIDEN_TELEMETRY_CONFIGURED = True
-            logger.info("Configured TPU Raiden C++ telemetry backends: %s", backends)
+            logger.info("Configured TPU Raiden C++ telemetry backends")
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
 
