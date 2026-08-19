@@ -329,7 +329,6 @@ def _patch_vllm_compile_all_ranges() -> None:
     import time
     from collections import deque
 
-    from vllm.compilation.compiler_interface import is_compile_cache_enabled
     from vllm.compilation.piecewise_backend import (PiecewiseBackend,
                                                     create_concrete_args,
                                                     get_fake_args_from_graph)
@@ -385,7 +384,9 @@ def _patch_vllm_compile_all_ranges() -> None:
             _compile_entry(range_entry_list[i])
 
         # Phase 2: For remaining entries, rotate order and wait for peer's cache if enabled
-        cache_enabled = is_compile_cache_enabled(self.compilation_config)
+        cache_enabled = not bool(
+            os.environ.get("VLLM_DISABLE_COMPILE_CACHE", "0") in ("1", "true",
+                                                                  "True"))
         adapter = getattr(self.vllm_backend.compiler_manager, "adapter", None)
         cache_dir = getattr(adapter, "cache_dir", None) if adapter else None
 
