@@ -670,6 +670,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.seq_lens,
             )
 
+        # Speculative decoding splits the batch as [decode][verify][prefill].
+        # `request_distribution` keeps ragged paged attention's 1-token decode
+        # front segment, so its first segment excludes verify windows; the
+        # mamba variant widens that segment to cover them. GDN already selects
+        # it this way (see `gdn_attention_op`), and the KDA kernels must see the
+        # same segmentation or verify rows are routed as prefill.
+        request_distribution = metadata.request_distribution
+        mamba_request_distribution = getattr(metadata,
+                                             "mamba_request_distribution",
+                                             None)
+        if mamba_request_distribution is not None:
+            request_distribution = mamba_request_distribution
+
         return self.dispatched_kda_op(
             mixed_qkv,
             raw_gate,
@@ -684,5 +697,5 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             metadata.query_start_loc,
             metadata.mamba_state_indices,
             metadata.seq_lens,
-            metadata.request_distribution,
+            request_distribution,
         )
