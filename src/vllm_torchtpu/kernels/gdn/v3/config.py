@@ -21,6 +21,16 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
+
+
+def get_vmem_limit_bytes(
+    vmem_limit_factor: float = DEFAULT_VMEM_LIMIT_FACTOR,
+) -> int:
+    """Returns the maximum allowable VMEM capacity budget in bytes."""
+    tpu_info = pltpu.get_tpu_info()
+    return int(vmem_limit_factor * tpu_info.vmem_capacity_bytes)
+
 
 class GDNMode(enum.StrEnum):
     # Multiple sequences per tile, one tile per sequence. Each sequence
@@ -157,7 +167,10 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
-        return f"fused_conv1d_gdn_{self.mode.value}{suffix}"
+        return (
+            f"fused_conv1d_gdn_{self.mode.value}_b{self.seq_tile_size}"
+            f"_c{self.chunk_size}{suffix}"
+        )
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -177,16 +190,15 @@ class GDNConfig:
 
     # Fraction of VMEM the kernel may use. A multi-token window holds one
     # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
+    # default budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
+    DEFAULT_VMEM_FRACTION = 0.80
     WINDOWED_VMEM_FRACTION = 0.9
 
     def get_vmem_limit_bytes(self) -> int:
-        tpu_info = pltpu.get_tpu_info()
         fraction = (self.WINDOWED_VMEM_FRACTION
                     if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
-        return int(fraction * tpu_info.vmem_capacity_bytes)
+        return get_vmem_limit_bytes(fraction)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,

@@ -20,7 +20,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
-                                          memory_ref, metadata, vmem_ldst)
+                                          memory_ref, metadata, tiling,
+                                          vmem_ldst)
 
 
 def inner_kernel(
@@ -337,9 +338,8 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
-    decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    decode_tile_size: int | None = None,
+    mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
                                                            jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
@@ -454,9 +454,30 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, batch_size)
-    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    conv_state_dim_size = dim if pooled else conv_state.shape[-1]
+    conv_state_dtype = jnp.float32.dtype if pooled else conv_state.dtype
+    recurrent_state_dtype = (
+        jnp.float32.dtype if pooled else recurrent_state.dtype)
+
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=padded_batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=conv_state_dim_size,
+        act_in_dtype=act_in_dtype,
+        act_out_dtype=act_out_dtype,
+        conv_state_dtype=conv_state_dtype,
+        recurrent_state_dtype=recurrent_state_dtype,
+        num_lanes=num_lanes,
+        decode_tile_size=decode_tile_size,
+        mixed_tile_size=mixed_tile_size,
+    )
+    aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
 
     if num_spec_tokens > 0:
         # A verify window holds one state checkpoint per window position per
