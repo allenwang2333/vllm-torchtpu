@@ -65,15 +65,26 @@ CAPACITY = 128
 # capacity by 230.7K", so everything else is ~231 kB. Rounded up.
 _SMEM_OVERHEAD_BYTES = 236 * 1024
 
-# Skew margin for the per-shard slab, and it is ON by default -- the drop-free
-# slab is what makes the 16384-token bucket cost 15,620 us/layer against the GMM
-# path's 3,264, and sizing it takes the MoE program's XLA temp from 919.9 MB to
-# 490.4 MB at that point. The default lives HERE, not only in the serving
-# adapter's env read, so that a caller driving the kernel straight from JAX gets
-# the shipped program rather than the pre-fix one. Pass 0 for the drop-free
-# slab. The derivation and the three bounds that justify 3.0 are in
-# layers/vllm/fused_moe_ep.capacity_skew.
-CAPACITY_SKEW = 3.0
+# Skew margin for the per-shard slab. **Zero -- the drop-free bound -- because
+# the path that a smaller slab depends on does not work.**
+#
+# A sized slab is only safe if a shard whose experts overflow it *drops* the
+# excess. It does not: it writes past the end of the buffer. Reproduced on CPU
+# under the Pallas interpreter with the routing concentrated on one shard --
+# "Out-of-bounds write ... writing [(slice(448, 456, 1), ...)] but buffer has
+# shape (384, 2, 128)" -- which on a chip is a DMA past a buffer, i.e. an
+# unexpected core halt with leaked semaphores, which is what a DP8 serving run
+# at 16,384 tokens produced. The overflow needs a slab smaller than the routing
+# demands, and the sizing formula's floor keeps every test shape at or above
+# the drop-free bound, so no test we had could reach it.
+#
+# The sizing itself is worth having -- it is what takes the 16,384-token bucket
+# from 15,620 us/layer to ~1,874 -- so the knob stays and the arithmetic stays
+# tested. What is missing is a drop that drops. Until then this default keeps
+# the kernel to the shapes where it is correct, and the token cap that comes
+# back with it (fused_moe_ep._V2_MAX_TOKENS) keeps an engine that would overflow
+# from arming at all.
+CAPACITY_SKEW = 0.0
 
 
 def _slab_rows(tokens: int, top_k: int, num_experts: int, ep: int,

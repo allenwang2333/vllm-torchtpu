@@ -297,36 +297,51 @@ def test_the_smem_ceiling_is_refused_by_name(mesh, topology):
     from vllm_torchtpu.layers.common.fused_moe_ep_v2 import max_node_tokens
 
     limit = max_node_tokens(TOP_K, NUM_EXPERTS, 1024 * 1024)
-    # The shipped full-prefill point has to be inside it, and not by much --
-    # this is a real constraint on max_num_batched_tokens, not a formality.
-    assert 16384 < limit < 32768, limit
+    # 19,801 on the drop-free slab, which is what ships. The engagement band's
+    # own cap (8192) is below it, so SMEM is not the binding constraint at the
+    # default -- it becomes one for a deployment that sizes the slab and lifts
+    # the cap, which is why the message names both knobs.
+    assert 8192 < limit < 32768, limit
 
     # The next power-of-two bucket above the ceiling: pallas_select wants a
     # block height that divides the local row count, so an arbitrary count is
     # refused for an unrelated reason.
     local = 4096
     assert local * EP_SIZE > limit, (local * EP_SIZE, limit)
+    # The default is the drop-free slab, so the default refuses here...
     with pytest.raises(ValueError, match="scalar-prefetch|SMEM"):
-        _compile(mesh, topology, _operands(mesh, local), capacity_skew=0)
-    # ...and the default slab is several times smaller, so the same shape
-    # compiles on it: the ceiling is a property of the slab, not of the tokens.
-    _compile(mesh, topology, _operands(mesh, local))
+        _compile(mesh, topology, _operands(mesh, local))
+    # ...and a sized slab is several times smaller, so the same shape compiles
+    # on it: the ceiling is a property of the slab, not of the token count.
+    # (That path is opt-in until its drop path stops writing out of bounds --
+    # tests/kernels/fused_moe/test_fused_ep_v2_slab_overflow.py.)
+    _compile(mesh, topology, _operands(mesh, local), capacity_skew=3.0)
 
 
-def test_the_default_sizes_the_slab_without_being_asked(mesh, topology):
+def test_the_default_slab_is_the_drop_free_one(mesh, topology):
     """A caller driving the kernel from JAX must get the shipped program.
 
     The env var is read in the serving adapter, so a harness that calls
     ``fused_ep_moe_v2_func`` directly never sees it -- and the failure is a
     silent no-op with a correct-looking run (found exactly that way). The
     default therefore lives on the JAX entry point, and this is what says so.
+
+    The shipped default is the **drop-free** slab: sizing it smaller is what
+    makes 16384 affordable, but a shard that overflows a sized slab writes past
+    the end of its buffer (``test_fused_ep_v2_slab_overflow.py``), so the
+    sizing is opt-in. This asserts the default *is* the bound, and that asking
+    for a sized slab still gets you a smaller program -- i.e. the knob works.
     """
-    sized = _compile(mesh, topology, _operands(mesh, 2048))
+    default = _compile(mesh, topology, _operands(mesh, 2048))
     drop_free = _compile(mesh,
                          topology,
                          _operands(mesh, 2048),
                          capacity_skew=0)
-    a = sized.memory_analysis().temp_size_in_bytes
+    sized = _compile(mesh, topology, _operands(mesh, 2048), capacity_skew=3.0)
+    a = default.memory_analysis().temp_size_in_bytes
     b = drop_free.memory_analysis().temp_size_in_bytes
-    print(f"[slab] default {a / 1e6:.1f} MB vs drop-free {b / 1e6:.1f} MB")
-    assert a < b / 1.5, (a, b)
+    c = sized.memory_analysis().temp_size_in_bytes
+    print(f"[slab] default {a / 1e6:.1f} MB, drop-free {b / 1e6:.1f} MB, "
+          f"sized {c / 1e6:.1f} MB")
+    assert a == b, (a, b)
+    assert c < b / 1.5, (c, b)

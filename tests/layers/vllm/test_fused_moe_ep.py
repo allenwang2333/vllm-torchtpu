@@ -143,15 +143,19 @@ def test_the_band_defaults_are_the_measured_ones(monkeypatch):
     monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", raising=False)
     monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
     assert envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS == 2048
-    # No cap by default, because the default slab sizing removes the cliff that
-    # was the only reason for one; `test_sizing_the_slab_lifts_the_token_cap`.
-    assert fused_moe_ep.max_tokens() == 0
+    # And a cap by default, because the default slab is the drop-free one: the
+    # sizing that removes the cliff needs a drop path that does not work yet
+    # (`test_fused_ep_v2_slab_overflow.py`), so the cap it justified stays.
+    assert fused_moe_ep.max_tokens() == 8192
 
 
 @pytest.mark.parametrize(
     "cap,dp_size,armed",
     [
-        (2048, 8, True),  # 16384 node-wide: the full-prefill point, 1.71x
+        (2048, 8, False),  # 16384 node-wide: above the cap the drop-free slab
+        #                    keeps; armable only with a sized slab, which is
+        #                    opt-in until its drop path drops
+        (1024, 8, True),  # 8192 node-wide: the top of the band as shipped
         (256, 8, True),  # 2048 node-wide: exactly the crossover
         (248, 8, False),  # 1984 node-wide: below it
         (255, 8, True),  # 2048 too: the rows are padded to 256 before the
@@ -220,19 +224,20 @@ def test_the_token_cap_can_be_lifted(monkeypatch):
 def test_sizing_the_slab_lifts_the_token_cap(monkeypatch):
     """The cap and the slab are the same fact seen twice.
 
-    The 8192-token cap exists because the drop-free slab makes 16384 cost
-    15,620 us/layer against production's 3,264. A deployment that sizes the
-    slab has removed that reason, so it should not also have to know to lift
-    the cap by hand.
+    The 8192-token cap goes with the drop-free slab, which is the default. A
+    deployment that opts into a sized slab has taken on the cliff's cause and
+    should not also have to lift the cap by hand -- but it has also taken on a
+    drop path that writes out of bounds when a shard overflows
+    (`test_fused_ep_v2_slab_overflow.py`), which is why it is opt-in.
     """
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
     monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
+    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", raising=False)
 
     assert fused_moe_ep.max_tokens() == 8192
     assert not fused_moe_ep.in_token_band(16384)
 
-    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW")  # back to the default
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "3")
     assert fused_moe_ep.capacity_skew() == 3.0
     assert fused_moe_ep.max_tokens() == 0
     assert fused_moe_ep.in_token_band(16384)
@@ -242,12 +247,18 @@ def test_sizing_the_slab_lifts_the_token_cap(monkeypatch):
     assert fused_moe_ep.max_tokens() == 4096
 
 
-def test_the_slab_is_sized_by_default(monkeypatch):
-    """The default is ON, because the drop-free slab IS the 16384 cliff."""
+def test_the_slab_is_drop_free_by_default(monkeypatch):
+    """The default is OFF, because the drop path a sized slab needs is broken.
+
+    It writes past the end of the buffer when a shard overflows -- an
+    out-of-bounds DMA, which on a chip is a core halt. The sizing is kept
+    because it is what makes 16384 affordable, but it is opt-in until the drop
+    drops.
+    """
     monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", raising=False)
-    assert fused_moe_ep.capacity_skew() == 3.0
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
     assert fused_moe_ep.capacity_skew() == 0.0
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "3")
+    assert fused_moe_ep.capacity_skew() == 3.0
 
 
 def test_an_unreadable_engine_cap_arms_on_the_flag_alone(
@@ -644,3 +655,24 @@ def test_register_replica_rank_buffer_holds_the_rank(monkeypatch):
 # tuned nothing -- and the four cases that pinned the parser went with them.
 # Nothing else covered that function; the coverage is deliberately dropped, not
 # relocated.
+
+
+def test_an_engine_above_the_cap_declines_and_names_both_numbers(
+        tp1, engine_cap, monkeypatch):
+    """The shipped behaviour at our own benchmark shape, pinned.
+
+    With the drop-free slab the token cap comes back, so a DP8 engine at
+    2048 tokens/rank -- 16,384 node-wide -- does not arm. That is correct: the
+    sized slab that would make it profitable overflows into an out-of-bounds
+    DMA (`test_fused_ep_v2_slab_overflow.py`). A reviewer meets this decline
+    before anything else, so it has to say what happened and which knob moves
+    it, not merely that something was refused.
+    """
+    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", raising=False)
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
+    engine_cap(2048)  # x dp_size=8 -> 16,384 node-wide tokens
+    reason = fused_moe_ep.out_of_band_reason(_layer())
+
+    assert reason is not None
+    assert "16384" in reason and "8192" in reason, reason
+    assert "max-num-batched-tokens" in reason, reason
