@@ -14,6 +14,8 @@ the final TP-side reduction. Callers must pass equal token counts on each DP
 rank.
 """
 
+import sys
+
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -50,12 +52,15 @@ def _offload_gate_is_traceable() -> bool:
     explicit opt-in that no runner sets today; a runner that has solved both
     halves says so by defining ``RETRACES_PER_BUCKET_GROUP``, and that test is
     the tripwire that says when it is safe.
+
+    Read out of ``sys.modules`` rather than imported: a worker has imported the
+    runner long before it builds a communicator (``tpu_worker`` imports
+    ``TPUModelRunner`` at module scope), so the answer is the same there, and
+    anywhere else -- a unit test, a tool -- this must not be what drags the
+    runner, jax and the device stack into the process.
     """
-    try:
-        from vllm_torchtpu.runner import tpu_runner
-    except Exception:  # a communicator must not depend on importing the runner
-        return False
-    return getattr(tpu_runner, "RETRACES_PER_BUCKET_GROUP", False)
+    runner = sys.modules.get("vllm_torchtpu.runner.tpu_runner")
+    return getattr(runner, "RETRACES_PER_BUCKET_GROUP", False)
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -90,7 +95,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         which is the same reason ``moe_routing`` resolves its simulation
         strategy at import. The per-bucket consequence of the gate is
         therefore reported as the row count where it flips, computed by the
-        arithmetic the predicate uses.
+        arithmetic the predicate uses, and this is also where the geometry's
+        offload margin gets checked.
         """
         if not self.dispatch_fp8:
             return  # with the flag off, no [fp8wire] line is printed at all
@@ -109,9 +115,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
                 "[fp8wire] offload gate=REFUSED: choosing the wire per bucket "
                 "is a Python branch on the token count, which specializes the "
                 "dynamic token dim and dies at engine init with "
-                "ConstraintViolationError on this runner. It needs the "
-                "per-bucket retrace series (d4a603cb, e682de33a); until then "
-                "this arm runs as plain fp8 dispatch.")
+                "ConstraintViolationError on this runner. Per-bucket "
+                "retracing landed in #474, but the boundary here is the top "
+                "bucket itself, so the branch still refuses to trace; this "
+                "arm runs as plain fp8 dispatch until a runner says otherwise "
+                "(RETRACES_PER_BUCKET_GROUP).")
         elif self.offload_threshold is None:
             logger.info_once(
                 "[fp8wire] offload gate=on but INERT: no "
@@ -121,21 +129,94 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             logger.info_once(
                 f"[fp8wire] offload gate=on threshold="
                 f"{self.offload_threshold}B{self._engagement_bucket()}")
+        self._warn_if_the_offload_margin_is_thin()
+
+    def _geometry(self) -> tuple[int, int, list[int]] | None:
+        """``(dp_size, hidden, token buckets)``, if the config carries them."""
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return None
+        try:
+            # The platform fills compile_sizes from the token-bucket ladder; if
+            # a caller cleared it, the largest bucket is still the token budget.
+            buckets = sorted(config.compilation_config.compile_sizes or [])
+            return (config.parallel_config.data_parallel_size,
+                    config.model_config.get_hidden_size(), buckets
+                    or [config.scheduler_config.max_num_batched_tokens])
+        except Exception:  # a log line must never be the thing that fails
+            return None
 
     def _engagement_bucket(self) -> str:
         """``T_local`` at which the gated wire starts taking the fp8 path."""
-        config = get_current_vllm_config_or_none()
-        if config is None:
+        geometry = self._geometry()
+        if geometry is None:
             return ""
-        try:
-            hidden = config.model_config.get_hidden_size()
-            dp = config.parallel_config.data_parallel_size
-            rows = -(-self.offload_threshold // (dp * hidden))
-        except Exception:  # a log line must never be the thing that fails
-            return ""
+        dp, hidden, _ = geometry
+        rows = -(-self.offload_threshold // (dp * hidden))
         return (f": with dp={dp} hidden={hidden}, fp8 engages at "
                 f"T_local>={rows} rows ({rows * dp} gathered); every smaller "
                 "bucket takes the bf16 all-gather")
+
+    def _warn_if_the_offload_margin_is_thin(self) -> None:
+        """Say at boot when this geometry leaves the wire nothing to stand on.
+
+        The whole win is that halving the payload keeps the gather on the
+        SparseCore's asynchronous path; below the offload threshold both
+        wires are synchronous and exposed, and the second collective's fixed cost
+        makes the wire a straight loss. At the shipped geometry the largest
+        bucket's fp8 buffer *is* that threshold, to the byte, on a ``>=`` --
+        so one halving of the gathered rows (microbatching, a smaller
+        ``--max-num-batched-tokens``, a narrower hidden, fewer DP ranks) flips
+        the sign of the change with nothing in the log to say so.
+
+        Every term is known at communicator init, so it is checkable here, and
+        an operator who has to set a global libtpu flag to keep this change
+        profitable should be told at boot rather than in a PR body.
+        """
+        geometry = self._geometry()
+        if geometry is None or self.packed_wire:
+            return  # a packed uint8 gather is synchronous at every size
+        dp, hidden, buckets = geometry
+        if dp == 1 or not buckets:
+            return  # the wire is a no-op before any of this matters
+        fp8_bytes = max(buckets) * dp * hidden  # one byte per element
+        threshold = sc_all_gather_offload_threshold_bytes()
+        if threshold is None:
+            logger.warning_once(
+                f"[fp8wire] offload margin unknown: no "
+                f"{SC_ALL_GATHER_OFFLOAD_FLAG} in LIBTPU_INIT_ARGS, so the "
+                "threshold is libtpu's own. The wire pays only while the "
+                f"gathered fp8 buffer ({fp8_bytes} B at the largest bucket) "
+                "stays at or above it; spell it with "
+                f"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES={fp8_bytes // 2} "
+                "on every rank to be sure of that.")
+            return
+        if fp8_bytes >= 2 * threshold:
+            return  # a whole bucket-halving of slack; nothing to warn about
+        payload = (f"the largest token bucket gathers {max(buckets)} x "
+                   f"dp{dp} x {hidden} = {fp8_bytes} B of fp8")
+        if fp8_bytes < threshold:
+            diagnosis = (
+                f"[fp8wire] no offload margin at all: {payload}, under the "
+                f"SparseCore all-gather offload threshold of {threshold} B, "
+                f"so all {len(buckets)} buckets send that gather "
+                "synchronously and pay an extra collective for bytes they "
+                "cannot cash in")
+        else:
+            exposed = sum(1 for b in buckets if b * dp * hidden < threshold)
+            diagnosis = (
+                f"[fp8wire] thin offload margin: {payload} against a "
+                f"SparseCore all-gather offload threshold of {threshold} B, "
+                f"i.e. {fp8_bytes - threshold} B of margin -- one halving of "
+                "the gathered rows (microbatching, a smaller "
+                "--max-num-batched-tokens, a narrower hidden, fewer DP ranks) "
+                f"drops it under, where {exposed} of these {len(buckets)} "
+                "buckets already are and the wire costs more than it saves")
+        logger.warning_once(
+            f"{diagnosis}. Buy a bucket of margin with "
+            f"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES={fp8_bytes // 2}, "
+            "identical on every rank -- it moves the all-reduce threshold as "
+            "well -- or leave TPU_MOE_DISPATCH_FP8 off for this geometry.")
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
@@ -168,11 +249,29 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def dispatch_hidden_states(self, x: torch.Tensor) -> torch.Tensor:
         """DP all-gather of MoE token rows, in fp8 when the flag is set.
 
-        The single owner of the dispatch wire format: anything that gathers
-        activations for the MoE -- including a patched upstream
-        ``MoERunner._maybe_dispatch`` -- must come through here, or
-        ``TPU_MOE_DISPATCH_FP8`` silently stops applying. Safe to call at
-        ``dp_size == 1``.
+        Owner of the **DP** dispatch wire, and of no other. vLLM's naive DP+EP
+        dispatch (``MoERunner._maybe_dispatch``) arrives here through
+        ``dispatch_router_logits``/``dispatch``, so anything else that gathers
+        MoE activations across DP has to come through here too, or
+        ``TPU_MOE_DISPATCH_FP8`` silently stops applying. The claim stops at
+        DP: ``_maybe_dispatch`` has a second leg for prefill context
+        parallelism (``get_pcp_group().all_gather``, live exactly when
+        ``use_all2all_kernels`` is false, which for EP means ``dp == 1`` and is
+        what ``_patch_moe_explicit_pcp_collectives`` deliberately arranges),
+        and that leg stays bf16.
+
+        The two never overlap under EP at vllm==0.27.0 -- ``dp > 1`` makes
+        upstream skip the PCP leg, and where the PCP leg runs this function
+        returns early -- so in ``examples/disagg/launch_qwen35_pcp4_dp4.sh``
+        the fp8 wire covers the decode server's DP gather while the prefill
+        server's PCP gather crosses in bf16, out of the flag's reach. Without
+        EP, both run and the PCP gather is the larger by ``dp``. Covering it
+        would mean taking a group instead of keying off ``get_dp_group()``, on
+        a configuration nothing has measured;
+        ``test_which_dispatch_legs_the_fp8_wire_owns`` pins all four cases
+        against the installed vLLM so this cannot rot quietly.
+
+        Safe to call at ``dp_size == 1``.
 
         The rows are rounded to fp8 one step later regardless -- gmm_v2
         quantizes its lhs before the matmul -- so the wire mostly costs a
@@ -207,6 +306,22 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         return fp8_wire.dequantize_rows(self._dp_gather(q),
                                         self._dp_gather(scale), x.dtype)
 
+    def _dp_gather_extras(self, extra_tensors):
+        """Gather each companion tensor on the token axis, unquantized.
+
+        ``extra_tensors`` is upstream's channel for whatever travels beside
+        the payload -- an activation scale, a LoRA token mapping
+        (``prepare_finalize/naive_dp_ep.py``) -- and every one of them is
+        per-token, so dim 0 is the axis. A scalar scale never reaches here;
+        upstream drops it before dispatching.
+
+        TODO: this is the seam our fp8 wire re-implements privately. Once
+        ``gmm_v2`` accepts an ``lhs_scale``, the scale should ride this channel
+        with the payload staying quantized end to end, which is what upstream's
+        ``(a1q, a1q_scale)`` hand-off to the experts does.
+        """
+        return [self._dp_gather(t) for t in extra_tensors]
+
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -214,17 +329,16 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         is_sequence_parallel: bool = False,
         extra_tensors=None,
     ):
-        if extra_tensors is not None:
-            raise NotImplementedError(
-                "extra_tensors is not supported by TpuDeviceCommunicator")
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        if get_dp_group().world_size > 1:
+            hidden_states = self.dispatch_hidden_states(hidden_states)
+            # Router logits stay bf16: they are 1/8 of the hidden payload and a
+            # rounding there moves top-k membership, not just magnitudes.
+            router_logits = self._dp_gather(router_logits)
+            if extra_tensors is not None:
+                extra_tensors = self._dp_gather_extras(extra_tensors)
+        if extra_tensors is None:
             return hidden_states, router_logits
-        hidden_states = self.dispatch_hidden_states(hidden_states)
-        # Router logits stay bf16: they are 1/8 of the hidden payload and a
-        # rounding there moves top-k membership, not just magnitudes.
-        router_logits = self._dp_gather(router_logits)
-        return hidden_states, router_logits
+        return hidden_states, router_logits, extra_tensors
 
     def dispatch(
         self,
@@ -234,16 +348,15 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         is_sequence_parallel: bool = False,
         extra_tensors=None,
     ):
-        if extra_tensors is not None:
-            raise NotImplementedError(
-                "extra_tensors is not supported by TpuDeviceCommunicator")
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        if get_dp_group().world_size > 1:
+            hidden_states = self.dispatch_hidden_states(hidden_states)
+            topk_weights = self._dp_gather(topk_weights)
+            topk_ids = self._dp_gather(topk_ids)
+            if extra_tensors is not None:
+                extra_tensors = self._dp_gather_extras(extra_tensors)
+        if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
-        hidden_states = self.dispatch_hidden_states(hidden_states)
-        topk_weights = self._dp_gather(topk_weights)
-        topk_ids = self._dp_gather(topk_ids)
-        return hidden_states, topk_weights, topk_ids
+        return hidden_states, topk_weights, topk_ids, extra_tensors
 
     def combine(self,
                 hidden_states: torch.Tensor,
