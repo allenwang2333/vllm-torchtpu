@@ -650,26 +650,27 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                              f"expected head dim {local_n_v}, "
                              f"got {recurrent_state_.shape[1]}.")
 
-        (new_conv_shard, new_rec_shard), seq_output_shard = _fused_conv1d_gdn(
-            qkv_shard,
-            b_shard,
-            a_shard,
-            conv_state_,
-            recurrent_state_,
-            weight_shard,
-            bias_shard,
-            A_shard,
-            dt_shard,
-            query_start_loc_,
-            state_indices_,
-            distribution_,
-            seq_lens_,
-            n_kq=local_n_kq,
-            n_v=local_n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
+        (new_conv_shard,
+         new_rec_shard), seq_output_shard = gdn_v3_wrapper.fused_conv1d_gdn(
+             qkv_shard,
+             b_shard,
+             a_shard,
+             conv_state_,
+             recurrent_state_,
+             weight_shard,
+             bias_shard,
+             A_shard,
+             dt_shard,
+             query_start_loc_,
+             state_indices_,
+             distribution_,
+             seq_lens_,
+             n_kq=local_n_kq,
+             n_v=local_n_v,
+             d_k=d_k,
+             d_v=d_v,
+             kernel_size=kernel_size,
+         )
 
         seq_output_shard = seq_output_shard.reshape(seq_output_shard.shape[0],
                                                     local_n_v, d_v)
