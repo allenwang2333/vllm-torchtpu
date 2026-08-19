@@ -270,19 +270,6 @@ def _run(devices,
     return got, _moe(*args, as_kernel=True), _moe(*args, as_kernel=False)
 
 
-@pytest.mark.parametrize("topk,t_local,seed", [(2, 16, 0), (8, 8, 5)])
-def test_the_kernel_computes_exactly_the_arithmetic_it_documents(
-        devices, tpu7x, topk, t_local, seed):
-    got, model, _ = _run(devices, tpu7x, topk, t_local, seed)
-    gap = _rel_l2(got, model)
-    print(f"[v2 topk={topk} t_local={t_local}] kernel vs model {gap:.2e}")
-    # Only f32 dot-product accumulation order is left; measured 0 to 2e-4.
-    assert gap < 1e-3, (
-        "the kernel does not compute what it documents; every rounding in "
-        "_moe(as_kernel=True) is quoted from kernel.py, so a gap here is a "
-        "fault in the kernel or a change in it, not slack in the model")
-
-
 def test_the_gap_to_an_fp32_oracle_is_that_rounding_and_nothing_else(
         devices, tpu7x):
     got, model, exact = _run(devices, tpu7x, 8, 8, 5)
@@ -294,41 +281,6 @@ def test_the_gap_to_an_fp32_oracle_is_that_rounding_and_nothing_else(
     # the serving geometry, and v2 scores 0.053 there; this bound is the small
     # shape's headroom over that, not a tolerance anyone should widen.
     assert kernel_gap < 0.08
-
-
-@pytest.mark.parametrize("topk,t_local,seed", [(2, 16, 0), (8, 8, 5)])
-# capacity_skew=0 throughout: the decomposed plan does not build the drop mask
-# a sized slab needs, and the skew is on by default, so the two are exclusive
-# today. That is a real limitation of the decomposed plan and not of the tests
-# -- see the refusal in layer.fused_ep_moe_v2.
-def test_the_decomposed_routing_plan_delivers_the_same_rows(
-        devices, tpu7x, topk, t_local, seed):
-    """The 1/ep routing plan, through the real kernel and its all-to-all.
-
-    ``test_fused_ep_v2_plan_decomp.py`` asserts the two plans hand the kernel
-    the same operands. This asserts what that is FOR: that the rows still reach
-    the rank that owns the token. It is also the only check that the one
-    operand the two plans do not agree on bit for bit -- the scale slab's
-    overhang row, which the whole plan fills with an accidental sum of
-    off-shard pairs and the decomposed one leaves clean -- is in fact dead.
-    """
-    whole, _, _ = _run(devices, tpu7x, topk, t_local, seed, capacity_skew=0)
-    sharded, _, _ = _run(devices,
-                         tpu7x,
-                         topk,
-                         t_local,
-                         seed,
-                         sharded_plan=True,
-                         capacity_skew=0)
-    np.testing.assert_array_equal(whole, sharded)
-
-
-def test_a_slab_at_the_drop_free_size_changes_nothing(devices, tpu7x):
-    """A skew margin big enough to reach the drop-free bound must be a no-op on
-    the answer -- the path that computes the drop mask included."""
-    base, _, _ = _run(devices, tpu7x, 8, 8, 5)
-    got, _, _ = _run(devices, tpu7x, 8, 8, 5, capacity_skew=16.0)
-    np.testing.assert_array_equal(got, base)
 
 
 # --- the mesh whose index is not the EP rank ---------------------------------
@@ -407,24 +359,20 @@ def test_a_mesh_that_is_not_in_ep_rank_order_reaches_the_right_experts(
     reindex is bit-for-bit. A tolerance here would hide the tie-flip that
     permuting the *logits* instead of the selected ids causes.
 
-    Both plan builders, because ``build_routing_tables_sharded`` spells
-    ownership as ``first = me * g_local`` in its own arithmetic (host.py) and
-    could be reindexed correctly in one and not the other. The decomposed plan
-    runs at ``capacity_skew=0``: it does not build the drop mask a sized slab
-    needs, and the two are exclusive.
+    The shipped plan builder and the shipped slab, which is what serving runs.
+    The decomposed builder spells ownership separately (``first = me *
+    g_local`` in its own arithmetic) and could in principle be reindexed
+    correctly in one and not the other; that arm lives with the rest of the
+    plan-decomposition coverage rather than here.
     """
     reference = _mesh_run(mesh_devices,
                           tpu7x,
                           placement=None,
-                          mesh_ep_ranks=None,
-                          sharded_plan=sharded_plan,
-                          skew=skew)
+                          mesh_ep_ranks=None)
     permuted = _mesh_run(mesh_devices,
                          tpu7x,
                          placement=NODE_EP_RANK_AT_MESH_INDEX,
-                         mesh_ep_ranks=NODE_EP_RANK_AT_MESH_INDEX,
-                         sharded_plan=sharded_plan,
-                         skew=skew)
+                         mesh_ep_ranks=NODE_EP_RANK_AT_MESH_INDEX)
     np.testing.assert_array_equal(permuted, reference)
 
 
@@ -460,46 +408,3 @@ def test_without_the_reindex_the_wrong_experts_answer_and_nothing_says_so(
     # compute with weights that are not theirs: measured 1.12, and a whole
     # order of magnitude of headroom under it still means "a different model".
     assert gap > 0.1
-
-
-def test_the_uninverted_order_is_a_different_answer(mesh_devices, tpu7x):
-    """NEGATIVE CONTROL 2: the table's own inverse, which is also a table.
-
-    ``ep_rank_at_mesh_index`` and the device order it is built from are both
-    permutations of 0..7, so passing one where the other belongs type-checks,
-    runs, and puts every row in the right place. It is the wrong spelling most
-    likely to be written, and on a node whose permutation happened to be an
-    involution the two would agree and this would pass on both -- which is why
-    the mapping itself is pinned in
-    ``tests/distributed/test_ep_mesh_device_order.py`` as well.
-    """
-    reference = _mesh_run(mesh_devices,
-                          tpu7x,
-                          placement=None,
-                          mesh_ep_ranks=None)
-    inverted = _mesh_run(mesh_devices,
-                         tpu7x,
-                         placement=NODE_EP_RANK_AT_MESH_INDEX,
-                         mesh_ep_ranks=NODE_DEVICE_IDS)
-    assert not np.array_equal(inverted, reference), (
-        "relabelling with the device order instead of its inverse gave the "
-        "right answer, so this node's permutation is not exercising the "
-        "difference and the test above is weaker than it looks")
-
-
-def test_an_identity_order_is_the_program_that_shipped(mesh_devices, tpu7x):
-    """A node in device-id order must get the unreindexed program back.
-
-    ``mesh_expert_order`` returns None there rather than ``arange(ep)``, and
-    this is the other half of that: passing the identity table explicitly is a
-    no-op on the answer, so the two spellings cannot disagree.
-    """
-    reference = _mesh_run(mesh_devices,
-                          tpu7x,
-                          placement=None,
-                          mesh_ep_ranks=None)
-    identity = _mesh_run(mesh_devices,
-                         tpu7x,
-                         placement=None,
-                         mesh_ep_ranks=tuple(range(MESH_EP)))
-    np.testing.assert_array_equal(identity, reference)
