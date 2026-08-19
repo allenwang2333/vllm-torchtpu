@@ -599,6 +599,7 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
+    num_spec_tokens: int = 0,
 ):
     """Build the KDA op that sends decode rows to the fused decode kernel.
 
@@ -622,6 +623,7 @@ def build_kimi_dispatched_kda_op(
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        slot_read_offsets: jax.Array,  # [N] int32, num_accepted - 1
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
@@ -644,23 +646,68 @@ def build_kimi_dispatched_kda_op(
                                           total_tokens)
 
         # --- decode segment: fused convolution + recurrence ---------------
-        decode_out, conv_after_decode, pool_after_decode = decode_kda(
-            _match_rows(mixed_qkv, num_seqs),
-            _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads,
+        decode_slots = _null_out_non_decode(state_indices, decode_end)
+        window = num_spec_tokens + 1
+
+        def _decode_once(tokens, gate, beta_rows, conv, pool, slots, initial,
+                         read_off, write_off):
+            return decode_kda(
+                _match_rows(tokens, num_seqs),
+                _match_rows(gate, num_seqs).reshape(num_seqs, num_heads,
                                                     head_dim),
-            _activate_beta(_match_rows(beta, num_seqs)),
-            conv_in,
-            conv_weight,
-            recurrent_state,
-            a_log,
-            dt_bias.reshape(num_heads, head_dim),
-            _null_out_non_decode(state_indices, decode_end),
-            has_initial_state,
-            lower_bound=lower_bound,
-            # The pool is [slots, H, K, V], which is the layout the recurrence
-            # indexes as state[k, v]; no in-kernel swap.
-            state_transposed=False,
-        )
+                _activate_beta(_match_rows(beta_rows, num_seqs)),
+                conv,
+                conv_weight,
+                pool,
+                a_log,
+                dt_bias.reshape(num_heads, head_dim),
+                slots,
+                initial,
+                read_off,
+                write_off,
+                lower_bound=lower_bound,
+                # The pool is [slots, H, K, V], which is the layout the
+                # recurrence indexes as state[k, v]; no in-kernel swap.
+                state_transposed=False,
+            )
+
+        zeros = jnp.zeros((num_seqs, ), jnp.int32)
+        if window == 1:
+            decode_out, conv_after_decode, pool_after_decode = _decode_once(
+                mixed_qkv, raw_gate, beta, conv_in, recurrent_state,
+                decode_slots, has_initial_state, zeros, zeros)
+        else:
+            # Speculative verify window. Each request owns `window` consecutive
+            # slots; position t resumes from the previous checkpoint and lays
+            # down its own, so a rejected draft is rolled back by selecting a
+            # slot. Position 0 resumes from `slot_read_offsets`, which the
+            # runner derives from the last step's acceptance.
+            #
+            # One kernel launch per position rather than one fused windowed
+            # launch: correctness first, and `window` is 2-5 in practice. Fusing
+            # the window into a single call is the optimization on top.
+            #
+            # The token axis is strided, not blocked: with every request in this
+            # segment carrying `window` tokens, position t of request s is token
+            # row s * window + t, so `x[t::window]` is position t for all
+            # requests. A batch mixing plain decodes with verify windows breaks
+            # that stride, and this does not handle it.
+            conv_cur, pool_cur = conv_in, recurrent_state
+            per_position = []
+            for t in range(window):
+                read_off = (slot_read_offsets if t == 0 else jnp.full(
+                    (num_seqs, ), t - 1, jnp.int32))
+                # After position 0 the state always exists: we just wrote it.
+                initial = has_initial_state if t == 0 else decode_slots > 0
+                out_t, conv_cur, pool_cur = _decode_once(
+                    mixed_qkv[t::window], raw_gate[t::window],
+                    beta[t::window], conv_cur, pool_cur, decode_slots, initial,
+                    read_off, jnp.full((num_seqs, ), t, jnp.int32))
+                per_position.append(out_t)
+            # Back to token order: [num_seqs, window, H, D] -> row s*window + t.
+            decode_out = jnp.stack(per_position, axis=1).reshape(
+                num_seqs * window, num_heads, head_dim)
+            conv_after_decode, pool_after_decode = conv_cur, pool_cur
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
         # Guarded, because a decode-only step pays dearly for it otherwise.
@@ -758,8 +805,12 @@ def build_kimi_dispatched_kda_op(
         # --- select per token ---------------------------------------------
         # Each side left the other's rows zero, so this is a select rather than
         # a sum only to keep the intent legible.
+        # `first_prefill_token`, not `decode_end`: the former is a token index,
+        # the latter a request count. They coincide only while every decode
+        # request holds exactly one token, which a speculative verify window
+        # breaks.
         output = jnp.where(
-            (token_ids < decode_end)[:, None, None],
+            (token_ids < first_prefill_token)[:, None, None],
             _match_rows(decode_out, num_tokens).astype(chunk_out.dtype),
             chunk_out,
         )
@@ -799,7 +850,10 @@ def build_kimi_dispatched_kda_op(
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         distribution: torch.Tensor,
+        slot_read_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if slot_read_offsets is None:
+            slot_read_offsets = torch.zeros_like(state_indices)
         output, new_conv_state, new_pool = dispatched_op(
             mixed_qkv,
             raw_gate,
@@ -815,6 +869,7 @@ def build_kimi_dispatched_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            slot_read_offsets,
         )
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)

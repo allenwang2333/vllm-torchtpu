@@ -362,18 +362,22 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     ) -> None:
         super().__init__()
         _k3_probe.emit_versions()
-        if vllm_config.speculative_config is not None:
-            spec = vllm_config.speculative_config
+        # Speculative decoding: each request owns a group of `num_spec + 1`
+        # consecutive state slots, and the verify window writes one checkpoint
+        # per position so a rejected draft is rolled back by selecting a slot.
+        # This is the protocol `kernels/gdn/v3` speaks and the runner already
+        # produces offsets for; `decode_kda` learned to read and write them.
+        spec = vllm_config.speculative_config
+        self.num_spec = (0 if spec is None else int(
+            getattr(spec, "num_speculative_tokens", 0)))
+        if spec is not None:
             _k3_probe.emit(
                 "SPEC_GUARD",
                 once_key="spec_guard",
                 method=getattr(spec, "method", "?"),
-                num_spec=getattr(spec, "num_speculative_tokens", "?"),
+                num_spec=self.num_spec,
                 bypassed=_k3_probe.allow_spec(),
             )
-            if not _k3_probe.allow_spec():
-                raise NotImplementedError(
-                    "TPU KDA does not support speculative decode")
         kda_config = config.linear_attn_config
         if kda_config is None:
             raise ValueError("KDA requires linear_attn_config")
@@ -513,6 +517,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+            num_spec_tokens=self.num_spec,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -670,6 +675,24 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.seq_lens,
             )
 
+        # With speculation the batch is ordered [decode][verify][prefill].
+        # `request_distribution` keeps ragged paged attention's 1-token decode
+        # front segment, which excludes verify windows; the mamba variant widens
+        # it to cover them. GDN selects it the same way — see
+        # `gdn_attention_op`. Only correct now that `decode_kda` can process a
+        # window; before that it fed 4-token requests to a kernel that reads one
+        # row per request.
+        request_distribution = metadata.request_distribution
+        mamba_distribution = getattr(metadata, "mamba_request_distribution",
+                                     None)
+        if mamba_distribution is not None:
+            request_distribution = mamba_distribution
+        slot_read_offsets = getattr(metadata, "mamba_slot_read_offsets", None)
+        if self.num_spec > 0 and slot_read_offsets is None:
+            raise RuntimeError(
+                "Speculative decoding with KDA layers requires "
+                "mamba_slot_read_offsets in the attention metadata.")
+
         return self.dispatched_kda_op(
             mixed_qkv,
             raw_gate,
@@ -684,5 +707,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             metadata.query_start_loc,
             metadata.mamba_state_indices,
             metadata.seq_lens,
-            metadata.request_distribution,
+            request_distribution,
+            slot_read_offsets,
         )
