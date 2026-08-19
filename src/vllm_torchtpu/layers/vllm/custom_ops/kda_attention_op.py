@@ -693,6 +693,14 @@ def build_kimi_dispatched_kda_op(
             # window, a plain 1-token decode step (ngram proposed nothing), or a
             # mix of the two. Requests shorter than t are pointed at the null
             # slot for that position, so they compute nothing and write nothing.
+            # `slot_read_offsets` is `(mamba_num_blocks,)`, indexed by physical
+            # slot rather than batch position so the value survives requests
+            # being rescheduled or condensed. The kernel wants one offset per
+            # grid step, so gather through this step's slot ids. Null-slot
+            # requests land on slot 0, whose offset is 0.
+            seq_read_offsets = jnp.take(slot_read_offsets.astype(jnp.int32),
+                                        decode_slots,
+                                        axis=0)
             starts = query_start_loc[:num_seqs]
             conv_cur, pool_cur = conv_in, recurrent_state
             decode_out = jnp.zeros((num_tokens, num_heads, head_dim),
@@ -701,7 +709,7 @@ def build_kimi_dispatched_kda_op(
                 rows = jnp.minimum(starts + t, jnp.maximum(num_tokens - 1, 0))
                 present = query_lens > t
                 slots_t = jnp.where(present, decode_slots, 0)
-                read_off = (slot_read_offsets if t == 0 else jnp.full(
+                read_off = (seq_read_offsets if t == 0 else jnp.full(
                     (num_seqs, ), t - 1, jnp.int32))
                 # After position 0 the state always exists: we just wrote it.
                 initial = has_initial_state if t == 0 else slots_t > 0
