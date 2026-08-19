@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_NAME=""; RANK="${JOB_COMPLETION_INDEX:-0}"; NNODES=4; LEADER=""
 LEADER_ADDR=""
 RESULTS_DIR="/tmp/out/bench"; PORT=8000
-RECORD_IDENTITY=0; SKIP_EVAL=0; EXTRA_SERVE=""; CAPTURE=0
+RECORD_IDENTITY=0; SKIP_EVAL=0; EXTRA_SERVE=""; CAPTURE=0; CAPTURE_HLO=0
 CAPTURE_DIR="/tmp/profiles"; HLO_DIR="/tmp/hlo"
 
 while [[ $# -gt 0 ]]; do
@@ -35,7 +35,8 @@ while [[ $# -gt 0 ]]; do
     --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
     --port)          PORT="$2"; shift 2 ;;
     --record-identity) RECORD_IDENTITY=1; shift ;;
-    --capture)       CAPTURE=1; shift ;;   # xprof trace + HLO dump
+    --capture)       CAPTURE=1; shift ;;   # xprof trace
+    --capture-hlo)   CAPTURE=1; CAPTURE_HLO=1; shift ;;  # ...and the HLO dump
     --capture-dir)   CAPTURE_DIR="$2"; shift 2 ;;
     --no-frontier)   USE_FRONTIER=0; shift ;;
     --skip-eval)     SKIP_EVAL=1; shift ;;
@@ -93,8 +94,16 @@ fi
 # passes below stay unarmed; only the short capture pass at the end is armed, so
 # the reported numbers are never profiling-polluted (~+11% TTFT / -4% tput).
 if [ "$CAPTURE" = "1" ]; then
-  mkdir -p "$CAPTURE_DIR" "$HLO_DIR"
-  export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=$HLO_DIR --xla_dump_hlo_as_text"
+  mkdir -p "$CAPTURE_DIR"
+  # The HLO dump is opt-in and off by default, because it does not fit. A 12L
+  # model produced 7356 modules / 469 MB gzipped; as uncompressed text at 93
+  # layers that is tens of GB against 47 GB of node ephemeral storage shared
+  # with the weight cache. A run that fills the disk dies mid-benchmark and
+  # takes the xprof trace -- the thing actually wanted -- down with it.
+  if [ "$CAPTURE_HLO" = "1" ]; then
+    mkdir -p "$HLO_DIR"
+    export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=$HLO_DIR --xla_dump_hlo_as_text"
+  fi
   SERVE+=(--profiler-config.profiler=torch
           --profiler-config.torch_profiler_dir="$CAPTURE_DIR"
           --profiler-config.ignore_frontend=true
@@ -203,7 +212,10 @@ if [ "$CAPTURE" = "1" ]; then
   bench 128 "$COSL" 1 "capture_decode" >/dev/null 2>&1
   sleep 2; curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null; sleep 30
 
-  tar czf "$CAPTURE_DIR/hlo.tar.gz" -C "$(dirname $HLO_DIR)" "$(basename $HLO_DIR)" 2>/dev/null && rm -rf "$HLO_DIR"
+  if [ "$CAPTURE_HLO" = "1" ]; then
+    tar czf "$CAPTURE_DIR/hlo.tar.gz" -C "$(dirname $HLO_DIR)" "$(basename $HLO_DIR)" 2>/dev/null && rm -rf "$HLO_DIR"
+  fi
+  df -h /tmp 2>/dev/null | tail -1 | sed "s/^/CAPTURE disk /"
   cp "$RESULTS_DIR/server.log" "$CAPTURE_DIR/" 2>/dev/null
   echo "CAPTURE local $(du -sh "$CAPTURE_DIR" 2>/dev/null | cut -f1) in $CAPTURE_DIR"
   # Upload is best-effort: a pod without a GCS-writable SA must not fail the run.
