@@ -36,7 +36,7 @@ SERVER_READY_WAIT_MIN=15           # weights stream ~5 min, then 4 compile shape
 GPU_MEMORY_UTILIZATION=0.7
 ATTENTION_BACKEND="CUSTOM"         # KDA + MLA both need it; leave VLLM_TPU_USE_NAIVE_KDA unset
 BENCHMARK_TEMPERATURE="0"          # greedy; otherwise the client inherits server-side sampling
-CHAT_TEMPLATE="/tmp/k3_chat.jinja" # not in the repo; staged by the entrypoint
+CHAT_TEMPLATE=""   # proxy runs no chat eval; a template file would only be a failure mode
 
 # K3 always builds the MoonViT tower, so text-only serving needs BOTH flags.
 # --enable-ep-weight-filter makes each rank fetch only its 28/896 experts.
