@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_MOE_HIERARCHICAL_EP_TP_SIZE: int = 0
     TPU_PARALLEL_PRECOMPILE: bool = False
 
 
@@ -303,6 +304,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Widen the hierarchical-MoE tensor-parallel group beyond one chip. 0
+    # keeps the default, which is one chip's cores. Must be a multiple of the
+    # cores per chip and divide the world size; anything else falls back.
+    "TPU_MOE_HIERARCHICAL_EP_TP_SIZE":
+    lambda: int(os.getenv("TPU_MOE_HIERARCHICAL_EP_TP_SIZE") or "0"),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),

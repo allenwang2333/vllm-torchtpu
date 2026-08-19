@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import functools
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -115,5 +116,33 @@ def hierarchical_moe_split(world_size: int,
         return None
 
     chip_index, core_on_chip = topology.chip_of(rank)
-    return (topology.num_chips, chip_index, topology.cores_per_chip,
-            core_on_chip)
+    group_tp = envs.TPU_MOE_HIERARCHICAL_EP_TP_SIZE or topology.cores_per_chip
+    if group_tp == topology.cores_per_chip:
+        return (topology.num_chips, chip_index, topology.cores_per_chip,
+                core_on_chip)
+
+    # A wider tensor-parallel group spans several adjacent chips instead of the
+    # two chiplets of one. Fewer, larger expert groups mean each group holds
+    # more experts, so a decode step reads a given expert's weights on fewer
+    # devices -- which is the cost that binds at low concurrency. It also
+    # trades against locality: within one chip the tensor-parallel collective
+    # stays on-package, and across chips it does not.
+    if (group_tp % topology.cores_per_chip
+            or world_size % group_tp
+            or group_tp > world_size):
+        logger.warning(
+            "TPU_MOE_HIERARCHICAL_EP_TP_SIZE=%d is not a multiple of the %d "
+            "cores per chip, or does not divide the world size %d; falling "
+            "back to the one-chip split.", group_tp, topology.cores_per_chip,
+            world_size)
+        return (topology.num_chips, chip_index, topology.cores_per_chip,
+                core_on_chip)
+
+    chips_per_group = group_tp // topology.cores_per_chip
+    group_index = chip_index // chips_per_group
+    rank_in_group = ((chip_index % chips_per_group) * topology.cores_per_chip
+                     + core_on_chip)
+    logger.info_once(
+        "Hierarchical MoE split widened: ep_size=%d over groups of %d chips "
+        "(tp_size=%d).", world_size // group_tp, chips_per_group, group_tp)
+    return (world_size // group_tp, group_index, group_tp, rank_in_group)
