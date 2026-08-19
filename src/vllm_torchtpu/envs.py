@@ -352,6 +352,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
 
+    # Enable dynamic fused conv1d GDN kernel with adaptive tiling.
+    "TPU_ENABLE_GDN_DYNAMIC_TILING":
+    env_bool("TPU_ENABLE_GDN_DYNAMIC_TILING", default=False),
+
+    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
+    # chunked kernel.
+    "VLLM_TPU_USE_NAIVE_KDA":
+    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
+
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":

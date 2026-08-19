@@ -29,13 +29,22 @@ from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes)
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.experimental.gdn_dynamic import \
-    wrapper as gdn_v3_wrapper
+    wrapper as gdn_dynamic_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
 
+
+def _fused_conv1d_gdn(*args, **kwargs):
+    wrapper = (
+        gdn_dynamic_wrapper
+        if tpu_envs.TPU_ENABLE_GDN_DYNAMIC_TILING
+        else gdn_v3_wrapper
+    )
+    return wrapper.fused_conv1d_gdn(*args, **kwargs)
 
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
@@ -132,7 +141,7 @@ def run_jax_gdn_attention(
     tp_size = get_mesh_shape_product(mesh, "model")
 
     p_run_jax_gdn_attention_local = functools.partial(
-        gdn_v3_wrapper.fused_conv1d_gdn,
+        _fused_conv1d_gdn,
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
         d_k=d_k,
@@ -644,7 +653,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                              f"got {recurrent_state_.shape[1]}.")
 
         (new_conv_shard,
-         new_rec_shard), seq_output_shard = gdn_v3_wrapper.fused_conv1d_gdn(
+         new_rec_shard), seq_output_shard = _fused_conv1d_gdn(
              qkv_shard,
              b_shard,
              a_shard,
