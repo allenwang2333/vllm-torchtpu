@@ -292,6 +292,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
 
+    # Enable dynamic fused conv1d GDN kernel with adaptive tiling.
+    "TPU_ENABLE_GDN_DYNAMIC_TILING":
+    env_bool("TPU_ENABLE_GDN_DYNAMIC_TILING", default=False),
+
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
     "VLLM_TPU_USE_NAIVE_KDA":
