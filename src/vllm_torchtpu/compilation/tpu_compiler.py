@@ -411,17 +411,33 @@ class TpuCompilerAdaptor(CompilerInterface):
                 path)
             return None
 
+        # Re-create the aot_autograd wrapper around the cached executable.
+        # Returning inner_exe from _cached_compiler takes 0ms (no FX->MLIR lowering)
+        # while constructing the correct input adapter & buffer donation masks.
+        from torch._dynamo.backends.common import aot_autograd
+
+        graph = copy.deepcopy(graph)
+        graph, was_wrapped = _ensure_tuple_output(graph)
+
+        def _cached_compiler(*_args, **_kwargs):
+            return inner_exe
+
+        with torch._guards.tracing(None):
+            compiled_fn = aot_autograd(
+                fw_compiler=_cached_compiler,
+                keep_inference_input_mutations=False,
+            )(graph, example_inputs)
+
         if was_wrapped:
+            inner_fn = compiled_fn
 
             def unwrap_fn(*args, **kwargs):
-                result = inner_exe(*args, **kwargs)
+                result = inner_fn(*args, **kwargs)
                 if isinstance(result, (tuple, list)) and len(result) == 1:
                     return result[0]
                 return result
 
             compiled_fn = unwrap_fn
-        else:
-            compiled_fn = inner_exe
 
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
