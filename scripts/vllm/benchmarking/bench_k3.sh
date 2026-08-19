@@ -254,12 +254,25 @@ if [ "$CAPTURE" = "1" ]; then
   cp "$RESULTS_DIR/server.log" "$CAPTURE_DIR/" 2>/dev/null
   echo "CAPTURE local $(du -sh "$CAPTURE_DIR" 2>/dev/null | cut -f1) in $CAPTURE_DIR"
   # Upload is best-effort: a pod without a GCS-writable SA must not fail the run.
+  UPLOADED=0
   if [ -n "${CAPTURE_GCS:-}" ]; then
     if gsutil -q -m cp -r "$CAPTURE_DIR"/* "$CAPTURE_GCS/rank${RANK}/" 2>&1 | tail -3; then
-      echo "CAPTURE uploaded $CAPTURE_GCS/rank${RANK}/"
+      echo "CAPTURE uploaded $CAPTURE_GCS/rank${RANK}/"; UPLOADED=1
     else
       echo "CAPTURE upload FAILED -- artifacts remain in the pod at $CAPTURE_DIR"
     fi
+  fi
+  # Egress is not guaranteed: these nodes' service account carries
+  # devstorage.READ_ONLY, so a pod cannot write to any bucket regardless of
+  # bucket IAM. That is a node-pool scope, not something a policy fixes. When
+  # the upload does not happen, hold the pod open so the artifacts can be
+  # pulled with `kubectl cp` -- otherwise the pod is collected and a capture
+  # that succeeded is lost anyway. Measured once: 13 GB captured, 0 retrieved.
+  if [ "$UPLOADED" = "0" ] && [ "${CAPTURE_HOLD_S:-0}" != "0" ]; then
+    echo "CAPTURE HOLDING pod open ${CAPTURE_HOLD_S}s for retrieval:"
+    echo "  kubectl cp $(hostname):${CAPTURE_DIR} ./profiles-rank${RANK}"
+    sleep "$CAPTURE_HOLD_S"
+    echo "CAPTURE hold elapsed"
   fi
 fi
 
