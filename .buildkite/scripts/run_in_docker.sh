@@ -47,9 +47,9 @@ docker pull "${IMAGE_TAG}"
 mkdir -p /mnt/disks/persist/models
 
 # Ensure results directory exists on the persistent disk (always mountable)
-rm -rf /mnt/disks/persist/perf_eval_results
 mkdir -p /mnt/disks/persist/perf_eval_results
 chmod 777 /mnt/disks/persist/perf_eval_results 2>/dev/null || true
+rm -rf /mnt/disks/persist/perf_eval_results/* 2>/dev/null || true
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results
@@ -119,6 +119,9 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
     umask 000
     rm -rf /perf_eval_results/*
     "$@"
+    DOCKER_INNER_EXIT=$?
+    chmod -R 777 /perf_eval_results 2>/dev/null || true
+    exit ${DOCKER_INNER_EXIT}
   ' -- "$@"
 DOCKER_EXIT_CODE=$?
 set -e
