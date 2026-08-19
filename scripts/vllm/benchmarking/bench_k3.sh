@@ -81,7 +81,7 @@ TARGET="${MODEL_URI:-$MODEL}"
 # is over and this rank exits too.
 if [ "$RANK" != "0" ]; then
   echo "rank $RANK: headless, following leader $LEADER_ADDR"
-  vllm serve "$TARGET" "${SERVE[@]}" --headless 2>&1 | tee "$RESULTS_DIR/worker.log" &
+  vllm serve "$TARGET" "${SERVE[@]}" --headless > "$RESULTS_DIR/worker.log" 2>&1 &
   WORKER_PID=$!
   LEADER_WAS_UP=0
   while true; do
@@ -101,9 +101,24 @@ if [ "$RANK" != "0" ]; then
 fi
 
 # ---- leader
+# The server is a background child holding this script's stdout. Without an
+# explicit kill it survives the script, `tail`/`grep` downstream never see EOF,
+# and a caller running arms in sequence wedges forever. Measured once: arm A
+# finished its cells, then the sweep sat for 30 minutes with arm B never
+# starting. Trap covers the error paths too.
+cleanup_server() {
+  [ -n "${SERVER_PID:-}" ] || return 0
+  kill -TERM "$SERVER_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 1; done
+  kill -9 "$SERVER_PID" 2>/dev/null || true
+  pkill -9 -f "vllm serve" 2>/dev/null || true
+}
+trap cleanup_server EXIT INT TERM
+
 echo "[cmd] vllm serve $TARGET ${SERVE[*]} --host 0.0.0.0 --port $PORT"
-vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" 2>&1 \
-  | tee "$RESULTS_DIR/server.log" &
+vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" \
+  > "$RESULTS_DIR/server.log" 2>&1 &
+  > "$RESULTS_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 T0=$SECONDS
@@ -171,4 +186,5 @@ print('$(basename "$f" .json)', '|',
       'completed=%s' % d.get('completed'))"
 done
 echo "identity_fail=${IDENTITY_FAIL:-0}"
+cleanup_server
 echo "########## BENCH_K3_DONE ##########"
