@@ -16,6 +16,7 @@ normalization remains with the caller.
 from __future__ import annotations
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,19 @@ from vllm_torchtpu.kernels.gdn.v3.compute_gdn import fused_transpose_broadcast
 __all__ = ["decode_kda"]
 
 _L2_EPS = 1e-6
+
+
+def get_interpret() -> bool:
+    """Whether to run the Pallas call in interpret mode, as ``chunk_kda`` does.
+
+    Interpret mode executes the kernel on any backend, which makes the logic
+    testable without a TPU. It simulates the kernel, not the hardware: memory
+    spaces, DMA semantics, and lane/sublane layout are not modelled, so a pass
+    here is evidence the arithmetic and indexing are right, never that the
+    kernel is correct on device.
+    """
+    return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1",
+                                                                     "true")
 
 
 def _l2_norm(x: jax.Array) -> jax.Array:
@@ -322,6 +336,14 @@ def decode_kda(
 
     # Alias both state pools in->out. Operand order is (scalar prefetch...,
     # mixed_qkv, g, beta, conv_state, conv_weight, a_log, dt_bias, state).
+    interpret = get_interpret()
+    # `get_tpu_info` needs a real device, so the VMEM budget cannot be computed
+    # off-TPU. Interpret mode has no VMEM to budget either way.
+    compiler_params = None if interpret else pltpu.CompilerParams(
+        dimension_semantics=("arbitrary", ),
+        vmem_limit_bytes=int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes),
+    )
+
     out, conv_state, state = pl.pallas_call(
         kernel,
         grid_spec=grid_spec,
@@ -331,11 +353,8 @@ def decode_kda(
             9: 2
         },
         name="kda_decode_fused_conv_recurrent",
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary", ),
-            vmem_limit_bytes=int(0.9 *
-                                 pltpu.get_tpu_info().vmem_capacity_bytes),
-        ),
+        compiler_params=compiler_params,
+        interpret=interpret,
     )(
         state_indices.astype(jnp.int32),
         has_initial_state.astype(jnp.int32),
