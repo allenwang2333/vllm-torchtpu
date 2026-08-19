@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
+    USE_FUSED_MOE_GMM: bool = False
 
 
 def env_with_choices(
@@ -316,6 +317,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Run the MoE grouped GEMMs as one gmm_v2_fused call, keeping the
+    # gmm1 -> activation -> gmm2 intermediate in VMEM instead of writing it to
+    # HBM. Only applies to shapes whose whole-expert weight slabs fit in VMEM;
+    # fused_moe_gmm.moe_gmm checks that per shape and otherwise keeps the
+    # two-call path, so enabling this cannot change which models run.
+    "USE_FUSED_MOE_GMM":
+    env_bool("USE_FUSED_MOE_GMM"),
 }
 
 
