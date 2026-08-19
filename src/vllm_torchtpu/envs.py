@@ -16,14 +16,11 @@ if TYPE_CHECKING:
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     USE_MOE_FUSED_EP_V2: bool = False
-    MOE_FUSED_EP_QUANT_ACT: bool = True
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 2048
     MOE_FUSED_EP_KERNEL_MAX_TOKENS: int = -1
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_CAPACITY_SKEW: float = -1.0
-    MOE_FUSED_EP_KERNEL_BLOCKS: str = ""
     MOE_FUSED_EP_REQUIRE_ENGAGEMENT: bool = True
-    TPU_MOE_ROUTER_LOGITS_FP32: bool = False
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
@@ -178,23 +175,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use custom expert-parallel kernel for MoE (Mixture of Experts)
     "USE_MOE_EP_KERNEL":
     lambda: bool(int(os.getenv("USE_MOE_EP_KERNEL") or "0")),
-    # Which fused EP MoE program: 1 = token-stationary (kernels/fused_moe/v1,
-    # measured -1.4% end to end at conc 64), 2 = weight-stationary
-    # (kernels/fused_moe/v2, tpu-inference PR #3288). v2 visits each local
-    # expert once and streams its weights once, where v1 re-streams every local
-    # expert for every token block, so v2 is the prefill kernel and v1 is not.
-    # This branch's own on-switch, deliberately not USE_MOE_EP_KERNEL: that
-    # name is the token-stationary kernel's, it belongs to a change that is
-    # open at the same time as this one, and two pull requests that repoint one
-    # flag at different kernels silently change each other's meaning depending
-    # on merge order. Refused together -- see `layers/vllm/fused_moe_ep.py`.
+    # This kernel's own on-switch, deliberately not USE_MOE_EP_KERNEL: that
+    # name belongs to the token-stationary kernel, which is a change open at
+    # the same time as this one, and two changes pointing one flag at different
+    # kernels would alter each other's meaning by merge order. Setting both is
+    # refused at load (layers/vllm/fused_moe_ep.is_enabled).
     "USE_MOE_FUSED_EP_V2":
     lambda: bool(int(os.getenv("USE_MOE_FUSED_EP_V2") or "0")),
-    # Within the fused EP MoE kernel, quantize each matmul's activations to fp8
-    # per row-block, as gmm_v2 does on the general path. Off runs bf16 x fp8,
-    # which halves the v7x MXU rate. No effect unless USE_MOE_FUSED_EP_V2=1.
-    "MOE_FUSED_EP_QUANT_ACT":
-    lambda: bool(int(os.getenv("MOE_FUSED_EP_QUANT_ACT") or "1")),
     # Engage the fused EP MoE kernel only from this many node-wide tokens
     # (rows x dp_size) upwards; smaller steps stay on the GMM path, which shares
     # the same weights. No effect unless USE_MOE_FUSED_EP_V2=1.
@@ -204,8 +191,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-device barrier and one weight refill per *local expert*, 64 of each
     # per layer here -- so on a decode step it does a 16-row GMM's work with a
     # prefill step's overhead. Measured at conc 64 / DP4TP2 with this set to 0:
-    # 563 vs 4110 tok/s/chip, i.e. -86%. 1024 matches the JAX recipe's
-    # MOE_FUSED_EP_KERNEL_MIN_TOKENS and keeps decode on the GMM path.
+    # 563 vs 4110 tok/s/chip, i.e. -86%. 2048 is the measured crossover: at
+    # 1024 node-wide tokens the kernel is still behind the GMM path (610 us
+    # against 509), so a lower floor arms it inside its own losing band.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS") or "2048"),
     # The other end of the band: engage the fused EP MoE kernel only UP TO this
@@ -231,13 +219,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # correctness -- and the drop is over a whole shard's 64 experts, not one.
     "MOE_FUSED_EP_V2_CAPACITY_SKEW":
     lambda: float(os.getenv("MOE_FUSED_EP_V2_CAPACITY_SKEW") or "-1"),
-    # Override the fused EP kernel's block sizes for tuning:
-    # "bt,bf,bd1,bd2,btc,bfc,bd1c,bd2c". Empty = the kernel's own tuned table
-    # (which has no entry for Qwen3.5's shape and falls back to a formula).
-    # Validate a candidate with tests/kernels/fused_moe/test_fused_ep_aot.py
-    # before it reaches a chip.
-    "MOE_FUSED_EP_KERNEL_BLOCKS":
-    lambda: os.getenv("MOE_FUSED_EP_KERNEL_BLOCKS", ""),
     # Refuse to serve when USE_MOE_FUSED_EP_V2=1 reached zero compiled graphs.
     # The engagement branch is resolved at trace time, so "the flag was on" and
     # "the kernel is in the program" are different facts, and three device jobs
@@ -245,14 +226,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel unreachable (a separator control) -- that has to be said out loud.
     "MOE_FUSED_EP_REQUIRE_ENGAGEMENT":
     lambda: bool(int(os.getenv("MOE_FUSED_EP_REQUIRE_ENGAGEMENT") or "1")),
-    # Emit f32 router logits from the MoE gate. bf16 logits leave ~11.4% of
-    # Qwen3.5 tokens with two experts exactly tied at the top-k boundary, where
-    # the expert set is then chosen by the selector's tie-break rather than by
-    # the model; f32 takes that to 2e-6. The MXU already accumulates the gate
-    # matmul in f32, so only the output rounding changes -- the price is one
-    # doubled collective payload. See land/TIE_FLOOR_NOTE.md.
-    "TPU_MOE_ROUTER_LOGITS_FP32":
-    lambda: bool(int(os.getenv("TPU_MOE_ROUTER_LOGITS_FP32") or "0")),
     # Number of TPU slices for multi-slice mesh
     "NUM_SLICES":
     lambda: int(os.getenv("NUM_SLICES") or "1"),

@@ -57,11 +57,24 @@ from .ep_device_harness import (HIDDEN, INTERMEDIATE, NUM_EXPERTS, SMALL,
                                 TOP_K, _gmm_reference, _inputs, _mesh, _rel_l2,
                                 _shard, _small_inputs, _small_ref, _weights)
 
-pytestmark = [
-    pytest.mark.multichip,
-    pytest.mark.skipif(jax.default_backend() != "tpu",
-                       reason="fused EP kernel needs a TPU backend"),
-]
+pytestmark = pytest.mark.multichip
+
+
+@pytest.fixture(autouse=True)
+def require_tpu_backend():
+    """Ask for the backend inside the test, never at module scope.
+
+    ``jax.default_backend()`` *initialises* a backend. In a ``skipif`` it runs
+    at **collection** time, in the parent process, for every pytest invocation
+    that merely imports this file -- including CPU gates that then deselect it,
+    and including runs whose other modules need a different device count and
+    now have to ``clear_backends()`` to get one. Deferring it to setup costs
+    nothing and keeps collection device-free; the guard is
+    ``test_import_is_backend_free.py``.
+    """
+    if jax.default_backend() != "tpu":
+        pytest.skip("fused EP kernel needs a TPU backend")
+
 
 FP8 = jnp.float8_e4m3fn
 # The InferenceX prefill point is 16384 node-wide = 2048 local at ep=8; the rest

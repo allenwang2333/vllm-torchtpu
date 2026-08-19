@@ -13,6 +13,9 @@
 # limitations under the License.
 """Fused expert-parallel MoE kernel: the fused_ep_moe_v2 entry point, the
 layout constants a caller must match, and the VMEM estimator and limit.
+
+Vendored from tpu-inference PR #3288/#3346, with import rewrites and the
+changes recorded in the commits that touch this package.
 """
 
 from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel

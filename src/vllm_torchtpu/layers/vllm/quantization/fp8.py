@@ -855,7 +855,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             scoring_fn=getattr(layer, "scoring_func", "softmax"),
             subc_quant_w1_sz=hidden_size,
             subc_quant_w2_sz=intermediate_size,
-            quant_act=envs.MOE_FUSED_EP_QUANT_ACT,
+            # Not a knob: the kernel's dispatch wire is fp8. Stated here so the
+            # op cache key carries it rather than an env nothing reads.
+            quant_act=True,
         )
 
     def apply_monolithic(
@@ -899,7 +901,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        states = fused_moe_gmm(
+        return fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -913,7 +915,6 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
-        return states
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

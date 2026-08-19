@@ -64,8 +64,8 @@ def _gmm_reference_fn(mesh, ep_size, local_experts):
     object per call, so JAX's compilation cache misses every time and a timing
     loop measures the compiler. That is not hypothetical: it is why this file
     once reported `gmm=11102.307 ms` and "182x / 2911x" speedups, all of which
-    were compile time (`rh0syw4w/w4/CORRECTION.md` §4). The v2 device ladder
-    imports this function for its `gmm_ms` column, so the defect propagates.
+    were compile time. The v2 device ladder imports this function for its
+    `gmm_ms` column, so the defect propagates.
     """
 
     @jax.jit

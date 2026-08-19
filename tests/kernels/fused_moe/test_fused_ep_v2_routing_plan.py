@@ -162,7 +162,7 @@ def test_the_capacity_slab_masks_exactly_what_it_drops():
     assert seen[16.0][1] == 0, seen
     drops = [seen[f][1] for f in (0.5, 1.0, 1.5, 16.0)]
     assert drops == sorted(drops, reverse=True), seen
-    # W5's law with no extra margin already covers a uniform draw at the
+    # The sizing law with no extra margin already covers a uniform draw at the
     # serving shape -- that is what the sqrt term is for.
     assert seen[1.0][1] == 0, seen
     print(f"[capacity slab] stride/drops by skew margin: {seen}")

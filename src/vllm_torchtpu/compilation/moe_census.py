@@ -8,8 +8,7 @@ numbers that could not be attributed to either, because every observable
 reached for was adjacent to the thing: the enable banner proves selection at
 weight load, the decline warning appears in the controls too, the boot log's
 ``compil*`` line count was a *hang warning* containing the word "compilation",
-and total compile time tracks the flag rather than the kernel (W6, jobs
-``j-b18b80fc``, ``j-7337172b``, ``j-88be9cc4``).
+and total compile time tracks the flag rather than the kernel.
 
 The graph handed to the compiler is not adjacent to anything: it either
 contains the custom call or it does not. This module counts, and
@@ -35,7 +34,7 @@ MOE_OP_LABELS: tuple[tuple[str, str], ...] = (
 # Cross-device collectives, counted BY KIND rather than as one number, because
 # the kinds do not behave alike here: a production capture has 0 of 5844
 # dispatch all-gather pairs overlapping in wall clock while the combine
-# reduce-scatter in the same capture is async (D1). What the fused path claims
+# reduce-scatter in the same capture is async. What the fused path claims
 # is that it *removes* the exposed pair, not that it shrinks it -- and shrinking
 # is worth ~nothing at our shapes, where the dispatch all-gather is 89-97%
 # fixed cost (alpha = 9.61 us + 4.47 us/MiB) at decode sizes. So the count of
@@ -50,7 +49,6 @@ COLLECTIVE_LABELS: tuple[tuple[str, str], ...] = (
 
 _LABELS: tuple[str, ...] = (tuple(label for label, _ in MOE_OP_LABELS) +
                             tuple(label for label, _ in COLLECTIVE_LABELS))
-
 
 # Boot order, so the table reads the way the run happened.
 _PHASE_ORDER = ("boot", "profile", "capture", "serving")
@@ -120,8 +118,9 @@ class _Recorder:
         return sum(c.get(label, 0) for c in self.by_range.values())
 
     def total_in_phase(self, label: str, phase: str) -> int:
-        return sum(c.get(label, 0) for key, c in self.by_range.items()
-                   if key.startswith(f"{phase} "))
+        return sum(
+            c.get(label, 0) for key, c in self.by_range.items()
+            if key.startswith(f"{phase} "))
 
     def reset(self) -> None:
         self.by_range.clear()
@@ -130,9 +129,10 @@ class _Recorder:
 
     def table(self) -> str:
         if not self.by_range:
-            return ("MoE graph census: NOTHING WAS COMPILED THROUGH THIS "
-                    "PROCESS -- the census saw 0 graphs, which is not the same "
-                    "as 0 MoE ops.")
+            return (
+                "MoE graph census: NOTHING WAS COMPILED THROUGH THIS "
+                "PROCESS -- the census saw 0 graphs, which is not the same "
+                "as 0 MoE ops.")
         lines = [f"MoE graph census over {self.graphs} compiled graphs:"]
         for key in sorted(self.by_range, key=_range_sort_key):
             lines.append(f"  range {key}: {format_counts(self.by_range[key])}")
@@ -146,8 +146,30 @@ class _Recorder:
 RECORDER = _Recorder()
 
 
+def enabled() -> bool:
+    """Whether to census at all.
+
+    The census is what stops a serving arm being unattributable -- 
+    ``fused_moe_ep.report_engagement`` reads it, and a run that cannot say
+    which MoE program it compiled has already cost this project two jobs. It is
+    also a general compile-time facility, so it stays switched off, and leaves
+    the compiler's log lines unchanged, for every deployment that is not using
+    the kernel it exists to observe.
+    """
+    from vllm_torchtpu import envs
+
+    return bool(envs.USE_MOE_FUSED_EP_V2)
+
+
 def observe(graph: Any, compile_range: Any) -> collections.Counter:
-    """Census one ``fx.GraphModule`` and fold it into the process tally."""
+    """Census one ``fx.GraphModule`` and fold it into the process tally.
+
+    Inert unless the fused-EP kernel was asked for. The census is what stops a
+    serving arm being unattributable -- ``fused_moe_ep.report_engagement``
+    See `enabled`.
+    """
+    if not enabled():
+        return collections.Counter()
     nodes = getattr(getattr(graph, "graph", None), "nodes", ())
     return RECORDER.observe(nodes, compile_range)
 

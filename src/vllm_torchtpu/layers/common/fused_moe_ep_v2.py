@@ -21,7 +21,7 @@ same tensors (one set of weights, two paths):
   Dropping a singleton axis is a metadata-only view that XLA folds away.
 * **f32 router logits.** v2 softmaxes and selects from what it is given; scoring
   in bf16 disagrees with ``torch.topk`` on a few tokens per thousand at
-  serving-scale logit spreads (measured for v1, ``impl/w3-fused-ep.md``).
+  serving-scale logit spreads (measured for v1).
 
 The torch side is ``layers/vllm/fused_moe_ep.py``.
 """
@@ -169,7 +169,7 @@ def fused_ep_moe_v2_func(
     sharded iota and the SPMD partitioner implements one of those by emitting
     the `partition-id` that the exported module is then refused for. Left None
     it is built here, which is correct and fast for a harness driving the
-    kernel directly from jax and is what W1's benchmark does.
+    kernel directly from jax and is what the standalone jax benchmark does.
     """
     skew = CAPACITY_SKEW if capacity_skew is None else capacity_skew
     ep = ep_size if ep_size is not None else mesh.shape[mesh.axis_names[-1]]

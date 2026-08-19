@@ -83,26 +83,52 @@ def clean_state(monkeypatch):
     fused_moe_ep.reset_engagement_state()
 
 
-@pytest.mark.parametrize("lockstep", [True, False])
-def test_the_ladder_traces_with_the_coordination_it_actually_has(lockstep):
-    """Every bucket declares the coordination the runner really has.
+@pytest.mark.parametrize("lockstep,armed,coordinated", [
+    (True, True, True),
+    (True, False, False),
+    (False, True, False),
+    (False, False, False),
+])
+def test_the_ladder_is_coordinated_only_when_a_fused_layer_armed(
+        lockstep, armed, coordinated):
+    """The ladder's coordination must follow the feature, not the topology.
 
-    This no longer selects the MoE program -- arming does, at weight load --
-    but it still decides what each dummy forward puts in
-    ``set_forward_context``: ``num_tokens_across_dp``, and the idle-engine
-    logits collective that pairs with a busy engine's. A ladder that declared
-    itself differently per bucket would compile a different collective stream
-    into some of them.
+    ``dp_lockstep`` changes what every bucket compiles: it sets
+    ``num_tokens_across_dp`` in ``set_forward_context``, changes ``DPMetadata``,
+    and adds an idle-engine logits collective. Keying it on
+    ``_dp_lockstep_enabled()`` -- which is ``dp_size > 1 and
+    enable_expert_parallel``, with **no MoE flag in it** -- changed the compiled
+    ladder on every DP+EP boot whether or not this kernel was wanted, which is
+    our production cell and the opposite of default-off. It has to read
+    ``_fused_moe_needs_rendezvous()``, which is the same DP+EP condition **and**
+    an armed layer.
     """
+    if armed:
+        fused_moe_ep._register_enabled_layer(4)
     runner, calls, _ = _runner(lockstep=lockstep)
     TPUModelRunner.capture_model(runner)
 
     assert len(calls) == 3
-    assert all(kwargs["dp_lockstep"] is lockstep for _, kwargs in calls)
+    assert all(kwargs["dp_lockstep"] is coordinated for _, kwargs in calls)
     assert [args[0] for args, _ in calls] == [16, 128, 4096]
 
 
+def test_with_the_flag_off_the_ladder_is_what_main_compiles():
+    """"Default off" has to mean the compiled program is unchanged.
+
+    Base passes nothing to ``_dummy_run``, whose ``dp_lockstep`` defaults to
+    False. So with no layer armed -- which is what an unset flag produces, on
+    any topology -- every bucket must be traced with ``dp_lockstep=False``, and
+    no rank may enter a barrier that base does not have.
+    """
+    runner, calls, barriers = _runner(lockstep=True)  # DP+EP, feature off
+    TPUModelRunner.capture_model(runner)
+    assert [kwargs["dp_lockstep"] for _, kwargs in calls] == [False] * 3
+    assert runner._fused_moe_needs_rendezvous() is False
+
+
 def test_both_request_shapes_of_a_bucket_are_traced_the_same_way():
+    fused_moe_ep._register_enabled_layer(4)
     runner, calls, barriers = _runner(lockstep=True, most_model_len=1024)
     TPUModelRunner.capture_model(runner)
     assert len(calls) == 6 and len(barriers) == 6
@@ -117,10 +143,38 @@ def test_every_coordinated_bucket_is_preceded_by_a_rendezvous():
     the shape, but they compile it at different speeds and the lead grows down
     the ladder until two ranks' barriers pair across different buckets.
     """
+    fused_moe_ep._register_enabled_layer(4)
     runner, calls, barriers = _runner(lockstep=True)
     TPUModelRunner.capture_model(runner)
     assert barriers == [16, 128, 4096]
     assert len(barriers) == len(calls)
+
+
+def test_the_barrier_itself_is_gated_and_not_only_its_call_site(monkeypatch):
+    """The gate is inside the helper, so a caller cannot forget it.
+
+    ``capture_model`` calls the rendezvous for every bucket unconditionally and
+    the helper decides; a test that only counted call sites would therefore
+    pass on a build that barriers with the feature off. This drives the real
+    helper and watches for the collective.
+    """
+    import torch.distributed as dist
+    from vllm.distributed import parallel_state
+
+    entered = []
+    monkeypatch.setattr(dist,
+                        "barrier",
+                        lambda group=None: entered.append(group))
+    monkeypatch.setattr(parallel_state, "get_ep_group",
+                        lambda: SimpleNamespace(cpu_group="ep-cpu"))
+
+    runner, _, _ = _runner(lockstep=True)
+    TPUModelRunner._capture_ladder_rendezvous(runner, 16)
+    assert entered == [], "barriered with no layer armed"
+
+    fused_moe_ep._register_enabled_layer(4)
+    TPUModelRunner._capture_ladder_rendezvous(runner, 16)
+    assert entered == ["ep-cpu"]
 
 
 def test_the_rendezvous_is_skipped_where_it_could_only_deadlock(monkeypatch):
@@ -143,6 +197,7 @@ def test_the_rendezvous_is_skipped_where_it_could_only_deadlock(monkeypatch):
 def test_the_run_is_reported_before_the_sampling_subgraphs():
     """The census must print even if a later precompile stage explodes."""
     order = []
+    fused_moe_ep._register_enabled_layer(4)
     runner, _, _ = _runner(lockstep=True)
     runner._precompile_sampling_subgraphs = lambda: order.append("sampling")
     import unittest.mock as mock
@@ -186,11 +241,11 @@ def test_the_profile_shape_is_the_top_of_the_config_ladder(monkeypatch):
         vllm_config=SimpleNamespace(),
     )
     monkeypatch.setattr(
-        utils, "compute_hbm_budget", lambda devices, util: utils.HbmBudget(
-            total_limit=64 * utils.GBYTES,
-            total_used=8 * utils.GBYTES,
-            cap=48 * utils.GBYTES,
-            available=40 * utils.GBYTES))
+        utils, "compute_hbm_budget",
+        lambda devices, util: utils.HbmBudget(total_limit=64 * utils.GBYTES,
+                                              total_used=8 * utils.GBYTES,
+                                              cap=48 * utils.GBYTES,
+                                              available=40 * utils.GBYTES))
     monkeypatch.setattr(utils, "estimate_kv_connector_hbm_reserve",
                         lambda vllm_config: 0)
 

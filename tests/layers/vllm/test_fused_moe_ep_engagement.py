@@ -40,6 +40,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import moe_census
 from vllm_torchtpu.layers.vllm import fused_moe_ep
 from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
@@ -57,8 +58,15 @@ def clean_state(monkeypatch):
     # setenv, never setattr: `envs` serves these through `__getattr__`, so a
     # `monkeypatch.setattr` here would survive its own undo as a real module
     # attribute and make every later `setenv` in the session invisible. A
-    # sibling file does exactly that; `tests/conftest.py::_unpin_envs_between_tests`
-    # is what stops it reaching us.
+    # sibling file does exactly that, and the shared conftest fixture that used
+    # to sweep those up is not on this branch -- so clear our own names first
+    # rather than depend on the order the files run in.
+    for name in ("USE_MOE_FUSED_EP_V2", "USE_MOE_EP_KERNEL",
+                 "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
+                 "MOE_FUSED_EP_KERNEL_MAX_TOKENS",
+                 "MOE_FUSED_EP_REQUIRE_ENGAGEMENT"):
+        if name in vars(envs):
+            delattr(envs, name)
     monkeypatch.setenv("USE_MOE_FUSED_EP_V2", "1")
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", "0")
@@ -156,9 +164,11 @@ def test_the_arming_log_does_not_fire_in_a_control(monkeypatch):
     monkeypatch.setattr(fused_moe_ep.logger, "warning_once",
                         lambda *a, **k: warned.append(a))
     monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (1, 0))
-    layer = SimpleNamespace(moe_config=SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_ep=False), ep_size=1,
-        dp_size=DP_SIZE))
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(
+            use_ep=False),
+                                   ep_size=1,
+                                   dp_size=DP_SIZE))
 
     monkeypatch.setenv("USE_MOE_FUSED_EP_V2", "0")
     assert fused_moe_ep.is_enabled(layer) is False
@@ -181,7 +191,8 @@ def _fused_ep_op(tokens: torch.Tensor) -> torch.Tensor:
     return tokens * 2.0
 
 
-@torch.library.custom_op("pallas::fused_moe_kernel_censusgate", mutates_args=())
+@torch.library.custom_op("pallas::fused_moe_kernel_censusgate",
+                         mutates_args=())
 def _gmm_op(tokens: torch.Tensor) -> torch.Tensor:
     return tokens * 3.0
 
@@ -214,10 +225,9 @@ def _layer():
         _ep_rank_ids=torch.zeros(1, dtype=torch.int32),
         _experts_start=torch.zeros((), dtype=torch.int32),
         custom_routing_function=lambda hidden_states, gating_output, topk,
-        renormalize: (torch.ones(hidden_states.shape[0], topk),
-                      torch.zeros(hidden_states.shape[0],
-                                  topk,
-                                  dtype=torch.int32)),
+        renormalize:
+        (torch.ones(hidden_states.shape[0], topk),
+         torch.zeros(hidden_states.shape[0], topk, dtype=torch.int32)),
     )
 
 
@@ -344,8 +354,8 @@ def test_the_armed_path_compiles_across_the_band_edge(stub_kernels):
     ``apply_monolithic`` asks the band about ``x.shape[0]``, dynamo specialises
     the dimension vLLM marked dynamic, and the whole compile dies with
     ``Constraints violated (L['input_ids'].size()[0], ...)`` inside
-    ``capture_model``, on device, taking the boot with it. It cost job
-    j-2ca2a7d7. Nothing on this path may read that number now, and this is what
+    ``capture_model``, on device, taking the boot with it. It cost a device
+    job. Nothing on this path may read that number now, and this is what
     says so at every commit rather than at every boot.
     """
     _trace_across(_method(armed=True).apply_monolithic,
@@ -395,8 +405,7 @@ def test_a_band_read_without_the_message_is_worse_than_a_crash():
     """
 
     def reads_the_band(x, router_logits):
-        return x * 2 if fused_moe_ep.in_token_band(x.shape[0] *
-                                                   DP_SIZE) else x
+        return x * 2 if fused_moe_ep.in_token_band(x.shape[0] * DP_SIZE) else x
 
     graphs = _trace_across(reads_the_band, ACROSS_THE_BAND_EDGE)
     assert len(graphs) == 2, (
@@ -449,7 +458,7 @@ def test_nothing_on_the_traced_path_formats_a_shape():
     traced = (fused_moe_ep.fused_moe_ep, fused_moe_ep._padded_rows,
               fused_moe_ep._row_slice_index,
               fused_moe_ep._scatter_replica_rows, fused_moe_ep.op_cache_key,
-              fused_moe_ep.block_size_override, fused_moe_ep._get_op,
+              fused_moe_ep._get_op,
               fp8_mod.VllmFp8MoEMethodTPU.apply_monolithic)
     offenders = [
         fn.__name__ for fn in traced

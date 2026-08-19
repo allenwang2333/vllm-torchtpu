@@ -200,9 +200,9 @@ def _main_params(mlir: str) -> str:
 
 def test_the_shard_identity_is_a_parameter_not_a_constant(mesh):
     """The second half of the partition-id story, found on device a commit
-    after the first (W6, job j-9c4716c7).
+    after the first.
 
-    Asserting the *absence* of `partition_id` was not enough. `4b9b99ec1`
+    Asserting the *absence* of `partition_id` was not enough. The first fix
     exported with `partition_id: 0` and still died on device, because the shard
     identity was an `arange(ep)` built inside the trace and sharded over the
     mesh -- and the SPMD partitioner implements a sharded iota **by emitting
@@ -242,7 +242,7 @@ def test_the_gate_bites_when_the_identity_is_built_in_the_trace(mesh):
     failure. This one is only worth having if it can tell the two programs
     apart, so build the bad one on purpose -- ``ep_ids=None`` makes the layer
     fall back to an in-trace ``arange(ep)``, which is exactly what shipped in
-    `4b9b99ec1` -- and require that the parameter is gone.
+    the first partition-id fix -- and require that the parameter is gone.
     """
     operands = _operands(mesh, 64)
     operands.pop("ep_ids")
@@ -262,7 +262,7 @@ def test_the_exported_module_has_no_partition_id(mesh):
     partitioner then refuses the *exported* module on its own with "partitionId
     instruction is not supported for SPMD partitioning since the meaning is
     ambiguous", and serving dies in `_dummy_run` on the first profile run. That
-    is a real incident (W6, job j-50b9706b, 2026-08-15), and it cost a TPU slot
+    is a real incident (seen on device, 2026-08-15), and it cost a TPU slot
     because the two compile paths disagree and only one of them was gated.
 
     Asserting on the exported MLIR rather than trying to reproduce the
@@ -318,7 +318,7 @@ def test_the_default_sizes_the_slab_without_being_asked(mesh, topology):
 
     The env var is read in the serving adapter, so a harness that calls
     ``fused_ep_moe_v2_func`` directly never sees it -- and the failure is a
-    silent no-op with a correct-looking run (found exactly that way, W1). The
+    silent no-op with a correct-looking run (found exactly that way). The
     default therefore lives on the JAX entry point, and this is what says so.
     """
     sized = _compile(mesh, topology, _operands(mesh, 2048))

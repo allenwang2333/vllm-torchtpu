@@ -2,7 +2,7 @@
 """v2's fp8 expert FFN contracts in ONE dot per matmul. Pinned, because a
 sibling investigation has v1's unexplained 14% pointing at split contractions.
 
-W4's bisection of the fused-EP **v1** kernel's 14% rel-L2 (measured on device,
+A bisection of the fused-EP **v1** kernel's 14% rel-L2 (measured on device,
 0.0077 under a patched Pallas interpreter and 0.0090 in an independent numpy
 model -- so the program is right and the *lowering* is not) indicts the
 combination "quantized operands **and** a contraction split into several

@@ -149,7 +149,8 @@ def fused_ep_moe_v2(x,
     sharded_plan builds the routing tables through
     build_routing_tables_sharded: the same operands out of 1/ep of the
     arithmetic, plus one 2 kB all-gather. It is off by default -- see
-    that function, and PLAN-DECOMP.md for what is verified about it.
+    that function, and ``test_fused_ep_v2_plan_decomp.py`` for what is
+    verified about it.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -471,7 +472,7 @@ def fused_ep_moe_v2(x,
     # `arange(ep)` built here is a sharded constant, and the SPMD partitioner
     # implements a sharded iota by emitting the `partition-id` this operand
     # exists to avoid -- so the instruction comes back, created by XLA instead
-    # of by us, in the same standalone compile that refuses it (W6, device,
+    # of by us, in the same standalone compile that refuses it (on device,
     # 2026-08-15). A parameter cannot be folded, because the compiler does not
     # know its contents.
     ids = jnp.arange(ep, dtype=jnp.int32) if ep_ids is None else ep_ids

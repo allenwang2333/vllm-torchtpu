@@ -36,7 +36,8 @@ def test_the_census_separates_the_two_moe_programs():
         _node("call_function", "pallas.fused_ep_moe_kernel_0.default"),
         _node("call_function", "pallas.fused_ep_moe_kernel_0.default"),
         _node("call_function", "pallas.fused_moe_kernel_3.default"),
-        _node("call_function", "torch.ops._c10d_functional.all_reduce.default"),
+        _node("call_function",
+              "torch.ops._c10d_functional.all_reduce.default"),
         _node("call_function", "torch.ops.vllm.all_gather.default"),
         _node("call_function", "torch.ops.vllm.reduce_scatter.default"),
         _node("placeholder", "x"),
@@ -46,8 +47,9 @@ def test_the_census_separates_the_two_moe_programs():
     assert counts["gmm"] == 1
     # By kind, not as one number: the dispatch all-gather is fully exposed in a
     # production capture while the combine reduce-scatter is async, so "which
-    # collective disappeared" is the mechanism claim (D1).
-    assert (counts["ar"], counts["ag"], counts["rs"], counts["a2a"]) == (1, 1, 1, 0)
+    # collective disappeared" is the mechanism claim.
+    assert (counts["ar"], counts["ag"], counts["rs"], counts["a2a"]) == (1, 1,
+                                                                         1, 0)
 
 
 def test_the_fused_name_is_not_swallowed_by_the_gmm_label():
@@ -103,8 +105,9 @@ def test_the_recorder_tallies_by_range_and_totals():
     recorder.observe(
         [_node("call_function", "pallas.fused_ep_moe_kernel_0.default")],
         "Range(16384, 16384)")
-    recorder.observe([_node("call_function", "pallas.fused_moe_kernel_1.default")],
-                     "Range(128, 128)")
+    recorder.observe(
+        [_node("call_function", "pallas.fused_moe_kernel_1.default")],
+        "Range(128, 128)")
     assert recorder.total("fused_ep") == 2
     assert recorder.total("gmm") == 1
     assert recorder.graphs == 3

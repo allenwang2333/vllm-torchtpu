@@ -128,6 +128,7 @@ class _FusedEpExperts:
             "batch")
         return self._fused_out
 
+
 class _SharedPartial(torch.nn.Module):
     """A TP-sharded shared expert: this rank's partial sum, not the total."""
 
@@ -267,7 +268,7 @@ def test_the_takeover_is_one_answer_for_the_run(monkeypatch):
     earlier shape of this path answered it per step, from a token band and a
     DP-coordination flag, and then reinstated the pair itself when it declined.
     Two ways that lost: a step where one rank engaged and another did not hung
-    the device in ``semaphore_wait`` (W6, three boots), and vLLM drops Dynamo's
+    the device in ``semaphore_wait`` (three boots), and vLLM drops Dynamo's
     guards after the first trace, so the per-step answer was frozen anyway.
 
     Arming is now settled once, at weight load, and this pins both halves of
@@ -385,23 +386,22 @@ def test_rows_are_padded_to_a_legal_per_rank_block(monkeypatch, rows,
         monkeypatch.setattr(fused_moe_ep,
                             "_replica_group",
                             lambda r=rank: (replica_size, r))
-        out = fused_moe_ep.fused_moe_ep(tokens,
-                                        logits,
-                                        w1=None,
-                                        w2=None,
-                                        w1_scale=None,
-                                        w2_scale=None,
-                                        top_k=1,
-                                        renormalize=True,
-                                        activation="silu",
-                                        scoring_fn="softmax",
-                                        subc_quant_w1_sz=None,
-                                        subc_quant_w2_sz=None,
-                                        quant_act=True,
-                                        replica_rank=torch.tensor(
-                                            rank, dtype=torch.int32),
-                                        ep_rank_ids=torch.zeros(
-                                            1, dtype=torch.int32))
+        out = fused_moe_ep.fused_moe_ep(
+            tokens,
+            logits,
+            w1=None,
+            w2=None,
+            w1_scale=None,
+            w2_scale=None,
+            top_k=1,
+            renormalize=True,
+            activation="silu",
+            scoring_fn="softmax",
+            subc_quant_w1_sz=None,
+            subc_quant_w2_sz=None,
+            quant_act=True,
+            replica_rank=torch.tensor(rank, dtype=torch.int32),
+            ep_rank_ids=torch.zeros(1, dtype=torch.int32))
         assert out.shape == (rows, HIDDEN)
         total += out
 
@@ -459,7 +459,7 @@ def test_the_forward_never_builds_the_op(monkeypatch):
     """The prebuild at load must cover the key the forward asks for.
 
     Registering a custom op inside the Dynamo-compiled forward is a TPU-only
-    failure (a sibling workstream lost a slot to exactly that). Our op is built
+    failure (we have lost a device job to exactly that). Our op is built
     in `process_weights_after_loading`; what can still go wrong is a *key* skew
     between that prebuild and the forward, which would move the build into the
     traced region. Pin it: with a counting builder, prebuild once, then call the
@@ -604,7 +604,7 @@ def test_a_deployment_that_cannot_coordinate_is_refused_not_fallen_back(
     """The successor to the per-step decline: refuse the layout at weight load.
 
     A step where one rank engages and another does not hangs the TensorCore in
-    ``semaphore_wait`` (W6, three boots). The old fix answered per step; this
+    ``semaphore_wait`` (three boots). The old fix answered per step; this
     one answers per deployment, and ``dp_size=1`` -- the layout with no DP
     transport to take over -- is refused by name.
     """
@@ -617,11 +617,11 @@ def test_a_deployment_that_cannot_coordinate_is_refused_not_fallen_back(
 def test_nothing_on_the_traced_path_logs(monkeypatch):
     """Dynamo refuses a `logging.Logger` call in a graph it is capturing.
 
-    "logging.Logger method not supported for non-export cases" (W6,
-    j-cf06d716) -- fatal in the traced region and invisible in eager, which is
-    why 33 decline lines printed happily and the boot still died. Arming is
-    announced from `is_enabled`, which runs at weight load; nothing reachable
-    from the forward may log.
+    "logging.Logger method not supported for non-export cases" -- fatal in the
+    traced region and invisible in eager, which is why 33 decline lines
+    printed happily and the boot still died. Arming is announced from
+    `is_enabled`, which runs at weight load; nothing reachable from the
+    forward may log.
 
     Checked structurally rather than by inspection, because the next person
     adding a diagnostic to the decline path will not read this docstring.
@@ -629,9 +629,9 @@ def test_nothing_on_the_traced_path_logs(monkeypatch):
     import inspect
 
     traced = (fused_moe_ep.fused_moe_ep, fused_moe_ep.op_cache_key,
-              fused_moe_ep.block_size_override, fused_moe_ep.capacity_skew,
-              fused_moe_ep.max_tokens, fused_moe_ep._input_partition_specs,
-              fused_moe_ep._padded_rows, fused_moe_ep._row_slice_index,
+              fused_moe_ep.capacity_skew, fused_moe_ep.max_tokens,
+              fused_moe_ep._input_partition_specs, fused_moe_ep._padded_rows,
+              fused_moe_ep._row_slice_index,
               fused_moe_ep._scatter_replica_rows)
     offenders = [
         fn.__name__ for fn in traced if "logger." in inspect.getsource(fn)
@@ -648,11 +648,11 @@ def test_the_engagement_assertion_flag_cannot_change_a_graph():
     The AOT cache key hashes env + config but validates only *source files* on
     load, so a **graph-changing** flag parked in that ignore set makes arm B
     load arm A's executable and the A/B measures nothing while returning a
-    clean, plausible null (`d4/a/REPORT.md`). Ignoring this one is only correct
-    because it gates a post-hoc assertion in eager code and is unreachable from
-    anything traced. Pin that, structurally: if someone ever reads it from the
-    forward, this fails instead of a serving A/B silently comparing an arm with
-    itself.
+    clean, plausible null. Ignoring this one is only correct because it
+    gates a post-hoc assertion in eager code and is unreachable from
+    anything traced. Pin that, structurally: if someone ever reads it from
+    the forward, this fails instead of a serving A/B silently comparing an
+    arm with itself.
     """
     import inspect
 
@@ -671,11 +671,9 @@ def test_the_engagement_assertion_flag_cannot_change_a_graph():
             "executable")
 
     traced = (fused_moe_ep.fused_moe_ep, fused_moe_ep.op_cache_key,
-              fused_moe_ep.block_size_override, fused_moe_ep.capacity_skew,
-              fused_moe_ep.max_tokens, fused_moe_ep._get_op)
-    readers = [
-        fn.__name__ for fn in traced if flag in inspect.getsource(fn)
-    ]
+              fused_moe_ep.capacity_skew, fused_moe_ep.max_tokens,
+              fused_moe_ep._get_op)
+    readers = [fn.__name__ for fn in traced if flag in inspect.getsource(fn)]
     assert not readers, (
         f"{readers} read {flag}, which is excluded from the compile-cache key "
         "-- so two arms differing only in it would share an executable")
@@ -699,8 +697,13 @@ def test_the_engagement_assertion_flag_cannot_change_a_graph():
 TP = 4
 
 
-def _run_tp_group(monkeypatch, *, fused_of_rank, shared_of_rank, moe_kernel,
-                  skip_final_all_reduce, tp=TP):
+def _run_tp_group(monkeypatch,
+                  *,
+                  fused_of_rank,
+                  shared_of_rank,
+                  moe_kernel,
+                  skip_final_all_reduce,
+                  tp=TP):
     """Run the real runner once per TP rank; return each rank's final output.
 
     ``tensor_model_parallel_all_reduce`` is replayed in two passes: pass 1
@@ -739,7 +742,8 @@ def _run_tp_group(monkeypatch, *, fused_of_rank, shared_of_rank, moe_kernel,
                               moe_kernel=moe_kernel,
                               skip_final_all_reduce=skip_final_all_reduce)
         monkeypatch.setattr(moe_runner_mod, "get_ep_group", _ExplodingEpGroup)
-        monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
+        monkeypatch.setattr(moe_runner_mod,
+                            "get_layer_from_name",
                             lambda _name, r=runner: r)
         return runner(x, logits)
 

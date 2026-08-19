@@ -188,18 +188,24 @@ def report_engagement(*, strict: bool | None = None) -> None:
     logger.error("%s", message)
 
 
-def max_engine_node_tokens(dp_size: int) -> int | None:
-    """The largest node-wide batch this engine can build, or None if unreadable.
+def max_engine_node_tokens(dp_size: int, replica_size: int = 1) -> int | None:
+    """The largest node-wide batch this kernel can be handed, or None.
 
     The scheduler's cap is the per-rank ceiling and the runner pads every step
     to a bucket no larger than it (``tpu_platform`` derives the ladder from the
-    same number), so ``cap * dp`` is the widest batch the kernel can be handed.
+    same number) -- but the rows reaching the kernel are padded again, up to a
+    multiple of ``_MIN_LOCAL_ROWS`` per replica (`fused_moe_ep` slices the batch
+    across the TP group). Bounding ``cap * dp`` instead of the padded count is
+    the difference between arming and dying at the first compile: at the shipped
+    slab a cap in {6537..6540} rounds up over the scalar-memory budget.
     """
     from vllm.config import get_current_vllm_config_or_none
     scheduler = getattr(get_current_vllm_config_or_none(), "scheduler_config",
                         None)
     cap = getattr(scheduler, "max_num_batched_tokens", None)
-    return None if cap is None else int(cap) * max(dp_size, 1)
+    if cap is None:
+        return None
+    return _padded_rows(int(cap), max(replica_size, 1)) * max(dp_size, 1)
 
 
 def in_token_band(node_tokens: int) -> bool:
@@ -237,7 +243,7 @@ def out_of_band_reason(layer) -> str | None:
             f"dp_size=1 (TP{replica_size}_EP): this kernel exists to remove the "
             "DP dispatch/combine pair, and with no DP transport to remove the "
             "grouped-matmul path is ahead at every token count we measured")
-    node_tokens = max_engine_node_tokens(dp_size)
+    node_tokens = max_engine_node_tokens(dp_size, _replica_group()[0])
     if node_tokens is None:
         logger.warning_once(
             "Fused EP MoE: the engine's max_num_batched_tokens is unreadable, "
@@ -351,7 +357,7 @@ def _smem_reason(moe) -> str | None:
         _SMEM_OVERHEAD_BYTES, _slab_rows)
 
     dp_size = int(getattr(moe, "dp_size", 1))
-    node_tokens = max_engine_node_tokens(dp_size)
+    node_tokens = max_engine_node_tokens(dp_size, _replica_group()[0])
     if not node_tokens:
         return None
     smem = _smem_capacity_bytes()
@@ -419,24 +425,11 @@ def is_enabled(layer) -> bool:
         "dp_size=%d | largest node-wide batch %s in band [%d, %s] | "
         "mesh_index=%d ep_rank_at_mesh_index=%s", layer.moe_config.ep_size,
         layer.moe_config.experts_per_token, dp_size,
-        max_engine_node_tokens(dp_size), envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS,
-        ceiling if ceiling > 0 else "inf", layout.mesh_index,
-        layout.ep_rank_at_mesh_index)
+        max_engine_node_tokens(dp_size, replica_size),
+        envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS, ceiling if ceiling > 0 else "inf",
+        layout.mesh_index, layout.ep_rank_at_mesh_index)
     _register_enabled_layer(int(getattr(layer.moe_config, "dp_size", 1)))
     return True
-
-
-def block_size_override() -> tuple[int, ...] | None:
-    """Parse ``MOE_FUSED_EP_KERNEL_BLOCKS`` (bt,bf,bd1,bd2,btc,bfc,bd1c,bd2c)."""
-    raw = envs.MOE_FUSED_EP_KERNEL_BLOCKS.strip()
-    if not raw:
-        return None
-    blocks = tuple(int(v) for v in raw.replace(" ", "").split(","))
-    if len(blocks) != 8:
-        raise ValueError(
-            "MOE_FUSED_EP_KERNEL_BLOCKS wants 8 comma-separated ints "
-            f"(bt,bf,bd1,bd2,btc,bfc,bd1c,bd2c); got {raw!r}")
-    return blocks
 
 
 def mesh_expert_order() -> tuple[int, ...] | None:
@@ -460,15 +453,30 @@ def mesh_expert_order() -> tuple[int, ...] | None:
     return layout.ep_rank_at_mesh_index
 
 
-def _v2_partial(*, mesh, top_k: int, renormalize: bool, activation: str,
-                **_v1_only):
-    """v2 routes and quantizes on its own terms, so the v1 knobs do not apply.
+def _v2_partial(*,
+                mesh,
+                top_k: int,
+                renormalize: bool,
+                activation: str,
+                scoring_fn: str = "softmax",
+                subc_quant_w1_sz: int | None = None,
+                subc_quant_w2_sz: int | None = None,
+                quant_act: bool = True):
+    """The kernel's config.
 
-    ``scoring_fn`` is softmax by construction and ``quant_act`` is not optional
-    (the wire itself is fp8); both are refused for this version in
-    ``unsupported_reason`` rather than silently ignored here. ``subc_quant_*``
-    have no analogue: v2 takes per-output-channel weight scales only.
+    The last four describe the layer rather than the kernel: this program scores
+    with softmax and puts fp8 on the wire by construction, and it reads
+    per-output-channel scales only. They are *checked* rather than accepted and
+    ignored -- a knob that is parsed and then discarded is how a deployment ends
+    up believing it configured something. ``unsupported_reason`` refuses the
+    layers that would violate them, so reaching here with anything else is a
+    wiring bug, not a user error.
     """
+    assert scoring_fn == "softmax", (
+        f"scoring_fn={scoring_fn!r} reached the kernel; the layer refusal in "
+        "unsupported_reason should have caught it")
+    assert quant_act, "this kernel's dispatch wire is fp8; there is no bf16 mode"
+    del subc_quant_w1_sz, subc_quant_w2_sz  # per-output-channel scales only
     return functools.partial(
         fused_ep_moe_v2_func,
         mesh=mesh,
@@ -476,7 +484,7 @@ def _v2_partial(*, mesh, top_k: int, renormalize: bool, activation: str,
         renormalize=renormalize,
         activation=activation,
         sharded_plan=envs.MOE_FUSED_EP_V2_SHARDED_PLAN,
-        capacity_skew=capacity_skew() or None,
+        capacity_skew=capacity_skew(),
         mesh_ep_ranks=mesh_expert_order(),
     )
 
@@ -493,13 +501,12 @@ def op_cache_key(*, top_k: int, renormalize: bool, activation: str,
     read it from one place.
     """
     return (top_k, renormalize, activation, scoring_fn, subc_quant_w1_sz,
-            subc_quant_w2_sz, quant_act, block_size_override())
+            subc_quant_w2_sz, quant_act)
 
 
 def _get_op(*, top_k: int, renormalize: bool, activation: str, scoring_fn: str,
             subc_quant_w1_sz: int | None, subc_quant_w2_sz: int | None,
             quant_act: bool):
-    blocks = block_size_override()
     key = op_cache_key(top_k=top_k,
                        renormalize=renormalize,
                        activation=activation,
@@ -522,8 +529,7 @@ def _get_op(*, top_k: int, renormalize: bool, activation: str, scoring_fn: str,
                      scoring_fn=scoring_fn,
                      subc_quant_w1_sz=subc_quant_w1_sz,
                      subc_quant_w2_sz=subc_quant_w2_sz,
-                     quant_act=quant_act,
-                     blocks=blocks)
+                     quant_act=quant_act)
     op = pallas.jax_op(name,
                        fn,
                        mesh=mesh,

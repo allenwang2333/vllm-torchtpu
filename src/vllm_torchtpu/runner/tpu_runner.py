@@ -4189,9 +4189,6 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
-        if envs.TPU_MOE_ROUTER_LOGITS_FP32:
-            from vllm_torchtpu.layers.vllm import moe_routing
-            moe_routing.promote_router_gates_to_fp32(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
 
@@ -4745,13 +4742,15 @@ class TPUModelRunner(GPUModelRunner):
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
             return
-        # The ladder decides which MoE program each bucket carries: engagement
-        # is a branch resolved at trace time, so a ladder that declares itself
-        # uncoordinated compiles the fallback into every bucket and no runtime
-        # predicate can reach the kernel afterwards. profile_run stays
+        # Coordinated only when a fused-MoE layer actually armed: the kernel's
+        # peers must enter its collectives with matching buckets, and nothing
+        # else here needs lockstep. Reading `_dp_lockstep_enabled()` directly
+        # would couple the ladder to DP+EP rather than to this feature, and
+        # would change what every DP+EP boot compiles with the feature off --
+        # which is the one thing "default off" has to mean. profile_run stays
         # uncoordinated (it only sizes memory, and its compile is isolated into
         # `profile_cache/` then thrown away by `torch._dynamo.reset()`).
-        ladder_lockstep = self._dp_lockstep_enabled()
+        ladder_lockstep = self._fused_moe_needs_rendezvous()
         moe_census.set_phase("capture")
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):

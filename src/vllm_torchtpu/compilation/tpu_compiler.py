@@ -304,11 +304,13 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         # Which MoE program is in *this* graph, counted on the graph itself:
         # the only engagement observable that is not adjacent to the thing.
-        logger.info(
-            "[TpuCompilerAdaptor] Compiling FX graph for range %s | MoE %s",
-            compile_range,
-            moe_census.format_counts(moe_census.observe(graph, compile_range)),
-        )
+        # The suffix only appears when the census is on, so the two most-grepped
+        # compiler lines keep their shape for every other deployment.
+        moe = (
+            f" | MoE {moe_census.format_counts(moe_census.observe(graph, compile_range))}"
+            if moe_census.enabled() else "")
+        logger.info("[TpuCompilerAdaptor] Compiling FX graph for range %s%s",
+                    compile_range, moe)
 
         # aot_autograd (inside TpuBackend) requires tuple outputs.
         graph = copy.deepcopy(graph)
@@ -409,10 +411,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         # for every arm after the first in a job that shares a cache directory
         # -- indistinguishable from the kernel not engaging, which is the exact
         # confusion this exists to remove.
+        moe = (
+            f" | MoE {moe_census.format_counts(moe_census.observe(graph, compile_range))}"
+            if moe_census.enabled() else "")
         logger.info(
-            "[TpuCompilerAdaptor] Loading compiled executable from %s "
-            "| MoE %s", path,
-            moe_census.format_counts(moe_census.observe(graph, compile_range)))
+            "[TpuCompilerAdaptor] Loading compiled executable from %s%s", path,
+            moe)
 
         with open(path, "rb") as f:
             loaded_data = pickle.load(f)

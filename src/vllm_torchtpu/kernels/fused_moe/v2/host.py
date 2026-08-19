@@ -304,25 +304,25 @@ def capacity_slab_rows(num_tokens, topk, e_total, ep, capacity, skew):
     over-provisioning is not free. Measured on an 8-chip v7x node at a fixed
     16,384 tokens, changing only this number: **the drop-free 167,552 rows run
     the layer in 15,561 us and 85,632 rows run it in 1,874**, an 8.3x step with
-    a threshold between 85,632 and 106,912 (W1, job j-55b4be57). Holding the
-    slab and changing the token count does not move it.
+    a threshold between 85,632 and 106,912. Holding the slab and changing the
+    token count does not move it.
 
-    The sizing law is W5's, from the capacity study for this repository's own
-    routed layout (`w5/CAPACITY.md`), and it is the same statistical situation:
+    The sizing law comes from the capacity study for this repository's own
+    routed layout, and it is the same statistical situation:
     one flat buffer pooled over a shard's ``e_total / ep`` local experts, so
     only the shard TOTAL has to fit and a hot expert is absorbed by its
-    neighbours. They measured the pooled coefficient of variation at 0.648%
+    neighbours. That study put the pooled coefficient of variation at 0.648%
     against 5.535% per expert, i.e. per-expert capacity would be 1.35x larger
     and 400x riskier.
 
         rows = skew * mu + 7 * sqrt(mu) + 16,   mu = num_tokens * topk / ep
 
-    **The sqrt term is not decoration**: W5 measured the alpha needed for a
-    1e-12 drop probability running from 2.15 at 32 tokens to 1.046 at 16,384,
+    **The sqrt term is not decoration**: the alpha measured for a
+    1e-12 drop probability runs from 2.15 at 32 tokens to 1.046 at 16,384,
     so a constant factor is wrong at both ends. ``skew`` is the margin on top,
-    for load that is not uniform; W5's asymmetry argument applies here too --
+    for load that is not uniform; the same asymmetry argument applies here --
     going from 1.0 to 1.5 buys a 50% shard-load skew for a few percent of the
-    win. On top of their law this slab also carries ``(ROWBLK - 1) * e_total``,
+    win. On top of that law this slab also carries ``(ROWBLK - 1) * e_total``,
     because its runs are padded per (expert, source) pair, and one tile-height
     tail-read window.
 
