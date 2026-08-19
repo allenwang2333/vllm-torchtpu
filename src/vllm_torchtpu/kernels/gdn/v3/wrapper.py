@@ -627,20 +627,65 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    # Pre-allocate zero output buffer when zero_initialize_out is enabled.
+    out_act_init = (
+        jnp.zeros((padded_batch_size, n_v, d_v), dtype=act_out_dtype)
+        if zero_initialize_out else None)
+
+    def call_kernel_if_active(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+        is_active: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        """Conditionally launches Pallas kernel if the pass has active sequences."""
+
+        def _execute():
+            return call_kernel(in_conv_state, in_recurrent_state, in_act, mode)
+
+        def _skip():
+            act = in_act if in_act is not None else out_act_init
+            return act, in_conv_state, in_recurrent_state
+
+        return jax.lax.cond(is_active, _execute, _skip)
+
     if pooled:
-        out_act, out_source, _ = call_kernel(state_source, None, None,
-                                             config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        out_act, out_source, _ = call_kernel_if_active(
+            state_source,
+            None,
+            None,
+            config.GDNMode.BATCHED,
+            distribution[0] > 0,
+        )
+        out_act, out_source, _ = call_kernel_if_active(
+            out_source,
+            None,
+            out_act,
+            config.GDNMode.PER_SEQ,
+            distribution[-1] > distribution[0],
+        )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
-    # The first segment holds verify windows of up to `num_spec_tokens + 1`
-    # tokens, or plain 1-token decodes without speculative decoding.
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    # Phase 1: Decode pass over sequences [0, distribution[0])
+    out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+        conv_state,
+        recurrent_state,
+        None,
+        config.GDNMode.BATCHED,
+        distribution[0] > 0,
+    )
+
+    # Phase 2: Prefill/mixed pass over sequences
+    # [distribution[0], distribution[-1])
+    out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+        out_conv_state,
+        out_recurrent_state,
+        out_act,
+        config.GDNMode.PER_SEQ,
+        distribution[-1] > distribution[0],
+    )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
