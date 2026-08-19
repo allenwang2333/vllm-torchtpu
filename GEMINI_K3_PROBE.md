@@ -11,6 +11,26 @@ Branch to use: **`shriharim/k3-spec-probe`**
 
 ---
 
+## Model and topology — read this first
+
+**Use Kimi-Linear-48B-A3B, not Kimi K3.** Do not wait for a 32-chip v7 slice and
+do not use XPK for this. Whatever topology CDK can give you now is fine; TP=4 or
+TP=8 is plenty.
+
+Kimi-Linear and Kimi K3 are served by the same code in this repo: the same
+`KimiDeltaAttention` layer, the same `decode_kda` / `chunk_kda` Pallas kernels,
+and the same speculative-decode guard. Everything this probe measures is
+therefore identical between them, at a fraction of the memory. K3 needs roughly
+115 GB per rank for weights alone.
+
+If a large slice happens to be free and a K3 checkpoint is already staged, a
+third run on K3 is a bonus — but it is not required, and it must not delay
+Runs A and B.
+
+Record which model and topology you actually used in your reply.
+
+---
+
 ## What this branch changes
 
 1. Adds `src/vllm_torchtpu/_k3_probe.py`, a defensive diagnostic module. All of
@@ -119,8 +139,7 @@ grep -A 40 'Traceback (most recent call last)' <run-B-log> | head -120
 - Do not inline a GitHub token into a clone URL. Use the existing secret or the
   mounted checkout.
 - Do not modify kernel code. This job is measurement only.
-- If the 32-core slice is unavailable, run both configurations at whatever
-  smaller topology is free and say which topology you used — relative numbers
-  are still useful.
+- Do not wait for a large allocation. A small topology running Kimi-Linear
+  answers every question this probe asks.
 - If Run A and Run B cannot share a job, run them as two jobs and label the logs
   clearly.
