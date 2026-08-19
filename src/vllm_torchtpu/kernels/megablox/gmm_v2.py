@@ -23,6 +23,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Width of the k slice the kernel re-derives an lhs quantization scale over.
+# Input quantization involves reading all elements in a block to compute the
+# scale value. Since this operation is very memory intensive, we use a block
+# size that is small enough to minimize memory overhead but large enough to
+# minimize compute overhead of quantization.
+# distributed/fp8_wire.py names this width to say what its per-row scale trades
+# away: a wire quantized on these blocks would hand this kernel the scale it is
+# about to derive, instead of a second rounding.
+LHS_QUANT_BLOCK_SIZE = 512
+
 # Util.
 
 
@@ -1231,11 +1241,7 @@ def make_gmm_configs(
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
-        # Input quantization involves reading all elements in a block to compute
-        # scale value. Since this operation is very memory intensive, we use a
-        # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        quant_block_size=LHS_QUANT_BLOCK_SIZE,
         dtype=lhs.dtype,
     )
 

@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_DISPATCH_FP8: bool = False
+    TPU_MOE_DISPATCH_FP8_WIRE: str = "fp8"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -292,6 +294,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Send the MoE dispatch all-gather over ICI as fp8 (e4m3) rows plus a
+    # per-row fp32 scale, dequantized to the activation dtype immediately
+    # after the collective, halving the dispatch payload under DP+EP. The
+    # rows are rounded to fp8 one step later anyway, inside gmm_v2's lhs
+    # quantizer, so only the scale granularity changes (per row here vs per
+    # row x 512-wide k block there). Off by default; see
+    # distributed/fp8_wire.py.
+    "TPU_MOE_DISPATCH_FP8":
+    env_bool("TPU_MOE_DISPATCH_FP8"),
+
+    # Wire form for the fp8 dispatch payload. "fp8" sends the rows and their
+    # scales as two collectives; "uint8" packs both into one, saving a
+    # collective's fixed cost and losing the async, sparsecore-offloaded form
+    # that lets the gather overlap the compute it sits between. Kept selectable
+    # so the two can be measured against each other; the packed form measured
+    # -60.8% and -61.5% on device.
+    "TPU_MOE_DISPATCH_FP8_WIRE":
+    env_with_choices("TPU_MOE_DISPATCH_FP8_WIRE", "fp8", ["fp8", "uint8"]),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
