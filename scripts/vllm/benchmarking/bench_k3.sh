@@ -128,13 +128,27 @@ if [ "$RANK" != "0" ]; then
   vllm serve "$TARGET" "${SERVE[@]}" --headless > "$RESULTS_DIR/worker.log" 2>&1 &
   WORKER_PID=$!
   LEADER_WAS_UP=0
+  WAITED=0
+  # A leader that never comes up at all must still release this rank. Without a
+  # bound the latch below waits forever, the rank keeps its chips, and in a
+  # multi-arm run the NEXT arm's rendezvous then fails with "3/4 clients
+  # joined" -- one dead arm silently kills every arm after it. Measured once.
+  LEADER_WAIT_MAX="${LEADER_WAIT_MAX:-2700}"
   while true; do
-    sleep 20
+    sleep 20; WAITED=$((WAITED + 20))
     kill -0 "$WORKER_PID" 2>/dev/null || { echo "rank $RANK: worker exited"; break; }
     if curl -sf --max-time 5 "http://${LEADER_ADDR}:${PORT}/health" >/dev/null 2>&1; then
       LEADER_WAS_UP=1
     elif [ "$LEADER_WAS_UP" = "1" ]; then
       echo "rank $RANK: leader went away, shutting down"
+      kill -TERM "$WORKER_PID" 2>/dev/null || true
+      sleep 10; kill -9 "$WORKER_PID" 2>/dev/null || true
+      break
+    elif [ "$WAITED" -ge "$LEADER_WAIT_MAX" ]; then
+      echo "rank $RANK: leader never came up within ${LEADER_WAIT_MAX}s, giving up"
+      echo "rank $RANK: tail of worker.log ----"
+      tail -40 "$RESULTS_DIR/worker.log" 2>/dev/null
+      echo "rank $RANK: ---- end worker.log"
       kill -TERM "$WORKER_PID" 2>/dev/null || true
       sleep 10; kill -9 "$WORKER_PID" 2>/dev/null || true
       break
@@ -168,7 +182,17 @@ T0=$SECONDS
 MAXWAIT=$(( ${SERVER_READY_WAIT_MIN:-40} * 60 ))
 until curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
   (( SECONDS - T0 > MAXWAIT )) && { echo "TIMEOUT after $((SECONDS-T0))s"; tail -120 "$RESULTS_DIR/server.log"; exit 1; }
-  kill -0 "$SERVER_PID" 2>/dev/null || { echo "!!! server died"; tail -120 "$RESULTS_DIR/server.log"; exit 1; }
+  # On multi-host the leader's traceback ends at "WorkerProc initialization
+  # failed ... in a background process", which names no cause; the cause is in
+  # this rank's own worker log. Print both or the failure is undiagnosable
+  # after the pod is collected.
+  kill -0 "$SERVER_PID" 2>/dev/null || {
+    echo "!!! server died"
+    tail -120 "$RESULTS_DIR/server.log"
+    [ -f "$RESULTS_DIR/worker.log" ] && {
+      echo "---- worker.log (this rank) ----"
+      tail -60 "$RESULTS_DIR/worker.log"; }
+    exit 1; }
   (( (SECONDS - T0) % 180 == 0 )) && echo "[$((SECONDS-T0))s] booting..."
   sleep 10
 done
