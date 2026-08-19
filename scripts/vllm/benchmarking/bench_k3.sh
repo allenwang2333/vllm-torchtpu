@@ -224,10 +224,32 @@ READY_S=$((SECONDS-T0)); echo "SERVER READY after ${READY_S}s"
 
 bench () {   # $1=isl $2=osl $3=concurrency $4=label
   local isl=$1 osl=$2 conc=$3 label=$4
+  # Dataset selection. The default `random` generates independent prompts, which
+  # is right for measuring steady-state decode but makes prefix caching
+  # unmeasurable by construction: there is no shared prefix to hit, so the
+  # feature reads as null whether or not it works.
+  #
+  # `prefix_repetition` builds NUM_PREFIXES distinct prefixes and reuses each
+  # across num_prompts/NUM_PREFIXES requests, so every request after the first
+  # of its group should hit. isl is split prefix/suffix -- the suffix is the
+  # unique part, so a long prefix and short suffix is the agentic shape where
+  # caching is worth the most.
+  local DS=()
+  case "${BENCH_DATASET:-random}" in
+    prefix_repetition)
+      local pfx="${PREFIX_LEN:-$(( isl - ${SUFFIX_LEN:-256} ))}"
+      DS=(--dataset-name prefix_repetition
+          --prefix-repetition-prefix-len "$pfx"
+          --prefix-repetition-suffix-len "${SUFFIX_LEN:-256}"
+          --prefix-repetition-output-len "$osl"
+          --prefix-repetition-num-prefixes "${NUM_PREFIXES:-4}") ;;
+    *)
+      DS=(--dataset-name random --random-input-len "$isl"
+          --random-output-len "$osl" --random-range-ratio 0.0) ;;
+  esac
   vllm bench serve --host 127.0.0.1 --port "$PORT" \
     --model "$MODEL" --trust-remote-code \
-    --dataset-name random --random-input-len "$isl" --random-output-len "$osl" \
-    --random-range-ratio 0.0 \
+    "${DS[@]}" \
     --num-prompts $(( conc * ${PROMPTS_PER_CONC:-5} )) \
     --max-concurrency "$conc" --request-rate inf \
     --temperature "${BENCHMARK_TEMPERATURE:-0}" --ignore-eos --seed 42 \
@@ -242,6 +264,10 @@ for cell in ${ISL_OSL_CONFIGS}; do
     bench "$isl" "$osl" "$conc" "warmup_isl${isl}_osl${osl}_c${conc}" >/dev/null 2>&1
     echo "########## BENCH isl=$isl osl=$osl c=$conc ##########"
     bench "$isl" "$osl" "$conc" "isl${isl}_osl${osl}_c${conc}"
+    # The verdict on a prefix-caching arm is the hit rate, not the latency: a
+    # latency win with a 0% hit rate is something else moving.
+    grep -o "Prefix cache hit rate: [0-9.]*%" "$RESULTS_DIR/server.log" 2>/dev/null \
+      | tail -1 | sed "s/^/HITRATE isl${isl}_osl${osl}_c${conc} /"
   done
 done
 
