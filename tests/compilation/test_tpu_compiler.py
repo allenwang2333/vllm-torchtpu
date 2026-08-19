@@ -268,3 +268,60 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_tpu_compiler_adaptor_load_direct_executable(self, tmp_path):
+        """Verify that TpuCompilerAdaptor.load directly returns the unpickled executable without re-tracing."""
+        import pickle
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilationHandle, TpuCompilerAdaptor)
+
+        class MockExecutable:
+
+            def __call__(self, x):
+                return x * 2
+
+        mock_exe = MockExecutable()
+        handle_path = tmp_path / "mock_handle.pkl"
+        handle_data = TpuCompilationHandle(
+            key="test_key",
+            tier3_cache_active=True,
+            executable=mock_exe,
+        )
+        with open(handle_path, "wb") as f:
+            pickle.dump(handle_data, f)
+
+        adaptor = TpuCompilerAdaptor()
+        adaptor.initialize_cache(cache_dir=str(tmp_path))
+
+        # Test loading unwrapped
+        loaded_fn = adaptor.load(
+            handle=("test_key", str(handle_path), False),
+            graph=None,
+            example_inputs=[],
+            graph_index=0,
+            compile_range=(512, 512),
+        )
+        assert loaded_fn(10) == 20
+
+        # Test loading with tuple unwrapping (was_wrapped=True)
+        class MockTupleExecutable:
+
+            def __call__(self, x):
+                return (x * 3, )
+
+        tuple_handle_path = tmp_path / "mock_tuple_handle.pkl"
+        with open(tuple_handle_path, "wb") as f:
+            pickle.dump(
+                TpuCompilationHandle(key="tuple_key",
+                                     tier3_cache_active=True,
+                                     executable=MockTupleExecutable()), f)
+
+        loaded_tuple_fn = adaptor.load(
+            handle=("tuple_key", str(tuple_handle_path), True),
+            graph=None,
+            example_inputs=[],
+            graph_index=0,
+            compile_range=(512, 512),
+        )
+        assert loaded_tuple_fn(10) == 30
