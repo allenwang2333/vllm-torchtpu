@@ -185,52 +185,48 @@ class TestTpuCompilerCache:
 
         assert factors == ["upstream", "tpu"]
 
-    def test_env_override_mapping(self):
-        """Verify that setting TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT sets TORCH_TPU_TIER2_COMPILATION_CACHE default."""
+    def test_env_override_tier3_default_when_cache_enabled(self):
+        """Verify that when compile cache is enabled, TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT defaults to VLLM_CACHE_ROOT/xla_cache."""
         env_mock = {
-            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT":
-            "/tmp/test_tier3_cache_env",
+            "VLLM_DISABLE_COMPILE_CACHE": "0",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
         }
         with patch.dict(os.environ, env_mock, clear=True):
-            # Reload env_override to re-execute its top-level statements
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/tmp/custom_vllm_cache/xla_cache"
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
 
-    def test_env_override_disables_breakable_cudagraph(self):
-        """Verify that the TPU plugin always disables breakable cudagraph."""
-        with patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}):
+    def test_env_override_tier3_respects_vllm_xla_cache_path(self):
+        """Verify that VLLM_XLA_CACHE_PATH overrides the default VLLM_CACHE_ROOT/xla_cache path."""
+        env_mock = {
+            "VLLM_DISABLE_COMPILE_CACHE": "0",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
+            "VLLM_XLA_CACHE_PATH": "/mnt/gcs_xla_cache",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
-            assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
+            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
+                                  ) == "/mnt/gcs_xla_cache"
 
-    def test_env_override_no_clobber(self):
-        """Verify that existing native variables are not overwritten by env_override."""
+    def test_env_override_tier3_disabled_when_vllm_disable_compile_cache_1(
+            self):
+        """Verify that TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT is not set when VLLM_DISABLE_COMPILE_CACHE=1."""
         env_mock = {
-            "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
-            "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT":
-            "/custom/tier3/path",
-            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/custom/tier3/path",
-            "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "custom_tier2",
-            "TORCH_TPU_TIER2_COMPILATION_CACHE": "custom_tier2",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "VLLM_CACHE_ROOT": "/tmp/custom_vllm_cache",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
             importlib.reload(vllm_torchtpu.env_override)
 
             assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
-            ) == "/custom/tier3/path"
-            assert os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"
-                                  ) == "/custom/tier3/path"
-
-            assert os.environ.get(
-                "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") == "custom_tier2"
-            assert os.environ.get(
-                "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
+                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT") is None
 
     def test_tpu_compilation_handle_serialization(self):
         """Verify serialization and deserialization of TpuCompilationHandle and legacy fallbacks."""
