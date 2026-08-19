@@ -34,7 +34,12 @@ _DECODE_BLOCKS = configs.BlockSizes(bq_sz=1,
                                     batch_size=8,
                                     n_buffer=3)
 
-_LAYOUTS = [configs.KVLayout.HEAD_ALONG_SUBLANE]
+# Both layouts: the writeback address arithmetic is shared, but SEQ_ALONG_LANE
+# packs the sequence on the lane axis, so it lands new KV through a different
+# offset computation and needs its own coverage.
+_LAYOUTS = [
+    configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE
+]
 
 
 def _cdiv(a, b):
@@ -180,14 +185,27 @@ def test_writeback_touches_only_the_new_token_lane(kv_layout, kv_lens):
     _, out_cache = jax.block_until_ready(_run(b))
     after = np.asarray(out_cache.astype(jnp.float32))
 
+    seq_on_lane = kv_layout == configs.KVLayout.SEQ_ALONG_LANE
     allowed = np.zeros(
-        before.shape[0::4]
-        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else before.shape[0:2],
-        dtype=bool)
+        before.shape[0::4] if seq_on_lane else before.shape[0:2], dtype=bool)
     for page, lane in slots:
         allowed[page, lane] = True
 
-    if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    if seq_on_lane:
+        # This layout puts the sequence on the lane axis and writes a whole
+        # lane block at a time, so the unused tail of a sequence's last page
+        # gets rewritten as a side effect. Those lanes sit past kv_len and are
+        # never read; what must not move is live data, which
+        # test_live_tokens_are_preserved asserts directly. Allow the dead tail
+        # here rather than weakening the invariant for the other layout.
+        for seq, kv_len in enumerate(kv_lens):
+            last = kv_len - 1
+            for page_in_seq in range(b["pages_per_seq"]):
+                page = int(b["page_indices"][seq * b["pages_per_seq"] +
+                                             page_in_seq])
+                first_dead = last + 1 - page_in_seq * PAGE_SIZE
+                if first_dead < PAGE_SIZE:
+                    allowed[page, max(first_dead, 0):] = True
         changed = np.any(after != before, axis=(1, 2, 3))
     else:
         changed = np.any(after != before, axis=(2, 3, 4))

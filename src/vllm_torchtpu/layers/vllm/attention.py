@@ -11,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
-                                       MLAAttentionImpl, MultipleOf)
+                                       MLAAttentionImpl)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
@@ -454,9 +454,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Any multiple of 128 is a valid page size for this kernel (with or without
-    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
-    so the auto-selected default (no `--block-size` given) stays at 256.
+    Declares `get_supported_kernel_block_sizes() -> [256]` so vLLM's standard
+    `get_preferred_block_size` flow picks the right block size automatically.
+    256 is not merely a tile-alignment choice: both batched-RPA kernels address
+    KV pages with shift/mask arithmetic derived from `page_size`
+    (`configs.ServingConfigs.page_size_log2` / `page_size_mask`), so the page
+    size must be a power of two. Advertising `MultipleOf(128)` here would let
+    the hybrid GDN pool hand the kernel its 4224-token state-fit block as an
+    exact kernel block, and the writeback addresses would silently be wrong.
     """
 
     @staticmethod
@@ -494,8 +499,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        if envs.USE_BATCHED_RPA_LONGCTX:
-            return [MultipleOf(128)]
         return [256]
 
     @staticmethod

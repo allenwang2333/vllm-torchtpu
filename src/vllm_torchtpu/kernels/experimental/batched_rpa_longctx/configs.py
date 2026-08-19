@@ -373,6 +373,16 @@ class RpaConfigs:
     ):
         """Validate inputs to the RPA kernel statically."""
 
+        # KV writeback addresses are built with `page_size_log2` shifts and
+        # `page_size_mask` ands, so a page size that is not a power of two
+        # silently lands new KV on the wrong page. Both layouts share that
+        # arithmetic, so this check is not layout-specific.
+        if self.serve.page_size & (self.serve.page_size - 1):
+            raise ValueError(
+                "Expected page_size to be a power of two -- KV writeback "
+                "addressing is shift/mask based -- but got "
+                f"{self.serve.page_size=}")
+
         if not q.ndim == k.ndim == v.ndim == 3:
             raise ValueError(
                 f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")
