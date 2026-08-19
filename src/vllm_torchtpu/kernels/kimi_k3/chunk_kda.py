@@ -5,16 +5,21 @@
 Adated from the implementation from the following tokamax PR:
 https://github.com/openxla/tokamax/pull/1103
 
-Two Pallas passes over a shared (sequence, tile) grid:
+The work splits into two halves:
 
-1. ``pallas_kda_fwd_intra_fused`` -- gate activation, chunk-local prefix sum and
-   the intra-chunk solve, producing ``w/u/kg/Aqk/g_cumsum`` per chunk.
-2. ``chunk_kda_fwd_h_o_varlen`` -- the inter-chunk recurrence and the output.
+1. gate activation, chunk-local prefix sum and the intra-chunk solve, producing
+   ``w/u/kg/Aqk/g_cumsum`` per chunk;
+2. the inter-chunk recurrence and the output.
 
-Both grid over ``(head block, batch, tile)``, where a tile holds up to
+Both halves grid over ``(head block, batch, tile)``, where a tile holds up to
 ``chunk_size`` tokens of exactly one segment. The tile axis is static at the
 worst-case tile count while a device-valued ``num_tiles`` bounds the real work,
 so padding the runner's request axis costs skipped tiles rather than real ones.
+
+They run as a single Pallas call, ``chunk_kda_fwd_fused``. Since both halves
+walk the *same* grid and half 2 at tile ``p`` reads half 1 only at tile ``p``
+(the sole cross-tile dependency is the recurrent state, which already lives in
+a VMEM scratch), the six per-chunk tensors never have to reach HBM at all.
 """
 
 from __future__ import annotations
@@ -233,7 +238,7 @@ def _fused_gate_intra_tile(
     dt_b,  # [MB, K] float32
     r_size,  # device scalar
     *,
-    out_dtype,
+    activation_dtype,
     chunk_size: int,
     head_dim: int,
     value_dim: int,
@@ -252,11 +257,14 @@ def _fused_gate_intra_tile(
   first -- see the mask comment below for why that is the correct padding value
   and why the gate has to be masked *after* activation.
 
+  Everything returned stays float32: nothing crosses an HBM boundary between
+  the halves, so there is no narrow tensor to round to.
+
   Args:
-      out_dtype: the caller's activation dtype. The staged inputs arrive in
-          float32 (see the staging note in ``pallas_kda_fwd_intra_fused``), so
-          the dtype the results belong in has to be passed in rather than read
-          off ``q``.
+      activation_dtype: the caller's activation dtype, which is what selects
+          the solve. Passed in rather than read off ``q``, because the staged
+          inputs arrive already widened to float32 (see the staging note in
+          ``chunk_kda_fwd_fused``) and so no longer carry it.
       r_size: rows of this tile that hold real tokens, ``<= chunk_size``.
       mini_batch: number of heads processed per grid point (MB).
 
@@ -264,10 +272,10 @@ def _fused_gate_intra_tile(
       ``(u, w, kg, Aqk, g_cumsum, q_masked)``; the last is ``q`` with its padded
       rows zeroed, which stage 3+4 needs in the same masked form.
   """
-    dtype = out_dtype
     BT = chunk_size
     BC = 16
     NC = BT // BC
+    BC_diag = 8
     K = head_dim
     V = value_dim
     MB = mini_batch
@@ -349,8 +357,15 @@ def _fused_gate_intra_tile(
     # matmul: there both exponents are provably <= 0 as well, because
     # g_cumsum[t] >= gn_ref for t < i_s and g_i[r] <= gn_ref for r >= i_s.
     #
-    # This costs the single fused matmul on the diagonal blocks (NC of them, each
-    # BC x BC x K) in exchange for being numerically valid at any gate
+    # Note what makes that second case safe: the reference row sits *between*
+    # r and t. That holds at any granularity, not just at the sub-block
+    # boundary, so `_diag_block` below recurses -- it bisects the diagonal
+    # block and factors the off-diagonal half through the row on the seam,
+    # leaving only BC_diag x BC_diag leaves genuinely pairwise. The pairwise
+    # path costs BC_diag * K of vector work per row, so each level of bisection
+    # halves the dominant term; the leaf size is a tuning knob, not a
+    # correctness one.
+    #
     # PRECONDITION: the activated gate is <= 0, i.e. `lower_bound` (when given)
     # is negative. `chunk_kda` validates this.
     #
@@ -370,6 +385,72 @@ def _fused_gate_intra_tile(
             (((2, ), (1, )), ((0, ), (0, ))),
             preferred_element_type=jnp.float32,
         )
+
+    def _diag_block(q_i, k_i, g_i, size):
+        """Causal ``q @ k^T`` and ``k @ k^T`` over a [size, size] diagonal block.
+
+        Both are returned unmasked; the caller applies the causal/strict masks.
+        Bisects down to ``BC_diag`` rows, where the per-channel decay is applied
+        pairwise. See the discussion above for why the recursive step is
+        overflow-free at any gate magnitude.
+
+        ``size`` is a Python int, so the whole recursion unrolls at trace time
+        and Mosaic sees straight-line code -- no dynamic control flow.
+        """
+        # Base case: a BC_diag-row leaf, small enough that the pairwise decay
+        # is affordable. One iteration per row, so BC_diag=8 means 8 steps.
+        if size <= BC_diag:
+            rows_q = []
+            rows_k = []
+            for r in range(size):
+                # g_i[r] - g_i[t] <= 0 for t <= r; the clamp is a no-op there
+                # and hard bounds the exponent for the masked-away t > r.
+                kw = k_i * jnp.exp2(jnp.minimum(g_i[:, r:r + 1, :] - g_i, 0.0))
+                rows_q.append(_mv_k(kw, q_i[:, r, :])[:, None, :])  # [MB,1,sz]
+                rows_k.append(_mv_k(kw, k_i[:, r, :])[:, None, :])
+            return (jnp.concatenate(rows_q, axis=1),
+                    jnp.concatenate(rows_k, axis=1))
+
+        # Recursive step. Split into halves and handle the three surviving
+        # quadrants separately; at size=BC=16 this is the only level, h=8.
+        h = size // 2
+
+        # Quadrants [0, h)x[0, h) and [h, size)x[h, size) are themselves
+        # diagonal blocks, one level smaller. Recurse.
+        q00, k00 = _diag_block(q_i[:, :h], k_i[:, :h], g_i[:, :h], h)
+        q11, k11 = _diag_block(q_i[:, h:], k_i[:, h:], g_i[:, h:], h)
+
+        # Quadrant [h, size)x[0, h) is entirely below the diagonal, so every
+        # pair in it is causal and the decay can be factored through the seam
+        # row g_i[h] -- which lies between r and t for every pair here, making
+        # both exponents <= 0: for r >= h, g_i[r] - g_i[h] <= 0, and for t < h,
+        # g_i[h] - g_i[t] <= 0. That is what buys the matmul.
+        ref = g_i[:, h:h + 1, :]  # [MB, 1, K]
+        lo = k_i[:, :h] * jnp.exp2(jnp.minimum(ref - g_i[:, :h], 0.0))
+        hi_e = jnp.exp2(jnp.minimum(g_i[:, h:] - ref, 0.0))
+        # q and k contract against the same `lo`, so stack them into one MXU
+        # call rather than two: [MB, 2h, K] x [MB, h, K] over the channel axis.
+        cross = jax.lax.dot_general(
+            jnp.concatenate([q_i[:, h:] * hi_e, k_i[:, h:] * hi_e], axis=1),
+            lo,
+            (((2, ), (2, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32,
+        )  # [MB, 2*h, h]
+
+        # The [0, h) x [h, size) corner is above the diagonal; the caller masks
+        # it away, so fill it with zeros rather than computing it.
+        zero = jnp.zeros((MB, h, h), jnp.float32)
+
+        def _assemble(top_left, bot_left, bot_right):
+            # Stitch the four quadrants back into one [MB, size, size] block.
+            return jnp.concatenate([
+                jnp.concatenate([top_left, zero], axis=2),
+                jnp.concatenate([bot_left, bot_right], axis=2),
+            ],
+                                   axis=1)
+
+        return (_assemble(q00, cross[:, :h], q11),
+                _assemble(k00, cross[:, h:], k11))
 
     Aqk_rows = []
     L_rows = []
@@ -403,18 +484,7 @@ def _fused_gate_intra_tile(
         Akk_row = qk_dot[:, BC:]  # [MB, BC, BT]
 
         # --- diagonal block t in [i_s, i_s + BC): exact per-channel decay ---
-        aqk_diag_rows = []
-        akk_diag_rows = []
-        for r in range(BC):
-            # g_i[r] - g_i[t] <= 0 for t <= r; the clamp is a no-op there and hard
-            # bounds the exponent for the masked-away t > r entries.
-            kw = k_i * jnp.exp2(jnp.minimum(g_i[:, r:r + 1, :] - g_i, 0.0))
-            aqk_diag_rows.append(_mv_k(kw, q_i[:,
-                                               r, :])[:,
-                                                      None, :])  # [MB, 1, BC]
-            akk_diag_rows.append(_mv_k(kw, k_i[:, r, :])[:, None, :])
-        Aqk_diag = jnp.concatenate(aqk_diag_rows, axis=1)  # [MB, BC, BC]
-        Akk_diag = jnp.concatenate(akk_diag_rows, axis=1)  # [MB, BC, BC]
+        Aqk_diag, Akk_diag = _diag_block(q_i, k_i, g_i, BC)  # [MB, BC, BC]
         Aqk_diag = jnp.where(causal_bc, Aqk_diag, jnp.float32(0.0))
         Akk_diag = jnp.where(strict_bc, Akk_diag, jnp.float32(0.0))
 
@@ -438,7 +508,7 @@ def _fused_gate_intra_tile(
         Aqk_rows.append(Aqk_row)
         L_rows.append(Akk_row)
 
-    Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
+    Aqk = jnp.concatenate(Aqk_rows, axis=1)  # [MB, BT, BT]
     L = jnp.concatenate(L_rows, axis=1)  # [MB, BT, BT]
 
     # --- Solve (I + L) x = rhs ---
@@ -455,7 +525,7 @@ def _fused_gate_intra_tile(
             preferred_element_type=jnp.float32,
         )
 
-    use_neumann = dtype != jnp.float32
+    use_neumann = activation_dtype != jnp.float32
 
     if use_neumann:
         # --- Neumann series inversion ---
@@ -524,15 +594,23 @@ def _fused_gate_intra_tile(
     g_last = g_cumsum[:, BT - 1:BT, :]  # [MB, 1, K]
     kg = k_f32 * exp2(g_last - g_cumsum)
 
-    return u, w, kg, Aqk, g_cumsum, q_f32.astype(dtype)
+    return u, w, kg, Aqk, g_cumsum, q_f32
 
 
-def _fused_gate_intra_kernel(
+# =============================================================================
+# Megakernel: gate + intra-chunk solve + recurrence + output, in one pass
+# =============================================================================
+
+
+def _chunk_kda_fwd_fused_kernel(
     # Scalar prefetch: the tile plan.
     num_tiles_ref,  # [B]
     r_base_ref,  # [B, NT]
     r_size_ref,  # [B, NT]
-    # Inputs, as whole-array HBM refs over the *unaligned* token axis.
+    s_idx_ref,  # [B, NT] -- consumed by the state index maps, not the body
+    is_first_ref,  # [B, NT]
+    is_last_ref,  # [B, NT]
+    # Activations, as whole-array HBM refs over the *unaligned* token axis.
     q_hbm,  # [H, B, T, K]
     k_hbm,  # [H, B, T, K]
     g_hbm,  # [H, B, T, K]
@@ -541,57 +619,74 @@ def _fused_gate_intra_kernel(
     # Per-head gate parameters.
     A_log_ref,  # [MB, 1, 1, 1, 1]
     dt_bias_ref,  # [MB, 1, 1, 1, K]
-    # Outputs, in tile layout.
-    u_out_ref,  # [MB, 1, 1, BT, V]
-    w_out_ref,  # [MB, 1, 1, BT, K]
-    kg_out_ref,  # [MB, 1, 1, BT, K]
-    Aqk_out_ref,  # [MB, 1, 1, BT, BT]
-    g_cumsum_out_ref,  # [MB, 1, 1, BT, K]
-    q_out_ref,  # [MB, 1, 1, BT, K]
-    # Scratch: one float32 staging buffer per input, plus a DMA semaphore.
-    q_buf,  # [MB, 1, BT, K]
+    _o_in,  # the zero-filled output, aliased; written through o_ref
+    h0_ref,  # [1, 1, MB, K, V] or None
+    # Outputs.
+    o_ref,  # [H, B, T, V] whole-array HBM ref
+    ht_ref,  # [1, 1, MB, K, V] or None
+    # Scratch.
+    q_buf,  # [MB, 1, BT, K] float32 staging
     k_buf,  # [MB, 1, BT, K]
     g_buf,  # [MB, 1, BT, K]
     beta_buf,  # [MB, 1, BT, 1]
     v_buf,  # [MB, 1, BT, V]
-    sem,
+    h_scratch,  # [MB, K, V] float32 recurrent state
+    o_buf,  # [MB, 1, BT, V] float32 output staging
+    sem_in,
+    sem_out,
     *,
     chunk_size: int,
+    scale: float,
+    use_initial_state: bool,
+    store_final_state: bool,
     mini_batch: int,
+    output_precision,
     **tile_kwargs,
 ):
-    """Stage the tile's rows out of HBM, then run the intra-chunk solve.
+    """Both halves of the algorithm for one tile, at one grid point.
 
-  The grid is (head block, batch, tile) and the tile axis is static at
-  ``max_tiles``; ``num_tiles`` bounds what the batch actually needs. A tile
-  starts at an arbitrary token row, which no ``BlockSpec`` index map can
-  address, so the activations arrive as whole-array HBM refs and this kernel
-  issues its own DMAs at ``r_base``.
+  This used to be two Pallas calls, splitting here: half 1 wrote
+  ``u/w/kg/Aqk/g_cumsum/q`` to HBM in tile layout and half 2 read them back.
+  That boundary buys nothing -- the grids are identical, ``p`` is the innermost
+  (sequential) axis in both, and half 2 at tile ``p`` touches half 1's results
+  only at tile ``p``. The one genuine cross-tile dependency is the recurrent
+  state, and that was already a VMEM scratch rather than a tensor. So the six
+  intermediates become live values and the round trip disappears.
+
+  It is close to VMEM-neutral, which is the part that makes it cheap: those six
+  tensors cost *twelve* double-buffered pipeline windows across the two calls
+  (six out, six in) and are replaced by one copy of each value.
+
+  The intermediates also get wider for free: the HBM boundary used to round
+  them to the activation dtype, and now there is no narrow tensor to round to,
+  so they stay float32 all the way through.
   """
-    head_block = pl.program_id(0) * mini_batch
+    del _o_in, s_idx_ref
+    BT = chunk_size
+    MB = mini_batch
+    K = q_buf.shape[-1]
+    V = v_buf.shape[-1]
+
+    head_block = pl.program_id(0) * MB
     i_b = pl.program_id(1)
     p_id = pl.program_id(2)
-    num_tiles = num_tiles_ref[i_b]
 
-    # Tiles past the batch's real content are skipped, which leaves their slice
-    # of every output holding whatever the pipeline last had. Stage 3+4 skips the
-    # same tiles, so nothing reads it -- and even if it did not, those tiles
-    # carry `r_size` 0 and neither first- nor last-tile flag, so they would
-    # write no output rows and touch no state. A stage that starts *depending* on
-    # these values, rather than merely reading them, has to zero them here.
-    @pl.when(p_id < num_tiles)
-    def _():
+    def _tile():
         r_base = r_base_ref[i_b, p_id]
         r_size = r_size_ref[i_b, p_id]
-        # Exactly the rows the tile owns. Rows past `r_size` keep whatever the
-        # previous tile left in the buffer, which the solve masks off.
+
+        # --- Stage the tile's rows out of HBM ---
+        # A tile starts at an arbitrary token row, which no BlockSpec index map
+        # can address, so the activations arrive as whole-array HBM refs and
+        # this kernel issues its own DMAs at `r_base`. Rows past `r_size` keep
+        # whatever the previous tile left behind; the solve masks them off.
         copies = [
             pltpu.make_async_copy(
-                src.at[pl.ds(head_block, mini_batch),
+                src.at[pl.ds(head_block, MB),
                        pl.ds(i_b, 1),
                        pl.ds(r_base, r_size)],
                 dst.at[:, :, pl.ds(0, r_size)],
-                sem,
+                sem_in,
             ) for src, dst in (
                 (q_hbm, q_buf),
                 (k_hbm, k_buf),
@@ -605,7 +700,8 @@ def _fused_gate_intra_kernel(
         for copy in copies:
             copy.wait()
 
-        u, w, kg, Aqk, g_cumsum, q_masked = _fused_gate_intra_tile(
+        # --- Half 1: gate activation, cumsum, intra-chunk solve ---
+        b_u, b_w, b_kg, b_A, b_g, b_q = _fused_gate_intra_tile(
             q_buf[:, 0],
             k_buf[:, 0],
             g_buf[:, 0],
@@ -614,366 +710,99 @@ def _fused_gate_intra_kernel(
             A_log_ref[:, 0, 0, 0, 0],
             dt_bias_ref[:, 0, 0, 0],
             r_size,
-            chunk_size=chunk_size,
-            mini_batch=mini_batch,
-            **tile_kwargs,
-        )
-        u_out_ref[:, 0, 0] = u.astype(u_out_ref.dtype)
-        w_out_ref[:, 0, 0] = w.astype(w_out_ref.dtype)
-        kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
-        Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
-        g_cumsum_out_ref[:, 0, 0] = g_cumsum
-        q_out_ref[:, 0, 0] = q_masked.astype(q_out_ref.dtype)
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "chunk_size",
-        "scale",
-        "cumsum_scale",
-        "use_gate_in_kernel",
-        "lower_bound",
-        "mini_batch",
-    ],
-)
-def pallas_kda_fwd_intra_fused(
-    q: jax.Array,  # [H, B, T, K]
-    k: jax.Array,  # [H, B, T, K]
-    v: jax.Array,  # [H, B, T, V]
-    g: jax.Array,  # [H, B, T, K]
-    beta: jax.Array,  # [H, B, T]
-    num_tiles: jax.Array,  # [B]
-    r_base: jax.Array,  # [B, NT]
-    r_size: jax.Array,  # [B, NT]
-    scale: float,
-    chunk_size: int = 64,
-    cumsum_scale: float = RCP_LN2,
-    A_log: jax.Array | None = None,  # [H]
-    dt_bias: jax.Array | None = None,  # [H*K]
-    use_gate_in_kernel: bool = False,
-    lower_bound: float | None = None,
-    mini_batch: int | None = None,
-) -> tuple[
-        jax.Array,  # w   [H, B, NT, BT, K]
-        jax.Array,  # u   [H, B, NT, BT, V]
-        jax.Array,  # kg  [H, B, NT, BT, K]
-        jax.Array,  # Aqk [H, B, NT, BT, BT]
-        jax.Array,  # g_cumsum [H, B, NT, BT, K]
-        jax.Array,  # q   [H, B, NT, BT, K]
-]:
-    """Fuse gate cumsum with the intra-chunk solve, one tile per grid point.
-
-    Takes the activations on the *unaligned* token axis and returns the derived
-    per-chunk quantities in tile layout, indexed ``[H, B, tile, row, channel]``.
-    That layout is what stage 3+4 wants anyway -- a tile index is a block index,
-    so it needs no gather -- and it is where the padding gather used to go.
-
-    `q` is returned alongside because stage 3+4 needs it with the same rows
-    masked; re-deriving it there would mean duplicating the staging DMAs.
-    """
-    H, B, _, K = q.shape
-    V = v.shape[-1]
-    BT = chunk_size
-    NT = r_base.shape[-1]
-    out_dtype = q.dtype
-
-    if use_gate_in_kernel:
-        assert A_log is not None, "A_log required when use_gate_in_kernel=True"
-
-    if mini_batch is None:
-        elem = out_dtype.itemsize
-        # Staged inputs (float32: q/k/g at K, v at V, beta lane-padded), the
-        # pipelined outputs, and the solve's [BT, BT] float32 temporaries.
-        # Under-counting here over-subscribes VMEM silently.
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        staged = (3 * BT * K + BT * V + BT * num_lanes) * 4
-        produced = (3 * BT * K + BT * V + BT * BT) * elem + BT * K * 4
-        per_head = staged + 2 * produced + 8 * BT * BT * 4
-        MB = estimate_mini_batch(per_head, H, max_mb=16)
-    else:
-        MB = mini_batch
-        assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
-
-    # A per-token scalar on a lane-minor axis cannot be DMA'd at an arbitrary
-    # row offset, so beta is carried with the token axis second-minor like the
-    # rest. It costs lane padding on a tensor 1/128th the size of the others.
-    beta_4d = beta[..., None]
-
-    # The staged tensors are float32, not the caller's bfloat16, because a tile
-    # starts at an arbitrary token row and Mosaic will only slice a *packed*
-    # memref at tile-aligned offsets and in tile-aligned sizes -- for bfloat16
-    # that means multiples of 8, and neither `query_start_loc[s] + t *
-    # chunk_size` nor a ragged tile's row count is. Unpacked 32-bit types have no
-    # such rule. The kernel casts every input to float32 immediately anyway, so
-    # this only moves that cast out of the tile loop; it costs one contiguous
-    # pass over the activations -- not the indexed gather over
-    # T + N * (chunk_size - 1) rows the alignment needed -- and 2x the DMA bytes.
-    q_s, k_s, g_s, v_s, beta_s = (x.astype(jnp.float32)
-                                  for x in (q, k, g, v, beta_4d))
-
-    if use_gate_in_kernel:
-        A_log_r = A_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
-        if dt_bias is not None:
-            dt_bias_r = dt_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
-        else:
-            dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
-    else:
-        A_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
-        dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
-
-    grid = (H // MB, B, NT)
-    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-
-    # Scalar prefetch adds three leading arguments to every index map.
-    def _out_spec(last_dim):
-        return pl.BlockSpec(
-            index_map=lambda i, j, p, *_: (i, j, p, 0, 0),
-            block_shape=(MB, 1, 1, BT, last_dim),
-        )
-
-    def _per_head_spec(last_dim):
-        return pl.BlockSpec(
-            index_map=lambda i, j, p, *_: (i, 0, 0, 0, 0),
-            block_shape=(MB, 1, 1, 1, last_dim),
-        )
-
-    def _tile_shape(last_dim, dtype):
-        return jax.ShapeDtypeStruct((H, B, NT, BT, last_dim), dtype)
-
-    u_r, w_r, kg_r, Aqk_r, g_cumsum_r, q_r = pl.pallas_call(
-        functools.partial(
-            _fused_gate_intra_kernel,
-            out_dtype=out_dtype,
             chunk_size=BT,
             head_dim=K,
             value_dim=V,
             scale=scale,
-            cumsum_scale=cumsum_scale,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
             mini_batch=MB,
-        ),
-        interpret=get_interpret(),
-        out_shape=[
-            _tile_shape(V, out_dtype),
-            _tile_shape(K, out_dtype),
-            _tile_shape(K, out_dtype),
-            _tile_shape(BT, out_dtype),
-            _tile_shape(K, jnp.float32),
-            _tile_shape(K, out_dtype),
-        ],
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
-            grid=grid,
-            in_specs=[
-                hbm_spec,  # q
-                hbm_spec,  # k
-                hbm_spec,  # g
-                hbm_spec,  # beta
-                hbm_spec,  # v
-                _per_head_spec(1),  # A_log
-                _per_head_spec(K),  # dt_bias
-            ],
-            out_specs=[
-                _out_spec(V),
-                _out_spec(K),
-                _out_spec(K),
-                _out_spec(BT),
-                _out_spec(K),
-                _out_spec(K),
-            ],
-            scratch_shapes=[
-                pltpu.VMEM((MB, 1, BT, K), jnp.float32),
-                pltpu.VMEM((MB, 1, BT, K), jnp.float32),
-                pltpu.VMEM((MB, 1, BT, K), jnp.float32),
-                pltpu.VMEM((MB, 1, BT, 1), jnp.float32),
-                pltpu.VMEM((MB, 1, BT, V), jnp.float32),
-                pltpu.SemaphoreType.DMA,
-            ],
-        ),
-        compiler_params=pltpu.CompilerParams(
-            # The tile axis carries the staging DMAs, so it stays sequential.
-            dimension_semantics=("parallel", "parallel", "arbitrary"),
-            disable_bounds_checks=True,
-        ),
-    )(num_tiles, r_base, r_size, q_s, k_s, g_s, beta_s, v_s, A_log_r,
-      dt_bias_r)
+            **tile_kwargs,
+        )
 
-    return w_r, u_r, kg_r, Aqk_r, g_cumsum_r, q_r
-
-
-# =============================================================================
-# Fused state propagation and output
-# =============================================================================
-
-
-def _chunk_kda_fwd_h_o_varlen_kernel(
-    # Scalar prefetch: the tile plan.
-    num_tiles_ref,  # [B]
-    r_base_ref,  # [B, NT]
-    r_size_ref,  # [B, NT]
-    s_idx_ref,  # [B, NT]
-    is_first_ref,  # [B, NT]
-    is_last_ref,  # [B, NT]
-    # Stage 3 inputs
-    w_ref,  # [MB, 1, 1, BT, K_PADSIZE]
-    u_ref,  # [MB, 1, 1, BT, V_ALIGNED]
-    kg_ref,  # [MB, 1, 1, BT, K_PADSIZE]
-    gk_ref,  # [MB, 1, 1, BT, K_PADSIZE]  -- g_cumsum
-    # Stage 4 inputs
-    q_ref,  # [MB, 1, 1, BT, K_PADSIZE]
-    A_ref,  # [MB, 1, 1, BT, BT]
-    _o_in,  # the zero-filled output, aliased; written through o_ref
-    # Optional initial state
-    h0_ref,  # [1, 1, MB, K_PADSIZE, V_ALIGNED] or None
-    # Outputs
-    o_ref,  # [H, B, T, V_ALIGNED] whole-array HBM ref
-    ht_ref,  # [1, 1, MB, K_PADSIZE, V_ALIGNED] or None
-    # Scratch
-    scratch_ref,  # [MB, K_PADSIZE, V_ALIGNED]
-    o_buf,  # [MB, 1, BT, V_ALIGNED]
-    sem,
-    *,
-    BT,
-    scale,
-    USE_INITIAL_STATE,
-    STORE_FINAL_STATE,
-    MB,
-    OUTPUT_PRECISION,
-):
-    """Fused Stage 3+4 Pallas kernel body, one tile per grid point.
-
-  Grid is (H // MB, B, NT). For each program point (h_group, i_b, p_id):
-    - MB heads [h_group*MB .. h_group*MB+MB) are processed per grid point
-      via batched matmuls over the MB dimension.
-    - p_id indexes the tile axis, static at NT; `num_tiles` bounds what the
-      batch actually needs, and tiles past it are skipped outright.
-    - A segment's tiles are consecutive p_ids, so `is_first` / `is_last` mark
-      where its recurrent state is read in and written back.
-
-  The per-chunk inputs arrive already in tile layout, which is BlockSpec-
-  addressable. Only the output is not: a tile's rows land at an arbitrary
-  offset on the token axis, so `o_ref` is a whole-array HBM ref this kernel
-  DMAs into. Rows no tile covers keep the zeros the caller passed in.
-  """
-    del _o_in
-    head_block = pl.program_id(0) * MB
-    i_b = pl.program_id(1)
-    p_id = pl.program_id(2)
-
-    K = w_ref.shape[-1]
-    V = u_ref.shape[-1]
-
-    def _tile():
-        # === Init state (first tile of THIS segment) — uniform across MB heads
+        # --- Half 2: inter-chunk recurrence and output ---
+        # Init state on the first tile of THIS segment.
         @pl.when(is_first_ref[i_b, p_id])
         def _():
-            scratch_ref[:] = jnp.zeros([MB, K, V], dtype=jnp.float32)
-            if USE_INITIAL_STATE:
-                scratch_ref[:] = h0_ref[0, 0].astype(jnp.float32)  # [MB, K, V]
+            if use_initial_state:
+                h_scratch[:] = h0_ref[0, 0].astype(jnp.float32)
+            else:
+                h_scratch[:] = jnp.zeros((MB, K, V), dtype=jnp.float32)
 
-        # === Stage 3+4 work — batched over MB heads ===
-        # h: pre-update state for all MB heads in this tile.
-        b_h = scratch_ref[:]  # [MB, K, V]
+        b_h = h_scratch[:]  # [MB, K, V] pre-update state
 
-        b_w = w_ref[:, 0, 0]  # [MB, BT, K]
-        b_u = u_ref[:, 0, 0]  # [MB, BT, V]
-
-        # Stage 3 delta correction: v_new = u - w @ h
-        # [MB, BT, K] @ [MB, K, V] -> [MB, BT, V]
-        # HIGHEST precision: v_new feeds the recursive state update directly.
-        b_v_new = b_u.astype(jnp.float32) - jnp.matmul(
-            b_w.astype(jnp.float32),
+        # Delta correction: v_new = u - w @ h.
+        # HIGHEST: v_new feeds the recursive state update directly.
+        b_v_new = b_u - jnp.matmul(
+            b_w,
             b_h,
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )  # [MB, BT, V]
 
-        # Stage 4 inter-chunk output:
-        #   scale * (q * exp2(g - g_ref)) @ (h * exp2(g_ref))
-        # Reference-point stabilization mirrors the production varlen kernel's
-        # g_ref = g[0] choice for bit-identical numerics.
-        b_q = q_ref[:, 0, 0]  # [MB, BT, K]
-        b_g = gk_ref[:, 0, 0].astype(jnp.float32)  # [MB, BT, K]
-        b_A = A_ref[:, 0, 0]  # [MB, BT, BT]
-
+        # Inter-chunk output: scale * (q * exp2(g - g_ref)) @ (h * exp2(g_ref)).
+        # Stabilized at g_ref = g[0], the tile's largest cumulative gate: the
+        # gate is non-positive, so `g - g_ref` and `g_ref` are the exponents
+        # that keep both factors in range without changing the product.
         b_g_ref_row = b_g[:, 0:1, :]  # [MB, 1, K]
-        b_qg = b_q.astype(jnp.float32) * jnp.exp2(
-            jnp.maximum(b_g - b_g_ref_row, -126.0))  # [MB, BT, K]
+        b_qg = b_q * jnp.exp2(jnp.maximum(b_g - b_g_ref_row,
+                                          -126.0))  # [MB, BT, K]
         b_h_scaled = b_h * jnp.exp2(jnp.maximum(
             b_g_ref_row[:, 0, :], -126.0))[:, :, None]  # [MB, K, V]
-
-        # [MB, BT, K] @ [MB, K, V] -> [MB, BT, V]
-        # Output-only GEMM: bf16 inputs use DEFAULT (no extra precision to
-        # preserve), fp32 inputs HIGHEST for full mantissa fidelity.
         b_o = jnp.matmul(
             b_qg,
             b_h_scaled,
-            precision=OUTPUT_PRECISION,
+            precision=output_precision,
             preferred_element_type=jnp.float32,
         ) * scale  # [MB, BT, V]
 
-        # Stage 4 intra-chunk: A @ v_new
-        # Apply lower-triangular mask: Aqk is causal by construction, but masking
-        # here matches the original per-head loop behaviour and guards against
-        # any tiny upper-triangle fp noise from the Neumann intra-chunk solve.
+        # Intra-chunk: A @ v_new. Aqk is causal by construction; the mask guards
+        # against upper-triangle fp noise out of the Neumann solve.
         m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]  # [BT, BT]
-        b_A_f32 = jnp.where(m_s[None, :, :], b_A.astype(jnp.float32), 0.0)
-        # [MB, BT, BT] @ [MB, BT, V] -> [MB, BT, V]
+        b_A = jnp.where(m_s[None, :, :], b_A, 0.0)
         b_o = b_o + jnp.matmul(
-            b_A_f32,
+            b_A,
             b_v_new,
-            precision=OUTPUT_PRECISION,
+            precision=output_precision,
             preferred_element_type=jnp.float32,
         )  # [MB, BT, V]
 
         # Scatter this tile's rows to where its tokens live. `r_size` rows, so
-        # rows the tile does not own keep the caller's zeros -- and a dynamically
-        # sized slice is legal here only because the output is float32 (see the
-        # staging note in `pallas_kda_fwd_intra_fused`).
-        r_base = r_base_ref[i_b, p_id]
-        r_size = r_size_ref[i_b, p_id]
-        o_buf[:, 0] = b_o.astype(o_buf.dtype)
+        # rows the tile does not own keep the caller's zeros -- and a
+        # dynamically sized slice is legal only because the output is float32
+        # (see the staging note in `chunk_kda_fwd_fused`).
+        o_buf[:, 0] = b_o
         copy = pltpu.make_async_copy(
             o_buf.at[:, :, pl.ds(0, r_size)],
             o_ref.at[pl.ds(head_block, MB),
                      pl.ds(i_b, 1),
                      pl.ds(r_base, r_size)],
-            sem,
+            sem_out,
         )
         copy.start()
         copy.wait()
 
-        # Stage 3 state update: h = decay(h) + kg^T @ v_new
-        # HIGHEST precision: accumulates into the recursive hidden state.
-        b_gk_last = gk_ref[:, 0, 0][:,
-                                    BT - 1, :].astype(jnp.float32)  # [MB, K]
-        b_h_new = b_h * jnp.exp2(b_gk_last)[:, :, None]  # [MB, K, V] decay
-
-        b_kg = kg_ref[:, 0, 0]  # [MB, BT, K]
-        # [MB, K, BT] @ [MB, BT, V] -> [MB, K, V]
+        # State update: h = h * exp2(g[-1]) + kg^T @ v_new.
+        # HIGHEST: accumulates into the recursive hidden state.
+        b_h_new = b_h * jnp.exp2(b_g[:, BT - 1, :])[:, :, None]  # decay
         b_h_new = b_h_new + jnp.matmul(
-            b_kg.astype(jnp.float32).transpose(0, 2, 1),
+            b_kg.transpose(0, 2, 1),
             b_v_new,
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
-        )
-        scratch_ref[:] = b_h_new
+        )  # [MB, K, V]
+        h_scratch[:] = b_h_new
 
-        # === Final state (last tile of THIS segment) ===
+        # Final state on the last tile of THIS segment.
         @pl.when(is_last_ref[i_b, p_id])
         def _():
-            if STORE_FINAL_STATE:
-                ht_ref[0, 0] = scratch_ref[:].astype(ht_ref.dtype)
+            if store_final_state:
+                ht_ref[0, 0] = h_scratch[:].astype(ht_ref.dtype)
 
     # Tiles past the batch's real content own no output rows (`r_size` 0) and
     # carry no segment's state (neither first- nor last-tile flag), so skipping
-    # them is an optimization rather than a correctness requirement -- running
-    # them would only scribble on the state scratch, which the next segment's
-    # first tile reinitialises. What *is* load-bearing is that `s_idx` names the
-    # final segment for them: that keeps the state window from changing blocks,
-    # and so from flushing an uninitialised buffer over a live slot.
+    # them is an optimization rather than a correctness requirement. What *is*
+    # load-bearing is that `s_idx` names the final segment for them: that keeps
+    # the state window from changing blocks, and so from flushing an
+    # uninitialised buffer over a live slot.
     pl.when(p_id < num_tiles_ref[i_b])(_tile)
 
 
@@ -984,181 +813,231 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
         "output_final_state",
         "scale",
         "chunk_size",
+        "cumsum_scale",
+        "use_gate_in_kernel",
+        "lower_bound",
         "mini_batch",
     ],
 )
-def chunk_kda_fwd_h_o_varlen(
-    w: jax.Array,  # [H, B, NT, BT, K]
-    u: jax.Array,  # [H, B, NT, BT, V]
-    kg: jax.Array,  # [H, B, NT, BT, K]
-    gk: jax.Array,  # [H, B, NT, BT, K]
-    q: jax.Array,  # [H, B, NT, BT, K]
-    A: jax.Array,  # [H, B, NT, BT, BT]
+def chunk_kda_fwd_fused(
+    q: jax.Array,  # [H, B, T, K]
+    k: jax.Array,  # [H, B, T, K]
+    v: jax.Array,  # [H, B, T, V]
+    g: jax.Array,  # [H, B, T, K]
+    beta: jax.Array,  # [H, B, T]
     plan: _TilePlan,
     query_lens: jax.Array,  # [B, N]
     num_tokens: int,
+    scale: float,
+    A_log: jax.Array | None = None,  # [H]
+    dt_bias: jax.Array | None = None,  # [H*K]
     initial_state: jax.Array | None = None,  # [B, N, H, K, V]
     output_final_state: bool = False,
-    scale: float = 1.0,
+    use_gate_in_kernel: bool = False,
+    lower_bound: float | None = None,
     chunk_size: int = 64,
+    cumsum_scale: float = RCP_LN2,
     mini_batch: int | None = None,
 ) -> tuple[
         jax.Array,  # [H, B, T, V]
         jax.Array | None,  # [B, N, H, K, V]
 ]:
-    """Fuse variable-length state propagation with output projection.
+    """Run the whole forward pass in a single Pallas call.
 
-    Takes the per-chunk quantities in tile layout (what
-    ``pallas_kda_fwd_intra_fused`` returns) and scatters the output onto the
-    caller's ``num_tokens``-row token axis.
+    Both halves of the algorithm, minus the six per-chunk tensors that used to
+    cross between them and minus the second launch.
+
+    The channel axis is padded to the lane count *in HBM*, on the staged inputs,
+    rather than on the intermediates -- they never materialize. Zero-padded channels stay inert
+    throughout: `q`/`k`/`v` are zero there, so they contribute nothing to `Aqk`,
+    to `w`, or to `kg^T @ v_new`, and the matching rows of the state stay zero
+    from `h0`'s own zero padding onward. The padded gate channels do pick up a
+    non-zero decay from the activation, which only decays state rows that are
+    already zero. At the production ``head_dim`` of 128 all of this is a no-op.
     """
-    H, B, NT, BT_in, K = q.shape
-    V = u.shape[-1]
+    H, B, _, K = q.shape
+    V = v.shape[-1]
     BT = chunk_size
+    NT = plan.r_base.shape[-1]
     N = query_lens.shape[-1]
+    act_dtype = q.dtype
 
-    assert BT_in == BT, f"tile rows {BT_in} must equal chunk_size={BT}"
-    assert A.shape[-1] == BT, (
-        f"A.shape[-1]={A.shape[-1]} must equal chunk_size={BT}")
+    assert K <= 256, "current kernel does not support K > 256."
+    if use_gate_in_kernel:
+        assert A_log is not None, "A_log required when use_gate_in_kernel=True"
     if initial_state is not None:
         assert initial_state.shape[1] == N, (
             f"initial_state has N={initial_state.shape[1]}, expected {N}")
-    assert K <= 256, "current kernel does not support K > 256."
 
     align_major = pltpu.get_tpu_info().num_lanes
-    K_PADSIZE = int(align_up(K, align_major))
-    V_ALIGNED = int(align_up(V, align_major))
+    K_PAD = int(align_up(K, align_major))
+    V_PAD = int(align_up(V, align_major))
 
     # ---- auto-compute mini-batch (MB) to maximise VMEM utilisation ----
     if mini_batch is None:
-        elem_size = q.dtype.itemsize
-        # scratch per head: h_state[K_PADSIZE*V_ALIGNED] in f32 + i/o buffers
-        in_bytes = (BT * K_PADSIZE + BT * V_ALIGNED + BT) * elem_size
-        out_bytes = BT * V_ALIGNED * 4  # float32 staging for the output DMA
-        scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
-        per_head = in_bytes + out_bytes + scratch_bytes
+        # Staged inputs (float32; beta is lane-padded), the six intermediates as
+        # *live values* -- one copy each, no double buffering, which is where
+        # the fusion pays for itself -- the solve's [BT, BT] temporaries, the
+        # recurrent state (scratch plus the double-buffered h0/ht windows), and
+        # the output staging buffer. Under-counting here over-subscribes VMEM
+        # silently.
+        staged = (3 * BT * K_PAD + BT * V_PAD + BT * align_major) * 4
+        live = (4 * BT * K_PAD + BT * V_PAD + BT * BT) * 4
+        solve = (8 * BT * BT + BT * (BT + V_PAD + K_PAD)) * 4
+        state = 3 * K_PAD * V_PAD * 4
+        staged_out = BT * V_PAD * 4
+        per_head = staged + live + solve + state + staged_out
         MB = estimate_mini_batch(per_head, H, max_mb=16)
     else:
         MB = mini_batch
         assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
 
-    # Pad the channel axis to the lane count where needed. A no-op at the
-    # production head_dim of 128; the tile axis needs no padding at all, since
-    # every tile is exactly BT rows by construction.
-    def _pad_channels(x, dim_pad):
-        if dim_pad > 0:
-            x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 0), (0, dim_pad)))
+    # The staged tensors are float32, not the caller's bfloat16, because a tile
+    # starts at an arbitrary token row and Mosaic will only slice a *packed*
+    # memref at tile-aligned offsets and in tile-aligned sizes -- for bfloat16
+    # that means multiples of 8, and neither `query_start_loc[s] + t *
+    # chunk_size` nor a ragged tile's row count is. Unpacked 32-bit types have
+    # no such rule. The kernel casts every input to float32 immediately anyway,
+    # so this only moves that cast out of the tile loop; it costs one contiguous
+    # pass over the activations and 2x the DMA bytes.
+    def _stage(x, pad_to):
+        x = x.astype(jnp.float32)
+        pad = pad_to - x.shape[-1]
+        if pad:
+            x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, pad)))
         return x
 
-    w_t = _pad_channels(w, K_PADSIZE - K)
-    kg_t = _pad_channels(kg, K_PADSIZE - K)
-    gk_t = _pad_channels(gk, K_PADSIZE - K)
-    q_t = _pad_channels(q, K_PADSIZE - K)
-    u_t = _pad_channels(u, V_ALIGNED - V)
-    A_t = A
+    q_s = _stage(q, K_PAD)
+    k_s = _stage(k, K_PAD)
+    g_s = _stage(g, K_PAD)
+    v_s = _stage(v, V_PAD)
+    # A per-token scalar on a lane-minor axis cannot be DMA'd at an arbitrary
+    # row offset, so beta is carried with the token axis second-minor like the
+    # rest. It costs lane padding on a tensor 1/128th the size of the others.
+    beta_s = beta[..., None].astype(jnp.float32)
 
-    # h0: [B, N, H, K, V] -> pad K and V -> [B, N, H, K_PADSIZE, V_ALIGNED]
+    if use_gate_in_kernel:
+        A_log_r = A_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
+        if dt_bias is not None:
+            dt_bias_r = dt_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
+            if K_PAD > K:
+                dt_bias_r = jnp.pad(
+                    dt_bias_r, ((0, 0), (0, 0), (0, 0), (0, 0), (0, K_PAD - K)))
+        else:
+            dt_bias_r = jnp.zeros((H, 1, 1, 1, K_PAD), dtype=jnp.float32)
+    else:
+        A_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
+        dt_bias_r = jnp.zeros((H, 1, 1, 1, K_PAD), dtype=jnp.float32)
+
+    # h0: [B, N, H, K, V] -> [B, N, H, K_PAD, V_PAD]
     if initial_state is not None:
         h0 = initial_state
-        if V_ALIGNED > V:
-            h0 = jnp.pad(h0,
-                         ((0, 0), (0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
-        if K_PADSIZE > K:
-            h0 = jnp.pad(h0,
-                         ((0, 0), (0, 0), (0, 0), (0, K_PADSIZE - K), (0, 0)))
+        if V_PAD > V:
+            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, 0), (0, V_PAD - V)))
+        if K_PAD > K:
+            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, 0)))
     else:
         h0 = None
 
     # Six scalar-prefetch arrays, so every index map takes six trailing refs.
-    # The tile-layout inputs index by grid position alone; the state windows
-    # index by the tile's segment.
-    def _tile_index_map(h, b, p, *_):
-        return (h, b, p, 0, 0)
+    def _per_head_index_map(h, b, p, *_):
+        del b, p
+        return (h, 0, 0, 0, 0)
 
     def _state_index_map(h, b, p, _num_tiles, _r_base, _r_size, s_idx, *_):
         return (b, s_idx[b, p], h, 0, 0)
 
-    bspec_k = pl.BlockSpec([MB, 1, 1, BT, K_PADSIZE],
-                           index_map=_tile_index_map)
-    bspec_v = pl.BlockSpec([MB, 1, 1, BT, V_ALIGNED],
-                           index_map=_tile_index_map)
-    bspec_a = pl.BlockSpec([MB, 1, 1, BT, BT], index_map=_tile_index_map)
-    bspec_state = pl.BlockSpec([1, 1, MB, K_PADSIZE, V_ALIGNED],
-                               index_map=_state_index_map)
+    def _per_head_spec(last_dim):
+        return pl.BlockSpec(index_map=_per_head_index_map,
+                            block_shape=(MB, 1, 1, 1, last_dim))
+
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    state_spec = pl.BlockSpec([1, 1, MB, K_PAD, V_PAD],
+                              index_map=_state_index_map)
 
     # The output is written by DMA at arbitrary token rows, so it is a
     # whole-array HBM ref rather than a pipelined window, and it is passed in
     # zeroed and aliased: rows that no tile owns -- the token axis's padded tail
     # -- are never written, and must still come back as zeros.
-    o_shape = jax.ShapeDtypeStruct([H, B, num_tokens, V_ALIGNED], jnp.float32)
+    o_shape = jax.ShapeDtypeStruct([H, B, num_tokens, V_PAD], jnp.float32)
     o_zeros = jnp.zeros(o_shape.shape, o_shape.dtype)
-    ht_shape = (jax.ShapeDtypeStruct([B, N, H, K_PADSIZE, V_ALIGNED],
-                                     jnp.float32)
+    ht_shape = (jax.ShapeDtypeStruct([B, N, H, K_PAD, V_PAD], jnp.float32)
                 if output_final_state else None)
-    grid = (H // MB, B, NT)
 
     # bf16 inputs: DEFAULT precision is lossless (operands already have ~7-bit
     # mantissa); fp32 inputs: HIGHEST preserves full 23-bit mantissa fidelity.
-    # State-update matmuls always use HIGHEST regardless (recursive accumulation).
-    _output_prec = (jax.lax.Precision.DEFAULT
-                    if q.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST)
+    # State-update matmuls always use HIGHEST (recursive accumulation).
+    output_precision = (jax.lax.Precision.DEFAULT if act_dtype == jnp.bfloat16
+                        else jax.lax.Precision.HIGHEST)
 
     o_out, ht_out = pl.pallas_call(
         functools.partial(
-            _chunk_kda_fwd_h_o_varlen_kernel,
-            BT=BT,
+            _chunk_kda_fwd_fused_kernel,
+            chunk_size=BT,
             scale=scale,
-            USE_INITIAL_STATE=(h0 is not None),
-            STORE_FINAL_STATE=output_final_state,
-            MB=MB,
-            OUTPUT_PRECISION=_output_prec,
+            cumsum_scale=cumsum_scale,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            activation_dtype=act_dtype,
+            use_initial_state=(h0 is not None),
+            store_final_state=output_final_state,
+            mini_batch=MB,
+            output_precision=output_precision,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
-            grid=grid,
+            grid=(H // MB, B, NT),
             in_specs=[
-                bspec_k,  # w
-                bspec_v,  # u
-                bspec_k,  # kg
-                bspec_k,  # gk
-                bspec_k,  # q
-                bspec_a,  # A
+                hbm_spec,  # q
+                hbm_spec,  # k
+                hbm_spec,  # g
+                hbm_spec,  # beta
+                hbm_spec,  # v
+                _per_head_spec(1),  # A_log
+                _per_head_spec(K_PAD),  # dt_bias
                 hbm_spec,  # the zeroed output, aliased
-                bspec_state if h0 is not None else None,  # h0
+                state_spec if h0 is not None else None,  # h0
             ],
             out_specs=[
-                hbm_spec,
-                bspec_state if output_final_state else None,
+                hbm_spec,  # o
+                state_spec if output_final_state else None,  # ht
             ],
             scratch_shapes=[
-                pltpu.VMEM((MB, K_PADSIZE, V_ALIGNED), jnp.float32),
-                pltpu.VMEM((MB, 1, BT, V_ALIGNED), jnp.float32),
-                pltpu.SemaphoreType.DMA,
+                pltpu.VMEM((MB, 1, BT, K_PAD), jnp.float32),  # q
+                pltpu.VMEM((MB, 1, BT, K_PAD), jnp.float32),  # k
+                pltpu.VMEM((MB, 1, BT, K_PAD), jnp.float32),  # g
+                pltpu.VMEM((MB, 1, BT, 1), jnp.float32),  # beta
+                pltpu.VMEM((MB, 1, BT, V_PAD), jnp.float32),  # v
+                pltpu.VMEM((MB, K_PAD, V_PAD), jnp.float32),  # h
+                pltpu.VMEM((MB, 1, BT, V_PAD), jnp.float32),  # o
+                pltpu.SemaphoreType.DMA,  # staging in
+                pltpu.SemaphoreType.DMA,  # output scatter
             ],
         ),
         compiler_params=pltpu.CompilerParams(
+            # The tile axis carries both the staging DMAs and the recurrence,
+            # so it stays sequential.
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             disable_bounds_checks=True,
         ),
         out_shape=[o_shape, ht_shape],
-        # The zeroed output rides input slot 6; `h0` sits after it so that
-        # index holds whether or not there is an initial state (a None operand
-        # contributes no leaf and would otherwise shift it).
-        input_output_aliases={6 + 6: 0},
+        # The zeroed output rides input slot 7; `h0` sits after it so that index
+        # holds whether or not there is an initial state (a None operand
+        # contributes no leaf and would otherwise shift it). The 6 is the
+        # scalar-prefetch prefix.
+        input_output_aliases={6 + 7: 0},
         interpret=get_interpret(),
     )(plan.num_tiles, plan.r_base, plan.r_size, plan.s_idx, plan.is_first,
-      plan.is_last, w_t, u_t, kg_t, gk_t, q_t, A_t, o_zeros, h0)
+      plan.is_last, q_s, k_s, g_s, beta_s, v_s, A_log_r, dt_bias_r, o_zeros, h0)
 
-    # Post-process: o is [H, B, num_tokens, V_ALIGNED]
-    if V_ALIGNED > V:
+    if V_PAD > V:
         o_out = o_out[..., :V]
-    o_out = o_out.astype(u.dtype)
+    o_out = o_out.astype(act_dtype)
 
     if output_final_state and ht_out is not None:
-        if V_ALIGNED > V:
+        if V_PAD > V:
             ht_out = ht_out[..., :V]
-        if K_PADSIZE > K:
+        if K_PAD > K:
             ht_out = ht_out[..., :K, :]
 
         # Handle empty sequences: sequences with no tiles never execute kernel
@@ -1167,12 +1046,9 @@ def chunk_kda_fwd_h_o_varlen(
         # buffer. Fill both from initial_state, or zeros.
         empty_mask = (query_lens == 0)  # [B, N]
         if initial_state is not None:
-            # For empty sequences, final_state should equal initial_state
             fill_value = initial_state[:, :, :, :K, :V]
         else:
-            # For empty sequences without initial_state, final_state should be zeros
             fill_value = jnp.zeros((B, N, H, K, V), dtype=ht_out.dtype)
-        # Use where to selectively replace empty sequence states
         ht_out = jnp.where(empty_mask[:, :, None, None, None], fill_value,
                            ht_out)
     else:
@@ -1204,57 +1080,24 @@ def _run_chunk_kda(
         jax.Array | None,  # [B, N, H, K, V]
 ]:
     """Run the kernel on canonicalized inputs and the batch's tile plan."""
-    BT = chunk_size
-
-    # ------------------------------------------------------------------
-    # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
-    # ------------------------------------------------------------------
-    w, u, kg, Aqk, g_cumsum, q_tiled = pallas_kda_fwd_intra_fused(
+    output, final_state = chunk_kda_fwd_fused(
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
-        num_tiles=plan.num_tiles,
-        r_base=plan.r_base,
-        r_size=plan.r_size,
-        scale=scale,
-        chunk_size=BT,
-        cumsum_scale=RCP_LN2,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-    )
-
-    # ------------------------------------------------------------------
-    # Step 3 + Step 4: Inter-chunk state + Output
-    #
-    # Stage 3+4 walks the same tiles, reading the per-chunk quantities straight
-    # out of tile layout and scattering the output back to the token rows each
-    # tile owns. Nothing is gathered in either direction.
-    #
-    # Padding semantics (relied on for correctness), produced by the tile
-    # kernel's row masking rather than by a zero-filled gather:
-    #   - k/w/u/q/Aqk at padded rows = 0. With those zero the state update
-    #     reduces to h_pad = h_{t-1} * exp(g_pad), and the output to 0.
-    #   - g_cumsum at padded rows = 0 => exp(g_pad) = 1, so the hidden state is
-    #     carried through padded rows unchanged.
-    # ------------------------------------------------------------------
-    output, final_state = chunk_kda_fwd_h_o_varlen(
-        w=w,
-        u=u,
-        kg=kg,
-        gk=g_cumsum,
-        q=q_tiled,
-        A=Aqk,
         plan=plan,
         query_lens=jnp.diff(cu_seqlens, axis=-1),
         num_tokens=num_tokens,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        scale=scale,
-        chunk_size=BT,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        chunk_size=chunk_size,
+        cumsum_scale=RCP_LN2,
     )
     return output.astype(q.dtype), final_state
 

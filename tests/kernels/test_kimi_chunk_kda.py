@@ -319,6 +319,56 @@ def test_chunk_kda_matches_recurrence_with_slow_decay(
     _assert_close(output, expected, rtol=3e-2, name="output")
 
 
+@pytest.mark.parametrize("a_log_value", [1.0, 7.5])
+@pytest.mark.parametrize("query_lens", [[64], [70, 33], [17, 48, 96]])
+def test_chunk_kda_matches_recurrence_with_an_overflowing_gate(
+        query_lens, a_log_value: float) -> None:
+    """A gate big enough to overflow the factored decay must stay finite.
+
+    The intra-chunk solve never forms ``exp2(g_r - g_t)`` directly for a distant
+    pair; it factors the decay through a reference row as
+    ``exp2(g_r - g_ref) * exp2(g_ref - g_t)``. That identity is only *finite*
+    when the reference row lies between ``r`` and ``t`` -- then both exponents
+    are provably <= 0. Choose a reference outside the span and one factor
+    overflows to ``inf`` while the other underflows to ``0``, so the product is
+    ``NaN`` rather than a slightly wrong number.
+
+    With ``lower_bound=None`` the activated gate is unbounded, so the span of
+    ``g_cumsum`` within a single chunk can exceed the ~128 that ``exp2``
+    survives in float32:
+
+    * ``A_log = 1.0`` is the interesting one: the per-token decay averages 3.55
+      in base 2, so a 64-row chunk spans ~227 -- comfortably past the overflow
+      point -- while an adjacent pair still weighs ``exp2(-3.55) = 0.086``. The
+      overflow *and* the arithmetic are both live, so a wrongly chosen
+      reference row surfaces either as NaN or as a value mismatch. (At
+      ``A_log = 0.0`` the span is only ~84 and nothing overflows, which is why
+      the existing tests do not cover this.)
+    * ``A_log = 7.5`` is the pathological end: a single token decays by ~1636
+      in natural log. It is a finiteness guard rather than a value check --
+      the carried state is annihilated outright, so the arithmetic degenerates
+      and only a NaN would be caught here.
+
+    This is the property the recursive bisection in ``_diag_block`` rests on:
+    it holds at every level, not just at the sub-block boundary. The ragged
+    shapes are here because a partial tile changes which rows are real, and the
+    seam row of a bisection must still be one of them.
+    """
+    output, expected, final_state, expected_state = _run(
+        query_lens, a_log_value=a_log_value, lower_bound=None)
+
+    # Check finiteness before closeness: `assert_allclose` reports a NaN as an
+    # ordinary mismatch, which would hide *why* this test failed.
+    assert np.isfinite(np.asarray(output, np.float64)).all(), (
+        "output is not finite -- the factored decay overflowed, so some "
+        "reference row was not between the two rows it was factoring")
+    assert np.isfinite(np.asarray(final_state, np.float64)).all(), (
+        "final state is not finite -- see the output assertion above")
+
+    _assert_close(output, expected, rtol=3e-2, name="output")
+    _assert_close(final_state, expected_state, rtol=3e-2, name="final state")
+
+
 # ---------------------------------------------------------------------------
 # Recurrent state
 # ---------------------------------------------------------------------------
