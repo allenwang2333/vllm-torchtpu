@@ -188,10 +188,21 @@ until curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
   # after the pod is collected.
   kill -0 "$SERVER_PID" 2>/dev/null || {
     echo "!!! server died"
+    # The tail is the LAST frame of a re-raise chain and names nothing. The
+    # worker's real error is printed much earlier and has already scrolled
+    # past 120 lines by the time the leader notices. Show the first error
+    # block as well, which is where the cause actually is.
+    echo "---- first error block in server.log ----"
+    grep -nE "Error|Exception|Traceback|Killed|out of memory|OOM|RESOURCE_EXHAUSTED|Aborted" \
+      "$RESULTS_DIR/server.log" 2>/dev/null | head -40
+    echo "---- server.log tail ----"
     tail -120 "$RESULTS_DIR/server.log"
     [ -f "$RESULTS_DIR/worker.log" ] && {
       echo "---- worker.log (this rank) ----"
       tail -60 "$RESULTS_DIR/worker.log"; }
+    echo "---- resources ----"
+    df -h /tmp 2>/dev/null | tail -1
+    free -g 2>/dev/null | head -2
     exit 1; }
   (( (SECONDS - T0) % 180 == 0 )) && echo "[$((SECONDS-T0))s] booting..."
   sleep 10
