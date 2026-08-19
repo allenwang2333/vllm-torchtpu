@@ -310,24 +310,18 @@ def apply_tpu_patches() -> None:
     global _tpu_patches_applied
     if _tpu_patches_applied:
         return
-
-    # Before the latch and before the first patch: a refusal raised mid-chain
-    # would leave the plugin half-patched with _tpu_patches_applied already
-    # set, so a caller that catches it can neither run nor retry.
-    from vllm_torchtpu import _validate_moe_env_flags
-    _validate_moe_env_flags()
-
     _tpu_patches_applied = True
 
     import vllm_torchtpu as tpu_plugin
-    from vllm_torchtpu import (
-        _patch_default_moe_runner_select_forward,
-        _patch_disable_sequence_parallel_moe,
-        _patch_moe_explicit_pcp_collectives, _patch_moe_local_routing_dispatch,
-        _patch_moe_no_ep_tp_scope, _patch_rowparallel_defer_bias,
-        _patch_vllm_compile_all_ranges, _patch_vllm_disable_compile_ranges,
-        _patch_vllm_hybrid_producer_prefix_hits,
-        _patch_vllm_tpu_group_custom_ops)
+    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
+                               _patch_disable_sequence_parallel_moe,
+                               _patch_moe_explicit_pcp_collectives,
+                               _patch_moe_no_ep_tp_scope,
+                               _patch_rowparallel_defer_bias,
+                               _patch_vllm_compile_all_ranges,
+                               _patch_vllm_disable_compile_ranges,
+                               _patch_vllm_hybrid_producer_prefix_hits,
+                               _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
@@ -341,7 +335,7 @@ def apply_tpu_patches() -> None:
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
-    _patch_moe_local_routing_dispatch()
+    tpu_plugin._patch_moe_local_routing_dispatch()
     _patch_moe_explicit_pcp_collectives()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()

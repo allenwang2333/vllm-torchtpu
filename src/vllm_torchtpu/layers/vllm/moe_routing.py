@@ -86,6 +86,16 @@ def _uniform_random_routing(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
+def simulation_is_active() -> bool:
+    """Is expert selection being simulated rather than computed?
+
+    ``moe_dispatch`` reads this to keep the simulated path on upstream's
+    dispatch: the draw is shaped like its input, so simulating per rank and
+    simulating on the gathered rows disagree.
+    """
+    return _SIMULATION_STRATEGY is not None
+
+
 def maybe_simulate_routing(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

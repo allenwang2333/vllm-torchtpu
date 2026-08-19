@@ -20,6 +20,8 @@ row by row and bit by bit, plus the pack/unpack round trip that carries it.
 """
 
 import inspect
+import pathlib
+import re
 import textwrap
 from types import SimpleNamespace
 
@@ -32,6 +34,23 @@ EXPERTS = 512
 TOPK = 10
 
 
+def _quant_method(*, monolithic=True, forwards_input_ids=False, unpacks=True):
+    """A stand-in for the six TPU MoE methods, as the wrapper reads them.
+
+    ``forwards_input_ids_to_route`` is the capability that decides whether a
+    layer's ``hash_indices_table`` can ever be used: only a method that passes
+    ``input_ids`` into ``moe_routing.route`` reaches the hash branch.
+
+    ``unpacks_routing_blob`` is the receiver's own declaration that its
+    ``apply_monolithic`` routes through ``moe_routing.route``, which is what
+    unpacks the decision. A monolithic method from another MoE stack does not
+    declare it and must keep the raw logits.
+    """
+    return SimpleNamespace(is_monolithic=monolithic,
+                           forwards_input_ids_to_route=forwards_input_ids,
+                           unpacks_routing_blob=unpacks)
+
+
 def _layer(topk=TOPK, **kwargs):
     attrs = dict(use_grouped_topk=False,
                  num_expert_group=None,
@@ -42,14 +61,43 @@ def _layer(topk=TOPK, **kwargs):
                  routed_scaling_factor=1.0,
                  hash_indices_table=None,
                  custom_routing_function=None,
+                 quant_method=_quant_method(),
                  moe_config=SimpleNamespace(experts_per_token=topk))
     attrs.update(kwargs)
     return SimpleNamespace(**attrs)
 
 
+def _cpu_rng(seed: int = 0) -> torch.Generator:
+    """One CPU generator, instead of seeding every device.
+
+    ``torch.manual_seed`` also seeds each registered device backend, so with
+    torch_tpu loaded it calls ``torch.tpu.manual_seed_all`` -- which builds the
+    PjRt client inside this process and takes /tmp/libtpu_lockfile away from
+    every isolated-subprocess TPU test that runs after this file. Nothing here
+    needs a device, so nothing here touches one.
+    """
+    return torch.Generator().manual_seed(seed)
+
+
+def test_this_file_never_seeds_a_device_backend():
+    """The rule above, pinned, because breaking it fails somewhere else.
+
+    ``torch.manual_seed`` seeds every registered device backend. With
+    torch_tpu loaded that reaches ``torch.tpu.manual_seed_all``, which builds
+    the PjRt client in this process and holds /tmp/libtpu_lockfile -- and what
+    then fails is not this file but the next isolated-subprocess TPU test in
+    the session, with a lockfile error that reads like a dirty machine.
+    """
+    source = pathlib.Path(__file__).read_text()
+
+    # Spelled as patterns so this check does not match itself.
+    assert not re.search(r"torch\.manual_seed\(", source)
+    assert not re.search(r"torch\.seed\(", source)
+
+
 def _logits(rows, seed=0):
-    torch.manual_seed(seed)
-    return (torch.randn(rows, EXPERTS) * 2.0).to(torch.bfloat16)
+    return (torch.randn(rows, EXPERTS, generator=_cpu_rng(seed)) * 2.0).to(
+        torch.bfloat16)
 
 
 # The row-wise premise has to hold for every branch of the router, not just the
@@ -101,9 +149,12 @@ def grouped_topk_without_its_own_compile(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("rows", [1, 7, 256])
 def test_pack_unpack_round_trip_is_bit_exact(rows, dtype):
-    torch.manual_seed(rows)
-    ids = torch.randint(0, EXPERTS, (rows, TOPK), dtype=torch.int32)
-    weights = torch.rand(rows, TOPK).to(dtype)
+    rng = _cpu_rng(rows)
+    ids = torch.randint(0,
+                        EXPERTS, (rows, TOPK),
+                        dtype=torch.int32,
+                        generator=rng)
+    weights = torch.rand(rows, TOPK, generator=rng).to(dtype)
     blob = moe_dispatch.pack_routing(ids, weights)
 
     assert blob.dtype == torch.int32 and blob.shape == (rows * 2 * TOPK, )
@@ -182,6 +233,14 @@ def test_the_row_wise_check_rejects_a_router_that_is_not_row_wise(
     A router with a genuine cross-row dependency -- here, centring the scores
     on the batch's own column mean -- is exactly what would make routing before
     the dispatch wrong, and the comparison has to catch it.
+
+    This router is synthetic because the tree's one real whole-batch statistic
+    is inert for *selection*: `_uniform_random_routing` shifts its noise by
+    `router_logits.float().mean()`, a constant per batch that cannot reorder an
+    argsort. What it does change is the RNG draw's shape, so the flag on and
+    the flag off pick different experts under
+    `VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random` -- documented next to
+    the flag in `envs.py`, and never set in serving.
     """
 
     def not_row_wise(hidden_states,
@@ -282,15 +341,147 @@ def test_route_and_pack_round_trips_through_the_dispatch():
     assert torch.equal(got_i, ref_i) and torch.equal(got_w, ref_w)
 
 
-@pytest.mark.parametrize("unsupported", [
-    dict(hash_indices_table=torch.zeros(4, TOPK, dtype=torch.int32)),
+# Every way a layer can decline the pack. Each one must fall back to the
+# upstream dispatch -- the raw logits, routed by the receiving rank -- because
+# there is no flag left to unset for a model that hits one.
+UNSUPPORTED_LAYERS = {
+    "hash_routing":
+    dict(hash_indices_table=torch.zeros(4, TOPK, dtype=torch.int32),
+         quant_method=_quant_method(forwards_input_ids=True)),
+    "custom_routing_function":
     dict(custom_routing_function=lambda **kw: None),
-])
-def test_route_and_pack_refuses_what_it_cannot_prove(unsupported):
-    layer = _layer(**unsupported)
+    "receiver_does_not_unpack":
+    dict(quant_method=_quant_method(unpacks=False)),
+}
+UNSUPPORTED = sorted(UNSUPPORTED_LAYERS) + ["routing_simulation"]
+
+
+def _unsupported_layer(name, monkeypatch):
+    """A layer (and process state) that cannot route before the dispatch."""
+    if name == "routing_simulation":
+        # Set at import from VLLM_MOE_ROUTING_SIMULATION_STRATEGY; the object
+        # itself is never called on this path.
+        monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
+        return _layer()
+    return _layer(**UNSUPPORTED_LAYERS[name])
+
+
+@pytest.mark.parametrize("case", UNSUPPORTED)
+def test_route_and_pack_falls_back_to_the_upstream_dispatch(case, monkeypatch):
+    """An unpackable layer keeps the logits, byte for byte and object for
+    object, so the receiving rank routes exactly as it does upstream."""
+    layer = _unsupported_layer(case, monkeypatch)
+    logits = _logits(4)
     assert moe_dispatch.unsupported_reason(layer) is not None
-    with pytest.raises(NotImplementedError, match="TPU_MOE_LOCAL_ROUTING"):
-        moe_dispatch.route_and_pack(layer, torch.zeros(4, 8), _logits(4))
+
+    out = moe_dispatch.route_and_pack(layer, torch.zeros(4, 8), logits)
+
+    assert out is logits, "the fallback must not touch router_logits"
+    assert not moe_dispatch.is_routing_blob(out)
+
+
+@pytest.mark.parametrize("case", UNSUPPORTED)
+def test_the_fallback_routes_the_way_the_control_does(case, monkeypatch):
+    """Not just "it runs": the decision has to be the unpatched one.
+
+    ``route()`` on what the fallback dispatched is what the receiving rank
+    computes; comparing it against ``route()`` on the raw logits is the same
+    comparison the flag's numerics gate makes, for the layers that opt out.
+    """
+    layer = _unsupported_layer(case, monkeypatch)
+    if case == "custom_routing_function":
+        # The poison lambda above cannot route; give it a real row-wise one.
+        layer.custom_routing_function = (
+            lambda hidden_states, gating_output, topk, renormalize: torch.topk(
+                gating_output.float(), k=topk, dim=-1))
+    if case == "routing_simulation":
+        monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
+        monkeypatch.setattr(moe_routing, "_strategy_name", "uniform_random")
+
+    logits = _logits(16, seed=41)
+    hidden = torch.zeros(16, 8, dtype=torch.bfloat16)
+    # The simulation strategies draw from the global CPU generator, so the two
+    # routes have to start from the same state. Save and restore it rather than
+    # re-seeding: torch.manual_seed would seed the device backends too.
+    before = torch.random.get_rng_state()
+    got_w, got_i = moe_routing.route(
+        layer, hidden, moe_dispatch.route_and_pack(layer, hidden, logits))
+    torch.random.set_rng_state(before)
+    ref_w, ref_i = moe_routing.route(layer, hidden, logits)
+
+    assert torch.equal(got_i, ref_i) and torch.equal(got_w, ref_w)
+
+
+def _record_info(monkeypatch, module):
+    """Capture ``module.logger.info`` calls; vLLM's loggers do not propagate."""
+    said = []
+    monkeypatch.setattr(
+        module, "logger",
+        SimpleNamespace(info=lambda msg, *args: said.append(msg % args)))
+    return said
+
+
+@pytest.mark.parametrize("case", UNSUPPORTED)
+def test_the_fallback_neither_breaks_the_graph_nor_logs_under_compile(
+        case, monkeypatch):
+    """The fallback runs inside the compiled MoE forward, so it may not log.
+
+    Dynamo rejects ``logging.Logger`` calls under ``fullgraph=True`` outright
+    ("logging.Logger method not supported for non-export cases"), which is
+    also torch_tpu's objection. ``_log_fallback_once`` is therefore guarded on
+    ``torch.compiler.is_compiling()``; this is the test that keeps it guarded,
+    because losing the guard turns every unpackable model into a startup
+    crash. The eager path asserts the diagnostic is not simply dead.
+    """
+    import torch._dynamo as dynamo
+
+    layer = _unsupported_layer(case, monkeypatch)
+    monkeypatch.setattr(moe_dispatch, "_FALLBACKS_LOGGED", set())
+    said = _record_info(monkeypatch, moe_dispatch)
+    logits = _logits(8, seed=8)
+    hidden = torch.zeros(8, 8, dtype=torch.bfloat16)
+
+    dynamo.reset()
+    explained = dynamo.explain(moe_dispatch.route_and_pack)(layer, hidden,
+                                                            logits)
+    assert explained.graph_break_count == 0, explained.break_reasons
+    dynamo.reset()
+    # backend="eager": what is under test is a Dynamo property (no graph
+    # break, no logger call under fullgraph), and the platform's default
+    # backend is the TPU one, which refuses the CPU tensors these tests use.
+    torch.compile(moe_dispatch.route_and_pack,
+                  backend="eager",
+                  fullgraph=True,
+                  dynamic=False)(layer, hidden, logits)
+    assert said == [], f"the compiled path logged: {said}"
+
+    moe_dispatch.route_and_pack(layer, hidden, logits)
+    moe_dispatch.route_and_pack(layer, hidden, logits)
+    assert len(said) == 1, said
+    assert "keeps the upstream path" in said[0]
+
+
+def test_a_hash_table_the_far_side_cannot_reach_still_routes_locally():
+    """The DeepSeek-V4-on-fp8 case: table present, hash branch unreachable.
+
+    ``select_experts`` takes the hash branch only when ``input_ids is not
+    None``, and only a method that forwards ``input_ids`` into ``route()``
+    supplies it -- mxfp4, alone. The same checkpoint on the fp8 method routes
+    from the gate today, so falling back for it would give up the saving for a
+    reason that is not true of it.
+    """
+    layer = _layer(hash_indices_table=torch.zeros(4, TOPK, dtype=torch.int32),
+                   quant_method=_quant_method(forwards_input_ids=False))
+    assert moe_dispatch.unsupported_reason(layer) is None
+
+    logits = _logits(16, seed=13)
+    hidden = torch.zeros(16, 8, dtype=torch.bfloat16)
+    got_w, got_i = moe_routing.route(
+        layer, hidden, moe_dispatch.route_and_pack(layer, hidden, logits))
+    # The reference is what fp8's apply_monolithic calls: route() with no
+    # input_ids, on the gathered rows.
+    ref_w, ref_i = moe_routing.route(layer, hidden, logits)
+    assert torch.equal(got_i, ref_i) and torch.equal(got_w, ref_w)
 
 
 # The six quant methods that reach moe_routing.route, and whether each zeroes
@@ -352,6 +543,108 @@ def test_the_flag_does_not_change_which_methods_zero_padded_rows(module_name):
     local rows silently zeroes rows four of these six leave computed.
     """
     assert _zeroing_guard(module_name) == ROUTE_CALLERS[module_name]
+
+
+def _route_call_forwards_input_ids(module_name):
+    """Does this module's ``route()`` call pass ``input_ids``? From the AST."""
+    import ast
+    import importlib
+
+    mod = importlib.import_module(f"vllm_torchtpu.layers.vllm.{module_name}")
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "route" and any(kw.arg == "input_ids"
+                                              for kw in node.keywords)
+        for node in ast.walk(ast.parse(inspect.getsource(mod))))
+
+
+def test_exactly_one_quant_method_can_reach_hash_routing():
+    """Anchors the audit below: it must find something, and only this.
+
+    `unsupported_reason` refuses a layer carrying `hash_indices_table` only
+    where the hash branch is reachable, i.e. where the receiving method hands
+    `route()` the `input_ids` that branch is keyed on.
+    """
+    forwarding = sorted(m for m in ROUTE_CALLERS
+                        if _route_call_forwards_input_ids(m))
+    assert forwarding == ["quantization.mxfp4"], forwarding
+
+
+@pytest.mark.parametrize("module_name", sorted(ROUTE_CALLERS))
+def test_the_hash_refusal_capability_bit_matches_the_route_call(module_name):
+    """`forwards_input_ids_to_route` is a claim about the method's own call.
+
+    The predicate reads the class attribute; the attribute is only true if the
+    method really forwards `input_ids`. Check the declaration against the
+    source rather than trusting that the two were kept in step.
+    """
+    import importlib
+
+    mod = importlib.import_module(f"vllm_torchtpu.layers.vllm.{module_name}")
+    declared = sorted(
+        name for name, cls in inspect.getmembers(mod, inspect.isclass)
+        if cls.__module__ == mod.__name__
+        and getattr(cls, "forwards_input_ids_to_route", False))
+    assert bool(declared) == _route_call_forwards_input_ids(module_name), (
+        f"{module_name}: classes declaring forwards_input_ids_to_route are "
+        f"{declared}, which disagrees with its moe_routing.route() call")
+
+
+def _quantization_modules():
+    """Every module of the TPU quantization package, imported."""
+    import importlib
+    import pkgutil
+
+    import vllm_torchtpu.layers.vllm.quantization as pkg
+    for info in pkgutil.walk_packages(pkg.__path__, f"{pkg.__name__}."):
+        yield importlib.import_module(info.name)
+
+
+def _calls_moe_routing_route(mod) -> bool:
+    import ast
+
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "route" and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "moe_routing"
+        for node in ast.walk(ast.parse(inspect.getsource(mod))))
+
+
+def test_the_unpack_capability_bit_matches_the_route_call():
+    """`unpacks_routing_blob` is a claim that the method unpacks the decision.
+
+    It is what the dispatch packs *for*: `moe_routing.route` is the only
+    unpacker, so a method that does not go through it must be handed logits.
+    Discovered rather than listed -- a new quant method that declares the bit
+    without calling `route()` would read the packed int32 as logits, which is
+    the one way this change can be silently wrong rather than merely slower.
+    """
+    declaring, calling = set(), set()
+    for mod in _quantization_modules():
+        if _calls_moe_routing_route(mod):
+            calling.add(mod.__name__)
+        if any("unpacks_routing_blob" in vars(cls)
+               for _, cls in inspect.getmembers(mod, inspect.isclass)
+               if cls.__module__ == mod.__name__):
+            declaring.add(mod.__name__)
+
+    assert calling, "the source scan found no route() call at all"
+    assert declaring == calling, (
+        f"declared but does not route(): {sorted(declaring - calling)}; "
+        f"routes() but does not declare: {sorted(calling - declaring)}")
+
+
+def test_a_receiver_that_does_not_unpack_is_never_packed_for():
+    """Negative control for the bit: the check has to be able to fire.
+
+    A monolithic method from another MoE stack -- tpu-inference ships seven,
+    and a stacked install can put one on the far side -- reads whatever the
+    dispatch carried as router logits.
+    """
+    foreign = _layer(quant_method=SimpleNamespace(is_monolithic=True))
+    reason = moe_dispatch.unsupported_reason(foreign)
+    assert reason is not None and "unpacks_routing_blob" in reason
+    assert moe_dispatch.unsupported_reason(_layer()) is None
 
 
 def test_route_and_pack_does_not_mask_padded_rows():
@@ -428,15 +721,27 @@ def test_the_gathered_padding_mask_runs_identically_with_the_flag_on(
     assert torch.equal(got, weights * (~mask)[:, None])
 
 
-def _install_patch(monkeypatch, enabled):
-    """Install (or refuse to install) the _maybe_dispatch patch, undoably."""
+def _upstream_maybe_dispatch():
+    """``MoERunner._maybe_dispatch`` as installed, asserted to be upstream's."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+    fn = mr.MoERunner.__dict__["_maybe_dispatch"]
+    assert fn.__module__.startswith("vllm."), (
+        f"expected unpatched upstream code to start from, got {fn!r} from "
+        f"{fn.__module__}")
+    return fn
+
+
+def _install_patch(monkeypatch, enabled, ep_kernel=False):
+    """Install (or decline to install) the _maybe_dispatch patch, undoably."""
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 
     import vllm_torchtpu
     monkeypatch.setattr(
         vllm_torchtpu.envs, "environment_variables",
         dict(vllm_torchtpu.envs.environment_variables,
-             TPU_MOE_LOCAL_ROUTING=lambda: enabled))
+             TPU_MOE_LOCAL_ROUTING=lambda: enabled,
+             USE_MOE_EP_KERNEL=lambda: ep_kernel))
     monkeypatch.setattr(mr.MoERunner,
                         "_maybe_dispatch",
                         mr.MoERunner._maybe_dispatch,
@@ -451,10 +756,9 @@ def _install_patch(monkeypatch, enabled):
 def test_local_routing_is_off_by_default():
     """With no env set the flag reads False, and only startup reads it.
 
-    Both read sites run once, at patch time -- the installer, and the flag
-    validation that refuses impossible combinations ahead of it. Neither the
-    codec nor the routing path reads it, so there is no module-scope cache
-    whose value depends on import order relative to the worker's environment.
+    The one read site runs once, at patch time. Neither the codec nor the
+    routing path reads it, so there is no module-scope cache whose value
+    depends on import order relative to the worker's environment.
     """
     import vllm_torchtpu
     import vllm_torchtpu.envs as envs
@@ -465,14 +769,10 @@ def test_local_routing_is_off_by_default():
          ("moe_routing", inspect.getsource(moe_routing)),
          ("token_padding", inspect.getsource(token_padding)),
          ("_patch_moe_local_routing_dispatch",
-          inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch)),
-         ("_validate_moe_env_flags",
-          inspect.getsource(vllm_torchtpu._validate_moe_env_flags)))
+          inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch)))
         if "envs.TPU_MOE_LOCAL_ROUTING" in src
     ]
-    assert readers == [
-        "_patch_moe_local_routing_dispatch", "_validate_moe_env_flags"
-    ], readers
+    assert readers == ["_patch_moe_local_routing_dispatch"], readers
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -485,13 +785,7 @@ def test_maybe_dispatch_is_wrapped_only_when_the_flag_is_on(
     ``flag_on`` case is the negative control -- an assertion about the flag-off
     path that also holds with the flag on is not evidence of anything.
     """
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
-
-    before = mr.MoERunner.__dict__["_maybe_dispatch"]
-    assert before.__module__.startswith("vllm."), (
-        f"expected unpatched upstream code to start from, got {before!r} "
-        f"from {before.__module__}")
-
+    before = _upstream_maybe_dispatch()
     mr = _install_patch(monkeypatch, enabled=flag_on)
     after = mr.MoERunner.__dict__["_maybe_dispatch"]
 
@@ -522,7 +816,7 @@ def test_patched_dispatch_sends_the_blob_not_the_logits(monkeypatch):
     monkeypatch.setattr(mr, "get_ep_group", lambda: _Group())
 
     layer = _layer()
-    layer.quant_method = SimpleNamespace(is_monolithic=True)
+    layer.quant_method = _quant_method()
 
     class _Runner:
         do_naive_dispatch_combine = True
@@ -586,8 +880,7 @@ def test_the_wrapper_leaves_router_logits_alone_when_a_guard_is_false(
     monkeypatch.setattr(mr, "get_ep_group", lambda: _Group())
 
     layer = _layer()
-    layer.quant_method = SimpleNamespace(
-        is_monolithic=guard != "is_monolithic")
+    layer.quant_method = _quant_method(monolithic=guard != "is_monolithic")
 
     class _Runner:
         do_naive_dispatch_combine = guard != "do_naive_dispatch_combine"
@@ -608,41 +901,90 @@ def test_the_wrapper_leaves_router_logits_alone_when_a_guard_is_false(
             "the modular path's router must receive the raw logits")
 
 
-def test_the_fused_ep_kernel_refusal_runs_before_any_patch(monkeypatch):
-    """Refuse the pair, and refuse it before the plugin has touched anything.
+@pytest.mark.parametrize("case", UNSUPPORTED)
+def test_the_wrapper_dispatches_raw_logits_for_a_layer_that_cannot_pack(
+        case, monkeypatch):
+    """The fallback, through the real MoERunner method rather than the codec.
 
-    The kernel that reads ``USE_MOE_EP_KERNEL`` lives in tpu-inference
-    (``tpu_inference/layers/vllm/interface/moe.py``) and scores the raw logits
-    itself, so it cannot be paired with a packed decision. Raising from inside
-    the patch chain would be worse than not checking at all:
-    ``apply_tpu_patches`` latches ``_tpu_patches_applied`` first, so a caught
-    ValueError would leave the plugin half-patched and the retry a silent
-    no-op.
+    Object identity again: what reaches the collective must be the very tensor
+    upstream would have handed it, so the receiving rank's routing is not
+    merely equal to the unpatched decision but produced by the unpatched code.
     """
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+    mr = _install_patch(monkeypatch, enabled=True)
+    assert mr.MoERunner._tpu_local_routing_patch, (
+        "the wrapper is not installed, so this would pass against unpatched "
+        "upstream code")
+    layer = _unsupported_layer(case, monkeypatch)
 
+    seen = {}
+
+    class _Group:
+
+        def dispatch_router_logits(self, hidden, logits, is_sp):
+            seen["logits"] = logits
+            return hidden, logits
+
+    monkeypatch.setattr(mr, "get_ep_group", lambda: _Group())
+
+    class _Runner:
+        do_naive_dispatch_combine = True
+        routed_experts = layer
+        moe_config = SimpleNamespace(is_sequence_parallel=False, pcp_size=1)
+
+    logits = _logits(24, seed=9)
+    hidden = torch.zeros(24, 8, dtype=torch.bfloat16)
+    out_hidden, out_logits = mr.MoERunner._maybe_dispatch(
+        _Runner(), hidden, logits)
+
+    assert seen["logits"] is logits, "the collective saw something repacked"
+    assert out_logits is logits and out_hidden is hidden
+
+
+def test_the_fused_ep_kernel_keeps_upstreams_dispatch(monkeypatch):
+    """``USE_MOE_EP_KERNEL=1`` declines the patch; it does not refuse to run.
+
+    The kernel that reads it lives in tpu-inference
+    (``tpu_inference/layers/vllm/interface/moe.py``) and scores the raw logits
+    itself, so it cannot be paired with a packed decision. Leaving
+    ``_maybe_dispatch`` alone is exactly what that configuration needs, and it
+    is the only outcome available now that there is no flag to unset: raising
+    would make a working fused-EP deployment unstartable.
+    """
     import vllm_torchtpu
+
+    said = _record_info(monkeypatch, vllm_torchtpu)
+    before = _upstream_maybe_dispatch()
+    mr = _install_patch(monkeypatch, enabled=True, ep_kernel=True)
+
+    assert mr.MoERunner.__dict__["_maybe_dispatch"] is before, (
+        "the patch was installed under the fused EP kernel")
+    assert not getattr(mr.MoERunner, "_tpu_local_routing_patch", False)
+    assert len(said) == 1 and "USE_MOE_EP_KERNEL" in said[0], said
+
+
+def test_the_patch_chain_installs_the_local_routing_patch():
+    """Every other test calls the installer directly; this one checks it runs.
+
+    Dropping the call from ``apply_tpu_patches`` would leave the whole feature
+    uninstalled with the rest of this file still green.
+    """
+    import ast
+
     from vllm_torchtpu.platforms import tpu_platform
 
-    monkeypatch.setattr(
-        vllm_torchtpu.envs, "environment_variables",
-        dict(vllm_torchtpu.envs.environment_variables,
-             TPU_MOE_LOCAL_ROUTING=lambda: True,
-             USE_MOE_EP_KERNEL=lambda: True))
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        vllm_torchtpu._validate_moe_env_flags()
-
-    before = mr.MoERunner.__dict__["_maybe_dispatch"]
-    monkeypatch.setattr(tpu_platform, "_tpu_patches_applied", False)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        tpu_platform.apply_tpu_patches()
-
-    assert tpu_platform._tpu_patches_applied is False, (
-        "the latch was set before the refusal: every later call returns "
-        "early and the plugin stays half-patched")
-    assert mr.MoERunner.__dict__["_maybe_dispatch"] is before, (
-        "a patch was applied before the refusal")
+    src = textwrap.dedent(inspect.getsource(tpu_platform.apply_tpu_patches))
+    # The chain calls some patches by bare name and others through the module
+    # object (`tpu_plugin.foo()`), so match on the attribute too -- what this
+    # test is protecting is that the installer is reached, not how it is spelt.
+    called = set()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            called.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            called.add(node.func.attr)
+    assert "_patch_moe_local_routing_dispatch" in called, sorted(called)
 
 
 @pytest.mark.parametrize("variant", sorted(ROUTER_VARIANTS))
@@ -661,7 +1003,12 @@ def test_pack_and_unpack_compile_fullgraph(variant):
         blob = moe_dispatch.route_and_pack(layer, h, r)
         return moe_routing.route(layer, h, blob)
 
-    compiled = torch.compile(round_trip, fullgraph=True, dynamic=False)
+    # backend="eager" for the same reason as above: this asserts a tracing
+    # property on CPU tensors, not a lowering.
+    compiled = torch.compile(round_trip,
+                             backend="eager",
+                             fullgraph=True,
+                             dynamic=False)
     got_w, got_i = compiled(hidden, logits)
     ref_w, ref_i = moe_routing.route(layer, hidden, logits)
     assert torch.equal(got_w, ref_w) and torch.equal(got_i, ref_i)
@@ -706,10 +1053,10 @@ RAY_COPIED_PREFIXES = ("VLLM_", "FLASH_ATTENTION_", "LMCACHE_", "NCCL_",
 # additional_env_vars -- see test_every_env_var_this_feature_reads_reaches_the_worker.
 NOT_PROPAGATED = {
     "USE_MOE_EP_KERNEL":
-    "read only to refuse the pair before patching; it is the fused-EP "
-    "kernel's own flag and that feature owns its propagation. A worker that "
-    "never receives it never runs the fused EP kernel, so the combination "
-    "this refusal exists to prevent cannot arise there.",
+    "read only to leave the patch uninstalled; it is the fused-EP kernel's "
+    "own flag and that feature owns its propagation. A worker that never "
+    "receives it never runs the fused EP kernel, so the pairing this skip "
+    "exists to avoid cannot arise there.",
 }
 
 
@@ -725,7 +1072,6 @@ def _feature_env_reads():
         inspect.getsource(token_padding),
         inspect.getsource(moe_routing),
         inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch),
-        inspect.getsource(vllm_torchtpu._validate_moe_env_flags),
     ]
     names = set()
     for src in units:
@@ -916,11 +1262,17 @@ def test_a_layer_that_declines_to_pack_still_gets_its_padded_rows_masked(
     assert (masked[~mask] != 0).any()
 
 
-# --- what the flag costs per step at DECODE, where it buys nothing ----------
-# An earlier revision lost 20.27% to a per-step device->host sync in a
-# diagnostic, on decode steps where its optimisation was a no-op. Decode is
-# most of the steps and this flag does approximately nothing there, so any
-# per-step host cost it adds is pure loss. These three pin that there is none.
+# --- what the flag costs per step at DECODE ---------------------------------
+# It costs +5.56 us/layer there, +1.64% of a decode step (measured on tpu7x at
+# DP4TP2_EP conc 64): the packed s32 blob is 13x smaller in bytes than the
+# logit gather but 33% more expensive per call, and at a decode row count a
+# collective is pure latency. That cost is in the device program and these
+# tests cannot see it; see envs.py for the workload rule it implies.
+#
+# What they do pin is that no *host* cost is added on top of it. An earlier
+# revision lost 20.27% to a per-step device->host sync introduced by a
+# diagnostic, on exactly these steps. Decode is most of the steps, so a graph
+# break or a sync here would dwarf the collective difference above.
 DECODE_ROWS = (8, 16, 32)
 
 

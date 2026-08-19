@@ -297,7 +297,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Removes dp_size-fold duplicated routing and shrinks that collective
     # from num_experts to 2*topk int32 per token. The padding-mask all-gather
     # stays where it is; moving it would change which rows get zeroed, see
-    # layers/vllm/moe_dispatch.py. DP-only; a no-op at dp_size 1.
+    # layers/vllm/moe_dispatch.py.
+    #
+    # OFF BY DEFAULT BECAUSE IT IS NOT FREE AT DECODE. Measured per MoE layer
+    # on tpu7x, DP4TP2_EP / ISL 8192 / OSL 1024 / conc 64:
+    #     prefill  -191.4 us/layer (-3.07%)  = -216.8 sort, -143.8 logit
+    #                                          gather, +211.3 given back as
+    #                                          newly exposed all-gather wait
+    #     decode   +5.56 us/layer (+1.64% of a decode step)
+    # The packed s32 blob is 13x smaller in bytes but 33% more expensive per
+    # call than the logit gather (13.08 vs 9.85 us/layer): at a decode row
+    # count both collectives are pure latency, and the T(1024)-rounded 3-D
+    # s32 form costs more to issue. This is a bytes-regime win that inverts
+    # in the latency regime, so the decision is a workload question:
+    #
+    #     enable when  ceil(ISL / max_num_batched_tokens)
+    #                    * min(conc / dp_size, max_num_seqs) / OSL  >  0.029
+    #
+    # At ISL 8192 / conc 64 / dp 4 that means OSL below ~1,100 tokens; it also
+    # wants conc >= 60 at dp 4 (>= 119 at dp 8) and ISL > max_num_batched_
+    # tokens, since a single-chunk prompt has no prefill win to trade. Long
+    # prompts and short outputs win; chat-shaped, decode-heavy traffic loses.
+    #
+    # Inert unless upstream's own MoERunner.do_naive_dispatch_combine is True
+    # -- that is `dp_size > 1 or is_sequence_parallel`, and SP is forced off
+    # on TPU by _patch_disable_sequence_parallel_moe. So at dp_size 1 the
+    # wrapper hands the logits straight to the upstream body and nothing is
+    # packed: 10 of the 14 points on the InferenceX Qwen3.5 sweep (all seven
+    # of 1024:1024, plus conc 4/8/16 of 8192:1024) run TP8_EP at dp_size 1 and
+    # cannot move either way.
+    #
+    # Do not compare the flag on against the flag off with
+    # VLLM_MOE_ROUTING_SIMULATION_STRATEGY set: the simulation runs on this
+    # rank's rows here and on the gathered rows without the flag. Both are
+    # per-row draws, so expert load balance is unaffected, but `uniform_random`
+    # shifts by a whole-batch mean and draws rand_like(router_logits)
+    # (layers/vllm/moe_routing.py), whose shape follows the row count -- so the
+    # two paths select different, equally balanced, experts. Inert for real
+    # serving, which never sets it.
     "TPU_MOE_LOCAL_ROUTING":
     env_bool("TPU_MOE_LOCAL_ROUTING"),
 

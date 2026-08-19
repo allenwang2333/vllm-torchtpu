@@ -139,6 +139,10 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # apply_monolithic.  Override both after super().__init__().
         self.apply_monolithic = self._select_monolithic()
 
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True

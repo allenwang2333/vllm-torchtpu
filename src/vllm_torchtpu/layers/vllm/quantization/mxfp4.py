@@ -164,6 +164,17 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     # Since __init__ is bypassed on TPU, explicitly define it here as False.
     is_k3_situ_aiter: bool = False
 
+    # This is the only method that forwards input_ids into moe_routing.route
+    # (see _forward_monolithic_tpu), so it is the only one where a layer
+    # carrying hash_indices_table actually routes by hash. moe_dispatch reads
+    # this to keep exactly that case on the upstream dispatch, whose boundary
+    # has no input_ids.
+    forwards_input_ids_to_route: bool = True
+
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True

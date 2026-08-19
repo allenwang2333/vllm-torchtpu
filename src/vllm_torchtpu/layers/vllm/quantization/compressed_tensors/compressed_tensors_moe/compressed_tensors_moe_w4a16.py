@@ -56,6 +56,10 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
     _INT4_SIGN_XOR = ctypes.c_int32(0x88888888).value
 
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True

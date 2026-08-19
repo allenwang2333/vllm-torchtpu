@@ -223,29 +223,6 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
-def _validate_moe_env_flags() -> None:
-    """Refuse impossible MoE flag combinations, before anything is patched.
-
-    Called from ``apply_tpu_patches`` ahead of its ``_tpu_patches_applied``
-    latch. Raising from inside the patch chain instead would set the latch,
-    apply part of the chain and then abort: a caller that catches the error
-    is left with a half-patched plugin that cannot be retried.
-    """
-    import vllm_torchtpu.envs as envs
-
-    if envs.TPU_MOE_LOCAL_ROUTING and envs.USE_MOE_EP_KERNEL:
-        raise ValueError(
-            "TPU_MOE_LOCAL_ROUTING=1 and USE_MOE_EP_KERNEL=1 are mutually "
-            "exclusive: USE_MOE_EP_KERNEL selects the fused expert-parallel "
-            "MoE kernel that lives in tpu-inference "
-            "(tpu_inference/layers/vllm/interface/moe.py), which scores the "
-            "raw router logits itself and would be handed a packed int32 "
-            "decision instead. No code in this package reads the flag, so "
-            "here the pair is merely useless -- it is refused anyway rather "
-            "than depend on which MoE implementation a stacked install ends "
-            "up with. Unset one of the two.")
-
-
 def _patch_moe_local_routing_dispatch() -> None:
     """Route on the rank that owns the rows, and dispatch the decision.
 
@@ -263,8 +240,19 @@ def _patch_moe_local_routing_dispatch() -> None:
     import vllm_torchtpu.envs as envs
     if not envs.TPU_MOE_LOCAL_ROUTING:
         return
-    # The USE_MOE_EP_KERNEL refusal is in _validate_moe_env_flags, which runs
-    # before the patch chain starts.
+
+    if envs.USE_MOE_EP_KERNEL:
+        # The fused expert-parallel MoE kernel lives in tpu-inference
+        # (tpu_inference/layers/vllm/interface/moe.py) and scores the raw
+        # router logits itself, so it would be handed a packed int32 decision.
+        # Leaving the patch uninstalled keeps that configuration on upstream's
+        # dispatch, which is what it needs; refusing the pair instead would
+        # make a working setup unstartable.
+        logger.info(
+            "Skipped TPU patch: MoE keeps upstream's dispatch because "
+            "USE_MOE_EP_KERNEL=1 selects the fused expert-parallel kernel, "
+            "which routes from the raw logits itself.")
+        return
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
 
@@ -278,6 +266,12 @@ def _patch_moe_local_routing_dispatch() -> None:
     def _maybe_dispatch(self, hidden_states, router_logits):
         # Only the monolithic path is packable: the modular path feeds
         # router_logits to upstream's own router after the dispatch.
+        #
+        # `is_monolithic` does not by itself mean the far side unpacks: that
+        # is `unpacks_routing_blob`, declared by the methods that route
+        # through `moe_routing.route` and checked in
+        # `moe_dispatch.unsupported_reason`, which falls back to the raw
+        # logits for anything else.
         if (self.do_naive_dispatch_combine
                 and self.routed_experts.quant_method.is_monolithic
                 and not moe_dispatch.is_routing_blob(router_logits)):

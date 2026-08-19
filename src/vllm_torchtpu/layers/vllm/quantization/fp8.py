@@ -718,6 +718,10 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 intermediate_size_per_partition, params_dtype,
                 **extra_weight_attrs)
 
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True

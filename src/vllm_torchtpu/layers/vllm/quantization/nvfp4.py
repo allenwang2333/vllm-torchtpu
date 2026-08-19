@@ -182,6 +182,10 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         # those scales (W4A16), so any value works -- keep False (no global SF).
         self.use_global_sf = False
 
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True

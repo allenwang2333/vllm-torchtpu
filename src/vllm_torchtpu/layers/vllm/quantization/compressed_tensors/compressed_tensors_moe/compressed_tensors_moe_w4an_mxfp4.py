@@ -30,6 +30,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     Accommodates both W4A4 and W4A16.
     """
 
+    # apply_monolithic routes through moe_routing.route, which unpacks a
+    # decision the dispatch already made: moe_dispatch.unsupported_reason.
+    unpacks_routing_blob: bool = True
+
     @property
     def is_monolithic(self) -> bool:
         return True
