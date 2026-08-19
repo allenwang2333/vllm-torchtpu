@@ -22,7 +22,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
-from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -349,16 +348,20 @@ def apply_tpu_patches() -> None:
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
-    from vllm_torchtpu import (_patch_disable_dp_ubatch,
+    from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
+    from vllm_torchtpu import (_patch_dflash_bypass_v2_runner_check,
+                               _patch_disable_dp_ubatch,
                                _patch_multiproc_worker_global_rank_env,
                                _patch_vllm_compile_prefix_isolation,
-                               _patch_vllm_piecewise_backend,
-                               _patch_vllm_reset_compile_wrapper)
+                               _patch_vllm_config_triton_tpu,
+                               _patch_vllm_piecewise_backend)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
     _patch_vllm_reset_compile_wrapper()
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
+    _patch_dflash_bypass_v2_runner_check()
+    _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
         patch_runai_sharded_expert_streaming
     patch_runai_sharded_expert_streaming()
@@ -884,18 +887,13 @@ class TpuPlatform(Platform):
                     "not supported on TPU; Run with async_scheduling=False.")
         # Hybrid (attention + Mamba) models with prefix caching enabled need
         # the pool's align-mode mamba state seed copies; other cache modes
-        # and speculative decoding must be rejected up front instead of
-        # failing partway through warmup.
+        # must be rejected up front instead of failing partway through warmup.
         if is_hybrid and cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
                     "mamba_cache_mode='align' (got "
                     f"{cache_config.mamba_cache_mode!r}).")
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "Speculative decoding is not yet supported with hybrid "
-                    "Mamba prefix caching (mamba_cache_mode='align').")
             if not unified_kv_layout_enabled(vllm_config):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and
@@ -937,10 +935,6 @@ class TpuPlatform(Platform):
             # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
-                if pcp_size > 1:
-                    ensure_pcp_local_rank_remap(
-                        parallel_config.world_size_across_dp,
-                        get_topology=cls._get_tpu_topology)
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -983,9 +977,6 @@ class TpuPlatform(Platform):
                     logger.info(
                         "Preparing TorchTPU bootstrap env for native PCP "
                         "multiprocess world_size=%d.", torch_tpu_world_size)
-                    ensure_pcp_local_rank_remap(
-                        torch_tpu_world_size,
-                        get_topology=cls._get_tpu_topology)
                 cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
             if (pcp_size <= 1 and parallel_config.data_parallel_size == 1
                     and parallel_config.pipeline_parallel_size == 1

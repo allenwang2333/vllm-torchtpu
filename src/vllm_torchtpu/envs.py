@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
+    TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -210,6 +212,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    "TPU_RAIDEN_GLM_ADMISSION":
+    env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.
@@ -280,6 +284,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Hierarchical MoE parallelism: expert-parallel between chips,
+    # tensor-parallel between the two chiplets of a chip. Off by
+    # default; it helps only at low concurrency, where the MoE is
+    # weight-bandwidth bound and the per-device expert load is badly
+    # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
+    "TPU_MOE_HIERARCHICAL_EP":
+    env_bool("TPU_MOE_HIERARCHICAL_EP"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
