@@ -232,23 +232,6 @@ class TestTpuCompilerCache:
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
 
-    def test_env_override_disables_python_compile_cache_by_default(self):
-        """Verify that env_override defaults VLLM_DISABLE_COMPILE_CACHE to '1'."""
-        with patch.dict(os.environ, {}, clear=True):
-            import vllm_torchtpu.env_override
-            importlib.reload(vllm_torchtpu.env_override)
-            assert os.environ.get("VLLM_DISABLE_COMPILE_CACHE") == "1"
-
-    def test_env_override_fails_fast_on_python_cache_enabled(self):
-        """Verify that env_override raises RuntimeError if VLLM_DISABLE_COMPILE_CACHE=0."""
-        import pytest
-        for val in ("0", "false", "False", "no", "NO"):
-            with patch.dict(os.environ, {"VLLM_DISABLE_COMPILE_CACHE": val},
-                            clear=True):
-                with pytest.raises(RuntimeError, match="not supported on TPU"):
-                    import vllm_torchtpu.env_override
-                    importlib.reload(vllm_torchtpu.env_override)
-
     def test_tpu_compilation_handle_serialization(self):
         """Verify serialization and deserialization of TpuCompilationHandle and legacy fallbacks."""
         import pickle
@@ -271,24 +254,24 @@ class TestTpuCompilerCache:
         assert isinstance(loaded_dict, dict)
         assert loaded_dict.get("tier3_cache_active") is True
 
+        # 3. Test non-tier3 handle with executable
+        handle_with_exe = TpuCompilationHandle(key="test_key_456",
+                                               tier3_cache_active=False,
+                                               executable="mock_exe")
+        loaded_exe_handle = pickle.loads(pickle.dumps(handle_with_exe))
+        assert loaded_exe_handle.tier3_cache_active is False
+        assert loaded_exe_handle.executable == "mock_exe"
+
     def test_compiler_initialize_cache(self):
-        """Verify that TpuCompilerAdaptor sets cache_dir and always keeps _disable_cache=True."""
+        """Verify that TpuCompilerAdaptor sets cache_dir and _disable_cache accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir",
                                   disable_cache=False)
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+        assert compiler._disable_cache is False
+
+        compiler.initialize_cache(cache_dir="/tmp/test_cache_dir_2",
+                                  disable_cache=True)
+        assert compiler.cache_dir == "/tmp/test_cache_dir_2"
         assert compiler._disable_cache is True
-
-    def test_compiler_load_raises_not_implemented(self):
-        """Verify that TpuCompilerAdaptor.load raises NotImplementedError."""
-        import pytest
-
-        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
-        compiler = TpuCompilerAdaptor()
-        with pytest.raises(NotImplementedError, match="disabled on TPU"):
-            compiler.load(handle=None,
-                          graph=None,
-                          example_inputs=[],
-                          graph_index=0,
-                          compile_range=None)
