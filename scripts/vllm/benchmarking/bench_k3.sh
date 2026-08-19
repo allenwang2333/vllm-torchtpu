@@ -154,16 +154,17 @@ for cell in ${ISL_OSL_CONFIGS}; do
   done
 done
 
-# ---- Tier 0: output identity
+# ---- Tier 0: output identity (own probe -- vllm bench serve --save-result
+# strips the per-request lists, so the result JSON carries no generated text)
 echo "########## TIER 0 — output identity ##########"
-for f in "$RESULTS_DIR"/isl*_osl*_c*.json; do
-  base="$SCRIPT_DIR/baselines/identity/${CONFIG_NAME}.$(basename "$f" .json).json"
-  if [ "$RECORD_IDENTITY" = "1" ]; then
-    python3 "$SCRIPT_DIR/check_identity.py" --record "$f" --baseline "$base"
-  else
-    python3 "$SCRIPT_DIR/check_identity.py" --result "$f" --baseline "$base" || IDENTITY_FAIL=1
-  fi
-done
+IDBASE="$SCRIPT_DIR/baselines/identity/${CONFIG_NAME}.json"
+if [ "$RECORD_IDENTITY" = "1" ]; then
+  python3 "$SCRIPT_DIR/identity_probe.py" --record --model "$MODEL" \
+      --port "$PORT" --out "$IDBASE" || IDENTITY_FAIL=1
+else
+  python3 "$SCRIPT_DIR/identity_probe.py" --compare --model "$MODEL" \
+      --port "$PORT" --out "$IDBASE" || IDENTITY_FAIL=1
+fi
 
 # ---- Tier 1: accuracy, against the same server
 if [ "$SKIP_EVAL" != "1" ] && [ -n "${EVAL_TASKS:-}" ]; then
