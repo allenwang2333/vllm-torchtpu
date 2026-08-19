@@ -14,15 +14,19 @@ _CN_I_TILE = 2048
 _CN_NBUF = 4
 
 
-def _blockwise_matmul(lhs, w, scales, n_blocks, block, out_cols):
-  """Memory-efficient blockwise matmul applying scales per block."""
+def _blockwise_matmul_chunked(lhs, w, scales, total_dim, num_scale_blocks, out_cols):
+  """Memory-efficient 128-element chunked matmul keeping VPU registers at 64 KB."""
+  CHUNK_SIZE = 128
+  num_chunks = total_dim // CHUNK_SIZE
   acc = jnp.zeros((1, out_cols), dtype=jnp.float32)
-  for b in range(n_blocks):
-    s = b * block
-    cur_lhs = lhs[:, s : s + block]
-    cur_w = w[s : s + block, :].astype(lhs.dtype)
+  for b in range(num_chunks):
+    s = b * CHUNK_SIZE
+    cur_lhs = lhs[:, s : s + CHUNK_SIZE]
+    cur_w = w[s : s + CHUNK_SIZE, :].astype(lhs.dtype)
     blk = jnp.matmul(cur_lhs, cur_w, preferred_element_type=jnp.float32)
-    acc = acc + blk * scales[b].reshape(1, out_cols)
+    # If subchannel scaling, index per-chunk; if per-channel, index 0
+    scale_idx = b if num_scale_blocks == num_chunks else 0
+    acc = acc + blk * scales[scale_idx].reshape(1, out_cols)
   return acc
 
 
@@ -37,7 +41,7 @@ def _inner_kernel(
     acc_ref,  # [N_TOKENS_, 1, H]
     ID,
 ):
-  """Inner kernel for pipelined weight fetch with blockwise matmul."""
+  """Inner kernel for pipelined weight fetch with 128-element chunked matmul."""
   slot = pl.program_id(0)
   tok = slot // TOP_K
   weight = weights_ref[slot]
@@ -47,10 +51,9 @@ def _inner_kernel(
 
   _, K, TWO_ID = w1_tile_ref.shape
   K_BLOCKS = w1_scale_tile_ref.shape[1]
-  QB = K // K_BLOCKS
   w1 = w1_tile_ref[...].reshape(K, TWO_ID)
   s1 = w1_scale_tile_ref[...].reshape(K_BLOCKS, 1, TWO_ID)
-  gate_up = _blockwise_matmul(lhs_row, w1, s1, K_BLOCKS, QB, TWO_ID)
+  gate_up = _blockwise_matmul_chunked(lhs_row, w1, s1, K, K_BLOCKS, TWO_ID)
 
   gate = gate_up[:, :ID]
   up = gate_up[:, ID:]
@@ -58,10 +61,9 @@ def _inner_kernel(
 
   _, ID_, H = w2_tile_ref.shape
   I_BLOCKS = w2_scale_tile_ref.shape[1]
-  IB = ID_ // I_BLOCKS
   w2 = w2_tile_ref[...].reshape(ID_, H)
   s2 = w2_scale_tile_ref[...].reshape(I_BLOCKS, 1, H)
-  down = _blockwise_matmul(act, w2, s2, I_BLOCKS, IB, H)
+  down = _blockwise_matmul_chunked(act, w2, s2, ID_, I_BLOCKS, H)
 
   H_acc = acc_ref.shape[2]
   current = acc_ref[pl.ds(tok, 1), 0, :H_acc]
