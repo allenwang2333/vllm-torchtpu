@@ -299,7 +299,7 @@ def fused_conv1d_gdn(
     state_indices: jax.Array,  # [num_seqs]
     distribution: jax.Array,  # [3]
     seq_lens: jax.Array,  # [num_seqs]
-    *args,
+    *,
     n_kq: int,
     n_v: int,
     d_k: int,
@@ -308,7 +308,6 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(b/534541080): Calculate tile size based on input dimensions.
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
     **kwargs,
@@ -356,10 +355,10 @@ def fused_conv1d_gdn(
       recurrent state cache tensors.
     out: Fused output tensor.
   """
+    act_in_dtype = qkv.dtype
     act_out_dtype = qkv.dtype
     conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
-    act_in_dtype = qkv.dtype
 
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
@@ -530,7 +529,7 @@ def fused_conv1d_gdn(
             weights,
         )
 
-    # qkv = pltpu.with_memory_space_constraint(qkv, pltpu.HBM)
+    qkv = pltpu.with_memory_space_constraint(qkv, pltpu.HBM)
     conv_state = pltpu.with_memory_space_constraint(conv_state, pltpu.HBM)
 
     out_act, out_conv_state, out_recurrent_state = call_kernel(

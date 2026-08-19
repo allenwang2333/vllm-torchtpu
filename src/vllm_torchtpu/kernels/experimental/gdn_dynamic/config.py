@@ -171,8 +171,8 @@ class GDNConfig:
         if self.dtypes.act_in_packing > 1:
             qkv_out_scratch = pltpu.VMEM(qkv_out_shape, jnp.float32)
 
-        return dict(
-            carry_conv_scratch_ref=carry_conv_scratch,
-            carry_recurrent_scratch_ref=carry_recurrent_scratch,
-            qkv_out_scratch_ref=qkv_out_scratch,
-        )
+        return {
+            "carry_conv_scratch_ref": carry_conv_scratch,
+            "carry_recurrent_scratch_ref": carry_recurrent_scratch,
+            "qkv_out_scratch_ref": qkv_out_scratch,
+        }

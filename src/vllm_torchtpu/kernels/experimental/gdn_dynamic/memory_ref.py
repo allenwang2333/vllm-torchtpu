@@ -52,7 +52,7 @@ class SmemWrapper:
     """Maps physical 1-D data into logical N-D representation."""
 
     data: Any
-    shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    shape: tuple[int, ...] = dataclasses.field(metadata={'static': True})
 
     def _get_pos(self, indices: tuple[Any, ...]) -> Any:
         strides = pl.strides_from_shape(self.shape)
@@ -118,11 +118,11 @@ class MetadataRef:
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BaseBufferedRef(pltpu.BufferedRef):
 
-    cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
+    cfg: config.GDNConfig = dataclasses.field(metadata={'static': True})
     # NOTE: Despite being ref, metadata_ref should be set to static. This is
     # because the memory will be allocated outside of kernel and metadata_ref
     # merely points to the reference.
-    metadata_ref: MetadataRef = dataclasses.field(metadata=dict(static=True))
+    metadata_ref: MetadataRef = dataclasses.field(metadata={'static': True})
 
     @classmethod
     def create(  # pyrefly: ignore[bad-override]
@@ -414,12 +414,7 @@ def create_allocs(
         cfg.num_v_heads,
         cfg.v_head_dim,
     )
-    conv_shape = (
-        cfg.seq_tile_size,
-        cfg.prev_kernel_size,
-        1,
-        cfg.dim_size,
-    )
+    conv_shape = (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size)
     recurrent_shape = (
         cfg.seq_tile_size,
         cfg.num_v_heads,
