@@ -2,22 +2,27 @@
 # ==============================================================================
 # Compilation Cache E2E Test (Raw TPU Execution)
 # ==============================================================================
-# Verifies compilation cache behavior, storage duplication reduction, and warm-start
-# cache hit consistency for vllm-torchtpu across 4 distinct test phases in 2 runs:
+# Verifies compilation cache behavior, storage duplication reduction, warm-start
+# cache hit speedup, inference output fidelity, and binary consistency across
+# 5 distinct test phases in 2 runs (Cold and Warm):
 #
 #   [Test 1] Cold Compilation Run:
-#            Verifies that running on a clean cache directory triggers FX graph
-#            compilation and generates initial compilation artifacts.
+#            Verifies that running on a clean cache directory performs runtime
+#            memory profiling (profile_run), triggers FX graph compilation, and
+#            generates initial Tier-3 compilation artifacts.
 #   [Test 2] Storage Duplication Audit:
 #            Audits cache sizes and verifies that Category 2 Python pickle files
 #            contain lightweight metadata handles (<50KB total) rather than duplicating
 #            heavy compiled binary payloads.
 #   [Test 3] Warm Start Cache Hit Verification:
-#            Verifies that subsequent inference runs load compiled executables directly
-#            from the cache (<1ms) without triggering re-compilation.
-#   [Test 4] Cache File & MD5 Consistency Check (Cold vs Warm):
-#            Compares Tier-3 binary artifact MD5sums between Cold and Warm runs to audit
-#            cache file consistency.
+#            Verifies that subsequent inference runs load compiled executables from
+#            cache, significantly reducing total compilation time (WARM < COLD).
+#   [Test 4] Inference Output Correctness Check (Cold vs Warm):
+#            Verifies that generated prompt text matches 100% between Cold and Warm runs
+#            (deterministic generation with temperature=0).
+#   [Test 5] Tier-3 Binary & MD5 Checksum Consistency Check (Cold vs Warm):
+#            Verifies that Tier-3 binary artifacts exist and maintain 100% identical
+#            MD5 checksums between Cold and Warm runs.
 #
 # Usage: ./scripts/vllm/integration/run_compilation_cache_e2e.sh [model_name]
 # Example: ./scripts/vllm/integration/run_compilation_cache_e2e.sh Qwen/Qwen3-0.6B
@@ -172,7 +177,11 @@ echo "📊 Total Cold Compilation Time: ${COLD_COMP_TIME}s"
 echo "📊 Total Warm Compilation Time: ${WARM_COMP_TIME}s"
 
 # Assert that warm start compilation completed significantly faster than cold compilation
-IS_FAST=$(python3 -c "print(1 if (float('${WARM_COMP_TIME}') < float('${COLD_COMP_TIME}') * 0.75 or float('${WARM_COMP_TIME}') < 20.0) else 0)" 2>/dev/null || echo "0")
+IS_FAST=$(python3 -c "
+cold = float('${COLD_COMP_TIME}')
+warm = float('${WARM_COMP_TIME}')
+print(1 if (warm < cold and (warm < cold * 0.75 or warm < 20.0)) else 0)
+" 2>/dev/null || echo "0")
 
 if [ "${IS_FAST}" -eq 1 ]; then
   echo "✅ [Test 3 PASSED] Warm start confirmed cache hit! (Warm: ${WARM_COMP_TIME}s vs Cold: ${COLD_COMP_TIME}s)"
