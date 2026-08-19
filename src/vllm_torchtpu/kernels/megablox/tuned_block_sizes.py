@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -359,6 +361,56 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int,
     return tm, tk, tn
 
 
+
+def _parse_gmm_block_sizes(spec: str) -> list[tuple[tuple, tuple[int, int, int]]]:
+    """Parse the GMM_BLOCK_SIZES tuning spec.
+
+    Grammar: entries separated by ';', each `k:n:g=tm,tk,tn`. A `*` in any of
+    the three selector positions matches anything, so `*:*:*=128,2048,2048`
+    forces one tiling everywhere and `3584:6144:112=256,3584,2048` targets a
+    single call site.
+
+    This exists because TUNED_BLOCK_SIZES is keyed on a full 8-tuple including
+    the model's total expert count, so a table built for one model cannot be
+    reused by another even when the matmul shapes coincide. Sweeping tilings
+    for a new model would otherwise mean one image build per candidate.
+    """
+    out = []
+    for entry in spec.split(';'):
+        entry = entry.strip()
+        if not entry:
+            continue
+        sel, _, val = entry.partition('=')
+        parts = sel.split(':')
+        if len(parts) != 3:
+            raise ValueError(f'GMM_BLOCK_SIZES: bad selector {sel!r}')
+        selector = tuple(None if x.strip() == '*' else int(x) for x in parts)
+        tiles = tuple(int(x) for x in val.split(','))
+        if len(tiles) != 3:
+            raise ValueError(f'GMM_BLOCK_SIZES: need tm,tk,tn, got {val!r}')
+        out.append((selector, tiles))
+    return out
+
+
+_GMM_OVERRIDES = None
+
+
+def _env_override(m: int, k: int, n: int, g: int):
+    global _GMM_OVERRIDES
+    if _GMM_OVERRIDES is None:
+        spec = os.getenv('GMM_BLOCK_SIZES', '')
+        _GMM_OVERRIDES = _parse_gmm_block_sizes(spec) if spec else []
+    for (sk, sn, sg), tiles in _GMM_OVERRIDES:
+        if (sk is None or sk == k) and (sn is None or sn == n) \
+                and (sg is None or sg == g):
+            # m % tm == 0 is a kernel requirement, not a preference.
+            tm = tiles[0]
+            if m % tm != 0:
+                continue
+            return tiles
+    return None
+
+
 def get_tuned_block_sizes(
     m: int,
     k: int,
@@ -384,6 +436,12 @@ def get_tuned_block_sizes(
         str(rhs_dtype),
         quant_block_size,
     )
+
+    override = _env_override(m, k, n, num_current_groups)
+    if override is not None:
+        logger.warning_once(
+            f'[GMM kernel] GMM_BLOCK_SIZES override for key {key}: {override}')
+        return override
 
     if key not in TUNED_BLOCK_SIZES:
         default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
