@@ -41,6 +41,7 @@ import pytest
 from vllm_torchtpu import utils
 from vllm_torchtpu.layers.vllm import fused_moe_ep
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
+from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
@@ -72,7 +73,30 @@ def _runner(*, lockstep, most_model_len=None):
     )
     runner._fused_moe_needs_rendezvous = (
         TPUModelRunner._fused_moe_needs_rendezvous.__get__(runner))
+    # The real ladder walk, not a stub of it: the properties under test are
+    # that every bucket is preceded by a rendezvous and that `dp_lockstep`
+    # reaches `_dummy_run`, and both live inside this method. Main moved the
+    # loop here from `capture_model`; binding the real one is what keeps these
+    # tests pointed at the code rather than at a copy of it.
+    runner._precompile_backbone = (
+        TPUModelRunner._precompile_backbone.__get__(runner))
     return runner, calls, barriers
+
+
+@pytest.fixture(autouse=True)
+def _no_shape_variants(monkeypatch):
+    """Stub only the retrace bookkeeping the ladder walks through.
+
+    `shape_variants` decides whether a bucket needs its own trace, which is a
+    separate feature with its own tests and needs a real compiled model. Here
+    it must simply not interfere: no retraces, nothing refused.
+    """
+
+    @contextlib.contextmanager
+    def _warmup():
+        yield SimpleNamespace(needs_retrace=lambda _n: False, refused=set())
+
+    monkeypatch.setattr(tpu_runner_mod.shape_variants, "warmup", _warmup)
 
 
 @pytest.fixture(autouse=True)
