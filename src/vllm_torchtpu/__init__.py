@@ -326,12 +326,13 @@ def _patch_vllm_compile_all_ranges() -> None:
     loads peer ranks' artifacts from disk cache without redundant recompilation.
     """
     import os
-    import time
-    from collections import deque
 
     from vllm.compilation.piecewise_backend import (PiecewiseBackend,
                                                     create_concrete_args,
                                                     get_fake_args_from_graph)
+
+    from vllm_torchtpu.compilation.parallel_precompile import \
+        parallel_precompile
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -340,17 +341,7 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called.")
 
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        world_size = int(
-            os.environ.get(
-                "WORLD_SIZE",
-                os.environ.get("LOCAL_WORLD_SIZE", "8"),
-            ))
-        if world_size <= 0:
-            world_size = 1
-
         range_entry_list = list(self.range_entries.values())
-        range_entry_len = len(range_entry_list)
 
         def _compile_entry(entry):
             if entry.compiled:
@@ -375,62 +366,38 @@ def _patch_vllm_compile_all_ranges() -> None:
             )
             entry.compiled = True
 
-        # Phase 1: Compile own disjoint partition
-        my_assigned_indices = [
-            i for i in range(range_entry_len)
-            if i % world_size == (local_rank % world_size)
-        ]
-        for i in my_assigned_indices:
-            _compile_entry(range_entry_list[i])
-
-        # Phase 2: For remaining entries, rotate order and wait for peer's cache if enabled
+        adapter = getattr(self.vllm_backend.compiler_manager, "adapter", None)
+        cache_dir = getattr(adapter, "cache_dir", None) if adapter else None
         cache_enabled = not bool(
             os.environ.get("VLLM_DISABLE_COMPILE_CACHE", "0") in ("1", "true",
                                                                   "True"))
-        adapter = getattr(self.vllm_backend.compiler_manager, "adapter", None)
-        cache_dir = getattr(adapter, "cache_dir", None) if adapter else None
 
-        remaining_indices = [
-            i for i in range(range_entry_len) if i not in my_assigned_indices
-        ]
-        d = deque(remaining_indices)
-        d.rotate(-local_rank)
-        ordered_remaining = list(d)
+        def _get_peer_cache_file(entry):
+            if not cache_enabled or not adapter or not cache_dir:
+                return None
+            try:
+                if entry.compile_range.is_single_size():
+                    concrete_args = create_concrete_args(
+                        self.graph, entry.compile_range.start)
+                else:
+                    concrete_args = get_fake_args_from_graph(self.graph)
+                key = adapter.key(
+                    self.graph,
+                    concrete_args,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    self.piecewise_compile_index,
+                    entry.compile_range,
+                )
+                return os.path.join(cache_dir, key) if key else None
+            except Exception:
+                return None
 
-        for i in ordered_remaining:
-            entry = range_entry_list[i]
-            if entry.compiled:
-                continue
-
-            if cache_enabled and adapter and cache_dir and os.path.exists(
-                    cache_dir):
-                try:
-                    if entry.compile_range.is_single_size():
-                        concrete_args = create_concrete_args(
-                            self.graph, entry.compile_range.start)
-                    else:
-                        concrete_args = get_fake_args_from_graph(self.graph)
-                    key = adapter.key(
-                        self.graph,
-                        concrete_args,
-                        self.vllm_backend.inductor_config,
-                        self.compilation_config,
-                        self.piecewise_compile_index,
-                        entry.compile_range,
-                    )
-                    expected_cache_file = os.path.join(cache_dir,
-                                                       key) if key else None
-                    if expected_cache_file and not os.path.exists(
-                            expected_cache_file):
-                        # Wait for peer rank to finish writing its compilation artifact (up to 300s)
-                        for _ in range(600):
-                            if os.path.exists(expected_cache_file):
-                                break
-                            time.sleep(0.5)
-                except Exception:
-                    pass
-
-            _compile_entry(entry)
+        parallel_precompile(
+            items=range_entry_list,
+            compile_fn=_compile_entry,
+            poll_cache_fn=_get_peer_cache_file,
+        )
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
