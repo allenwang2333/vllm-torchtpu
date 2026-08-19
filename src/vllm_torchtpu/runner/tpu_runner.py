@@ -67,7 +67,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   prepare_kernel_block_sizes)
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import moe_census, shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -79,7 +79,7 @@ from vllm_torchtpu.layers.common.attention_metadata import (
     AttentionMetadataBuilderContext)
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
-from vllm_torchtpu.layers.vllm import token_padding
+from vllm_torchtpu.layers.vllm import fused_moe_ep, token_padding
 from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
                                                  PallasAttentionBackend,
                                                  PallasMLAttentionBackend)
@@ -88,8 +88,6 @@ from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
-from vllm_torchtpu.compilation import moe_census
-from vllm_torchtpu.layers.vllm import fused_moe_ep
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -4415,7 +4413,6 @@ class TPUModelRunner(GPUModelRunner):
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
-                fused_moe_ep.dp_agreement(dp_lockstep, num_tokens),
                 set_forward_context(
                     per_layer_attn_metadata,
                     self.vllm_config,
@@ -4737,7 +4734,8 @@ class TPUModelRunner(GPUModelRunner):
             return
         from vllm.distributed.parallel_state import get_ep_group
         torch.distributed.barrier(group=get_ep_group().cpu_group)
-        logger.info("  -- fused EP MoE rendezvous at num_tokens=%d", num_tokens)
+        logger.info("  -- fused EP MoE rendezvous at num_tokens=%d",
+                    num_tokens)
 
     def _fused_moe_needs_rendezvous(self) -> bool:
         return (self._dp_lockstep_enabled()

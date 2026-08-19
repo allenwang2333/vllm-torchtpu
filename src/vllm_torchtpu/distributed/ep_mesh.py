@@ -3,9 +3,22 @@
 
 Same mechanism as :mod:`vllm_torchtpu.distributed.pcp`: every rank agrees on an
 order for ``jax.devices()`` by gathering each peer's TPU global device id over
-the group's CPU process group. A shard_map'd Pallas kernel needs that order to
-match EP rank order, because expert ``e`` lives on rank ``e // local_experts``
-and the kernel addresses peers by mesh index.
+the group's CPU process group.
+
+The mesh goes in **ascending device-id order, which is not EP-rank order**. A
+Mosaic kernel that addresses a peer with ``DeviceIdType.MESH`` resolves the
+coordinate positionally against the runtime's device list rather than through
+the device array the mesh was built with, so mesh index ``i`` has to *be* device
+id ``i``. On the tpu7x-8 we serve on, whose EP ranks come up as device ids
+``(0, 1, 4, 5, 6, 7, 2, 3)``, a mesh in EP-rank order sends every routed row to
+the wrong peer and the ranks deadlock on the first call.
+
+Ordering by device id means mesh index ``i`` is no longer EP rank ``i``: the
+shard there holds the experts of EP rank ``ep_rank_at_mesh_index[i]``. A kernel
+that takes ownership as data can be told so -- see
+``layers/vllm/fused_moe_ep.py`` -- and one that infers it from its own axis
+index cannot, which is what ``validate_ep_mesh``'s ``reindexes_expert_order``
+separates.
 """
 
 from __future__ import annotations
@@ -40,6 +53,32 @@ class EpGroupLayout:
     device_ids: tuple[int, ...]
     rank_in_group: int
     world_size: int
+
+    @property
+    def mesh_device_ids(self) -> tuple[int, ...]:
+        """Device ids in the order the mesh builders lay them out."""
+        if len(set(self.device_ids)) != len(self.device_ids):
+            raise RuntimeError(
+                "Two EP ranks report the same TPU global device id, so no mesh "
+                f"order can address them: ranks={self.ranks}, "
+                f"device_ids={self.device_ids}")
+        return tuple(sorted(self.device_ids))
+
+    @property
+    def ep_rank_at_mesh_index(self) -> tuple[int, ...]:
+        """The EP rank whose expert block sits at each mesh index."""
+        ep_rank_of_device = {d: r for r, d in enumerate(self.device_ids)}
+        return tuple(ep_rank_of_device[d] for d in self.mesh_device_ids)
+
+    @property
+    def mesh_index(self) -> int:
+        """This rank's index into that mesh -- what the kernel's own
+        ``lax.axis_index`` returns, and the peer coordinate others address."""
+        return self.mesh_device_ids.index(self.device_ids[self.rank_in_group])
+
+    @property
+    def mesh_order_is_ep_rank_order(self) -> bool:
+        return self.ep_rank_at_mesh_index == tuple(range(self.world_size))
 
 
 _LAYOUT_CACHE: dict[tuple[int, tuple[int, ...], int, int], EpGroupLayout] = {}
@@ -93,7 +132,7 @@ def get_ep_group_layout() -> EpGroupLayout:
 
 
 def get_or_create_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any:
-    """Build the ``(1, ep_size)`` JAX mesh ordered by EP rank."""
+    """Build the ``(1, ep_size)`` JAX mesh in ascending device-id order."""
     return _get_or_create_mesh((EP_MESH_DATA_AXIS, axis_name))
 
 
@@ -103,10 +142,10 @@ def get_or_create_ep_mesh_1d(axis_name: str = EP_AXIS_NAME_1D) -> Any:
 
 
 def _get_or_create_mesh(axis_names: tuple[str, ...]) -> Any:
-    """EP-rank-ordered mesh whose LAST axis is the expert-parallel one."""
+    """Device-id-ordered mesh whose LAST axis is the expert-parallel one."""
 
     layout = get_ep_group_layout()
-    cache_key = (axis_names, layout.device_ids)
+    cache_key = (axis_names, layout.mesh_device_ids)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -119,9 +158,9 @@ def _get_or_create_mesh(axis_names: tuple[str, ...]) -> Any:
         int(getattr(device, "id", idx)): device
         for idx, device in enumerate(jax.devices())
     }
+    device_ids = layout.mesh_device_ids
     missing = [
-        device_id for device_id in layout.device_ids
-        if device_id not in devices_by_id
+        device_id for device_id in device_ids if device_id not in devices_by_id
     ]
     if missing:
         raise RuntimeError(
@@ -129,10 +168,21 @@ def _get_or_create_mesh(axis_names: tuple[str, ...]) -> Any:
             f"device ids: missing={missing}, layout={layout}, "
             f"jax_device_ids={sorted(devices_by_id)}")
 
+    # Ascending order buys positional addressing only when the ids *are* the
+    # positions: a Mosaic peer coordinate resolves against the runtime's device
+    # list, so mesh index i reaches device id i whatever this mesh says. A group
+    # on some other set of devices -- a sub-slice, or two groups sharing a node
+    # -- cannot be fixed by reordering, and the expert reindex does not reach it
+    # either: that moves ownership between *ranks*, not between devices.
+    if device_ids != tuple(range(layout.world_size)):
+        raise NotImplementedError(
+            "EP mesh needs the group's TPU global device ids to be "
+            f"0..{layout.world_size - 1}; got {sorted(layout.device_ids)}. Mesh "
+            "index i must be device id i, because a Mosaic kernel resolves a "
+            "MESH peer coordinate positionally against the device list.")
     shape = (1, ) * (len(axis_names) - 1) + (layout.world_size, )
-    mesh_devices = np.asarray([
-        devices_by_id[device_id] for device_id in layout.device_ids
-    ]).reshape(shape)
+    mesh_devices = np.asarray(
+        [devices_by_id[device_id] for device_id in device_ids]).reshape(shape)
     # Explicit axes keep the shard_map out-spec on the exported output aval,
     # which is what torch_tpu's `torch_placeholder` divides by to size the torch
     # buffer (pallas.py:get_local_shape). Under the default Auto axes
@@ -146,12 +196,18 @@ def _get_or_create_mesh(axis_names: tuple[str, ...]) -> Any:
     return mesh
 
 
-def validate_ep_mesh(layer) -> None:
+def validate_ep_mesh(layer, *, reindexes_expert_order: bool = False) -> None:
     """Fail loudly if vLLM's expert ownership and the mesh order can disagree.
 
-    Mesh index i must be EP rank i, because expert block i lives on EP rank i
-    (``moe_routing.get_experts_start``) and the kernel addresses peers by mesh
-    index. Nothing upstream asserts ``moe_config.ep_rank ==
+    Expert block ``r`` lives on EP rank ``r`` (``moe_routing.get_experts_start``)
+    while the mesh is in device-id order, so the shard at mesh index ``i`` holds
+    block ``ep_rank_at_mesh_index[i]``. Pass ``reindexes_expert_order=True`` if
+    the caller carries that permutation into the kernel; a kernel that reads
+    ownership off its own axis index must not run on a permuted node at all,
+    because the rows land on the wrong experts and no shape or row-order test
+    can see it.
+
+    Nothing upstream asserts ``moe_config.ep_rank ==
     get_ep_group().rank_in_group``; they agree by construction, and a mismatch
     would silently route rows to the wrong experts.
     """
@@ -166,6 +222,14 @@ def validate_ep_mesh(layer) -> None:
     if int(group.world_size) != int(moe.ep_size):
         raise RuntimeError(f"ep_group.world_size={group.world_size} != "
                            f"moe_config.ep_size={moe.ep_size}")
+    layout = get_ep_group_layout()
+    if not reindexes_expert_order and not layout.mesh_order_is_ep_rank_order:
+        raise NotImplementedError(
+            "This MoE kernel takes expert ownership from its mesh index, and "
+            "the mesh is in device-id order: the node drives EP ranks "
+            f"{layout.ranks} from device ids {layout.device_ids}, which puts EP "
+            f"ranks {layout.ep_rank_at_mesh_index} at mesh indices "
+            f"0..{layout.world_size - 1}.")
     if not (torch.distributed.is_available()
             and torch.distributed.is_initialized()):
         return

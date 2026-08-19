@@ -25,8 +25,8 @@ from jax import lax
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, WeightFormat,
     act_scale_slab_rows, align_up, build_routing_tables,
-    build_routing_tables_sharded, expert_visit_list, local_slab_rows,
-    capacity_slab_rows, ragged_stride_bound, routing_block, shard_count_vector,
+    build_routing_tables_sharded, capacity_slab_rows, expert_visit_list,
+    local_slab_rows, ragged_stride_bound, routing_block, shard_count_vector,
     shard_expert_slabs, shard_push_tables_in_rows, shard_token_gather,
     shard_transport_tables_in_blocks, weight_form, weight_format_of_dtype)
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
@@ -111,7 +111,8 @@ def fused_ep_moe_v2(x,
                     act_fn="silu",
                     collective_id=None,
                     sharded_plan=False,
-                    ep_ids=None):
+                    ep_ids=None,
+                    mesh_ep_ranks=None):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
@@ -289,6 +290,26 @@ def fused_ep_moe_v2(x,
         topk_weights, topk_idx = pallas_select(scores,
                                                topk=topk,
                                                block_rows=select_rows)
+        if mesh_ep_ranks is not None:
+            # vLLM numbers expert blocks by EP rank; everything below this line
+            # numbers them by mesh index, because the mesh is laid out in
+            # device-id order and `me` is a mesh coordinate in both of the roles
+            # it plays -- the block it owns, and the peer others address. Where
+            # the two orders differ, relabel the ids here, once, and the plan,
+            # the transport tables and the drop mask are all in one space.
+            #
+            # After selection, not before: permuting the *logits* is
+            # arithmetically the same and changes which expert wins an exact
+            # top-k tie, which is a real difference at bf16.
+            #
+            # `ep` selects rather than a table gather: a gather over the lane
+            # axis is the shape this file avoids everywhere else.
+            owning_rank = topk_idx // g_local
+            mesh_block = jnp.zeros_like(topk_idx)
+            for mesh_index, ep_rank in enumerate(mesh_ep_ranks):
+                mesh_block = jnp.where(owning_rank == ep_rank,
+                                       jnp.int32(mesh_index), mesh_block)
+            topk_idx = mesh_block * g_local + topk_idx % g_local
         # A row of scores carrying no real value routes nowhere. It was
         # dropped by arithmetic accident: the selector gives every slot of
         # such a row a large negative sentinel, and the renormalization below
@@ -461,8 +482,8 @@ def fused_ep_moe_v2(x,
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride,
-           capacity_skew, weight_format, rhs_qb, act_fn, collective_id,
+           block, ragged_stride, capacity_skew,
+           weight_format, rhs_qb, act_fn, collective_id, mesh_ep_ranks,
            bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
            and w1_bias.dtype, has_w2_bias and w2_bias.dtype)

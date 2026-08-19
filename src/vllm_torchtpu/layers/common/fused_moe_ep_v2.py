@@ -151,6 +151,7 @@ def fused_ep_moe_v2_func(
     collective_id: int = FUSED_EP_V2_COLLECTIVE_ID,
     sharded_plan: bool = False,
     capacity_skew: Optional[float] = None,
+    mesh_ep_ranks: Optional[tuple] = None,
     ep_size: Optional[int] = None,
 ) -> jax.Array:
     """Run one MoE layer over the EP mesh through the v2 kernel.
@@ -181,6 +182,7 @@ def fused_ep_moe_v2_func(
         _scales_2d(w2_scale),
         gating_output.astype(jnp.float32),
         ep_ids=ep_ids,
+        mesh_ep_ranks=mesh_ep_ranks,
         topk=top_k,
         renormalize=renormalize,
         mesh=mesh,

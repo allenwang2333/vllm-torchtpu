@@ -152,7 +152,7 @@ def test_it_refuses_to_compose_with_the_fused_ep_kernel(monkeypatch):
     nothing. Refuse loudly: a silent fallback here would look like a measured
     null.
     """
-    monkeypatch.setenv("USE_MOE_EP_KERNEL", "1")
+    monkeypatch.setenv("USE_MOE_FUSED_EP_V2", "1")
     with pytest.raises(RuntimeError, match="does not compose"):
         moe_routing.promote_router_gates_to_fp32(_model())
 

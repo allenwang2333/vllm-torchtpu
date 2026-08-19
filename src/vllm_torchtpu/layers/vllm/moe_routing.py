@@ -240,10 +240,10 @@ def promote_router_gates_to_fp32(model) -> int:
 
     from vllm_torchtpu import envs
 
-    if envs.USE_MOE_EP_KERNEL:
+    if envs.USE_MOE_FUSED_EP_V2:
         raise RuntimeError(
             "TPU_MOE_ROUTER_LOGITS_FP32=1 does not compose with "
-            "USE_MOE_EP_KERNEL=1: the fused kernel takes `gating_output` as a "
+            "USE_MOE_FUSED_EP_V2=1: the fused kernel takes `gating_output` as a "
             "typed operand and selects experts inside the Pallas program, so "
             "f32 logits would either be refused by the kernel or cast back to "
             "bf16 before they reach the selector, which buys nothing. Pick one."

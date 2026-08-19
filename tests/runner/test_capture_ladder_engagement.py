@@ -11,14 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``capture_model``'s ladder is what decides which MoE program each bucket has.
+"""What the boot path owes an armed fused-EP layer: equal shapes, bounded skew.
 
-vLLM compiles one program per token bucket and the fused EP kernel's engagement
-is a branch *inside* that program, so the ladder's own declaration of DP
-coordination selects the kernel for the whole run. A ladder that declares
-itself uncoordinated compiles the GMM path into every bucket and no runtime
-predicate can reach the kernel afterwards -- the fix that unblocked the boot
-was also what guaranteed the kernel never ran (W6 blocker 6).
+The kernel's rendezvous is an all-device barrier, so every rank must enter each
+forward with the same shape and none may be so far behind that the barrier's
+counting semaphore has already been reused. Arming moves *which* forwards this
+covers: the layer no longer declines an uncoordinated step, so every backbone
+forward from ``profile_run`` onwards runs the kernel.
+
+Two different guarantees, from two different places, and this file pins both:
+
+* **equal shapes** are structural. Every dummy forward's token count is config,
+  not schedule -- ``profile_run`` takes ``max_num_tokens`` and the capture
+  ladder walks ``num_tokens_paddings``, both of which are
+  ``compilation_config.compile_sizes`` and identical on every rank.
+* **bounded skew** is not structural over a *ladder*: compile time differs per
+  rank and accumulates across eleven buckets until one rank is a whole bucket
+  ahead of another, so ``capture_model`` puts one CPU-group barrier before each
+  bucket. A single-shape phase has nothing to accumulate, which is why
+  ``profile_run`` does not need one -- and why it must not have one, since a
+  barrier is also a way for one rank that never arrives to hang the rest.
 """
 
 import contextlib
@@ -26,8 +38,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu import utils
 from vllm_torchtpu.layers.vllm import fused_moe_ep
+from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 
 def _runner(*, lockstep, most_model_len=None):
@@ -70,13 +85,20 @@ def clean_state(monkeypatch):
 
 @pytest.mark.parametrize("lockstep", [True, False])
 def test_the_ladder_traces_with_the_coordination_it_actually_has(lockstep):
+    """Every bucket declares the coordination the runner really has.
+
+    This no longer selects the MoE program -- arming does, at weight load --
+    but it still decides what each dummy forward puts in
+    ``set_forward_context``: ``num_tokens_across_dp``, and the idle-engine
+    logits collective that pairs with a busy engine's. A ladder that declared
+    itself differently per bucket would compile a different collective stream
+    into some of them.
+    """
     runner, calls, _ = _runner(lockstep=lockstep)
     TPUModelRunner.capture_model(runner)
 
     assert len(calls) == 3
-    assert all(kwargs["dp_lockstep"] is lockstep for _, kwargs in calls), (
-        "every bucket in the ladder must declare the same coordination; a "
-        "bucket traced uncoordinated carries the GMM path forever")
+    assert all(kwargs["dp_lockstep"] is lockstep for _, kwargs in calls)
     assert [args[0] for args, _ in calls] == [16, 128, 4096]
 
 
@@ -88,7 +110,13 @@ def test_both_request_shapes_of_a_bucket_are_traced_the_same_way():
 
 
 def test_every_coordinated_bucket_is_preceded_by_a_rendezvous():
-    """"Coordinated in fact" is an argument; the barrier is a guarantee."""
+    """"Coordinated in fact" is an argument; the barrier is a guarantee.
+
+    One barrier per bucket, because the skew this bounds is *accumulated*: the
+    ranks walk the same list in the same order, so they cannot disagree about
+    the shape, but they compile it at different speeds and the lead grows down
+    the ladder until two ranks' barriers pair across different buckets.
+    """
     runner, calls, barriers = _runner(lockstep=True)
     TPUModelRunner.capture_model(runner)
     assert barriers == [16, 128, 4096]
@@ -96,13 +124,14 @@ def test_every_coordinated_bucket_is_preceded_by_a_rendezvous():
 
 
 def test_the_rendezvous_is_skipped_where_it_could_only_deadlock(monkeypatch):
-    """No DP lockstep, or no layer on the fused path: nothing to rendezvous.
+    """No DP lockstep, or no armed layer: nothing to rendezvous.
 
     A CPU-group barrier is only safe where every rank reaches it. Both
     conditions are the runner's own, and both are cheap to get wrong in the
-    direction that hangs a boot.
+    direction that hangs a boot -- as a stray ``@contextlib.contextmanager`` on
+    ``fused_path_is_live`` did, making it return an always-truthy object and
+    arming the barrier on control runs.
     """
-    # No layer on the fused path yet, whatever the lockstep setting says.
     assert _runner(lockstep=False)[0]._fused_moe_needs_rendezvous() is False
     assert _runner(lockstep=True)[0]._fused_moe_needs_rendezvous() is False
 
@@ -112,7 +141,7 @@ def test_the_rendezvous_is_skipped_where_it_could_only_deadlock(monkeypatch):
 
 
 def test_the_run_is_reported_before_the_sampling_subgraphs():
-    """The ledger must print even if a later precompile stage explodes."""
+    """The census must print even if a later precompile stage explodes."""
     order = []
     runner, _, _ = _runner(lockstep=True)
     runner._precompile_sampling_subgraphs = lambda: order.append("sampling")
@@ -121,3 +150,84 @@ def test_the_run_is_reported_before_the_sampling_subgraphs():
                            lambda **k: order.append("report")):
         TPUModelRunner.capture_model(runner)
     assert order == ["report", "sampling"]
+
+
+# --------------------------------------------------------------------------
+# The profile run, which arming turned into the kernel's first execution
+# --------------------------------------------------------------------------
+
+
+def test_the_profile_shape_is_the_top_of_the_config_ladder(monkeypatch):
+    """Every rank profiles at the same shape, and nothing rank-local says so.
+
+    With arming, ``profile_run``'s dummy forward is the **first execution of
+    the kernel** on every rank, so its barrier pairs only if the shapes match.
+    They do, by construction rather than by coordination: the count is
+    ``model_runner.max_num_tokens``, which is ``num_tokens_paddings[-1]``,
+    which is ``compilation_config.compile_sizes[-1]`` -- computed once from
+    ``scheduler_config.max_num_batched_tokens`` and carried inside the config
+    every worker is constructed from. No rank, dp_rank, schedule or device
+    state is consulted.
+
+    That is why there is no rendezvous here and must not be one: the barrier
+    would bound arrival skew that a single-shape phase cannot accumulate, and
+    it would add a collective to a path where a rank that never arrives (an
+    engine that took the ``kv_cache_memory_bytes`` short-circuit, say) hangs
+    the rest with no diagnostic.
+    """
+    profiled = []
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=None,
+                                     gpu_memory_utilization=0.9),
+        model_runner=SimpleNamespace(
+            max_num_tokens=8192,
+            profile_run=lambda num_tokens: profiled.append(num_tokens)),
+        devices=[],
+        vllm_config=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        utils, "compute_hbm_budget", lambda devices, util: utils.HbmBudget(
+            total_limit=64 * utils.GBYTES,
+            total_used=8 * utils.GBYTES,
+            cap=48 * utils.GBYTES,
+            available=40 * utils.GBYTES))
+    monkeypatch.setattr(utils, "estimate_kv_connector_hbm_reserve",
+                        lambda vllm_config: 0)
+
+    TPUWorker.determine_available_memory(worker)
+
+    assert profiled == [worker.model_runner.max_num_tokens]
+
+
+def test_the_bucket_ladder_is_a_pure_function_of_the_engine_cap():
+    """The other half of "equal shapes": the ladder itself is config.
+
+    Two ranks with the same ``max_num_batched_tokens`` get the same list, in
+    the same order, so ``capture_model``'s walk is rank-invariant too. The one
+    input that is not config is ``TPU_TOKEN_BUCKET_EXTRA``, and it is read
+    exactly once -- on the process that first builds the config, whose
+    ``compile_sizes`` then travels to every worker (a worker that already has
+    the list only sorts it). A change that made a worker recompute the ladder
+    would put that env var on the critical path for shape agreement.
+    """
+    ladder = _get_token_paddings(16, 8192, None)
+    assert ladder == _get_token_paddings(16, 8192, None)
+    assert ladder[0] == 16 and ladder[-1] >= 8192
+    assert _get_token_paddings(16, 4096, None)[-1] < ladder[-1]
+    assert 3000 in _get_token_paddings(16, 8192, [3000])
+
+
+def test_the_smallest_bucket_is_what_the_surviving_trace_sees():
+    """The number that made a per-step threshold unreachable, pinned.
+
+    ``capture_model`` walks the ladder in ascending order and vLLM keeps only
+    the first trace, so whatever the branch answers at ``num_tokens_paddings[0]``
+    is what every bucket gets. At 16 tokens that is 64 node-wide on a DP4
+    engine -- below any threshold that keeps decode on the GMM path, which is
+    why the kernel reached zero compiled graphs in every serving arm before
+    arming. Nothing may reintroduce a token-count branch on the strength of
+    "the ladder is coordinated now".
+    """
+    runner, calls, _ = _runner(lockstep=True)
+    TPUModelRunner.capture_model(runner)
+    assert [args[0] for args, _ in calls][0] == min(runner.num_tokens_paddings)

@@ -53,10 +53,9 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME_1D
 from vllm_torchtpu.layers.common.fused_moe_ep_v2 import fused_ep_moe_v2_func
 
-from .test_fused_ep_device import (HIDDEN, INTERMEDIATE, NUM_EXPERTS, SMALL,
-                                   TOP_K, _fused, _gmm_reference, _inputs,
-                                   _mesh, _rel_l2, _shard, _small_inputs,
-                                   _small_ref, _weights)
+from .ep_device_harness import (HIDDEN, INTERMEDIATE, NUM_EXPERTS, SMALL,
+                                TOP_K, _gmm_reference, _inputs, _mesh, _rel_l2,
+                                _shard, _small_inputs, _small_ref, _weights)
 
 pytestmark = [
     pytest.mark.multichip,
@@ -192,17 +191,14 @@ def test_report_layer_time_and_wire_bandwidth(local_tokens):
     args2d = _inputs(mesh2d, ep_size, local_tokens)
 
     v2_ms = _bench(lambda: _v2(*args1d, mesh1d))
-    v1_ms = _bench(lambda: _fused(*args2d, mesh2d, True))
     gmm_ms = _bench(lambda: _gmm_reference(*args2d, mesh2d, ep_size))
 
     wire = _wire_bytes(local_tokens, ep_size)
     row = dict(local_tokens=local_tokens,
                node_tokens=local_tokens * ep_size,
                v2_ms=round(v2_ms, 4),
-               v1_ms=round(v1_ms, 4),
                gmm_ms=round(gmm_ms, 4),
                v2_over_gmm=round(gmm_ms / v2_ms, 3),
-               v2_over_v1=round(v1_ms / v2_ms, 3),
                wire_bytes=wire,
                v2_wire_gbps=round(wire["total"] / (v2_ms * 1e-3) / 1e9, 1))
     print("V2_LADDER " + json.dumps(row))

@@ -832,20 +832,15 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         The TP all-reduce still must, and does: ``_fused_output_is_reduced`` is
         driven by ``moe_kernel``, which stays None here.
 
-        **Per step, not per layer.** The runner reads this property inside
-        ``_maybe_dispatch`` and ``_maybe_combine`` on every forward, so it can
-        answer per step -- and it has to. On a step whose DP ranks have not
-        agreed on a shape (a profile run, or an idle DP engine's dummy batch)
-        this layer cannot take over the pair: it would issue DP collectives
-        from inside the layer, on ranks that are not arriving together, which
-        halts the device exactly the way an uncoordinated barrier does. Give
-        the pair back to the runner for that step and let it do what it does on
-        every other layer. ``_needs_fallback_dispatch`` reads the same
-        predicate, so the two never both run or both skip.
+        **One answer for the run, not one per step.** The runner reads this on
+        every forward, but it must not vary: the layer either owns the pair or
+        it does not, and a property that answered per step would put the taking
+        over and the giving back on different sides of a trace that is compiled
+        once. Arming is settled at weight load (``fused_moe_ep.is_enabled``),
+        and the deployments where a step could not be coordinated are refused
+        there rather than fallen back from here.
         """
-        return (getattr(self, "_fused_ep_enabled", False)
-                and fused_moe_ep.dp_step_is_coordinated(
-                    getattr(self, "_fused_ep_dp_size", 1)))
+        return getattr(self, "_fused_ep_enabled", False)
 
     @staticmethod
     def _fused_ep_kernel_config(layer: RoutedExperts) -> dict:
@@ -873,7 +868,13 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
         fused_ep = getattr(self, "_fused_ep_enabled", False)
-        if fused_ep and fused_moe_ep.engages_for(layer, x):
+        # No per-step test: an armed layer serves every step. Asking the band
+        # here would read a token count vLLM marked dynamic, and with Dynamo's
+        # guards dropped after the first trace the answer would be frozen for
+        # every bucket -- which is how this kernel previously reached zero
+        # compiled graphs while looking engaged. `fused_moe_ep.is_enabled`
+        # decides once, at weight load.
+        if fused_ep:
             return fused_moe_ep.fused_moe_ep(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -885,13 +886,6 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 ep_rank_ids=layer._ep_rank_ids,
                 **self._fused_ep_config,
             )
-
-        if fused_ep:
-            # This layer told the runner we own dispatch/combine, but this step
-            # is below the fused kernel's token threshold, so reinstate the
-            # DP pair the runner skipped.
-            x, router_logits = fused_moe_ep.dispatch_for_fallback(
-                layer, x, router_logits)
 
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -919,8 +913,6 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
-        if fused_ep:
-            states = fused_moe_ep.combine_for_fallback(layer, states)
         return states
 
 

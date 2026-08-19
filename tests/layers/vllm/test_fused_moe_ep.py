@@ -11,36 +11,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch-side unit tests for the fused expert-parallel MoE bridge."""
+"""Torch-side unit tests for the fused expert-parallel MoE bridge.
+
+**Everything the kernel decides, it decides here, at weight load.** vLLM
+compiles the backbone once with every Dynamo guard dropped
+(``TorchCompileWithNoGuardsWrapper``), so a branch inside the traced forward is
+answered once and that answer is the program for every token bucket. A layer
+therefore either arms -- and then serves every step from the smallest decode
+bucket to the largest prefill one -- or it declines, with a reason. These tests
+pin the arming decision and its inputs; ``test_fused_moe_ep_engagement.py`` pins
+what the compiler then receives.
+"""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+import vllm.config as vllm_config_mod
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.vllm import fused_moe_ep
 
-
-@pytest.fixture
-def dp_coordinated(monkeypatch):
-    """The runner's declaration that every DP rank has the same token count.
-
-    ``engages_for`` declines without it, because the kernel's barrier needs
-    every rank to enter -- see ``dp_step_is_coordinated``.
-    """
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", True, raising=False)
+# Qwen3.5-397B's MoE geometry, which every measured number in this file is at.
+TOP_K = 10
+NUM_EXPERTS = 512
+EP_SIZE = 8
 
 
 def _layer(**overrides):
     moe_config = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(use_ep=True),
-        ep_size=8,
+        ep_size=EP_SIZE,
         dp_size=8,
-        num_experts=512,
-        experts_per_token=10,
+        num_experts=NUM_EXPERTS,
+        experts_per_token=TOP_K,
         is_sequence_parallel=False,
         pcp_size=1,
+        skip_final_all_reduce=False,
+        is_lora_enabled=False,
     )
     layer = SimpleNamespace(
         moe_config=moe_config,
@@ -57,37 +65,408 @@ def _layer(**overrides):
 
 @pytest.fixture
 def tp1(monkeypatch):
+    """The DP8_EP layout: tokens are not replicated across a TP group."""
     monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (1, 0))
 
 
-def test_the_threshold_defaults_to_the_jax_recipes_value(monkeypatch):
-    """A default of 0 means the kernel takes decode steps too: -86% e2e."""
+@pytest.fixture
+def engine_cap(monkeypatch):
+    """Set the scheduler cap the band reads, the way a booted engine would.
+
+    ``max_engine_node_tokens`` goes through ``get_current_vllm_config_or_none``,
+    so this patches the source rather than the answer: the multiplication by
+    ``dp_size`` -- the step from a per-engine cap to the node-wide count every
+    measurement is indexed by -- stays under test.
+    """
+
+    def _set(max_num_batched_tokens):
+        config = (None if max_num_batched_tokens is None else SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=max_num_batched_tokens)))
+        monkeypatch.setattr(vllm_config_mod, "get_current_vllm_config_or_none",
+                            lambda: config)
+
+    return _set
+
+
+@pytest.fixture(autouse=True)
+def clean_arming_state():
+    fused_moe_ep.reset_engagement_state()
+    yield
+    fused_moe_ep.reset_engagement_state()
+
+
+@pytest.fixture
+def armable(monkeypatch, tp1, engine_cap):
+    """Flag on, mesh accepted, and an engine whose largest batch is in band."""
+    monkeypatch.setenv("USE_MOE_FUSED_EP_V2", "1")
+    monkeypatch.setattr(fused_moe_ep, "validate_ep_mesh",
+                        lambda layer, **kwargs: None)
+    engine_cap(1024)  # x dp_size=8 -> 8192 node-wide tokens
+    return engine_cap
+
+
+# --------------------------------------------------------------------------
+# The band, which is now one question about the engine rather than one per step
+# --------------------------------------------------------------------------
+
+
+def test_the_band_defaults_are_the_measured_ones(monkeypatch):
+    """The floor is the crossover, and it is not a recipe's number.
+
+    Whole-MoE-layer microseconds at this geometry, EP=8, one clock, against the
+    production GMM path (W1, job j-f52bceac): the fused kernel is **610 us
+    against 509** at 1024 node-wide tokens and 471 against 430 at 256 -- it
+    *loses* through that band -- and only crosses over at 2048 (607 against
+    692), reaching 1.71x by 8192. The old default of 1024 armed a deployment
+    precisely where the kernel is slowest, which nothing about a per-step
+    threshold could have rescued: an armed layer takes every step.
+    """
     monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", raising=False)
-    assert envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS == 1024
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
+    assert envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS == 2048
+    # No cap by default, because the default slab sizing removes the cliff that
+    # was the only reason for one; `test_sizing_the_slab_lifts_the_token_cap`.
+    assert fused_moe_ep.max_tokens() == 0
 
 
 @pytest.mark.parametrize(
-    "threshold,rows,dp_size,expected",
+    "cap,dp_size,armed",
     [
-        (0, 8, 1, True),  # 0 disables the threshold entirely
-        (1024, 2048, 8, True),  # DP8_EP full prefill: 16384 node-wide
-        (1024, 64, 8, False),  # DP8_EP decode: 512 node-wide
-        (1024, 1024, 1, True),  # TP8_EP: rows are already node-wide
-        (1024, 1023, 1, False),
+        (2048, 8, True),  # 16384 node-wide: the full-prefill point, 1.71x
+        (256, 8, True),  # 2048 node-wide: exactly the crossover
+        (255, 8, False),  # 2040 node-wide: one token below it
+        (2048, 1, False),  # dp=1 is refused on its own terms, whatever the cap
+        (16, 8, False),  # a decode-only engine: 128 node-wide
     ])
-def test_token_threshold_picks_the_path(tp1, monkeypatch, dp_coordinated,
-                                        threshold, rows, dp_size, expected):
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", threshold)
-    layer = _layer(dp_size=dp_size)
-    assert fused_moe_ep.engages_for(layer, torch.zeros(rows, 4)) is expected
+def test_the_band_is_answered_from_the_engine_cap_times_dp(
+        tp1, engine_cap, monkeypatch, cap, dp_size, armed):
+    """``max_num_batched_tokens * dp_size``, asked once, of the whole engine.
+
+    The scheduler's cap is the largest ``x.shape[0]`` an MoE layer can ever see
+    -- the runner pads every step to a bucket no larger than it -- and
+    ``dp_size`` turns that into the node-wide count the kernel's cost is a
+    function of. Both factors are config, identical on every rank, and readable
+    before the first forward: that is what makes the decision static.
+    """
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
+    engine_cap(cap)
+    assert (fused_moe_ep.out_of_band_reason(_layer(dp_size=dp_size)) is
+            None) is armed
+
+
+def test_the_refusal_names_the_engine_batch_and_the_band(tp1, engine_cap,
+                                                         monkeypatch):
+    """A decline has to be actionable from a boot log, without the source.
+
+    It names the number that was computed, the two factors it came from, the
+    band edge it missed, and -- because this is the part an operator cannot
+    guess -- that there is no per-step choice to fall back on.
+    """
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
+    engine_cap(64)
+    reason = fused_moe_ep.out_of_band_reason(_layer(dp_size=8))
+    assert "512 node-wide tokens" in reason  # 64 x 8, the computed batch
+    assert "dp_size=8" in reason
+    assert "max_num_batched_tokens" in reason  # the knob that moves it
+    assert "2048" in reason  # the edge it missed
+    assert "guards" in reason  # why there is no per-step fallback
+
+
+@pytest.mark.parametrize(
+    "node_tokens,in_band",
+    [
+        (512, False),  # below the floor
+        (2048, True),  # v2's win band opens
+        (8192, True),  # 1.71x of the GMM path, measured
+        (16384, False),  # 4.79x of it on the drop-free slab -- the cliff
+    ])
+def test_the_band_is_a_band_not_a_floor(monkeypatch, node_tokens, in_band):
+    """v2 is slow at both ends, so one threshold cannot express the policy."""
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")  # the cliff is on
+    assert fused_moe_ep.in_token_band(node_tokens) is in_band
+
+
+def test_the_token_cap_can_be_lifted(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", "0")
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
+    assert fused_moe_ep.max_tokens() == 0
+    assert fused_moe_ep.in_token_band(16384)
+
+
+def test_sizing_the_slab_lifts_the_token_cap(monkeypatch):
+    """The cap and the slab are the same fact seen twice.
+
+    The 8192-token cap exists because the drop-free slab makes 16384 cost
+    15,620 us/layer against production's 3,264. A deployment that sizes the
+    slab has removed that reason, so it should not also have to know to lift
+    the cap by hand.
+    """
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
+
+    assert fused_moe_ep.max_tokens() == 8192
+    assert not fused_moe_ep.in_token_band(16384)
+
+    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW")  # back to the default
+    assert fused_moe_ep.capacity_skew() == 3.0
+    assert fused_moe_ep.max_tokens() == 0
+    assert fused_moe_ep.in_token_band(16384)
+
+    # ...and an explicit cap still wins over both.
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", "4096")
+    assert fused_moe_ep.max_tokens() == 4096
+
+
+def test_the_slab_is_sized_by_default(monkeypatch):
+    """The default is ON, because the drop-free slab IS the 16384 cliff."""
+    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", raising=False)
+    assert fused_moe_ep.capacity_skew() == 3.0
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
+    assert fused_moe_ep.capacity_skew() == 0.0
+
+
+def test_an_unreadable_engine_cap_arms_on_the_flag_alone(
+        tp1, engine_cap, monkeypatch):
+    """No config to read is not a reason to refuse; being wrong costs speed."""
+    warned = []
+    monkeypatch.setattr(fused_moe_ep.logger, "warning_once",
+                        lambda *a, **k: warned.append(a))
+    engine_cap(None)
+    assert fused_moe_ep.out_of_band_reason(_layer(dp_size=8)) is None
+    assert warned and "unreadable" in warned[0][0]
+
+
+# --------------------------------------------------------------------------
+# The layouts, which are refused for reasons the band cannot express
+# --------------------------------------------------------------------------
+
+
+def test_supported_layout_is_accepted(tp1):
+    assert fused_moe_ep.unsupported_reason(_layer()) is None
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({
+        "moe_parallel_config": SimpleNamespace(use_ep=False)
+    }, "expert parallelism is off"),
+    ({
+        "is_sequence_parallel": True
+    }, "sequence parallelism"),
+    ({
+        "pcp_size": 2
+    }, "PCP"),
+    ({
+        "use_grouped_topk": True
+    }, "grouped top-k"),
+    ({
+        "e_score_correction_bias": torch.zeros(4)
+    }, "bias-corrected"),
+    ({
+        "routed_scaling_factor": 2.5
+    }, "routed_scaling_factor"),
+    ({
+        "scoring_func": "sqrtsoftplus"
+    }, "scoring_func"),
+    ({
+        "has_bias": True
+    }, "expert biases"),
+    ({
+        "num_experts": 500
+    }, "divisible"),
+    ({
+        "dp_size": 4
+    }, "not dp_size"),
+    ({
+        "skip_final_all_reduce": True
+    }, "skip_final_all_reduce"),
+    ({
+        "is_lora_enabled": True
+    }, "LoRA"),
+])
+def test_unsupported_layouts_are_refused_with_a_reason(tp1, overrides,
+                                                       expected):
+    reason = fused_moe_ep.unsupported_reason(_layer(**overrides))
+    assert reason is not None and expected in reason
+
+
+def test_the_kernel_refuses_what_it_cannot_route(tp1):
+    """One program now, so scoring and activation are properties of it.
+
+    The kernel softmaxes internally and fuses two activations; there is no
+    second version to fall through to since the token-stationary v1 was cut.
+    """
+    layer = _layer()
+    layer.scoring_func = "sigmoid"
+    assert "scoring_func" in fused_moe_ep.unsupported_reason(layer)
+    layer.scoring_func = "softmax"
+    layer._tpu_activation_str = "gelu"
+    assert "activation" in fused_moe_ep.unsupported_reason(layer)
+    for supported in ("silu", "swigluoai"):
+        layer._tpu_activation_str = supported
+        assert fused_moe_ep.unsupported_reason(layer) is None
+
+
+def test_a_tp_group_is_refused_until_it_is_measured(monkeypatch):
+    """DP4TP2 has coherent token ownership and is still refused, deliberately.
+
+    ``ep_size == dp_size * tp_size`` makes the row slice/scatter well defined,
+    which is why the ownership check below passes -- but the sliced path has
+    never been measured for this kernel, and an armed layer now serves every
+    step rather than the large ones only. The narrower refusal comes first.
+    """
+    monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (2, 1))
+    reason = fused_moe_ep.unsupported_reason(_layer(dp_size=4))
+    assert reason is not None and "tp_size=2" in reason
+    # The ownership check is still the one that catches an incoherent layout,
+    # and it must fire before the tp refusal so the message names the cause.
+    assert "not dp_size" in fused_moe_ep.unsupported_reason(_layer(dp_size=8))
+
+
+def test_dp1_is_refused_because_there_is_no_transport_to_remove(
+        tp1, engine_cap, monkeypatch):
+    """TP8_EP: the kernel's whole win is deleting the DP dispatch/combine pair.
+
+    With ``dp_size == 1`` there is no such pair, and the comparison changes
+    sides: production's kernel alone measures 290 us against v2's 299 at 64
+    node-wide tokens and 1747 against 1907 at 16384 (W1 j-f52bceac, `prodnt`).
+    Under a per-step threshold this layout looked merely small; under arming it
+    is a deployment we must turn away, because there is no token count at which
+    it wins.
+    """
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "2048")
+    engine_cap(16384)  # far inside the band -- the size is not the objection
+    reason = fused_moe_ep.out_of_band_reason(_layer(dp_size=1))
+    assert reason is not None and "dp_size=1" in reason
+
+
+# --------------------------------------------------------------------------
+# The SMEM ceiling: a hard limit, checked against the same engine batch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("skew,last_ok", [(0, 19801), (3.0, 52322)])
+def test_the_smem_ceiling_is_refused_from_both_sides(tp1, monkeypatch,
+                                                     skew, last_ok):
+    """The kernel's plan is scalar-prefetch, so SMEM caps the batch, not VMEM.
+
+    One int32 per drop-free slab row lands in a 1 MiB scalar memory with a
+    ~236 kB overhead, which at top-10 over 512 experts puts the ceiling at
+    **19,801** node-wide tokens on the drop-free slab and **52,322** once the
+    slab is sized (skew 3.0, ep 8). Both edges are asserted because the value
+    is a formula, not a constant: a change to ROWBLK, the tile height or the
+    overhead moves it, and the failure it replaces is Mosaic's "Ran out of
+    memory in memory space smem" at the first compile of a serving run --
+    which names neither the token count nor the setting that controls it.
+    """
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", str(skew))
+    moe = _layer(dp_size=8).moe_config
+
+    monkeypatch.setattr(fused_moe_ep, "max_engine_node_tokens",
+                        lambda dp: last_ok)
+    assert fused_moe_ep._smem_reason(moe) is None
+
+    monkeypatch.setattr(fused_moe_ep, "max_engine_node_tokens",
+                        lambda dp: last_ok + 1)
+    reason = fused_moe_ep._smem_reason(moe)
+    assert reason is not None
+    assert f"{last_ok + 1} node-wide tokens" in reason
+    assert "SMEM" in reason and "max-num-batched-tokens" in reason
+
+
+def test_the_smem_ceiling_is_reached_through_the_same_engine_batch(
+        tp1, engine_cap, monkeypatch):
+    """It reads ``cap * dp``, like the band, so one number moves both."""
+    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
+    engine_cap(19801 // 8)  # 2475 x 8 = 19800 node-wide: fits
+    assert fused_moe_ep.unsupported_reason(_layer(dp_size=8)) is None
+    engine_cap(4096)  # 32768 node-wide: does not
+    assert "SMEM" in fused_moe_ep.unsupported_reason(_layer(dp_size=8))
+
+
+# --------------------------------------------------------------------------
+# Arming
+# --------------------------------------------------------------------------
+
+
+def test_flag_defaults_off(tp1, monkeypatch):
+    monkeypatch.delenv("USE_MOE_FUSED_EP_V2", raising=False)
+    assert envs.USE_MOE_FUSED_EP_V2 is False
+    assert fused_moe_ep.is_enabled(_layer()) is False
+    assert fused_moe_ep.fused_path_is_live() is False
+
+
+def test_both_fused_kernel_flags_at_once_is_refused(armable, monkeypatch):
+    """Two kernels, one layer, and the second one to look would win silently.
+
+    They disagree about the weight layout, the collective id and the output
+    contract, and each would claim this layer's. Which one actually served
+    would depend on import order, so it is refused by name instead.
+    """
+    monkeypatch.setenv("USE_MOE_EP_KERNEL", "1")
+    with pytest.raises(ValueError, match="both set"):
+        fused_moe_ep.is_enabled(_layer())
+
+
+def test_an_armed_layer_is_recorded_once(armable):
+    """Arming is the process-wide record the boot report and the ladder read."""
+    assert fused_moe_ep.is_enabled(_layer()) is True
+    assert fused_moe_ep.fused_path_is_live() is True
+
+
+def test_a_declined_layer_is_not_recorded(armable, engine_cap):
+    """A refusal must not leave the run looking armed: the rendezvous and the
+    report both key on this, and a barrier entered by one rank alone hangs."""
+    engine_cap(16)  # 128 node-wide tokens, below the floor
+    assert fused_moe_ep.is_enabled(_layer()) is False
+    assert fused_moe_ep.fused_path_is_live() is False
+
+
+def test_routing_simulation_disables_the_kernel(tp1, monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
+                       "uniform_random")
+    assert "SIMULATION" in fused_moe_ep.unsupported_reason(_layer())
+
+
+def test_refusal_checks_read_attributes_that_actually_exist():
+    """The refusal path degrades silently, so pin the names it reads.
+
+    Every check is a ``getattr`` with a default: if upstream renames one, the
+    kernel would quietly stop arming -- or quietly arm on a configuration it
+    cannot serve -- instead of failing. The scheduler field is on the list
+    because the band now reads it, and it is the one input that comes from
+    outside the MoE config.
+    """
+    from vllm.config import SchedulerConfig
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig, FusedMoEParallelConfig)
+
+    for name in ("num_experts", "experts_per_token", "has_bias", "ep_size",
+                 "dp_size", "pcp_size", "is_sequence_parallel", "ep_rank",
+                 "moe_parallel_config", "skip_final_all_reduce",
+                 "is_lora_enabled"):
+        assert (name in FusedMoEConfig.__annotations__ or isinstance(
+            getattr(FusedMoEConfig, name, None), property)), name
+    assert "use_ep" in FusedMoEParallelConfig.__annotations__
+    assert "max_num_batched_tokens" in SchedulerConfig.__annotations__
+
+
+# --------------------------------------------------------------------------
+# The row slice/scatter around the kernel, which arming does not change
+# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("replica_size", [2, 4, 8])
 def test_row_slices_partition_the_batch(replica_size):
     """Every row is owned by exactly one replica, and summing rebuilds it.
 
-    That sum is what vLLM's TP all-reduce performs, so this is the numerical
-    contract the fused path relies on.
+    That sum is what vLLM's TP all-reduce performs. Kept although
+    ``unsupported_reason`` refuses ``tp_size > 1`` today: the refusal is a
+    measurement gap, and this is the arithmetic that will have to hold when it
+    is closed.
     """
     rows, hidden = 4 * replica_size, 3
     x = torch.arange(rows * hidden, dtype=torch.float32).reshape(rows, hidden)
@@ -138,60 +517,6 @@ def test_register_replica_rank_buffer_holds_the_rank(monkeypatch):
     assert "_ep_replica_rank" not in layer.state_dict()
 
 
-def test_supported_layout_is_accepted(tp1):
-    assert fused_moe_ep.unsupported_reason(_layer()) is None
-
-
-@pytest.mark.parametrize("overrides,expected", [
-    ({
-        "moe_parallel_config": SimpleNamespace(use_ep=False)
-    }, "expert parallelism is off"),
-    ({
-        "is_sequence_parallel": True
-    }, "sequence parallelism"),
-    ({
-        "pcp_size": 2
-    }, "PCP"),
-    ({
-        "use_grouped_topk": True
-    }, "grouped top-k"),
-    ({
-        "e_score_correction_bias": torch.zeros(4)
-    }, "bias-corrected"),
-    ({
-        "routed_scaling_factor": 2.5
-    }, "routed_scaling_factor"),
-    ({
-        "scoring_func": "sqrtsoftplus"
-    }, "scoring_func"),
-    ({
-        "has_bias": True
-    }, "expert biases"),
-    ({
-        "num_experts": 500
-    }, "divisible"),
-    ({
-        "dp_size": 4
-    }, "not dp_size"),
-])
-def test_unsupported_layouts_are_refused_with_a_reason(tp1, overrides,
-                                                       expected):
-    reason = fused_moe_ep.unsupported_reason(_layer(**overrides))
-    assert reason is not None and expected in reason
-
-
-def test_dp4tp2_is_supported_only_with_the_matching_replica_group(monkeypatch):
-    monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (2, 1))
-    assert fused_moe_ep.unsupported_reason(_layer(dp_size=4)) is None
-    assert "not dp_size" in fused_moe_ep.unsupported_reason(_layer(dp_size=8))
-
-
-def test_routing_simulation_disables_the_kernel(tp1, monkeypatch):
-    monkeypatch.setenv("VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
-                       "uniform_random")
-    assert "SIMULATION" in fused_moe_ep.unsupported_reason(_layer())
-
-
 @pytest.mark.parametrize("raw,expected", [
     ("", None),
     ("128,512,1024,2048,64,512,1024,2048",
@@ -200,142 +525,11 @@ def test_routing_simulation_disables_the_kernel(tp1, monkeypatch):
      (64, 512, 1024, 2048, 32, 512, 1024, 2048)),
 ])
 def test_block_size_override_parses(monkeypatch, raw, expected):
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_BLOCKS", raw)
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_BLOCKS", raw)
     assert fused_moe_ep.block_size_override() == expected
 
 
 def test_block_size_override_rejects_a_wrong_arity(monkeypatch):
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_BLOCKS", "128,512")
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_BLOCKS", "128,512")
     with pytest.raises(ValueError, match="8 comma-separated"):
         fused_moe_ep.block_size_override()
-
-
-def test_refusal_checks_read_attributes_that_actually_exist():
-    """The refusal path degrades silently, so pin the names it reads.
-
-    Every check in ``unsupported_reason`` is a ``getattr`` with a default: if
-    upstream renames one of these, the kernel would quietly stop engaging (or
-    quietly engage on a configuration it cannot serve) instead of failing.
-    """
-    from vllm.model_executor.layers.fused_moe.config import (
-        FusedMoEConfig, FusedMoEParallelConfig)
-
-    for name in ("num_experts", "experts_per_token", "has_bias", "ep_size",
-                 "dp_size", "pcp_size", "is_sequence_parallel", "ep_rank",
-                 "moe_parallel_config"):
-        assert (name in FusedMoEConfig.__annotations__ or isinstance(
-            getattr(FusedMoEConfig, name, None), property)), name
-    assert "use_ep" in FusedMoEParallelConfig.__annotations__
-
-
-def test_flag_defaults_off(tp1, monkeypatch):
-    monkeypatch.delenv("USE_MOE_EP_KERNEL", raising=False)
-    assert envs.USE_MOE_EP_KERNEL is False
-    assert fused_moe_ep.is_enabled(_layer()) is False
-
-
-def test_version_2_refuses_what_it_cannot_route(tp1, monkeypatch):
-    """v2 softmaxes internally and fuses only two activations."""
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    layer = _layer()
-    layer.scoring_func = "sigmoid"
-    assert "scoring_func" in fused_moe_ep.unsupported_reason(layer)
-    layer.scoring_func = "softmax"
-    layer._tpu_activation_str = "gelu"
-    assert "activation" in fused_moe_ep.unsupported_reason(layer)
-    # ...and both are fine on v1, which is what makes this a version property.
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "1")
-    assert fused_moe_ep.unsupported_reason(layer) is None
-
-
-def test_an_unknown_version_is_refused_by_name(monkeypatch):
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "3")
-    with pytest.raises(ValueError, match="MOE_FUSED_EP_KERNEL_VERSION=3"):
-        fused_moe_ep.kernel_version()
-
-
-@pytest.mark.parametrize(
-    "version,tokens,expect",
-    [
-        (2, 512, False),  # below the floor
-        (2, 2048, True),  # v2's win band opens
-        (2, 8192, True),  # 0.59x of the GMM path, measured
-        (2, 16384, False),  # 4.79x of it, measured -- the default cap
-        (1, 16384, True),  # v1 has no measured cliff, so no default cap
-    ])
-def test_engagement_is_a_band_not_a_floor(tp1, monkeypatch, dp_coordinated,
-                                          version, tokens, expect):
-    """v2 is slow at both ends, so one threshold cannot express the policy."""
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", str(version))
-    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")  # the cliff is on
-    layer = _layer(dp_size=8)
-    x = torch.empty(tokens // 8, 4)
-    assert fused_moe_ep.engages_for(layer, x) is expect
-
-
-def test_the_token_cap_can_be_lifted(tp1, monkeypatch, dp_coordinated):
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", "0")
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
-    assert fused_moe_ep.max_tokens() == 0
-    assert fused_moe_ep.engages_for(_layer(dp_size=8), torch.empty(2048, 4))
-
-
-def test_sizing_the_slab_lifts_the_token_cap(tp1, monkeypatch, dp_coordinated):
-    """The cap and the slab are the same fact seen twice.
-
-    v2's default 8192-token cap exists because the drop-free slab makes 16384
-    cost 15,620 us/layer against production's 3,264. A deployment that sizes
-    the slab has removed that reason, so it should not also have to know to
-    lift the cap by hand.
-    """
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", raising=False)
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
-    layer, big = _layer(dp_size=8), torch.empty(16384 // 8, 4)
-
-    assert fused_moe_ep.max_tokens() == 8192
-    assert not fused_moe_ep.engages_for(layer, big)
-
-    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW")  # back to the default
-    assert fused_moe_ep.capacity_skew() == 3.0
-    assert fused_moe_ep.max_tokens() == 0
-    assert fused_moe_ep.engages_for(layer, big)
-
-    # ...and an explicit cap still wins over both.
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS", "4096")
-    assert fused_moe_ep.max_tokens() == 4096
-
-
-def test_the_slab_is_sized_by_default_on_v2_and_never_on_v1(tp1, monkeypatch):
-    """The default is ON, because the drop-free slab IS the 16384 cliff."""
-    monkeypatch.delenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", raising=False)
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    assert fused_moe_ep.capacity_skew() == 3.0
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "1")
-    assert fused_moe_ep.capacity_skew() == 0.0
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    monkeypatch.setenv("MOE_FUSED_EP_V2_CAPACITY_SKEW", "0")
-    assert fused_moe_ep.capacity_skew() == 0.0
-
-
-def test_a_step_the_dp_ranks_have_not_agreed_on_is_declined(tp1, monkeypatch):
-    """The deadlock guard. ``engages_for`` runs independently on every rank; if
-    one engages and another does not, the entrant waits on a barrier signal
-    that never comes, and the SparseCore is what halts."""
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    layer, big = _layer(dp_size=8), torch.empty(2048, 4)
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", None, raising=False)
-    assert not fused_moe_ep.engages_for(layer, big)
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", True, raising=False)
-    assert fused_moe_ep.engages_for(layer, big)
-
-
-def test_without_dp_there_is_nothing_to_agree_on(tp1, monkeypatch):
-    """At dp_size 1 the TP ranks hold the same tensor, so no rendezvous is
-    needed and nobody declaring must not disable the kernel."""
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", None, raising=False)
-    layer = _layer(dp_size=1, ep_size=8)
-    assert fused_moe_ep.dp_agreed_tokens(layer, torch.empty(2048, 4)) == 2048

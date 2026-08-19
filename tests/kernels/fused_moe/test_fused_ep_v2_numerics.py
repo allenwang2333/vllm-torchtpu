@@ -20,6 +20,13 @@ Two assertions, in increasing strength:
   no room to absorb one.
 * the gap to an fp32 oracle *is* that model's gap, and nothing else.
 
+and, on a mesh whose index is not the EP rank:
+
+* the expert relabel puts every row on the weights vLLM actually loaded into
+  that chip. Uncompensated this is SILENT -- finite, correctly shaped, right
+  rows, wrong experts -- so it is asserted by value against an unpermuted run,
+  exactly, and with a negative control that shows the failure is silent.
+
 The interpreter simulates the DMAs, so this gates arithmetic and transport
 addressing, not timing or the on-device DMA engine; ``test_fused_ep_device.py``
 remains the on-chip gate.
@@ -36,61 +43,94 @@ jnp = pytest.importorskip("jax.numpy")
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = 448.0
 EP = 4
+# The mesh-order tests need the node's real permutation, which is eight wide.
+# Everything else stays at four: this is the width of the process's device
+# count, not of the arithmetic tests' mesh.
+MESH_EP = 8
+# The tpu7x-8 we serve on drives EP ranks 0..7 from these device ids; the mesh
+# is in ascending device-id order, so EP rank NODE_EP_RANK_AT_MESH_INDEX[i]
+# -- and the expert block vLLM gave it -- sits at mesh index i.  The mapping
+# itself is pinned in tests/distributed/test_ep_mesh_device_order.py.
+NODE_DEVICE_IDS = (0, 1, 4, 5, 6, 7, 2, 3)
+NODE_EP_RANK_AT_MESH_INDEX = (0, 1, 6, 7, 2, 3, 4, 5)
 HIDDEN = 256
 INTER = 128
 EXPERTS = 16
 
 
-@pytest.fixture(scope="module")
-def devices():
-    """``EP`` addressable devices, on a host that has one CPU.
+def _force_cpu_devices(count):
+    """``count`` addressable CPU devices on a host that has one -- or FAIL.
 
-    ``jax_num_cpu_devices`` only takes effect before the backend initializes,
-    so in a whole-suite run some earlier test has already claimed it and this
-    would *skip* -- which is how the most valuable gate in this module quietly
-    stops running. ``test_this_module_runs_even_in_a_full_suite`` catches that;
-    read its docstring before weakening either.
+    **Never a skip.** These are the only checks in the repository that execute
+    the real Pallas program with its in-kernel all-to-all, so "could not get
+    the devices" has to read as a broken gate, not as a green one.
+
+    Getting them is the awkward part. ``jax_num_cpu_devices`` is honoured only
+    before the backend initializes, and by the time a test in this file runs,
+    some earlier module usually has -- which is exactly when the old fixture
+    skipped, and skipping is decided by collection order, which is not ours.
+    So take the one lever that still works afterwards and re-initialize. That
+    invalidates arrays earlier modules hold; their tests have finished, and the
+    modules that share this process's device count (``test_fused_ep_v2_plan_
+    decomp.py`` asks for four) slice what they need out of ``jax.devices()``,
+    so a larger count is compatible with all of them.
     """
+    if len(jax.devices()) >= count:
+        return tuple(jax.devices()[:count])
+    # What the old fixture would have skipped on, printed so a run can say how
+    # much of this file the forcing is buying.
+    print(f"[cpu devices] {len(jax.devices())} in this process, forcing "
+          f"{count}")
     try:
-        jax.config.update("jax_num_cpu_devices", EP)
-    except Exception as exc:  # already initialized, or the knob moved
-        pytest.skip(f"cannot ask for {EP} CPU devices: {exc}")
-    devs = jax.devices()
-    if len(devs) < EP:
-        pytest.skip(f"{len(devs)} devices, need {EP}")
-    return tuple(devs[:EP])
+        # Not `import jax.extend`: that binds `jax` as a local for the whole
+        # function and the line above stops seeing the module.
+        from jax.extend import backend as jax_backend
+
+        jax_backend.clear_backends()
+        jax.config.update("jax_num_cpu_devices", count)
+        devices = jax.devices()
+    except Exception as exc:  # the knob or the backend API moved
+        pytest.fail(
+            f"cannot get {count} CPU devices for the fused EP MoE "
+            f"numerics gate: {exc!r}. Run this file in its own process "
+            f"with XLA_FLAGS=--xla_force_host_platform_device_count="
+            f"{count}; do not turn this back into a skip.")
+    if len(devices) < count:
+        pytest.fail(f"asked for {count} CPU devices and got {len(devices)}")
+    return tuple(devices[:count])
 
 
-def test_this_module_runs_even_in_a_full_suite():
-    """Re-run this file in a subprocess that definitely has the devices.
+@pytest.fixture(scope="module", autouse=True)
+def cpu_device_pool():
+    """Force the process's device count once, before anything here traces."""
+    return _force_cpu_devices(MESH_EP)
 
-    The gate above is the only check in the repository that executes the real
-    Pallas program with its in-kernel all-to-all, so a silent skip is worse
-    than a failure. Ordering decides whether it skips, and ordering is not
-    ours: ``jax.config.update("jax_num_cpu_devices", ...)`` is a no-op once any
-    earlier test has initialized the backend. A subprocess with the devices
-    requested up front cannot be ordered out of existence.
+
+@pytest.fixture(scope="module")
+def devices(cpu_device_pool):
+    """The ``EP``-wide mesh the arithmetic tests run on."""
+    return cpu_device_pool[:EP]
+
+
+@pytest.fixture(scope="module")
+def mesh_devices(cpu_device_pool):
+    """The ``MESH_EP``-wide mesh the device-order tests need."""
+    return cpu_device_pool[:MESH_EP]
+
+
+def test_this_module_runs_even_in_a_full_suite(cpu_device_pool):
+    """The contract the rest of this file rests on, asserted rather than hoped.
+
+    This used to re-run the whole file in a subprocess, because a module-scoped
+    fixture could not obtain devices once the backend was up and every test
+    here would then *skip*. ``_force_cpu_devices`` removes the precondition
+    instead of working around it: the count is forced, and a failure to force
+    it fails. That is strictly stronger than the subprocess -- it cannot be
+    ordered out of existence either, and it reports on the tests themselves
+    rather than on a copy of them -- and it is why this no longer skips.
     """
-    import os
-    import subprocess
-    import sys
-
-    if len(jax.devices()) >= EP:
-        pytest.skip("already have the devices; the in-process tests ran")
-    env = dict(os.environ,
-               XLA_FLAGS=f"--xla_force_host_platform_device_count={EP} " +
-               os.environ.get("XLA_FLAGS", ""))
-    done = subprocess.run([
-        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        __file__, "-k", "not full_suite"
-    ],
-                          env=env,
-                          capture_output=True,
-                          text=True,
-                          timeout=900)
-    assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-2000:]
-    assert " skipped" not in done.stdout.splitlines()[-1], (
-        f"the subprocess skipped too: {done.stdout.splitlines()[-1]}")
+    assert len(cpu_device_pool) == MESH_EP
+    assert len(jax.devices()) >= MESH_EP
 
 
 @pytest.fixture
@@ -160,6 +200,51 @@ def _rel_l2(a, b):
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
+def _operands(ep, t_local, seed):
+    """One layer's inputs: tokens, gating, fp8 weights, the loader's scales."""
+    T = t_local * ep
+    rng = np.random.default_rng(seed)
+    return dict(
+        x=jnp.asarray(rng.normal(size=(T, HIDDEN)), jnp.bfloat16),
+        w1=jnp.asarray(rng.normal(size=(EXPERTS, HIDDEN, 2 * INTER)) *
+                       0.1).astype(FP8),
+        w2=jnp.asarray(rng.normal(size=(EXPERTS, INTER, HIDDEN)) *
+                       0.1).astype(FP8),
+        # The loader's layout, singleton axes and all.
+        w1s=jnp.asarray(rng.uniform(0.5, 1.5, size=(EXPERTS, 1, 1, 2 * INTER)),
+                        jnp.float32),
+        w2s=jnp.asarray(rng.uniform(0.5, 1.5, size=(EXPERTS, 1, 1, HIDDEN)),
+                        jnp.float32),
+        gating=jnp.asarray(rng.normal(size=(T, EXPERTS)), jnp.bfloat16),
+    )
+
+
+def _kernel_out(devices, tpu7x, operands, *, ep, topk, sharded_plan, skew,
+                mesh_ep_ranks):
+    """The kernel's own answer for one set of operands, as f32."""
+    from jax.sharding import AxisType, Mesh
+
+    from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME_1D
+    from vllm_torchtpu.layers.common.fused_moe_ep_v2 import \
+        fused_ep_moe_v2_func
+
+    mesh = Mesh(np.asarray(devices[:ep]).reshape(ep),
+                axis_names=(EP_AXIS_NAME_1D, ),
+                axis_types=(AxisType.Explicit, ))
+    fn = functools.partial(fused_ep_moe_v2_func,
+                           mesh=mesh,
+                           top_k=topk,
+                           renormalize=True,
+                           activation="silu",
+                           sharded_plan=sharded_plan,
+                           capacity_skew=skew,
+                           mesh_ep_ranks=mesh_ep_ranks)
+    with tpu7x.force_tpu_interpret_mode():
+        out = jax.jit(fn)(operands["x"], operands["gating"], operands["w1"],
+                          operands["w2"], operands["w1s"], operands["w2s"])
+    return np.asarray(jax.device_get(out), np.float32)
+
+
 def _run(devices,
          tpu7x,
          topk,
@@ -167,48 +252,21 @@ def _run(devices,
          seed,
          sharded_plan=False,
          capacity_skew=None):
-    from jax.sharding import AxisType, Mesh
-
-    from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME_1D
-    from vllm_torchtpu.layers.common.fused_moe_ep_v2 import \
-        fused_ep_moe_v2_func
-
-    mesh = Mesh(np.asarray(devices).reshape(EP),
-                axis_names=(EP_AXIS_NAME_1D, ),
-                axis_types=(AxisType.Explicit, ))
-    T = t_local * EP
-    rng = np.random.default_rng(seed)
-    x = jnp.asarray(rng.normal(size=(T, HIDDEN)), jnp.bfloat16)
-    w1 = jnp.asarray(rng.normal(size=(EXPERTS, HIDDEN, 2 * INTER)) *
-                     0.1).astype(FP8)
-    w2 = jnp.asarray(rng.normal(size=(EXPERTS, INTER, HIDDEN)) *
-                     0.1).astype(FP8)
-    # The loader's layout, singleton axes and all.
-    w1s = jnp.asarray(rng.uniform(0.5, 1.5, size=(EXPERTS, 1, 1, 2 * INTER)),
-                      jnp.float32)
-    w2s = jnp.asarray(rng.uniform(0.5, 1.5, size=(EXPERTS, 1, 1, HIDDEN)),
-                      jnp.float32)
-    gating = jnp.asarray(rng.normal(size=(T, EXPERTS)), jnp.bfloat16)
-
-    fn = functools.partial(fused_ep_moe_v2_func,
-                           mesh=mesh,
-                           top_k=topk,
-                           renormalize=True,
-                           activation="silu",
-                           sharded_plan=sharded_plan,
-                           capacity_skew=capacity_skew)
-    with tpu7x.force_tpu_interpret_mode():
-        got = np.asarray(
-            jax.device_get(jax.jit(fn)(x, gating, w1, w2, w1s, w2s)),
-            np.float32)
-
-    w1d = np.asarray(w1, np.float32) * np.asarray(w1s).reshape(
+    op = _operands(EP, t_local, seed)
+    got = _kernel_out(devices,
+                      tpu7x,
+                      op,
+                      ep=EP,
+                      topk=topk,
+                      sharded_plan=sharded_plan,
+                      skew=capacity_skew,
+                      mesh_ep_ranks=None)
+    w1d = np.asarray(op["w1"], np.float32) * np.asarray(op["w1s"]).reshape(
         EXPERTS, 1, 2 * INTER)
-    w2d = np.asarray(w2, np.float32) * np.asarray(w2s).reshape(
+    w2d = np.asarray(op["w2"], np.float32) * np.asarray(op["w2s"]).reshape(
         EXPERTS, 1, HIDDEN)
-    args = (np.asarray(x,
-                       np.float32), w1d, w2d, np.asarray(gating,
-                                                         jnp.float32), topk)
+    args = (np.asarray(op["x"], np.float32), w1d, w2d,
+            np.asarray(op["gating"], jnp.float32), topk)
     return got, _moe(*args, as_kernel=True), _moe(*args, as_kernel=False)
 
 
@@ -271,3 +329,177 @@ def test_a_slab_at_the_drop_free_size_changes_nothing(devices, tpu7x):
     base, _, _ = _run(devices, tpu7x, 8, 8, 5)
     got, _, _ = _run(devices, tpu7x, 8, 8, 5, capacity_skew=16.0)
     np.testing.assert_array_equal(got, base)
+
+
+# --- the mesh whose index is not the EP rank ---------------------------------
+#
+# The mesh is laid out in ascending device-id order, so the shard at mesh index
+# i runs on the process holding EP rank NODE_EP_RANK_AT_MESH_INDEX[i]'s expert
+# block -- vLLM loaded those weights into that worker and no operand can move
+# them. Model that by dealing the expert blocks out in that order, and require
+# the answer not to change: same tokens, same weights, same routing, a different
+# chip doing each expert.
+
+MESH_TOPK = 2
+MESH_T_LOCAL = 8
+MESH_SEED = 0
+_MESH_RUNS: dict[tuple, np.ndarray] = {}
+
+
+def _by_mesh_index(order):
+    """The expert axis reordered so block ``order[i]`` lands at mesh index i."""
+    g_local = EXPERTS // MESH_EP
+    return jnp.asarray(
+        np.concatenate([
+            np.arange(rank * g_local, (rank + 1) * g_local) for rank in order
+        ]))
+
+
+def _mesh_run(mesh_devices,
+              tpu7x,
+              *,
+              placement,
+              mesh_ep_ranks,
+              sharded_plan=False,
+              skew=None):
+    """One ``MESH_EP``-wide run; memoized, because each interprets for ~10s.
+
+    ``placement`` is the EP-rank order the expert blocks are dealt out in, or
+    None for the identity; ``mesh_ep_ranks`` is what the driver tells the kernel
+    about that order, or None for "they agree".
+    """
+    key = (placement, mesh_ep_ranks, sharded_plan, skew)
+    if key not in _MESH_RUNS:
+        op = _operands(MESH_EP, MESH_T_LOCAL, MESH_SEED)
+        if placement is not None:
+            index = _by_mesh_index(placement)
+            op = dict(op,
+                      **{n: op[n][index]
+                         for n in ("w1", "w2", "w1s", "w2s")})
+        _MESH_RUNS[key] = _kernel_out(mesh_devices,
+                                      tpu7x,
+                                      op,
+                                      ep=MESH_EP,
+                                      topk=MESH_TOPK,
+                                      sharded_plan=sharded_plan,
+                                      skew=skew,
+                                      mesh_ep_ranks=mesh_ep_ranks)
+    return _MESH_RUNS[key]
+
+
+def test_the_node_permutation_is_not_the_identity():
+    """Without this, every assertion below is green on any spelling."""
+    ranks = {device: rank for rank, device in enumerate(NODE_DEVICE_IDS)}
+    assert tuple(ranks[d] for d in sorted(NODE_DEVICE_IDS)) == (
+        NODE_EP_RANK_AT_MESH_INDEX), "the two constants are not inverses"
+    assert NODE_EP_RANK_AT_MESH_INDEX != tuple(range(MESH_EP))
+    assert len(NODE_DEVICE_IDS) == MESH_EP
+
+
+@pytest.mark.parametrize("sharded_plan,skew", [(False, None), (True, 0)])
+def test_a_mesh_that_is_not_in_ep_rank_order_reaches_the_right_experts(
+        mesh_devices, tpu7x, sharded_plan, skew):
+    """Mesh index <-> EP rank <-> expert block, through the real kernel.
+
+    Exact, not approximate: relabelling the expert axis moves which chip
+    computes a pair, not the arithmetic of the pair, and the combine sums the
+    ``topk`` slots in slot order rather than arrival order -- so a correct
+    reindex is bit-for-bit. A tolerance here would hide the tie-flip that
+    permuting the *logits* instead of the selected ids causes.
+
+    Both plan builders, because ``build_routing_tables_sharded`` spells
+    ownership as ``first = me * g_local`` in its own arithmetic (host.py) and
+    could be reindexed correctly in one and not the other. The decomposed plan
+    runs at ``capacity_skew=0``: it does not build the drop mask a sized slab
+    needs, and the two are exclusive.
+    """
+    reference = _mesh_run(mesh_devices,
+                          tpu7x,
+                          placement=None,
+                          mesh_ep_ranks=None,
+                          sharded_plan=sharded_plan,
+                          skew=skew)
+    permuted = _mesh_run(mesh_devices,
+                         tpu7x,
+                         placement=NODE_EP_RANK_AT_MESH_INDEX,
+                         mesh_ep_ranks=NODE_EP_RANK_AT_MESH_INDEX,
+                         sharded_plan=sharded_plan,
+                         skew=skew)
+    np.testing.assert_array_equal(permuted, reference)
+
+
+def test_without_the_reindex_the_wrong_experts_answer_and_nothing_says_so(
+        mesh_devices, tpu7x):
+    """NEGATIVE CONTROL, and the reason this gate is by value.
+
+    Deal the blocks out and tell the kernel nothing: every table is then
+    self-consistent, so the rows still reach the token that selected them and
+    the shapes, the row count and the finiteness are all exactly right. Only
+    the *weights* are another rank's. Nothing in the program can notice --
+    which is why no shape test, no row-order test and no "it ran" check can
+    stand in for this one.
+    """
+    reference = _mesh_run(mesh_devices,
+                          tpu7x,
+                          placement=None,
+                          mesh_ep_ranks=None)
+    uncompensated = _mesh_run(mesh_devices,
+                              tpu7x,
+                              placement=NODE_EP_RANK_AT_MESH_INDEX,
+                              mesh_ep_ranks=None)
+
+    assert uncompensated.shape == reference.shape
+    assert np.isfinite(uncompensated).all(), "the failure is silent, not a NaN"
+    assert not np.array_equal(uncompensated, reference), (
+        "the uncompensated run agreed with the reference, so either the "
+        "placement did not move any expert or the kernel is ignoring "
+        "mesh_ep_ranks -- in both cases the test above proves nothing")
+    gap = _rel_l2(uncompensated, reference)
+    print(f"[v2 mesh order] uncompensated vs reference rel-L2 {gap:.4f}")
+    # Two of the eight blocks are the permutation's fixed points, so six ranks
+    # compute with weights that are not theirs: measured 1.12, and a whole
+    # order of magnitude of headroom under it still means "a different model".
+    assert gap > 0.1
+
+
+def test_the_uninverted_order_is_a_different_answer(mesh_devices, tpu7x):
+    """NEGATIVE CONTROL 2: the table's own inverse, which is also a table.
+
+    ``ep_rank_at_mesh_index`` and the device order it is built from are both
+    permutations of 0..7, so passing one where the other belongs type-checks,
+    runs, and puts every row in the right place. It is the wrong spelling most
+    likely to be written, and on a node whose permutation happened to be an
+    involution the two would agree and this would pass on both -- which is why
+    the mapping itself is pinned in
+    ``tests/distributed/test_ep_mesh_device_order.py`` as well.
+    """
+    reference = _mesh_run(mesh_devices,
+                          tpu7x,
+                          placement=None,
+                          mesh_ep_ranks=None)
+    inverted = _mesh_run(mesh_devices,
+                         tpu7x,
+                         placement=NODE_EP_RANK_AT_MESH_INDEX,
+                         mesh_ep_ranks=NODE_DEVICE_IDS)
+    assert not np.array_equal(inverted, reference), (
+        "relabelling with the device order instead of its inverse gave the "
+        "right answer, so this node's permutation is not exercising the "
+        "difference and the test above is weaker than it looks")
+
+
+def test_an_identity_order_is_the_program_that_shipped(mesh_devices, tpu7x):
+    """A node in device-id order must get the unreindexed program back.
+
+    ``mesh_expert_order`` returns None there rather than ``arange(ep)``, and
+    this is the other half of that: passing the identity table explicitly is a
+    no-op on the answer, so the two spellings cannot disagree.
+    """
+    reference = _mesh_run(mesh_devices,
+                          tpu7x,
+                          placement=None,
+                          mesh_ep_ranks=None)
+    identity = _mesh_run(mesh_devices,
+                         tpu7x,
+                         placement=None,
+                         mesh_ep_ranks=tuple(range(MESH_EP)))
+    np.testing.assert_array_equal(identity, reference)

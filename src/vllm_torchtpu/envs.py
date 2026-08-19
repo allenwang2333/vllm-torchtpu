@@ -15,9 +15,9 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
-    MOE_FUSED_EP_KERNEL_VERSION: int = 1
+    USE_MOE_FUSED_EP_V2: bool = False
     MOE_FUSED_EP_QUANT_ACT: bool = True
-    MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 2048
     MOE_FUSED_EP_KERNEL_MAX_TOKENS: int = -1
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_CAPACITY_SKEW: float = -1.0
@@ -183,17 +183,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/fused_moe/v2, tpu-inference PR #3288). v2 visits each local
     # expert once and streams its weights once, where v1 re-streams every local
     # expert for every token block, so v2 is the prefill kernel and v1 is not.
-    # No effect unless USE_MOE_EP_KERNEL=1.
-    "MOE_FUSED_EP_KERNEL_VERSION":
-    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_VERSION") or "1"),
+    # This branch's own on-switch, deliberately not USE_MOE_EP_KERNEL: that
+    # name is the token-stationary kernel's, it belongs to a change that is
+    # open at the same time as this one, and two pull requests that repoint one
+    # flag at different kernels silently change each other's meaning depending
+    # on merge order. Refused together -- see `layers/vllm/fused_moe_ep.py`.
+    "USE_MOE_FUSED_EP_V2":
+    lambda: bool(int(os.getenv("USE_MOE_FUSED_EP_V2") or "0")),
     # Within the fused EP MoE kernel, quantize each matmul's activations to fp8
     # per row-block, as gmm_v2 does on the general path. Off runs bf16 x fp8,
-    # which halves the v7x MXU rate. No effect unless USE_MOE_EP_KERNEL=1.
+    # which halves the v7x MXU rate. No effect unless USE_MOE_FUSED_EP_V2=1.
     "MOE_FUSED_EP_QUANT_ACT":
     lambda: bool(int(os.getenv("MOE_FUSED_EP_QUANT_ACT") or "1")),
     # Engage the fused EP MoE kernel only from this many node-wide tokens
     # (rows x dp_size) upwards; smaller steps stay on the GMM path, which shares
-    # the same weights. No effect unless USE_MOE_EP_KERNEL=1.
+    # the same weights. No effect unless USE_MOE_FUSED_EP_V2=1.
     #
     # The default is not a tuning choice. The kernel's cost per token block is
     # dominated by terms that do not depend on how many rows move -- one
@@ -203,7 +207,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 563 vs 4110 tok/s/chip, i.e. -86%. 1024 matches the JAX recipe's
     # MOE_FUSED_EP_KERNEL_MIN_TOKENS and keeps decode on the GMM path.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
-    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS") or "1024"),
+    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS") or "2048"),
     # The other end of the band: engage the fused EP MoE kernel only UP TO this
     # many node-wide tokens. -1 takes the measured default for the kernel
     # version (see fused_moe_ep._V2_MAX_TOKENS -- v2 is 0.59x of the GMM path at
@@ -234,7 +238,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before it reaches a chip.
     "MOE_FUSED_EP_KERNEL_BLOCKS":
     lambda: os.getenv("MOE_FUSED_EP_KERNEL_BLOCKS", ""),
-    # Refuse to serve when USE_MOE_EP_KERNEL=1 reached zero compiled graphs.
+    # Refuse to serve when USE_MOE_FUSED_EP_V2=1 reached zero compiled graphs.
     # The engagement branch is resolved at trace time, so "the flag was on" and
     # "the kernel is in the program" are different facts, and three device jobs
     # have already been spent on the difference. Set 0 for an arm that WANTS the

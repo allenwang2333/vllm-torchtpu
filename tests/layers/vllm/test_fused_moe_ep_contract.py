@@ -13,17 +13,34 @@
 # limitations under the License.
 """Collective contract for the fused expert-parallel MoE path.
 
-The fused kernel returns each rank its own token rows, already summed over
-every expert. Two things must therefore hold, and both are checked here against
-the *real* upstream ``MoERunner`` on CPU:
+The kernel returns each rank its own token rows, already summed over every
+expert on every rank -- reduced over the EXPERT axis, and a row-disjoint
+partition over the mesh. It is *not* a TP partial, so the bridge zero-fills the
+other ranks' rows and lets vLLM's late all-reduce reassemble the batch. Three
+things must therefore hold, all checked against the *real* upstream
+``MoERunner`` on CPU:
 
 1. vLLM must not run its DP dispatch/combine pair around the kernel (the rows
    are not gathered and the output is not a partial sum over DP ranks);
-2. the TP all-reduce must still run, because it is what re-assembles the
-   disjoint row slices *and* reduces the TP-sharded shared expert.
+2. the late all-reduce must still run, because it is what reassembles the
+   disjoint row slices *and*, in the same collective, sums a TP-sharded shared
+   expert -- so this layer must never declare ``moe_kernel.output_is_reduced``;
+3. every deployment that would withdraw that all-reduce must be refused at
+   weight load, not discovered as wrong output.
+
+``_run_tp_group`` drives (2) and (3) properly: it runs the real runner once per
+TP rank and replays the all-reduce across them, so the assertion is the
+invariant that matters -- **after the layer every rank holds the complete
+output** -- and not merely "a collective was called".
+
+The row-slicing path itself is refused today for ``tp_size > 1``
+(``fused_moe_ep.unsupported_reason``, "not measured for this kernel"). These
+cases are what that refusal has to be lifted against; they also pin vLLM 0.27's
+reduce order, which is what would move under us on an upgrade.
 """
 
 import contextlib
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -32,10 +49,15 @@ from jax.sharding import PartitionSpec
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.runner import \
     moe_runner as moe_runner_mod
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import \
+    SharedExperts
 
 from vllm_torchtpu.layers.vllm import fused_moe_ep
 
 HIDDEN = 4
+# Divisible by the TP width the reduction cases use, so a rank's row slice is
+# a whole number of rows.
+ROWS = 8
 
 
 class _ExplodingEpGroup:
@@ -48,6 +70,32 @@ class _ExplodingEpGroup:
         raise AssertionError("DP reduce-scatter ran under the fused EP kernel")
 
 
+class _NoPrepareFinalize:
+    """``FusedMoEMethodBase.topk_indices_dtype`` reaches through this."""
+
+    @staticmethod
+    def topk_indices_dtype():
+        return None
+
+
+class _ReducedOutputMoEKernel:
+    """The duck type that declares "this layer reduced its own output".
+
+    Our #3040 branch sets exactly this on its own quant method, because that
+    kernel really does return a fully reduced output. Here it is a MUTATION:
+    v2 returns a row slice, and this is the spelling that silently drops the
+    other ranks' rows. See ``test_declaring_the_output_reduced_drops_...``.
+    """
+
+    is_monolithic = True
+    can_overlap_shared_experts = False
+    prepare_finalize = _NoPrepareFinalize()
+
+    @staticmethod
+    def output_is_reduced():
+        return True
+
+
 class _FusedEpQuantMethod:
     """What ``VllmFp8MoEMethodTPU`` looks like with the fused path active."""
 
@@ -55,14 +103,19 @@ class _FusedEpQuantMethod:
     supports_internal_mk = True
     skip_forward_padding = True
     has_unpadded_output = False
-    moe_kernel = None
+    mk_can_overlap_shared_experts = False
+
+    def __init__(self, moe_kernel=None):
+        # None is the shipped answer: `MoERunner._fused_output_is_reduced` is
+        # `moe_kernel is not None and moe_kernel.output_is_reduced()`.
+        self.moe_kernel = moe_kernel
 
 
 class _FusedEpExperts:
     """Routed experts whose monolithic kernel owns dispatch and combine."""
 
-    def __init__(self, fused_out):
-        self.quant_method = _FusedEpQuantMethod()
+    def __init__(self, fused_out, moe_kernel=None):
+        self.quant_method = _FusedEpQuantMethod(moe_kernel)
         self._fused_out = fused_out
 
     def _ensure_moe_quant_config_init(self):
@@ -75,8 +128,33 @@ class _FusedEpExperts:
             "batch")
         return self._fused_out
 
+class _SharedPartial(torch.nn.Module):
+    """A TP-sharded shared expert: this rank's partial sum, not the total."""
 
-def _make_runner(*, dp_size, ep_size, fused_out):
+    def __init__(self, partial):
+        super().__init__()
+        self._partial = partial
+
+    def forward(self, x):
+        del x
+        return self._partial
+
+
+def _make_runner(*,
+                 dp_size,
+                 ep_size,
+                 fused_out,
+                 shared_partial=None,
+                 moe_kernel=None,
+                 skip_final_all_reduce=False):
+    """The real ``MoERunner`` around a stubbed monolithic quant method.
+
+    ``shared_partial`` attaches vLLM's real ``SharedExperts`` wrapper around a
+    module that returns that tensor -- i.e. a TP-sharded shared expert's own
+    partial sum, which is what Qwen3.5 produces (``Qwen3NextMLP`` is built with
+    ``reduce_results=False``, so its RowParallel down-projection does not
+    all-reduce and the runner is what must).
+    """
     parallel_config = FusedMoEParallelConfig(
         tp_size=1,
         tp_rank=0,
@@ -100,15 +178,27 @@ def _make_runner(*, dp_size, ep_size, fused_out):
         ep_size=ep_size,
         sp_size=1,
         is_sequence_parallel=False,
-        skip_final_all_reduce=False,
+        skip_final_all_reduce=skip_final_all_reduce,
         moe_parallel_config=parallel_config,
     )
     runner = moe_runner_mod.MoERunner.__new__(moe_runner_mod.MoERunner)
     torch.nn.Module.__init__(runner)
     runner.moe_config = moe_config
     runner.router = object()
-    runner.routed_experts = _FusedEpExperts(fused_out)
-    runner._shared_experts = None
+    runner.routed_experts = _FusedEpExperts(fused_out, moe_kernel)
+    # `MoERunner.shared_experts` is a read-only property over
+    # `_shared_experts`, so the wrapper is the only thing to set -- and the
+    # entry point moves with it (`_select_forward` picks the two-output op).
+    if shared_partial is None:
+        runner._shared_experts = None
+        runner._forward_entry = moe_runner_mod._moe_forward
+    else:
+        runner._shared_experts = SharedExperts(
+            _SharedPartial(shared_partial),
+            moe_config,
+            enable_dbo=False,
+            mk_can_overlap_shared_experts=lambda: False)
+        runner._forward_entry = moe_runner_mod._moe_forward_shared
     runner.gate = None
     runner.shared_expert_gate = None
     runner._fse_fuse_gate = False
@@ -118,7 +208,6 @@ def _make_runner(*, dp_size, ep_size, fused_out):
     runner.routed_scaling_factor = 1.0
     runner.layer_name = "fused_ep_contract_test.moe"
     runner._sequence_parallel_context = contextlib.nullcontext
-    runner._forward_entry = moe_runner_mod._moe_forward
     return runner
 
 
@@ -170,55 +259,38 @@ def test_dp_dispatch_still_runs_without_the_fused_kernel(monkeypatch):
         runner(hidden_states, router_logits)
 
 
-class _RecordingEpGroup:
+def test_the_takeover_is_one_answer_for_the_run(monkeypatch):
+    """Half a takeover is worse than none, so there is no per-step half.
 
-    def __init__(self):
-        self.dispatched = 0
-        self.combined = 0
+    The layer tells the runner "I own DP dispatch and combine"
+    (``supports_internal_mk``) and the runner reads that on every forward. An
+    earlier shape of this path answered it per step, from a token band and a
+    DP-coordination flag, and then reinstated the pair itself when it declined.
+    Two ways that lost: a step where one rank engaged and another did not hung
+    the device in ``semaphore_wait`` (W6, three boots), and vLLM drops Dynamo's
+    guards after the first trace, so the per-step answer was frozen anyway.
 
-    def dispatch_router_logits(self, hidden_states, router_logits, sp=False):
-        self.dispatched += 1
-        return (torch.cat([hidden_states, hidden_states]),
-                torch.cat([router_logits, router_logits]))
-
-    def combine(self, hidden_states, sp=False):
-        self.combined += 1
-        return hidden_states.chunk(2)[0]
-
-
-@pytest.mark.parametrize("dp_size,expect_calls", [(8, 1), (1, 0)])
-def test_a_step_below_the_threshold_reinstates_the_dp_pair(
-        monkeypatch, dp_size, expect_calls):
-    """The hazard the token threshold introduces, and its fix.
-
-    ``supports_internal_mk`` is a property of the layer, so the runner stops
-    dispatching for *every* step once the fused path is active -- while the
-    threshold is per step. A fallback step must therefore run the DP
-    all-gather / reduce-scatter itself, or the other DP ranks' expert
-    contributions are silently missing (the TP all-reduce does not span them).
-
-    On a *coordinated* step, which is the only kind where the layer owns the
-    pair at all: ``supports_internal_mk`` hands it back to the runner
-    otherwise, and ``_needs_fallback_dispatch`` reads the same predicate, so
-    the two never both run and never both skip.
+    Arming is now settled once, at weight load, and this pins both halves of
+    that: the property does not read the step, and the per-step reinstatement
+    pair is gone rather than dormant.
     """
-    import vllm.distributed.parallel_state as parallel_state
+    from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
 
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", True, raising=False)
-    group = _RecordingEpGroup()
-    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: group)
-    layer = SimpleNamespace(moe_config=SimpleNamespace(dp_size=dp_size))
+    method = fp8_mod.VllmFp8MoEMethodTPU.__new__(fp8_mod.VllmFp8MoEMethodTPU)
+    method._fused_ep_enabled = True
+    for agreed in (None, False, True):
+        monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", agreed, raising=False)
+        assert method.supports_internal_mk is True, (
+            "the takeover varied with the step; the runner compiles one graph")
+    method._fused_ep_enabled = False
+    assert method.supports_internal_mk is False
 
-    tokens = torch.randn(4, HIDDEN)
-    logits = torch.randn(4, 8)
-    x, gathered_logits = fused_moe_ep.dispatch_for_fallback(
-        layer, tokens, logits)
-    out = fused_moe_ep.combine_for_fallback(layer, x)
-
-    assert (group.dispatched, group.combined) == (expect_calls, expect_calls)
-    assert x.shape[0] == tokens.shape[0] * (2 if expect_calls else 1)
-    assert gathered_logits.shape[0] == x.shape[0]
-    assert out.shape == tokens.shape
+    for gone in ("dispatch_for_fallback", "combine_for_fallback",
+                 "engages_for", "engaged_at"):
+        assert not hasattr(fused_moe_ep, gone), (
+            f"{gone} is back: a per-step engagement test cannot coexist "
+            "with a layer-level supports_internal_mk without splitting the "
+            "takeover")
 
 
 def _reference_moe(tokens, gate_w, up_w, down_w, logits, top_k):
@@ -281,6 +353,7 @@ def test_row_slicing_plus_all_reduce_reproduces_the_dense_moe(
             subc_quant_w2_sz=None,
             quant_act=True,
             replica_rank=torch.tensor(rank, dtype=torch.int32),
+            ep_rank_ids=torch.zeros(1, dtype=torch.int32),
         )
 
     torch.testing.assert_close(
@@ -326,7 +399,9 @@ def test_rows_are_padded_to_a_legal_per_rank_block(monkeypatch, rows,
                                         subc_quant_w2_sz=None,
                                         quant_act=True,
                                         replica_rank=torch.tensor(
-                                            rank, dtype=torch.int32))
+                                            rank, dtype=torch.int32),
+                                        ep_rank_ids=torch.zeros(
+                                            1, dtype=torch.int32))
         assert out.shape == (rows, HIDDEN)
         total += out
 
@@ -338,10 +413,9 @@ def _stub_op(tokens, logits, *_weights):
     return tokens * 2.0
 
 
-@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("replica_size", [1, 2])
 def test_the_forward_path_traces_under_dynamo_without_a_graph_break(
-        monkeypatch, replica_size, version):
+        monkeypatch, replica_size):
     """`fullgraph=True` over everything the forward does around the kernel.
 
     vLLM compiles the model with Dynamo, so anything in this path that Dynamo
@@ -357,7 +431,6 @@ def test_the_forward_path_traces_under_dynamo_without_a_graph_break(
                   subc_quant_w1_sz=None,
                   subc_quant_w2_sz=None,
                   quant_act=True)
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", str(version))
     monkeypatch.setitem(fused_moe_ep._op_cache,
                         fused_moe_ep.op_cache_key(**kwargs), _stub_op)
     monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda:
@@ -408,7 +481,8 @@ def test_the_forward_never_builds_the_op(monkeypatch):
         return _Op()
 
     monkeypatch.setattr(fused_moe_ep.pallas, "jax_op", _fake_jax_op)
-    monkeypatch.setattr(fused_moe_ep, "get_or_create_ep_mesh", lambda: "mesh")
+    monkeypatch.setattr(fused_moe_ep, "get_or_create_ep_mesh_1d",
+                        lambda: "mesh")
     monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (1, 0))
     monkeypatch.setattr(fused_moe_ep, "_op_cache", {})
 
@@ -429,25 +503,24 @@ def test_the_forward_never_builds_the_op(monkeypatch):
                               w1_scale=None,
                               w2_scale=None,
                               replica_rank=None,
+                              ep_rank_ids=torch.zeros(1, dtype=torch.int32),
                               **kwargs)
 
     assert builds == builds[:1], "the forward rebuilt the custom op"
 
 
-@pytest.mark.parametrize("version,expect_axes,expect_func", [
-    (1, ("data", "model"), "fused_ep_moe_func"),
-    (2, ("d", ), "fused_ep_moe_v2_func"),
-])
-def test_the_version_switch_picks_the_program_and_the_mesh_that_go_together(
-        monkeypatch, version, expect_axes, expect_func):
-    """v1 and v2 are one switch, and the switch moves three things at once.
+def test_the_program_and_the_mesh_that_go_together(monkeypatch):
+    """The kernel body, the mesh rank and the partition specs move as one.
 
-    The kernel body, the mesh rank (v2 addresses peers with a 1-tuple
-    ``device_id`` and names its own axis) and the partition specs have to move
-    together: a v2 program under v1's 2-D mesh raises inside Mosaic lowering
-    with "got 1 ids for a 2D mesh", which is a long way from the flag that
-    caused it.
+    v2 addresses its peers with a 1-tuple ``device_id`` and names its own
+    single mesh axis, so it is built on the 1-D EP mesh: the same program on a
+    2-D mesh raises inside Mosaic lowering with "got 1 ids for a 2D mesh", a
+    long way from whatever wired it. It also takes a seventh operand -- the
+    shard identity -- which has to be a parameter of the exported module or the
+    SPMD partitioner synthesises a ``partition-id`` for it
+    (``register_ep_rank_buffer``).
     """
+    expect_axes = ("d", )
     seen = {}
 
     def _fake_jax_op(name, fn, *, mesh, input_partition_specs):
@@ -463,13 +536,10 @@ def test_the_version_switch_picks_the_program_and_the_mesh_that_go_together(
 
         return _Op()
 
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", str(version))
     monkeypatch.setattr(fused_moe_ep.pallas, "jax_op", _fake_jax_op)
     monkeypatch.setattr(fused_moe_ep, "_op_cache", {})
-    for builder in ("get_or_create_ep_mesh", "get_or_create_ep_mesh_1d"):
-        monkeypatch.setattr(fused_moe_ep, builder,
-                            (lambda axes: lambda: axes)(expect_axes))
-
+    monkeypatch.setattr(fused_moe_ep, "get_or_create_ep_mesh_1d",
+                        lambda: expect_axes)
     fused_moe_ep.prebuild_fused_ep_moe_kernel(top_k=2,
                                               renormalize=True,
                                               activation="silu",
@@ -478,12 +548,8 @@ def test_the_version_switch_picks_the_program_and_the_mesh_that_go_together(
                                               subc_quant_w2_sz=1024,
                                               quant_act=True)
 
-    assert seen["fn"].func.__name__ == expect_func
-    # v2 takes a seventh operand, the shard identity -- it has to be a
-    # parameter of the exported module or the SPMD partitioner synthesises a
-    # partition-id for it (register_ep_rank_buffer).
-    n_operands = 6 if version == 1 else 7
-    assert seen["specs"] == (PartitionSpec(expect_axes[-1]), ) * n_operands
+    assert seen["fn"].func.__name__ == "fused_ep_moe_v2_func"
+    assert seen["specs"] == (PartitionSpec(expect_axes[-1]), ) * 7
     # The mesh the shard_map traces under is the mesh the bridge sizes with.
     assert seen["fn"].keywords["mesh"] is seen["mesh"]
 
@@ -507,7 +573,6 @@ def test_the_v2_op_registers_with_a_tensors_only_schema(monkeypatch):
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1),
                 axis_names=("d", ),
                 axis_types=(AxisType.Explicit, ))
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_VERSION", "2")
     monkeypatch.setattr(fused_moe_ep, "get_or_create_ep_mesh_1d", lambda: mesh)
     monkeypatch.setattr(fused_moe_ep, "_op_cache", {})
 
@@ -534,56 +599,19 @@ def test_the_v2_op_registers_with_a_tensors_only_schema(monkeypatch):
         f"a config parameter reached the op schema unbound: {schema}")
 
 
-def test_an_uncoordinated_step_gives_the_whole_takeover_back(monkeypatch):
-    """Half a takeover is worse than none.
-
-    On a step whose DP ranks have not agreed on a shape, the kernel declines --
-    but if the layer keeps `supports_internal_mk` it has also told the runner to
-    stop dispatching and combining, and then does that itself from inside the
-    layer, on ranks that are not arriving together. Same deadlock, different
-    collective, and it presents the same way (a SparseCore halt, because an
-    offloaded collective is what is outstanding when the TensorCore waits).
-    Measured: W6 jobs j-ef24b962 / j-d68b0dd5 / j-2846842c, three boots.
-
-    The runner reads `supports_internal_mk` inside `_maybe_dispatch` and
-    `_maybe_combine` on every forward, so it can and must answer per step.
-    """
-
-    from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
-
-    method = fp8_mod.VllmFp8MoEMethodTPU.__new__(fp8_mod.VllmFp8MoEMethodTPU)
-    method._fused_ep_enabled = True
-    method._fused_ep_dp_size = 8
-    layer = SimpleNamespace(moe_config=SimpleNamespace(dp_size=8))
-
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", None, raising=False)
-    assert method.supports_internal_mk is False, (
-        "the layer kept ownership of dispatch/combine on a step it cannot "
-        "coordinate")
-    assert fused_moe_ep._needs_fallback_dispatch(layer) is False, (
-        "and would then have reinstated the pair the runner is still doing")
-
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", True, raising=False)
-    assert method.supports_internal_mk is True
-    assert fused_moe_ep._needs_fallback_dispatch(layer) is True
-
-
-def test_without_dp_the_takeover_never_depends_on_a_forward_context(
+def test_a_deployment_that_cannot_coordinate_is_refused_not_fallen_back(
         monkeypatch):
-    """dp_size 1 has nothing to coordinate, and TP8_EP must not be disabled by
-    a missing forward context."""
+    """The successor to the per-step decline: refuse the layout at weight load.
 
-    from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
-
-    method = fp8_mod.VllmFp8MoEMethodTPU.__new__(fp8_mod.VllmFp8MoEMethodTPU)
-    method._fused_ep_enabled = True
-    method._fused_ep_dp_size = 1
-    monkeypatch.setattr(fused_moe_ep, "_DP_AGREED", None, raising=False)
-    assert method.supports_internal_mk is True
-
-
-def _layer_dp(dp_size):
-    return SimpleNamespace(moe_config=SimpleNamespace(dp_size=dp_size))
+    A step where one rank engages and another does not hangs the TensorCore in
+    ``semaphore_wait`` (W6, three boots). The old fix answered per step; this
+    one answers per deployment, and ``dp_size=1`` -- the layout with no DP
+    transport to take over -- is refused by name.
+    """
+    monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (8, 0))
+    reason = fused_moe_ep.out_of_band_reason(
+        SimpleNamespace(moe_config=SimpleNamespace(dp_size=1)))
+    assert reason is not None and "dp_size=1" in reason, reason
 
 
 def test_nothing_on_the_traced_path_logs(monkeypatch):
@@ -591,28 +619,27 @@ def test_nothing_on_the_traced_path_logs(monkeypatch):
 
     "logging.Logger method not supported for non-export cases" (W6,
     j-cf06d716) -- fatal in the traced region and invisible in eager, which is
-    why 33 decline lines printed happily and the boot still died. The decline
-    is announced from `dp_agreement`, which runs eagerly in the runner; nothing
-    reachable from the forward may log.
+    why 33 decline lines printed happily and the boot still died. Arming is
+    announced from `is_enabled`, which runs at weight load; nothing reachable
+    from the forward may log.
 
     Checked structurally rather than by inspection, because the next person
     adding a diagnostic to the decline path will not read this docstring.
     """
     import inspect
 
-    traced = (fused_moe_ep.engages_for, fused_moe_ep.dp_agreed_tokens,
-              fused_moe_ep.dp_step_is_coordinated, fused_moe_ep.max_tokens,
-              fused_moe_ep.capacity_skew, fused_moe_ep.kernel_version,
-              fused_moe_ep.fused_moe_ep, fused_moe_ep.dispatch_for_fallback,
-              fused_moe_ep.combine_for_fallback, fused_moe_ep.op_cache_key,
-              fused_moe_ep.block_size_override)
+    traced = (fused_moe_ep.fused_moe_ep, fused_moe_ep.op_cache_key,
+              fused_moe_ep.block_size_override, fused_moe_ep.capacity_skew,
+              fused_moe_ep.max_tokens, fused_moe_ep._input_partition_specs,
+              fused_moe_ep._padded_rows, fused_moe_ep._row_slice_index,
+              fused_moe_ep._scatter_replica_rows)
     offenders = [
         fn.__name__ for fn in traced if "logger." in inspect.getsource(fn)
         or "print(" in inspect.getsource(fn)
     ]
     assert not offenders, (
         f"{offenders} log from inside the Dynamo-traced forward; announce it "
-        "from dp_agreement or another eager caller instead")
+        "from is_enabled or another eager caller instead")
 
 
 def test_the_engagement_assertion_flag_cannot_change_a_graph():
@@ -633,8 +660,8 @@ def test_the_engagement_assertion_flag_cannot_change_a_graph():
 
     flag = "MOE_FUSED_EP_REQUIRE_ENGAGEMENT"
     assert flag in tpu_compiler._TPU_COMPILE_ENV_IGNORED
-    # …and the two that select which custom op is emitted must NEVER be ignored.
-    for graph_changing in ("USE_MOE_EP_KERNEL", "MOE_FUSED_EP_KERNEL_VERSION",
+    # …and the ones selecting which custom op is emitted are NEVER ignored.
+    for graph_changing in ("USE_MOE_FUSED_EP_V2", "USE_MOE_EP_KERNEL",
                            "MOE_FUSED_EP_KERNEL_MIN_TOKENS",
                            "MOE_FUSED_EP_KERNEL_MAX_TOKENS",
                            "MOE_FUSED_EP_QUANT_ACT"):
@@ -643,16 +670,275 @@ def test_the_engagement_assertion_flag_cannot_change_a_graph():
             "it in the cache key would make every arm load the first arm's "
             "executable")
 
-    traced = (fused_moe_ep.engages_for, fused_moe_ep.dp_agreed_tokens,
-              fused_moe_ep.dp_step_is_coordinated, fused_moe_ep.max_tokens,
-              fused_moe_ep.engagement_verdict, fused_moe_ep.capacity_skew,
-              fused_moe_ep.kernel_version, fused_moe_ep.fused_moe_ep,
-              fused_moe_ep.dispatch_for_fallback,
-              fused_moe_ep.combine_for_fallback, fused_moe_ep.op_cache_key,
-              fused_moe_ep.block_size_override, fused_moe_ep._get_op)
+    traced = (fused_moe_ep.fused_moe_ep, fused_moe_ep.op_cache_key,
+              fused_moe_ep.block_size_override, fused_moe_ep.capacity_skew,
+              fused_moe_ep.max_tokens, fused_moe_ep._get_op)
     readers = [
         fn.__name__ for fn in traced if flag in inspect.getsource(fn)
     ]
     assert not readers, (
         f"{readers} read {flag}, which is excluded from the compile-cache key "
         "-- so two arms differing only in it would share an executable")
+
+
+# ---------------------------------------------------------------------------
+# The reduction contract: who reduces what, and every spelling that loses half
+# of it. Driven through the real MoERunner with a real (TP-sharded) shared
+# expert, because the two halves are decided by two different switches and only
+# one of them touches the shared expert:
+#
+#   moe_kernel.output_is_reduced() -> True  skips the late all-reduce AND
+#                                           reduces the shared expert alone
+#   moe_config.skip_final_all_reduce        skips the late all-reduce and
+#                                           does NOTHING for the shared expert
+#
+# v2 wants neither: its output is a row slice, so the late all-reduce is the
+# reassembly and, in the same collective, the shared expert's reduction.
+# ---------------------------------------------------------------------------
+
+TP = 4
+
+
+def _run_tp_group(monkeypatch, *, fused_of_rank, shared_of_rank, moe_kernel,
+                  skip_final_all_reduce, tp=TP):
+    """Run the real runner once per TP rank; return each rank's final output.
+
+    ``tensor_model_parallel_all_reduce`` is replayed in two passes: pass 1
+    records every rank's operand per call index, pass 2 hands back the sum over
+    ranks. That is exact here because no all-reduce operand in this graph
+    depends on another all-reduce's output -- the one that would,
+    ``_maybe_reduce_routed_output_before_transform``, needs a
+    ``routed_output_transform`` (latent MoE), which this path refuses.
+
+    Asserting on the returned tensors rather than on a call count is the point:
+    a recording stub that returns its input cannot tell "reduced the sum" from
+    "reduced the shared expert and skipped the sum".
+    """
+    x = torch.zeros(ROWS, HIDDEN)
+    logits = torch.zeros(ROWS, 8)
+    recorded: list[list[torch.Tensor]] = []
+
+    def _one_rank(rank, sums):
+        calls = itertools.count()
+
+        def _all_reduce(tensor):
+            i = next(calls)
+            if sums is None:
+                while len(recorded) <= i:
+                    recorded.append([])
+                recorded[i].append(tensor.clone())
+                return tensor
+            return sums[i]
+
+        monkeypatch.setattr(moe_runner_mod, "tensor_model_parallel_all_reduce",
+                            _all_reduce)
+        runner = _make_runner(dp_size=tp,
+                              ep_size=tp,
+                              fused_out=fused_of_rank(rank),
+                              shared_partial=shared_of_rank(rank),
+                              moe_kernel=moe_kernel,
+                              skip_final_all_reduce=skip_final_all_reduce)
+        monkeypatch.setattr(moe_runner_mod, "get_ep_group", _ExplodingEpGroup)
+        monkeypatch.setattr(moe_runner_mod, "get_layer_from_name",
+                            lambda _name, r=runner: r)
+        return runner(x, logits)
+
+    for rank in range(tp):
+        _one_rank(rank, None)
+    sums = [torch.stack(operands).sum(0) for operands in recorded]
+    return [_one_rank(rank, sums) for rank in range(tp)]
+
+
+def _row_slice_of(rank):
+    """What v2 returns on rank ``rank``: its own rows, zero everywhere else."""
+    out = torch.zeros(ROWS, HIDDEN)
+    rows = ROWS // TP
+    out[rank * rows:(rank + 1) * rows] = float(rank + 1)
+    return out
+
+
+def _complete_rows(rank):
+    """What a kernel that gathers internally returns: every row, everywhere."""
+    del rank
+    return sum(_row_slice_of(r) for r in range(TP))
+
+
+def _shared_partial_of(rank):
+    """A TP-sharded shared expert's partial sum on rank ``rank``."""
+    return torch.full((ROWS, HIDDEN), 0.25 * (rank + 1))
+
+
+def _all_shared():
+    return sum(_shared_partial_of(r) for r in range(TP))
+
+
+# --- contract A: what v2 ships -- routed output is this rank's row slice -----
+
+
+def test_the_late_all_reduce_reassembles_rows_and_reduces_the_shared_expert(
+        monkeypatch):
+    """The shipped spelling, end to end through the runner.
+
+    One collective does both halves: it sums the disjoint row slices into the
+    whole batch and sums the shared expert's TP partials, and every rank comes
+    out holding the complete layer output.
+    """
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_row_slice_of,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=None,
+                         skip_final_all_reduce=False)
+    want = _complete_rows(0) + _all_shared()
+    for rank, out in enumerate(outs):
+        torch.testing.assert_close(out, want, msg=f"rank {rank}")
+
+
+def test_declaring_the_output_reduced_drops_the_other_ranks_rows(monkeypatch):
+    """`moe_kernel.output_is_reduced()` is the #3040 spelling, and it is wrong
+    here: v2's rows are a partition, not a sum, so skipping the late all-reduce
+    leaves every rank holding only its own slice. The shared expert survives
+    (it gets its own reduce), which is exactly what makes this hard to see.
+    """
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_row_slice_of,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=_ReducedOutputMoEKernel(),
+                         skip_final_all_reduce=False)
+    torch.testing.assert_close(outs[0], _row_slice_of(0) + _all_shared())
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(outs[0], _complete_rows(0) + _all_shared())
+
+
+def test_skip_final_all_reduce_loses_the_rows_and_the_shared_expert(
+        monkeypatch):
+    """The other way to switch the same collective off, and the worse one:
+    nothing is reduced at all, and vLLM's own assertion against a pre-reduced
+    output cannot see it (that assert is gated on `moe_kernel`, which this path
+    leaves None). Hence the weight-load refusal below.
+    """
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_row_slice_of,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=None,
+                         skip_final_all_reduce=True)
+    torch.testing.assert_close(outs[0],
+                               _row_slice_of(0) + _shared_partial_of(0))
+
+
+# --- contract B: the #3040 shape, and any future in-kernel gather ------------
+
+
+def test_a_reduced_output_still_needs_the_shared_expert_reduced(monkeypatch):
+    """If the kernel ever gathers internally, `moe_kernel` becomes required.
+
+    The routed output is then complete on every rank, and the ONLY thing that
+    reduces the TP-sharded shared expert is
+    `_maybe_reduce_shared_expert_output`, which fires on that switch alone.
+    """
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_complete_rows,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=_ReducedOutputMoEKernel(),
+                         skip_final_all_reduce=False)
+    want = _complete_rows(0) + _all_shared()
+    for rank, out in enumerate(outs):
+        torch.testing.assert_close(out, want, msg=f"rank {rank}")
+
+
+def test_skip_final_all_reduce_silently_loses_the_shared_expert(monkeypatch):
+    """The trap this whole file exists for, isolated.
+
+    Same reduced routed output, the other switch: the routed half is right, and
+    each rank keeps 1/tp of the shared expert forever. The model still produces
+    fluent text, which is why this is asserted as an exact wrong answer rather
+    than left to a numerics run to notice.
+    """
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_complete_rows,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=None,
+                         skip_final_all_reduce=True)
+    torch.testing.assert_close(outs[0],
+                               _complete_rows(0) + _shared_partial_of(0))
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(outs[0], _complete_rows(0) + _all_shared())
+
+
+def test_a_reduced_output_that_declares_nothing_is_counted_tp_times(
+        monkeypatch):
+    """The double-count, for completeness: a fully reduced output left to the
+    late all-reduce is multiplied by the TP width."""
+    outs = _run_tp_group(monkeypatch,
+                         fused_of_rank=_complete_rows,
+                         shared_of_rank=_shared_partial_of,
+                         moe_kernel=None,
+                         skip_final_all_reduce=False)
+    torch.testing.assert_close(outs[0], TP * _complete_rows(0) + _all_shared())
+
+
+# --- and the two ways to state the contract at its source --------------------
+
+
+def test_nothing_on_this_path_assigns_moe_kernel():
+    """`moe_kernel` is vLLM's switch for "this layer reduced its own output".
+
+    v2 returns a row slice, so it must stay None. Structural because the
+    behavioural test above can only see it once a shared expert is wired into
+    the fixture, and because the tempting edit -- copying #3040's
+    `ReducedOutputMoEKernel` across -- is one line in a file nobody re-reads.
+    """
+    import inspect
+    import re
+
+    from vllm_torchtpu.layers.vllm.quantization import fp8 as fp8_mod
+
+    for module in (fused_moe_ep, fp8_mod):
+        offenders = re.findall(r"^\s*(?:self\.)?moe_kernel\s*=.*$",
+                               inspect.getsource(module), re.M)
+        assert not offenders, (
+            f"{module.__name__} assigns moe_kernel ({offenders}); that tells "
+            "the runner to skip the all-reduce this path depends on")
+
+
+def test_a_layer_whose_late_all_reduce_was_deferred_is_refused(monkeypatch):
+    """`reduce_results=False` on the MoE layer -> `skip_final_all_reduce` ->
+    nothing reassembles the row slices. Refused at weight load, by name,
+    because there is no assertion downstream that can catch it: vLLM's own one
+    is gated on `moe_kernel`, which this path deliberately leaves None.
+
+    Reachable at dp_size == 1 with any model that forwards
+    `reduce_results=False` into `FusedMoEFactory` (DeepSeek-V2/V3 in this vLLM;
+    Qwen3.5 does not).
+    """
+    monkeypatch.setattr(fused_moe_ep, "_replica_group", lambda: (1, 0))
+    moe = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True),
+                          ep_size=8,
+                          dp_size=8,
+                          num_experts=64,
+                          experts_per_token=8,
+                          is_sequence_parallel=False,
+                          pcp_size=1,
+                          skip_final_all_reduce=True,
+                          is_lora_enabled=False)
+    layer = SimpleNamespace(moe_config=moe,
+                            use_grouped_topk=False,
+                            hash_indices_table=None,
+                            e_score_correction_bias=None,
+                            routed_scaling_factor=1.0,
+                            scoring_func="softmax",
+                            _tpu_activation_str="silu",
+                            has_bias=False)
+
+    reason = fused_moe_ep.unsupported_reason(layer)
+    assert reason is not None and "all-reduce" in reason, reason
+
+    moe.skip_final_all_reduce = False
+    assert fused_moe_ep.unsupported_reason(layer) is None, (
+        "the guard must refuse the deferral and nothing else")
+
+    # The neighbouring pair-consistency guard: vLLM's LoRA layer asserts
+    # moe_kernel is not None wherever supports_internal_mk is True, and this
+    # path is (True, None) -- so LoRA is refused here rather than asserted
+    # inside vllm/lora/layers/fused_moe.py.
+    moe.is_lora_enabled = True
+    assert "LoRA" in (fused_moe_ep.unsupported_reason(layer) or "")
