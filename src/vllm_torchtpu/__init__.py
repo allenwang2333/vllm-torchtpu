@@ -223,6 +223,29 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _validate_moe_env_flags() -> None:
+    """Refuse impossible MoE flag combinations, before anything is patched.
+
+    Called from ``apply_tpu_patches`` ahead of its ``_tpu_patches_applied``
+    latch. Raising from inside the patch chain instead would set the latch,
+    apply part of the chain and then abort: a caller that catches the error
+    is left with a half-patched plugin that cannot be retried.
+    """
+    import vllm_torchtpu.envs as envs
+
+    if envs.TPU_MOE_LOCAL_ROUTING and envs.USE_MOE_EP_KERNEL:
+        raise ValueError(
+            "TPU_MOE_LOCAL_ROUTING=1 and USE_MOE_EP_KERNEL=1 are mutually "
+            "exclusive: USE_MOE_EP_KERNEL selects the fused expert-parallel "
+            "MoE kernel that lives in tpu-inference "
+            "(tpu_inference/layers/vllm/interface/moe.py), which scores the "
+            "raw router logits itself and would be handed a packed int32 "
+            "decision instead. No code in this package reads the flag, so "
+            "here the pair is merely useless -- it is refused anyway rather "
+            "than depend on which MoE implementation a stacked install ends "
+            "up with. Unset one of the two.")
+
+
 def _patch_moe_local_routing_dispatch() -> None:
     """Route on the rank that owns the rows, and dispatch the decision.
 
@@ -240,15 +263,8 @@ def _patch_moe_local_routing_dispatch() -> None:
     import vllm_torchtpu.envs as envs
     if not envs.TPU_MOE_LOCAL_ROUTING:
         return
-    if envs.USE_MOE_EP_KERNEL:
-        # The fused EP kernel scores the router logits itself, from the same
-        # argument this patch replaces with a packed decision. Refuse the
-        # combination here, at startup, rather than handing that kernel an
-        # int32 blob to softmax.
-        raise ValueError(
-            "TPU_MOE_LOCAL_ROUTING=1 and USE_MOE_EP_KERNEL=1 are mutually "
-            "exclusive: the fused EP MoE kernel does its own routing from the "
-            "raw router logits.")
+    # The USE_MOE_EP_KERNEL refusal is in _validate_moe_env_flags, which runs
+    # before the patch chain starts.
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
 

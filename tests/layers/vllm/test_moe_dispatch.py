@@ -64,13 +64,15 @@ def _logits(rows, seed=0):
 # merged tree's numerics gate.
 ROUTER_VARIANTS = {
     "softmax": {},
-    "sigmoid_bias": dict(scoring_func="sigmoid",
-                         e_score_correction_bias=torch.linspace(
-                             -1.0, 1.0, EXPERTS)),
-    "sqrtsoftplus_scaled": dict(scoring_func="sqrtsoftplus",
-                                routed_scaling_factor=2.5),
-    "no_renormalize": dict(renormalize=False),
-    "grouped": dict(use_grouped_topk=True, num_expert_group=8, topk_group=3),
+    "sigmoid_bias":
+    dict(scoring_func="sigmoid",
+         e_score_correction_bias=torch.linspace(-1.0, 1.0, EXPERTS)),
+    "sqrtsoftplus_scaled":
+    dict(scoring_func="sqrtsoftplus", routed_scaling_factor=2.5),
+    "no_renormalize":
+    dict(renormalize=False),
+    "grouped":
+    dict(use_grouped_topk=True, num_expert_group=8, topk_group=3),
 }
 
 
@@ -118,10 +120,14 @@ def test_blob_is_distinguishable_from_router_logits():
         moe_dispatch.pack_routing(ids, torch.zeros(4, TOPK)))
 
 
-@pytest.mark.parametrize("bad", [
-    torch.zeros(4, 2 * TOPK, dtype=torch.int32),   # still 2-D: the old format
-    torch.zeros(4 * 2 * TOPK + 3, dtype=torch.int32),   # not a whole number of rows
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        torch.zeros(4, 2 * TOPK,
+                    dtype=torch.int32),  # still 2-D: the old format
+        torch.zeros(4 * 2 * TOPK + 3,
+                    dtype=torch.int32),  # not a whole number of rows
+    ])
 def test_unpack_rejects_anything_that_is_not_a_flat_blob(bad):
     with pytest.raises(ValueError, match="routing blob"):
         moe_dispatch.unpack_routing(bad, TOPK, torch.bfloat16)
@@ -160,8 +166,10 @@ def test_routing_is_row_wise_so_a_rank_can_decide_its_own_rows(
     on a chip.
     """
     layer = _layer(**ROUTER_VARIANTS[variant])
-    got_w, got_i, ref_w, ref_i = _chunked_vs_global(layer, 64 * dp_size,
-                                                    dp_size, seed=dp_size)
+    got_w, got_i, ref_w, ref_i = _chunked_vs_global(layer,
+                                                    64 * dp_size,
+                                                    dp_size,
+                                                    seed=dp_size)
     assert torch.equal(got_i, ref_i)
     assert torch.equal(got_w, ref_w)
 
@@ -176,16 +184,24 @@ def test_the_row_wise_check_rejects_a_router_that_is_not_row_wise(
     the dispatch wrong, and the comparison has to catch it.
     """
 
-    def not_row_wise(hidden_states, router_logits, *, topk, renormalize,
-                     scoring_fn, layer=None, input_ids=None):
+    def not_row_wise(hidden_states,
+                     router_logits,
+                     *,
+                     topk,
+                     renormalize,
+                     scoring_fn,
+                     layer=None,
+                     input_ids=None):
         scores = router_logits.float().softmax(dim=-1)
         scores = scores - scores.mean(dim=0, keepdim=True)
         w, i = torch.topk(scores, k=topk, dim=-1)
         return w.to(hidden_states.dtype), i.to(torch.int32)
 
     monkeypatch.setattr(moe_routing, "select_experts", not_row_wise)
-    got_w, got_i, ref_w, ref_i = _chunked_vs_global(_layer(), 64 * dp_size,
-                                                    dp_size, seed=dp_size)
+    got_w, got_i, ref_w, ref_i = _chunked_vs_global(_layer(),
+                                                    64 * dp_size,
+                                                    dp_size,
+                                                    seed=dp_size)
     assert not torch.equal(got_i, ref_i), (
         "a router that reads the whole batch produced the same decision "
         "chunked as whole -- the row-wise test cannot fail")
@@ -284,14 +300,20 @@ def test_route_and_pack_refuses_what_it_cannot_prove(unsupported):
 # semantic change, and it would break the claim that the decision is
 # bit-identical.
 ROUTE_CALLERS = {
-    "quantization.fp8": "TPU_MOE_SKIP_PADDED_TOKENS",
+    "quantization.fp8":
+    "TPU_MOE_SKIP_PADDED_TOKENS",
     "quantization.compressed_tensors.compressed_tensors_moe"
-    ".compressed_tensors_moe_w4an_mxfp4": "",
-    "quantization.mxfp4": None,
-    "quantization.nvfp4": None,
-    "quantization.unquantized": None,
+    ".compressed_tensors_moe_w4an_mxfp4":
+    "",
+    "quantization.mxfp4":
+    None,
+    "quantization.nvfp4":
+    None,
+    "quantization.unquantized":
+    None,
     "quantization.compressed_tensors.compressed_tensors_moe"
-    ".compressed_tensors_moe_w4a16": None,
+    ".compressed_tensors_moe_w4a16":
+    None,
 }
 
 
@@ -427,25 +449,30 @@ def _install_patch(monkeypatch, enabled):
 
 
 def test_local_routing_is_off_by_default():
-    """With no env set the flag reads False, and it is read in one place.
+    """With no env set the flag reads False, and only startup reads it.
 
-    One read site is the whole point: the flag gates the patch installer and
-    nothing else, so there is no module-scope cache whose value depends on
-    import order relative to the worker's environment.
+    Both read sites run once, at patch time -- the installer, and the flag
+    validation that refuses impossible combinations ahead of it. Neither the
+    codec nor the routing path reads it, so there is no module-scope cache
+    whose value depends on import order relative to the worker's environment.
     """
-    import vllm_torchtpu.envs as envs
     import vllm_torchtpu
+    import vllm_torchtpu.envs as envs
     assert envs.TPU_MOE_LOCAL_ROUTING is False
     readers = [
-        m for m, src in (
-            ("moe_dispatch", inspect.getsource(moe_dispatch)),
-            ("moe_routing", inspect.getsource(moe_routing)),
-            ("token_padding", inspect.getsource(token_padding)),
-            ("_patch_moe_local_routing_dispatch",
-             inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch)))
+        m for m, src in
+        (("moe_dispatch", inspect.getsource(moe_dispatch)),
+         ("moe_routing", inspect.getsource(moe_routing)),
+         ("token_padding", inspect.getsource(token_padding)),
+         ("_patch_moe_local_routing_dispatch",
+          inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch)),
+         ("_validate_moe_env_flags",
+          inspect.getsource(vllm_torchtpu._validate_moe_env_flags)))
         if "envs.TPU_MOE_LOCAL_ROUTING" in src
     ]
-    assert readers == ["_patch_moe_local_routing_dispatch"], readers
+    assert readers == [
+        "_patch_moe_local_routing_dispatch", "_validate_moe_env_flags"
+    ], readers
 
 
 @pytest.mark.parametrize("flag_on", [False, True])
@@ -522,22 +549,148 @@ def test_patched_dispatch_sends_the_blob_not_the_logits(monkeypatch):
     assert torch.equal(got_i, ref_i) and torch.equal(got_w, ref_w)
 
 
-def test_refuses_to_coexist_with_the_fused_ep_kernel(monkeypatch):
-    """The fused EP kernel scores the raw logits this patch replaces."""
+@pytest.mark.parametrize("guard",
+                         ["do_naive_dispatch_combine", "is_monolithic"])
+def test_the_wrapper_leaves_router_logits_alone_when_a_guard_is_false(
+        monkeypatch, guard):
+    """The negative controls for the predicate, one term at a time.
+
+    ``do_naive_dispatch_combine`` False is what ``dp_size == 1`` looks like
+    from inside the wrapper -- 10 of the 14 points on the InferenceX sweep --
+    and upstream's body must then run on the raw logits exactly as it does
+    unpatched. ``is_monolithic`` False is the modular path, whose router reads
+    ``router_logits`` *after* the dispatch and would be handed an int32 blob.
+
+    Object identity, not equality: a wrapper that packed and unpacked around
+    the collective would compare equal and still have cost the collective its
+    layout.
+    """
+    mr = _install_patch(monkeypatch, enabled=True)
+    assert mr.MoERunner._tpu_local_routing_patch, (
+        "the wrapper is not installed, so this negative control would pass "
+        "against unpatched upstream code")
+
+    def _refuse_to_pack(*args, **kwargs):
+        raise AssertionError(f"route_and_pack ran with {guard} False")
+
+    monkeypatch.setattr(moe_dispatch, "route_and_pack", _refuse_to_pack)
+
+    seen = {}
+
+    class _Group:
+
+        def dispatch_router_logits(self, hidden, logits, is_sp):
+            seen["logits"] = logits
+            return hidden, logits
+
+    monkeypatch.setattr(mr, "get_ep_group", lambda: _Group())
+
+    layer = _layer()
+    layer.quant_method = SimpleNamespace(
+        is_monolithic=guard != "is_monolithic")
+
+    class _Runner:
+        do_naive_dispatch_combine = guard != "do_naive_dispatch_combine"
+        routed_experts = layer
+        moe_config = SimpleNamespace(is_sequence_parallel=False, pcp_size=1)
+
+    logits = _logits(24, seed=9)
+    hidden = torch.zeros(24, 8, dtype=torch.bfloat16)
+    out_hidden, out_logits = mr.MoERunner._maybe_dispatch(
+        _Runner(), hidden, logits)
+
+    assert out_logits is logits, "router_logits did not survive the wrapper"
+    assert out_hidden is hidden
+    if guard == "do_naive_dispatch_combine":
+        assert not seen, "upstream dispatches nothing when the term is False"
+    else:
+        assert seen["logits"] is logits, (
+            "the modular path's router must receive the raw logits")
+
+
+def test_the_fused_ep_kernel_refusal_runs_before_any_patch(monkeypatch):
+    """Refuse the pair, and refuse it before the plugin has touched anything.
+
+    The kernel that reads ``USE_MOE_EP_KERNEL`` lives in tpu-inference
+    (``tpu_inference/layers/vllm/interface/moe.py``) and scores the raw logits
+    itself, so it cannot be paired with a packed decision. Raising from inside
+    the patch chain would be worse than not checking at all:
+    ``apply_tpu_patches`` latches ``_tpu_patches_applied`` first, so a caught
+    ValueError would leave the plugin half-patched and the retry a silent
+    no-op.
+    """
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 
     import vllm_torchtpu
+    from vllm_torchtpu.platforms import tpu_platform
 
     monkeypatch.setattr(
         vllm_torchtpu.envs, "environment_variables",
         dict(vllm_torchtpu.envs.environment_variables,
              TPU_MOE_LOCAL_ROUTING=lambda: True,
              USE_MOE_EP_KERNEL=lambda: True))
-    monkeypatch.delattr(mr.MoERunner,
-                        "_tpu_local_routing_patch",
-                        raising=False)
+
     with pytest.raises(ValueError, match="mutually exclusive"):
-        vllm_torchtpu._patch_moe_local_routing_dispatch()
+        vllm_torchtpu._validate_moe_env_flags()
+
+    before = mr.MoERunner.__dict__["_maybe_dispatch"]
+    monkeypatch.setattr(tpu_platform, "_tpu_patches_applied", False)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tpu_platform.apply_tpu_patches()
+
+    assert tpu_platform._tpu_patches_applied is False, (
+        "the latch was set before the refusal: every later call returns "
+        "early and the plugin stays half-patched")
+    assert mr.MoERunner.__dict__["_maybe_dispatch"] is before, (
+        "a patch was applied before the refusal")
+
+
+@pytest.mark.parametrize("variant", sorted(ROUTER_VARIANTS))
+def test_pack_and_unpack_compile_fullgraph(variant):
+    """Both halves run inside the region vLLM compiles with Dynamo.
+
+    The bitcast in particular (`Tensor.view(torch.int32)`) is the kind of op
+    that traces fine eagerly and breaks the graph under `torch.compile`.
+    """
+    torch._dynamo.reset()
+    layer = _layer(**ROUTER_VARIANTS[variant])
+    logits = _logits(16, seed=2)
+    hidden = torch.zeros(16, 8, dtype=torch.bfloat16)
+
+    def round_trip(h, r):
+        blob = moe_dispatch.route_and_pack(layer, h, r)
+        return moe_routing.route(layer, h, blob)
+
+    compiled = torch.compile(round_trip, fullgraph=True, dynamic=False)
+    got_w, got_i = compiled(hidden, logits)
+    ref_w, ref_i = moe_routing.route(layer, hidden, logits)
+    assert torch.equal(got_w, ref_w) and torch.equal(got_i, ref_i)
+
+
+@pytest.mark.parametrize("experts,topk", [(128, 8), (512, 10), (2048, 10)])
+def test_pack_and_unpack_are_o1_in_the_tensor_width(experts, topk):
+    """Op count must not grow with the shapes.
+
+    Every aten op here is a node in the MoE layer's compiled graph, and the
+    graph is instantiated once per shape bucket per layer. A codec whose op
+    count scales with a dimension is what made an earlier fp8-over-ICI codec
+    uncompilable at model shapes, so pin the invariant rather than the number.
+    """
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    rows = 64
+    ids = torch.zeros(rows, topk, dtype=torch.int32)
+    weights = torch.zeros(rows, topk, dtype=torch.bfloat16)
+    blob = torch.zeros(rows * 2 * topk, dtype=torch.int32)
+
+    def n_ops(fn, *args):
+        gm = make_fx(fn, tracing_mode="fake")(*args)
+        return sum(1 for node in gm.graph.nodes if node.op == "call_function")
+
+    assert n_ops(moe_dispatch.pack_routing, ids, weights) <= 5
+    assert n_ops(
+        lambda b: moe_dispatch.unpack_routing(b, topk, torch.bfloat16),
+        blob) <= 6
 
 
 # vllm/ray/ray_env.py: the only names copied to a Ray worker are vLLM's own
@@ -553,7 +706,7 @@ RAY_COPIED_PREFIXES = ("VLLM_", "FLASH_ATTENTION_", "LMCACHE_", "NCCL_",
 # additional_env_vars -- see test_every_env_var_this_feature_reads_reaches_the_worker.
 NOT_PROPAGATED = {
     "USE_MOE_EP_KERNEL":
-    "read only to refuse the pair at install time; it is the fused-EP "
+    "read only to refuse the pair before patching; it is the fused-EP "
     "kernel's own flag and that feature owns its propagation. A worker that "
     "never receives it never runs the fused EP kernel, so the combination "
     "this refusal exists to prevent cannot arise there.",
@@ -572,6 +725,7 @@ def _feature_env_reads():
         inspect.getsource(token_padding),
         inspect.getsource(moe_routing),
         inspect.getsource(vllm_torchtpu._patch_moe_local_routing_dispatch),
+        inspect.getsource(vllm_torchtpu._validate_moe_env_flags),
     ]
     names = set()
     for src in units:
@@ -639,12 +793,80 @@ def test_the_flat_blob_survives_a_dp_gather_and_rebuilds_global_routing():
         for r in range(dp_size)
     ]
     assert all(c.dim() == 1 and c.numel() == local * 2 * TOPK for c in chunks)
-    gathered = torch.cat(chunks, dim=0)          # exactly all_gather(dim=0)
+    gathered = torch.cat(chunks, dim=0)  # exactly all_gather(dim=0)
 
     got_w, got_i = moe_routing.route(layer, hidden, gathered)
     ref_w, ref_i = moe_routing.route(layer, hidden, logits)
     assert torch.equal(got_i, ref_i)
     assert torch.equal(got_w, ref_w)
+
+
+# Exactly the aten ops the routing codec is allowed to emit. An allow-list, so
+# a *new* copy appearing turns this red -- `_to_copy` is here because the codec
+# genuinely converts dtypes (int64 -> int32 ids, bf16 -> f32 for the bitcast),
+# which is data conversion, not data movement. Nothing that materialises a
+# buffer is on the list, which is what makes the flatten and the reshape back
+# provably views.
+CODEC_ALLOWED_ATEN_OPS = {
+    "aten._to_copy.default",  # ids -> int32, weights -> f32: real casts
+    "aten.view.dtype",  # the bitcast
+    "aten.view.default",  # the flatten, and the reshape back
+    "aten.cat.default",  # the pack
+    "aten.slice.Tensor",  # the two column slices in unpack
+    "aten.detach.default",  # make_fx bookkeeping
+}
+
+
+def _codec_aten_targets(fn, *args):
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    gm = make_fx(fn, tracing_mode="fake")(*args)
+    return [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+
+
+def _codec_example_tensors(rows=64):
+    return (torch.zeros(rows, TOPK, dtype=torch.int32),
+            torch.zeros(rows, TOPK, dtype=torch.bfloat16),
+            torch.zeros(rows * 2 * TOPK, dtype=torch.int32))
+
+
+def test_the_flatten_and_the_reshape_are_views_not_copies():
+    """A materialising reshape would hand back the bytes 1-D exists to save.
+
+    Checked on the traced graph, not in Python: `reshape` on a contiguous
+    tensor *is* a view, but only the graph says whether this one is.
+    """
+    ids, weights, blob = _codec_example_tensors()
+    pack = _codec_aten_targets(moe_dispatch.pack_routing, ids, weights)
+    unpack = _codec_aten_targets(
+        lambda b: moe_dispatch.unpack_routing(b, TOPK, torch.bfloat16), blob)
+
+    for names in (pack, unpack):
+        assert set(names) <= CODEC_ALLOWED_ATEN_OPS, (
+            f"codec emitted ops outside the allow-list: "
+            f"{sorted(set(names) - CODEC_ALLOWED_ATEN_OPS)}")
+    # Assert what must be present, not only what must be absent.
+    assert "aten.view.default" in pack, pack  # the flatten is a view
+    assert "aten.view.default" in unpack, unpack  # so is the reshape back
+    assert "aten.view.dtype" in unpack, unpack  # and the bitcast
+
+
+def test_the_codec_allow_list_rejects_a_codec_that_materialises():
+    """Negative control: the allow-list has to be able to fail.
+
+    Same codec with one genuine data movement in it -- a transpose forced
+    contiguous -- must fall outside the list.
+    """
+    ids, weights, _ = _codec_example_tensors()
+
+    def materialising_pack(topk_ids, topk_weights):
+        bits = topk_weights.float().view(torch.int32)
+        packed = torch.cat((topk_ids.to(torch.int32), bits), dim=-1)
+        return packed.t().contiguous().reshape(-1)
+
+    names = set(_codec_aten_targets(materialising_pack, ids, weights))
+    extra = names - CODEC_ALLOWED_ATEN_OPS
+    assert extra, f"the allow-list accepted a materialising codec: {names}"
 
 
 def test_a_layer_that_declines_to_pack_still_gets_its_padded_rows_masked(
@@ -681,7 +903,7 @@ def test_a_layer_that_declines_to_pack_still_gets_its_padded_rows_masked(
     try:
         layer = _layer()
         rows = dp_size * local
-        logits = _logits(rows, seed=31)          # logits, not a blob
+        logits = _logits(rows, seed=31)  # logits, not a blob
         hidden = torch.zeros(rows, 8, dtype=torch.bfloat16)
         w, i = moe_routing.route(layer, hidden, logits)
         _, masked = token_padding.zero_routing_weights_for_padding(i, w)
@@ -694,3 +916,120 @@ def test_a_layer_that_declines_to_pack_still_gets_its_padded_rows_masked(
     assert (masked[~mask] != 0).any()
 
 
+# --- what the flag costs per step at DECODE, where it buys nothing ----------
+# An earlier revision lost 20.27% to a per-step device->host sync in a
+# diagnostic, on decode steps where its optimisation was a no-op. Decode is
+# most of the steps and this flag does approximately nothing there, so any
+# per-step host cost it adds is pure loss. These three pin that there is none.
+DECODE_ROWS = (8, 16, 32)
+
+
+def _arm_round_trip(layer, hidden, logits):
+    return moe_routing.route(
+        layer, hidden, moe_dispatch.route_and_pack(layer, hidden, logits))
+
+
+@pytest.mark.parametrize("rows", DECODE_ROWS)
+def test_the_flag_on_path_is_one_graph_with_no_breaks_at_decode(rows):
+    """A graph break in the MoE forward at decode would be catastrophic."""
+    import torch._dynamo as dynamo
+
+    dynamo.reset()
+    layer = _layer()
+    logits = _logits(rows, seed=rows)
+    hidden = torch.zeros(rows, 8, dtype=torch.bfloat16)
+    explained = dynamo.explain(_arm_round_trip)(layer, hidden, logits)
+    assert explained.graph_count == 1, explained.break_reasons
+    assert explained.graph_break_count == 0, explained.break_reasons
+
+
+def test_the_flag_adds_no_device_host_sync():
+    """Count real syncs by wrapping what forces one. Zero, and zero either way.
+
+    `Tensor.float()` is a dtype cast and is not counted; `float(tensor)` would
+    be. Both paths are counted on purpose: a property the flag-off path also
+    lacks would not be evidence about the flag.
+    """
+    seen = []
+    names = ("item", "tolist", "cpu", "numpy", "__bool__", "__int__",
+             "__float__", "__index__")
+    originals = {
+        n: getattr(torch.Tensor, n)
+        for n in names if hasattr(torch.Tensor, n)
+    }
+
+    def instrument(name, original):
+
+        def wrapper(self, *a, **kw):
+            seen.append(name)
+            return original(self, *a, **kw)
+
+        return wrapper
+
+    for n, o in originals.items():
+        setattr(torch.Tensor, n, instrument(n, o))
+    try:
+        layer = _layer()
+        counts = {}
+        for arm, fn in (("control",
+                         lambda h, g: moe_routing.route(layer, h, g)),
+                        ("arm", lambda h, g: _arm_round_trip(layer, h, g))):
+            seen.clear()
+            for rows in DECODE_ROWS:
+                logits = _logits(rows, seed=rows)
+                hidden = torch.zeros(rows, 8, dtype=torch.bfloat16)
+                for _ in range(20):
+                    fn(hidden, logits)
+            counts[arm] = list(seen)
+    finally:
+        for n, o in originals.items():
+            setattr(torch.Tensor, n, o)
+
+    assert counts["arm"] == [], f"the flag-on path synced: {counts['arm']}"
+    assert counts["control"] == counts["arm"]
+
+
+def test_the_codec_is_inlined_into_the_compiled_graph_and_compiled_once():
+    """The decisive one: is the added Python per-bucket or per-step?
+
+    `unsupported_reason`, the shape checks and the wrapper's guards are pure
+    Python. Inside the region vLLM compiles they are traced through once per
+    shape bucket; if the MoE body were an opaque custom op -- which it would
+    be but for `_patch_default_moe_runner_select_forward` -- they would run on
+    every step, 60 layers deep, which is how an earlier revision lost 20% of
+    throughput.
+
+    Two assertions: the backend is invoked exactly once across 25 calls (so
+    the frame is not re-entered), and the codec's own aten ops are nodes *in*
+    that graph (so it is the codec that got inlined, not something adjacent).
+    """
+    import torch._dynamo as dynamo
+
+    graphs = []
+
+    def capture(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    layer = _layer()
+    logits = _logits(32, seed=3)
+    hidden = torch.zeros(32, 8, dtype=torch.bfloat16)
+
+    dynamo.reset()
+    compiled = torch.compile(_arm_round_trip,
+                             backend=capture,
+                             fullgraph=True,
+                             dynamic=False)
+    for _ in range(25):
+        compiled(layer, hidden, logits)
+
+    assert len(graphs) == 1, (
+        f"compiled {len(graphs)} times for 25 invocations of one bucket")
+    # A Dynamo graph, so the codec's ops appear as call_function (torch.cat)
+    # and call_method (Tensor.view / Tensor.reshape) alike.
+    names = [
+        str(n.target) for n in graphs[0].graph.nodes
+        if n.op in ("call_function", "call_method")
+    ]
+    assert any("cat" in n for n in names), names  # pack is in the graph
+    assert any("view" in n or "reshape" in n for n in names), names

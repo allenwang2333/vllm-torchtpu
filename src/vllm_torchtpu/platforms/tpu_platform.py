@@ -310,19 +310,24 @@ def apply_tpu_patches() -> None:
     global _tpu_patches_applied
     if _tpu_patches_applied:
         return
+
+    # Before the latch and before the first patch: a refusal raised mid-chain
+    # would leave the plugin half-patched with _tpu_patches_applied already
+    # set, so a caller that catches it can neither run nor retry.
+    from vllm_torchtpu import _validate_moe_env_flags
+    _validate_moe_env_flags()
+
     _tpu_patches_applied = True
 
     import vllm_torchtpu as tpu_plugin
-    from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
-                               _patch_disable_sequence_parallel_moe,
-                               _patch_moe_explicit_pcp_collectives,
-                               _patch_moe_local_routing_dispatch,
-                               _patch_moe_no_ep_tp_scope,
-                               _patch_rowparallel_defer_bias,
-                               _patch_vllm_compile_all_ranges,
-                               _patch_vllm_disable_compile_ranges,
-                               _patch_vllm_hybrid_producer_prefix_hits,
-                               _patch_vllm_tpu_group_custom_ops)
+    from vllm_torchtpu import (
+        _patch_default_moe_runner_select_forward,
+        _patch_disable_sequence_parallel_moe,
+        _patch_moe_explicit_pcp_collectives, _patch_moe_local_routing_dispatch,
+        _patch_moe_no_ep_tp_scope, _patch_rowparallel_defer_bias,
+        _patch_vllm_compile_all_ranges, _patch_vllm_disable_compile_ranges,
+        _patch_vllm_hybrid_producer_prefix_hits,
+        _patch_vllm_tpu_group_custom_ops)
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
@@ -612,14 +617,21 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
-        "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
-        "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
-        "ENABLE_QUANTIZED_MATMUL_KERNEL", "REQUANTIZE_BLOCK_SIZE",
-        "REQUANTIZE_WEIGHT_DTYPE", "MOE_REQUANTIZE_BLOCK_SIZE",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+        "TPU_MULTIHOST_BACKEND",
+        "VLLM_MLA_DISABLE",
+        "TPU_BACKEND_TYPE",
+        "ENABLE_QUANTIZED_MATMUL_KERNEL",
+        "REQUANTIZE_BLOCK_SIZE",
+        "REQUANTIZE_WEIGHT_DTYPE",
+        "MOE_REQUANTIZE_BLOCK_SIZE",
         "MOE_REQUANTIZE_WEIGHT_DTYPE",
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-        "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-        "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
+        "TORCHINDUCTOR_AUTOGRAD_CACHE",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+        "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES",
         # Read inside the worker: apply_tpu_patches() runs again in every
         # worker (tpu_worker.py) and _patch_moe_local_routing_dispatch reads
