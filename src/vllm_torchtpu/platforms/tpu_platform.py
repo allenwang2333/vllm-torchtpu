@@ -735,7 +735,31 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                device = torch.device(f"tpu:{device_id}")
+                _, total = torch.accelerator.get_memory_info(device)
+                return total
+            except Exception:
+                pass
+        return 32 * 1024 * 1024 * 1024
+
+    @classmethod
+    def get_current_memory_usage(
+        cls,
+        device: torch.types.Device | None = None,
+    ) -> float:
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                free, total = torch.accelerator.get_memory_info(device)
+                return float(total - free)
+            except Exception:
+                try:
+                    return float(
+                        torch.accelerator.max_memory_allocated(device))
+                except Exception:
+                    pass
+        return 0.0
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
@@ -787,6 +811,8 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if getattr(vllm_config, "model_config", None) is None:
+            return
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")

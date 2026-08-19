@@ -1,13 +1,11 @@
-"""TPU platform plugin for vllm-omni."""
-
 import os
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import (  # type: ignore[missing-import]
     OmniPlatform, OmniPlatformEnum)
 
-from vllm_torchtpu import utils
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
@@ -22,10 +20,38 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     _omni_enum = OmniPlatformEnum.OOT
 
-    dist_backend: str = "tpu_dist"
     device_control_env_var: str = "TPU_VISIBLE_CHIPS"
     simple_compile_backend: str = "tpu"
     _is_hybrid: bool = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+        if "TPU_VISIBLE_CHIPS" not in os.environ:
+            os.environ["TPU_VISIBLE_CHIPS"] = ""
+
+        try:
+            from vllm_omni.diffusion.attention.backends.registry import (  # type: ignore[missing-import]
+                DiffusionAttentionBackendEnum, register_diffusion_backend)
+
+            register_diffusion_backend(
+                DiffusionAttentionBackendEnum.TORCH_SDPA,
+                "vllm_torchtpu.omni.attention.TpuSDPABackend",
+            )
+            register_diffusion_backend(
+                DiffusionAttentionBackendEnum.FLASH_ATTN,
+                "vllm_torchtpu.omni.attention.TpuSDPABackend",
+            )
+        except Exception:
+            pass
+
+    @property
+    def dist_backend(self) -> str:
+        # For single chip / single rank, gloo is lightweight and avoids PJRT cluster init.
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size <= 1:
+            return "gloo"
+        return "tpu_dist"
 
     # Explicitly override platform checks to avoid MRO/enum conflicts with
     # OmniPlatform (which checks `self._omni_enum`) and provide has_flash_attn_package
@@ -52,6 +78,12 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
+
+        apply_tpu_patches()
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.worker.ar_worker.ARWorker"
 
@@ -69,7 +101,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_diffusion_model_runner_cls(cls) -> str:
-        return "vllm_torchtpu.worker.tpu_diffusion_model_runner.TpuDiffusionModelRunner"
+        return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -100,7 +132,23 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
-        pass
+        try:
+            from torch_tpu._internal.device import _device_ops_backend
+            _device_ops_backend._init_runtime_options("tpu")
+        except Exception:
+            pass
+        try:
+            torch.accelerator.set_device_index(0)
+        except Exception:
+            pass
+        try:
+            _ = torch.empty(1, device=torch.device("tpu"))
+            if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+                torch.tpu.synchronize()
+            logger.info(
+                "Successfully initialized TPU device in worker process")
+        except Exception as e:
+            logger.warning("Failed to eager-initialize TPU device: %s", e)
 
     @classmethod
     def get_device_count(cls) -> int:
@@ -134,37 +182,64 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        return utils.compute_hbm_budget([torch.device("tpu", device_id)],
-                                        1.0).total_limit
+        return TpuPlatform.get_device_total_memory(device_id)
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.accelerator.synchronize()
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                torch.tpu.synchronize()
+            except Exception:
+                pass
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
-        free, _ = cls.get_device_memory(device)
-        return free
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                free, _ = torch.accelerator.get_memory_info(device)
+                return free
+            except Exception:
+                pass
+        return 32 * 1024 * 1024 * 1024
 
     @classmethod
     def get_device_memory(cls,
                           device: torch.device | None = None
                           ) -> tuple[int, int]:
-        budget = utils.compute_hbm_budget([device or torch.device("tpu")], 1.0)
-        return budget.available, budget.total_limit
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                free, total = torch.accelerator.get_memory_info(device)
+                return free, total
+            except Exception:
+                pass
+        return 32 * 1024 * 1024 * 1024, 32 * 1024 * 1024 * 1024
 
     @classmethod
     def max_memory_reserved(cls, device: torch.device | None = None) -> int:
-        return cls.max_memory_allocated(device)
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                return torch.accelerator.max_memory_reserved(device)
+            except Exception:
+                pass
+        return 0
 
     @classmethod
     def max_memory_allocated(cls, device: torch.device | None = None) -> int:
-        return utils.compute_hbm_budget([device or torch.device("tpu")],
-                                        1.0).total_used
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                return torch.accelerator.max_memory_allocated(device)
+            except Exception:
+                pass
+        return 0
 
     @classmethod
-    def reset_peak_memory_stats(cls) -> None:
-        pass
+    def reset_peak_memory_stats(cls,
+                                device: torch.device | None = None) -> None:
+        if hasattr(torch, "tpu") and torch.tpu.is_initialized():
+            try:
+                torch.accelerator.reset_peak_memory_stats(device)
+            except Exception:
+                pass
 
     @classmethod
     def get_current_memory_usage(cls,
