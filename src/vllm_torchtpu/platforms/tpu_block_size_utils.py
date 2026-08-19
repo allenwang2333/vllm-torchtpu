@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -84,6 +85,10 @@ def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:
     return dtype
 
 
+def _use_marginal_page_size() -> bool:
+    return bool(int(os.getenv("TPU_FA_MARGINAL_PAGE_BYTES") or "0"))
+
+
 def _tpu_attention_slot_size_bytes(vllm_config: VllmConfig, backend_cls,
                                    block_size: int) -> int:
     model_config = vllm_config.model_config
@@ -101,7 +106,30 @@ def _tpu_attention_slot_size_bytes(vllm_config: VllmConfig, backend_cls,
 
 def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
                                    backend_cls) -> int:
-    return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
+    """Physical bytes each additional token adds to an attention page.
+
+    Asking the backend for a ONE-token page and calling that the per-token cost
+    is wrong whenever a page carries fixed padding: the constant then includes
+    that padding, and every caller which multiplies by block_size replicates it
+    once per token. Measured on Kimi-K3 MLA: a 1-token page is 2560 bytes while
+    a 336-token page is 430080, i.e. 1280 bytes/token -- the constant was 2x the
+    truth, and the unified-pool linearity check rejected a layout that was in
+    fact perfectly token-linear.
+
+    Taking the slope between two larger pages cancels any fixed term.
+    """
+    if not _use_marginal_page_size():
+        return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
+    lo, hi = 128, 256
+    lo_bytes = _tpu_attention_slot_size_bytes(vllm_config, backend_cls, lo)
+    hi_bytes = _tpu_attention_slot_size_bytes(vllm_config, backend_cls, hi)
+    marginal = hi_bytes - lo_bytes
+    # Fall back if the backend is not linear over that interval, or rounds in a
+    # way that makes the slope meaningless -- a wrong constant is better than a
+    # negative or non-integral one.
+    if marginal <= 0 or marginal % (hi - lo):
+        return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
+    return marginal // (hi - lo)
 
 
 def _hybrid_mamba_state_layout(
