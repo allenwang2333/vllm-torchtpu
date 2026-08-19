@@ -160,14 +160,15 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def _warn_if_the_offload_margin_is_thin(self) -> None:
         """Say at boot when this geometry leaves the wire nothing to stand on.
 
-        The whole win is that halving the payload keeps the gather on the
-        SparseCore's asynchronous path; below the offload threshold both
-        wires are synchronous and exposed, and the second collective's fixed cost
-        makes the wire a straight loss. At the shipped geometry the largest
-        bucket's fp8 buffer *is* that threshold, to the byte, on a ``>=`` --
-        so one halving of the gathered rows (microbatching, a smaller
-        ``--max-num-batched-tokens``, a narrower hidden, fewer DP ranks) flips
-        the sign of the change with nothing in the log to say so.
+        The prefill win is that halving the payload keeps the gather on the
+        SparseCore's asynchronous path, where the TensorCore's wait on it goes
+        546.8 -> 0.03 us/layer. Cross back under the threshold and the bf16
+        gather keeps that overlap while the fp8 one does not, so the win is
+        not merely smaller, it is on the wrong side. At the shipped geometry
+        the largest bucket's fp8 buffer *is* the threshold, to the byte, on a
+        ``>=`` -- so one halving of the gathered rows (microbatching, a
+        smaller ``--max-num-batched-tokens``, a narrower hidden, fewer DP
+        ranks) gives that up with nothing in the log to say so.
 
         Every term is known at communicator init, so it is checkable here, and
         an operator who has to set a global libtpu flag to keep this change
@@ -185,9 +186,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             logger.warning_once(
                 f"[fp8wire] offload margin unknown: no "
                 f"{SC_ALL_GATHER_OFFLOAD_FLAG} in LIBTPU_INIT_ARGS, so the "
-                "threshold is libtpu's own. The wire pays only while the "
+                "threshold is libtpu's own. The prefill win needs the "
                 f"gathered fp8 buffer ({fp8_bytes} B at the largest bucket) "
-                "stays at or above it; spell it with "
+                "to stay at or above it; spell it with "
                 f"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES={fp8_bytes // 2} "
                 "on every rank to be sure of that.")
             return
@@ -199,19 +200,22 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             diagnosis = (
                 f"[fp8wire] no offload margin at all: {payload}, under the "
                 f"SparseCore all-gather offload threshold of {threshold} B, "
-                f"so all {len(buckets)} buckets send that gather "
-                "synchronously and pay an extra collective for bytes they "
-                "cannot cash in")
+                f"so none of these {len(buckets)} buckets gets the offloaded "
+                "gather the prefill win comes from -- a win forgone rather "
+                "than a regression (a sub-threshold bucket was timed and the "
+                "wire still gains -3.6 to -2.9 us/layer), but a poor reason "
+                "to run the flag")
         else:
-            exposed = sum(1 for b in buckets if b * dp * hidden < threshold)
             diagnosis = (
                 f"[fp8wire] thin offload margin: {payload} against a "
                 f"SparseCore all-gather offload threshold of {threshold} B, "
-                f"i.e. {fp8_bytes - threshold} B of margin -- one halving of "
-                "the gathered rows (microbatching, a smaller "
+                f"i.e. {fp8_bytes - threshold} B of margin. That bucket is "
+                "where the change earns its prefill win (the TensorCore's "
+                "wait on the offloaded gather goes 546.8 -> 0.03 us/layer); "
+                "one halving of the gathered rows (microbatching, a smaller "
                 "--max-num-batched-tokens, a narrower hidden, fewer DP ranks) "
-                f"drops it under, where {exposed} of these {len(buckets)} "
-                "buckets already are and the wire costs more than it saves")
+                "drops it under, where the bf16 gather keeps the offload and "
+                "the fp8 one does not")
         logger.warning_once(
             f"{diagnosis}. Buy a bucket of margin with "
             f"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES={fp8_bytes // 2}, "
@@ -228,10 +232,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         that overlaps the compute it sits between -- at ``output_bytes >=``
         the threshold ``env_override`` sets (64 MiB on tpu7x). Halving the
         payload can cross back under it, turning an overlapped bf16 gather
-        into an exposed synchronous fp8 one; and below the threshold both
-        wires are exposed, where the extra collective's fixed cost (~9 us) is worth
-        more than the bytes saved. One byte per element: this is the fp8
-        buffer.
+        into an exposed synchronous fp8 one, which is the case worth gating:
+        that bucket is where the change's whole prefill win lives. Buckets
+        where *both* wires are already synchronous are not -- the decode case
+        was timed on device and the wire wins there too (-3.6 to -2.9
+        us/layer), because the two collectives net only +0.61 us/layer and
+        the quantize work the wire deletes is larger than that. One byte per
+        element: this is the fp8 buffer.
 
         Unreachable today: ``self.offload_threshold`` is ``None`` unless
         ``_offload_gate_is_traceable()``, which no runner satisfies, because
@@ -274,14 +281,21 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         Safe to call at ``dp_size == 1``.
 
         The rows are rounded to fp8 one step later regardless -- gmm_v2
-        quantizes its lhs before the matmul -- so the wire mostly costs a
-        rounding the MoE was going to do anyway. Not exactly, and the default
-        is the expensive side: the wire scales per row where the kernel scales
-        per 512-wide k block, so the payload is rounded twice on two grids and
-        the lhs the kernel finally sees sits 3.66e-2 from the fp32 rows where
-        the bf16 dispatch puts it at 2.65e-2 -- 1.38x the error, at hidden
-        4096, measured on this code. ``TPU_MOE_DISPATCH_FP8_BLOCK=512`` makes
-        the two grids the same and the kernel's requantization a bitwise no-op.
+        quantizes its lhs before the matmul -- so the wire does not add that
+        rounding, it moves it onto the wire and deletes the local one. That is
+        what pays for the second collective, measured on device: at decode the
+        bf16 dispatch quantizes three times per layer per rank to feed the
+        fp8 gmm, and dropping most of that (-2.7 to -3.4 us/layer) more than
+        covers the scale leg (+7.38) net of the payload saving (-6.76), for
+        -3.6 to -2.9 us/layer overall.
+
+        What the default does cost is accuracy, not time: the wire scales per
+        row where the kernel scales per 512-wide k block, so the payload is
+        rounded twice on two grids and the lhs the kernel finally sees sits
+        3.66e-2 from the fp32 rows where the bf16 dispatch puts it at 2.65e-2
+        -- 1.38x the error, at hidden 4096, measured on this code.
+        ``TPU_MOE_DISPATCH_FP8_BLOCK=512`` makes the two grids the same and the
+        kernel's requantization a bitwise no-op.
 
         The rows and their scales cross as two collectives, not one packed
         uint8 buffer: packing saves ~9 us of fixed cost and loses the async

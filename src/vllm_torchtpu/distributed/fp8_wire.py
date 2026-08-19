@@ -38,6 +38,19 @@ bucket). The two formulations that look cheaper are not: broadcasting the scale
 XLA materialize an f32 ``[T, H/B, B]`` scale and relayout it through a
 ``sparse-core-data-format-call`` -- 594.5 MB of temp, 7.3x the sliced form.
 
+Those are the *prefill* shape's numbers. Timed on device op by op at DP4TP2_EP,
+concurrency 64, the wire is cheaper in both phases, and the receive side is not
+where its cost lives:
+
+* decode, per layer: payload gather **-6.76 us** (halving a 512 KiB gather takes
+  37% off it, not the bandwidth term alone), the scale collective **+7.38 us**,
+  so the two collectives net **+0.61 us**; the quantizers are then a *saving* of
+  **-2.7 to -3.4 us** -- the bf16 dispatch makes each rank quantize three times
+  per layer to feed the fp8 gmm, and an fp8 wire has already done it -- for a
+  net **-3.6 to -2.9 us/layer**, i.e. the decode step gets slightly faster.
+* prefill, per layer: **-379.4 us** of TensorCore busy, which is the wait on the
+  offloaded gather going 546.8 -> 0.03 us as the payload halves.
+
 Rows and scales travel as **two** collectives, not one packed buffer. Packing
 both into uint8 saves an 8-rank all-gather's ~9 us of fixed cost, and costs the
 asynchronous form: XLA compiles a uint8 all-gather as a plain synchronous op
@@ -173,8 +186,11 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def dequantize_rows(q: torch.Tensor, scale: torch.Tensor,
                     dtype: torch.dtype) -> torch.Tensor:
-    # TODO: delete this entirely once gmm_v2 accepts an lhs_scale. It exists
-    # only because the kernel re-derives a scale it could have been handed;
+    # Not the added work it looks like: the rows are consumed by a kernel that
+    # would quantize them again itself, so on device this pass displaces more
+    # quantize work than it adds (module docstring).
+    # TODO: delete it entirely once gmm_v2 accepts an lhs_scale. It exists only
+    # because the kernel re-derives a scale it could have been handed;
     # upstream's dispatch keeps the payload quantized end to end for exactly
     # this reason (see the module docstring).
     width = q.shape[-1]

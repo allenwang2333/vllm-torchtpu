@@ -298,15 +298,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
     # Send the MoE dispatch all-gather over ICI as fp8 (e4m3) rows plus a
     # per-row fp32 scale, dequantized to the activation dtype immediately
-    # after the collective, halving the dispatch payload under DP+EP. Turn it
-    # on for prefill-dominated serving (long inputs, short outputs) and leave
-    # it off for decode-heavy mixes: measured at DP4TP2_EP/conc 64, TTFT -8.7%
-    # and TPOT +1.5%, which nets out positive only while prefill is more than
-    # ~17% of a request. Inert at dp_size == 1. The rows are rounded to fp8 one
-    # step later anyway, inside gmm_v2's lhs quantizer, but on a different grid
-    # unless TPU_MOE_DISPATCH_FP8_BLOCK=512 is set with it, so per row the
-    # payload is rounded twice (1.38x the layer's fp8 error). Off by default;
-    # see distributed/fp8_wire.py.
+    # after the collective, halving the dispatch payload under DP+EP. Timed on
+    # device op by op, both phases get cheaper -- prefill -379.4 us/layer
+    # (-6.08%), decode -3.6 to -2.9 us/layer (-1.06 to -0.87%) -- so no
+    # workload mix argues against it. There is no decode penalty: the
+    # "+1.5% TPOT" once read as one is boot-to-boot drift, not this change.
+    #
+    # It is off by default for two reasons, neither of them a decode cost:
+    #   * the prefill win needs the gathered fp8 buffer to stay at or above the
+    #     SparseCore all-gather offload threshold, and at the shipped geometry
+    #     (2048 rows x dp8 x 4096) it clears 67,108,864 B by *zero bytes*, so a
+    #     single halving of the gathered rows gives the win up. The
+    #     communicator computes that margin at init and warns.
+    #   * end-to-end serving throughput moves by a few percent from one server
+    #     boot to the next, in either direction and with the flag off as well
+    #     as on, so a single boot does not predict the next one. The per-step
+    #     device numbers above are the stable signal, and they are the reason
+    #     the direction is settled even though a boot-to-boot number is not.
+    #
+    # Inert at dp_size == 1. Set TPU_MOE_DISPATCH_FP8_BLOCK=512 with it: per
+    # row the payload is rounded twice, on the wire's grid and again on
+    # gmm_v2's (1.38x the layer's fp8 error). See distributed/fp8_wire.py.
     "TPU_MOE_DISPATCH_FP8":
     env_bool("TPU_MOE_DISPATCH_FP8"),
 
@@ -322,24 +334,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Hidden-axis width one fp8 dispatch scale covers. "0" keeps one scale per
     # row (what #499 measured); "512" matches gmm_v2's LHS_QUANT_BLOCK_SIZE,
-    # which makes that kernel's lhs requantization a bitwise no-op and the
-    # layer output bit-identical to the bf16 dispatch. No other width helps:
-    # anything that is not the kernel's grid is rounded twice anyway.
+    # which makes that kernel's lhs requantization a bitwise no-op, so the MoE
+    # layer's input is bit-identical to what the bf16 dispatch produces --
+    # recommended whenever TPU_MOE_DISPATCH_FP8 is on, and the same rule
+    # upstream applies in its DeepEP low-latency path (dequantize only when the
+    # wire's grid differs from the kernel's). It costs eight sliced multiplies
+    # on the receive side: +1.2% peak temp and +16.3% of the dispatch's cycles
+    # at the gathered prefill shape, about 2% of what the wire saves there. No
+    # other width helps: anything that is not the kernel's grid is rounded
+    # twice anyway.
     "TPU_MOE_DISPATCH_FP8_BLOCK":
     lambda: int(
         env_with_choices("TPU_MOE_DISPATCH_FP8_BLOCK", "0", ["0", "512"])()),
 
-    # Take the fp8 dispatch only where it can win: when the fp8 payload still
-    # clears the SparseCore all-gather offload threshold, so both wires keep
-    # the async, offloaded collective and halving the bytes is a pure saving.
-    # Below it both wires are synchronous and fully exposed, and the second
-    # collective's fixed cost (~9 us) exceeds the byte saving -- which is every
-    # decode bucket and the one prefill bucket whose bf16 gather is async and
-    # fp8 gather is not. REFUSED at runtime on this runner and logged as such:
-    # choosing the wire per bucket is a Python branch on the token dim, which
-    # specializes a dim vLLM marks dynamic and kills engine init on device. A
-    # server that sets it runs as plain fp8 dispatch until the runner can
-    # retrace per bucket; see distributed/tpu_communicator.py
+    # Take the fp8 dispatch only where the fp8 payload still clears the
+    # SparseCore all-gather offload threshold: skip it in the one bucket whose
+    # bf16 gather is offloaded and whose fp8 gather would not be, since that is
+    # where the prefill win lives. Where both wires are already synchronous the
+    # wire wins anyway (timed at decode, -3.6 to -2.9 us/layer), so the "every
+    # decode bucket" half of this knob's original rationale was wrong and the
+    # knob is narrower than it was sold as.
+    #
+    # REFUSED at runtime, and logged as such: choosing the wire per bucket is a
+    # Python branch on the token count, which specializes a dim vLLM marks
+    # dynamic and killed engine init with ConstraintViolationError on device.
+    # #474 landed per-bucket retracing, but the threshold here coincides with
+    # the top bucket, so the range guard still collapses to a point and the
+    # branch still refuses to trace. A server that sets this runs as plain fp8
+    # dispatch and says so; see distributed/tpu_communicator.py
     # _offload_gate_is_traceable.
     "TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD":
     env_bool("TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD"),
