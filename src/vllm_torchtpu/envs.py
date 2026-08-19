@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
-    TPU_RAIDEN_TELEMETRY_BACKENDS: str = "buffered"
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -226,8 +225,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
-    "TPU_RAIDEN_TELEMETRY_BACKENDS":
-    lambda: os.getenv("TPU_RAIDEN_TELEMETRY_BACKENDS", "buffered").strip(),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors

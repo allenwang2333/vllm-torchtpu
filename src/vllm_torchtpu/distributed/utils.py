@@ -270,9 +270,6 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
     try:
         telemetry = get_raiden_telemetry_module()
         if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
-            if backends is None:
-                backends_str = getattr(envs, "TPU_RAIDEN_TELEMETRY_BACKENDS", "buffered")
-                backends = [b.strip() for b in backends_str.split(",") if b.strip()]
             telemetry.configure_telemetry(backends)
             _RAIDEN_TELEMETRY_CONFIGURED = True
             logger.info("Configured TPU Raiden C++ telemetry backends: %s", backends)

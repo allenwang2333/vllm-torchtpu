@@ -1260,14 +1260,13 @@ class TPURaidenConnectorWorker:
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        # Get metrics from raiden library
         try:
             telemetry = dist_utils.get_raiden_telemetry_module()
+            raiden_samples = {}
             if telemetry is not None:
                 if hasattr(telemetry, "get_and_reset_metric_samples"):
                     raiden_samples = telemetry.get_and_reset_metric_samples()
-                    print(raiden_samples)
-                else:
-                    raiden_samples = {}
 
                 for metric_name, values in raiden_samples.items():
                     if metric_name not in self.transfer_stats.data:
