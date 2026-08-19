@@ -34,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --results-dir)   RESULTS_DIR="$2"; shift 2 ;;
     --port)          PORT="$2"; shift 2 ;;
     --record-identity) RECORD_IDENTITY=1; shift ;;
+    --no-frontier)   USE_FRONTIER=0; shift ;;
     --skip-eval)     SKIP_EVAL=1; shift ;;
     --extra-serve)   EXTRA_SERVE="$2"; shift 2 ;;   # the knob under test
     *) echo "unknown arg: $1"; exit 2 ;;
@@ -43,6 +44,14 @@ done
 LEADER_ADDR="${LEADER:-127.0.0.1}"
 # shellcheck disable=SC1090
 source "$SCRIPT_DIR/configs/${CONFIG_NAME}.sh"
+# Stack: every SUPPORTED lever so far, applied before the knob under test, so
+# each experiment measures a new lever on top of the current best rather than
+# against a bare baseline. --no-frontier opts out for a clean-baseline run.
+if [ "${USE_FRONTIER:-1}" = "1" ] && [ -f "$SCRIPT_DIR/configs/kimi-k3-frontier.sh" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/configs/kimi-k3-frontier.sh"
+  [ -n "${FRONTIER_ARGS:-}" ] && echo "[frontier] $FRONTIER_ARGS"
+fi
 mkdir -p "$RESULTS_DIR"
 
 SERVE=(--served-model-name "$MODEL"
@@ -63,6 +72,9 @@ if [ "$NNODES" -gt 1 ]; then
 fi
 # shellcheck disable=SC2206
 [ -n "${EXTRA_SERVE_ARGS:-}" ] && SERVE+=($EXTRA_SERVE_ARGS)
+# shellcheck disable=SC2206
+[ -n "${FRONTIER_ARGS:-}" ] && SERVE+=($FRONTIER_ARGS)
+# the knob under test goes LAST so it can override a frontier setting
 # shellcheck disable=SC2206
 [ -n "$EXTRA_SERVE" ] && SERVE+=($EXTRA_SERVE)
 
@@ -116,7 +128,6 @@ cleanup_server() {
 trap cleanup_server EXIT INT TERM
 
 echo "[cmd] vllm serve $TARGET ${SERVE[*]} --host 0.0.0.0 --port $PORT"
-vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" \
 vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" \
   > "$RESULTS_DIR/server.log" 2>&1 &
 SERVER_PID=$!
