@@ -204,8 +204,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MAX_TOKENS") or "-1"),
     # Build v2's routing plan as the two 1/ep slices each shard actually reads
     # instead of the whole T x top_k x num_experts product. Bit-identical
-    # (tests/kernels/fused_moe/test_fused_ep_v2_plan_decomp.py compares every
-    # kernel operand per shard) and 3.37x fewer flops in the plan at ep=8, but
+    # (asserted per shard on every kernel operand) and 3.37x fewer flops in the
+    # plan at ep=8, but
     # unmeasured on a chip, so it is off until one device number says otherwise.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     lambda: bool(int(os.getenv("MOE_FUSED_EP_V2_SHARDED_PLAN") or "0")),

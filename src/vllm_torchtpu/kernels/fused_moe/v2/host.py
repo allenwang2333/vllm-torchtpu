@@ -679,7 +679,7 @@ def _block_prefix(expert_blocks, bins):
     its lookup can take the rank out of it and drop that pass entirely, rather
     than shrink it. The totals are the block histogram, free from the last row
     of the prefix. It is arithmetically the same integers, asserted on every
-    kernel operand by the prefix arm of test_fused_ep_v2_plan_decomp.py.
+    kernel operand.
 
     **And it is far slower, measured**, which is why it is a flag that defaults
     off rather than the spelling. AOT for tpu7x at the serving shape, against

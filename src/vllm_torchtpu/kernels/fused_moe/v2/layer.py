@@ -149,8 +149,7 @@ def fused_ep_moe_v2(x,
     sharded_plan builds the routing tables through
     build_routing_tables_sharded: the same operands out of 1/ep of the
     arithmetic, plus one 2 kB all-gather. It is off by default -- see
-    that function, and ``test_fused_ep_v2_plan_decomp.py`` for what is
-    verified about it.
+    that function for what is verified about it.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
