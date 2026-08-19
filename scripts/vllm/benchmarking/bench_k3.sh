@@ -93,6 +93,19 @@ fi
 # read at compile time and the profiler dir is a serve-time flag. The bench
 # passes below stay unarmed; only the short capture pass at the end is armed, so
 # the reported numbers are never profiling-polluted (~+11% TTFT / -4% tput).
+# Only the named ranks arm the profiler. Arming all four on the full model kills
+# the pod: each rank buffers its own trace in the same host memory that is
+# already holding a share of 1.42 TiB of weights, and the serialise on
+# /stop_profile spikes it further. Measured twice -- the log reaches "CAPTURE --
+# decode window" and the pod vanishes with no traceback. Rank 0 is what the
+# analysis reads anyway (v001 captured rank 0 alone).
+CAPTURE_RANKS="${CAPTURE_RANKS:-0}"
+case " $CAPTURE_RANKS " in *" $RANK "*) CAPTURE_THIS_RANK=1 ;; *) CAPTURE_THIS_RANK=0 ;; esac
+if [ "$CAPTURE" = "1" ] && [ "$CAPTURE_THIS_RANK" = "0" ]; then
+  echo "rank $RANK: capture enabled for ranks [$CAPTURE_RANKS]; not arming here"
+  CAPTURE=0
+fi
+
 if [ "$CAPTURE" = "1" ]; then
   mkdir -p "$CAPTURE_DIR"
   # The HLO dump is opt-in and off by default, because it does not fit. A 12L
@@ -237,10 +250,13 @@ done
 # profiles and one merged window hides both).
 if [ "$CAPTURE" = "1" ]; then
   CISL="${CAPTURE_ISL:-8192}"; COSL="${CAPTURE_OSL:-1024}"
-  echo "########## CAPTURE — prefill window ##########"
-  curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null; sleep 2
-  bench "$CISL" 1 1 "capture_prefill" >/dev/null 2>&1
-  sleep 2; curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null; sleep 30
+  if [ "${CAPTURE_PREFILL:-1}" = "1" ]; then
+    echo "########## CAPTURE — prefill window ##########"
+    curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null; sleep 2
+    bench "$CISL" 1 1 "capture_prefill" >/dev/null 2>&1
+    sleep 2; curl -sf -X POST "http://127.0.0.1:$PORT/stop_profile" >/dev/null; sleep 30
+    echo "CAPTURE after prefill: $(du -sh "$CAPTURE_DIR" 2>/dev/null | cut -f1)"
+  fi
 
   echo "########## CAPTURE — decode window ##########"
   curl -sf -X POST "http://127.0.0.1:$PORT/start_profile" >/dev/null; sleep 2
