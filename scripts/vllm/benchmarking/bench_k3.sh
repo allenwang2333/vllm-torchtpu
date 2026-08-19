@@ -117,7 +117,7 @@ trap cleanup_server EXIT INT TERM
 
 echo "[cmd] vllm serve $TARGET ${SERVE[*]} --host 0.0.0.0 --port $PORT"
 vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" \
-  > "$RESULTS_DIR/server.log" 2>&1 &
+vllm serve "$TARGET" "${SERVE[@]}" --host 0.0.0.0 --port "$PORT" \
   > "$RESULTS_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
