@@ -265,11 +265,11 @@ class RaidenOffloadingManager(OffloadingManager):
                  if self._enable_global else ""))
         else:
             # Injected store (tests): the caller supplies the module holding
-            # BlockStatus / RaidenBlockID so tpu_sync isn't imported.
+            # BlockStatus / RaidenBlockId so tpu_sync isn't imported.
             assert store_types is not None
         self._store = store
         self._block_status = store_types.BlockStatus
-        self._block_id_cls = store_types.RaidenBlockID
+        self._block_id_cls = store_types.RaidenBlockId
         self._raiden_id = self._store.raiden_id
 
         # The connector's only cache-state bookkeeping, and it is
@@ -319,21 +319,21 @@ class RaidenOffloadingManager(OffloadingManager):
 
     # -- pin bookkeeping -------------------------------------------------
 
-    def _release_lookup_pins(self, matched: list[tuple[bytes,
-                                                       object]]) -> None:
-        """Give back the pins a `lookup` granted.
+    def _probe(self,
+               sub_hashes: list[bytes],
+               *,
+               enable_global: bool = False) -> list[tuple[bytes, object]]:
+        """Read the directory without laying claim to what it reports.
 
-        `lookup` pins every locally cached hit it reports, so the answer cannot
-        be evicted between being given and being used. A probe that goes on to
-        transfer nothing owes those pins back. Registry-only (`REMOTE`) hits
-        name a block on a peer and are never pinned here.
+        `lookup` pins its hits by default so the answer cannot be evicted
+        before the caller uses it. A probe uses the answer to make a decision
+        and transfers nothing, so it asks for no pin: taking one and handing it
+        straight back would drop the entry at the Most Recently Used position
+        and quietly reorder eviction, which is `touch`'s job to do on purpose.
         """
-        held = [
-            sub_hash for sub_hash, block in matched
-            if block.status != self._block_status.REMOTE
-        ]
-        if held:
-            self._store.release(held)
+        return self._store.lookup(sub_hashes,
+                                  enable_global=enable_global,
+                                  pin_found=False)
 
     def _pins_still_held(self, admission: Admission) -> list[bytes]:
         """The job's sub-hashes whose pin nothing has spent yet.
@@ -376,11 +376,9 @@ class RaidenOffloadingManager(OffloadingManager):
         evictable, so the key stores normally again once the store reclaims
         the slot.
         """
-        matched = self._store.lookup(sub_hashes)
-        # The admission already holds one pin per sub-hash, and that is the pin
-        # the save spends. This probe grants a second one on the same entries,
-        # so hand it straight back.
-        self._release_lookup_pins(matched)
+        # The admission already holds one pin per sub-hash, and that is the
+        # pin the save spends; this only needs to read their status.
+        matched = self._probe(sub_hashes)
         if len(matched) < len(sub_hashes):
             logger.error(
                 "TPURaidenOffloadingConnector: admitted sub-hash vanished under its own "
@@ -422,8 +420,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # If the registry is unreachable or times out, the error is swallowed and
         # lookup safely falls back to local-only caching without failing requests.
         allow_remote = self._enable_global
-        matches = self._store.lookup(sub_hashes, enable_global=allow_remote)
-        self._release_lookup_pins(matches)
+        matches = self._probe(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
             return LookupResult.MISS
         all_local = True
@@ -458,8 +455,13 @@ class RaidenOffloadingManager(OffloadingManager):
         # entries that were actually found move, and prepare_store re-offers
         # the key on its next appearance.
         for key in keys:
-            matched = self._store.lookup(self._sub_hashes(key))
-            self._release_lookup_pins(matched)
+            sub_hashes = self._sub_hashes(key)
+            held = [
+                sub_hash for sub_hash, block in self._store.lookup(sub_hashes)
+                if block.status != self._block_status.REMOTE
+            ]
+            if held:
+                self._store.release(held)
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
@@ -522,8 +524,7 @@ class RaidenOffloadingManager(OffloadingManager):
             if key in self._inflight_store_keys:
                 continue
             sub_hashes = self._sub_hashes(key)
-            matches = self._store.lookup(sub_hashes)
-            self._release_lookup_pins(matches)
+            matches = self._probe(sub_hashes)
             if len(matches) == len(sub_hashes) and all(
                     block.status in resident_statuses for _, block in matches):
                 continue

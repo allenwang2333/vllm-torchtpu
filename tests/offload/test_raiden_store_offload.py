@@ -56,7 +56,7 @@ class FakeBlockStatus(enum.Enum):
     HOST_AND_HBM = 4
 
 
-class FakeRaidenBlockID:
+class FakeRaidenBlockId:
 
     def __init__(self,
                  raiden_id=None,
@@ -70,7 +70,7 @@ class FakeRaidenBlockID:
 
 
 FAKE_STORE_TYPES = SimpleNamespace(BlockStatus=FakeBlockStatus,
-                                   RaidenBlockID=FakeRaidenBlockID)
+                                   RaidenBlockId=FakeRaidenBlockId)
 
 
 @dataclass
@@ -104,7 +104,7 @@ class FakeKVCacheStore:
         # Global registry entries: maps sub-hash -> peer REMOTE slice.
         # Queried on local miss when enable_global=True. registry_down simulates
         # graceful degradation during registry outages (falls back to local).
-        self.global_entries: dict[bytes, FakeRaidenBlockID] = {}
+        self.global_entries: dict[bytes, FakeRaidenBlockId] = {}
         self.registry_down = False
         # Queued terminal outcomes drained asynchronously by poll methods.
         self._save_done: list[bytes] = []
@@ -120,12 +120,14 @@ class FakeKVCacheStore:
 
     # -- store surface used by the manager -----------------------------
 
-    def lookup(self, block_hashes, enable_global=False):
+    def lookup(self, block_hashes, enable_global=False, pin_found=True):
         # Mirrors Raiden: every locally cached hit is PINNED as it is found, so
-        # the answer cannot be evicted before the caller uses it. Registry-only
-        # hits name a peer's block and are not pinned. Candidates are peeked,
-        # never pinned, so a lookup cannot resurrect one.
-        self.calls.append(_Call("lookup", (list(block_hashes), enable_global)))
+        # the answer cannot be evicted before the caller uses it, unless the
+        # caller opts out with pin_found=False. Registry-only hits name a
+        # peer's block and are never pinned. Candidates are peeked, never
+        # pinned, so a lookup cannot resurrect one.
+        self.calls.append(
+            _Call("lookup", (list(block_hashes), enable_global, pin_found)))
         out = []
         for h in block_hashes:
             entry = self.entries.get(h)
@@ -139,7 +141,8 @@ class FakeKVCacheStore:
                         out.append((h, remote))
                         continue
                 break
-            entry.pin_count += 1
+            if pin_found:
+                entry.pin_count += 1
             out.append((
                 h,
                 SimpleNamespace(status=entry.status,
@@ -348,7 +351,7 @@ def seed_global_entries(store,
     prefix = key_namespace or ns
     for i, sub_hash in enumerate(
             sub_hashes(key, device_block_size_factor, prefix)):
-        store.global_entries[sub_hash] = FakeRaidenBlockID(
+        store.global_entries[sub_hash] = FakeRaidenBlockId(
             raiden_id=object(),
             host_block_id=100 + i,
             status=FakeBlockStatus.REMOTE)
@@ -660,6 +663,30 @@ class TestTouchAndMisc(unittest.TestCase):
         self.manager.touch([_key(2), _key(1)], _ctx())
         (release, ) = self.store.calls_named("release")
         self.assertEqual(release.args[0], sub_hashes(_key(2)))
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_probes_do_not_reorder_lru(self):
+        # lookup/prepare_store only read the directory to decide what to do.
+        # Pinning a hit and releasing it would leave the entry at the Most
+        # Recently Used position, silently reordering eviction -- so they ask
+        # for no pin at all. Moving an entry is touch's job, and only touch's.
+        seed_host_entries(self.store, _key(0))
+        self.store.calls.clear()
+
+        self.manager.lookup(_key(0), _ctx())
+        self.manager.prepare_store([_key(0)], _ctx())
+        for call in self.store.calls_named("lookup"):
+            pin_found = call.args[2]
+            self.assertFalse(pin_found,
+                             "a probe must not take a pin: %r" % (call.args, ))
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+        # touch, by contrast, deliberately does take one and give it back.
+        self.store.calls.clear()
+        self.manager.touch([_key(0)], _ctx())
+        (probe, ) = self.store.calls_named("lookup")
+        self.assertTrue(probe.args[2])
+        self.assertEqual(len(self.store.calls_named("release")), 1)
         self.assertEqual(self.store.pinned_hashes(), {})
 
     def test_touch_never_resurrects_displaced_entries(self):
