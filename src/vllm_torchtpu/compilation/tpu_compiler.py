@@ -350,17 +350,12 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=True,
-                    )
-                else:
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=False,
-                        executable=inner_exe,
-                    )
+                handle_data = TpuCompilationHandle(
+                    key=key,
+                    tier3_cache_active=bool(
+                        os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")),
+                    executable=inner_exe,
+                )
                 with open(save_path, "wb") as f:
                     pickle.dump(handle_data, f)
                 handle = (key, save_path, was_wrapped)
@@ -421,18 +416,20 @@ class TpuCompilerAdaptor(CompilerInterface):
         else:
             inner_exe = loaded_data
 
-        if tier3_active:
-            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
+        if inner_exe is not None:
+
+            def _cached_compiler(*_args, **_kwargs):
+                return inner_exe
+
+        else:
+
+            # Fallback for legacy handle files where inner_exe was not saved
             def _cached_compiler(g, example_inputs):
                 clean_inputs = [
                     int(x) if isinstance(x, torch.SymInt) else x
                     for x in example_inputs
                 ]
                 return _tpu_backend(g, clean_inputs)
-        else:
-
-            def _cached_compiler(*_args, **_kwargs):
-                return inner_exe
 
         # The tracing context has a FakeTensorMode from Dynamo, but the example
         # inputs have fake tensors from a different FakeTensorMode.
