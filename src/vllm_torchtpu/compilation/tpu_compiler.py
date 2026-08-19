@@ -27,7 +27,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import moe_census, shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -61,6 +61,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    # Whether an unengaged fused-MoE run refuses to serve. A boot-time policy
+    # over graphs that were already built; it cannot change one.
+    "MOE_FUSED_EP_REQUIRE_ENGAGEMENT",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -78,6 +81,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/attention.py",
     "vllm_torchtpu/layers/vllm/custom_ops",
     "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
     "vllm_torchtpu/layers/vllm/linear_common.py",
     "vllm_torchtpu/layers/vllm/quantization",
     "vllm_torchtpu/layers/vllm/vision_attention.py",
@@ -298,9 +302,12 @@ class TpuCompilerAdaptor(CompilerInterface):
             if elsewhere is not None:
                 return elsewhere, None
 
+        # Which MoE program is in *this* graph, counted on the graph itself:
+        # the only engagement observable that is not adjacent to the thing.
         logger.info(
-            "[TpuCompilerAdaptor] Compiling FX graph for range %s",
+            "[TpuCompilerAdaptor] Compiling FX graph for range %s | MoE %s",
             compile_range,
+            moe_census.format_counts(moe_census.observe(graph, compile_range)),
         )
 
         # aot_autograd (inside TpuBackend) requires tuple outputs.
@@ -398,8 +405,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         if elsewhere is not None:
             return elsewhere
 
-        logger.info("[TpuCompilerAdaptor] Loading compiled executable from %s",
-                    path)
+        # Census the cache-hit path too, or the observable reports "no MoE ops"
+        # for every arm after the first in a job that shares a cache directory
+        # -- indistinguishable from the kernel not engaging, which is the exact
+        # confusion this exists to remove.
+        logger.info(
+            "[TpuCompilerAdaptor] Loading compiled executable from %s "
+            "| MoE %s", path,
+            moe_census.format_counts(moe_census.observe(graph, compile_range)))
 
         with open(path, "rb") as f:
             loaded_data = pickle.load(f)

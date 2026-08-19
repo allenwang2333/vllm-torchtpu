@@ -63,7 +63,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
-from vllm_torchtpu.layers.vllm import moe_routing, token_padding
+from vllm_torchtpu.layers.vllm import fused_moe_ep, moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  prebuild_fused_moe_kernel)
@@ -798,10 +798,69 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight.device)
+
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+        )
+
+        # Both MoE paths read the same weights, so the fused kernel can be
+        # engaged per step (see MOE_FUSED_EP_KERNEL_MIN_TOKENS) with the GMM
+        # path still available underneath it.
+        self._fused_ep_enabled = fused_moe_ep.is_enabled(layer)
+        if self._fused_ep_enabled:
+            fused_moe_ep.register_ep_rank_buffer(
+                layer, device=layer.w13_weight.device)
+            fused_moe_ep.register_replica_rank_buffer(
+                layer, device=layer.w13_weight.device)
+            # Resolve the kernel config once, here: the forward must look up an
+            # op that already exists, never build one inside the compiled
+            # region (see test_the_forward_never_builds_the_op).
+            self._fused_ep_dp_size = int(
+                getattr(layer.moe_config, "dp_size", 1))
+            self._fused_ep_config = self._fused_ep_kernel_config(layer)
+            fused_moe_ep.prebuild_fused_ep_moe_kernel(**self._fused_ep_config)
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Tell vLLM's runner we own EP dispatch/combine.
+
+        The fused EP kernel takes this rank's own token rows and returns them
+        combined across every expert, so the runner's naive DP all-gather and
+        reduce-scatter (``moe_runner.do_naive_dispatch_combine``) must not run.
+        The TP all-reduce still must, and does: ``_fused_output_is_reduced`` is
+        driven by ``moe_kernel``, which stays None here.
+
+        **Per step, not per layer.** The runner reads this property inside
+        ``_maybe_dispatch`` and ``_maybe_combine`` on every forward, so it can
+        answer per step -- and it has to. On a step whose DP ranks have not
+        agreed on a shape (a profile run, or an idle DP engine's dummy batch)
+        this layer cannot take over the pair: it would issue DP collectives
+        from inside the layer, on ranks that are not arriving together, which
+        halts the device exactly the way an uncoordinated barrier does. Give
+        the pair back to the runner for that step and let it do what it does on
+        every other layer. ``_needs_fallback_dispatch`` reads the same
+        predicate, so the two never both run or both skip.
+        """
+        return (getattr(self, "_fused_ep_enabled", False)
+                and fused_moe_ep.dp_step_is_coordinated(
+                    getattr(self, "_fused_ep_dp_size", 1)))
+
+    @staticmethod
+    def _fused_ep_kernel_config(layer: RoutedExperts) -> dict:
+        """Static kernel config; ``subc_quant_*`` == the contracting extent is
+        the kernel's spelling of per-output-channel scales."""
+        # From w2 ([E, F, H]) so this is layout-independent.
+        intermediate_size, hidden_size = layer.w2_weight.shape[-2:]
+        return dict(
+            top_k=layer.moe_config.experts_per_token,
+            renormalize=bool(layer.renormalize),
+            activation=layer._tpu_activation_str,
+            scoring_fn=getattr(layer, "scoring_func", "softmax"),
+            subc_quant_w1_sz=hidden_size,
+            subc_quant_w2_sz=intermediate_size,
+            quant_act=envs.MOE_FUSED_EP_QUANT_ACT,
         )
 
     def apply_monolithic(
@@ -813,6 +872,27 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         activation_str = layer._tpu_activation_str
+        fused_ep = getattr(self, "_fused_ep_enabled", False)
+        if fused_ep and fused_moe_ep.engages_for(layer, x):
+            return fused_moe_ep.fused_moe_ep(
+                hidden_states=x,
+                router_logits=router_logits,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                replica_rank=layer._ep_replica_rank,
+                ep_rank_ids=layer._ep_rank_ids,
+                **self._fused_ep_config,
+            )
+
+        if fused_ep:
+            # This layer told the runner we own dispatch/combine, but this step
+            # is below the fused kernel's token threshold, so reinstate the
+            # DP pair the runner skipped.
+            x, router_logits = fused_moe_ep.dispatch_for_fallback(
+                layer, x, router_logits)
+
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -825,7 +905,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        return fused_moe_gmm(
+        states = fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -839,6 +919,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
         )
+        if fused_ep:
+            states = fused_moe_ep.combine_for_fallback(layer, states)
+        return states
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

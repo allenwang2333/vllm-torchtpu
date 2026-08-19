@@ -34,6 +34,30 @@ import pytest
 import torch
 
 
+@pytest.fixture(autouse=True)
+def _unpin_envs_between_tests():
+    """Stop one test's `monkeypatch.setattr(envs, ...)` leaking into the next.
+
+    `vllm_torchtpu.envs` serves its settings through module `__getattr__`, so
+    the name is *not* a real module attribute until someone assigns one.
+    `monkeypatch.setattr(envs, "X", v)` assigns one, and its undo assigns the
+    **old value back** rather than deleting it -- after which `X` is a frozen
+    real attribute and every later `monkeypatch.setenv("X", ...)` is silently
+    invisible.
+
+    The symptom is the worst kind a gate can have: the test passes alone and
+    fails only in a full run, in a *different file*, with no connection to the
+    change under test. Delete anything that was materialised while the test ran.
+    """
+    from vllm_torchtpu import envs
+
+    managed = set(envs.environment_variables)
+    before = {k for k in vars(envs) if k in managed}
+    yield
+    for name in {k for k in vars(envs) if k in managed} - before:
+        delattr(envs, name)
+
+
 def pytest_addoption(parser):
     """Add --use-tpu command line option."""
     parser.addoption(

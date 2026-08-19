@@ -88,6 +88,8 @@ from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.compilation import moe_census
+from vllm_torchtpu.layers.vllm import fused_moe_ep
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -4189,6 +4191,9 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        if envs.TPU_MOE_ROUTER_LOGITS_FP32:
+            from vllm_torchtpu.layers.vllm import moe_routing
+            moe_routing.promote_router_gates_to_fp32(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
 
@@ -4410,6 +4415,7 @@ class TPUModelRunner(GPUModelRunner):
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
+                fused_moe_ep.dp_agreement(dp_lockstep, num_tokens),
                 set_forward_context(
                     per_layer_attn_metadata,
                     self.vllm_config,
@@ -4715,15 +4721,49 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
 
+    def _capture_ladder_rendezvous(self, num_tokens: int) -> None:
+        """Put every rank at the same bucket before a coordinated dummy run.
+
+        The ladder is walked in the same order by every rank, so the runs are
+        coordinated *in fact* -- but "in fact" is an argument, and what the
+        kernel's all-pairs barrier needs is a guarantee. Compile time differs
+        per rank, so without this the skew accumulates across the ladder until
+        one rank is a whole bucket ahead of another and their barriers pair up
+        across different shapes. One CPU-group barrier per bucket bounds the
+        skew to a single bucket's compile, which is what "tolerates a late
+        peer" was ever meant to cover.
+        """
+        if not self._fused_moe_needs_rendezvous():
+            return
+        from vllm.distributed.parallel_state import get_ep_group
+        torch.distributed.barrier(group=get_ep_group().cpu_group)
+        logger.info("  -- fused EP MoE rendezvous at num_tokens=%d", num_tokens)
+
+    def _fused_moe_needs_rendezvous(self) -> bool:
+        return (self._dp_lockstep_enabled()
+                and fused_moe_ep.fused_path_is_live())
+
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         if self.enforce_eager:
             return
+        # The ladder decides which MoE program each bucket carries: engagement
+        # is a branch resolved at trace time, so a ladder that declares itself
+        # uncoordinated compiles the fallback into every bucket and no runtime
+        # predicate can reach the kernel afterwards. profile_run stays
+        # uncoordinated (it only sizes memory, and its compile is isolated into
+        # `profile_cache/` then thrown away by `torch._dynamo.reset()`).
+        ladder_lockstep = self._dp_lockstep_enabled()
+        moe_census.set_phase("capture")
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
-                self._precompile_backbone()
+                self._precompile_backbone(dp_lockstep=ladder_lockstep)
+            fused_moe_ep.report_engagement()
 
             self._precompile_sampling_subgraphs()
+            # Anything compiled from here on is a *serving* recompile, which is
+            # worth seeing on its own line whatever it contains.
+            moe_census.set_phase("serving")
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
@@ -4831,7 +4871,7 @@ class TPUModelRunner(GPUModelRunner):
                 "start with residual synthetic request state")
         return attempt_succeeded
 
-    def _precompile_backbone(self) -> None:
+    def _precompile_backbone(self, *, dp_lockstep: bool = False) -> None:
         """Compile the backbone for every token bucket.
 
         One trace serves the whole ladder unless the model's structure depends
@@ -4839,21 +4879,31 @@ class TPUModelRunner(GPUModelRunner):
         serve gets a trace of its own and hands its executable back, leaving
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
+
+        ``dp_lockstep`` is set only when a fused-MoE layer armed, and it is why
+        the rendezvous below exists: the kernel's peers must enter its
+        collectives at the same bucket. It has to be threaded through here
+        rather than read from the runner, so that a ladder walked for any other
+        reason stays exactly what it was.
         """
         with shape_variants.warmup() as buckets:
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
                 if buckets.needs_retrace(num_tokens):
                     shape_variants.retrace(self.model, self.vllm_config)
+                self._capture_ladder_rendezvous(num_tokens)
                 self._dummy_run(num_tokens,
                                 self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req,
-                                use_max_model_len=True)
+                                use_max_model_len=True,
+                                dp_lockstep=dp_lockstep)
                 if self.most_model_len is not None:
+                    self._capture_ladder_rendezvous(num_tokens)
                     self._dummy_run(num_tokens,
                                     self.num_reqs_most_model_len,
                                     self.num_blocks_per_most_len_req,
-                                    use_max_model_len=False)
+                                    use_max_model_len=False,
+                                    dp_lockstep=dp_lockstep)
             if buckets.refused:
                 # A refusal that no trace picked up leaves a raising closure in
                 # the live graph, which would surface as a failed request. Fail
@@ -5276,6 +5326,7 @@ class TPUModelRunner(GPUModelRunner):
             # the region within budget for capture_model's full bucket ladder.
             with self._profile_isolated_cache():
                 cc.compile_sizes = [num_tokens]
+                moe_census.set_phase("profile")
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)
             reset_compile_wrapper(self.model)
