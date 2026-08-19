@@ -21,6 +21,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_NAME=""; RANK="${JOB_COMPLETION_INDEX:-0}"; NNODES=4; LEADER=""
+LEADER_ADDR=""
 RESULTS_DIR="/tmp/out/bench"; PORT=8000
 RECORD_IDENTITY=0; SKIP_EVAL=0; EXTRA_SERVE=""
 
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [ -n "$CONFIG_NAME" ] || { echo "ERROR: --config is required"; exit 2; }
+LEADER_ADDR="${LEADER:-127.0.0.1}"
 # shellcheck disable=SC1090
 source "$SCRIPT_DIR/configs/${CONFIG_NAME}.sh"
 mkdir -p "$RESULTS_DIR"
@@ -67,10 +69,35 @@ fi
 TARGET="${MODEL_URI:-$MODEL}"
 [ -n "${MODEL_URI:-}" ] && SERVE+=(--load-format runai_streamer)
 
-# ---- headless ranks: serve and block. They exit when the leader tears down.
+# ---- headless ranks: serve, then follow the leader out.
+#
+# `vllm serve --headless` never returns, so an exec here leaves the rank running
+# after the leader finishes. With completions=N the JobSet then never completes
+# and the slice keeps its chips until somebody deletes it. Measured once: rank 0
+# Completed while ranks 1-3 held 16 chips for 20 minutes.
+#
+# Instead: run headless in the background and poll the leader. The leader is up
+# once its port answers; when it stops answering after having been up, the run
+# is over and this rank exits too.
 if [ "$RANK" != "0" ]; then
-  echo "rank $RANK: headless"
-  exec vllm serve "$TARGET" "${SERVE[@]}" --headless
+  echo "rank $RANK: headless, following leader $LEADER_ADDR"
+  vllm serve "$TARGET" "${SERVE[@]}" --headless 2>&1 | tee "$RESULTS_DIR/worker.log" &
+  WORKER_PID=$!
+  LEADER_WAS_UP=0
+  while true; do
+    sleep 20
+    kill -0 "$WORKER_PID" 2>/dev/null || { echo "rank $RANK: worker exited"; break; }
+    if curl -sf --max-time 5 "http://${LEADER_ADDR}:${PORT}/health" >/dev/null 2>&1; then
+      LEADER_WAS_UP=1
+    elif [ "$LEADER_WAS_UP" = "1" ]; then
+      echo "rank $RANK: leader went away, shutting down"
+      kill -TERM "$WORKER_PID" 2>/dev/null || true
+      sleep 10; kill -9 "$WORKER_PID" 2>/dev/null || true
+      break
+    fi
+  done
+  echo "rank $RANK: done"
+  exit 0
 fi
 
 # ---- leader

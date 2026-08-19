@@ -21,6 +21,8 @@ ENABLE_EP=true
 
 # Match the published shape so numbers are comparable: vLLM's K3 blog reports
 # batch 1, 8K in / 1K out, on a served endpoint.
+RANDOM_RANGE_RATIO="0.0"        # run_eval_flow.sh requires it; 0.0 pins exact lengths
+RANGE_RATIO_STYLE="symmetric"
 ISL_OSL_CONFIGS="8192:1024"
 # --max-num-seqs is a CORRECTNESS ceiling on this model, not a tuning knob:
 # above 4 concurrent sequences a stress test produced repeated-token
