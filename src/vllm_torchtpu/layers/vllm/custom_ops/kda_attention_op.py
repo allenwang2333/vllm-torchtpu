@@ -687,26 +687,33 @@ def build_kimi_dispatched_kda_op(
             # launch: correctness first, and `window` is 2-5 in practice. Fusing
             # the window into a single call is the optimization on top.
             #
-            # The token axis is strided, not blocked: with every request in this
-            # segment carrying `window` tokens, position t of request s is token
-            # row s * window + t, so `x[t::window]` is position t for all
-            # requests. A batch mixing plain decodes with verify windows breaks
-            # that stride, and this does not handle it.
+            # Rows are gathered through `query_start_loc`, not by striding the
+            # token axis. Position t of request s is row `query_start_loc[s] +
+            # t`, which holds whatever the batch looks like -- a uniform verify
+            # window, a plain 1-token decode step (ngram proposed nothing), or a
+            # mix of the two. Requests shorter than t are pointed at the null
+            # slot for that position, so they compute nothing and write nothing.
+            starts = query_start_loc[:num_seqs]
             conv_cur, pool_cur = conv_in, recurrent_state
-            per_position = []
+            decode_out = jnp.zeros((num_tokens, num_heads, head_dim),
+                                   activation_dtype)
             for t in range(window):
+                rows = jnp.minimum(starts + t, jnp.maximum(num_tokens - 1, 0))
+                present = query_lens > t
+                slots_t = jnp.where(present, decode_slots, 0)
                 read_off = (slot_read_offsets if t == 0 else jnp.full(
                     (num_seqs, ), t - 1, jnp.int32))
                 # After position 0 the state always exists: we just wrote it.
-                initial = has_initial_state if t == 0 else decode_slots > 0
+                initial = has_initial_state if t == 0 else slots_t > 0
                 out_t, conv_cur, pool_cur = _decode_once(
-                    mixed_qkv[t::window], raw_gate[t::window],
-                    beta[t::window], conv_cur, pool_cur, decode_slots, initial,
-                    read_off, jnp.full((num_seqs, ), t, jnp.int32))
-                per_position.append(out_t)
-            # Back to token order: [num_seqs, window, H, D] -> row s*window + t.
-            decode_out = jnp.stack(per_position, axis=1).reshape(
-                num_seqs * window, num_heads, head_dim)
+                    jnp.take(mixed_qkv, rows, axis=0),
+                    jnp.take(raw_gate, rows, axis=0),
+                    jnp.take(beta, rows, axis=0), conv_cur, pool_cur, slots_t,
+                    initial, read_off, jnp.full((num_seqs, ), t, jnp.int32))
+                decode_out = decode_out.at[rows].set(
+                    jnp.where(present[:, None, None],
+                              out_t.astype(activation_dtype),
+                              jnp.take(decode_out, rows, axis=0)))
             conv_after_decode, pool_after_decode = conv_cur, pool_cur
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
