@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
     build_kimi_chunk_kda_op, build_kimi_dispatched_kda_op, build_kimi_kda_op,
     build_kimi_sconv_op)
+from vllm_torchtpu.models.vllm.kimi_k3 import kda_pool_state
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -581,7 +582,13 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 or self.kv_cache[0].numel() == 0):
             output = torch.zeros_like(query)
         else:
-            sconv_cache, recurrent_cache = self.kv_cache
+            # Accepts BOTH cache layouts. The per-layer pair passes straight
+            # through; a unified-pool page is carved into the same two views
+            # here, per upstream's contract that the layer unpacks its own
+            # conv/ssm regions out of the page's bytes. Prefix caching needs
+            # the pool, and this unpack was the last blocker to it.
+            sconv_cache, recurrent_cache = kda_pool_state.unpack(
+                self.kv_cache, *self.get_state_shape(), *self.get_state_dtype())
             output = self._core_attention(
                 mixed_qkv,
                 raw_gate,
