@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_DISPATCH_FP8: bool = False
     TPU_MOE_DISPATCH_FP8_WIRE: str = "fp8"
+    TPU_MOE_DISPATCH_FP8_BLOCK: int = 0
+    TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -296,11 +298,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
     # Send the MoE dispatch all-gather over ICI as fp8 (e4m3) rows plus a
     # per-row fp32 scale, dequantized to the activation dtype immediately
-    # after the collective, halving the dispatch payload under DP+EP. The
-    # rows are rounded to fp8 one step later anyway, inside gmm_v2's lhs
-    # quantizer, so only the scale granularity changes (per row here vs per
-    # row x 512-wide k block there). Off by default; see
-    # distributed/fp8_wire.py.
+    # after the collective, halving the dispatch payload under DP+EP. Turn it
+    # on for prefill-dominated serving (long inputs, short outputs) and leave
+    # it off for decode-heavy mixes: measured at DP4TP2_EP/conc 64, TTFT -8.7%
+    # and TPOT +1.5%, which nets out positive only while prefill is more than
+    # ~17% of a request. Inert at dp_size == 1. The rows are rounded to fp8 one
+    # step later anyway, inside gmm_v2's lhs quantizer, but on a different grid
+    # unless TPU_MOE_DISPATCH_FP8_BLOCK=512 is set with it, so per row the
+    # payload is rounded twice (1.38x the layer's fp8 error). Off by default;
+    # see distributed/fp8_wire.py.
     "TPU_MOE_DISPATCH_FP8":
     env_bool("TPU_MOE_DISPATCH_FP8"),
 
@@ -308,11 +314,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scales as two collectives; "uint8" packs both into one, saving a
     # collective's fixed cost and losing the async, sparsecore-offloaded form
     # that lets the gather overlap the compute it sits between. Kept selectable
-    # so the two can be measured against each other; the packed form measured
-    # -60.8% and -61.5% on device.
+    # so the two can be measured against each other; the two device runs on the
+    # packed form lost 60.8% and 61.5%, though neither is a single-variable
+    # comparison (see distributed/fp8_wire.py).
     "TPU_MOE_DISPATCH_FP8_WIRE":
     env_with_choices("TPU_MOE_DISPATCH_FP8_WIRE", "fp8", ["fp8", "uint8"]),
 
+    # Hidden-axis width one fp8 dispatch scale covers. "0" keeps one scale per
+    # row (what #499 measured); "512" matches gmm_v2's LHS_QUANT_BLOCK_SIZE,
+    # which makes that kernel's lhs requantization a bitwise no-op and the
+    # layer output bit-identical to the bf16 dispatch. No other width helps:
+    # anything that is not the kernel's grid is rounded twice anyway.
+    "TPU_MOE_DISPATCH_FP8_BLOCK":
+    lambda: int(
+        env_with_choices("TPU_MOE_DISPATCH_FP8_BLOCK", "0", ["0", "512"])()),
+
+    # Take the fp8 dispatch only where it can win: when the fp8 payload still
+    # clears the SparseCore all-gather offload threshold, so both wires keep
+    # the async, offloaded collective and halving the bytes is a pure saving.
+    # Below it both wires are synchronous and fully exposed, and the second
+    # collective's fixed cost (~9 us) exceeds the byte saving -- which is every
+    # decode bucket and the one prefill bucket whose bf16 gather is async and
+    # fp8 gather is not. REFUSED at runtime on this runner and logged as such:
+    # choosing the wire per bucket is a Python branch on the token dim, which
+    # specializes a dim vLLM marks dynamic and kills engine init on device. A
+    # server that sets it runs as plain fp8 dispatch until the runner can
+    # retrace per bucket; see distributed/tpu_communicator.py
+    # _offload_gate_is_traceable.
+    "TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD":
+    env_bool("TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD"),
+
+    # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
+    # chunked kernel.
+    "VLLM_TPU_USE_NAIVE_KDA":
+    env_bool("VLLM_TPU_USE_NAIVE_KDA"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":

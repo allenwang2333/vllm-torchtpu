@@ -204,6 +204,31 @@ if _libtpu_extra_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
+SC_ALL_GATHER_OFFLOAD_FLAG = (
+    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes")
+
+
+def sc_all_gather_offload_threshold_bytes() -> int | None:
+    """Output-buffer size at which XLA offloads an all-gather to SparseCore.
+
+    Reads the flag XLA will actually see rather than re-deriving the rule:
+    ``LIBTPU_INIT_ARGS`` is fully assembled above (an operator-supplied flag
+    wins over ours, and ``SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES=0`` leaves
+    it unset), so parsing it back is the one place that cannot drift.
+    ``None`` means the flag is not set and libtpu's own default applies -- a
+    value this module cannot know, so callers must not gate on it.
+
+    The predicate is ``>=`` on the gathered output buffer, bisected to the
+    byte on an 8-chip AOT compile.
+    """
+    for token in os.environ.get("LIBTPU_INIT_ARGS", "").split():
+        if token.startswith(SC_ALL_GATHER_OFFLOAD_FLAG + "="):
+            try:
+                return int(token.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
 
 def _patch_jax_pallas_fori_lowering() -> None:
     """Elide the dead remainder ``scf.for`` from Pallas ``fori_loop`` lowering.

@@ -30,7 +30,12 @@ from jax.experimental.pallas import tpu as pltpu
 # minimize compute overhead of quantization.
 # distributed/fp8_wire.py names this width to say what its per-row scale trades
 # away: a wire quantized on these blocks would hand this kernel the scale it is
-# about to derive, instead of a second rounding.
+# about to derive, instead of a second rounding. The width that contract really
+# depends on is min(tile_k, LHS_QUANT_BLOCK_SIZE) -- the k loop below clamps the
+# last block to tile_k -- so a shape whose tile_k falls under 512 would silently
+# put the wire back on a different grid. calculate_tiling only shrinks tile_k
+# after tile_n has fallen below mxu_column_size*2/fuse_act_factor, which at
+# hidden 4096 it never does (tile_k = 4096 down to a 1.8 MiB VMEM limit).
 LHS_QUANT_BLOCK_SIZE = 512
 
 # Util.

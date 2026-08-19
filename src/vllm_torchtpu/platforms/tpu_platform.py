@@ -609,6 +609,9 @@ class TpuPlatform(Platform):
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
+    # The dispatch-wire knobs below pick the collective a rank emits, so a rank
+    # that does not see them runs a different collective from its peers -- a
+    # desync, not a slower no-op. Ray V1 copies only this allow-list.
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
@@ -618,7 +621,10 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_DISPATCH_FP8",
+        "TPU_MOE_DISPATCH_FP8_WIRE", "TPU_MOE_DISPATCH_FP8_BLOCK",
+        "TPU_MOE_DISPATCH_FP8_GATE_OFFLOAD",
+        "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
