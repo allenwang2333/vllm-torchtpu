@@ -223,6 +223,58 @@ def _patch_default_moe_runner_select_forward() -> None:
         "Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
 
 
+def _patch_moe_local_routing_dispatch() -> None:
+    """Route on the rank that owns the rows, and dispatch the decision.
+
+    Upstream applies the gate locally, all-gathers the raw
+    ``[T_local, num_experts]`` logits, and lets every DP rank re-run the same
+    softmax + top-k over all ``T_global`` rows. Routing is per-row, so this
+    wrapper decides the local rows first and hands ``_maybe_dispatch`` a packed
+    flat ``[T_local * 2*topk]`` int32 blob in the logits slot;
+    ``moe_routing.route`` unpacks it on the far side. The collective, and
+    whatever wire format ``TpuDeviceCommunicator`` gives it, are untouched.
+
+    Installed only when ``TPU_MOE_LOCAL_ROUTING`` is set, so the default
+    configuration runs unpatched upstream code.
+    """
+    import vllm_torchtpu.envs as envs
+    if not envs.TPU_MOE_LOCAL_ROUTING:
+        return
+    if envs.USE_MOE_EP_KERNEL:
+        # The fused EP kernel scores the router logits itself, from the same
+        # argument this patch replaces with a packed decision. Refuse the
+        # combination here, at startup, rather than handing that kernel an
+        # int32 blob to softmax.
+        raise ValueError(
+            "TPU_MOE_LOCAL_ROUTING=1 and USE_MOE_EP_KERNEL=1 are mutually "
+            "exclusive: the fused EP MoE kernel does its own routing from the "
+            "raw router logits.")
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    if getattr(_mr.MoERunner, "_tpu_local_routing_patch", False):
+        return
+
+    from vllm_torchtpu.layers.vllm import moe_dispatch
+
+    original_maybe_dispatch = _mr.MoERunner._maybe_dispatch
+
+    def _maybe_dispatch(self, hidden_states, router_logits):
+        # Only the monolithic path is packable: the modular path feeds
+        # router_logits to upstream's own router after the dispatch.
+        if (self.do_naive_dispatch_combine
+                and self.routed_experts.quant_method.is_monolithic
+                and not moe_dispatch.is_routing_blob(router_logits)):
+            router_logits = moe_dispatch.route_and_pack(
+                self.routed_experts, hidden_states, router_logits)
+        return original_maybe_dispatch(self, hidden_states, router_logits)
+
+    _mr.MoERunner._maybe_dispatch = _maybe_dispatch
+    _mr.MoERunner._tpu_local_routing_patch = True
+    logger.info("Applied TPU patch: MoE routes before the DP dispatch and "
+                "gathers packed ids+weights instead of router logits.")
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Keep PCP MoE dispatch/combine explicit for TorchTPU.
 

@@ -16,6 +16,7 @@
 import torch
 import vllm.envs as vllm_envs
 
+from vllm_torchtpu.layers.vllm import moe_dispatch
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -132,6 +133,11 @@ def route(
     hook -- and any future routing-path change -- lives in exactly one place.
     """
     topk = layer.moe_config.experts_per_token
+    if moe_dispatch.is_routing_blob(router_logits):
+        # TPU_MOE_LOCAL_ROUTING: the rank that owned these rows already routed
+        # them and the dispatch carried the decision instead of the logits.
+        return moe_dispatch.unpack_routing(router_logits, topk,
+                                           hidden_states.dtype)
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated

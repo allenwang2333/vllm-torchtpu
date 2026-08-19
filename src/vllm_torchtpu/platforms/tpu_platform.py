@@ -316,6 +316,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import (_patch_default_moe_runner_select_forward,
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
+                               _patch_moe_local_routing_dispatch,
                                _patch_moe_no_ep_tp_scope,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
@@ -335,6 +336,7 @@ def apply_tpu_patches() -> None:
     tpu_plugin._patch_vllm_config_hash_ignore_diagnostics()
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
+    _patch_moe_local_routing_dispatch()
     _patch_moe_explicit_pcp_collectives()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
@@ -618,7 +620,12 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES"
+        "TPU_KERNEL_RELOAD_MODULES",
+        # Read inside the worker: apply_tpu_patches() runs again in every
+        # worker (tpu_worker.py) and _patch_moe_local_routing_dispatch reads
+        # the flag there. TPU_ is not a prefix Ray copies, so without this
+        # entry the flag reaches the driver and no engine.
+        "TPU_MOE_LOCAL_ROUTING",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

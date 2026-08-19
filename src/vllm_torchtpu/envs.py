@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_LOCAL_ROUTING: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -291,6 +292,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Route each DP rank's own rows before the MoE dispatch and all-gather the
+    # packed decision (topk ids + weights) instead of the raw router logits.
+    # Removes dp_size-fold duplicated routing and shrinks that collective
+    # from num_experts to 2*topk int32 per token. The padding-mask all-gather
+    # stays where it is; moving it would change which rows get zeroed, see
+    # layers/vllm/moe_dispatch.py. DP-only; a no-op at dp_size 1.
+    "TPU_MOE_LOCAL_ROUTING":
+    env_bool("TPU_MOE_LOCAL_ROUTING"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
