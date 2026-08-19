@@ -350,17 +350,12 @@ class TpuCompilerAdaptor(CompilerInterface):
                 inner_exe = _tpu_backend._compiled_executables[-1]
                 save_path = os.path.join(self.cache_dir, key)
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                if os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"):
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=True,
-                    )
-                else:
-                    handle_data = TpuCompilationHandle(
-                        key=key,
-                        tier3_cache_active=False,
-                        executable=inner_exe,
-                    )
+                handle_data = TpuCompilationHandle(
+                    key=key,
+                    tier3_cache_active=bool(
+                        os.getenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")),
+                    executable=inner_exe,
+                )
                 with open(save_path, "wb") as f:
                     pickle.dump(handle_data, f)
                 handle = (key, save_path, was_wrapped)
@@ -386,9 +381,8 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> Callable[..., Any]:
         """Load a compiled executable from disk.
 
-        Unpickles the _TorchTpuCompiledExecutable (or uses Tier-3 C++ cache),
-        then wraps it with aot_autograd (using the same graph) to reconstruct
-        the full callable.
+        Directly unpickles the TorchTpuCompiledExecutable from the cached handle,
+        completely skipping Python FX->MLIR lowering and aot_autograd re-tracing.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, was_wrapped = handle
@@ -404,57 +398,30 @@ class TpuCompilerAdaptor(CompilerInterface):
         with open(path, "rb") as f:
             loaded_data = pickle.load(f)
 
-        # Re-create the aot_autograd wrapper around the cached executable.
-        from torch._dynamo.backends.common import aot_autograd
-
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
-        tier3_active = False
-        inner_exe = None
         if isinstance(loaded_data, TpuCompilationHandle):
-            tier3_active = loaded_data.tier3_cache_active
             inner_exe = loaded_data.executable
         elif isinstance(loaded_data, dict):
-            tier3_active = loaded_data.get("tier3_cache_active", False)
             inner_exe = loaded_data.get("executable")
         else:
             inner_exe = loaded_data
 
-        if tier3_active:
-            # Tier-3 C++ cache is active: _tpu_backend will hit native C++ Tier-3 binary cache (<1ms)
-            def _cached_compiler(g, example_inputs):
-                clean_inputs = [
-                    int(x) if isinstance(x, torch.SymInt) else x
-                    for x in example_inputs
-                ]
-                return _tpu_backend(g, clean_inputs)
-        else:
-
-            def _cached_compiler(*_args, **_kwargs):
-                return inner_exe
-
-        # The tracing context has a FakeTensorMode from Dynamo, but the example
-        # inputs have fake tensors from a different FakeTensorMode.
-        # `aot_autograd` calls detect_fake_mode() which asserts all
-        # FakeTensorModes match, causing a crash.
-        # Clear the tracing context and let `aot_autograd` create its own.
-        with torch._guards.tracing(None):
-            compiled_fn = aot_autograd(
-                fw_compiler=_cached_compiler,
-                keep_inference_input_mutations=False,
-            )(graph, example_inputs)
+        if inner_exe is None:
+            logger.warning(
+                "[TpuCompilerAdaptor] No executable found in %s, falling back",
+                path)
+            return None
 
         if was_wrapped:
-            inner_fn = compiled_fn
 
             def unwrap_fn(*args, **kwargs):
-                result = inner_fn(*args, **kwargs)
+                result = inner_exe(*args, **kwargs)
                 if isinstance(result, (tuple, list)) and len(result) == 1:
                     return result[0]
                 return result
 
             compiled_fn = unwrap_fn
+        else:
+            compiled_fn = inner_exe
 
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
