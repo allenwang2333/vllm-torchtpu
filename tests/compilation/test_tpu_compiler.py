@@ -325,3 +325,29 @@ class TestTpuCompilerCache:
             compile_range=(512, 512),
         )
         assert loaded_tuple_fn(10) == 30
+
+        # Test loading with tier3_key (lightweight handle where executable=None)
+        tier3_handle_path = tmp_path / "mock_tier3_handle.pkl"
+        with open(tier3_handle_path, "wb") as f:
+            pickle.dump(
+                TpuCompilationHandle(
+                    key="tier3_test_key",
+                    tier3_cache_active=True,
+                    executable=None,
+                    tier3_key=
+                    "1234567890abcdef_1234567890abcdef_1234567890abcdef",
+                ), f)
+
+        with patch(
+                "torch_tpu._internal.compile.tpu_torch_compile.load_executable_from_tier3_key",
+                return_value=MockExecutable(),
+                create=True,
+        ):
+            loaded_tier3_fn = adaptor.load(
+                handle=("tier3_test_key", str(tier3_handle_path), False),
+                graph=None,
+                example_inputs=[],
+                graph_index=0,
+                compile_range=(512, 512),
+            )
+            assert loaded_tier3_fn(15) == 30
