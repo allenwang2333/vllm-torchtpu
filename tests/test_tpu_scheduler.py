@@ -12,6 +12,7 @@ def _make_scheduler(waiting=(), drain_prefill=False):
     scheduler.skipped_waiting = []
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler._drain_prefill = drain_prefill
+    scheduler._tpu_coordinated_prefill = False
     scheduler.prefill_capacity_bound = False
     return scheduler
 

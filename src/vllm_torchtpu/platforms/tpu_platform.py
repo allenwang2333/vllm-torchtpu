@@ -1059,7 +1059,45 @@ class TpuPlatform(Platform):
                 "Using uniproc_executor.")
             parallel_config.distributed_executor_backend = "uni"
 
+        state_sync_steps = scheduler_config.prefill_schedule_interval
+        flush_timeout_ms = envs.TPU_DP_PREFILL_FLUSH_TIMEOUT_MS
+        quorum_fraction = envs.TPU_DP_PREFILL_QUORUM_FRACTION
+        if flush_timeout_ms < 0:
+            raise ValueError(
+                "TPU_DP_PREFILL_FLUSH_TIMEOUT_MS must be non-negative")
+        if flush_timeout_ms > 0:
+            if not envs.DP_SCHED_ENABLED:
+                raise RuntimeError("TPU_DP_PREFILL_FLUSH_TIMEOUT_MS requires "
+                                   "DP_SCHED_ENABLED=1")
+            if parallel_config.data_parallel_size <= 1:
+                raise RuntimeError(
+                    "TPU_DP_PREFILL_FLUSH_TIMEOUT_MS requires data parallel "
+                    "size > 1")
+            if state_sync_steps <= 0:
+                raise ValueError("prefill_schedule_interval must be positive")
+            if not 0.0 < quorum_fraction <= 1.0:
+                raise ValueError(
+                    "TPU_DP_PREFILL_QUORUM_FRACTION must be in (0, 1]")
+            additional_config = vllm_config.additional_config
+            if not isinstance(additional_config, dict):
+                raise TypeError("coordinated DP prefill requires dict-valued "
+                                "VllmConfig.additional_config")
+            additional_config.update({
+                envs.TPU_DP_PREFILL_FLUSH_TIMEOUT_MS_CONFIG_KEY:
+                flush_timeout_ms,
+                envs.TPU_DP_PREFILL_QUORUM_FRACTION_CONFIG_KEY:
+                quorum_fraction,
+            })
+            logger.info(
+                "Serialized coordinated DP prefill settings into VllmConfig "
+                "(state_sync_steps=%d, flush_timeout_ms=%d, "
+                "quorum_fraction=%.3f).", state_sync_steps,
+                flush_timeout_ms, quorum_fraction)
+
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
+            if scheduler_config.policy != "fcfs":
+                raise ValueError(
+                    "TpuDpScheduler only supports the FCFS scheduling policy.")
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
             if scheduler_config.scheduler_cls != dp_sched_cls:
                 assert scheduler_config.scheduler_cls is None, (

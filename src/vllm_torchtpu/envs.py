@@ -6,6 +6,10 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+TPU_DP_PREFILL_FLUSH_TIMEOUT_MS_CONFIG_KEY = (
+    "tpu_dp_prefill_flush_timeout_ms")
+TPU_DP_PREFILL_QUORUM_FRACTION_CONFIG_KEY = ("tpu_dp_prefill_quorum_fraction")
+
 if TYPE_CHECKING:
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -57,6 +61,9 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_FUSED_MOE_GMM: bool = False
+    TPU_DP_PREFILL_FLUSH_TIMEOUT_MS: int = 0
+    TPU_DP_PREFILL_QUORUM_FRACTION: float = 1.0
+    TPU_DP_PREFILL_STATS: bool = False
 
 
 def env_with_choices(
@@ -298,6 +305,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Coordinate finite prefill cohorts at the existing DP state-sync point.
+    # A positive wall-clock timeout enables the feature. Defaults are inert.
+    "TPU_DP_PREFILL_FLUSH_TIMEOUT_MS":
+    lambda: int(os.getenv("TPU_DP_PREFILL_FLUSH_TIMEOUT_MS") or "0"),
+    "TPU_DP_PREFILL_QUORUM_FRACTION":
+    lambda: float(os.getenv("TPU_DP_PREFILL_QUORUM_FRACTION") or "1.0"),
+    # Emit per-interval, per-rank DP prefill coordination stats (pending,
+    # backlog, expired, in-flight) at each state-sync point. Debug aid that
+    # widens the per-sync state exchange by two columns; off by default.
+    "TPU_DP_PREFILL_STATS":
+    env_bool("TPU_DP_PREFILL_STATS", default=False),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

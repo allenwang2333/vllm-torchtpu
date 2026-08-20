@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Sweep the measured-best 8k1k configurations. TP8 c4-c64 intentionally share
-# one server; DP8 c128 and c256 each use their own measured scheduler shape.
+# Sweep 8k1k with a 16k node-wide token budget. Each server is compiled for the
+# point's concurrency; DP8 divides both token and sequence limits across its
+# eight schedulers.
 # Usage: bash sweep.sh
 set -uo pipefail
 
@@ -26,7 +27,7 @@ READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 # Both are overridable via env so per-point jobs can each own a slice.
 read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
 read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256}"
-# Every table is keyed by "ISL,OSL,CONC". Points with the same complete server
+# Sharding is keyed by "ISL,OSL,CONC". Points with the same complete server
 # configuration reuse the running server instead of recompiling per tier.
 declare -A SHARDING_TABLE=(
   [8192,1024,4]=TP8_EP
@@ -36,42 +37,6 @@ declare -A SHARDING_TABLE=(
   [8192,1024,64]=TP8_EP
   [8192,1024,128]=DP8_EP
   [8192,1024,256]=DP8_EP
-)
-declare -A MAX_BATCHED_TOKENS_TABLE=(
-  [8192,1024,4]=16384
-  [8192,1024,8]=16384
-  [8192,1024,16]=16384
-  [8192,1024,32]=16384
-  [8192,1024,64]=16384
-  [8192,1024,128]=256
-  [8192,1024,256]=512
-)
-declare -A MAX_SEQS_TABLE=(
-  [8192,1024,4]=256
-  [8192,1024,8]=256
-  [8192,1024,16]=256
-  [8192,1024,32]=256
-  [8192,1024,64]=256
-  [8192,1024,128]=32
-  [8192,1024,256]=64
-)
-declare -A PREFILL_INTERVAL_TABLE=(
-  [8192,1024,4]=1
-  [8192,1024,8]=1
-  [8192,1024,16]=1
-  [8192,1024,32]=1
-  [8192,1024,64]=1
-  [8192,1024,128]=1
-  [8192,1024,256]=1
-)
-declare -A FUSED_EP_TABLE=(
-  [8192,1024,4]=0
-  [8192,1024,8]=0
-  [8192,1024,16]=0
-  [8192,1024,32]=0
-  [8192,1024,64]=0
-  [8192,1024,128]=1
-  [8192,1024,256]=1
 )
 
 VLLM_PROCS='vllm serve|VLLM::'
@@ -143,10 +108,26 @@ for wl in "${WORKLOADS[@]}"; do
       server_key="override:$sharding:$point"
     else
       sharding="${SHARDING_TABLE[$point]:-}"
-      max_batched_tokens="${MAX_BATCHED_TOKENS_TABLE[$point]:-}"
-      max_seqs="${MAX_SEQS_TABLE[$point]:-}"
-      prefill_interval="${PREFILL_INTERVAL_TABLE[$point]:-}"
-      fused_ep="${FUSED_EP_TABLE[$point]:-}"
+      case "$sharding" in
+        TP8_EP)
+          dp_size=1
+          fused_ep=0
+          ;;
+        DP8_EP)
+          dp_size=8
+          fused_ep=1
+          ;;
+        DP4TP2_EP)
+          dp_size=4
+          fused_ep=0
+          ;;
+        *) echo "ERROR: cannot derive DP_SIZE for SHARDING='$sharding'" >&2; exit 1 ;;
+      esac
+      global_batched_tokens_min="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
+      global_batched_tokens=$(( ISL > global_batched_tokens_min ? ISL : global_batched_tokens_min ))
+      max_batched_tokens=$(((global_batched_tokens + dp_size - 1) / dp_size))
+      max_seqs=$(((CONC + dp_size - 1) / dp_size))
+      prefill_interval=8
       server_key="$ISL:$OSL:$sharding:$max_batched_tokens:$max_seqs:$prefill_interval:$fused_ep"
     fi
     [ -n "$sharding" ] || { echo "ERROR: no sharding in SHARDING_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }

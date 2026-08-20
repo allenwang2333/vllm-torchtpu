@@ -38,15 +38,20 @@ case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # The measured c128/c256 configurations admit prefills every step.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-1}"
+    # Coordinate prefill admission every 16 scheduler steps by default.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-16}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    export DP_SCHED_ENABLED=1
+    # Coordinate DP prefill cohorts by default. Set DP_SCHED_ENABLED=0 and
+    # TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0 to compare against the stock scheduler
+    # without coordinated cohort flushing.
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2000}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     ;;
   TP8_EP)
@@ -71,7 +76,12 @@ case "$SHARDING" in
       --enable-expert-parallel
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    export DP_SCHED_ENABLED=1
+    # Coordinate DP prefill cohorts by default. Set DP_SCHED_ENABLED=0 and
+    # TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0 to compare against the stock scheduler
+    # without coordinated cohort flushing.
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2000}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     # The fused EP kernel also refuses the TP2 component of this sharding.
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
     ;;
@@ -84,28 +94,11 @@ MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
-# Defaults reproduce the branch owner's measured configuration. TP8 uses one
-# server for c4-c64 with fixed compile limits. DP8 c128/c256 use independently
-# measured local scheduler chunks. Other configurations keep the derived
-# fallback and every value remains directly overridable.
-case "$SHARDING:$CONC" in
-  TP8_EP:*)
-    DEFAULT_MAX_NUM_BATCHED_TOKENS="$GLOBAL_BATCHED_TOKEN"
-    DEFAULT_MAX_NUM_SEQS=256
-    ;;
-  DP8_EP:128)
-    DEFAULT_MAX_NUM_BATCHED_TOKENS=256
-    DEFAULT_MAX_NUM_SEQS=32
-    ;;
-  DP8_EP:256)
-    DEFAULT_MAX_NUM_BATCHED_TOKENS=512
-    DEFAULT_MAX_NUM_SEQS=64
-    ;;
-  *)
-    DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
-    DEFAULT_MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
-    ;;
-esac
+# The token and sequence limits are node-wide targets. vLLM runs one scheduler
+# per DP rank, so divide both by DP_SIZE (rounding up for robustness). TP has
+# DP_SIZE=1 and therefore keeps the full values.
+DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
+DEFAULT_MAX_NUM_SEQS=$(((CONC + DP_SIZE - 1) / DP_SIZE))
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-$DEFAULT_MAX_NUM_SEQS}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
@@ -120,8 +113,9 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8
 # 48 for concurrency 256 when DP8+EP is enabled to reduce padding from 32->64.
+# 3072 adds a finer prefill bucket between 2048 and 4096 where the local cap permits.
 # Set it to empty to opt out of the extra buckets.
-export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48}"
+export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48,3072}"
 
 # Shrink the rotary cos_sin caches to max_model_len, text-only, to minimize
 # xla layout data copy overhead.

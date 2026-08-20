@@ -621,6 +621,11 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
 
+    from vllm_torchtpu.core.dp_prefill_coordinator import \
+        install_dp_prefill_coordinator
+
+    install_dp_prefill_coordinator(kwargs.get("vllm_config"))
+
     from vllm.v1.engine.core import EngineCoreProc
 
     original_run = EngineCoreProc._tpu_original_run_engine_core

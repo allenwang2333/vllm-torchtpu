@@ -11,6 +11,7 @@ import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
+from vllm_torchtpu import envs
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.logger import init_logger
 
@@ -40,6 +41,8 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 # TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    envs.TPU_DP_PREFILL_FLUSH_TIMEOUT_MS_CONFIG_KEY,
+    envs.TPU_DP_PREFILL_QUORUM_FRACTION_CONFIG_KEY,
 })
 
 
