@@ -199,7 +199,32 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
     # is all-to-all, so being in round k already proves every peer finished the
     # round that last read this slot; see the kernel docstring. Validate with
     # scripts/allreduce_ws_stress.py --no-steady-barrier before reading these.
-    if impl in ("twoshot_ws", "twoshot_ws_nb"):
+    if impl == "twoshot_ws_rs":
+        # (1, numel) in, reshaped to (n, numel/n) inside the loop and back out
+        # again -- exactly _build_two_shot's body. The reshape is not a bitcast:
+        # a 2-D bf16 array is tiled (16, 128), so (1, 10752) is lane-aligned but
+        # sublane-padded 1->16, while (32, 336) has clean sublanes but pads lanes
+        # 336->384. Different tiled layouts means a real relayout, and this arm
+        # is what prices it.
+        def body(local_x):
+            v = local_x[0]
+            rows, cols = v.shape
+            numel = rows * cols
+            inner = numel // num_devices
+            rs, ag, step = llar.make_two_shot_workspace((num_devices, inner),
+                                                        v.dtype, num_devices)
+            for _ in range(n_ops):
+                flat = v.reshape(num_devices, inner)
+                out, rs, ag, step = llar.two_shot_all_reduce_ws(
+                    flat,
+                    rs,
+                    ag,
+                    step,
+                    axis_name=AXIS,
+                    num_devices=num_devices)
+                v = out.reshape(v.shape) * scale
+            return v[None]
+    elif impl in ("twoshot_ws", "twoshot_ws_nb"):
         steady = impl == "twoshot_ws"
 
         def body(local_x):
