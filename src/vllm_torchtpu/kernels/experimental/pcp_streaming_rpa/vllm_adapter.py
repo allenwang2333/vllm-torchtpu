@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 """vLLM custom-op adapter for PCP streaming RPA."""
 
+import dataclasses
 import inspect
 from collections.abc import Callable, Sequence
 
@@ -37,76 +38,32 @@ PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS = (
 )
 
 
-def _torch_placeholder_with_sharding(
-        aval: jax.core.ShapedArray | None,
-        sharding: jax.sharding.NamedSharding | None,
-        mesh: jax.sharding.Mesh | None) -> torch.Tensor | None:
-    if not isinstance(aval, jax.core.ShapedArray):
-        return aval
-    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
-    if torch_dtype is None:
-        raise NotImplementedError(
-            f"Unsupported dtype for pallas kernels: {aval.dtype}")
-    spec = getattr(sharding, "spec", None)
-    if spec is None:
-        spec = getattr(getattr(aval, "sharding", None), "spec", None)
-    return torch.empty(pallas_impl.get_local_shape(aval.shape, mesh, spec),
-                       dtype=torch_dtype,
-                       device="tpu")
-
-
 class _PcpStreamingJaxCallable(pallas_impl.JaxCallable):
-    """JaxCallable variant that allocates shard-map outputs with out_shardings."""
+    """JaxCallable variant that attaches out_shardings to exported out_avals."""
 
-    def __call__(self, *args, **kwargs):
-        self._validate_args(*args)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        orig_exported = self.exported
 
-        kernel_key = pallas_impl._get_kernel_invocation_key(
-            self.trace_key, args, kwargs, self.static_argnums)
-        output_shapes, out_tree = self.output_shapes.get(
-            kernel_key, (None, None))
-        kernel_exists = pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-            self.name, kernel_key)
-        if not output_shapes or not kernel_exists:
-            jax_args = pallas_impl.jax_placeholders(
-                args,
-                mesh=self.mesh,
-                partition_specs=self.input_partition_specs,
-            )
-            with jax._src.config.export_ignore_forward_compatibility(True):
-                lowered = self.exported(*jax_args, **kwargs)
-            pallas_impl.tpu_torch_pallas.register_custom_kernel(
-                self.name,
-                kernel_key,
-                serialized_mlir_module=lowered.mlir_module_serialized,
-            )
+        # Wraps exported, to attach sharding to output avals.
+        def _exported_with_shardings(*exported_args, **exported_kwargs):
+            lowered = orig_exported(*exported_args, **exported_kwargs)
             out_shardings = getattr(lowered, "_out_named_shardings", None)
-            if (out_shardings is None
-                    or len(out_shardings) != len(lowered.out_avals)):
-                out_shardings = [None] * len(lowered.out_avals)
-            output_shapes = [
-                _torch_placeholder_with_sharding(aval, sharding, self.mesh)
-                for aval, sharding in zip(lowered.out_avals, out_shardings)
-            ]
-            out_tree = lowered.out_tree
-            self.output_shapes[kernel_key] = (output_shapes, out_tree)
+            if out_shardings and len(out_shardings) == len(lowered.out_avals):
+                new_avals = []
+                for aval, sharding in zip(lowered.out_avals, out_shardings):
+                    if (sharding is not None and getattr(
+                            getattr(aval, "sharding", None), "spec",
+                            None) is None):
+                        aval = jax.core.ShapedArray(aval.shape,
+                                                    aval.dtype,
+                                                    sharding=sharding)
+                    new_avals.append(aval)
+                lowered = dataclasses.replace(lowered,
+                                              out_avals=tuple(new_avals))
+            return lowered
 
-        tensor_args = [
-            arg for i, arg in enumerate(args)
-            if arg is not None and i not in self.static_argnums
-        ]
-        results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
-            self.name,
-            kernel_key,
-            inputs=tensor_args,
-            output_shapes=output_shapes,
-            donate_argnums=self.donate_argnums,
-        )
-
-        for in_idx, out_idx in self.input_output_aliases.items():
-            tensor_args[in_idx].copy_(results[out_idx])
-
-        return out_tree.unflatten(results)
+        self.exported = _exported_with_shardings
 
 
 def _named_shardings(mesh: jax.sharding.Mesh,
@@ -208,13 +165,9 @@ def pcp_streaming_jax_op(
         )
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        out_shardings = getattr(lowered, "_out_named_shardings", None)
-        if out_shardings is None or len(out_shardings) != len(
-                lowered.out_avals):
-            out_shardings = [None] * len(lowered.out_avals)
         return lowered.out_tree.unflatten(
-            _torch_placeholder_with_sharding(aval, sharding, mesh)
-            for aval, sharding in zip(lowered.out_avals, out_shardings))
+            pallas_impl.torch_placeholder(aval, mesh=mesh)
+            for aval in lowered.out_avals)
 
     result.register_fake(fake_fn)
     return result
