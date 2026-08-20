@@ -1116,16 +1116,13 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         logger.warning(
             f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
         )
+        # Note: nothing currently asks for `case="mixed"` -- the MLA call site
+        # in `layers/common/attention_interface.py` only builds a
+        # `batched_decode` key and sets the prefill and mixed block counts
+        # itself. This branch is kept for callers that do ask.
         if tuning_key.case == "mixed":
-            # 1 is the minimum legal value: one KV page per block, so the
-            # kernel walks the paged cache a page at a time and spends its
-            # time waiting on DMA rather than reading or computing. On
-            # Kimi-Linear this fallback path measured 80% of device time at
-            # 2.76% FLOPS and 5.82% HBM utilization.
-            from vllm_torchtpu import envs as tpu_envs
-            override = tpu_envs.TPU_MLA_MIXED_KV_PAGES_PER_BLOCK
             return TunableParams(
-                num_kv_pages_per_block=override if override > 0 else 1,
+                num_kv_pages_per_block=1,
                 num_queries_per_block=16,
                 vmem_limit_bytes=62914560,
             )
