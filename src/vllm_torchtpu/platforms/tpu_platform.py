@@ -267,6 +267,42 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
             "--profiler-config.torch_profiler_dir=<dir>.")
 
 
+def _refuse_kv_head_dim_fold(vllm_config: "VllmConfig") -> None:
+    """Turn TPU_RPA_FOLD_KV_HEAD_DIM off where the folded page is not readable.
+
+    The fold changes what a KV page *means*: the packing slots stop being
+    (K|V, head) and become head_dim segments. Only the batched_rpa_longctx
+    HEAD_ALONG_SUBLANE kernel knows that. Anything else that reads or writes a
+    page -- the PCP streaming path (which packs through the mainline
+    batched_rpa wrapper), a draft layer sharing a pool sized for a wider head,
+    a KV connector shipping pages off-box -- would read the right bytes with
+    the wrong meaning, silently, which is the PR #275 failure class.
+
+    Refuse rather than let it happen. Mutating the environment is the choke
+    point because the kernel reads the flag directly and `enable_envs_cache()`
+    has not run yet at config time.
+    """
+    if not envs.TPU_RPA_FOLD_KV_HEAD_DIM:
+        return
+    parallel_config = vllm_config.parallel_config
+    reason = None
+    if not envs.USE_BATCHED_RPA_LONGCTX:
+        reason = "the batched_rpa_longctx kernel is not selected"
+    elif envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        reason = "the SEQ_ALONG_LANE layout has no packing slots to reclaim"
+    elif getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
+        reason = "PCP streaming packs KV through the unfolded mainline wrapper"
+    elif vllm_config.speculative_config is not None:
+        reason = "a draft layer may share a pool sized for a wider head"
+    elif vllm_config.kv_transfer_config is not None:
+        reason = "a KV connector ships pages that assume the unfolded layout"
+    if reason is not None:
+        os.environ["TPU_RPA_FOLD_KV_HEAD_DIM"] = "0"
+        logger.warning(
+            "TPU_RPA_FOLD_KV_HEAD_DIM was requested but is refused: %s. "
+            "Running with the unfolded KV page.", reason)
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -1032,6 +1068,7 @@ class TpuPlatform(Platform):
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size)
+        _refuse_kv_head_dim_fold(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

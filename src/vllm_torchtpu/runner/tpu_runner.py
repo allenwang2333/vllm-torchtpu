@@ -1182,6 +1182,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            attn_backend_cls=backend_cls,
         )
 
     @staticmethod
