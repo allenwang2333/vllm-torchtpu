@@ -1122,7 +1122,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=1,
-        num_kv_pages_per_block=4,
+        num_kv_pages_per_block=2,
         num_queries_per_block=256,
         vmem_limit_bytes=62914560,
     ),
