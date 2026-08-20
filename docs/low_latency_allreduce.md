@@ -482,15 +482,59 @@ Three things fall out:
   class *differences* are differential and unaffected. A unidirectional variant
   would separate a source-core effect from a destination-core one.
 
-**Where this points.** Hierarchy is worth building, but as *one kernel with two
-DMA phases*, not two kernels -- launch is paid per kernel, a DMA phase per phase,
-so the marginal cost is ~0.9 us rather than 2.59. Against that: routing
-inter-chip traffic through core 1 of every chip moves the binding far-peer term
-from 6.94 to 6.02 us; the barrier's peers drop 31 -> 15; and the egress cut
-(31M -> 7.5M with both cores carrying half the payload) attacks the term that
-actually binds at 14-21 KiB, where one-shot is already bandwidth-bound.
-`two_shot_all_reduce_ws` is already two phases in one kernel, so the shape is
-known.
+### 6a. Hierarchy does not help, and the reason is algebraic
+
+The cost model above says a two-level collective should be built as *one* kernel
+with extra DMA phases (~0.9 us each) rather than two kernels (2.59 us each), and
+that the egress cut should pay for it. `scripts/debug/probe_hierarchical_dma.py`
+tests that by issuing each scheme's exact DMA pattern in one kernel, against flat
+controls on the same harness. Every arm computes a real all-reduce and is checked
+against `psum`, so a pattern cannot pass by quietly moving less data.
+
+32 devices, us:
+
+| KiB | flat_oneshot | **flat_twoshot** | hier_oneshot | hier_oneshot_noc | hier_twoshot |
+|----:|-------------:|-----------------:|-------------:|-----------------:|-------------:|
+| 14 | 31.70 | **15.73** | 16.37 | 15.51 | 17.27 |
+| 21 | 43.90 | **15.77** | 19.11 | 18.23 | 17.56 |
+| 28 | 57.10 | **16.00** | 21.96 | 21.02 | 17.55 |
+| 56 | 100.23 | **17.21** | 31.05 | 30.21 | 18.08 |
+
+**Flat two-shot wins everywhere.** `hier_oneshot` beats `flat_oneshot` by 15-69
+us, which confirms the egress model works exactly as predicted -- but that was
+never the relevant comparison, because the gate already sends these payloads to
+two-shot.
+
+Against two-shot, hierarchy is **egress-neutral by identity**, not by a narrow
+margin. With `C` chips and `N = 2C` devices:
+
+* flat two-shot: `2M(N-1)/N` = `M(2C-1)/C`
+* hier two-shot: `M/2` (phase A) + `2(M/2)(C-1)/C` (phase B) + `M/2` (phase C)
+  = `M(1 + (C-1)/C)` = `M(2C-1)/C`
+
+The intra-chip round trip costs precisely what the smaller inter-chip collective
+saves, for *any* chip count. At 32 devices both are 1.9375M. So hierarchical
+two-shot can only lose by the cost of its extra phases, and the measured penalty
+(1.54 / 1.79 / 1.55 / 0.87 us) is exactly that.
+
+Dropping phase C does not rescue it. `hier_oneshot_noc` reaches 15.51 against
+flat two-shot's 15.73 -- a tie -- and it is not a usable collective (each core
+holds only its own half). Its two-shot equivalent would land near 16.4.
+
+The underlying reason is that two-shot's egress is already within 3% of the `2M`
+floor for any two-phase algorithm, so there is nothing left for hierarchy to cut.
+Hierarchy pays off only against one-shot's `M(N-1)`, and one-shot is not the
+kernel we run at these sizes.
+
+Two things worth keeping from the exercise:
+
+* **Phase C costs 0.77-0.94 us**, matching the pairwise probe's 0.94 us
+  on-package DMA. The cost model transfers, which is what makes it usable for
+  ruling designs out on paper before implementing them.
+* **An all-1/1-class routing does not compose with a split scheme.** If core `c`
+  owns half `c`, then core 0 of chip `i` must send half 0 to core 0 of chip `j`,
+  so the slow 0/0 legs (+0.89 us) are forced. Buying the far-peer term requires
+  idling core 0, which halves the egress cut.
 
 **Prerequisite nobody has noticed.** `allreduce_latency_bench.py` builds its mesh
 with `mesh_utils.create_device_mesh`, which returns a topology-optimized order
