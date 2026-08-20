@@ -398,6 +398,7 @@ class LowLatencyAllReduce:
         _REPLICATED = _replicated_spec()
         collective_id = self._next_collective_id
         self._next_collective_id += 1
+        steady = steady_barrier_enabled()
 
         def _fn(x: jax.Array, ws: jax.Array,
                 step: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -411,6 +412,7 @@ class LowLatencyAllReduce:
                                               axis_name=axis,
                                               num_devices=n,
                                               collective_id=collective_id,
+                                              steady_barrier=steady,
                                               has_side_effects=False)
 
             return jax.shard_map(body,
@@ -459,6 +461,7 @@ class LowLatencyAllReduce:
         _REPLICATED = _replicated_spec()
         collective_id = self._next_collective_id
         self._next_collective_id += 1
+        steady = steady_barrier_enabled()
 
         numel_a = 1
         for d in shape_a:
@@ -483,6 +486,7 @@ class LowLatencyAllReduce:
                     axis_name=axis,
                     num_devices=n,
                     collective_id=collective_id,
+                    steady_barrier=steady,
                     has_side_effects=False)
 
             return jax.shard_map(body,
@@ -529,6 +533,7 @@ class LowLatencyAllReduce:
         _REPLICATED = _replicated_spec()
         collective_id = self._next_collective_id
         self._next_collective_id += 1
+        steady = steady_barrier_enabled()
 
         numel = 1
         for d in shape:
@@ -550,6 +555,7 @@ class LowLatencyAllReduce:
                     axis_name=axis,
                     num_devices=n,
                     collective_id=collective_id,
+                    steady_barrier=steady,
                     has_side_effects=False)
                 return out.reshape(x.shape), rs, ag, step
 
@@ -844,6 +850,27 @@ def moe_concat_enabled() -> bool:
     import os
 
     return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT", "0") == "1"
+
+
+def steady_barrier_enabled() -> bool:
+    """Whether the _ws kernels keep their steady-state barrier.
+
+    True by default. Setting TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER=1
+    removes the barrier from every round except round 0, leaving the collective
+    with no synchronization primitive in its steady state -- the recv wait
+    already proves every peer finished the round that last read this slot. Worth
+    ~1.5 us per collective (see the kernel docstring for the argument and
+    docs/low_latency_allreduce.md section 5 for the measurements).
+
+    Off by default because the failure mode is a silent stale read and soundness
+    requires every rank to call the collective the same number of times in the
+    same order. Speculative decode, early exit, a _dummy_run firing on a subset
+    of ranks, or a non-unanimous bucket switch all break that.
+    """
+    import os
+
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER",
+                          "0") != "1"
 
 
 def moe_variadic_enabled() -> bool:

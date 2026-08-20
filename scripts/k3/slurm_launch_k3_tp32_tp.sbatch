@@ -69,6 +69,8 @@ export TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT="${TPU_LOW_LATENCY_ALLREDUCE_MOE_CON
 # Supersedes MOE_CONCAT at the same call site rather than composing with it, but
 # still requires it, since that is what patches the MoE tail at all.
 export TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC="${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC:-0}"
+# Remove the steady-state barrier from the _ws kernels (round 0 keeps its own).
+export TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER="${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER:-0}"
 LOG_DIR="${KIMI_K3_LOG_ROOT:-${REPO_DIR}/results/kimi-k3-verify-${SLURM_JOB_ID}}"
 # Set PROFILE_DIR to make /start_profile work. Both halves are required and
 # neither can be turned on after the server is up: the phased profiler is read
@@ -162,6 +164,12 @@ _LLAR_TAG=""
   _LLAR_TAG="${_LLAR_TAG}-cat"
 [[ "${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC:-0}" == "1" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-var"
+# This one is the most dangerous to share. Barrier-free changes the kernel *body*
+# and not the op signature, so unlike the workspace-count flags above it produces
+# no arity mismatch to fail on -- a shared cache would silently execute the
+# barriered program and the A/B would measure nothing at all.
+[[ "${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER:-0}" == "1" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-nobar"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -362,6 +370,7 @@ report_split() {
   echo "Low-latency all-reduce: TPU_LOW_LATENCY_ALLREDUCE=${TPU_LOW_LATENCY_ALLREDUCE}"
   echo "  moe_concat=${TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT}" \
        "moe_variadic=${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC}" \
+       "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
        "xla_cache=${VLLM_XLA_CACHE_PATH}"
   local ll_one ll_two ll_xla
   ll_one=$(grep -c -- "-> one_shot" "${SERVER_LOG}" 2>/dev/null || true)
@@ -392,5 +401,26 @@ cat <<EOF
 ============================================================
 
 EOF
+
+# POST_READY_CMD runs once the endpoint is up, then the job exits and releases
+# the nodes. Without it the job holds the allocation for its whole time limit,
+# which is right for interactive use and wrong for an A/B: driving the client by
+# hand from a login shell means the two arms can drift in what they actually ran,
+# and arm_check.sh already makes that argument ("a hand-assembled sequence
+# drifted between arms is not a comparison"). ENDPOINT and OUT are exported for
+# it. A non-zero exit is reported but still releases the nodes.
+if [[ -n "${POST_READY_CMD:-}" ]]; then
+  export ENDPOINT="http://${HEAD_IP}:${PORT}"
+  export OUT="${LOG_DIR}"
+  echo "POST_READY_CMD: ${POST_READY_CMD}"
+  echo "  ENDPOINT=${ENDPOINT}"
+  set +e
+  bash -c "${POST_READY_CMD}"
+  _post_rc=$?
+  set -e
+  echo "POST_READY_CMD exited ${_post_rc}; releasing the allocation."
+  scancel "${SLURM_JOB_ID}" 2>/dev/null || true
+  exit "${_post_rc}"
+fi
 
 wait "${SERVER_STEP_PID}"
