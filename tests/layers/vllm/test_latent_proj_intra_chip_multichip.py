@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.multichip
+pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 WORLD_SIZE = 8
 # The real K3 latent-projection shapes, scaled down only in the token count.
