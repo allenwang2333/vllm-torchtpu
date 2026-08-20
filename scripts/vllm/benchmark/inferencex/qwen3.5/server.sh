@@ -80,9 +80,16 @@ MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
-MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
+# Overridable: the derived value sizes a step to hold a whole prompt, which
+# makes prefill steps efficient but expensive to mix into a decode step -- under
+# DP lockstep every rank pads up to the same bucket. A smaller chunk trades a
+# little per-token prefill efficiency for much cheaper mixing, which is what a
+# tight TTFT target needs.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))}"
 
-MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
+# Overridable so one server can be measured at several concurrencies without
+# a fresh 25-minute compile for each; leave unset for the per-concurrency value.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-$((CONC * 2 / DP_SIZE))}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
 # Increase API-server frontend wait time since cold init may take long.
@@ -105,6 +112,22 @@ export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 # Skip padded tokens in the fused MoE so they activate no experts.
 export TPU_MOE_SKIP_PADDED_TOKENS=1
 
+# Measured on this benchmark at 8k1k c256 DP8_EP (2560 prompts): 29,163 ->
+# 31,101 total tok/s, median TPOT 60.15 -> 56.21 ms, GSM8K 0.980 strict.
+#
+# Destination-major SparseCore combine. The MoE combine is ~13% of device time
+# at prefill and v3 roughly halves it.
+export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
+# One Pallas call for gmm1 -> activation -> gmm2, intermediate held in VMEM.
+# Bit-exact against the two-call path; -8% on the MoE layer at the decode shape.
+export USE_FUSED_MOE_GMM="${USE_FUSED_MOE_GMM:-1}"
+# Stacked scheduling in the batched-RPA kernel. Worth +1.6% end to end on a
+# mixed batch even though every fixed-shape microbenchmark says it is slower --
+# the win is in how it schedules a mixed batch, not in any single shape.
+# Leave USE_BATCHED_RPA_SEQ_ON_LANE off: that layout is slower here and, unlike
+# this one, is not bit-identical to the mainline kernel.
+export USE_BATCHED_RPA_LONGCTX="${USE_BATCHED_RPA_LONGCTX:-1}"
+
 args=(
   "$MODEL"
   --served-model-name="$SERVED_NAME"
@@ -125,6 +148,13 @@ args=(
 )
 # Pass --load-format when streaming from GCS.
 [ -n "${LOAD_FORMAT:-}" ] && args+=(--load-format="$LOAD_FORMAT")
+
+# Word-split extra flags (profiler config, one-off overrides) onto the command
+# line. Matches how run_benchmarks.sh consumes EXTRA_SERVE_ARGS.
+if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
+  read -r -a extra_serve_args <<< "$EXTRA_SERVE_ARGS"
+  args+=("${extra_serve_args[@]}")
+fi
 
 set -x
 vllm serve "${args[@]}"

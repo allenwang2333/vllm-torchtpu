@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-MODEL=Qwen/Qwen3.5-397B-A17B-FP8
+MODEL="${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
 PORT="${PORT:-8000}"
 # Matching InferenceX's Qwen3.5 benchmarks.
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
@@ -32,7 +32,10 @@ ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-64}"
 
-num_prompts=$((CONC * 10))
+# InferenceX sends 10 prompts per concurrency slot. Overridable so A/B screening
+# runs can trade statistical power for wall-clock; leave unset for the real thing.
+num_prompts="${NUM_PROMPTS:-$((CONC * 10))}"
+num_warmups="${NUM_WARMUPS:-$((2 * CONC))}"
 STAMP="$(date +%m%d-%H%M)"   # month-day-hour-minute
 
 mkdir -p "$RESULT_DIR"
@@ -50,7 +53,7 @@ benchmark_cmd=(
   --request-rate inf
   --ignore-eos
   --save-result
-  --num-warmups "$((2 * CONC))"
+  --num-warmups "$num_warmups"
   --percentile-metrics 'ttft,tpot,itl,e2el'
   --result-dir "$RESULT_DIR"
   --result-filename "qwen3.5_isl${ISL}_osl${OSL}_conc${CONC}_${STAMP}.json"
