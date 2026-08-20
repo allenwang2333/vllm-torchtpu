@@ -2,8 +2,10 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly perf benchmark for Kimi-K3 on the multihost TPU v7x-32 pod
 # (4 hosts x 8 chips): TP=32 with EP. Single-request latency probe at
-# 8k in / 1k out — the bring-up operating point proven in dev build 156
-# (median TPOT ~54 ms, median TTFT ~15 s, 14.5 output tok/s at bs=1).
+# 8k in / 1k out. Baseline calibrated from dev builds 223/224: median
+# TPOT ~35.9 ms, median TTFT ~4.64 s, ~24.7 output tok/s at bs=1, with
+# run-to-run spread <= 0.3% on every gated metric — the default 5%
+# perf tolerance applies.
 MODEL="moonshotai/Kimi-K3"
 # v7x-32 hosts have no data disk that fits the 1561 GB checkpoint, so
 # weights stream directly from GCS via --load-format runai_streamer.
