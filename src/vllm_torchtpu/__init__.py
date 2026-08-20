@@ -604,7 +604,20 @@ def _patch_latent_moe_concat_allreduce() -> None:
         # kernel that never ran, because at K3's bucket 16 the pair is 336 KiB
         # and two_shot is 0.75x XLA there (job 143). No ceiling change rescues
         # that: two_shot is bandwidth-bound past ~112 KiB and only gets worse.
-        if mergeable and _llar.bucket_matches(entry):
+        variadic = _llar._MOE_VARIADIC_ENTRY
+        if (mergeable and variadic is not None
+                and _llar.bucket_matches(variadic)):
+            # One kernel, two operands, no join: each tensor keeps the layout
+            # its producer emitted, so the torch.cat below and its two slices
+            # disappear entirely. Measured 16.66 vs 17.35 us on the 21 KiB pair
+            # at 32 devices against an in-jit-concat baseline (job 265), and the
+            # cat's XLA-side relayout goes with it.
+            _, op, buffers = variadic
+            fused_output, shared_output = op(fused_output.contiguous(),
+                                             shared_output.contiguous(),
+                                             *buffers)
+            fused_output_is_reduced = True
+        elif mergeable and _llar.bucket_matches(entry):
             n_latent = fused_output.numel()
             pair = torch.cat(
                 [fused_output.reshape(-1),

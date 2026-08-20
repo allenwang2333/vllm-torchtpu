@@ -94,6 +94,8 @@ __all__ = [
     "two_shot_all_reduce_ws",
     "make_two_shot_workspace",
     "two_shot_all_reduce_pair_ws",
+    "two_shot_all_reduce_variadic_ws",
+    "make_two_shot_variadic_workspace",
     "make_two_shot_pair_workspace",
     "two_shot_pair_layout",
 ]
@@ -670,6 +672,269 @@ def two_shot_all_reduce_ws(x: jax.Array,
             disable_semaphore_checks=disable_semaphore_checks),
     )(x.reshape(num_devices, chunk, cols), rs, ag, step)
     return out.reshape(rows, cols), rs, ag, step
+
+
+# -----------------------------------------------------------------------------
+# Variadic two-shot: two operands, one kernel, no join.
+# -----------------------------------------------------------------------------
+
+
+def _two_shot_variadic_ws_kernel(a_ref, b_ref, rsa_in, rsb_in, aga_in, agb_in,
+                                 step_in_ref, oa_ref, ob_ref, rsa_ref, rsb_ref,
+                                 aga_ref, agb_ref, step_ref, rva, rvb, reda,
+                                 redb, local_sem, s1a_s, s1a_r, s1b_s, s1b_r,
+                                 s2a_s, s2a_r, s2b_s, s2b_r, *,
+                                 num_devices: int, axis_name: str,
+                                 barrier_first: bool, steady_barrier: bool):
+    """Reduce two independent operands in one launch, without concatenating.
+
+    K3's latent-MoE site produces ``(1, 3584)`` and ``(1, 7168)`` and needs both
+    reduced. Doing it as two collectives costs two launches, which measured
+    ~2x one collective (32.60 vs 17.35 us at 32 devices, job 265) -- hence the
+    ``torch.cat`` that has been in production. This kernel gets the single launch
+    without the join: each operand keeps its own width and its own DMAs, and they
+    share the barrier and the launch.
+
+    Every ref is 3-D ``(num_devices, chunk, cols)``. That is mandatory, not
+    stylistic: both dimensions of a *2-D* VMEM ref are tiled (bf16 as ``(8,128)``
+    with ``(2,1)`` packing), so extracting one row fails to lower even at a
+    static index --
+
+        memref_slice(memref<7x448xbf16, tiled<(8,128)(2,1)>>) -> 1x448
+        "size at dimension 0 is divisible by the tile dimension 8"
+
+    -- which is what sank the first attempt at this design and produced the
+    mistaken conclusion (``scripts/debug/probe_variadic_dma.py``) that no
+    per-peer offset can lower at all. That probe used 1-D operands sliced with
+    ``pl.ds()``, where bf16 tiles at 16x128 = 2048 elements, so its "aligned"
+    arm was never aligned. Putting the peer index on an untiled leading
+    dimension is the fix, and it is the same reason
+    :func:`two_shot_all_reduce_ws` reshapes before its ``pallas_call``.
+
+    The two operands' phase-1 sends are issued together and waited together, so
+    their transfers overlap rather than serialize; likewise phase 2.
+    """
+    del rsa_in, rsb_in, aga_in, agb_in  # aliased onto the output views
+    my_id = lax.axis_index(axis_name)
+    step = step_in_ref[0]
+    slot = lax.rem(step, 2)
+
+    if barrier_first:
+        _full_barrier(my_id, num_devices, double_barrier=True)
+    else:
+
+        @pl.when(step == 0)
+        def _():
+            _full_barrier(my_id, num_devices, double_barrier=True)
+
+    # Phase 1 -- reduce-scatter both operands. Interleaved so both are in
+    # flight at once.
+    copies = []
+    for i in range(1, num_devices):
+        peer = lax.rem(my_id + i, num_devices)
+        for src, dst, ss, rs in ((a_ref, rsa_ref, s1a_s, s1a_r),
+                                 (b_ref, rsb_ref, s1b_s, s1b_r)):
+            copy = pltpu.make_async_remote_copy(
+                src_ref=src.at[peer],
+                dst_ref=dst.at[slot, i - 1],
+                send_sem=ss.at[slot],
+                recv_sem=rs.at[slot],
+                device_id=(peer, ),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            copy.start()
+            copies.append(copy)
+
+    # See _one_shot_ws_kernel for why the steady-state barrier is removable.
+    if not barrier_first and steady_barrier:
+
+        @pl.when(step != 0)
+        def _():
+            _full_barrier(my_id, num_devices, double_barrier=True)
+
+    for copy in copies:
+        copy.wait()
+
+    # Workspaces live in HBM so their addresses survive between kernels; stage
+    # each into VMEM to reduce it.
+    for ws, vm in ((rsa_ref, rva), (rsb_ref, rvb)):
+        local = pltpu.make_async_copy(src_ref=ws.at[slot],
+                                      dst_ref=vm,
+                                      sem=local_sem)
+        local.start()
+        local.wait()
+
+    acc_a = a_ref[my_id]
+    for i in range(num_devices - 1):
+        acc_a = acc_a + rva[i]
+    reda[...] = acc_a
+    acc_b = b_ref[my_id]
+    for i in range(num_devices - 1):
+        acc_b = acc_b + rvb[i]
+    redb[...] = acc_b
+
+    # Phase 2 -- all-gather each reduced chunk into slot ``my_id`` everywhere,
+    # our own included.
+    copies = []
+    for red, ag, ss, rs in ((reda, aga_ref, s2a_s, s2a_r), (redb, agb_ref,
+                                                            s2b_s, s2b_r)):
+        local = pltpu.make_async_copy(src_ref=red,
+                                      dst_ref=ag.at[slot, my_id],
+                                      sem=local_sem)
+        local.start()
+        local.wait()
+        for i in range(1, num_devices):
+            copy = pltpu.make_async_remote_copy(
+                src_ref=red,
+                dst_ref=ag.at[slot, my_id],
+                send_sem=ss.at[slot],
+                recv_sem=rs.at[slot],
+                device_id=(lax.rem(my_id + i, num_devices), ),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            copy.start()
+            copies.append(copy)
+    for copy in copies:
+        copy.wait()
+
+    for ag, out in ((aga_ref, oa_ref), (agb_ref, ob_ref)):
+        out_copy = pltpu.make_async_copy(src_ref=ag.at[slot],
+                                         dst_ref=out,
+                                         sem=local_sem)
+        out_copy.start()
+        out_copy.wait()
+    step_ref[0] = step + 1
+
+
+def make_two_shot_variadic_workspace(numel_a: int, numel_b: int, dtype,
+                                     num_devices: int):
+    """Zeroed ``(rsa, rsb, aga, agb, step)`` for the variadic two-shot."""
+    import jax.numpy as jnp
+    if numel_a % num_devices or numel_b % num_devices:
+        raise ValueError(
+            f"both element counts must divide num_devices ({num_devices}); "
+            f"got {numel_a} and {numel_b}")
+    ca = numel_a // num_devices
+    cb = numel_b // num_devices
+    return (jnp.zeros((2, num_devices - 1, 1, ca),
+                      dtype), jnp.zeros((2, num_devices - 1, 1, cb), dtype),
+            jnp.zeros((2, num_devices, 1, ca),
+                      dtype), jnp.zeros((2, num_devices, 1, cb),
+                                        dtype), jnp.zeros((1, ), jnp.int32))
+
+
+def two_shot_all_reduce_variadic_ws(a: jax.Array,
+                                    b: jax.Array,
+                                    rsa: jax.Array,
+                                    rsb: jax.Array,
+                                    aga: jax.Array,
+                                    agb: jax.Array,
+                                    step: jax.Array,
+                                    *,
+                                    axis_name: str,
+                                    num_devices: int,
+                                    collective_id: int = 0,
+                                    barrier_first: bool = False,
+                                    steady_barrier: bool = True,
+                                    disable_semaphore_checks: bool = True,
+                                    has_side_effects: bool = True):
+    """All-reduce two operands in one kernel, without concatenating them.
+
+    Replaces ``torch.cat`` + one :func:`two_shot_all_reduce_ws` at K3's
+    latent-MoE site. Measured at 32 devices on the 21 KiB pair (job 265, against
+    an in-jit-concat baseline): 16.66 us against 17.35, and against 32.60 for two
+    separate collectives.
+
+    Both operands may have any shape whose element count divides
+    ``num_devices``; each is reshaped to ``(num_devices, 1, numel/num_devices)``
+    internally and restored on the way out. **Equal per-device chunk widths are
+    rejected** -- see the ValueError below for the measured failure and why it is
+    a hard error rather than a warning. See
+    :func:`one_shot_all_reduce_ws` for ``disable_semaphore_checks`` and
+    ``has_side_effects``, and :func:`two_shot_all_reduce_ws` for what
+    ``steady_barrier`` trades.
+
+    Returns:
+      ``(out_a, out_b, rsa, rsb, aga, agb, step)`` -- thread the last five into
+      the next call.
+    """
+    if num_devices < 2:
+        return a, b, rsa, rsb, aga, agb, step
+    numel_a = math.prod(a.shape)
+    numel_b = math.prod(b.shape)
+    if numel_a % num_devices or numel_b % num_devices:
+        raise ValueError(
+            f"both element counts must divide num_devices ({num_devices}); "
+            f"got {numel_a} and {numel_b}")
+    ca = numel_a // num_devices
+    cb = numel_b // num_devices
+    if ca == cb:
+        raise ValueError(
+            f"equal per-device chunk widths ({ca}) are not supported: the "
+            "kernel returns partially corrupted results for both operands. "
+            "Measured at 32 devices across 4 processes with a=1.0 and b=2.0, "
+            "every chunk of both outputs came back containing a mix of 32.0 "
+            "and 64.0 -- interleaved within chunks, not one operand wholesale "
+            "receiving the other's data. It is deterministic, reproduces for "
+            "every equal width tried (64, 112, 128 and 256 element chunks), "
+            "does not reproduce at 8 devices in one process, and survives both "
+            "distinct collective_ids and optimization_barriers on the "
+            "workspaces. The likely mechanism is a DMA wait being satisfied by "
+            "the other operand's arrival, which is only possible when the byte "
+            "counts match -- but that is unproven, which is exactly why this "
+            "raises instead of warning. K3 is unaffected (112 against 224). "
+            "See scripts/debug/probe_variadic_bug.py.")
+
+    kernel = functools.partial(_two_shot_variadic_ws_kernel,
+                               num_devices=num_devices,
+                               axis_name=axis_name,
+                               barrier_first=barrier_first,
+                               steady_barrier=steady_barrier)
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    oa, ob, rsa, rsb, aga, agb, step = pl.pallas_call(
+        kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((num_devices, 1, ca), a.dtype),
+            jax.ShapeDtypeStruct((num_devices, 1, cb), b.dtype),
+            jax.ShapeDtypeStruct(rsa.shape, rsa.dtype),
+            jax.ShapeDtypeStruct(rsb.shape, rsb.dtype),
+            jax.ShapeDtypeStruct(aga.shape, aga.dtype),
+            jax.ShapeDtypeStruct(agb.shape, agb.dtype),
+            jax.ShapeDtypeStruct(step.shape, step.dtype),
+        ),
+        in_specs=[
+            vmem_spec, vmem_spec, any_spec, any_spec, any_spec, any_spec,
+            smem_spec
+        ],
+        out_specs=[
+            vmem_spec, vmem_spec, any_spec, any_spec, any_spec, any_spec,
+            smem_spec
+        ],
+        # Alias every workspace and the counter so the kernel updates them in
+        # place and their buffer identity is stable across calls.
+        input_output_aliases={
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6
+        },
+        scratch_shapes=[
+            pltpu.VMEM((num_devices - 1, 1, ca), a.dtype),
+            pltpu.VMEM((num_devices - 1, 1, cb), b.dtype),
+            pltpu.VMEM((1, ca), a.dtype),
+            pltpu.VMEM((1, cb), b.dtype),
+            pltpu.SemaphoreType.DMA,
+        ] + [pltpu.SemaphoreType.DMA((2, ))] * 8,
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            has_side_effects=has_side_effects,
+            disable_semaphore_checks=disable_semaphore_checks),
+    )(a.reshape(num_devices, 1, ca), b.reshape(num_devices, 1, cb), rsa, rsb,
+      aga, agb, step)
+    return (oa.reshape(a.shape), ob.reshape(b.shape), rsa, rsb, aga, agb, step)
 
 
 def make_two_shot_workspace(x_shape, dtype, num_devices: int):

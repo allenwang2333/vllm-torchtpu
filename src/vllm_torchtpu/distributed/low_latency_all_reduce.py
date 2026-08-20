@@ -434,6 +434,87 @@ class LowLatencyAllReduce:
         step = torch.zeros(1, dtype=torch.int32, device=device)
         return op, (ws, step)
 
+    def _build_two_shot_variadic(self, shape_a: tuple[int, ...],
+                                 shape_b: tuple[int, ...], dtype: torch.dtype):
+        """Two-operand two-shot: reduces K3's MoE pair without concatenating.
+
+        The ``torch.cat`` this replaces exists only to turn two collectives into
+        one, because two launches measured ~2x one (32.60 vs 17.35 us at 32
+        devices, job 265). This gets the single launch without the join, so each
+        operand keeps the layout its producer emits.
+
+        Returns ``(op, buffers)`` where ``buffers`` is
+        ``(rsa, rsb, aga, agb, step)``.
+        """
+        import jax
+
+        from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
+            two_shot_all_reduce_variadic_ws
+        from vllm_torchtpu.kernels.collectives.sharded_jax_op import \
+            sharded_jax_op
+
+        mesh = self._mesh
+        axis = self._axis
+        n = self._world_size
+        _REPLICATED = _replicated_spec()
+        collective_id = self._next_collective_id
+        self._next_collective_id += 1
+
+        numel_a = 1
+        for d in shape_a:
+            numel_a *= d
+        numel_b = 1
+        for d in shape_b:
+            numel_b *= d
+
+        def _fn(a, b, rsa, rsb, aga, agb, step):
+
+            def body(a, b, rsa, rsb, aga, agb, step):
+                # has_side_effects=False to compile through torch_tpu; see the
+                # kernel docstring.
+                return two_shot_all_reduce_variadic_ws(
+                    a,
+                    b,
+                    rsa,
+                    rsb,
+                    aga,
+                    agb,
+                    step,
+                    axis_name=axis,
+                    num_devices=n,
+                    collective_id=collective_id,
+                    has_side_effects=False)
+
+            return jax.shard_map(body,
+                                 mesh=mesh,
+                                 in_specs=(_REPLICATED, ) * 7,
+                                 out_specs=(_REPLICATED, ) * 7,
+                                 check_vma=False)(a, b, rsa, rsb, aga, agb,
+                                                  step)
+
+        name = (f"vllm_torchtpu::ll_all_reduce_variadic_{collective_id}")
+        op = sharded_jax_op(
+            name,
+            _fn,
+            mesh=mesh,
+            input_partition_specs=(_REPLICATED, ) * 7,
+            output_partition_specs=(_REPLICATED, ) * 7,
+            # rsa, rsb, aga, agb, step -- args 2..6. See donation_enabled().
+            donate_argnums=tuple(range(2, 7)) if donation_enabled() else None,
+        )
+        # Allocated as torch tensors on the comm's device, matching
+        # _build_two_shot -- they are op arguments, not jax values. Shapes must
+        # mirror make_two_shot_variadic_workspace exactly.
+        ca = numel_a // n
+        cb = numel_b // n
+        device = self._comm.device
+        rsa = torch.zeros((2, n - 1, 1, ca), dtype=dtype, device=device)
+        rsb = torch.zeros((2, n - 1, 1, cb), dtype=dtype, device=device)
+        aga = torch.zeros((2, n, 1, ca), dtype=dtype, device=device)
+        agb = torch.zeros((2, n, 1, cb), dtype=dtype, device=device)
+        step = torch.zeros(1, dtype=torch.int32, device=device)
+        return op, (rsa, rsb, aga, agb, step)
+
     def _build_two_shot(self, shape: tuple[int, ...], dtype: torch.dtype):
         import jax
 
@@ -749,6 +830,8 @@ def bucket_matches(entry: tuple) -> bool:
 # communicator can keep routing by shape with no ambiguity, so this needs none
 # of the call-site patching that halted the SparseCore.
 _MOE_CONCAT_ENTRY: tuple | None = None
+# (num_tokens, op, buffers) for the variadic pair reduction.
+_MOE_VARIADIC_ENTRY: tuple | None = None
 
 
 def moe_concat_enabled() -> bool:
@@ -761,6 +844,65 @@ def moe_concat_enabled() -> bool:
     import os
 
     return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT", "0") == "1"
+
+
+def moe_variadic_enabled() -> bool:
+    """Whether to reduce K3's latent-MoE pair with the variadic kernel.
+
+    Off by default. It supersedes TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT rather
+    than composing with it: both wire the same call site, and this one removes
+    the ``torch.cat`` that one depends on. Requires the concat path to be
+    enabled too, since that is what patches the MoE tail at all.
+    """
+    import os
+
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC", "0") == "1"
+
+
+def get_moe_variadic_op(dispatcher: LowLatencyAllReduce, shape_a: tuple[int,
+                                                                        ...],
+                        shape_b: tuple[int, ...], dtype: torch.dtype) -> Any:
+    """An opaque op that reduces the latent-MoE pair as two operands.
+
+    Same reasoning as ``get_moe_concat_op`` for why this is a custom_op bound to
+    fixed shapes rather than anything that inspects dims: reading a dim in
+    traced Python pins vLLM's dynamic token dimension and fails compilation.
+    """
+    name = (f"vllm_torchtpu::ll_all_reduce_moe_variadic_"
+            f"{dispatcher.op_suffix}")
+    existing = _ENTRY_OPS.get(name)
+    if existing is not None:
+        return existing
+
+    inner, buffers = dispatcher._build_two_shot_variadic(
+        shape_a, shape_b, dtype)
+    donate = donation_enabled()
+    expect_a, expect_b = tuple(shape_a), tuple(shape_b)
+
+    def _impl(a: torch.Tensor, b: torch.Tensor, rsa: torch.Tensor,
+              rsb: torch.Tensor, aga: torch.Tensor, agb: torch.Tensor,
+              step: torch.Tensor) -> list[torch.Tensor]:
+        if (tuple(a.shape) == expect_a and tuple(b.shape) == expect_b
+                and a.dtype == dtype and b.dtype == dtype
+                and a.is_contiguous() and b.is_contiguous()):
+            out = inner(a, b, rsa, rsb, aga, agb, step)
+            oa, ob, new = out[0], out[1], out[2:]
+            if not donate:
+                for dst, src in zip((rsa, rsb, aga, agb, step), new):
+                    dst.copy_(src)
+            return [oa, ob]
+        # Any shape we were not built for falls back; correctness first.
+        return [
+            dispatcher.xla_all_reduce(a),
+            dispatcher.xla_all_reduce(b),
+        ]
+
+    op = torch.library.custom_op(name, _impl, mutates_args=())
+    op.register_fake(
+        lambda a, b, rsa, rsb, aga, agb, step:
+        [torch.empty_like(a), torch.empty_like(b)])
+    _ENTRY_OPS[name] = op
+    return op, buffers
 
 
 def get_entry_op(dispatcher: LowLatencyAllReduce) -> Any:
@@ -925,6 +1067,24 @@ def _moe_concat_width(vllm_config) -> int | None:
     return hidden + latent
 
 
+def _moe_latent_width(vllm_config) -> int | None:
+    """Routed-expert latent width, or None. The narrower half of the pair."""
+    model_config = vllm_config.model_config
+    hf = getattr(model_config, "hf_text_config",
+                 None) or model_config.hf_config
+    latent = getattr(hf, "routed_expert_hidden_size", None)
+    return latent if isinstance(latent, int) and latent > 0 else None
+
+
+def _moe_hidden_width(vllm_config) -> int | None:
+    """Hidden size, or None. The wider half of the pair."""
+    model_config = vllm_config.model_config
+    hf = getattr(model_config, "hf_text_config",
+                 None) or model_config.hf_config
+    hidden = getattr(hf, "hidden_size", None)
+    return hidden if isinstance(hidden, int) and hidden > 0 else None
+
+
 def _candidate_shapes(vllm_config) -> tuple[list[tuple[int, int]], Any]:
     """(rows, cols) an all-reduce might carry, derived from the config.
 
@@ -1085,9 +1245,10 @@ def warmup(vllm_config) -> None:
             "'rowparallel'; using 'all'.", site)
         site = "all"
 
-    global _ROWPARALLEL_ENTRY, _MOE_CONCAT_ENTRY
+    global _ROWPARALLEL_ENTRY, _MOE_CONCAT_ENTRY, _MOE_VARIADIC_ENTRY
     _ROWPARALLEL_ENTRY = None
     _MOE_CONCAT_ENTRY = None
+    _MOE_VARIADIC_ENTRY = None
     communicator._ll_entry = None
 
     # Entries carry the token bucket they were compiled for as element 0, so a
@@ -1105,6 +1266,46 @@ def warmup(vllm_config) -> None:
             "Low-latency all-reduce: latent-MoE pair wired to one %s over %s; "
             "other token buckets keep upstream's two reductions.",
             concat_plan.kernel, concat_plan.shape)
+
+        # The variadic kernel supersedes the concat for the same call site: it
+        # reduces both operands in one launch without joining them, so the
+        # torch.cat and both reshapes at the call site disappear. Built from the
+        # component widths rather than concat_plan's summed one.
+        if moe_variadic_enabled():
+            latent = _moe_latent_width(vllm_config)
+            hidden = _moe_hidden_width(vllm_config)
+            rows = concat_plan.shape[0]
+            if latent is None or hidden is None:
+                logger.warning(
+                    "TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC is set but the "
+                    "component widths could not be read; keeping the concat.")
+            elif (latent * rows) % dispatcher._world_size or (
+                    hidden * rows) % dispatcher._world_size:
+                logger.warning(
+                    "Variadic pair needs both element counts divisible by %d; "
+                    "got %d and %d. Keeping the concat.",
+                    dispatcher._world_size, latent * rows, hidden * rows)
+            elif (
+                (latent * rows) // dispatcher._world_size == (hidden * rows) //
+                    dispatcher._world_size):
+                # The kernel corrupts both operands when their per-device chunk
+                # widths match; it raises rather than risk it, so decline here
+                # and keep the concat instead of taking down warmup. K3 is
+                # 112 against 224 and unaffected. See the kernel's ValueError.
+                logger.warning(
+                    "Variadic pair declined: latent and hidden give equal "
+                    "per-device chunks (%d), which the kernel does not support. "
+                    "Keeping the concat.",
+                    (latent * rows) // dispatcher._world_size)
+            else:
+                op, buffers = get_moe_variadic_op(dispatcher, (rows, latent),
+                                                  (rows, hidden),
+                                                  concat_plan.dtype)
+                _MOE_VARIADIC_ENTRY = (rows, op, buffers)
+                logger.info(
+                    "Low-latency all-reduce: latent-MoE pair wired to the "
+                    "VARIADIC two_shot over (%d,%d)+(%d,%d) -- no concat, no "
+                    "reshape at the call site.", rows, latent, rows, hidden)
 
     if chosen is not None:
         # get_entry_op reads primary_plan to fix the op's arity, so it must be
