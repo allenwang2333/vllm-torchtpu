@@ -1156,9 +1156,30 @@ _MIXED_KV_PAGES_TARGET = 64
 #     queries : 8      16     32     64     128
 #     ms      : 4.888  2.808  1.756  1.256  1.041
 #
-# 16 -> 128 is 2.70x on the kernel. Still improving at 128, so this target is
-# where the measurement stops rather than where the curve does.
-_MIXED_QUERIES_TARGET = 128
+# 16 -> 128 is 2.70x on the kernel. Sweeping further, at 64 pages per block
+# and q_split=2: 128 -> 0.976 ms, 256 -> 0.911, 512 -> 1.505. 256 is the
+# measured optimum and 512 is past the turn, where it also stops compiling
+# without a query split.
+#
+# Note the VMEM arithmetic below does not predict that boundary: it would
+# happily allow 2000+ query rows, while the kernel's own intermediates run
+# out at somewhere between 256 and 512. This target, not the budget term, is
+# what keeps the schedule inside measured-safe territory.
+_MIXED_QUERIES_TARGET = 256
+
+# Query-parallel split. The kernel accepts one and nothing ever passed it, so
+# it has always run at 1. Measured, it wins at every query block size tried:
+#
+#     queries : 64     128    256    (ms, 64 pages per block)
+#     split 1 : 1.184  1.047  1.018
+#     split 2 : 1.102  0.976  0.911   <- best everywhere
+#     split 4 : 1.172  1.016  0.956
+#     split 8 : 1.495  1.060  0.953
+#
+# It also relieves VMEM rather than only costing it: 512 queries at split 1
+# fails to compile with CompileTimeScopedVmemOom, and split >= 2 makes the
+# same configuration legal by working through the query rows in stages.
+_MIXED_Q_SPLIT = 2
 
 _DTYPE_BYTES = {
     "float8_e4m3fn": 1,
@@ -1218,6 +1239,24 @@ def mixed_queries_per_block(tuning_key: TuningKey, kv_pages: int) -> int:
     return max(_prev_power_of_two(queries), 1)
 
 
+def mixed_q_split(tuning_key: TuningKey) -> int:
+    """Query-parallel split for the mixed kernel.
+
+    Constant rather than derived: it won at every query block size measured,
+    and there is no shape-dependent model behind that yet. Splitting works
+    through the query rows in stages, which both overlaps better and lowers
+    peak VMEM -- a configuration that fails to compile at split 1 can succeed
+    at 2.
+
+    `TPU_MLA_MIXED_Q_SPLIT` overrides; 0 uses the measured default.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override = tpu_envs.TPU_MLA_MIXED_Q_SPLIT
+    if override > 0:
+        return override
+    return _MIXED_Q_SPLIT
+
+
 def mixed_kv_pages_per_block(tuning_key: TuningKey) -> int:
     """KV pages per block for the mixed kernel when no tuned entry matches.
 
@@ -1268,6 +1307,7 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
                 num_kv_pages_per_block=kv_pages,
                 num_queries_per_block=mixed_queries_per_block(
                     tuning_key, kv_pages),
+                q_split=mixed_q_split(tuning_key),
                 vmem_limit_bytes=mixed_vmem_limit_bytes(),
             )
 

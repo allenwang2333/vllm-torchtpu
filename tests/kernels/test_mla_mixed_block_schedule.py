@@ -17,7 +17,8 @@ from __future__ import annotations
 import pytest
 
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (
-    TuningKey, mixed_kv_pages_per_block, mixed_queries_per_block)
+    TuningKey, mixed_kv_pages_per_block, mixed_q_split,
+    mixed_queries_per_block)
 
 
 def _key(**overrides) -> TuningKey:
@@ -84,14 +85,14 @@ def test_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_queries_reproduce_the_measured_optimum() -> None:
-    """Kimi-Linear's shape must land on 128 query rows per block.
+    """Kimi-Linear's shape must land on 256 query rows per block.
 
-    Swept at kernel level with `scripts/kernels/autotune_mla.py` at 32 pages
-    per block: 8 -> 4.888 ms, 16 -> 2.808, 32 -> 1.756, 64 -> 1.256,
-    128 -> 1.041. The fallback had this pinned at 16.
+    Swept at kernel level with `scripts/kernels/autotune_mla.py`. At 64 pages
+    per block and a query split of 2: 128 -> 0.976 ms, 256 -> 0.911,
+    512 -> 1.505. The fallback had this pinned at 16.
     """
     key = _key()
-    assert mixed_queries_per_block(key, mixed_kv_pages_per_block(key)) == 128
+    assert mixed_queries_per_block(key, mixed_kv_pages_per_block(key)) == 256
 
 
 def test_queries_never_exceed_the_batch() -> None:
@@ -128,3 +129,17 @@ def test_queries_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_torchtpu.envs as tpu_envs
     monkeypatch.setattr(tpu_envs, "TPU_MLA_MIXED_QUERIES_PER_BLOCK", 12)
     assert mixed_queries_per_block(_key(), 32) == 12
+
+
+def test_q_split_matches_the_measured_default() -> None:
+    """The query split won at every query block size measured.
+
+    Nothing ever passed this parameter, so the kernel ran at 1 throughout.
+    """
+    assert mixed_q_split(_key()) == 2
+
+
+def test_q_split_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_torchtpu.envs as tpu_envs
+    monkeypatch.setattr(tpu_envs, "TPU_MLA_MIXED_Q_SPLIT", 5)
+    assert mixed_q_split(_key()) == 5

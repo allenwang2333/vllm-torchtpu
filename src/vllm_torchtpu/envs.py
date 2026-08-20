@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     TPU_MLA_MIXED_KV_PAGES_PER_BLOCK: int = 0
     TPU_MLA_MIXED_VMEM_MB: int = 0
     TPU_MLA_MIXED_QUERIES_PER_BLOCK: int = 0
+    TPU_MLA_MIXED_Q_SPLIT: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -319,6 +320,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 16, and kernel-level sweeps put 128 at 2.70x that.
     "TPU_MLA_MIXED_QUERIES_PER_BLOCK":
     lambda: int(os.getenv("TPU_MLA_MIXED_QUERIES_PER_BLOCK") or "0"),
+
+    # Query-parallel split for the MLA mixed kernel; 0 uses the measured
+    # default. Nothing ever passed this, so the kernel ran at 1 throughout.
+    "TPU_MLA_MIXED_Q_SPLIT":
+    lambda: int(os.getenv("TPU_MLA_MIXED_Q_SPLIT") or "0"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.

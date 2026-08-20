@@ -626,6 +626,11 @@ def mla_attention(
             num_kv_pages_per_block=num_kv_pages_per_blocks,
             num_queries_per_block=num_queries_per_blocks,
             decode_batch_size=decode_batch_size,
+            # Never passed before, so the kernel ran at its default of 1. It
+            # works through the query rows in stages, which overlaps better
+            # and lowers peak VMEM: 0.911 ms at split 2 against 1.018 at 1,
+            # and a 512-query block that fails to compile at 1 succeeds at 2.
+            mixed_q_split=mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)
