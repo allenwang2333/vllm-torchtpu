@@ -68,60 +68,36 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
+  # Bring-up: multi-host smoke test on the smallest model we have.
+  #
+  # The only multi-host coverage today is the GLM-5.2-FP8 perf suite, which
+  # takes ~an hour and needs a 355GB checkpoint — too heavy to gate a PR on.
+  # This runs the same run_multihost.sh plumbing (Ray head + worker containers
+  # across the two hosts of a v7x-16 slice, TP=16) against Qwen3-0.6B, so a
+  # break in the multi-host path shows up in minutes instead of at 09:00 UTC.
+  #
+  # Qwen3-0.6B is a plain HF repo id on purpose. A gs:// URI would be staged
+  # into the head's assets cache and the resulting head-local path shipped to
+  # the worker inside the pickled VllmConfig, where it does not exist; a repo
+  # id is resolved independently by each host against its own mounted
+  # ~/hf_home. That failure is what PR #338 hit, and it is a separate fix.
   # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  - label: "[multihost] offline_inference.py (Qwen3-0.6B, TP16, ray)"
+    key: mh_offline_ray
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: tpu_v7x_16_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "1800"
     commands:
       - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        bash .buildkite/scripts/run_multihost.sh \
           python3 examples/offline_inference.py \
             --model Qwen/Qwen3-0.6B \
+            --tensor-parallel-size 16 \
             --max-model-len 256 \
             --max-num-batched-tokens 256 \
-            --max-tokens 32'
-
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+            --max-tokens 32
+    artifact_paths:
+      - "perf_eval_results/**/*"
