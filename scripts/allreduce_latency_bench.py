@@ -195,7 +195,12 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
     """
     scale = 1.0 / num_devices
 
-    if impl == "twoshot_ws":
+    # *_nb drop the steady-state barrier, keeping only round 0's. The recv wait
+    # is all-to-all, so being in round k already proves every peer finished the
+    # round that last read this slot; see the kernel docstring. Validate with
+    # scripts/allreduce_ws_stress.py --no-steady-barrier before reading these.
+    if impl in ("twoshot_ws", "twoshot_ws_nb"):
+        steady = impl == "twoshot_ws"
 
         def body(local_x):
             v = local_x[0]
@@ -203,10 +208,18 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
                 v.shape, v.dtype, num_devices)
             for _ in range(n_ops):
                 v, rs, ag, step = llar.two_shot_all_reduce_ws(
-                    v, rs, ag, step, axis_name=AXIS, num_devices=num_devices)
+                    v,
+                    rs,
+                    ag,
+                    step,
+                    axis_name=AXIS,
+                    num_devices=num_devices,
+                    steady_barrier=steady)
                 v = v * scale
             return v[None]
-    elif impl == "oneshot_ws":
+    elif impl in ("oneshot_ws", "oneshot_ws_nb"):
+        steady = impl == "oneshot_ws"
+
         # Persistent workspace threaded call-to-call; that liveness is what
         # lets the kernel barrier after its sends instead of before.
         def body(local_x):
@@ -214,7 +227,12 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
             ws, step = llar.make_workspace(v.shape, v.dtype, num_devices)
             for _ in range(n_ops):
                 v, ws, step = llar.one_shot_all_reduce_ws(
-                    v, ws, step, axis_name=AXIS, num_devices=num_devices)
+                    v,
+                    ws,
+                    step,
+                    axis_name=AXIS,
+                    num_devices=num_devices,
+                    steady_barrier=steady)
                 v = v * scale
             return v[None]
     else:
@@ -356,16 +374,16 @@ def main():
             lat = {}
             absolute = {}
             for impl in impls:
-                if (impl in ("twoshot", "twoshot_ws")
-                        and rows % num_devices != 0):
+                if (impl.startswith("twoshot") and rows % num_devices != 0):
                     lat[impl] = None
                     continue
                 try:
                     if not ARGS.no_verify:
                         err = (verify_chain(impl, mesh, num_devices, x_dev,
                                             ARGS.iters_lo) if impl
-                               in ("oneshot_ws", "twoshot_ws") else verify(
-                                   impl, mesh, num_devices, x_dev))
+                               in ("oneshot_ws", "oneshot_ws_nb", "twoshot_ws",
+                                   "twoshot_ws_nb") else verify(
+                                       impl, mesh, num_devices, x_dev))
                         # bfloat16 sums N-1 peers in a different order than
                         # psum, and that drift grows with rounds and devices
                         # (0.02 at 8 devices, 0.05 at 32). A fixed threshold

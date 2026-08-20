@@ -221,7 +221,8 @@ def _one_shot_ws_kernel(x_ref,
                         *,
                         num_devices: int,
                         axis_name: str,
-                        barrier_first: bool = False):
+                        barrier_first: bool = False,
+                        steady_barrier: bool = True):
     del ws_in_ref  # aliased onto ws_ref; write through the output view
     my_id = lax.axis_index(axis_name)
     step = step_in_ref[0]
@@ -265,7 +266,37 @@ def _one_shot_ws_kernel(x_ref,
         copy.start()
         copies.append(copy)
 
-    if not barrier_first:
+    # steady_barrier=False removes the barrier from every round *except* round
+    # 0, on the argument that the recv wait already establishes the ordering the
+    # barrier was buying. This is the TPU analogue of the barrier-free (Lamport)
+    # collectives used on NVLink: there the data word doubles as the ready flag
+    # so no separate flag round-trip is needed; here the DMA's recv semaphore is
+    # already delivered by the same hardware transaction as the data, so
+    # arrival detection was never what cost us anything. What the barrier
+    # actually buys is the *buffer-reuse* guarantee -- exactly the job Lamport's
+    # rotating buffers do -- and that can come from the data dependency instead:
+    #
+    #   Phase 1 is all-to-all, so completing round k-1 required receiving from
+    #   *every* peer in round k-1. Being in round k therefore proves every peer
+    #   entered round k-1, which (ws and step are aliased, so the rounds are
+    #   strictly ordered on each device) proves every peer completed round k-2 --
+    #   including its reads of slot (k-2)%2 == k%2, the slot we are about to
+    #   write. That is precisely the invariant the barrier was purchasing.
+    #
+    #   Symmetrically, skew is bounded at one round: peer j cannot enter round
+    #   k+1 until our round-k sends land, so while we are in round k, j is at
+    #   most in k+1 and touches the *other* slot. Two slots suffice.
+    #
+    # Round 0 keeps its barrier and must: nothing has synchronized yet, the
+    # workspace may not be allocated on every peer, and the collective_id may
+    # not be registered.
+    #
+    # This holds only while every rank calls the collective the same number of
+    # times in the same order. Rank-divergent control flow -- speculative
+    # decode, early exit, a dummy_run that fires on some ranks only, a
+    # non-unanimous bucket switch -- makes skew unbounded and no slot count is
+    # safe. That is why it is gated rather than default.
+    if not barrier_first and steady_barrier:
 
         @pl.when(step != 0)
         def _():
@@ -298,7 +329,8 @@ def one_shot_all_reduce_ws(x: jax.Array,
                            collective_id: int = 0,
                            barrier_first: bool | None = None,
                            disable_semaphore_checks: bool = True,
-                           has_side_effects: bool = True):
+                           has_side_effects: bool = True,
+                           steady_barrier: bool = True):
     """One-shot all-reduce over a caller-owned persistent workspace.
 
     Removes barrier #1 from the critical path. :func:`one_shot_all_reduce`
@@ -344,6 +376,24 @@ def one_shot_all_reduce_ws(x: jax.Array,
         and are consumed by the next round, verified exact against psum in
         float32 over 440 executions at 8 and 32 devices.
 
+      steady_barrier: Keep the barrier in rounds past round 0. Setting it False
+        removes the last synchronization primitive from the steady state, on the
+        argument that the all-to-all recv wait already proves every peer
+        finished the round that last read this slot -- the TPU analogue of a
+        barrier-free (Lamport) NVLink collective, where the buffer-reuse
+        guarantee comes from buffer rotation rather than a barrier. Measured
+        cost of what this removes: ~2.9 us per barrier at 32 devices
+        (``scripts/debug/two_shot_ablation.py``, jobs 118/119), against a
+        near-to-far ICI distance spread of only ~3.5 us
+        (``scripts/debug/probe_pairwise_latency.py``, job 250) -- so this is the
+        larger of the two terms available to attack.
+
+        Only sound while every rank calls the collective the same number of
+        times in the same order; rank-divergent control flow makes skew
+        unbounded. Validate with ``scripts/allreduce_ws_stress.py
+        --no-steady-barrier`` before trusting it, and see the kernel body for
+        the full argument.
+
     Returns:
       ``(out, ws, step)``. The caller must pass the returned ``ws``/``step``
       into the next call -- that is what keeps the buffer live and the parity
@@ -358,7 +408,8 @@ def one_shot_all_reduce_ws(x: jax.Array,
     kernel = functools.partial(_one_shot_ws_kernel,
                                num_devices=num_devices,
                                axis_name=axis_name,
-                               barrier_first=barrier_first)
+                               barrier_first=barrier_first,
+                               steady_barrier=steady_barrier)
     return pl.pallas_call(
         kernel,
         out_shape=(
@@ -407,10 +458,26 @@ def make_workspace(x_shape, dtype, num_devices: int):
 # -----------------------------------------------------------------------------
 
 
-def _two_shot_ws_kernel(x_ref, rs_in_ref, ag_in_ref, step_in_ref, o_ref,
-                        rs_ref, ag_ref, step_ref, recv_vmem, red_vmem,
-                        local_sem, s1_send, s1_recv, s2_send, s2_recv, *,
-                        num_devices: int, axis_name: str, barrier_first: bool):
+def _two_shot_ws_kernel(x_ref,
+                        rs_in_ref,
+                        ag_in_ref,
+                        step_in_ref,
+                        o_ref,
+                        rs_ref,
+                        ag_ref,
+                        step_ref,
+                        recv_vmem,
+                        red_vmem,
+                        local_sem,
+                        s1_send,
+                        s1_recv,
+                        s2_send,
+                        s2_recv,
+                        *,
+                        num_devices: int,
+                        axis_name: str,
+                        barrier_first: bool,
+                        steady_barrier: bool = True):
     del rs_in_ref, ag_in_ref  # aliased onto the output views
     my_id = lax.axis_index(axis_name)
     step = step_in_ref[0]
@@ -444,7 +511,11 @@ def _two_shot_ws_kernel(x_ref, rs_in_ref, ag_in_ref, step_in_ref, o_ref,
     # writes slot k%2, last read at round k-2, and passing round k-1's barrier
     # proves every peer finished round k-2. It also covers phase 2, whose sends
     # come later still.
-    if not barrier_first:
+    # See _one_shot_ws_kernel for why the steady-state barrier is removable.
+    # The argument is if anything stronger here: phase 2's sends come after the
+    # phase-1 recv wait, so by the time they are issued every peer is known to
+    # have entered this round, not merely the previous one.
+    if not barrier_first and steady_barrier:
 
         @pl.when(step != 0)
         def _():
@@ -505,7 +576,8 @@ def two_shot_all_reduce_ws(x: jax.Array,
                            collective_id: int = 0,
                            barrier_first: bool = False,
                            disable_semaphore_checks: bool = True,
-                           has_side_effects: bool = True):
+                           has_side_effects: bool = True,
+                           steady_barrier: bool = True):
     """Two-shot all-reduce over a caller-owned persistent workspace.
 
     Does for :func:`two_shot_all_reduce` what :func:`one_shot_all_reduce_ws`
@@ -521,6 +593,24 @@ def two_shot_all_reduce_ws(x: jax.Array,
     ``disable_semaphore_checks`` must stay True and ``has_side_effects`` must
     be False to compile through torch_tpu; see :func:`one_shot_all_reduce_ws`
     for both.
+
+      steady_barrier: Keep the barrier in rounds past round 0. Setting it False
+        removes the last synchronization primitive from the steady state, on the
+        argument that the all-to-all recv wait already proves every peer
+        finished the round that last read this slot -- the TPU analogue of a
+        barrier-free (Lamport) NVLink collective, where the buffer-reuse
+        guarantee comes from buffer rotation rather than a barrier. Measured
+        cost of what this removes: ~2.9 us per barrier at 32 devices
+        (``scripts/debug/two_shot_ablation.py``, jobs 118/119), against a
+        near-to-far ICI distance spread of only ~3.5 us
+        (``scripts/debug/probe_pairwise_latency.py``, job 250) -- so this is the
+        larger of the two terms available to attack.
+
+        Only sound while every rank calls the collective the same number of
+        times in the same order; rank-divergent control flow makes skew
+        unbounded. Validate with ``scripts/allreduce_ws_stress.py
+        --no-steady-barrier`` before trusting it, and see the kernel body for
+        the full argument.
 
     Returns:
       ``(out, rs, ag, step)`` -- thread the last three into the next call.
@@ -538,7 +628,8 @@ def two_shot_all_reduce_ws(x: jax.Array,
     kernel = functools.partial(_two_shot_ws_kernel,
                                num_devices=num_devices,
                                axis_name=axis_name,
-                               barrier_first=barrier_first)
+                               barrier_first=barrier_first,
+                               steady_barrier=steady_barrier)
     out, rs, ag, step = pl.pallas_call(
         kernel,
         out_shape=(

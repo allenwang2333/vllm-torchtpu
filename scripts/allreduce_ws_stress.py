@@ -70,6 +70,16 @@ def _parse_args():
     # Default None so the kernel's own default (checks disabled, required for
     # the overlap) applies. A store_true default of False would silently
     # re-enable the check and take down the slice -- which it did.
+    p.add_argument("--no-steady-barrier",
+                   action="store_true",
+                   help="Drop the barrier from every round except round 0, on "
+                   "the argument that the all-to-all recv wait already proves "
+                   "every peer finished the round that last read this slot. "
+                   "This is the setting this script exists to validate: the "
+                   "safety case is a data-dependency argument, not a "
+                   "synchronization primitive, and its failure mode is a "
+                   "timing-dependent stale read that a short smoke test will "
+                   "not surface. Expect to need long chains and many repeats.")
     p.add_argument("--kernel",
                    default="oneshot",
                    choices=["oneshot", "twoshot"],
@@ -155,6 +165,7 @@ def make_chain(use_ws: bool, mesh: Mesh, n: int, rounds: int, shape, dtype):
                     axis_name=AXIS,
                     num_devices=n,
                     barrier_first=bool(ARGS.barrier_first),
+                    steady_barrier=not ARGS.no_steady_barrier,
                     disable_semaphore_checks=(False if ARGS.enable_sem_checks
                                               else True))
                 v = v * (1.0 / n) + jnp.asarray(j % 3, dtype) * 0.25
@@ -169,6 +180,7 @@ def make_chain(use_ws: bool, mesh: Mesh, n: int, rounds: int, shape, dtype):
                     num_devices=n,
                     barrier_first=(False if ARGS.force_overlap else
                                    ARGS.barrier_first),
+                    steady_barrier=not ARGS.no_steady_barrier,
                     disable_semaphore_checks=(False if ARGS.enable_sem_checks
                                               else True))
                 v = v * (1.0 / n) + jnp.asarray(j % 3, dtype) * 0.25
