@@ -35,6 +35,7 @@ from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
     build_kimi_chunk_kda_op, build_kimi_dispatched_kda_op, build_kimi_kda_op,
     build_kimi_sconv_op)
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing import TraceAnnotation
 
 logger = init_logger(__name__)
 
@@ -314,6 +315,7 @@ class MultiHeadLatentAttention(nn.Module):
             prefix,
         )
 
+    @TraceAnnotation(name="KimiMLA")
     def forward(
         self,
         positions: torch.Tensor,
@@ -577,6 +579,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         out.copy_(fused)
         self.conv_weight_fused = out
 
+    @TraceAnnotation(name="KimiKDA")
     def forward(
         self,
         positions: torch.Tensor,
@@ -621,6 +624,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         output, _ = self.o_proj(output)
         return output
 
+    @TraceAnnotation(name="KimiKDACore")
     def _core_attention(
         self,
         mixed_qkv: torch.Tensor,

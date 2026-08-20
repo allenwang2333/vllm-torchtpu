@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import _k3_probe
+from vllm_torchtpu.tracing import TraceAnnotation
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
@@ -177,10 +178,13 @@ class KimiMoE(nn.Module):
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
                 config.moe_intermediate_size // moe_tp_size)
 
+    @TraceAnnotation(name="KimiMoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
-        output = self.experts(hidden_states=hidden_states,
-                              router_logits=router_logits)
+        with TraceAnnotation(name="KimiMoERouter"):
+            router_logits, _ = self.gate(hidden_states)
+        with TraceAnnotation(name="KimiMoEExperts"):
+            output = self.experts(hidden_states=hidden_states,
+                                  router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
