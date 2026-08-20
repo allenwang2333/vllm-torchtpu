@@ -362,21 +362,85 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.kv_cache_dtype.lower().strip())
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        super().process_weights_after_loading(act_dtype)
+        # Directly extract and dequantize kv_b_proj weights for TPU without
+        # relying on upstream vLLM's GPU-transposing get_and_maybe_dequant_weights.
+        layer = self.kv_b_proj
+        while hasattr(layer, "base_layer"):
+            layer = layer.base_layer
 
-        device = torch.device("tpu")
+        weight = getattr(layer, "weight", None)
+        if weight is None:
+            weight = getattr(layer, "qweight", None)
+        if weight is None:
+            weight = getattr(layer, "weight_packed", None)
 
-        # move W_UK_T and W_UV into fresh contiguous buffers
-        self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
-        self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
+        weight_scales = getattr(layer, "weight_scale", None)
+        if weight_scales is None:
+            weight_scales = getattr(layer, "weight_scale_inv", None)
 
-        # Keep `W_UK_T`/`W_UV` in the activation dtype, matching upstream vLLM's
-        # `MLAAttention.process_weights_after_loading`: there is no quantized bmm
-        # for these two, so `forward_mla` upcasts them back to the activation
-        # dtype before `torch.bmm` anyway. Quantizing here only cost precision.
-        # `kv_cache_quantized_dtype` still governs the KV cache itself.
-        self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
-        self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
+        if weight_scales is not None:
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                scaled_dequantize,
+            )
+            kv_b_proj_weight = scaled_dequantize(
+                weight,
+                weight_scales,
+                group_shape=getattr(layer, "weight_block_size", None),
+                out_dtype=act_dtype,
+            )
+        else:
+            kv_b_proj_weight = weight.to(act_dtype)
+
+        # Canonicalize layout: MLA expects (kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim))
+        expected_shape = (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        )
+        if kv_b_proj_weight.shape != expected_shape:
+            kv_b_proj_weight = kv_b_proj_weight.T
+
+        assert kv_b_proj_weight.shape == expected_shape, (
+            f"kv_b_proj_weight shape mismatch: expected {expected_shape}, "
+            f"got {kv_b_proj_weight.shape}"
+        )
+
+        kv_b_proj_reshaped = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        W_UK, W_UV = kv_b_proj_reshaped.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+
+        W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+        W_UV = W_UV.transpose(0, 1).contiguous()
+
+        device = weight.device if weight is not None else torch.device("cpu")
+        if device.type != "tpu":
+            try:
+                device = torch.device("tpu")
+            except Exception:
+                device = weight.device if weight is not None else torch.device("cpu")
+
+        self.W_UK_T = Parameter(_fresh(W_UK_T).to(device), requires_grad=False)
+        self.W_UV = Parameter(_fresh(W_UV).to(device), requires_grad=False)
+
+        if getattr(self, "dcp_q_replicate", False):
+            from vllm.distributed import get_dcp_group
+            self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
+                self.W_UK_T.contiguous(), dim=0
+            )
+
+        quant_method = (
+            self.quant_config.get_quant_method(self, prefix=self.layer_name)
+            if getattr(self, "quant_config", None)
+            else None
+        )
+        from vllm.model_executor.layers.quantization.base_config import (
+            set_default_quant_scales, should_load_quant_weights)
+        if not should_load_quant_weights(quant_method):
+            set_default_quant_scales(self, register_buffer=False)
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())

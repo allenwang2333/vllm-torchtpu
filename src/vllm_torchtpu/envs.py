@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
 
 
 def env_with_choices(
@@ -310,6 +311,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # Comma-separated module prefix names that will be quantized to FP8 on load.
+    "QUANTIZE_ON_LOAD_PREFIXES":
+    lambda: [
+        p.strip()
+        for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
+        if p.strip()
+    ],
 }
 
 

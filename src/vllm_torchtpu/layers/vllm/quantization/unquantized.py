@@ -48,6 +48,7 @@ from vllm.model_executor.layers.quantization import \
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.vllm import moe_routing
@@ -75,6 +76,12 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     @classmethod
     def get_name(cls) -> str:
         return UNQUANTIZED
+
+    @classmethod
+    def set_configs(cls, vllm_config) -> None:
+        super().set_configs(vllm_config)
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
+        VllmFp8Config.set_configs(vllm_config)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -108,6 +115,17 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
+            quantize_prefixes = envs.QUANTIZE_ON_LOAD_PREFIXES
+            if any(p in prefix for p in quantize_prefixes):
+                from vllm_torchtpu.layers.vllm.quantization.fp8 import (
+                    VllmFp8Config, VllmFp8LinearMethodTPU)
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8LinearMethodTPU(
+                    fp8_config, self.get_linear_config(layer), prefix=prefix)
+
             # Return None to let vLLM use its default UnquantizedLinearMethod
             # which uses torch.matmul - works fine on TPU
             # TODO: Do we need to use our own linear method?

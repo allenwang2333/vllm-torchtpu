@@ -604,6 +604,9 @@ class TpuPlatform(Platform):
     simple_compile_backend: str = "tpu"
     _is_hybrid: bool = False
 
+    def is_tpu(self) -> bool:
+        return True
+
     supported_quantization: list[str] = [
         "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
         "modelopt_fp4", "deepseek_v4_fp8"

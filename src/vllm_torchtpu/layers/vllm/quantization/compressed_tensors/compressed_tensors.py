@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target, should_ignore_layer)
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (COMPRESSED_TENSORS,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
@@ -195,6 +196,16 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                     "input_activations") if scheme_dict else None
 
                 if weight_quant is None:
+                    quantize_prefixes = envs.QUANTIZE_ON_LOAD_PREFIXES
+                    if any(p in prefix for p in quantize_prefixes):
+                        fp8_config = VllmFp8Config(
+                            is_checkpoint_fp8_serialized=False,
+                            activation_scheme="dynamic",
+                        )
+                        return VllmFp8LinearMethodTPU(
+                            fp8_config,
+                            self.get_linear_config(layer),
+                            prefix=prefix)
                     return VllmUnquantizedConfig.get_quant_method(
                         self, layer, prefix)
 
