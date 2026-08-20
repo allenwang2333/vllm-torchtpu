@@ -95,6 +95,8 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.mm_encoder_manager import \
+    maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -1658,6 +1660,8 @@ class TPUModelRunner(GPUModelRunner):
         filling the connector reserve back up with KV blocks and defeating
         the worker-side subtraction.
         """
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            return kv_cache_memory_bytes
         budget = utils.compute_hbm_budget(
             [self.device], self.cache_config.gpu_memory_utilization)
         return budget.available - utils.estimate_kv_connector_hbm_reserve(
@@ -4491,7 +4495,9 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            if self.speculative_config is None:
+            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
+            # we skip it here as well.
+            if self.speculative_config is None or self._pcp_mtp_k1_enabled:
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
@@ -4761,6 +4767,13 @@ class TPUModelRunner(GPUModelRunner):
             # Anything compiled from here on is a *serving* recompile, which is
             # worth seeing on its own line whatever it contains.
             moe_census.set_phase("serving")
+
+            # Precompile multimodal vision encoder graphs
+            self.encoder_cudagraph_manager = (maybe_create_mm_encoder_manager(
+                self.vllm_config, self.device, self.model))
+            if self.encoder_cudagraph_manager is not None:
+                with self._precompile_timed("multimodal vision encoder"):
+                    self.encoder_cudagraph_manager.precompile_vision_encoder()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
