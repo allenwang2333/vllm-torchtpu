@@ -84,7 +84,8 @@ def _parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode",
                    default="fanout",
-                   help="Comma-separated: fanout (one root, "
+                   help="Comma-separated: idle (no exchange, "
+                   "launch floor), fanout (one root, "
                    "isolated), allpairs (every pair, isolated -- the real "
                    "matrix), matrix (concurrent rounds, contended).")
     p.add_argument("--root",
@@ -289,6 +290,23 @@ def fanout_schedule(n: int, root: int):
         yield [(root, r)], p
 
 
+def idle_schedule(n: int):
+    """One configuration in which nobody exchanges anything.
+
+    Isolates the part of the measurement that is not network: kernel launch,
+    the SMEM/VMEM plumbing, and the local HBM->VMEM staging copy every device
+    does whether or not it received. Subtracting this from the same-chip figure
+    splits the fixed floor into "cost of invoking the kernel at all" and "cost
+    of an on-package DMA plus its semaphore".
+
+    Worth having as a first-class mode because the number matters for design
+    decisions: launch is paid per *kernel*, while a DMA phase is paid per phase,
+    so whether a two-level collective costs one launch or two decides whether
+    hierarchy is affordable at all.
+    """
+    yield [], list(range(n))
+
+
 def allpairs_schedule(n: int):
     """Every one of the ``C(N,2)`` pairs, measured in isolation.
 
@@ -421,15 +439,38 @@ def make_chain(num_devices: int, barrier_every: bool, mesh, shard,
 
 
 def time_call(fn, args, repeats: int, warmup: int) -> float:
+    """Median wall time of a blocked call, maxed across processes.
+
+    The cross-process max is load-bearing, not defensive. ``block_until_ready``
+    only waits on *local* shards, so a process with no participating device
+    times its own idle path -- and in every schedule except ``fanout`` from a
+    root on process 0, most configurations have no participant on process 0. The
+    first ``allpairs`` run reported a 2.62 us median across 496 pairs, below the
+    3.47 us same-chip floor, because process 0 was measuring an empty kernel
+    chain for all but the pairs that happened to touch its own devices. Only the
+    manhattan-5 tier looked right, since chip (0,0,0) holds devices 0-1.
+
+    Elapsed durations are comparable across processes even though their clocks
+    are not, because every timed region opens after the same
+    ``sync_global_devices``. The slowest process is the one holding a
+    participant.
+    """
     for _ in range(warmup):
         jax.block_until_ready(fn(*args))
     samples = []
     for _ in range(repeats):
+        # Line the processes up so one straggler's dispatch does not land
+        # inside another's timed region.
         multihost_utils.sync_global_devices("probe")
         t0 = time.perf_counter()
         jax.block_until_ready(fn(*args))
         samples.append(time.perf_counter() - t0)
-    return float(np.median(samples))
+    local = float(np.median(samples))
+    if jax.process_count() == 1:
+        return local
+    gathered = np.asarray(
+        multihost_utils.process_allgather(np.asarray([local])))
+    return float(np.max(gathered))
 
 
 def main():
@@ -496,7 +537,9 @@ def main():
 
     results = []
     for mode in [m.strip() for m in ARGS.mode.split(",") if m.strip()]:
-        if mode == "fanout":
+        if mode == "idle":
+            sched = list(idle_schedule(n))
+        elif mode == "fanout":
             sched = list(fanout_schedule(n, ARGS.root))
         elif mode == "allpairs":
             sched = list(allpairs_schedule(n))
@@ -567,6 +610,25 @@ def main():
                     "t_lo_ms": t_lo * 1e3,
                     "t_hi_ms": t_hi * 1e3,
                 })
+            if not pairs:
+                results.append({
+                    "mode": mode,
+                    "cfg": cfg,
+                    "a": -1,
+                    "b": -1,
+                    "coords_a": (),
+                    "coords_b": (),
+                    "same_chip": False,
+                    "manhattan": -1,
+                    "bytes": payload,
+                    "us": us,
+                    "t_lo_ms": t_lo * 1e3,
+                    "t_hi_ms": t_hi * 1e3,
+                })
+                rprint(f"   cfg{cfg:>3}  all idle   {us:7.2f} us  "
+                       f"[t{ARGS.n_lo}={t_lo*1e3:.3f} ms "
+                       f"t{ARGS.n_hi}={t_hi*1e3:.3f} ms x{growth:.2f}]")
+                continue
             tag = (f"{pairs[0][0]:>3}<->{pairs[0][1]:<3}"
                    if len(pairs) == 1 else f"{len(pairs)} pairs")
             extra = ""
