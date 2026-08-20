@@ -73,6 +73,7 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
         # rows: rank0=[valid, pad], rank1=[pad, valid]
         assert w2[0].tolist() == [0.5, 0.5]
         assert float(w2[1].abs().sum()) == 0.0
+        assert float(w2[2].abs().sum()) == 0.0
         assert w2[3].tolist() == [0.5, 0.5]
     finally:
         token_padding.set_padding_state(None)
