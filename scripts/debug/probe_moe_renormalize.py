@@ -145,6 +145,7 @@ def build(arm: str, routers, combs, biases, topk: int):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--layers", type=int, default=92)
+    p.add_argument("--batch", type=int, default=1)
     p.add_argument("--topk", type=int, default=16)
     p.add_argument("--experts", type=int, default=224)
     p.add_argument("--hidden", type=int, default=7168)
@@ -182,10 +183,11 @@ def main() -> int:
         rnd(args.topk, args.hidden, scale=0.02) for _ in range(args.layers)
     ]
     biases = [rnd(args.experts, scale=0.1).float() for _ in range(args.layers)]
-    h0 = rnd(1, args.hidden)
+    h0 = rnd(args.batch, args.hidden)
 
-    lead(f"layers={args.layers} topk={args.topk} experts={args.experts} "
-         f"hidden={args.hidden} repeats={args.repeats}")
+    lead(
+        f"batch={args.batch} layers={args.layers} topk={args.topk} experts={args.experts} "
+        f"hidden={args.hidden} repeats={args.repeats}")
 
     results = {}
     outs = {}
@@ -202,9 +204,17 @@ def main() -> int:
             t0 = time.perf_counter()
             fn(h0).cpu()
             samples.append((time.perf_counter() - t0) * 1e6)
-        results[arm] = (float(np.median(samples)), float(np.std(samples)))
-        lead(f"  {arm:6s} median={results[arm][0]:9.1f} us  "
-             f"sd={results[arm][1]:6.1f}")
+        # Wall clock picks up host dispatch jitter that grows with batch: at
+        # batch>=16 its sd reached 890 us against a ~1 us/layer effect, which
+        # made the first sweep's large-batch rows pure noise. `min` is the
+        # robust statistic for "how fast can this run" under additive noise;
+        # median and sd are kept alongside so disagreement stays visible.
+        results[arm] = (float(np.min(samples)),
+                        float(np.percentile(samples, 10)),
+                        float(np.median(samples)), float(np.std(samples)))
+        lead(
+            f"  {arm:6s} min={results[arm][0]:9.1f} p10={results[arm][1]:9.1f} "
+            f"median={results[arm][2]:9.1f} sd={results[arm][3]:7.1f}")
 
     # Equivalence: `fold` must match `sum` to bf16 rounding, `late` may differ
     # slightly (divide after accumulate), `none` and `chain` are reference
@@ -216,9 +226,9 @@ def main() -> int:
         for arm, o in outs.items():
             lead(f"  {arm:6s} {((o - ref).abs().max() / scale).item():.3e}")
 
-    base = results.get("sum", (float("nan"), 0))[0]
-    none = results.get("none", (float("nan"), 0))[0]
-    lead(f"\n{'arm':6s} {'total us':>10} {'vs sum':>10} {'us/layer':>10} "
+    base = results.get("sum", (float("nan"), ) * 4)[0]
+    none = results.get("none", (float("nan"), ) * 4)[0]
+    lead(f"\n{'arm':6s} {'min us':>10} {'vs sum':>10} {'us/layer':>10} "
          f"{'% of headroom':>14}")
     headroom = base - none
     for arm in args.arms.split(","):

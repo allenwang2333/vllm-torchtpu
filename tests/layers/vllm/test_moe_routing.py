@@ -145,6 +145,30 @@ class TestRenormalizeDenominator:
         out = moe_routing._renormalize(torch.zeros(2, 8, dtype=torch.float32))
         assert torch.isfinite(out).all()
 
+    @pytest.mark.parametrize("tokens", [1, 8, 64, 65, 512, 4096])
+    def test_token_gate_picks_a_path_and_both_agree(self, monkeypatch, tokens):
+        """Above the threshold the fold is bypassed; results agree regardless."""
+        import torch
+        w = torch.rand(tokens, 16, dtype=torch.float32) + 0.5
+        got = moe_routing._renormalize(w)
+        ref = w / torch.clamp(w.sum(dim=-1, keepdim=True), min=1e-20)
+        torch.testing.assert_close(got, ref, rtol=1e-6, atol=0.0)
+        # Above the threshold it must be the plain reduce, bit-for-bit.
+        if tokens > moe_routing._RENORMALIZE_FOLD_MAX_TOKENS:
+            assert torch.equal(got, ref)
+
+    def test_token_gate_threshold_is_respected(self, monkeypatch):
+        """The fold is only reached at or below the configured token count."""
+        import torch
+        calls = []
+        real = moe_routing._renormalize_denominator
+        monkeypatch.setattr(moe_routing, "_renormalize_denominator",
+                            lambda w: calls.append(w.shape[0]) or real(w))
+        monkeypatch.setattr(moe_routing, "_RENORMALIZE_FOLD_MAX_TOKENS", 8)
+        for n in (1, 8, 9, 64):
+            moe_routing._renormalize(torch.rand(n, 16) + 0.5)
+        assert calls == [1, 8]
+
     @pytest.mark.parametrize("fold", [True, False])
     def test_gate_selects_equivalent_paths(self, monkeypatch, fold):
         import torch

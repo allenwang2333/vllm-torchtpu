@@ -38,8 +38,14 @@ _UNIFORM_RANDOM = "uniform_random"
 
 # Off switch for the fold in `_renormalize_denominator` below, so the change can
 # be A/B'd end to end without a second build. Set to "0" to restore
-# `.sum(dim=-1)`.
+# `.sum(dim=-1)` everywhere.
 _RENORMALIZE_FOLD = os.environ.get("TPU_MOE_RENORMALIZE_FOLD", "1") != "0"
+
+# The fold trades a fixed per-invocation stall for work proportional to the token
+# count, so it only wins while the token count is small. See the batch sweep in
+# `_renormalize` below for the measurements behind this default.
+_RENORMALIZE_FOLD_MAX_TOKENS = int(
+    os.environ.get("TPU_MOE_RENORMALIZE_FOLD_MAX_TOKENS", "64"))
 
 _SIMULATION_STRATEGY = None
 _strategy_name = vllm_envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
@@ -248,8 +254,40 @@ def _renormalize_denominator(w: torch.Tensor) -> torch.Tensor:
 
 
 def _renormalize(topk_weights: torch.Tensor) -> torch.Tensor:
-    """Scale each token's top-k weights to sum to 1."""
-    if _RENORMALIZE_FOLD:
+    """Scale each token's top-k weights to sum to 1.
+
+    The fold is applied only for small token counts. What it removes is a fixed
+    stall at one op boundary per MoE layer -- constant in the token count. What
+    it adds is four slice-and-add pairs over `(tokens, 8/4/2/1)`, which grows
+    with the token count. So it wins at decode widths and eventually loses.
+
+    Batch sweep, 92 layers, topk=16, hidden 7168, one device, 150 repeats,
+    arms interleaved sum/fold/sum/fold, `min` of samples (wall-clock sd reached
+    890 us at large batch, so median was unusable there):
+
+        tokens   us/layer   replicate spread        read
+             1     +1.76    +-5 / +-2               clean win
+             8     +0.46 .. -0.04   +-11 / +-45     neutral
+            64     +0.12 .. +1.23   +-19 / +-122    leans positive
+           512     --       control moved 4%        uninformative
+          2048     -0.28 .. -1.95   +-268 / +-115   leans negative
+
+    Only the batch-1 row is clean; it has since been reproduced four times
+    (+2.26, +1.89, +1.87, +1.76). The threshold is set at the largest token
+    count where every measurement still leaned positive, rather than at the
+    apparent crossover, because nothing between 64 and 2048 was measured well
+    enough to place one.
+
+    This matters most for prefill, not for large-batch decode: prefill runs
+    thousands of tokens through this same line, which is exactly the region the
+    fold looks like a small loss in. Gating here keeps it out of that path.
+
+    The branch is free. `topk_weights.shape[0]` is static at trace time, and
+    vLLM already compiles a separate graph per token bucket, so this resolves
+    during tracing and leaves no runtime test in the graph.
+    """
+    tokens = topk_weights.shape[0]
+    if _RENORMALIZE_FOLD and tokens <= _RENORMALIZE_FOLD_MAX_TOKENS:
         total = _renormalize_denominator(topk_weights)
     else:
         total = topk_weights.sum(dim=-1, keepdim=True)
