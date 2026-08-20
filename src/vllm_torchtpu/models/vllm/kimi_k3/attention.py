@@ -35,7 +35,6 @@ from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
     build_kimi_chunk_kda_op, build_kimi_dispatched_kda_op, build_kimi_kda_op,
     build_kimi_sconv_op)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.tracing import TraceAnnotation
 
 logger = init_logger(__name__)
 
@@ -315,13 +314,13 @@ class MultiHeadLatentAttention(nn.Module):
             prefix,
         )
 
-    @TraceAnnotation(name="KimiMLA")
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        with torch.profiler.record_function("KimiMLA"):
+            return self.mla_attn(positions, hidden_states)
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -579,52 +578,51 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         out.copy_(fused)
         self.conv_weight_fused = out
 
-    @TraceAnnotation(name="KimiKDA")
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        del positions
-        projected, _ = self.fused_qkvb_proj(hidden_states)
-        query, key, value, beta = projected.split(
-            [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-        if self.use_full_rank_gate:
-            assert self.f_a_proj is not None
-            f_a, _ = self.f_a_proj(hidden_states)
-            assert self.g_proj is not None
-            output_gate, _ = self.g_proj(hidden_states)
-        else:
-            assert self.fused_fa_ga_proj is not None
-            gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
-            f_a, gate_input = gate_inputs.split([self.head_dim, self.head_dim],
-                                                dim=-1)
-        raw_gate, _ = self.f_b_proj(f_a)
-        if not self.use_full_rank_gate:
-            assert self.g_b_proj is not None
-            output_gate, _ = self.g_b_proj(gate_input)
+        with torch.profiler.record_function("KimiKDA"):
+            del positions
+            projected, _ = self.fused_qkvb_proj(hidden_states)
+            query, key, value, beta = projected.split(
+                [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+            if self.use_full_rank_gate:
+                assert self.f_a_proj is not None
+                f_a, _ = self.f_a_proj(hidden_states)
+                assert self.g_proj is not None
+                output_gate, _ = self.g_proj(hidden_states)
+            else:
+                assert self.fused_fa_ga_proj is not None
+                gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
+                f_a, gate_input = gate_inputs.split([self.head_dim, self.head_dim],
+                                                    dim=-1)
+            raw_gate, _ = self.f_b_proj(f_a)
+            if not self.use_full_rank_gate:
+                assert self.g_b_proj is not None
+                output_gate, _ = self.g_b_proj(gate_input)
 
-        metadata = self._metadata()
-        if (metadata is None or self.kv_cache is None
-                or self.kv_cache[0].numel() == 0):
-            output = torch.zeros_like(query)
-        else:
-            sconv_cache, recurrent_cache = self.kv_cache
-            output = self._core_attention(
-                mixed_qkv,
-                raw_gate,
-                beta,
-                output_gate,
-                sconv_cache,
-                recurrent_cache,
-                metadata,
-            ).flatten(1)
+            metadata = self._metadata()
+            if (metadata is None or self.kv_cache is None
+                    or self.kv_cache[0].numel() == 0):
+                output = torch.zeros_like(query)
+            else:
+                sconv_cache, recurrent_cache = self.kv_cache
+                output = self._core_attention(
+                    mixed_qkv,
+                    raw_gate,
+                    beta,
+                    output_gate,
+                    sconv_cache,
+                    recurrent_cache,
+                    metadata,
+                ).flatten(1)
 
-        output, _ = self.o_proj(output)
-        return output
+            output, _ = self.o_proj(output)
+            return output
 
-    @TraceAnnotation(name="KimiKDACore")
     def _core_attention(
         self,
         mixed_qkv: torch.Tensor,
@@ -656,61 +654,62 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         configuration flag rather than on the batch, so it is free of that
         hazard.
         """
-        if self.use_naive_kda:
-            mixed_qkv = self.sconv_op(
-                mixed_qkv,
-                sconv_cache,
-                self.conv_weight_fused,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-            )
-            return self.kda_op(
+        with torch.profiler.record_function("KimiKDACore"):
+            if self.use_naive_kda:
+                mixed_qkv = self.sconv_op(
+                    mixed_qkv,
+                    sconv_cache,
+                    self.conv_weight_fused,
+                    metadata.query_start_loc,
+                    metadata.mamba_state_indices,
+                    metadata.seq_lens,
+                )
+                return self.kda_op(
+                    mixed_qkv,
+                    raw_gate,
+                    beta,
+                    output_gate,
+                    recurrent_cache,
+                    self.A_log,
+                    self.dt_bias,
+                    self.o_norm.weight,
+                    metadata.query_start_loc,
+                    metadata.mamba_state_indices,
+                    metadata.seq_lens,
+                )
+
+            # With speculation the batch is ordered [decode][verify][prefill].
+            # `request_distribution` keeps ragged paged attention's 1-token decode
+            # front segment, which excludes verify windows; the mamba variant widens
+            # it to cover them. GDN selects it the same way — see
+            # `gdn_attention_op`. Only correct now that `decode_kda` can process a
+            # window; before that it fed 4-token requests to a kernel that reads one
+            # row per request.
+            request_distribution = metadata.request_distribution
+            mamba_distribution = getattr(metadata, "mamba_request_distribution",
+                                         None)
+            if mamba_distribution is not None:
+                request_distribution = mamba_distribution
+            slot_read_offsets = getattr(metadata, "mamba_slot_read_offsets", None)
+            if self.num_spec > 0 and slot_read_offsets is None:
+                raise RuntimeError(
+                    "Speculative decoding with KDA layers requires "
+                    "mamba_slot_read_offsets in the attention metadata.")
+
+            return self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,
                 beta,
                 output_gate,
+                sconv_cache,
                 recurrent_cache,
+                self.conv_weight_fused,
                 self.A_log,
                 self.dt_bias,
                 self.o_norm.weight,
                 metadata.query_start_loc,
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
+                request_distribution,
+                slot_read_offsets,
             )
-
-        # With speculation the batch is ordered [decode][verify][prefill].
-        # `request_distribution` keeps ragged paged attention's 1-token decode
-        # front segment, which excludes verify windows; the mamba variant widens
-        # it to cover them. GDN selects it the same way — see
-        # `gdn_attention_op`. Only correct now that `decode_kda` can process a
-        # window; before that it fed 4-token requests to a kernel that reads one
-        # row per request.
-        request_distribution = metadata.request_distribution
-        mamba_distribution = getattr(metadata, "mamba_request_distribution",
-                                     None)
-        if mamba_distribution is not None:
-            request_distribution = mamba_distribution
-        slot_read_offsets = getattr(metadata, "mamba_slot_read_offsets", None)
-        if self.num_spec > 0 and slot_read_offsets is None:
-            raise RuntimeError(
-                "Speculative decoding with KDA layers requires "
-                "mamba_slot_read_offsets in the attention metadata.")
-
-        return self.dispatched_kda_op(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            sconv_cache,
-            recurrent_cache,
-            self.conv_weight_fused,
-            self.A_log,
-            self.dt_bias,
-            self.o_norm.weight,
-            metadata.query_start_loc,
-            metadata.mamba_state_indices,
-            metadata.seq_lens,
-            request_distribution,
-            slot_read_offsets,
-        )
