@@ -34,6 +34,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -918,65 +919,68 @@ class ZmqShmKvConnectorBase:
         their own inline stage in parallel with us."""
         assert self.is_producer
         num_blocks = self._blocks_token(req_meta.local_block_ids)
-        logger.info(
-            "TPUConnectorWorker(%s) rank0 --> handle_new_send req_id=%s uuid=%s "
-            "blocks=%s", self.node_id, req_id, req_meta.uuid, num_blocks)
-        logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
-                    req_meta.uuid, time.time())
-        try:
-            slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
-        except Exception:
-            # Pool full. Drop request; scheduler will surface a failure.
+        try: shape_size = self._coord_pool.spec.layer_shard_shape_size; itemsize = self._coord_pool.spec.dtype.itemsize; dim = str(self._coord_pool.spec.layer_shard_shape)
+        except Exception: shape_size = 0; itemsize = 1; dim = "unknown"
+        with TraceAnnotation("KV_Cache_Push_Staging", phase="Prefill", req_id=req_id, uuid=req_meta.uuid, num_blocks=num_blocks, bytes=num_blocks * shape_size * itemsize, dimension=dim, source_node=self.node_id):
+            logger.info(
+                "TPUConnectorWorker(%s) rank0 --> handle_new_send req_id=%s uuid=%s "
+                "blocks=%s", self.node_id, req_id, req_meta.uuid, num_blocks)
+            logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
+                        req_meta.uuid, time.time())
+            try:
+                slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
+            except Exception:
+                # Pool full. Drop request; scheduler will surface a failure.
+                with self._coord_lock:
+                    send_holders = [
+                        f"uuid={u} req={e.req_id} "
+                        f"acked={e.pull_acked} "
+                        f"exp_in={max(0.0, e.expiration_time - time.perf_counter()):.1f}s"
+                        for u, e in self._coord_send.items()
+                    ]
+                    recv_holders = [
+                        f"uuid={u} req={e.req_id}"
+                        for u, e in self._coord_recv.items()
+                    ]
+                    self._coord_done_sending.add(req_id)
+                logger.error(
+                    "TPUConnectorWorker(%s) rank0 --> shm pool exhausted for "
+                    "req_id=%s (producer). send_holders=%s recv_holders=%s",
+                    self.node_id, req_id, send_holders, recv_holders)
+                return
+
+            entry = _CoordSendEntry(
+                req_id=req_id,
+                slot_idx=slot_idx,
+                num_blocks=num_blocks,
+                expiration_time=req_meta.expiration_time,
+                tp_size=self.tp_size,
+            )
             with self._coord_lock:
-                send_holders = [
-                    f"uuid={u} req={e.req_id} "
-                    f"acked={e.pull_acked} "
-                    f"exp_in={max(0.0, e.expiration_time - time.perf_counter()):.1f}s"
-                    for u, e in self._coord_send.items()
-                ]
-                recv_holders = [
-                    f"uuid={u} req={e.req_id}"
-                    for u, e in self._coord_recv.items()
-                ]
-                self._coord_done_sending.add(req_id)
-            logger.error(
-                "TPUConnectorWorker(%s) rank0 --> shm pool exhausted for "
-                "req_id=%s (producer). send_holders=%s recv_holders=%s",
-                self.node_id, req_id, send_holders, recv_holders)
-            return
+                self._coord_send[req_meta.uuid] = entry
 
-        entry = _CoordSendEntry(
-            req_id=req_id,
-            slot_idx=slot_idx,
-            num_blocks=num_blocks,
-            expiration_time=req_meta.expiration_time,
-            tp_size=self.tp_size,
-        )
-        with self._coord_lock:
-            self._coord_send[req_meta.uuid] = entry
+            # Enqueue broadcast first so other ranks can start their own stage
+            # while we run ours.
+            self._coord_broadcast(
+                _IPC_STAGE_NOTIFY,
+                (req_meta.uuid, slot_idx, num_blocks, req_meta.local_block_ids))
+            logger.info(
+                "TPUConnectorWorker(%d) rank0 --> handle_new_send broadcast uuid=%s "
+                "slot=%d to %d non-zero ranks", self.node_id, req_meta.uuid,
+                slot_idx, len(self._coord_rank_to_identity))
 
-        # Enqueue broadcast first so other ranks can start their own stage
-        # while we run ours.
-        self._coord_broadcast(
-            _IPC_STAGE_NOTIFY,
-            (req_meta.uuid, slot_idx, num_blocks, req_meta.local_block_ids))
-        logger.info(
-            "TPUConnectorWorker(%d) rank0 --> handle_new_send broadcast uuid=%s "
-            "slot=%d to %d non-zero ranks", self.node_id, req_meta.uuid,
-            slot_idx, len(self._coord_rank_to_identity))
-
-        # Rank 0 enqueues its own async D2H on the main thread; the waiter
-        # thread emits STAGE_DONE once the future completes. Returning here
-        # before the DMA finishes lets vLLM advance and the
-        # STAGE_NOTIFY/scheduler/PULL-setup round-trip overlap with the
-        # transfer.
-        try:
-            self._coord_stage_shard(req_meta.uuid, slot_idx, num_blocks,
-                                    req_meta.local_block_ids)
-        except Exception as ex:
-            logger.exception(
-                "TPUConnectorWorker(%d) rank0 --> stage_self uuid=%s failed: %s",
-                self.node_id, req_meta.uuid, ex)
+            # Rank 0 enqueues its own async D2H on the main thread; the waiter
+            # thread emits STAGE_DONE once the future completes. Returning here
+            # before the DMA finishes lets vLLM advance and the
+            # STAGE_NOTIFY/scheduler/PULL-setup round-trip overlap with the
+            # transfer.
+            try:
+                self._coord_stage_shard(req_meta.uuid, slot_idx, num_blocks,
+                                        req_meta.local_block_ids)
+            except Exception as ex:
+                logger.exception(
+                    "TPUConnectorWorker(%d) rank0 --> stage_self uuid=%s failed: %s",
+                    self.node_id, req_meta.uuid, ex)
 
     def _coord_worker_stage_inline(self,
                                    uuid: int,
@@ -1338,200 +1342,205 @@ class ZmqShmKvConnectorBase:
         uuid_bytes = str(entry.uuid).encode("utf-8")
         timeout_s = dist_utils.get_p2p_wait_pull_timeout()
         req_blocks_pickle = _secure_dumps(entry.remote_blocks)
-        logger.info(
-            "TPUConnectorWorker(%s) rank0 --> PULL req_id=%s uuid=%s "
-            "from=%s:%s+0..%s blocks=%s n_channels=%s", self.node_id,
-            entry.req_id, entry.uuid, entry.remote_host, ports, n_channels - 1,
-            entry.num_blocks, n_channels)
+        try: dtype_name = self._coord_pool.spec.dtype.name; itemsize = self._coord_pool.spec.dtype.itemsize; shape_size = self._coord_pool.spec.layer_shard_shape_size; 
+        except (AttributeError, Exception): dtype_name = "unknown"; itemsize = 1; shape_size = 0
+        try: dim = str(self._coord_pool.spec.layer_shard_shape)
+        except Exception: dim = "unknown"
+        with TraceAnnotation("KV_Cache_Pull", phase="Decode", req_id=entry.req_id, uuid=entry.uuid, num_blocks=entry.num_blocks, n_channels=n_channels, bytes=entry.num_blocks * shape_size * itemsize, dtype=dtype_name, dimension=dim, source_hosts=",".join(hosts), dest_node=self.node_id):
+            logger.info(
+                "TPUConnectorWorker(%s) rank0 --> PULL req_id=%s uuid=%s "
+                "from=%s:%s+0..%s blocks=%s n_channels=%s", self.node_id,
+                entry.req_id, entry.uuid, entry.remote_host, ports, n_channels - 1,
+                entry.num_blocks, n_channels)
 
-        num_layers = self.num_layers
+            num_layers = self.num_layers
 
-        def _pull_channel(h: int, ch: int):
-            """Pull one channel's subset of ranks AND unpack their layer
-            frames into shm inline. Returns per-channel (wire_ms,
-            unpack_ms, ranks_handled) so the orchestrator can log the
-            breakdown but does not need to reassemble anything."""
-            port = ports[h] + ch
-            host = hosts[h]
-            sock_path = make_zmq_path("tcp", host, port)
-            sock = make_zmq_socket(ctx=self.zmq_cxt,
-                                   path=sock_path,
-                                   socket_type=zmq.DEALER,
-                                   bind=False,
-                                   linger=0)
-            timeout_ms = max(1, int(timeout_s * 1000))
-            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-            try:
-                t0 = time.perf_counter()
-                logger.info(
-                    "PERF D pull_send host_idx=%d ch=%d uuid=%s ts=%.6f", h,
-                    ch, entry.uuid, time.time())
-                sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
-                deadline = t0 + timeout_s
-                frames = None
-                while time.perf_counter() < deadline:
-                    remaining_ms = max(
-                        1, int((deadline - time.perf_counter()) * 1000))
-                    if sock.poll(timeout=min(remaining_ms, 1000)) != 0:
-                        # copy=False returns zmq.Frame objects whose
-                        # .buffer is a readonly memoryview into the ZMQ
-                        # recv buffer -- one less 256MB copy per layer.
-                        frames = sock.recv_multipart(copy=False)
-                        break
-                if frames is None:
-                    raise TimeoutError(
-                        f"PULL host_idx={h} ch={ch} timed out after {timeout_s}s "
-                        f"for req_id={entry.req_id}")
-                if bytes(frames[0].buffer) != _MSG_OK:
-                    tag = bytes(frames[0].buffer)
-                    payload_hint = (bytes(frames[1].buffer)
-                                    if len(frames) > 1 else b"")
-                    raise RuntimeError(
-                        f"PULL host_idx={h} ch={ch} failed for req_id={entry.req_id}: "
-                        f"[{tag!r}, {payload_hint!r}]")
-                t_wire_done = time.perf_counter()
-                logger.info(
-                    "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f", h,
-                    ch, entry.uuid, time.time())
-
-                # Wire format after OK:
-                #   frames[1]=uuid echo, frames[2]=n_ranks ascii
-                #   ch 0: frames[3]=header, then per-rank blocks
-                #   ch >0: per-rank blocks start at frames[3]
-                # Per-rank block = (rank_idx, layer0, layer1, ..., layer_{L-1})
-                n_ranks = int(bytes(frames[2].buffer).decode("utf-8"))
-                idx = 3
-                header_frame: Optional[zmq.Frame] = None
-                if ch == 0:
-                    header_frame = frames[idx]
-                    idx += 1
-
-                ranks_handled: list[int] = []
-                # Construct reverse mapping global_rank -> local_rank
-                with self._coord_lock:
-                    global_to_local = {
-                        global_rank: local_rank
-                        for local_rank, global_rank in
-                        self._coord_local_to_global_rank.items()
-                    }
-
-                for _ in range(n_ranks):
-                    global_rank = int(
-                        bytes(frames[idx].buffer).decode("utf-8"))
-                    idx += 1
-                    layer_buffers = [
-                        frames[idx + li].buffer for li in range(num_layers)
-                    ]
-                    idx += num_layers
-
-                    if global_rank in global_to_local:
-                        local_rank = global_to_local[global_rank]
-                        self._coord_pool.unpack_rank_layers(
-                            entry.slot_idx, local_rank, entry.num_blocks,
-                            layer_buffers)
-                        ranks_handled.append(global_rank)
-                t_unpack_done = time.perf_counter()
-                wire_ms = (t_wire_done - t0) * 1000.0
-                unpack_ms = (t_unpack_done - t_wire_done) * 1000.0
-                return h, ch, wire_ms, unpack_ms, ranks_handled, header_frame
-            finally:
-                sock.close(linger=0)
-
-        t_total0 = time.perf_counter()
-        try:
-            futures = [
-                self._coord_channel_executor.submit(_pull_channel, h, ch)
-                for h in range(num_hosts) for ch in range(n_channels)
-            ]
-            # Annotation was stale: _pull_channel returns 6 values
-            # (h, ch, wire_ms, unpack_ms, ranks_handled, header_frame), not 5.
-            results: list[tuple[int, int, float, float, list[int],
-                                Optional[zmq.Frame]]] = []
-            first_error: Optional[BaseException] = None
-            for fut in futures:
+            def _pull_channel(h: int, ch: int):
+                """Pull one channel's subset of ranks AND unpack their layer
+                frames into shm inline. Returns per-channel (wire_ms,
+                unpack_ms, ranks_handled) so the orchestrator can log the
+                breakdown but does not need to reassemble anything."""
+                port = ports[h] + ch
+                host = hosts[h]
+                sock_path = make_zmq_path("tcp", host, port)
+                sock = make_zmq_socket(ctx=self.zmq_cxt,
+                                       path=sock_path,
+                                       socket_type=zmq.DEALER,
+                                       bind=False,
+                                       linger=0)
+                timeout_ms = max(1, int(timeout_s * 1000))
+                sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+                sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
                 try:
-                    results.append(fut.result())
-                except BaseException as e:
-                    if first_error is None:
-                        first_error = e
-            # All channel futures have returned or timed out before we mark
-            # the request failed and release its shm slot. Otherwise a late
-            # successful channel from a failed pull can unpack into a slot
-            # already reused by a later request.
-            if first_error is not None:
-                raise first_error
-            t_done = time.perf_counter()
-
-            # Sanity-check all local ranks were delivered exactly once.
-            seen: set[int] = set()
-            header_frame: Optional[zmq.Frame] = None
-            for _h, _ch, _w, _u, ranks, hdr in results:
-                if hdr is not None:
-                    header_frame = hdr
-                for r in ranks:
-                    if r in seen:
+                    t0 = time.perf_counter()
+                    logger.info(
+                        "PERF D pull_send host_idx=%d ch=%d uuid=%s ts=%.6f", h,
+                        ch, entry.uuid, time.time())
+                    sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
+                    deadline = t0 + timeout_s
+                    frames = None
+                    while time.perf_counter() < deadline:
+                        remaining_ms = max(
+                            1, int((deadline - time.perf_counter()) * 1000))
+                        if sock.poll(timeout=min(remaining_ms, 1000)) != 0:
+                            # copy=False returns zmq.Frame objects whose
+                            # .buffer is a readonly memoryview into the ZMQ
+                            # recv buffer -- one less 256MB copy per layer.
+                            frames = sock.recv_multipart(copy=False)
+                            break
+                    if frames is None:
+                        raise TimeoutError(
+                            f"PULL host_idx={h} ch={ch} timed out after {timeout_s}s "
+                            f"for req_id={entry.req_id}")
+                    if bytes(frames[0].buffer) != _MSG_OK:
+                        tag = bytes(frames[0].buffer)
+                        payload_hint = (bytes(frames[1].buffer)
+                                        if len(frames) > 1 else b"")
                         raise RuntimeError(
-                            f"PULL req_id={entry.req_id}: rank {r} "
-                            f"delivered by multiple channels")
-                    seen.add(r)
-            if header_frame is None:
-                raise RuntimeError(
-                    f"PULL req_id={entry.req_id}: channel 0 omitted header")
-            if len(seen) != self.ranks_per_host:
-                raise RuntimeError(
-                    f"PULL req_id={entry.req_id}: got {len(seen)} ranks, "
-                    f"expected {self.ranks_per_host}")
+                            f"PULL host_idx={h} ch={ch} failed for req_id={entry.req_id}: "
+                            f"[{tag!r}, {payload_hint!r}]")
+                    t_wire_done = time.perf_counter()
+                    logger.info(
+                        "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f", h,
+                        ch, entry.uuid, time.time())
 
-            total_ms = (t_done - t_total0) * 1000.0
-            # With inline unpack per channel, wire+unpack are already
-            # overlapped; the outer total is max over channels of
-            # (wire+unpack). Report them separately for continuity
-            # with the existing latency tracker.
-            max_wire = max(w for _h, _c, w, _u, _r, _hdr in results)
-            max_unpack = max(u for _h, _c, _w, u, _r, _hdr in results)
-            self._lat.record(_LAT_WIRE, max_wire)
-            self._lat.record(_LAT_UNPACK, max_unpack)
-            self.transfer_stats.record_kv_pull(total_ms)
-            per_ch_ms = ",".join(f"{w + u:.1f}"
-                                 for _h, _c, w, u, _r, _hdr in results)
-            logger.info(
-                "TPUConnectorWorker(%d) rank0 --> done PULL req_id=%s uuid=%s "
-                "total=%.2fms max_wire=%.2fms max_unpack=%.2fms "
-                "per_ch_ms=[%s]", self.node_id, entry.req_id, entry.uuid,
-                total_ms, max_wire, max_unpack, per_ch_ms)
-            entry.pull_ok = True
-        except Exception as e:
-            logger.exception(
-                "TPUConnectorWorker(%d) rank0 --> PULL req_id=%s failed: %s",
-                self.node_id, entry.req_id, e)
-            entry.pull_ok = False
-            self.transfer_stats.record_failed_transfer()
-        finally:
-            # Tell workers the slot is ready (or drop it on failure).
-            if entry.pull_ok:
-                self._coord_broadcast(_IPC_LOAD_NOTIFY,
-                                      (entry.uuid, entry.slot_idx,
-                                       entry.num_blocks, entry.local_blocks))
-            else:
-                self._coord_broadcast(_IPC_DROP, (entry.uuid, ))
-                # Clean up: failed pulls will never reach COPY_DONE, so
-                # free the slot and drop bookkeeping now. Also surface
-                # the req_id as done_recving -- otherwise the vLLM
-                # scheduler waits forever for completion of a req whose
-                # entry we just silently removed.
-                with self._coord_lock:
-                    self._coord_recv.pop(entry.uuid, None)
-                    self._coord_done_recving.add(entry.req_id)
-                self._coord_pool.release_slot(entry.slot_idx)
-            entry.load_complete.set()
-            logger.info(
-                "PERF D pull_complete req_id=%s uuid=%s ts=%.6f pull_ok=%s",
-                entry.req_id, entry.uuid, time.time(), entry.pull_ok)
+                    # Wire format after OK:
+                    #   frames[1]=uuid echo, frames[2]=n_ranks ascii
+                    #   ch 0: frames[3]=header, then per-rank blocks
+                    #   ch >0: per-rank blocks start at frames[3]
+                    # Per-rank block = (rank_idx, layer0, layer1, ..., layer_{L-1})
+                    n_ranks = int(bytes(frames[2].buffer).decode("utf-8"))
+                    idx = 3
+                    header_frame: Optional[zmq.Frame] = None
+                    if ch == 0:
+                        header_frame = frames[idx]
+                        idx += 1
 
-    # =========================================================
-    # Drain pass: every rank (including 0) scatters its shard
-    # =========================================================
+                    ranks_handled: list[int] = []
+                    # Construct reverse mapping global_rank -> local_rank
+                    with self._coord_lock:
+                        global_to_local = {
+                            global_rank: local_rank
+                            for local_rank, global_rank in
+                            self._coord_local_to_global_rank.items()
+                        }
+
+                    for _ in range(n_ranks):
+                        global_rank = int(
+                            bytes(frames[idx].buffer).decode("utf-8"))
+                        idx += 1
+                        layer_buffers = [
+                            frames[idx + li].buffer for li in range(num_layers)
+                        ]
+                        idx += num_layers
+
+                        if global_rank in global_to_local:
+                            local_rank = global_to_local[global_rank]
+                            self._coord_pool.unpack_rank_layers(
+                                entry.slot_idx, local_rank, entry.num_blocks,
+                                layer_buffers)
+                            ranks_handled.append(global_rank)
+                    t_unpack_done = time.perf_counter()
+                    wire_ms = (t_wire_done - t0) * 1000.0
+                    unpack_ms = (t_unpack_done - t_wire_done) * 1000.0
+                    return h, ch, wire_ms, unpack_ms, ranks_handled, header_frame
+                finally:
+                    sock.close(linger=0)
+
+            t_total0 = time.perf_counter()
+            try:
+                futures = [
+                    self._coord_channel_executor.submit(_pull_channel, h, ch)
+                    for h in range(num_hosts) for ch in range(n_channels)
+                ]
+                # Annotation was stale: _pull_channel returns 6 values
+                # (h, ch, wire_ms, unpack_ms, ranks_handled, header_frame), not 5.
+                results: list[tuple[int, int, float, float, list[int],
+                                    Optional[zmq.Frame]]] = []
+                first_error: Optional[BaseException] = None
+                for fut in futures:
+                    try:
+                        results.append(fut.result())
+                    except BaseException as e:
+                        if first_error is None:
+                            first_error = e
+                # All channel futures have returned or timed out before we mark
+                # the request failed and release its shm slot. Otherwise a late
+                # successful channel from a failed pull can unpack into a slot
+                # already reused by a later request.
+                if first_error is not None:
+                    raise first_error
+                t_done = time.perf_counter()
+
+                # Sanity-check all local ranks were delivered exactly once.
+                seen: set[int] = set()
+                header_frame: Optional[zmq.Frame] = None
+                for _h, _ch, _w, _u, ranks, hdr in results:
+                    if hdr is not None:
+                        header_frame = hdr
+                    for r in ranks:
+                        if r in seen:
+                            raise RuntimeError(
+                                f"PULL req_id={entry.req_id}: rank {r} "
+                                f"delivered by multiple channels")
+                        seen.add(r)
+                if header_frame is None:
+                    raise RuntimeError(
+                        f"PULL req_id={entry.req_id}: channel 0 omitted header")
+                if len(seen) != self.ranks_per_host:
+                    raise RuntimeError(
+                        f"PULL req_id={entry.req_id}: got {len(seen)} ranks, "
+                        f"expected {self.ranks_per_host}")
+
+                total_ms = (t_done - t_total0) * 1000.0
+                # With inline unpack per channel, wire+unpack are already
+                # overlapped; the outer total is max over channels of
+                # (wire+unpack). Report them separately for continuity
+                # with the existing latency tracker.
+                max_wire = max(w for _h, _c, w, _u, _r, _hdr in results)
+                max_unpack = max(u for _h, _c, _w, u, _r, _hdr in results)
+                self._lat.record(_LAT_WIRE, max_wire)
+                self._lat.record(_LAT_UNPACK, max_unpack)
+                self.transfer_stats.record_kv_pull(total_ms)
+                per_ch_ms = ",".join(f"{w + u:.1f}"
+                                     for _h, _c, w, u, _r, _hdr in results)
+                logger.info(
+                    "TPUConnectorWorker(%d) rank0 --> done PULL req_id=%s uuid=%s "
+                    "total=%.2fms max_wire=%.2fms max_unpack=%.2fms "
+                    "per_ch_ms=[%s]", self.node_id, entry.req_id, entry.uuid,
+                    total_ms, max_wire, max_unpack, per_ch_ms)
+                entry.pull_ok = True
+            except Exception as e:
+                logger.exception(
+                    "TPUConnectorWorker(%d) rank0 --> PULL req_id=%s failed: %s",
+                    self.node_id, entry.req_id, e)
+                entry.pull_ok = False
+                self.transfer_stats.record_failed_transfer()
+            finally:
+                # Tell workers the slot is ready (or drop it on failure).
+                if entry.pull_ok:
+                    self._coord_broadcast(_IPC_LOAD_NOTIFY,
+                                          (entry.uuid, entry.slot_idx,
+                                           entry.num_blocks, entry.local_blocks))
+                else:
+                    self._coord_broadcast(_IPC_DROP, (entry.uuid, ))
+                    # Clean up: failed pulls will never reach COPY_DONE, so
+                    # free the slot and drop bookkeeping now. Also surface
+                    # the req_id as done_recving -- otherwise the vLLM
+                    # scheduler waits forever for completion of a req whose
+                    # entry we just silently removed.
+                    with self._coord_lock:
+                        self._coord_recv.pop(entry.uuid, None)
+                        self._coord_done_recving.add(entry.req_id)
+                    self._coord_pool.release_slot(entry.slot_idx)
+                entry.load_complete.set()
+                logger.info(
+                    "PERF D pull_complete req_id=%s uuid=%s ts=%.6f pull_ok=%s",
+                    entry.req_id, entry.uuid, time.time(), entry.pull_ok)
+
+        # =========================================================
+        # Drain pass: every rank (including 0) scatters its shard
+        # =========================================================
     def _coord_scatter_and_ack(self, req_id: ReqId, uuid: int, slot_idx: int,
                                num_blocks: int,
                                local_blocks: list[int]) -> None:
