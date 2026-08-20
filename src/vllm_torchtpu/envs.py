@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -294,6 +296,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
+    # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
+    # program, instead of bracketing the per-rank compute with vLLM's
+    # all-gather and reduce-scatter. The transport then overlaps the matmuls;
+    # the reduce-scatter it replaces is otherwise fully exposed.
+    "USE_MOE_FUSED_EP_KERNEL":
+    env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Largest node-wide token count, out of the scheduler's cap, at or above
+    # which the fused kernel is armed for the whole deployment. Decided once at
+    # weight load, not per step: a per-step choice would need the token count
+    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
+    # arming everything. Below the threshold the grouped-matmul path serves.
+    "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
