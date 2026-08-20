@@ -118,11 +118,10 @@ def _kernel(
     a_log_ref,  # [n_v, 1]
     dt_bias_ref,  # [n_v, d_k]
     state_ref,  # [1, n_v, d_k, d_v]  paged slot
-    # Outputs.
-    out_ref,  # [1, n_v, d_v]
-    conv_state_out_ref,  # aliased to conv_state_ref
-    state_out_ref,  # [1, n_v, d_k, d_v]  aliased to state_ref
-    *,
+    # Trailing refs, then outputs. Pallas passes refs positionally, so the
+    # optional epilogue operands cannot be declared as plain parameters: when
+    # they are absent the outputs would slide into their slots.
+    *refs,
     n_v: int,
     d_k: int,
     kernel_size: int,
@@ -130,7 +129,16 @@ def _kernel(
     compute_dtype,
     scale: float,
     state_transposed: bool,
+    eps: float | None,
+    fuse_epilogue: bool,
 ):
+    if fuse_epilogue:
+        (output_gate_ref, norm_weight_ref, out_ref, conv_state_out_ref,
+         state_out_ref) = refs
+    else:
+        output_gate_ref = None
+        norm_weight_ref = None
+        out_ref, conv_state_out_ref, state_out_ref = refs
     s = pl.program_id(0)
     slot = state_indices_ref[s]
     # Two independent flags, easy to conflate:
@@ -201,6 +209,22 @@ def _kernel(
     new_stored_conv = jnp.where(valid, new_stored_conv, stored_conv)
     new_stored = jnp.where(valid, new_stored, stored)
 
+    # Fused epilogue: per-head o_norm then the sigmoid output gate, matching
+    # `_gated_output_norm` in the caller exactly, including its round trip
+    # through the activation dtype. Doing it here keeps the output resident
+    # instead of writing it out and reading it back for two elementwise
+    # passes; upstream's CUDA fused KDA kernel folds the norm in the same way.
+    # An invalid row is already zero and stays zero: rsqrt(0 + eps) is finite,
+    # so 0 * anything is 0.
+    if output_gate_ref is not None:
+        assert eps is not None
+        normed = out.astype(out_ref.dtype).astype(jnp.float32)
+        normed *= jax.lax.rsqrt(
+            jnp.mean(normed * normed, axis=-1, keepdims=True) + eps)
+        normed = (normed *
+                  norm_weight_ref[0].astype(jnp.float32)).astype(out_ref.dtype)
+        out = normed * jax.nn.sigmoid(output_gate_ref[0])
+
     out_ref[0] = out.astype(out_ref.dtype)
     conv_state_out_ref[0] = new_stored_conv.astype(conv_state_out_ref.dtype)
     state_out_ref[0] = new_stored.astype(state_out_ref.dtype)
@@ -208,7 +232,7 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("lower_bound", "compute_dtype", "scale",
+    static_argnames=("eps", "lower_bound", "compute_dtype", "scale",
                      "conv_state_dim_first", "state_transposed"),
 )
 def decode_kda(
@@ -224,7 +248,10 @@ def decode_kda(
     has_initial_state: jax.Array,  # [num_seqs] int32/bool
     read_offsets: jax.Array | None = None,  # [num_seqs] int32
     write_offsets: jax.Array | None = None,  # [num_seqs] int32
+    output_gate: jax.Array | None = None,  # [num_seqs, n_v * d_v] raw gate
+    norm_weight: jax.Array | None = None,  # [d_v] o_norm weight
     *,
+    eps: float | None = None,
     lower_bound: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
     scale: float | None = None,
@@ -288,6 +315,11 @@ def decode_kda(
 
     a_log_2d = a_log.reshape(n_v, 1)
 
+    # The epilogue is fused only when the caller hands over both the gate and
+    # the norm weight; otherwise the kernel returns the bare recurrence output
+    # and the caller normalizes, which is the original contract.
+    fuse_epilogue = output_gate is not None and norm_weight is not None
+
     kernel = functools.partial(
         _kernel,
         n_v=n_v,
@@ -297,7 +329,19 @@ def decode_kda(
         compute_dtype=jnp.dtype(compute_dtype),
         scale=float(scale),
         state_transposed=bool(state_transposed),
+        eps=None if eps is None else float(eps),
+        fuse_epilogue=fuse_epilogue,
     )
+
+    if fuse_epilogue:
+        if eps is None:
+            raise ValueError("eps is required when fusing the output norm")
+        output_gate = output_gate.reshape(num_seqs, n_v, d_v)
+        if norm_weight.shape != (d_v, ):
+            raise ValueError(
+                f"norm_weight must be [d_v] = {(d_v, )}, got {norm_weight.shape}"
+            )
+        norm_weight = norm_weight.reshape(1, d_v)
 
     conv_state_shape = conv_state.shape
     if conv_state.ndim != 5:
@@ -352,7 +396,11 @@ def decode_kda(
                          (0, 0)),  # dt_bias
             # Paged state: this is the gather, expressed as a DMA.
             pl.BlockSpec((1, n_v, d_k, d_v), state_in_map),
-        ],
+        ] + ([
+            pl.BlockSpec((1, n_v, d_v), seq_map),  # output gate
+            pl.BlockSpec((1, d_v), lambda s, si, hi, ro, wo:
+                         (0, 0)),  # o_norm weight
+        ] if fuse_epilogue else []),
         out_specs=[
             pl.BlockSpec((1, n_v, d_v), seq_map),  # out
             pl.BlockSpec((1, state_len, 3, n_v, d_k),
@@ -401,6 +449,7 @@ def decode_kda(
         a_log_2d,
         dt_bias,
         state,
+        *([output_gate, norm_weight] if fuse_epilogue else []),
     )
     if len(conv_state_shape) != 5:
         conv_state = conv_state.reshape(conv_state.shape[0], state_len,

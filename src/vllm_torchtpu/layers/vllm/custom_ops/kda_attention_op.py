@@ -649,8 +649,12 @@ def build_kimi_dispatched_kda_op(
         decode_slots = _null_out_non_decode(state_indices, decode_end)
         window = num_spec_tokens + 1
 
-        def _decode_once(tokens, gate, beta_rows, conv, pool, slots, initial,
-                         read_off, write_off):
+        def _decode_once(tokens, gate, beta_rows, out_gate_rows, conv, pool,
+                         slots, initial, read_off, write_off):
+            # `output_gate` and `norm_weight` are handed to the kernel so the
+            # o_norm and sigmoid gate run inside it, on output still resident
+            # in VMEM, instead of costing a write and two elementwise reads
+            # afterwards. The prefill segment still normalizes in XLA below.
             return decode_kda(
                 _match_rows(tokens, num_seqs),
                 _match_rows(gate, num_seqs).reshape(num_seqs, num_heads,
@@ -665,6 +669,9 @@ def build_kimi_dispatched_kda_op(
                 initial,
                 read_off,
                 write_off,
+                _match_rows(out_gate_rows, num_seqs),
+                norm_weight,
+                eps=eps,
                 lower_bound=lower_bound,
                 # The pool is [slots, H, K, V], which is the layout the
                 # recurrence indexes as state[k, v]; no in-kernel swap.
@@ -674,8 +681,8 @@ def build_kimi_dispatched_kda_op(
         zeros = jnp.zeros((num_seqs, ), jnp.int32)
         if window == 1:
             decode_out, conv_after_decode, pool_after_decode = _decode_once(
-                mixed_qkv, raw_gate, beta, conv_in, recurrent_state,
-                decode_slots, has_initial_state, zeros, zeros)
+                mixed_qkv, raw_gate, beta, output_gate, conv_in,
+                recurrent_state, decode_slots, has_initial_state, zeros, zeros)
         else:
             # Speculative verify window. Each request owns `window` consecutive
             # slots; position t resumes from the previous checkpoint and lays
@@ -716,8 +723,10 @@ def build_kimi_dispatched_kda_op(
                 out_t, conv_cur, pool_cur = _decode_once(
                     jnp.take(mixed_qkv, rows, axis=0),
                     jnp.take(raw_gate, rows, axis=0),
-                    jnp.take(beta, rows, axis=0), conv_cur, pool_cur, slots_t,
-                    initial, read_off, jnp.full((num_seqs, ), t, jnp.int32))
+                    jnp.take(beta, rows, axis=0),
+                    jnp.take(output_gate, rows, axis=0), conv_cur, pool_cur,
+                    slots_t, initial, read_off,
+                    jnp.full((num_seqs, ), t, jnp.int32))
                 decode_out = decode_out.at[rows].set(
                     jnp.where(present[:, None, None],
                               out_t.astype(activation_dtype),
@@ -820,6 +829,12 @@ def build_kimi_dispatched_kda_op(
         # --- select per token ---------------------------------------------
         # Each side left the other's rows zero, so this is a select rather than
         # a sum only to keep the intent legible.
+        # Only the prefill rows still need the epilogue in XLA: `decode_kda`
+        # applied it inside the kernel. Normalizing zeros yields zeros, so the
+        # skipped-prefill branch is unaffected.
+        chunk_out = _gated_output_norm(chunk_out, output_gate, norm_weight,
+                                       eps, activation_dtype)
+
         # `first_prefill_token`, not `decode_end`: the former is a token index,
         # the latter a request count. They coincide only while every decode
         # request holds exactly one token, which a speculative verify window
@@ -829,8 +844,6 @@ def build_kimi_dispatched_kda_op(
             _match_rows(decode_out, num_tokens).astype(chunk_out.dtype),
             chunk_out,
         )
-        output = _gated_output_norm(output, output_gate, norm_weight, eps,
-                                    activation_dtype)
 
         return output, conv_after_prefill, new_pool
 

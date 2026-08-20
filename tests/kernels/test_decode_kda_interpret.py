@@ -252,6 +252,88 @@ def test_checkpoint_window_leaves_other_groups_untouched() -> None:
                 f"slot {slot} should be untouched")
 
 
+def _gated_output_norm_reference(out, output_gate, norm_weight, eps, dtype):
+    """The epilogue as `kda_attention_op._gated_output_norm` performs it."""
+    normed = out.astype(dtype).astype(jnp.float32)
+    normed *= jax.lax.rsqrt(
+        jnp.mean(normed * normed, axis=-1, keepdims=True) + eps)
+    normed = (normed * norm_weight.astype(jnp.float32)).astype(dtype)
+    return normed * jax.nn.sigmoid(output_gate.reshape(normed.shape))
+
+
+@pytest.mark.parametrize("eps", [1e-5, 1e-6])
+def test_fused_epilogue_matches_unfused(eps: float) -> None:
+    """Fusing o_norm and the output gate must not change the result.
+
+    The caller used to apply both after the kernel returned. Folding them in
+    keeps the output resident instead of writing it out and reading it back
+    for two elementwise passes, so the two paths have to agree.
+    """
+    inp = _inputs(seed=21)
+    state_indices = jnp.array([1, 2], jnp.int32)
+    has_initial_state = jnp.array([1, 1], jnp.int32)
+    keys = jax.random.split(jax.random.PRNGKey(77), 2)
+    output_gate = jax.random.normal(keys[0],
+                                    (NUM_SEQS, NUM_HEADS * HEAD_DIM)) * 0.5
+    norm_weight = jax.random.normal(keys[1], (HEAD_DIM, )) * 0.5
+
+    common = (inp["mixed_qkv"], inp["g"], inp["beta"], inp["conv_state"],
+              inp["conv_weight"], inp["state"], inp["a_log"], inp["dt_bias"],
+              state_indices, has_initial_state)
+
+    raw, conv_unfused, state_unfused = decode_kda(*common,
+                                                  lower_bound=None,
+                                                  compute_dtype=jnp.float32,
+                                                  scale=SCALE)
+    want = _gated_output_norm_reference(raw, output_gate, norm_weight, eps,
+                                        raw.dtype)
+
+    got, conv_fused, state_fused = decode_kda(*common,
+                                              None,
+                                              None,
+                                              output_gate,
+                                              norm_weight,
+                                              eps=eps,
+                                              lower_bound=None,
+                                              compute_dtype=jnp.float32,
+                                              scale=SCALE)
+
+    _assert_close("fused epilogue output", got, want)
+    # The recurrence itself must be untouched by the epilogue.
+    assert jnp.array_equal(conv_fused, conv_unfused)
+    assert jnp.array_equal(state_fused, state_unfused)
+
+
+def test_fused_epilogue_keeps_null_rows_zero() -> None:
+    """A null slot emits zeros, and the epilogue must not resurrect them."""
+    inp = _inputs(seed=23)
+    state_indices = jnp.array([1, 0], jnp.int32)
+    has_initial_state = jnp.array([1, 1], jnp.int32)
+    keys = jax.random.split(jax.random.PRNGKey(79), 2)
+
+    out, _, _ = decode_kda(inp["mixed_qkv"],
+                           inp["g"],
+                           inp["beta"],
+                           inp["conv_state"],
+                           inp["conv_weight"],
+                           inp["state"],
+                           inp["a_log"],
+                           inp["dt_bias"],
+                           state_indices,
+                           has_initial_state,
+                           None,
+                           None,
+                           jax.random.normal(keys[0],
+                                             (NUM_SEQS,
+                                              NUM_HEADS * HEAD_DIM)) * 0.5,
+                           jax.random.normal(keys[1], (HEAD_DIM, )) * 0.5,
+                           eps=1e-6,
+                           lower_bound=None,
+                           compute_dtype=jnp.float32,
+                           scale=SCALE)
+    assert jnp.array_equal(out[1], jnp.zeros_like(out[1]))
+
+
 def test_null_slot_emits_zeros_and_leaves_state() -> None:
     """Slot 0 is the reserved null block: emit nothing, write nothing."""
     inp = _inputs(seed=9)
