@@ -322,12 +322,29 @@ fi
 # strips the per-request lists, so the result JSON carries no generated text)
 echo "########## TIER 0 — output identity ##########"
 IDBASE="$SCRIPT_DIR/baselines/identity/${CONFIG_NAME}.json"
+# FAIL CLOSED. The old form left IDENTITY_FAIL unset on the happy path and the
+# summary printed "${IDENTITY_FAIL:-0}", so a probe that never ran -- or that
+# died -- still reported a pass. That default masked a real failure twice: on
+# v022, and again on v055e/v055f where the probe errored on BOTH cells and
+# identity_fail=0 printed anyway. Start at 1; only an explicit success clears it.
+IDENTITY_FAIL=1
 if [ "$RECORD_IDENTITY" = "1" ]; then
-  python3 "$SCRIPT_DIR/identity_probe.py" --record --model "$MODEL" \
-      --port "$PORT" --out "$IDBASE" || IDENTITY_FAIL=1
+  IDENTITY_MODE=record
+  if python3 "$SCRIPT_DIR/identity_probe.py" --record --model "$MODEL" \
+      --port "$PORT" --out "$IDBASE"; then
+    IDENTITY_FAIL=0
+  fi
 else
-  python3 "$SCRIPT_DIR/identity_probe.py" --compare --model "$MODEL" \
-      --port "$PORT" --out "$IDBASE" || IDENTITY_FAIL=1
+  IDENTITY_MODE=compare
+  if [ ! -s "$IDBASE" ]; then
+    # --compare against a reference that does not exist is not a pass, and it
+    # is not a probe failure either: it means nobody ever recorded one. Say so.
+    echo "identity: NO REFERENCE at $IDBASE -- record one from the BASELINE config first"
+    IDENTITY_MODE=absent
+  elif python3 "$SCRIPT_DIR/identity_probe.py" --compare --model "$MODEL" \
+      --port "$PORT" --out "$IDBASE"; then
+    IDENTITY_FAIL=0
+  fi
 fi
 
 # ---- Tier 1: accuracy, against the same server
@@ -350,6 +367,12 @@ print('$(basename "$f" .json)', '|',
       'ttft_ms=%.2f' % d.get('median_ttft_ms',0),
       'completed=%s' % d.get('completed'))"
 done
-echo "identity_fail=${IDENTITY_FAIL:-0}"
+# Report the MODE alongside the result. "identity_fail=0" from a `record` run
+# means "a reference was written", NOT "the output was checked" -- reading the
+# two as the same thing is what made the false pass invisible.
+echo "identity_mode=${IDENTITY_MODE:-none} identity_fail=${IDENTITY_FAIL}"
+if [ "${IDENTITY_MODE:-none}" != "compare" ]; then
+  echo "identity: NO SEMANTICS CHECK WAS PERFORMED (mode=${IDENTITY_MODE:-none})"
+fi
 cleanup_server
 echo "########## BENCH_K3_DONE ##########"
