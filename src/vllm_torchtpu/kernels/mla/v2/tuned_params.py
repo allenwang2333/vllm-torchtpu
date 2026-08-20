@@ -1117,7 +1117,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=128,
         kv_packing=2,
-        max_num_seqs=4,
+        max_num_seqs=8,
         pages_per_seq=128,
     ):
     TunableParams(
