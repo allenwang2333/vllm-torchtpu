@@ -71,6 +71,19 @@ export TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT="${TPU_LOW_LATENCY_ALLREDUCE_MOE_CON
 export TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC="${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC:-0}"
 # Remove the steady-state barrier from the _ws kernels (round 0 keeps its own).
 export TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER="${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER:-0}"
+# Format is ROWSxCOLS, not a bare width: the parser does
+# tuple(int(v) for v in value.split("x")) and compares against the plan's
+# (rows, cols), so "7168" builds a 1-tuple that matches nothing and falls back
+# silently-ish. Use 1x7168 for K3 at compile size 1.
+#
+# Which single shape gets the communicator's entry op. Without it the selector
+# takes the *smallest* payload that takes a kernel, which on K3 is the 7 KiB
+# (1,3584) latent reduce -- leaving the 14 KiB (1,7168) post-attention reduce on
+# XLA, where it costs 17.1 us against two_shot's ~12.5. That is ~433 us/step over
+# 95 layers, and it is why an arm run without this measured 15.73 ms against
+# 15.31 for the same nominal config. Set it to the hidden size to put the
+# post-attention reduce on the kernel.
+export TPU_LOW_LATENCY_ALLREDUCE_SHAPE="${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}"
 LOG_DIR="${KIMI_K3_LOG_ROOT:-${REPO_DIR}/results/kimi-k3-verify-${SLURM_JOB_ID}}"
 # Set PROFILE_DIR to make /start_profile work. Both halves are required and
 # neither can be turned on after the server is up: the phased profiler is read
@@ -170,6 +183,11 @@ _LLAR_TAG=""
 # barriered program and the A/B would measure nothing at all.
 [[ "${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER:-0}" == "1" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-nobar"
+# The override decides *which* shape carries the kernel, so it changes the
+# workspace shapes that are graph inputs. Sharing a cache across it is the same
+# arity hazard as the flags above.
+[[ -n "${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-s${TPU_LOW_LATENCY_ALLREDUCE_SHAPE}"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -371,6 +389,7 @@ report_split() {
   echo "  moe_concat=${TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT}" \
        "moe_variadic=${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC}" \
        "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
+       "shape=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-auto}" \
        "xla_cache=${VLLM_XLA_CACHE_PATH}"
   local ll_one ll_two ll_xla
   ll_one=$(grep -c -- "-> one_shot" "${SERVER_LOG}" 2>/dev/null || true)
@@ -409,6 +428,23 @@ EOF
 # and arm_check.sh already makes that argument ("a hand-assembled sequence
 # drifted between arms is not a comparison"). ENDPOINT and OUT are exported for
 # it. A non-zero exit is reported but still releases the nodes.
+# Refuse to measure a wiring we did not ask for. Both failure modes here have
+# already cost a run: a bare width silently falls back to the smallest shape,
+# which leaves K3's post-attention reduce on XLA at 17.1 us against two_shot's
+# 12.5 -- ~433 us/step over 95 layers, enough to swamp anything under test.
+if [[ -n "${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}" ]]; then
+  if grep -q "does not match any shape that takes a kernel" \
+      "${LOG_DIR}/server.log" 2>/dev/null; then
+    echo "FATAL: TPU_LOW_LATENCY_ALLREDUCE_SHAPE=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE}" \
+         "was rejected by the dispatcher (expects ROWSxCOLS, e.g. 1x7168)." >&2
+    grep -oE "does not match any shape[^.]*" "${LOG_DIR}/server.log" \
+      | head -1 >&2
+    scancel "${SLURM_JOB_ID}" 2>/dev/null || true
+    exit 3
+  fi
+  echo "shape override accepted: $(grep -hoE 'wired to \(1, [0-9]+\) \([a-z_]+\) at site=[a-z]+' "${LOG_DIR}/server.log" | head -1)"
+fi
+
 if [[ -n "${POST_READY_CMD:-}" ]]; then
   export ENDPOINT="http://${HEAD_IP}:${PORT}"
   export OUT="${LOG_DIR}"
