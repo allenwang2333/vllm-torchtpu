@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MLA_MIXED_KV_PAGES_PER_BLOCK: int = 0
+    TPU_MLA_MIXED_VMEM_MB: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -302,6 +303,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block sizes are two different kernels.
     "TPU_MLA_MIXED_KV_PAGES_PER_BLOCK":
     lambda: int(os.getenv("TPU_MLA_MIXED_KV_PAGES_PER_BLOCK") or "0"),
+
+    # VMEM budget in MiB for the MLA mixed kernel; 0 keeps the 60 MiB every
+    # hand-tuned entry declares. That figure is roughly 15x what the kernel's
+    # KV window actually needs at 32 pages per block, and the request competes
+    # with the rest of the program: TP=8 died in warmup at 63.50 MiB of a 64
+    # MiB budget. Lowering it frees room for wider tensor parallelism without
+    # changing the computed block schedule.
+    "TPU_MLA_MIXED_VMEM_MB":
+    lambda: int(os.getenv("TPU_MLA_MIXED_VMEM_MB") or "0"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.

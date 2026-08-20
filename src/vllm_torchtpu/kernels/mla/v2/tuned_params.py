@@ -1111,6 +1111,28 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 
 _MIXED_VMEM_LIMIT_BYTES = 62914560  # 60 MiB, as every hand-tuned entry uses.
 
+
+def mixed_vmem_limit_bytes() -> int:
+    """VMEM budget the mixed kernel declares.
+
+    60 MiB is what every hand-tuned entry asks for, and it is far more than
+    the kernel needs. At 32 pages per block and Kimi's 20 KB pages the KV
+    window wants about 4 MiB; the budget only starts to bind the block
+    schedule below roughly 2 MiB.
+
+    The request is not free, because it competes with the rest of the program
+    for the 64 MiB a core has. TP=8 died during warmup at 63.50 MiB of 64,
+    half a megabyte short -- so a budget nobody needed was the thing standing
+    between this model and twice the tensor parallelism.
+
+    `TPU_MLA_MIXED_VMEM_MB` lowers it; 0 keeps 60 MiB.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override_mb = tpu_envs.TPU_MLA_MIXED_VMEM_MB
+    if override_mb > 0:
+        return override_mb * 1024 * 1024
+    return _MIXED_VMEM_LIMIT_BYTES
+
 # Enough KV pages in flight to cover DMA latency. Measured on
 # Kimi-Linear-48B-A3B at TP=4, 8k/1k, concurrency 16, end to end:
 #
@@ -1172,7 +1194,7 @@ def mixed_kv_pages_per_block(tuning_key: TuningKey) -> int:
     page_bytes = slots * width * _DTYPE_BYTES.get(tuning_key.kv_dtype, 2)
 
     # Half the budget for the KV window, and it is double buffered.
-    fits = (_MIXED_VMEM_LIMIT_BYTES // 2) // max(page_bytes * 2, 1)
+    fits = (mixed_vmem_limit_bytes() // 2) // max(page_bytes * 2, 1)
     pages = min(fits, _MIXED_KV_PAGES_TARGET, tuning_key.pages_per_seq)
     return max(_prev_power_of_two(pages), 1)
 
@@ -1188,7 +1210,7 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
             return TunableParams(
                 num_kv_pages_per_block=mixed_kv_pages_per_block(tuning_key),
                 num_queries_per_block=16,
-                vmem_limit_bytes=_MIXED_VMEM_LIMIT_BYTES,
+                vmem_limit_bytes=mixed_vmem_limit_bytes(),
             )
 
         # decode, batched_decode
