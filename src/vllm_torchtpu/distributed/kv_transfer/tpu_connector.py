@@ -1614,9 +1614,12 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
-        from tpu_sync.rpc.raiden_controller import RaidenControllerClientFacade
+        # The reshard surface moved off the Python controller and behind this
+        # client, which fronts the native implementation. The work-unit and
+        # request-block calls below keep the names and arguments they had.
+        from tpu_sync.api.torch.reshard_client import ReshardClient
 
-        return RaidenControllerClientFacade(controller_address)
+        return ReshardClient(controller_address)
 
     @staticmethod
     def _new_raiden_id(fields: dict[str, Any]) -> Any:
