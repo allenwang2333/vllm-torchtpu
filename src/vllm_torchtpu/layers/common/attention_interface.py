@@ -607,7 +607,14 @@ def mla_attention(
         num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block)
-        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
+        # Same story as the KV tuple above: the prefill and mixed entries were
+        # literal 16s that no tuned entry or computed schedule could reach.
+        # Fixing only the KV side left the kernel at bq_16-bkvp_64, which
+        # measured 2.72 ms per call against 0.911 ms for the schedule the
+        # tuner found.
+        num_queries_per_blocks = (tuned.num_queries_per_block,
+                                  mixed_tuned.num_queries_per_block,
+                                  mixed_tuned.num_queries_per_block)
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
