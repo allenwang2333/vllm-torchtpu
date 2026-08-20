@@ -571,10 +571,23 @@ def mla_attention(
         # than a sequence owns -- so leaving the placeholder capped the block
         # count at 8 and gave up about 12% end to end. Only the mixed key gets
         # the real value; changing the decode key would miss its tuned rows.
+        #
+        # `block_tables` arrives here already flattened to the kernel's
+        # `page_indices` layout, i32[max_num_seqs * pages_per_seq], so the page
+        # count per sequence comes from dividing by the sequence count rather
+        # than from a second axis. Both layouts are handled because this is a
+        # tuning hint: getting it wrong costs performance, and raising here
+        # would cost the whole server.
+        if block_tables.ndim >= 2:
+            pages_per_seq = block_tables.shape[1]
+        elif seq_lens.shape[0] > 0:
+            pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
+        else:
+            pages_per_seq = tuning_key.pages_per_seq
         mixed_tuned = get_tuned_params(
             dataclasses.replace(tuning_key,
                                 case="mixed",
-                                pages_per_seq=block_tables.shape[1]))
+                                pages_per_seq=max(int(pages_per_seq), 1)))
         num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block)
