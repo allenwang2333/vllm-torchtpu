@@ -128,6 +128,10 @@ BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 # non-greedy: temp 0.7 / top_p 0.8 / top_k 20).
 # Set to 0 for deterministic greedy decoding.
 BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
+# Extra flags appended verbatim to every `vllm bench serve` invocation
+# (client side — EXTRA_SERVE_ARGS is the server-side counterpart). E.g.
+# --trust-remote-code for models whose HF repo ships a custom tokenizer.
+EXTRA_BENCH_ARGS=""
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
@@ -391,6 +395,7 @@ run_benchmark_once() {
         --ignore-eos \
         --result-filename "$result_file" \
         $profile_arg \
+        ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
