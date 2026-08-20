@@ -1133,17 +1133,32 @@ def mixed_vmem_limit_bytes() -> int:
         return override_mb * 1024 * 1024
     return _MIXED_VMEM_LIMIT_BYTES
 
-# Enough KV pages in flight to cover DMA latency. Measured on
-# Kimi-Linear-48B-A3B at TP=4, 8k/1k, concurrency 16, end to end:
+# Enough KV pages in flight to cover DMA latency. Measured end to end on
+# Kimi-Linear-48B-A3B at TP=4, 8k/1k, concurrency 16:
 #
 #     pages per block :    1       4       16      32
 #     output tok/s    :  581.94  829.70  945.33  964.71
 #
-# The curve is latency-bound and flattens: 1->4 is +42.6%, 4->16 is +13.9%,
-# 16->32 is +2.1%. Nothing OOMed, so VMEM was never the binding constraint --
-# past the knee, extra pages buy nothing and only cost residency. 32 sits just
-# past the knee, which is where we want to land when the shape is unknown.
-_MIXED_KV_PAGES_TARGET = 32
+# and again at kernel level with `scripts/kernels/autotune_mla.py`, which
+# sweeps further than a serving benchmark affordably can. 64 beat 32 at every
+# query block size tried:
+#
+#     pages per block :   1      8      16     32     64     (ms, queries=64)
+#     kernel time     : 17.961  2.714  1.630  1.302  1.174
+#
+# Nothing OOMed anywhere in that sweep, so VMEM is not what ends the curve.
+_MIXED_KV_PAGES_TARGET = 64
+
+# Query rows resident per block. The untuned fallback pinned this at 16 and
+# nobody had swept it; it turned out to matter as much as the KV block size.
+# At 32 pages per block, same harness:
+#
+#     queries : 8      16     32     64     128
+#     ms      : 4.888  2.808  1.756  1.256  1.041
+#
+# 16 -> 128 is 2.70x on the kernel. Still improving at 128, so this target is
+# where the measurement stops rather than where the curve does.
+_MIXED_QUERIES_TARGET = 128
 
 _DTYPE_BYTES = {
     "float8_e4m3fn": 1,
@@ -1159,6 +1174,48 @@ def _prev_power_of_two(value: int) -> int:
     while result * 2 <= value:
         result *= 2
     return result
+
+
+def _mixed_page_bytes(tuning_key: TuningKey) -> int:
+    """VMEM one KV page occupies, latent and RoPE dims together."""
+    r_dim_padded = ((tuning_key.actual_r_dim + 127) // 128) * 128
+    width = tuning_key.actual_lkv_dim + r_dim_padded
+    slots = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+    return slots * width * _DTYPE_BYTES.get(tuning_key.kv_dtype, 2)
+
+
+def mixed_queries_per_block(tuning_key: TuningKey, kv_pages: int) -> int:
+    """Query rows per block for the mixed kernel, from what VMEM is left.
+
+    Sized after the KV window rather than beside it, because the two share one
+    budget and the KV side is chosen first. A query row costs its own latent
+    and RoPE slice plus the scores it produces against the whole KV window, so
+    a wider KV block makes each query row more expensive -- the two knobs
+    trade against each other and cannot be picked independently.
+
+    `TPU_MLA_MIXED_QUERIES_PER_BLOCK` overrides the result; 0 computes it.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override = tpu_envs.TPU_MLA_MIXED_QUERIES_PER_BLOCK
+    if override > 0:
+        return override
+
+    r_dim_padded = ((tuning_key.actual_r_dim + 127) // 128) * 128
+    width = tuning_key.actual_lkv_dim + r_dim_padded
+    dtype_bytes = _DTYPE_BYTES.get(tuning_key.q_dtype, 2)
+    row_bytes = tuning_key.actual_num_q_heads * width * dtype_bytes
+
+    kv_positions = kv_pages * (tuning_key.page_size_per_kv_packing *
+                               tuning_key.kv_packing)
+    score_bytes = kv_positions * 4  # scores accumulate in float32
+    per_query = max(row_bytes + score_bytes, 1)
+
+    kv_window = kv_pages * _mixed_page_bytes(tuning_key) * 2  # double buffered
+    remaining = max(mixed_vmem_limit_bytes() - kv_window, 0)
+    fits = remaining // (per_query * 2)
+
+    queries = min(fits, _MIXED_QUERIES_TARGET, tuning_key.max_num_tokens)
+    return max(_prev_power_of_two(queries), 1)
 
 
 def mixed_kv_pages_per_block(tuning_key: TuningKey) -> int:
@@ -1188,10 +1245,7 @@ def mixed_kv_pages_per_block(tuning_key: TuningKey) -> int:
 
     # One page holds `page_size_per_kv_packing * kv_packing` slots of the
     # latent and RoPE dims together, the latter padded to a 128 lane multiple.
-    r_dim_padded = ((tuning_key.actual_r_dim + 127) // 128) * 128
-    width = tuning_key.actual_lkv_dim + r_dim_padded
-    slots = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
-    page_bytes = slots * width * _DTYPE_BYTES.get(tuning_key.kv_dtype, 2)
+    page_bytes = _mixed_page_bytes(tuning_key)
 
     # Half the budget for the KV window, and it is double buffered.
     fits = (mixed_vmem_limit_bytes() // 2) // max(page_bytes * 2, 1)
@@ -1207,9 +1261,13 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
             f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
         )
         if tuning_key.case == "mixed":
+            # Order matters: the query block is sized from whatever VMEM the
+            # KV window leaves.
+            kv_pages = mixed_kv_pages_per_block(tuning_key)
             return TunableParams(
-                num_kv_pages_per_block=mixed_kv_pages_per_block(tuning_key),
-                num_queries_per_block=16,
+                num_kv_pages_per_block=kv_pages,
+                num_queries_per_block=mixed_queries_per_block(
+                    tuning_key, kv_pages),
                 vmem_limit_bytes=mixed_vmem_limit_bytes(),
             )
 

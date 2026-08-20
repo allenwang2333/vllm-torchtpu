@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MLA_MIXED_KV_PAGES_PER_BLOCK: int = 0
     TPU_MLA_MIXED_VMEM_MB: int = 0
+    TPU_MLA_MIXED_QUERIES_PER_BLOCK: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -312,6 +313,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # changing the computed block schedule.
     "TPU_MLA_MIXED_VMEM_MB":
     lambda: int(os.getenv("TPU_MLA_MIXED_VMEM_MB") or "0"),
+
+    # Query rows per block for the MLA mixed kernel; 0 computes it from the
+    # VMEM left over after the KV window. The untuned fallback pinned this at
+    # 16, and kernel-level sweeps put 128 at 2.70x that.
+    "TPU_MLA_MIXED_QUERIES_PER_BLOCK":
+    lambda: int(os.getenv("TPU_MLA_MIXED_QUERIES_PER_BLOCK") or "0"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
