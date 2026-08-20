@@ -38,23 +38,40 @@ Two trace-reading traps, both of which produced confidently wrong answers first:
   for the post-attention reduce. Op names carry nothing, which is why
   ``allreduce_profile_stats.py`` cannot attribute them.
 
+Use a LOW PERCENTILE of the per-layer minima as the skew-free cost, not their
+median. The median of the minima is still contaminated -- in about half the
+layers even the fastest *sampled* chip is waiting, because only 16 of the 32
+participants have usable traces and being last at phase 1 does not make a rank
+last at phase 2. p10 is where it converges with the microbenchmark.
+
 Findings, job 154 (K3, compile size 1, 32 devices, 16 chips, EP=16 x TP=2):
 
-                       per-chip median      per-layer skew (max-min)
-    MoE pair           23.6 - 26.2 us       median 16.01 us
-    post-attention     12.1 - 13.1 us       median  1.53 us
+                     per-layer min across chips        production
+                     p10     median   microbench      median    waiting  %TPOT
+  MoE pair          13.54    16.13      12.98          25.07     11.53    6.9
+  post-attention    11.28    11.77      12.49          12.51      1.23    0.8
+
+  p10-of-minima lands +0.56 us from the microbenchmark at the MoE site, so two
+  independent methods -- a synthetic chained benchmark and the 10th-percentile
+  straggler in production -- agree on ~13 us. Post-attention is the control: its
+  production median matches its microbenchmark to 0.02 us.
 
   All 16 chips are the fastest for at least one layer and every chip's median
   sits inside a 2.56 us band, so there is no persistent placement imbalance --
   no chip drew a hot expert set. The skew is per-layer routing.
 
-  Average excess over the straggler is ~9 us (per-chip median 25.08 against
-  per-layer min median 16.13), so ~828 us of a 15.31 ms step, about 5.4%, is
-  spent waiting at this one collective. That is several times what any of the
-  kernel-level changes can deliver, and it is a load-balance/overlap problem.
+  Together ~1.2 ms of a 15.31 ms step (7.7%) is spent waiting at these two
+  collectives, against ~2.3 ms (15.1%) of actual collective work. The waiting is
+  several times what any kernel-level change can deliver, and it is a
+  load-balance/overlap problem.
 
-  It also means barrier removal cannot help at this site: the recv wait blocks on
-  the same stragglers the barrier did.
+  It also means barrier removal cannot help at the MoE site: the recv wait blocks
+  on the same stragglers the barrier did.
+
+  History worth keeping, since the floor choice is the whole answer: this was
+  first quoted as 7.2% (floor = microbenchmark), then "corrected" to 5.4% (floor
+  = median-of-minima), and the correction was the error -- median-of-minima is
+  inflated. 6.9% (floor = p10-of-minima) is the defensible figure.
 """
 import collections
 import glob
