@@ -229,9 +229,12 @@ class FakeKVCacheStore:
         return True
 
     def poll_save_status(self):
+        # Mirrors Raiden's five-element save poll: (done, failed, pending,
+        # existing, unregistered). The last two annotate REMOTE save failures
+        # and stay empty here, because this connector only saves locally.
         done, self._save_done = self._save_done, []
         failed, self._save_failed = self._save_failed, []
-        return done, failed, list(self._saving)
+        return done, failed, list(self._saving), [], []
 
     def poll_load_status(self):
         done, self._load_done = self._load_done, []

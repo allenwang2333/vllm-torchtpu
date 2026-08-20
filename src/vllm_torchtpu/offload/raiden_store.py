@@ -819,7 +819,11 @@ class RaidenOffloadingManager(OffloadingManager):
                          for admission in self._admissions.values())
         results: list[tuple[list[bytes], list[bytes]]] = []
         if has_stores:
-            done, failed, _pending = self._store.poll_save_status()
+            # Save polls carry two extra lists that annotate why a REMOTE save
+            # failed; a hash in either is already in `failed`, and both are
+            # empty for the local saves this connector issues.
+            done, failed, _pending, _existing, _unregistered = (
+                self._store.poll_save_status())
             results.append((done, failed))
         if has_loads:
             done, failed, _pending = self._store.poll_load_status()
