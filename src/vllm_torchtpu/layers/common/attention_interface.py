@@ -584,10 +584,26 @@ def mla_attention(
             pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
         else:
             pages_per_seq = tuning_key.pages_per_seq
+
+        # The page geometry has to come from the cache too, for the same
+        # reason: `page_size_per_kv_packing` and `kv_packing` default to 256
+        # and 4, which describes a page 25x larger than Kimi's. The computed
+        # schedule sizes its VMEM window from those, so the defaults made it
+        # believe only 30 pages fit and it settled on 16 instead of 32.
+        #
+        # The untransposed cache is
+        # [pages, page_size_per_kv_packing, kv_packing, align_to(lkv, 128)].
+        # A transposed cache is [pages, lkv_dim, page_size], where those axes
+        # mean something else, so leave the defaults alone there.
+        geometry = {}
+        if cache.ndim == 4:
+            geometry = dict(page_size_per_kv_packing=int(cache.shape[1]),
+                            kv_packing=int(cache.shape[2]))
         mixed_tuned = get_tuned_params(
             dataclasses.replace(tuning_key,
                                 case="mixed",
-                                pages_per_seq=max(int(pages_per_seq), 1)))
+                                pages_per_seq=max(int(pages_per_seq), 1),
+                                **geometry))
         num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block)
