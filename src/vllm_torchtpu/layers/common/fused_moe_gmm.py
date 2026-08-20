@@ -197,6 +197,7 @@ def _counting_sort_positions(sort_keys: jax.Array,
     onehot = jax.nn.one_hot(sort_keys.reshape(-1, block),
                             num_buckets,
                             dtype=jnp.bfloat16)
+    # fp32 accumulate: positions run to M, bf16 is exact only to 2**8.
     hist = onehot.sum(axis=1, dtype=jnp.float32)
     counts = hist.sum(axis=0)
     base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
