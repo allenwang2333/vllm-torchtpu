@@ -350,6 +350,164 @@ step is a profile of a real decode step** (e.g. the traces in
 `k3_pruned_profiles/`) to see the actual device-side collective duration and the
 gaps between them.
 
+## 5. Barrier-free steady state (`steady_barrier=False`)
+
+§3 said "there is no barrier-free variant here, deliberately ... one barrier is
+the hard floor for a **stateless** kernel." That qualifier was load-bearing and
+has since stopped applying: the `_ws` kernels are not stateless, so a late DMA
+lands in a live caller-owned slot rather than in memory the kernel no longer
+owns. `steady_barrier=False` removes the barrier from every round except round 0.
+
+**Why it is safe.** This is the TPU analogue of the barrier-free (Lamport)
+collectives used on NVLink, but only at the level of the idea -- the mechanism
+does not port. There the data word doubles as the ready flag so the consumer
+polls it, skipping a flag round-trip. On TPU there is nothing to poll: transfers
+are DMA, not core-issued stores to peer memory, and the recv semaphore is
+already delivered by the same hardware transaction as the data. Arrival
+detection never cost us anything. What the barrier buys is the *buffer-reuse*
+guarantee -- exactly the job Lamport's rotating buffers do -- and the data
+dependency supplies it:
+
+* Phase 1 is all-to-all, so completing round `k-1` required receiving from every
+  peer. Being in round `k` proves every peer entered round `k-1`, which (`ws` and
+  `step` are aliased, so rounds are strictly ordered per device) proves every
+  peer completed round `k-2` -- including its reads of slot `(k-2)%2 == k%2`,
+  the slot we are about to write.
+* Skew is bounded at one round symmetrically: peer `j` cannot enter round `k+1`
+  until our round-`k` sends land, so while we are in round `k`, `j` is at most in
+  `k+1` and touches the *other* slot. Two slots suffice; no third is needed.
+
+Round 0 keeps its barrier and must -- nothing has synchronized yet, the workspace
+may not be allocated on every peer, and the `collective_id` may not be
+registered.
+
+**Correctness.** `scripts/allreduce_ws_stress.py --no-steady-barrier`, float32
+oracle, non-idempotent twist chain, rounds 1-200, 20 repeats:
+
+| devices | hosts | arms | result |
+|--------:|------:|-----:|--------|
+| 8 | 1 | 4 | 360 exec each, 0 failing |
+| 32 | 4 | 4 | 360 exec each, 0 failing (job 254) |
+
+Errors sit at the float32 floor and are *bit-identical* between control and
+barrier-free within each kernel, which is the signature to expect: removing the
+barrier changes synchronization, not arithmetic. The two kernels do differ from
+each other, confirming the switch is live rather than the flag inert.
+
+**What it is worth: ~1.5 us, flat.** Measured at the shapes production actually
+runs. `_build_two_shot` reshapes the flattened payload to `(N, numel/N)`, so K3's
+`(1,7168)` post-attention reduce is `32x224` and its `(1,10752)` latent-MoE pair
+is `32x336`; reach them with `LL_SHAPES`. Two independent runs (jobs 256/257),
+us:
+
+| shape | KiB | site | xla | `twoshot_ws` | `twoshot_ws_nb` |
+|-------|----:|------|----:|-------------:|----------------:|
+| 32x224 | 14 | post-attention | 17.48 / 17.11 | 12.73 / 12.25 | **10.66 / 10.92** |
+| 32x336 | 21 | latent-MoE pair | 17.99 / 17.50 | 12.79 / 12.45 | **11.76 / 10.96** |
+| 32x448 | 28 | -- | 18.06 / 18.03 | 12.62 / 13.14 | **11.63 / 11.07** |
+
+Read the *levels*, not the per-run deltas: `twoshot_ws` is 12.6 +/- 0.4 and
+`twoshot_ws_nb` is 11.0 +/- 0.5, so the saving is ~1.5 us (12%) and flat across
+14-28 KiB. Run-to-run variation is comparable to the effect -- a 2.07 outlier
+appeared at 14 KiB in job 256 and at 28 KiB in job 257 -- so single-run deltas
+mean nothing here. Against XLA the post-attention kernel goes 1.39x -> 1.59x.
+
+Flatness is the mechanism: the barrier costs 62 semaphore signals plus two waits,
+a fixed message count independent of payload.
+
+**Do not read 2.93 us from §3a's ablation as the available win.** That figure
+comes from *adding* a barrier to a bare `noop` rung -- a serial position -- while
+the shipping `_ws` kernels already overlap theirs. The same ablation's `full_bf`
+rung (16.77 against `full`'s 12.65) shows the overlap already recovers 4.12 of
+the 5.85 us serial double-barrier cost, leaving ~1.7 us exposed. And not even all
+of that returns, because the barrier and the recv wait block on the same event --
+peer arrival. Removing the barrier removes its bookkeeping, not the waiting.
+
+**Not enabled by default, and why the correctness result is not sufficient.**
+The failure mode is a silent stale read, and soundness requires every rank to
+call the collective the same number of times in the same order -- speculative
+decode, early exit, a `_dummy_run` firing on a subset of ranks, or a
+non-unanimous bucket switch all break it. Worse, the stress test cannot see the
+case that matters: every rank runs identical work in lockstep, so there is almost
+no arrival skew, and skew is precisely what the barrier absorbs. Under the MoE
+call site's skew -- the suspected cause of the pair kernel's 12.98 -> 25.16 us
+inflation in production -- the exposed portion could be much larger, in either
+direction. Testing that needs a rank-dependent delay, and it has to be a
+side-effecting Pallas spin kernel: multiply-by-zero and `s*1.0` loops get folded
+away, static per-process variation is impossible under one SPMD program, and
+anything that perturbs values breaks the oracle.
+
+At ~1.5 us across K3's 187 collectives/step this is ~281 us, **1.8% of the
+15.31 ms TPOT** -- worth having, not worth shipping ungated.
+
+## 6. The slice is not flat, and the kernels do not know it
+
+`scripts/debug/probe_pairwise_latency.py` measures one bidirectional exchange
+between every pair of devices at 2 KiB. On `ici-2x2x4` TPU7x (16 chips x 2 cores),
+496 isolated pairs, jobs 248/250/251:
+
+| component | us | how |
+|-----------|---:|-----|
+| kernel invocation -- launch, plumbing, local HBM->VMEM stage, no network | **2.59** | `idle` mode |
+| + on-package DMA and its semaphore | +0.94 | same-chip 3.53 - idle |
+| + leaving the chip (first ICI hop) | +1.15 | manhattan-1 0/1 4.68 - same-chip |
+| + each additional hop | +0.455 | slope over manhattan 1..5 |
+| + each core-0 endpoint | +0.45 | class 0/1, 0/0 vs 1/1 |
+
+Full range 3.44 us (on-chip) to 6.94 us (5 hops, both endpoints core 0), a 2.02x
+spread. `fanout` reproduced across three jobs with per-tier medians within
+0.03 us.
+
+Three things fall out:
+
+* **The length-4 dimension is a line, not a ring.** `(0,0,0)->(0,0,3)` lands in
+  the manhattan-3 tier, so there is no torus wraparound and the diameter is 5.
+* **Invocation costs 5.7x a hop** (2.59 vs 0.455). Any algorithm that spends a
+  *kernel* to save hops must win back 5.7 hops and the diameter is only 5. This
+  is the first direct evidence for the flat one-shot design, which until now
+  rested on hop-count arithmetic; it also reframes why XLA loses at decode sizes
+  -- not long hops, but having phases at all.
+* **The core penalty is additive per endpoint, not a max.** The exchange is
+  bidirectional, so if addressing core 0 were simply slower the measurement would
+  be the max of the two directions and 0/0 would match 0/1. It does not:
+
+  | class | manh 1 | 2 | 3 | 4 | 5 | vs 1/1 |
+  |-------|-------:|--:|--:|--:|--:|-------:|
+  | 1/1 | 4.23 | 4.68 | 5.18 | 5.60 | 6.02 | -- |
+  | 0/1 | 4.68 | 5.15 | 5.59 | 6.05 | 6.49 | +0.45 |
+  | 0/0 | 5.12 | 5.58 | 6.04 | 6.49 | 6.94 | +0.89 |
+
+  Additive means the two directions partly serialize, so the absolute figures
+  include per-endpoint serialization and overstate one-way latency; tier and
+  class *differences* are differential and unaffected. A unidirectional variant
+  would separate a source-core effect from a destination-core one.
+
+**Where this points.** Hierarchy is worth building, but as *one kernel with two
+DMA phases*, not two kernels -- launch is paid per kernel, a DMA phase per phase,
+so the marginal cost is ~0.9 us rather than 2.59. Against that: routing
+inter-chip traffic through core 1 of every chip moves the binding far-peer term
+from 6.94 to 6.02 us; the barrier's peers drop 31 -> 15; and the egress cut
+(31M -> 7.5M with both cores carrying half the payload) attacks the term that
+actually binds at 14-21 KiB, where one-shot is already bandwidth-bound.
+`two_shot_all_reduce_ws` is already two phases in one kernel, so the shape is
+known.
+
+**Prerequisite nobody has noticed.** `allreduce_latency_bench.py` builds its mesh
+with `mesh_utils.create_device_mesh`, which returns a topology-optimized order
+(`[0,1,2,3,6,7,4,5,...]`), while production's `_get_mesh` uses plain TP-rank
+order. This is benign for the current kernels -- both are all-to-all, so the
+destination set is identical and only DMA issue order changes -- but it stops
+being benign for a hierarchical kernel, where "my on-chip partner" and "one core
+per chip" must be real physical relationships. `_get_mesh` would need a 2-D mesh
+built from `chip_topology`. A mis-ordered mesh fails *silently*: it still
+computes the right answer, just slowly.
+
+**Also worth knowing:** `_GATE` keys on device count, which works only because
+count proxies slice geometry on this hardware. The cost model is dominated by
+invocation plus diameter, and diameter is a property of slice *shape* -- 32
+devices as `4x4x2` would have a different diameter than `2x2x4` and hit the same
+gate entry.
+
 ## Recommendation
 
 1. **Confirm §4 first.** If torchtpu really adds ~130 µs per collective in
@@ -388,5 +546,12 @@ gaps between them.
   kernels (`--kernel oneshot|twoshot`), float32 oracle. Run this to a clean exit
   before trusting any `_ws` change; it caught every bug in both.
 * `scripts/allreduce_breakdown.py` — latency attribution (launch / barrier / DMA).
+* `scripts/debug/probe_pairwise_latency.py` — pairwise ICI latency matrix
+  (`idle` / `fanout` / `allpairs` / `matrix`). Run `--sweep-n` first on any new
+  slice shape: the fixed cost of one blocked dispatch is ~1 ms, so a short chain
+  measures noise, and the harness will happily report a figure below the launch
+  floor if you let it.
+* `scripts/debug/slurm_stress_barrier_free_32.sbatch` — the 2x2 correctness
+  matrix (one-shot/two-shot x barriered/barrier-free) at 32 devices.
 * `scripts/slurm_allreduce_32.sbatch` — 32-device (16-chip) multi-host run.
 * `scripts/torchtpu_allreduce_bench.py` — torchrun benchmark of torchtpu's own all-reduce.
