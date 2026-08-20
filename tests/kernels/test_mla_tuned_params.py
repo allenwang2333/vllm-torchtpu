@@ -10,14 +10,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_torchtpu.kernels.mla.v2 import tuned_params
-from vllm_torchtpu.kernels.mla.v2.tuned_params import (MLATuningKey,
-                                                       get_mla_kernel_config)
+from vllm_torchtpu.kernels.mla.v2 import config as mla_config
+from vllm_torchtpu.kernels.mla.v2.config import get_mla_kernel_config
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey
 
 
-def _k3_mixed_key() -> MLATuningKey:
-    return MLATuningKey(
-        device_name="TPU v7",
+def _k3_mixed_key() -> TuningKey:
+    return TuningKey(
         case="mixed",
         max_num_tokens=4096,
         actual_num_q_heads=12,
@@ -25,12 +24,15 @@ def _k3_mixed_key() -> MLATuningKey:
         actual_r_dim=64,
         q_dtype="bfloat16",
         kv_dtype="bfloat16",
-        page_size=256,
+        page_size_per_kv_packing=128,
+        kv_packing=2,
+        max_num_seqs=4,
+        pages_per_seq=128,
     )
 
 
 def test_k3_mixed_tuned_params() -> None:
-    tuned = tuned_params.mla_tuned_params_mapping[_k3_mixed_key()]
+    tuned = mla_config.MLA_TUNED_CONFIGS["TPU v7"][_k3_mixed_key()]
 
     assert tuned.num_kv_pages_per_block == 4
     assert tuned.num_queries_per_block == 512
@@ -39,8 +41,15 @@ def test_k3_mixed_tuned_params() -> None:
 
 def test_k3_kernel_config_combines_decode_and_mixed_slots(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tuned_params, "logger", MagicMock())
-    config = get_mla_kernel_config(
+    monkeypatch.setattr(
+        mla_config, "get_tuned_params",
+        MagicMock(return_value=mla_config.TunableParams(
+            decode_batch_size=4,
+            num_kv_pages_per_block=3,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+        )))
+    kernel_config = get_mla_kernel_config(
         device_name="TPU v7",
         max_num_tokens=4096,
         local_num_q_heads=12,
@@ -56,17 +65,24 @@ def test_k3_kernel_config_combines_decode_and_mixed_slots(
     )
 
     # Decode has no K3-specific entry yet and keeps the historical fallback.
-    assert config.num_kv_pages_per_block == (3, 1, 4)
-    assert config.num_queries_per_block == (1, 16, 512)
-    assert config.decode_batch_size == 4
-    assert config.mixed_q_split == 1
-    assert config.vmem_limit_bytes == 62914560
+    assert kernel_config.num_kv_pages_per_block == (3, 1, 4)
+    assert kernel_config.num_queries_per_block == (1, 16, 512)
+    assert kernel_config.decode_batch_size == 4
+    assert kernel_config.mixed_q_split == 1
+    assert kernel_config.vmem_limit_bytes == 62914560
 
 
 def test_k3_mixed_config_requires_matching_page_size(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tuned_params, "logger", MagicMock())
-    config = get_mla_kernel_config(
+    monkeypatch.setattr(
+        mla_config, "get_tuned_params",
+        MagicMock(side_effect=lambda key: mla_config.TunableParams(
+            num_kv_pages_per_block=1 if key.case == "mixed" else 3,
+            num_queries_per_block=16 if key.case == "mixed" else 1,
+            vmem_limit_bytes=62914560,
+            decode_batch_size=4,
+        )))
+    kernel_config = get_mla_kernel_config(
         device_name="TPU v7",
         max_num_tokens=4096,
         local_num_q_heads=12,
@@ -81,12 +97,12 @@ def test_k3_mixed_config_requires_matching_page_size(
         pages_per_seq=256,
     )
 
-    assert config.num_kv_pages_per_block == (3, 1, 1)
-    assert config.num_queries_per_block == (1, 16, 16)
+    assert kernel_config.num_kv_pages_per_block == (3, 1, 1)
+    assert kernel_config.num_queries_per_block == (1, 16, 16)
 
 
 def test_global_head_count_entry_remains_compatible() -> None:
-    config = get_mla_kernel_config(
+    kernel_config = get_mla_kernel_config(
         device_name="TPU v7",
         max_num_tokens=16,
         local_num_q_heads=8,
@@ -101,7 +117,7 @@ def test_global_head_count_entry_remains_compatible() -> None:
         pages_per_seq=9,
     )
 
-    assert config.num_kv_pages_per_block == (2, 1, 1)
-    assert config.num_queries_per_block == (1, 16, 64)
-    assert config.decode_batch_size == 16
-    assert config.mixed_q_split == 16
+    assert kernel_config.num_kv_pages_per_block == (2, 1, 1)
+    assert kernel_config.num_queries_per_block == (1, 16, 64)
+    assert kernel_config.decode_batch_size == 16
+    assert kernel_config.mixed_q_split == 16

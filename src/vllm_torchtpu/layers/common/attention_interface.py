@@ -19,7 +19,7 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla.v2.tuned_params import get_mla_kernel_config
+from vllm_torchtpu.kernels.mla.v2.config import get_mla_kernel_config
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.utils import (repack_sparse_mla_cache,
                                                update_sparse_mla_kv_cache)
