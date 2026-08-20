@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MLA_MIXED_KV_PAGES_PER_BLOCK: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -291,6 +292,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+
+    # Override `num_kv_pages_per_block` for the MLA "mixed" (prefill) kernel
+    # when no tuned entry matches the shape. The untuned fallback uses 1, the
+    # minimum legal value, which walks the paged KV cache one page per block
+    # and leaves the kernel latency-bound. 0 keeps the built-in fallback.
+    # Must live here rather than being read from os.environ directly: every
+    # name in this registry is folded into the TPU compile-cache key, and two
+    # block sizes are two different kernels.
+    "TPU_MLA_MIXED_KV_PAGES_PER_BLOCK":
+    lambda: int(os.getenv("TPU_MLA_MIXED_KV_PAGES_PER_BLOCK") or "0"),
 
     # Run Kimi KDA on the plain-XLA reference recurrence instead of the Pallas
     # chunked kernel.
