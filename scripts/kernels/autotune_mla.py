@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
                    help="num_kv_pages_per_block candidates.")
     p.add_argument("--queries", type=_int_list, default=[16],
                    help="num_queries_per_block candidates.")
+    p.add_argument("--q-split", type=_int_list, default=[1],
+                   help="mixed_q_split candidates. The kernel's query-parallel "
+                        "split, and it defaults to 1 -- off -- on the stage "
+                        "that owns most of the device time.")
     p.add_argument("--vmem-mb", type=_int_list, default=[60],
                    help="vmem_limit_bytes candidates, in MiB. The tuned "
                         "entries use 60; the field's own guidance is 16 to 64 "
@@ -114,8 +118,8 @@ def build_inputs(a: argparse.Namespace):
     )
 
 
-def time_candidate(inputs: dict, kv_pages: int, queries: int, vmem_mb: int,
-                   iters: int) -> tuple[float | None, str]:
+def time_candidate(inputs: dict, kv_pages: int, queries: int, q_split: int,
+                   vmem_mb: int, iters: int) -> tuple[float | None, str]:
     """Median milliseconds for one schedule, or (None, reason) if it fails."""
 
     def run():
@@ -132,6 +136,7 @@ def time_candidate(inputs: dict, kv_pages: int, queries: int, vmem_mb: int,
             # (decode, prefill, mixed) -- tune the mixed stage.
             num_kv_pages_per_block=(1, kv_pages, kv_pages),
             num_queries_per_block=(1, queries, queries),
+            mixed_q_split=q_split,
             vmem_limit_bytes=vmem_mb * 1024 * 1024,
         )
         out.block_until_ready()
@@ -160,38 +165,40 @@ def main() -> int:
           f"{a.context_pages} cache pages/seq\n")
 
     inputs = build_inputs(a)
-    results: dict[tuple[int, int, int], float] = {}
+    results: dict[tuple[int, int, int, int], float] = {}
 
-    header = (f"{'kv_pages':>9} {'queries':>8} {'vmem_mb':>8} "
+    header = (f"{'kv_pages':>9} {'queries':>8} {'q_split':>8} {'vmem_mb':>8} "
               f"{'median_ms':>11} {'vs bkvp=1':>10}")
     print(header)
     print("-" * len(header))
 
     for vmem_mb in a.vmem_mb:
-        for queries in a.queries:
-            for kv_pages in a.kv_pages:
-                ms, reason = time_candidate(inputs, kv_pages, queries, vmem_mb,
-                                            a.iters)
-                if ms is None:
-                    print(f"{kv_pages:>9} {queries:>8} {vmem_mb:>8} "
-                          f"{'FAILED':>11}   {reason}")
-                    continue
-                results[(kv_pages, queries, vmem_mb)] = ms
-                base = results.get((1, queries, vmem_mb))
-                rel = f"{base / ms:>9.2f}x" if base else "        --"
-                print(f"{kv_pages:>9} {queries:>8} {vmem_mb:>8} "
-                      f"{ms:>11.3f} {rel}")
+        for q_split in a.q_split:
+            for queries in a.queries:
+                for kv_pages in a.kv_pages:
+                    ms, reason = time_candidate(inputs, kv_pages, queries,
+                                                q_split, vmem_mb, a.iters)
+                    key = (kv_pages, queries, q_split, vmem_mb)
+                    if ms is None:
+                        print(f"{kv_pages:>9} {queries:>8} {q_split:>8} "
+                              f"{vmem_mb:>8} {'FAILED':>11}   {reason}")
+                        continue
+                    results[key] = ms
+                    base = results.get((1, queries, q_split, vmem_mb))
+                    rel = f"{base / ms:>9.2f}x" if base else "        --"
+                    print(f"{kv_pages:>9} {queries:>8} {q_split:>8} "
+                          f"{vmem_mb:>8} {ms:>11.3f} {rel}")
 
     if not results:
         print("\nno candidate ran; nothing to emit")
         return 1
 
-    (best_kv, best_q, best_vmem), best_ms = min(results.items(),
-                                                key=lambda kv: kv[1])
-    base = results.get((1, best_q, best_vmem))
+    (best_kv, best_q, best_split,
+     best_vmem), best_ms = min(results.items(), key=lambda kv: kv[1])
+    base = results.get((1, best_q, best_split, best_vmem))
     print(f"\nbest: num_kv_pages_per_block={best_kv} "
-          f"num_queries_per_block={best_q} vmem={best_vmem} MiB "
-          f"at {best_ms:.3f} ms")
+          f"num_queries_per_block={best_q} q_split={best_split} "
+          f"vmem={best_vmem} MiB at {best_ms:.3f} ms")
     if base:
         print(f"speedup over the untuned fallback (kv_pages=1): "
               f"{base / best_ms:.2f}x")
@@ -209,6 +216,7 @@ def main() -> int:
     print("    TunableParams(")
     print(f"        num_kv_pages_per_block={best_kv},")
     print(f"        num_queries_per_block={best_q},")
+    print(f"        q_split={best_split},")
     print(f"        vmem_limit_bytes={best_vmem * 1024 * 1024},")
     print("    ),")
     return 0
