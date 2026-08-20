@@ -1,3 +1,4 @@
+import dataclasses
 import functools
 import math
 from typing import Any, Callable, Optional, Tuple
@@ -547,24 +548,26 @@ def mla_attention(
         tuned = get_tuned_params(tuning_key)
         decode_batch_size = tuned.decode_batch_size
 
-        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages.
+        # Block ratio tuples for the (decode, prefill, mixed) stages.
         #
-        # The prefill and mixed stages were pinned to 1 here for every model,
-        # which the tuning table cannot reach: `get_tuned_params` is only ever
-        # asked for `case="batched_decode"`, so no table entry and no fallback
-        # can raise them. One KV page per block leaves that kernel walking the
-        # paged cache a page at a time, waiting on DMA rather than reading or
-        # computing -- HLO op profiling on Kimi-Linear attributed 80.3% of
-        # device time to `MLA-m-bq_16-bkvp_1-p_16-bsz_1` at 2.76% FLOPS and
-        # 5.82% HBM utilization, averaging 27.54 ms per call.
+        # The prefill and mixed entries used to be literal 1s, which no table
+        # entry could reach: this is the only caller, and it asks solely for
+        # `case="batched_decode"`. One KV page per block leaves that kernel
+        # walking the paged cache a page at a time, waiting on DMA rather than
+        # reading or computing -- HLO op profiling on Kimi-Linear attributed
+        # 80.3% of device time to `MLA-m-bq_16-bkvp_1-p_16-bsz_1` at 2.76%
+        # FLOPS and 5.82% HBM utilization, 27.54 ms per call. Raising it to 32
+        # took end-to-end throughput from 581.94 to 964.71 tok/s at 8k/1k,
+        # concurrency 16, with byte-identical greedy output.
         #
-        # `TPU_MLA_MIXED_KV_PAGES_PER_BLOCK` opens that up; 0 keeps the pinned
-        # value. The ceiling is VMEM, so the useful setting is the largest one
-        # that still fits.
-        from vllm_torchtpu import envs as tpu_envs
-        mixed_kv_pages = tpu_envs.TPU_MLA_MIXED_KV_PAGES_PER_BLOCK or 1
+        # Asking for a `mixed` key routes through the same lookup, so a tuned
+        # entry can now govern these stages, and the miss path computes a
+        # schedule from the shape instead of returning the minimum.
+        mixed_tuned = get_tuned_params(
+            dataclasses.replace(tuning_key, case="mixed"))
         num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block,
-                                   mixed_kv_pages, mixed_kv_pages)
+                                   mixed_tuned.num_kv_pages_per_block,
+                                   mixed_tuned.num_kv_pages_per_block)
         num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]

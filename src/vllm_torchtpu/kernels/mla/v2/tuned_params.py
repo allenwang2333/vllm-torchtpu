@@ -1109,6 +1109,74 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+_MIXED_VMEM_LIMIT_BYTES = 62914560  # 60 MiB, as every hand-tuned entry uses.
+
+# Enough KV pages in flight to cover DMA latency. Measured on
+# Kimi-Linear-48B-A3B at TP=4, 8k/1k, concurrency 16, end to end:
+#
+#     pages per block :    1       4       16      32
+#     output tok/s    :  581.94  829.70  945.33  964.71
+#
+# The curve is latency-bound and flattens: 1->4 is +42.6%, 4->16 is +13.9%,
+# 16->32 is +2.1%. Nothing OOMed, so VMEM was never the binding constraint --
+# past the knee, extra pages buy nothing and only cost residency. 32 sits just
+# past the knee, which is where we want to land when the shape is unknown.
+_MIXED_KV_PAGES_TARGET = 32
+
+_DTYPE_BYTES = {
+    "float8_e4m3fn": 1,
+    "bfloat16": 2,
+    "float16": 2,
+    "float32": 4,
+}
+
+
+def _prev_power_of_two(value: int) -> int:
+    """Largest power of two <= value, at least 1."""
+    result = 1
+    while result * 2 <= value:
+        result *= 2
+    return result
+
+
+def mixed_kv_pages_per_block(tuning_key: TuningKey) -> int:
+    """KV pages per block for the mixed kernel when no tuned entry matches.
+
+    The previous behaviour was to return 1 -- the minimum legal value -- which
+    walks the paged KV cache one page per block. Each block is then a tiny DMA
+    with nothing to overlap against, so the kernel waits on memory latency
+    instead of reading or computing. HLO op profiling on Kimi-Linear-48B put
+    that path at 80.3% of device time with the chip at 2.76% FLOPS and 5.82%
+    HBM utilization, averaging 27.54 ms per call.
+
+    A hand-written table entry is the wrong repair. `TuningKey` includes
+    `max_num_tokens`, `max_num_seqs` and `pages_per_seq`, which are deployment
+    settings rather than model properties, so any row matches only the exact
+    configuration it was measured on and misses the moment someone changes
+    `--max-num-seqs` or `--max-model-len`. That over-specified key is why the
+    lookup misses in the first place. Computing the value on the miss path
+    cannot fail to match.
+
+    `TPU_MLA_MIXED_KV_PAGES_PER_BLOCK` overrides the result; 0 computes it.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    override = tpu_envs.TPU_MLA_MIXED_KV_PAGES_PER_BLOCK
+    if override > 0:
+        return override
+
+    # One page holds `page_size_per_kv_packing * kv_packing` slots of the
+    # latent and RoPE dims together, the latter padded to a 128 lane multiple.
+    r_dim_padded = ((tuning_key.actual_r_dim + 127) // 128) * 128
+    width = tuning_key.actual_lkv_dim + r_dim_padded
+    slots = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+    page_bytes = slots * width * _DTYPE_BYTES.get(tuning_key.kv_dtype, 2)
+
+    # Half the budget for the KV window, and it is double buffered.
+    fits = (_MIXED_VMEM_LIMIT_BYTES // 2) // max(page_bytes * 2, 1)
+    pages = min(fits, _MIXED_KV_PAGES_TARGET, tuning_key.pages_per_seq)
+    return max(_prev_power_of_two(pages), 1)
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
@@ -1116,15 +1184,11 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         logger.warning(
             f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
         )
-        # Note: nothing currently asks for `case="mixed"` -- the MLA call site
-        # in `layers/common/attention_interface.py` only builds a
-        # `batched_decode` key and sets the prefill and mixed block counts
-        # itself. This branch is kept for callers that do ask.
         if tuning_key.case == "mixed":
             return TunableParams(
-                num_kv_pages_per_block=1,
+                num_kv_pages_per_block=mixed_kv_pages_per_block(tuning_key),
                 num_queries_per_block=16,
-                vmem_limit_bytes=62914560,
+                vmem_limit_bytes=_MIXED_VMEM_LIMIT_BYTES,
             )
 
         # decode, batched_decode
