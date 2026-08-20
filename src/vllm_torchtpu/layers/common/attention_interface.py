@@ -19,13 +19,12 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+from vllm_torchtpu.kernels.mla.v2.tuned_params import get_mla_kernel_config
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.utils import (repack_sparse_mla_cache,
                                                update_sparse_mla_kv_cache)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import get_megacore
+from vllm_torchtpu.utils import get_device_name, get_megacore
 
 logger = init_logger(__name__)
 
@@ -532,24 +531,23 @@ def mla_attention(
         max_num_tokens = q.shape[
             0]  # q is in token-major sequence format (T, N, A)
         actual_r_dim = q_rope.shape[2]
-        kv_dtype_str = "float8_e4m3fn" if any(
-            x in str(cache.dtype).lower()
-            for x in ("fp8", "e4m3")) else "bfloat16"
-
-        tuning_key = TuningKey(
-            case="batched_decode",
+        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
+        max_num_seqs = seq_lens.shape[0]
+        pages_per_seq = block_tables.shape[0] // max_num_seqs
+        tuning_config = get_mla_kernel_config(
+            device_name=get_device_name(),
             max_num_tokens=max_num_tokens,
-            actual_num_q_heads=num_attention_heads,
+            local_num_q_heads=q.shape[1],
+            global_num_q_heads=num_attention_heads,
             actual_lkv_dim=qk_nope_head_dim,
             actual_r_dim=actual_r_dim,
-            kv_dtype=kv_dtype_str,
+            q_dtype=jnp.dtype(q.dtype).name,
+            kv_dtype=jnp.dtype(cache.dtype).name,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=pages_per_seq,
         )
-        tuned = get_tuned_params(tuning_key)
-        decode_batch_size = tuned.decode_batch_size
-
-        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
-        num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block, 1, 1)
-        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
@@ -565,9 +563,11 @@ def mla_attention(
             query_start_loc,
             request_distribution,
             sm_scale=sm_scale or 1.0,
-            num_kv_pages_per_block=num_kv_pages_per_blocks,
-            num_queries_per_block=num_queries_per_blocks,
-            decode_batch_size=decode_batch_size,
+            num_kv_pages_per_block=tuning_config.num_kv_pages_per_block,
+            num_queries_per_block=tuning_config.num_queries_per_block,
+            vmem_limit_bytes=tuning_config.vmem_limit_bytes,
+            decode_batch_size=tuning_config.decode_batch_size,
+            mixed_q_split=tuning_config.mixed_q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)
