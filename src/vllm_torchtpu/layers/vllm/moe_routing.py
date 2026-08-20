@@ -13,6 +13,8 @@
 # limitations under the License.
 """Routing helpers for TPU local MoE kernels."""
 
+import os
+
 import torch
 import vllm.envs as vllm_envs
 
@@ -33,6 +35,11 @@ logger = init_logger(__name__)
 # instead of upstream's route_tokens(), so the sampled experts keep a data
 # dependency on the real activations (see that docstring for why).
 _UNIFORM_RANDOM = "uniform_random"
+
+# Off switch for the fold in `_renormalize_denominator` below, so the change can
+# be A/B'd end to end without a second build. Set to "0" to restore
+# `.sum(dim=-1)`.
+_RENORMALIZE_FOLD = os.environ.get("TPU_MOE_RENORMALIZE_FOLD", "1") != "0"
 
 _SIMULATION_STRATEGY = None
 _strategy_name = vllm_envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
@@ -171,6 +178,84 @@ def _apply_scoring_fn(scoring_fn: str,
         f"FusedMoE does not support {scoring_fn} scoring function for TPU.")
 
 
+# Summing the top-k weights with `.sum(dim=-1)` emits a standalone `reduce` HLO,
+# and on TPU its consumer fusion then sits idle waiting for it. In the K3
+# barrier-free profile that stall is 2.76 us per MoE layer, 92 times per decode
+# step -- 254 us, the single largest attributable source of within-graph device
+# idle, ahead of everything else by a factor of two.
+#
+# There is no work to speed up here: the tensor is `(num_tokens, topk)` with
+# topk=16, so the cost is entirely cross-lane reduction latency plus the sync
+# that hands a scalar to the next fusion. Folding the last dim in halves keeps
+# the whole thing in slices and adds, which fuse, and emits no `reduce`.
+#
+# Measured in isolation at K3's shape (92 layers, topk=16, hidden 7168, one
+# device; `scripts/debug/probe_moe_renormalize.py`).
+#
+# Confirmation run, 80 repeats, arms interleaved sum/fold/sum/fold so drift
+# cannot be mistaken for the effect -- both replicates of each arm agreed to
+# 3.5 us out of 1485:
+#
+#     arm     total us   us/layer
+#     sum       1485.0      --      control
+#     fold      1311.0    -1.89     the change; output unchanged in bf16
+#     none      1161.2    -3.52     renormalize deleted: the bound, not a
+#                                   candidate, since it changes the math
+#
+# The two rejected candidates, from the earlier 30-repeat run whose own control
+# read sum=1532.3 (its sd was 427 us, which is why the numbers above and not
+# these are the ones to quote):
+#
+#     chain     2162.4    +6.85     left-to-right accumulate
+#     late      1514.2    -0.20     divide after the expert combine
+#
+# Two negative results worth keeping. `chain` (left-to-right accumulate) is far
+# *worse* than the reduce it replaces, so the win is not "avoid the reduce HLO"
+# -- dependency depth matters, and only the log2-depth fold pays off. And `late`
+# (keep the sum, move the division past the expert combine so the reduce can
+# compute alongside the matmul) recovers almost nothing, because a TPU core runs
+# its ops in sequence: there is no second unit for the reduce to overlap with.
+# Reordering does not help; only removing the op does.
+def _renormalize_denominator(w: torch.Tensor) -> torch.Tensor:
+    """Sum `w` along its last dim, emitting no standalone `reduce` HLO.
+
+    Halving fold, so log2(topk) depth and log2(topk) adds. `topk` is static at
+    trace time, so the loop unrolls during tracing and nothing dynamic is left.
+
+    This reassociates, so it is *not* bit-equal to `w.sum(dim=-1, keepdim=True)`
+    -- it differs by about one ulp (~2.4e-7 relative in float32, which is the
+    dtype this runs in, since `_apply_scoring_fn` upcasts). That is not a
+    regression against a stricter status quo: XLA reassociates reductions
+    freely, so the `.sum()` being replaced was never bit-stable against CPU
+    torch either. The difference is four orders of magnitude below bf16
+    resolution, and the routing weights are cast to bf16 before use, so the
+    model output is unchanged -- verified end to end over 92 layers by the probe
+    above and pinned by `test_bf16_cast_hides_the_difference`.
+    """
+    n = w.shape[-1]
+    while n > 1:
+        half = n // 2
+        if n % 2:
+            # Odd width: add the aligned halves, carry the orphan lane forward.
+            w = torch.cat(
+                [w[..., :half] + w[..., half:2 * half], w[..., 2 * half:]],
+                dim=-1)
+            n = half + 1
+        else:
+            w = w[..., :half] + w[..., half:]
+            n = half
+    return w
+
+
+def _renormalize(topk_weights: torch.Tensor) -> torch.Tensor:
+    """Scale each token's top-k weights to sum to 1."""
+    if _RENORMALIZE_FOLD:
+        total = _renormalize_denominator(topk_weights)
+    else:
+        total = topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights / torch.clamp(total, min=1e-20)
+
+
 def _hash_moe_select(
     scores: torch.Tensor,
     hash_indices_table: torch.Tensor,
@@ -191,8 +276,7 @@ def _hash_moe_select(
     topk_weights = scores.gather(-1, topk_ids)
 
     if renormalize:
-        topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+        topk_weights = _renormalize(topk_weights)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
@@ -272,8 +356,7 @@ def select_experts(
         topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
 
     if renormalize:
-        topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
+        topk_weights = _renormalize(topk_weights)
     routed_scaling_factor = getattr(layer, "routed_scaling_factor",
                                     1.0) if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
