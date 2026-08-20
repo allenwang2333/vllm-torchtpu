@@ -437,8 +437,83 @@ side-effecting Pallas spin kernel: multiply-by-zero and `s*1.0` loops get folded
 away, static per-process variation is impossible under one SPMD program, and
 anything that perturbs values breaks the oracle.
 
-At ~1.5 us across K3's 187 collectives/step this is ~281 us, **1.8% of the
-15.31 ms TPOT** -- worth having, not worth shipping ungated.
+### 5a. End-to-end: 15.22 -> 14.88 ms, -2.2% (jobs 286/287)
+
+A/B on four pinned nodes, back to back, one bit different in the config, separate
+XLA cache trees, the same measurement script driven from the launcher's
+POST_READY_CMD hook so the arms cannot drift in what they ran. Coherent canary on
+every check, including under barrier-free -- the first end-to-end correctness
+signal for a collective with no synchronization primitive in its steady state.
+
+| arm | reps | mean | spread |
+|-----|------|-----:|-------:|
+| control (barrier on) | 15.20 / 15.18 / 15.28 | 15.22 | 0.10 |
+| barrier-free | 14.88 / 14.88 / 14.88 | **14.88** | **0.00** |
+
+**-0.34 ms, -2.23%**, about 7x the control's standard error.
+
+Per site, from the traces (`scripts/debug/llar_chip_skew.py`, 16 chips x 92/95
+layers, us):
+
+| site | control | barrier-free | delta | predicted |
+|------|--------:|-------------:|------:|----------:|
+| post-attention | 12.46 | **10.74** | **-1.72** | -1.70 |
+| MoE pair | 24.64 | **23.07** | **-1.57** | ~0 |
+
+`95 x 1.72 + 92 x 1.57 = 307 us` against a measured 340 us. The accounting
+closes.
+
+**The MoE prediction was wrong, and the decomposition says why.** Splitting each
+site into work and skew:
+
+| | work (ctl -> free) | skew (ctl -> free) |
+|---|---|---|
+| post-attention | 12.49 -> 10.79 | 1.01 -> 0.40 |
+| MoE pair | 12.98 -> 11.36 | 11.66 -> 11.71 |
+
+The MoE site's skew is unchanged, as §6 argues it must be. But its *work* fell by
+1.57 us, essentially the microbenchmark's 1.62. **The two terms are additive, not
+overlapping.** The mistaken reasoning was that because the barrier waits on the
+same event as the recv wait, its cost would be swallowed by the skew; that
+conflates the barrier's *wait* (genuinely redundant) with its *message traffic* --
+62 semaphore signals plus two waits, which is work on the critical path whether
+or not the rank then waits for data.
+
+So the simple statement is the correct one: **barrier-free removes ~1.6 us of work
+from every collective at every site, independent of skew.**
+
+Two corroborating observations. Uniformity improved everywhere -- per-chip spread
+0.41 -> 0.19 at post-attention and 3.11 -> 1.74 at the MoE site, per-layer skew
+1.01 -> 0.40 and 14.61 -> 13.66 -- which is also why the treatment's TPOT reps
+came out identical to two decimals while the control's spread 0.10. And the
+post-attention treatment lands at 10.74 against the microbenchmark's 10.79, so
+the microbenchmark predicts production for this kernel in *both* barrier modes.
+
+Caveat: one control and one treatment, so day-scale drift is not excluded, though
+back-to-back scheduling on pinned nodes makes it unlikely.
+
+**Still not enabled by default**, for the reasons above: the failure mode is a
+silent stale read, and soundness needs every rank calling the collective the same
+number of times in the same order. The skew-injection test matters more now, not
+less, because the change is worth 2.2%.
+
+**Two configuration traps this run exposed**, both of which cost a slice:
+
+* `TPU_LOW_LATENCY_ALLREDUCE_SHAPE` is what puts K3's post-attention reduce on the
+  kernel. Without it the dispatcher takes the *smallest* payload that takes a
+  kernel -- the 7 KiB `(1,3584)` latent reduce -- leaving the 14 KiB `(1,7168)`
+  on XLA at 17.1 us against two_shot's 12.5. That is ~433 us/step over 95 layers,
+  and it fully explains a 15.73-vs-15.31 discrepancy first misattributed to node
+  variation. Four samples at 15.68-15.81 with the wrong wiring against three at
+  15.18-15.28 with the right one.
+* The value is `ROWSxCOLS`, not a bare width. `7168` parses to a 1-tuple, matches
+  nothing, and falls back -- warning in the server log only. Use `1x7168`.
+
+The launcher now tags the XLA cache per flag and refuses to measure when the
+dispatcher rejected the override.
+
+At ~1.5 us across K3's 187 collectives/step this is ~281 us predicted; measured
+end to end it is 340 us, **2.2% of TPOT**.
 
 ## 6. The slice is not flat, and the kernels do not know it
 
