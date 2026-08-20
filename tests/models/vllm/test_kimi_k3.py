@@ -515,7 +515,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     )
 
 
-def test_mla_fuses_output_gate_with_lora_a_projections(
+def test_mla_unmerges_output_gate_and_lora_a_projections(
         monkeypatch: pytest.MonkeyPatch) -> None:
 
     class FakeLinear(nn.Module):
@@ -565,9 +565,11 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
             prefix="model.layers.0.self_attn",
         )
 
-    assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
-    assert layer.g_proj is None
-    assert layer.mla_attn.mla_modules.gate_is_fused is True
+    assert layer.fused_qkv_a_proj is None
+    assert layer.q_a_proj.output_size == 8
+    assert layer.kv_a_proj_with_mqa.output_size == 8 + 2
+    assert layer.g_proj.output_size == 4 * 4
+    assert layer.mla_attn.mla_modules.gate_is_fused is False
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
@@ -636,7 +638,10 @@ class _ConvWeight(nn.Module):
 def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.fused_qkvb_proj = _Projection(14)
+    layer.q_proj = _Projection(4)
+    layer.k_proj = _Projection(4)
+    layer.v_proj = _Projection(4)
+    layer.b_proj = _Projection(2)
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
     layer.g_proj = None
@@ -728,7 +733,10 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch.setattr(kimi_custom_ops.pallas, "jax_op", jax_op)
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.fused_qkvb_proj = _Projection(14)
+    layer.q_proj = _Projection(4)
+    layer.k_proj = _Projection(4)
+    layer.v_proj = _Projection(4)
+    layer.b_proj = _Projection(2)
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
     layer.g_proj = None

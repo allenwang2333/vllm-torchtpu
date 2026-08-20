@@ -456,6 +456,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
         self.fused_qkv_a_proj = mla_modules.fused_qkv_a_proj
+        self.q_a_proj = getattr(mla_modules, "q_a_proj", None)
         self.kv_a_proj_with_mqa = mla_modules.kv_a_proj_with_mqa
         self.q_a_layernorm = mla_modules.q_a_layernorm
         self.q_b_proj = mla_modules.q_b_proj
@@ -522,31 +523,39 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         output_gate = None
 
         if self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None, (
-                "fused_qkv_a_proj is required when q_lora_rank is not None")
             assert self.q_a_layernorm is not None, (
                 "q_a_layernorm is required when q_lora_rank is not None")
             assert self.q_b_proj is not None, (
                 "q_b_proj is required when q_lora_rank is not None")
 
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            if self.gate_is_fused:
-                q_c, kv_lora, output_gate = qkv_lora.split(
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        self.num_heads * self.v_head_dim,
-                    ],
-                    dim=-1,
-                )
+            if self.fused_qkv_a_proj is not None:
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if self.gate_is_fused:
+                    q_c, kv_lora, output_gate = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            self.num_heads * self.v_head_dim,
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    q_c, kv_lora = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim
+                        ],
+                        dim=-1,
+                    )
             else:
-                q_c, kv_lora = qkv_lora.split(
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim
-                    ],
-                    dim=-1,
-                )
+                assert self.q_a_proj is not None, "q_a_proj is required"
+                assert self.kv_a_proj_with_mqa is not None, (
+                    "kv_a_proj_with_mqa is required")
+                q_c = self.q_a_proj(hidden_states)[0]
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                if self.g_proj is not None:
+                    output_gate = self.g_proj(hidden_states)[0]
+
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
         else:

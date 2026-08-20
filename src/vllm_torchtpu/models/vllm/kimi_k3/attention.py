@@ -184,6 +184,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.qk_head_dim = qk_head_dim
 
         self.mla_gate_is_fused = False
+        self.fused_qkv_a_proj = None
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
                 config.hidden_size,
@@ -192,35 +193,17 @@ class MultiHeadLatentAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
-            self.fused_qkv_a_proj = None
+            self.q_a_proj = None
             self.q_a_layernorm = None
             self.q_b_proj = None
         else:
-            qkv_a_output_sizes = [
+            self.q_a_proj = ColumnParallelLinear(
+                config.hidden_size,
                 self.q_lora_rank,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-            ]
-            if getattr(config, "mla_use_output_gate", False):
-                qkv_a_output_sizes.append(config.num_attention_heads *
-                                          self.v_head_dim)
-                self.fused_qkv_a_proj = MixedParallelMergedLinear(
-                    config.hidden_size,
-                    qkv_a_output_sizes,
-                    [True, True, False],
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.fused_qkv_a_proj",
-                )
-                self.mla_gate_is_fused = True
-            else:
-                self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                    config.hidden_size,
-                    qkv_a_output_sizes,
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.fused_qkv_a_proj",
-                    disable_tp=True,
-                )
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_a_proj",
+            )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -230,15 +213,14 @@ class MultiHeadLatentAttention(nn.Module):
                 prefix=f"{prefix}.q_b_proj",
             )
             self.q_proj = None
-            self.kv_a_proj_with_mqa = None
-        if self.q_lora_rank is None:
-            self.kv_a_proj_with_mqa = ReplicatedLinear(
-                config.hidden_size,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.kv_a_proj_with_mqa",
-            )
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_a_proj_with_mqa",
+        )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -254,8 +236,7 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.g_proj",
-        ) if (getattr(config, "mla_use_output_gate", False)
-              and not self.mla_gate_is_fused) else None)
+        ) if getattr(config, "mla_use_output_gate", False) else None)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.v_head_dim,
             config.hidden_size,
@@ -268,7 +249,7 @@ class MultiHeadLatentAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             rotary_emb=None,
             o_proj=self.o_proj,
-            fused_qkv_a_proj=self.fused_qkv_a_proj,
+            fused_qkv_a_proj=None,
             kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
             q_a_layernorm=self.q_a_layernorm,
             q_b_proj=self.q_b_proj,
@@ -277,12 +258,10 @@ class MultiHeadLatentAttention(nn.Module):
             is_sparse=False,
             topk_indices_buffer=None,
         )
-        # The TPU MLA wrapper supports K3's optional output gate, while the
-        # current upstream MLAModules dataclass does not expose that field.
-        # Attach it as backend-specific metadata instead of passing a stale
-        # constructor argument.
+        # The TPU MLA wrapper supports K3's optional output gate and unmerged q_a_proj.
+        mla_modules.q_a_proj = self.q_a_proj
         mla_modules.g_proj = self.g_proj
-        mla_modules.gate_is_fused = self.mla_gate_is_fused
+        mla_modules.gate_is_fused = False
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
@@ -367,12 +346,33 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
         quant_config = vllm_config.quant_config
 
-        self.fused_qkvb_proj = MergedColumnParallelLinear(
+        self.q_proj = ColumnParallelLinear(
             config.hidden_size,
-            [self.projection_size] * 3 + [self.total_heads],
+            self.projection_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.fused_qkvb_proj",
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+        self.b_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.total_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.b_proj",
         )
         if self.use_full_rank_gate:
             self.fused_fa_ga_proj = None
@@ -525,9 +525,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         del positions
-        projected, _ = self.fused_qkvb_proj(hidden_states)
-        query, key, value, beta = projected.split(
-            [self.local_projection_size] * 3 + [self.num_heads], dim=-1)
+        query, _ = self.q_proj(hidden_states)
+        key, _ = self.k_proj(hidden_states)
+        value, _ = self.v_proj(hidden_states)
+        beta, _ = self.b_proj(hidden_states)
         mixed_qkv = torch.cat((query, key, value), dim=-1)
         if self.use_full_rank_gate:
             assert self.f_a_proj is not None
@@ -547,7 +548,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         metadata = self._metadata()
         if (metadata is None or self.kv_cache is None
                 or self.kv_cache[0].numel() == 0):
-            output = torch.zeros_like(query)
+            output = torch.zeros_like(mixed_qkv[:, :self.local_projection_size])
         else:
             sconv_cache, recurrent_cache = self.kv_cache
             output = self.dispatched_kda_op(

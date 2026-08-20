@@ -241,18 +241,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             ".up_proj.": (".gate_up_proj.", 1),
         },
     )
-    fused_mla_mapper = WeightsMapper(orig_to_new_stacked={
-        ".q_a_proj.": (".fused_qkv_a_proj.", 0),
-        ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
-    }, )
     fused_attention_params_mapping = (
-        (".self_attn.q_proj.", ".self_attn.fused_qkvb_proj.", 0),
-        (".self_attn.k_proj.", ".self_attn.fused_qkvb_proj.", 1),
-        (".self_attn.v_proj.", ".self_attn.fused_qkvb_proj.", 2),
-        (".self_attn.b_proj.", ".self_attn.fused_qkvb_proj.", 3),
         (".self_attn.f_a_proj.", ".self_attn.fused_fa_ga_proj.", 0),
         (".self_attn.g_a_proj.", ".self_attn.fused_fa_ga_proj.", 1),
-        (".self_attn.g_proj.", ".self_attn.fused_qkv_a_proj.", 2),
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -337,8 +328,6 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             name.endswith("w13_weight_packed") for name in params_dict)
         loaded_experts: set[str] = set()
         mapper = self.hf_to_vllm_mapper
-        if self.config.q_lora_rank is not None:
-            mapper |= self.fused_mla_mapper
 
         # Feed non-expert weights to AutoWeightsLoader as a GENERATOR, not a
         # list: with a streamed checkpoint the loop below drains the whole
