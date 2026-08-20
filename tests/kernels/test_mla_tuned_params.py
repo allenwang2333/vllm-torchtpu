@@ -21,7 +21,7 @@ def _k3_mixed_key() -> TuningKey:
         case="mixed",
         max_num_tokens=4096,
         actual_num_q_heads=12,
-        actual_lkv_dim=128,
+        actual_lkv_dim=512,
         actual_r_dim=64,
         q_dtype="bfloat16",
         kv_dtype="bfloat16",
@@ -35,8 +35,8 @@ def _k3_mixed_key() -> TuningKey:
 def test_k3_mixed_tuned_params() -> None:
     tuned = get_tuned_params(_k3_mixed_key())
 
-    assert tuned.num_kv_pages_per_block == 2
-    assert tuned.num_queries_per_block == 512
+    assert tuned.num_kv_pages_per_block == 4
+    assert tuned.num_queries_per_block == 256
     assert tuned.q_split == 1
 
 

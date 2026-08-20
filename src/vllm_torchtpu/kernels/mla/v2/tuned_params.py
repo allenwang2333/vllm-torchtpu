@@ -1111,7 +1111,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         case="mixed",
         max_num_tokens=4096,
         actual_num_q_heads=12,
-        actual_lkv_dim=128,
+        actual_lkv_dim=512,
         actual_r_dim=64,
         kv_dtype="bfloat16",
         q_dtype="bfloat16",
@@ -1122,8 +1122,8 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=1,
-        num_kv_pages_per_block=2,
-        num_queries_per_block=512,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=256,
         vmem_limit_bytes=62914560,
     ),
 }

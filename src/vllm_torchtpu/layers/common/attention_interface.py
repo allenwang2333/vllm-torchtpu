@@ -552,7 +552,7 @@ def mla_attention(
             case="mixed",
             max_num_tokens=max_num_tokens,
             actual_num_q_heads=q.shape[1],
-            actual_lkv_dim=qk_nope_head_dim,
+            actual_lkv_dim=q.shape[-1],
             actual_r_dim=actual_r_dim,
             q_dtype=jnp.dtype(q.dtype).name,
             kv_dtype=kv_dtype_str,
