@@ -563,8 +563,18 @@ def mla_attention(
         # Asking for a `mixed` key routes through the same lookup, so a tuned
         # entry can now govern these stages, and the miss path computes a
         # schedule from the shape instead of returning the minimum.
+        #
+        # `pages_per_seq` has to be filled in here. It is a `TuningKey` field
+        # with a placeholder default of 9, and the decode key above never sets
+        # it because the decode entries were tuned against that placeholder.
+        # The computed schedule clamps to it -- a block cannot span more pages
+        # than a sequence owns -- so leaving the placeholder capped the block
+        # count at 8 and gave up about 12% end to end. Only the mixed key gets
+        # the real value; changing the decode key would miss its tuned rows.
         mixed_tuned = get_tuned_params(
-            dataclasses.replace(tuning_key, case="mixed"))
+            dataclasses.replace(tuning_key,
+                                case="mixed",
+                                pages_per_seq=block_tables.shape[1]))
         num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block,
                                    mixed_tuned.num_kv_pages_per_block)
