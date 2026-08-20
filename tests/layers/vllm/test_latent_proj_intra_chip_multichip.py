@@ -27,6 +27,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -88,6 +89,16 @@ def _prepare_worker_env() -> dict[str, str]:
                    "false")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    # Drop env leaked by an in-process engine run earlier in the pytest
+    # session (e.g. tests/entrypoints/llm/test_generate_tp.py, which
+    # collection orders before this file). env_override.py assembles
+    # LIBTPU_INIT_ARGS at import; one of its additions,
+    # --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes,
+    # miscompiles this test's compiled GEMM+all-gather into garbage
+    # (scripts/debug/ag_offload_flag_repro.py isolates it). The workers
+    # re-import vllm_torchtpu themselves, but only after the device is
+    # touched, so the leaked value is what their client init sees.
+    env.pop("LIBTPU_INIT_ARGS", None)
     env["TPU_LATENT_PROJ_INTRA_CHIP_TP"] = "1"
     return env
 
@@ -220,7 +231,8 @@ def _run_worker(result_dir: Path) -> None:
         raise SystemExit(1)
 
 
-def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_worker_group_once(
+        result_dir: Path) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         _worker_command(result_dir),
         cwd=Path(__file__).resolve().parents[3],
@@ -238,6 +250,25 @@ def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
         process.wait(timeout=60)
     return subprocess.CompletedProcess(process.args, process.returncode,
                                        output, "")
+
+
+def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
+    """Run the workers, retrying through the device-teardown race.
+
+    In the full CI session an in-process engine test runs before this file,
+    and its workers release the TPUs asynchronously. Spawned too soon after,
+    this test's workers fail init_process_group with "PjRtClient is not
+    initialized" (CI build 3112). That is a transient resource race, not a
+    code defect, so wait for the devices to drain and try again.
+    """
+    completed = _run_worker_group_once(result_dir)
+    attempts = 1
+    while ("PjRtClient is not initialized" in (completed.stdout or "")
+           and attempts < 3):
+        attempts += 1
+        time.sleep(60)
+        completed = _run_worker_group_once(result_dir)
+    return completed
 
 
 def test_intra_chip_gather_matches_the_replicated_projection(tmp_path):
