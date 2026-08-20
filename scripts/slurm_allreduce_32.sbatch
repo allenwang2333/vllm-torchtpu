@@ -41,6 +41,13 @@ export PYTHONUNBUFFERED=1
 # devices that puts its smallest payload at rows=32.
 export LL_IMPLS="${LL_IMPLS:-xla,oneshot}"
 export LL_ROWS="${LL_ROWS:-1,2,4,8,16,32,64,128,256}"
+# LL_SHAPES overrides the rows sweep with explicit ROWSxCOLS payloads. Needed to
+# reach the shapes production actually runs: _build_two_shot reshapes the
+# flattened payload to (N, numel/N), so K3's (1,7168) post-attention reduce is
+# 32x224 and its (1,10752) latent-MoE pair is 32x336. The rows sweep cannot
+# express either -- two_shot needs rows % 32 == 0, which at cols=1024 puts its
+# smallest payload at 64 KiB, four times K3's.
+export LL_SHAPES="${LL_SHAPES:-}"
 export LL_COLS="${LL_COLS:-1024}"
 export REPO_DIR PYTHON BENCH RUN_DIR LL_IMPLS LL_ROWS LL_COLS
 mkdir -p "${HOME}" "${XDG_CACHE_HOME}" "${RUN_DIR}"
@@ -64,6 +71,7 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --unbuffered --export=ALL \
       --devices 32 \
       --impls "${LL_IMPLS}" \
       --dtype bfloat16 \
+      ${LL_SHAPES:+--shapes "${LL_SHAPES}"} \
       --rows "${LL_ROWS}" \
       --cols "${LL_COLS}" \
       --sc-offload-bytes 67108864 \
