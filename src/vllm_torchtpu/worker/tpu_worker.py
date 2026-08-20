@@ -526,7 +526,7 @@ class TPUWorker(WorkerBase):
             return
 
         if is_start:
-            if self.profile_context is not None:
+            if self.profile_context is not None or getattr(self, "_jax_profiling", False):
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
@@ -549,6 +549,18 @@ class TPUWorker(WorkerBase):
 
             logger.info("Starting TorchTPU profiler trace at %s...",
                         self.profile_capture_dir)
+
+            # Start JAX profiler for direct PJRT TPU hardware trace capture (*.xplane.pb)
+            try:
+                import jax.profiler
+                jax.profiler.start_trace(self.profile_capture_dir)
+                self._jax_profiling = True
+                logger.info("JAX on-device TPU hardware profiler started at %s.",
+                            self.profile_capture_dir)
+            except Exception as e:
+                logger.warning("Failed to start JAX profiler: %s", e)
+                self._jax_profiling = False
+
             handler = torch.profiler.tensorboard_trace_handler(
                 dir_name=self.profile_capture_dir, use_gzip=True)
             config = TpuProfilerConfig(
@@ -572,17 +584,29 @@ class TPUWorker(WorkerBase):
                 self.profile_context = None
                 raise
         else:
-            if self.profile_context is None:
+            if self.profile_context is None and not getattr(self, "_jax_profiling", False):
                 logger.warning(
                     "Profiler context is not set. Cannot stop profiler.")
                 return
             logger.info("Stopping TorchTPU profiler trace...")
             try:
-                # The trace is written by the on_trace_ready handler during
-                # __exit__, so it is on disk once this returns.
-                self.profile_context.__exit__(None, None, None)
+                if self.profile_context is not None:
+                    # The trace is written by the on_trace_ready handler during
+                    # __exit__, so it is on disk once this returns.
+                    self.profile_context.__exit__(None, None, None)
             finally:
                 self.profile_context = None
+
+            if getattr(self, "_jax_profiling", False):
+                try:
+                    import jax.profiler
+                    jax.profiler.stop_trace()
+                    logger.info("JAX on-device TPU hardware profiler stopped.")
+                except Exception as e:
+                    logger.warning("Failed to stop JAX profiler: %s", e)
+                finally:
+                    self._jax_profiling = False
+
             # Merge into the run directory this capture was started under,
             # which is what the sandbox path is relative to, rather than
             # re-deriving it from the stop call's prefix.
