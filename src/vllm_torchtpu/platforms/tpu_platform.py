@@ -369,9 +369,12 @@ def apply_tpu_patches() -> None:
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
     import vllm_torchtpu.layers.vllm.vision_attention  # noqa: F401
+    from vllm_torchtpu.models.vllm import register_models
+    register_models()
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
+
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:

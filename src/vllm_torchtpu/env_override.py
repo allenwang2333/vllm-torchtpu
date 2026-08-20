@@ -256,3 +256,30 @@ def _patch_jax_pallas_fori_lowering() -> None:
 
 
 _patch_jax_pallas_fori_lowering()
+
+
+def _patch_transformers_output_recorder() -> None:
+    """Expose OutputRecorder on transformers.utils.generic if missing in current transformers version."""
+    try:
+        import transformers.utils.generic as _tg
+        if not hasattr(_tg, "OutputRecorder"):
+            from transformers.utils import output_capturing as _toc
+            if hasattr(_toc, "OutputRecorder"):
+                _tg.OutputRecorder = _toc.OutputRecorder
+    except Exception:
+        pass
+
+
+def _patch_vllm_envs_bucket_padding_gap() -> None:
+    """Ensure VLLM_TPU_BUCKET_PADDING_GAP is set on vllm.envs."""
+    try:
+        import vllm.envs as _ve
+        if not hasattr(_ve, "VLLM_TPU_BUCKET_PADDING_GAP"):
+            setattr(_ve, "VLLM_TPU_BUCKET_PADDING_GAP",
+                    int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "128")))
+    except Exception:
+        pass
+
+
+_patch_transformers_output_recorder()
+_patch_vllm_envs_bucket_padding_gap()

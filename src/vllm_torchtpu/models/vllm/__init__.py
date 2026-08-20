@@ -21,3 +21,16 @@ def register_models() -> None:
                                  _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
+
+    if hasattr(ModelRegistry, "is_text_generation_model"):
+        orig_fn = ModelRegistry.is_text_generation_model
+        if not getattr(orig_fn, "_tpu_kimi_k3_patch", False):
+            def patched_is_text_gen(model_arch: str, *args, **kwargs) -> bool:
+                if model_arch in ("KimiK3ForConditionalGeneration",
+                                  "KimiLinearForCausalLM"):
+                    return True
+                return orig_fn(model_arch, *args, **kwargs)
+
+            patched_is_text_gen._tpu_kimi_k3_patch = True
+            ModelRegistry.is_text_generation_model = patched_is_text_gen
+

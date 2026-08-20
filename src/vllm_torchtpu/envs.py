@@ -279,7 +279,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
-    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
+    lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "128")),
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN":
     lambda: int(val)
