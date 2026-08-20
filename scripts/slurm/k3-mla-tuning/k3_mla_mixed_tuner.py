@@ -21,7 +21,6 @@ import sys
 import time
 import types
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SOURCE_ROOT = REPO_ROOT / "src"
 
@@ -47,8 +46,7 @@ from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.mla.v2.kernel import (  # noqa: E402
-    mla_ragged_paged_attention,
-)
+    mla_ragged_paged_attention, )
 
 
 def parse_shapes(value: str) -> list[tuple[int, int]]:
@@ -96,35 +94,30 @@ def make_inputs(
     total_pages: int,
     max_num_seqs: int,
     pages_per_seq: int,
+    page_size_per_kv_packing: int,
+    kv_packing: int,
 ):
     local_num_heads = 12
     model_axis_size = len(jax.devices())
     num_heads = local_num_heads * model_axis_size
     lkv_dim = 128
     r_dim = 64
-    page_size_per_kv_packing = 256
-    kv_packing = 4
     logical_page_size = page_size_per_kv_packing * kv_packing
     required_pages = math.ceil(valid_tokens / logical_page_size)
     if required_pages > pages_per_seq:
         raise ValueError(
             f"valid_tokens={valid_tokens} needs {required_pages} pages, "
-            f"but pages_per_seq={pages_per_seq}"
-        )
+            f"but pages_per_seq={pages_per_seq}")
     if required_pages > total_pages:
         raise ValueError(
             f"valid_tokens={valid_tokens} needs {required_pages} pages, "
-            f"but total_pages={total_pages}"
-        )
+            f"but total_pages={total_pages}")
 
     # Match mla_attention's serving boundary: queries are token-major with the
     # global head count and are sharded over the eight-device model axis.
-    ql_nope = jnp.ones(
-        (physical_tokens, num_heads, lkv_dim), dtype=jnp.bfloat16
-    )
-    q_pe = jnp.ones(
-        (physical_tokens, num_heads, r_dim), dtype=jnp.bfloat16
-    )
+    ql_nope = jnp.ones((physical_tokens, num_heads, lkv_dim),
+                       dtype=jnp.bfloat16)
+    q_pe = jnp.ones((physical_tokens, num_heads, r_dim), dtype=jnp.bfloat16)
     new_kv_c = jnp.ones((physical_tokens, lkv_dim), dtype=jnp.bfloat16)
     new_k_pe = jnp.ones((physical_tokens, r_dim), dtype=jnp.bfloat16)
     cache_kv = jnp.zeros(
@@ -132,18 +125,18 @@ def make_inputs(
         dtype=jnp.bfloat16,
     )
 
-    kv_lens = jnp.zeros((max_num_seqs,), dtype=jnp.int32).at[0].set(valid_tokens)
-    cu_q_lens = jnp.full((max_num_seqs + 1,), valid_tokens, dtype=jnp.int32)
+    kv_lens = jnp.zeros((max_num_seqs, ),
+                        dtype=jnp.int32).at[0].set(valid_tokens)
+    cu_q_lens = jnp.full((max_num_seqs + 1, ), valid_tokens, dtype=jnp.int32)
     cu_q_lens = cu_q_lens.at[0].set(0)
-    page_indices = jnp.full(
-        (max_num_seqs * pages_per_seq,), -1, dtype=jnp.int32
-    )
+    page_indices = jnp.full((max_num_seqs * pages_per_seq, ),
+                            -1,
+                            dtype=jnp.int32)
     page_indices = page_indices.at[:required_pages].set(
-        jnp.arange(required_pages, dtype=jnp.int32)
-    )
+        jnp.arange(required_pages, dtype=jnp.int32))
     distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)
 
-    mesh = Mesh(np.asarray(jax.devices()), ("model",))
+    mesh = Mesh(np.asarray(jax.devices()), ("model", ))
     specs = (
         P(None, "model", None),
         P(None, "model", None),
@@ -171,15 +164,13 @@ def make_inputs(
             ),
             specs,
             strict=True,
-        )
-    )
+        ))
     jax.block_until_ready(inputs)
     return mesh, inputs
 
 
-def make_invoker(
-    mesh: Mesh, *, bkv: int, bq: int, q_split: int, vmem_limit_bytes: int
-):
+def make_invoker(mesh: Mesh, *, bkv: int, bq: int, q_split: int,
+                 vmem_limit_bytes: int):
     """Build the same model-axis shard_map used by the serving wrapper."""
 
     def local_invoke(
@@ -229,8 +220,7 @@ def make_invoker(
             ),
             out_specs=(P(None, "model", None), P()),
             check_rep=False,
-        )
-    )
+        ))
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -251,6 +241,8 @@ def tune_candidate(
     total_pages: int,
     max_num_seqs: int,
     pages_per_seq: int,
+    page_size_per_kv_packing: int,
+    kv_packing: int,
     vmem_limit_bytes: int,
 ) -> dict:
     mesh, inputs = make_inputs(
@@ -259,6 +251,8 @@ def tune_candidate(
         total_pages=total_pages,
         max_num_seqs=max_num_seqs,
         pages_per_seq=pages_per_seq,
+        page_size_per_kv_packing=page_size_per_kv_packing,
+        kv_packing=kv_packing,
     )
 
     invoke = make_invoker(
@@ -320,8 +314,7 @@ def main() -> int:
         "--candidates",
         type=parse_candidates,
         default=parse_candidates(
-            "1x16,1x32,1x64,2x16,2x32,2x64,4x16,4x32,4x64"
-        ),
+            "1x16,1x32,1x64,2x16,2x32,2x64,4x16,4x32,4x64"),
     )
     parser.add_argument("--q-split", type=int, default=1)
     parser.add_argument("--warmups", type=int, default=2)
@@ -329,11 +322,15 @@ def main() -> int:
     parser.add_argument("--total-pages", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=160)
     parser.add_argument("--pages-per-seq", type=int, default=9)
+    parser.add_argument("--page-size-per-kv-packing", type=int, default=256)
+    parser.add_argument("--kv-packing", type=int, default=4)
     parser.add_argument("--vmem-mib", type=int, default=60)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.q_split <= 0 or args.warmups < 0 or args.iterations <= 0:
-        parser.error("q-split and iterations must be positive; warmups must be nonnegative")
+        parser.error(
+            "q-split and iterations must be positive; warmups must be nonnegative"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO)
@@ -348,7 +345,8 @@ def main() -> int:
                 "jaxlib": package_version("jaxlib"),
                 "libtpu": package_version("libtpu"),
                 "devices": [str(device) for device in jax.devices()],
-                "device_kinds": [device.device_kind for device in jax.devices()],
+                "device_kinds":
+                [device.device_kind for device in jax.devices()],
                 "shapes": args.shapes,
                 "candidates": args.candidates,
                 "q_split": args.q_split,
@@ -357,6 +355,8 @@ def main() -> int:
                 "total_pages": args.total_pages,
                 "max_num_seqs": args.max_num_seqs,
                 "pages_per_seq": args.pages_per_seq,
+                "page_size_per_kv_packing": args.page_size_per_kv_packing,
+                "kv_packing": args.kv_packing,
                 "vmem_mib": args.vmem_mib,
             },
             output_file,
@@ -377,6 +377,8 @@ def main() -> int:
                         total_pages=args.total_pages,
                         max_num_seqs=args.max_num_seqs,
                         pages_per_seq=args.pages_per_seq,
+                        page_size_per_kv_packing=args.page_size_per_kv_packing,
+                        kv_packing=args.kv_packing,
                         vmem_limit_bytes=args.vmem_mib * 1024 * 1024,
                     )
                 except Exception as error:  # Continue the sweep after invalid/OOM cases.
