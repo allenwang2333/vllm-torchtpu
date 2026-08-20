@@ -120,10 +120,10 @@ def make_inputs(
     # Match mla_attention's serving boundary: queries are token-major with the
     # global head count and are sharded over the eight-device model axis.
     ql_nope = jnp.ones(
-        (physical_tokens, num_heads, lkv_dim), dtype=jnp.float8_e4m3fn
+        (physical_tokens, num_heads, lkv_dim), dtype=jnp.bfloat16
     )
     q_pe = jnp.ones(
-        (physical_tokens, num_heads, r_dim), dtype=jnp.float8_e4m3fn
+        (physical_tokens, num_heads, r_dim), dtype=jnp.bfloat16
     )
     new_kv_c = jnp.ones((physical_tokens, lkv_dim), dtype=jnp.bfloat16)
     new_k_pe = jnp.ones((physical_tokens, r_dim), dtype=jnp.bfloat16)
