@@ -43,6 +43,13 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh"
 echo "--- Pulling Docker Image: ${IMAGE_TAG}"
 docker pull "${IMAGE_TAG}"
 
+echo "--- Checking persistent disk storage"
+docker run --rm \
+  -v /mnt/disks/persist:/mnt/disks/persist \
+  -v "${SCRIPT_DIR}:/scripts" \
+  "${IMAGE_TAG}" \
+  python3 /scripts/prune_persist_disk.py
+
 # Ensure cache directory exists on the host
 mkdir -p /mnt/disks/persist/models
 
@@ -50,6 +57,12 @@ mkdir -p /mnt/disks/persist/models
 mkdir -p /mnt/disks/persist/perf_eval_results
 chmod 777 /mnt/disks/persist/perf_eval_results 2>/dev/null || true
 rm -rf /mnt/disks/persist/perf_eval_results/* 2>/dev/null || true
+
+# Ensure ephemeral compilation cache directory exists on the persistent disk
+JOB_CACHE_DIR="/mnt/disks/persist/job_cache_${BUILDKITE_JOB_ID:-$$}"
+mkdir -p "${JOB_CACHE_DIR}"
+chmod 777 "${JOB_CACHE_DIR}" 2>/dev/null || true
+rm -rf "${JOB_CACHE_DIR:?}"/* 2>/dev/null || true
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results
@@ -62,7 +75,7 @@ CONTAINER_NAME="vllm-torchtpu-ci"
 echo "--- Cleaning up any existing container: ${CONTAINER_NAME}"
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
-trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
+trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true; rm -rf "${JOB_CACHE_DIR:-}" 2>/dev/null || true' EXIT INT TERM
 
 # Buildkite and test suite related environment variables and volume mounts
 export BUILDKITE_PARALLEL_JOB="${BUILDKITE_PARALLEL_JOB:-0}"
@@ -94,6 +107,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
   -w /root/torchtpu-vllm \
   -v /mnt/disks/persist/models:/local_hf_cache \
   -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v "${JOB_CACHE_DIR}:/root/.cache" \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
@@ -120,7 +134,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
     rm -rf /perf_eval_results/*
     "$@"
     DOCKER_INNER_EXIT=$?
-    chmod -R 777 /perf_eval_results 2>/dev/null || true
+    chmod -R 777 /perf_eval_results /root/.cache /local_hf_cache 2>/dev/null || true
     exit ${DOCKER_INNER_EXIT}
   ' -- "$@"
 DOCKER_EXIT_CODE=$?
@@ -130,6 +144,9 @@ echo "--- Copying test results back to workspace for artifact upload"
 cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
 # Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
+
+echo "--- Cleaning up job compilation cache"
+rm -rf "${JOB_CACHE_DIR}" 2>/dev/null || true
 
 echo "[INFO] Docker finished with exit code ${DOCKER_EXIT_CODE}."
 
