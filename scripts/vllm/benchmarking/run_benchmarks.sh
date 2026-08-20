@@ -128,10 +128,15 @@ BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 # non-greedy: temp 0.7 / top_p 0.8 / top_k 20).
 # Set to 0 for deterministic greedy decoding.
 BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
-# Extra flags appended verbatim to every `vllm bench serve` invocation
-# (client side — EXTRA_SERVE_ARGS is the server-side counterpart). E.g.
-# --trust-remote-code for models whose HF repo ships a custom tokenizer.
-EXTRA_BENCH_ARGS=""
+# Extra flags appended verbatim to every `vllm bench serve` invocation —
+# the client-side counterpart of EXTRA_SERVE_ARGS, same contract: env
+# passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
+# E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# Server async scheduling (--async-scheduling / --no-async-scheduling).
+# Resolution order: env > config > harness default (true). Left empty here
+# so a config can tell "unset" from "forced by the operator".
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
 EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
@@ -140,6 +145,13 @@ PERF_TOLERANCE="0.05"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
+if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
+    echo "ERROR: ASYNC_SCHEDULING must be 'true' or 'false', got '$ASYNC_SCHEDULING'"
+    exit 1
+fi
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
@@ -244,13 +256,17 @@ start_vllm_server() {
     if [ "${ENABLE_PREFIX_CACHING:-false}" = "true" ]; then
         prefix_caching_flag="--enable-prefix-caching"
     fi
-    local kv_cache_dtype="${KV_CACHE_DTYPE:-fp8}"
+    local async_scheduling_flag="--async-scheduling"
+    if [ "$ASYNC_SCHEDULING" = "false" ]; then
+        async_scheduling_flag="--no-async-scheduling"
+    fi
+    local kv_cache_dtype="$KV_CACHE_DTYPE"
     local serve_target="$MODEL"
     if [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
     fi
-    local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
+    local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT $async_scheduling_flag $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
 
     echo ""
     echo "================================================"
@@ -368,6 +384,8 @@ run_benchmark_once() {
     if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
         profile_arg="--profile"
     fi
+    local tokenizer_arg
+    tokenizer_arg=$(bench_tokenizer_args)
 
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
     # Otherwise vllm bench serve sends no temperature and the server's
@@ -381,6 +399,7 @@ run_benchmark_once() {
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
+        ${tokenizer_arg:+$tokenizer_arg} \
         --host "$HOST" \
         --port "$PORT" \
         --dataset-name random \
@@ -402,6 +421,33 @@ run_benchmark_once() {
     set -e
 
     return "$bench_exit"
+}
+
+# =============================================================================
+# Bench-client tokenizer
+# =============================================================================
+# With MODEL_URI the server pulls config/tokenizer/custom code from object
+# storage into ObjectStorageModel(MODEL_URI).dir in this container during
+# startup, so the client tokenizes from there instead of re-resolving MODEL
+# on the HF hub (a hub outage must not kill the bench after the serve
+# bring-up). BENCH_TOKENIZER overrides. The dir is only populated once the
+# server is up, so its presence is checked per bench run (see
+# bench_tokenizer_args); if absent (e.g. --host against a remote server)
+# the client falls back to MODEL.
+BENCH_TOKENIZER="${BENCH_TOKENIZER:-}"
+PULLED_TOKENIZER_DIR=""
+if [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
+    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
+fi
+
+bench_tokenizer_args() {
+    if [ -n "$BENCH_TOKENIZER" ]; then
+        echo "--tokenizer $BENCH_TOKENIZER"
+    elif [ -n "$PULLED_TOKENIZER_DIR" ] && [ -f "$PULLED_TOKENIZER_DIR/config.json" ]; then
+        echo "--tokenizer $PULLED_TOKENIZER_DIR"
+    elif [ -n "$MODEL_URI" ]; then
+        echo "WARNING: pulled dir $PULLED_TOKENIZER_DIR for $MODEL_URI has no config.json; bench client will resolve $MODEL on the hub" >&2
+    fi
 }
 
 # =============================================================================
@@ -450,6 +496,8 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
+    "async_scheduling": $ASYNC_SCHEDULING,
+    "kv_cache_dtype": "$KV_CACHE_DTYPE",
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
