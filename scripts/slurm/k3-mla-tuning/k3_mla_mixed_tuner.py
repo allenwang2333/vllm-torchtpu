@@ -41,6 +41,10 @@ _install_lightweight_package_stubs()
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+from jax.experimental import shard_map  # noqa: E402
+from jax.sharding import Mesh, NamedSharding  # noqa: E402
+from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.mla.v2.kernel import (  # noqa: E402
     mla_ragged_paged_attention,
@@ -93,7 +97,9 @@ def make_inputs(
     max_num_seqs: int,
     pages_per_seq: int,
 ):
-    num_heads = 12
+    local_num_heads = 12
+    model_axis_size = len(jax.devices())
+    num_heads = local_num_heads * model_axis_size
     lkv_dim = 128
     r_dim = 64
     page_size_per_kv_packing = 256
@@ -111,8 +117,10 @@ def make_inputs(
             f"but total_pages={total_pages}"
         )
 
+    # Match mla_attention's serving boundary: queries are token-major with the
+    # global head count and are sharded over the eight-device model axis.
     ql_nope = jnp.ones(
-        (num_heads, physical_tokens, lkv_dim), dtype=jnp.float8_e4m3fn
+        (physical_tokens, num_heads, lkv_dim), dtype=jnp.float8_e4m3fn
     )
     q_pe = jnp.ones(
         (physical_tokens, num_heads, r_dim), dtype=jnp.float8_e4m3fn
@@ -135,8 +143,47 @@ def make_inputs(
     )
     distribution = jnp.asarray([0, 0, 1], dtype=jnp.int32)
 
-    inputs = (
-        ql_nope,
+    mesh = Mesh(np.asarray(jax.devices()), ("model",))
+    specs = (
+        P(None, "model", None),
+        P(None, "model", None),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
+        P(),
+    )
+    inputs = tuple(
+        jax.device_put(value, NamedSharding(mesh, spec))
+        for value, spec in zip(
+            (
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache_kv,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            ),
+            specs,
+            strict=True,
+        )
+    )
+    jax.block_until_ready(inputs)
+    return mesh, inputs
+
+
+def make_invoker(
+    mesh: Mesh, *, bkv: int, bq: int, q_split: int, vmem_limit_bytes: int
+):
+    """Build the same model-axis shard_map used by the serving wrapper."""
+
+    def local_invoke(
+        q,
         q_pe,
         new_kv_c,
         new_k_pe,
@@ -145,20 +192,44 @@ def make_inputs(
         page_indices,
         cu_q_lens,
         distribution,
-    )
-    jax.block_until_ready(inputs)
-    return inputs
+    ):
+        output, updated_cache = mla_ragged_paged_attention(
+            q.transpose((1, 0, 2)),
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            cache_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            num_kv_pages_per_block=(3, 1, bkv),
+            num_queries_per_block=(1, 16, bq),
+            vmem_limit_bytes=vmem_limit_bytes,
+            decode_batch_size=4,
+            mixed_q_split=q_split,
+            s_dtype=jnp.bfloat16,
+        )
+        return output.transpose((1, 0, 2)), updated_cache
 
-
-def invoke(inputs, *, bkv: int, bq: int, q_split: int, vmem_limit_bytes: int):
-    return mla_ragged_paged_attention(
-        *inputs,
-        num_kv_pages_per_block=(3, 1, bkv),
-        num_queries_per_block=(1, 16, bq),
-        vmem_limit_bytes=vmem_limit_bytes,
-        decode_batch_size=4,
-        mixed_q_split=q_split,
-        s_dtype=jnp.bfloat16,
+    return jax.jit(
+        shard_map.shard_map(
+            local_invoke,
+            mesh=mesh,
+            in_specs=(
+                P(None, "model", None),
+                P(None, "model", None),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+            ),
+            out_specs=(P(None, "model", None), P()),
+            check_rep=False,
+        )
     )
 
 
@@ -182,7 +253,7 @@ def tune_candidate(
     pages_per_seq: int,
     vmem_limit_bytes: int,
 ) -> dict:
-    inputs = make_inputs(
+    mesh, inputs = make_inputs(
         physical_tokens,
         valid_tokens,
         total_pages=total_pages,
@@ -190,40 +261,29 @@ def tune_candidate(
         pages_per_seq=pages_per_seq,
     )
 
-    compile_start = time.perf_counter()
-    output, updated_cache = invoke(
-        inputs,
+    invoke = make_invoker(
+        mesh,
         bkv=bkv,
         bq=bq,
         q_split=q_split,
         vmem_limit_bytes=vmem_limit_bytes,
     )
+    compile_start = time.perf_counter()
+    output, updated_cache = invoke(*inputs)
     jax.block_until_ready((output, updated_cache))
     compile_and_first_run_ms = (time.perf_counter() - compile_start) * 1000
 
     mutable_inputs = list(inputs)
     mutable_inputs[4] = updated_cache
     for _ in range(warmups):
-        output, updated_cache = invoke(
-            tuple(mutable_inputs),
-            bkv=bkv,
-            bq=bq,
-            q_split=q_split,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
+        output, updated_cache = invoke(*mutable_inputs)
         jax.block_until_ready((output, updated_cache))
         mutable_inputs[4] = updated_cache
 
     latencies_ms: list[float] = []
     for _ in range(iterations):
         start = time.perf_counter()
-        output, updated_cache = invoke(
-            tuple(mutable_inputs),
-            bkv=bkv,
-            bq=bq,
-            q_split=q_split,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
+        output, updated_cache = invoke(*mutable_inputs)
         jax.block_until_ready((output, updated_cache))
         latencies_ms.append((time.perf_counter() - start) * 1000)
         mutable_inputs[4] = updated_cache
@@ -244,7 +304,7 @@ def tune_candidate(
         "max_ms": max(latencies_ms),
         "output_shape": list(output.shape),
     }
-    del inputs, mutable_inputs, output, updated_cache
+    del inputs, mutable_inputs, output, updated_cache, invoke, mesh
     gc.collect()
     return result
 
