@@ -973,9 +973,8 @@ class PallasMLAttentionBackend(AttentionBackend):
                 rope_head_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
                 quant_block = PallasMLAttentionBackend._DS_MLA_QUANT_BLOCK
                 nope_dim = head_size - rope_head_dim
-                packed_width = (
-                    PallasMLAttentionBackend._ds_mla_packed_width(
-                        nope_dim, rope_head_dim, quant_block))
+                packed_width = (PallasMLAttentionBackend._ds_mla_packed_width(
+                    nope_dim, rope_head_dim, quant_block))
             kv_packing = get_dtype_packing(torch.uint8)
             return mla_v2_kernel.get_kv_cache_shape(
                 total_num_pages=num_blocks,
