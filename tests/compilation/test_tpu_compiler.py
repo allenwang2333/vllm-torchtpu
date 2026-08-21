@@ -22,7 +22,7 @@ from unittest.mock import patch
 class TestTpuCompilerCache:
 
     @staticmethod
-    def _config(*, max_num_seqs=16, num_gpu_blocks=1024):
+    def _config(*, max_num_seqs=16, num_gpu_blocks=1024, compile_sizes=None):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.9,
@@ -35,6 +35,9 @@ class TestTpuCompilerCache:
                 max_num_seqs=max_num_seqs,
             ),
             parallel_config=SimpleNamespace(data_parallel_size=1),
+            compilation_config=SimpleNamespace(
+                compile_sizes=compile_sizes,
+            ) if compile_sizes is not None else None,
             speculative_config=None,
         )
 
@@ -51,9 +54,12 @@ class TestTpuCompilerCache:
                 self._config(max_num_seqs=32))
             different_kv = compute_tpu_compilation_hash(
                 self._config(num_gpu_blocks=2048))
+            different_compile_sizes = compute_tpu_compilation_hash(
+                self._config(compile_sizes=[512, 1024, 2048, 4096]))
 
         assert base != different_batch
         assert base != different_kv
+        assert base != different_compile_sizes
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import \

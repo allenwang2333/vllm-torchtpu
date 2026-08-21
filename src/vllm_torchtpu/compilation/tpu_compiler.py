@@ -157,6 +157,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
+    compilation_config = getattr(vllm_config, "compilation_config", None)
     factors = {
         "torch": torch.__version__,
         "torch_tpu": importlib_metadata.version("torch-tpu"),
@@ -186,6 +187,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,
             "max_num_seqs": scheduler_config.max_num_seqs,
+        },
+        "compilation": {
+            "compile_sizes": (
+                getattr(compilation_config, "compile_sizes", None)
+                if compilation_config is not None else None
+            ),
         },
         "speculative": {
             "model":
