@@ -42,8 +42,17 @@ print('canary:', repr(json.load(open('${OUT}/canary.json'))['choices'][0]['text'
 fi
 
 echo "### [${ARM}] 2/2 gsm8k 5-shot, limit=${GSM8K_LIMIT}"
+# lm_eval's local-completions wants the *full* completions URL in base_url, not
+# just scheme://host:port -- it posts to base_url verbatim. Passing the bare
+# endpoint sends every request to "/", which 404s; lm_eval then retries into an
+# aiohttp session its own error handler has already closed and dies with
+# "RuntimeError: Session is closed", which reads like a client bug rather than a
+# bad URL. Job 310 lost a booted 32-device server this way. The reference run in
+# results/k3-concat3/gsm8k-100 records the working form:
+# base_url=http://<ip>:8000/v1/completions. The canary above builds the same
+# path, so if the canary passes and lm_eval sees no traffic, suspect this line.
 MODEL="${MODEL:-moonshotai/Kimi-K3}" \
-  BASE_URL="${ENDPOINT}" \
+  BASE_URL="${ENDPOINT}/v1/completions" \
   OUTPUT_DIR="${OUT}/gsm8k-${GSM8K_LIMIT}" \
   LIMIT="${GSM8K_LIMIT}" \
   HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/.runtime-cache/hf-datasets}" \
