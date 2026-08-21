@@ -122,23 +122,21 @@ def _compressor_jax_csa(
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: NoPE and RoPE in two arrays, state shares the NoPE buffer."""
     if cache.shape[0] == 0:
-        # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
-        # the compiled signature because torch_tpu jits with keep_unused=True.
         return cache, rope_cache
     new_cache, new_rope_cache, _ = _run_compressor(
-        hidden_states,
-        wkv_wgate,
-        ape,
-        norm_weight,
-        cos_sin_cache,
-        positions,
-        state_block_tables,
-        query_start_loc,
-        k_block_tables,
-        request_distribution,
-        cache,
-        rope_cache,
-        None,
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=rope_cache,
+        state_cache=None,
         state_block_size=state_block_size,
         head_dim=head_dim,
         compress_ratio=compress_ratio,
@@ -174,19 +172,19 @@ def _compressor_jax_hca(
     if cache.shape[0] == 0 or state_cache.shape[0] == 0:
         return cache, state_cache
     new_cache, _, new_state_cache = _run_compressor(
-        hidden_states,
-        wkv_wgate,
-        ape,
-        norm_weight,
-        cos_sin_cache,
-        positions,
-        state_block_tables,
-        query_start_loc,
-        k_block_tables,
-        request_distribution,
-        cache,
-        None,
-        state_cache,
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=None,
+        state_cache=state_cache,
         state_block_size=state_block_size,
         head_dim=head_dim,
         compress_ratio=compress_ratio,
@@ -221,19 +219,19 @@ def _compressor_jax_indexer(
     if cache.shape[0] == 0:
         return cache
     new_cache, _, _ = _run_compressor(
-        hidden_states,
-        wkv_wgate,
-        ape,
-        norm_weight,
-        cos_sin_cache,
-        positions,
-        state_block_tables,
-        query_start_loc,
-        k_block_tables,
-        request_distribution,
-        cache,
-        None,
-        None,
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=None,
+        state_cache=None,
         state_block_size=state_block_size,
         head_dim=head_dim,
         compress_ratio=compress_ratio,
@@ -337,8 +335,7 @@ class VllmCompressorStateCache(CompressorStateCache):
 
 
 class VllmDeepseekCompressor(DeepseekCompressor):
-    """TPU compressor: projects, saves state, compresses and stores.
-    """
+    """TPU compressor: projects, saves state, compresses and stores. """
 
     def __init__(self, *args, **kwargs) -> None:
         orig_state_cache = dsv4_compressor.CompressorStateCache
@@ -405,7 +402,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             quant_block=self._quant_block,
         )
 
-        op_name = (f"pallas::deepseek_v4_compressor_v2_{variant}"
+        op_name = (f"pallas::deepseek_v4_compressor_{variant}"
                    f"_{self.head_dim}_{self.compress_ratio}"
                    f"_{self.state_cache.block_size}")
 

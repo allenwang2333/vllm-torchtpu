@@ -264,7 +264,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, and profiling stage.
-        op_name = (f"pallas::deepseek_v4_attention_{op_type}_v3"
+        op_name = (f"pallas::deepseek_v4_attention_{op_type}"
                    f"_p{logical_page_size}"
                    f"{'_aliased' if two_caches_same_buffer else ''}"
                    f"{'' if built_from_real_caches else '_prof'}")

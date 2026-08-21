@@ -158,7 +158,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
         _scale = f"{self.softmax_scale:.6g}".replace(".", "p").replace(
             "-", "m").replace("+", "")
-        op_name = (f"pallas::deepseek_v4_indexer_v2_k{self.topk_tokens}"
+        op_name = (f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
                    f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}")
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
