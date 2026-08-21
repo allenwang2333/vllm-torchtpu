@@ -51,28 +51,44 @@ export TPU_LATENT_PROJ_INTRA_CHIP_TP="${TPU_LATENT_PROJ_INTRA_CHIP_TP:-0}"
 # `if token_indices_sorted.shape[0] <= threshold`, and the count is
 # num_tokens * topk.
 #
-# This has to be set explicitly now. It used to be `int | None` where unset
-# meant auto -- resolve_onehot_permute_threshold() derived it from SparseCore
-# geometry -- but #485 reverted that (#371), so the default is a bare 0, and 0
-# makes the one-hot branch unreachable at every size.
+# This cannot be a blanket default in either direction, which is the whole
+# reason for the branch below.
 #
-# That is a correctness issue at K3's decode buckets, not a tuning knob. Below
-# one SparseCore block ragged_gather_v2 pads to a whole block, and at bucket 1
-# that padding path fails outright in Mosaic:
+# 0 (upstream's default since #485 reverted the auto-derivation in #371) breaks
+# a single-token decode bucket. Below one SparseCore block ragged_gather_v2 pads
+# to a whole block, and at bucket 1 that padding path fails in Mosaic:
 #
 #   ragged_gather_v2.py:182 -> emit_pipeline -> _make_pipeline_allocations
 #   ValueError: Expected input and output shapes are the same after
 #              multiplying the second-minor dimension by the bitwidths.
 #
-# 64 is what the reverted auto-derivation resolved to on TPU7x, recomputed from
-# the hardware rather than guessed: SparseCoreInfo(num_cores=2, num_subcores=16,
-# num_lanes=16) gives block_rows = 512, and threshold = min(512-1, cap 64) = 64.
-# It splits the buckets exactly where the observed failures split -- bucket 1
-# (16 rows) and bucket 2 (32) take one-hot, bucket 16 (256) stays on SparseCore,
-# and only the first two ever crashed.
+# 64 breaks a *multi*-bucket config. At topk=16 it puts bucket 2 (32 routed
+# rows) on the one-hot path while buckets 16 (256) and 512 (8192) stay on
+# SparseCore, so buckets sharing a compile range get different subgraph
+# structure and compilation refuses:
 #
-# Set 0 to force everything back onto the SparseCore path.
-export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-64}"
+#   vllm_torchtpu.compilation.shape_variants.ShapeSpecializationError:
+#   artifact_compile_range_2_2_subgraph_0 was compiled by another trace of this
+#   model whose inputs differ
+#
+# Measured both ways: [2,16,512] boots at 0 (job 293, SERVER_READY 1873s) and
+# never comes up at 64 (jobs 305/306); [1] is the reverse (302/304 vs earlier).
+# That the one-hot path cannot be *partially* enabled across buckets is the
+# likely reason #371 was reverted at all, so treat 64 as a decode-only setting
+# and not as a fix to carry everywhere.
+#
+# So: single bucket -> 64, several buckets -> 0. 64 is what the reverted
+# auto-derivation computed on TPU7x: SparseCoreInfo(num_cores=2,
+# num_subcores=16, num_lanes=16) gives block_rows = 512, min(512-1, cap 64) = 64.
+# Set the variable explicitly to override the choice.
+if [[ -z "${ONEHOT_MOE_PERMUTE_THRESHOLD:-}" ]]; then
+  if [[ -n "${COMPILE_SIZES:-}" && "${COMPILE_SIZES}" != *,* ]]; then
+    ONEHOT_MOE_PERMUTE_THRESHOLD=64
+  else
+    ONEHOT_MOE_PERMUTE_THRESHOLD=0
+  fi
+fi
+export ONEHOT_MOE_PERMUTE_THRESHOLD
 # Default ON here, unlike the launcher, which defaults it off. With async
 # scheduling off the host scheduler does not overlap device execution and adds
 # ~8.4 ms to every decode step -- half again the step time -- which swamps any
@@ -260,7 +276,7 @@ _LLAR_TAG=""
   _LLAR_TAG="${_LLAR_TAG}-cs${COMPILE_SIZES//,/_}"
 # Selects between the one-hot matmul and SparseCore gather kernels, so the
 # emitted programs differ and the cache trees must too.
-[[ "${ONEHOT_MOE_PERMUTE_THRESHOLD}" != "64" ]] && \
+[[ "${ONEHOT_MOE_PERMUTE_THRESHOLD}" != "0" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-oh${ONEHOT_MOE_PERMUTE_THRESHOLD}"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
