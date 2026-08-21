@@ -93,11 +93,8 @@ __all__ = [
     "two_shot_all_reduce",
     "two_shot_all_reduce_ws",
     "make_two_shot_workspace",
-    "two_shot_all_reduce_pair_ws",
     "two_shot_all_reduce_variadic_ws",
     "make_two_shot_variadic_workspace",
-    "make_two_shot_pair_workspace",
-    "two_shot_pair_layout",
 ]
 
 
@@ -450,7 +447,6 @@ def one_shot_all_reduce_ws(x: jax.Array,
 
 def make_workspace(x_shape, dtype, num_devices: int):
     """Zeroed ``(ws, step)`` for :func:`one_shot_all_reduce_ws`."""
-    import jax.numpy as jnp
     return (jnp.zeros((2, num_devices - 1, *x_shape),
                       dtype), jnp.zeros((1, ), jnp.int32))
 
@@ -809,7 +805,6 @@ def _two_shot_variadic_ws_kernel(a_ref, b_ref, rsa_in, rsb_in, aga_in, agb_in,
 def make_two_shot_variadic_workspace(numel_a: int, numel_b: int, dtype,
                                      num_devices: int):
     """Zeroed ``(rsa, rsb, aga, agb, step)`` for the variadic two-shot."""
-    import jax.numpy as jnp
     if numel_a % num_devices or numel_b % num_devices:
         raise ValueError(
             f"both element counts must divide num_devices ({num_devices}); "
@@ -939,7 +934,6 @@ def two_shot_all_reduce_variadic_ws(a: jax.Array,
 
 def make_two_shot_workspace(x_shape, dtype, num_devices: int):
     """Zeroed ``(rs, ag, step)`` for :func:`two_shot_all_reduce_ws`."""
-    import jax.numpy as jnp
     rows, cols = x_shape
     chunk = rows // num_devices
     return (jnp.zeros((2, num_devices - 1, chunk, cols),
@@ -951,308 +945,6 @@ def make_two_shot_workspace(x_shape, dtype, num_devices: int):
 # multiple of this is the case Mosaic lowers badly or refuses, so the pair
 # kernel below pads each operand's per-device slice up to it.
 _LANE = 128
-
-
-def _round_up(n: int, to: int) -> int:
-    return -(-n // to) * to
-
-
-def two_shot_pair_layout(numel_a: int, numel_b: int, num_devices: int):
-    """Per-device column layout for :func:`two_shot_all_reduce_pair_ws`.
-
-    Returns ``(ca, cb, pa, cols)``: the real column counts of each operand, the
-    lane-aligned offset operand *b* starts at, and the total per-device width.
-
-    The layout is the whole trick, so it is worth stating plainly. The obvious
-    way to reduce two tensors as one collective is to concatenate them
-    end-to-end, but two-shot scatters the *flattened* payload as one chunk per
-    device, and the join then lands wherever it lands: for K3's pair at a
-    two-token bucket that is element 448 of chunk 10, mid-chunk and mid-lane.
-    Only one device's chunk straddles the seam, and which one is
-    ``(my_id + i) % N`` -- dynamic -- so the unrolled send loop cannot be
-    specialised for it either.
-
-    Interleaving per device removes the seam instead of coping with it. Each
-    operand already divides across the mesh (the caller must ensure
-    ``numel % num_devices == 0`` for *each*, not merely for the sum), so device
-    d simply takes d's slice of a followed by d's slice of b. Every device's
-    chunk is then one whole row of an ``(N, cols)`` array, identically shaped on
-    every rank, and the reduce-scatter and all-gather are untouched -- an
-    all-reduce is elementwise, so it does not care what order the elements are
-    in, only that every rank agrees.
-
-    What is left is lane alignment: b's slice would start at column ``ca``, and
-    ``ca`` is 112 for K3 at a single-token bucket, which is not a multiple of
-    128. So a is given a lane-aligned span of its own and b starts at the next
-    lane boundary. The gap is padding that gets summed and then discarded.
-    It costs bytes -- K3's pair goes from 21 to 24 KiB, about 14% -- and that is
-    affordable precisely because this payload is synchronisation-bound: two-shot
-    runs 0.03 us/KiB in this range, so 3 KiB is ~0.1 us against the ~3.3 us per
-    layer of concatenation ops the kernel exists to remove.
-    """
-    if numel_a % num_devices or numel_b % num_devices:
-        raise ValueError(
-            f"each operand must divide across {num_devices} devices, got "
-            f"{numel_a} and {numel_b}")
-    ca = numel_a // num_devices
-    cb = numel_b // num_devices
-    pa = _round_up(ca, _LANE)
-    cols = pa + _round_up(cb, _LANE)
-    return ca, cb, pa, cols
-
-
-def _two_shot_pair_ws_kernel(a_ref, b_ref, rs_in_ref, ag_in_ref, step_in_ref,
-                             oa_ref, ob_ref, rs_ref, ag_ref, step_ref, x_vmem,
-                             recv_vmem, red_vmem, out_vmem, local_sem, s1_send,
-                             s1_recv, s2_send, s2_recv, *, num_devices: int,
-                             axis_name: str, barrier_first: bool, ca: int,
-                             cb: int, pa: int, cols: int):
-    """:func:`_two_shot_ws_kernel` with the two operands joined in VMEM.
-
-    Everything between the prologue and the epilogue is the same algorithm,
-    reading ``x_vmem`` where the single-operand kernel reads its input ref.
-    """
-    del rs_in_ref, ag_in_ref  # aliased onto the output views
-    my_id = lax.axis_index(axis_name)
-    step = step_in_ref[0]
-    slot = lax.rem(step, 2)
-
-    # Prologue -- the join. Two stores at lane-aligned starts, no HBM tensor
-    # anywhere: this is the whole point of the kernel. Writing the pad lanes
-    # rather than leaving scratch uninitialised is not required for correctness
-    # (they are summed and then dropped) but makes a rank's output a function of
-    # its inputs alone, which is worth the two stores when a collective
-    # misbehaves and the question is whether the inputs explain it.
-    x_vmem[:, :, 0:ca] = a_ref[...]
-    x_vmem[:, :, pa:pa + cb] = b_ref[...]
-    if pa != ca:
-        x_vmem[:, :, ca:pa] = jnp.zeros((num_devices, 1, pa - ca), a_ref.dtype)
-    if cols != pa + cb:
-        x_vmem[:, :, pa + cb:cols] = jnp.zeros(
-            (num_devices, 1, cols - pa - cb), a_ref.dtype)
-
-    if barrier_first:
-        _full_barrier(my_id, num_devices, double_barrier=True)
-    else:
-
-        @pl.when(step == 0)
-        def _():
-            _full_barrier(my_id, num_devices, double_barrier=True)
-
-    # Phase 1 -- reduce-scatter, unchanged but sourced from the joined buffer.
-    copies = []
-    for i in range(1, num_devices):
-        peer = lax.rem(my_id + i, num_devices)
-        copy = pltpu.make_async_remote_copy(
-            src_ref=x_vmem.at[peer],
-            dst_ref=rs_ref.at[slot, i - 1],
-            send_sem=s1_send.at[slot],
-            recv_sem=s1_recv.at[slot],
-            device_id=(peer, ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-
-    if not barrier_first:
-
-        @pl.when(step != 0)
-        def _():
-            _full_barrier(my_id, num_devices, double_barrier=True)
-
-    for copy in copies:
-        copy.wait()
-
-    local = pltpu.make_async_copy(src_ref=rs_ref.at[slot],
-                                  dst_ref=recv_vmem,
-                                  sem=local_sem)
-    local.start()
-    local.wait()
-
-    acc = x_vmem[my_id]
-    for i in range(num_devices - 1):
-        acc = acc + recv_vmem[i]
-    red_vmem[...] = acc
-
-    # Phase 2 -- all-gather, unchanged.
-    local_ag = pltpu.make_async_copy(src_ref=red_vmem,
-                                     dst_ref=ag_ref.at[slot, my_id],
-                                     sem=local_sem)
-    local_ag.start()
-    copies = []
-    for i in range(1, num_devices):
-        copy = pltpu.make_async_remote_copy(
-            src_ref=red_vmem,
-            dst_ref=ag_ref.at[slot, my_id],
-            send_sem=s2_send.at[slot],
-            recv_sem=s2_recv.at[slot],
-            device_id=(lax.rem(my_id + i, num_devices), ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-    local_ag.wait()
-    for copy in copies:
-        copy.wait()
-
-    # Epilogue -- the split, mirroring the prologue. The reduced pair is staged
-    # to VMEM so the two halves can be sliced out at the same aligned offsets
-    # they were written at, which is what lets the caller receive two tensors
-    # and never materialise a concatenation of its own.
-    out_copy = pltpu.make_async_copy(src_ref=ag_ref.at[slot],
-                                     dst_ref=out_vmem,
-                                     sem=local_sem)
-    out_copy.start()
-    out_copy.wait()
-    oa_ref[...] = out_vmem[:, :, 0:ca]
-    ob_ref[...] = out_vmem[:, :, pa:pa + cb]
-    step_ref[0] = step + 1
-
-
-def two_shot_all_reduce_pair_ws(a: jax.Array,
-                                b: jax.Array,
-                                rs: jax.Array,
-                                ag: jax.Array,
-                                step: jax.Array,
-                                *,
-                                axis_name: str,
-                                num_devices: int,
-                                collective_id: int = 0,
-                                barrier_first: bool = False,
-                                disable_semaphore_checks: bool = True,
-                                has_side_effects: bool = True):
-    """One two-shot all-reduce over two operands, joined inside the kernel.
-
-    **Measured, and it loses. Not wired into production; kept for the probe arm
-    that measured it.** The kernel is fine -- what defeats it is the reshape at
-    its boundary. See the note below before reaching for this again.
-
-    Reduces ``a`` and ``b`` as a single collective and returns them separately,
-    without either the caller or XLA ever building a concatenation. That is the
-    difference from doing it with ``torch.cat`` or ``jnp.concatenate``: both of
-    those materialise a joined tensor in HBM, which measured the same either way
-    (job 142) because relocating a concatenate does not remove it. Here the join
-    is a VMEM store inside the kernel and the tensor never exists.
-
-    It still loses, by 10.3 us/layer. Job 151, 32 devices, K3's pair at a
-    single-token bucket:
-
-        arm            us/layer   vs xla   pair kernel   data formatting
-        concat           100.64    -4.84     12.98 us          0.11 ms
-        concat_pair      110.98    +5.50     13.53 us          0.62 ms
-
-    The collective is healthy -- Mosaic accepts the aligned stores and the
-    +0.55 us is just the padding -- but ``data formatting`` went *up* 5.6x,
-    which is the cost this was built to remove.
-
-    The reason is that the ~1.1 us per formatting op is **relayout**, not
-    dispatch overhead. This kernel wants ``(N, 1, numel/N)``, and reshaping
-    ``(1, 3584) -> (32, 1, 112)`` is a physical retiling rather than a view:
-    112 lanes against a 128-lane register, 224 against two. ``concat`` pays that
-    once on one joined tensor; this pays it four times, two operands in and two
-    out, at the worst widths. The clue was already in the earlier data --
-    formatting is 0.15 ms at a two-token bucket and 0.11 at one, and pure
-    per-op overhead would not move when the payload halves.
-
-    So the 301 us/step is not the concatenation at all, and no amount of not
-    concatenating will reach it. It is the cost of getting into the flat view
-    two-shot scatters over. Removing it means teaching two-shot to scatter along
-    a lane-aligned column split of the *natural* ``(rows, cols)`` shape, which
-    for ``(1, 7168)`` over 32 devices is 224 columns per device and therefore
-    unaligned by construction -- a redesign of the collective, not a wrapper
-    change, and worth a feasibility sweep before any of it is written.
-
-    See :func:`two_shot_pair_layout` for why the operands are interleaved per
-    device rather than concatenated end-to-end, and what the padding is for.
-
-    Both operands must be reshapeable to ``(num_devices, 1, numel/num_devices)``
-    -- i.e. ``numel % num_devices == 0`` for *each* operand independently.
-
-    Returns:
-      ``(out_a, out_b, rs, ag, step)`` -- thread the last three into the next
-      call, as with :func:`two_shot_all_reduce_ws`.
-    """
-    if num_devices < 2:
-        return a, b, rs, ag, step
-
-    shape_a, shape_b = a.shape, b.shape
-    numel_a = math.prod(shape_a)
-    numel_b = math.prod(shape_b)
-    ca, cb, pa, cols = two_shot_pair_layout(numel_a, numel_b, num_devices)
-
-    kernel = functools.partial(_two_shot_pair_ws_kernel,
-                               num_devices=num_devices,
-                               axis_name=axis_name,
-                               barrier_first=barrier_first,
-                               ca=ca,
-                               cb=cb,
-                               pa=pa,
-                               cols=cols)
-    out_a, out_b, rs, ag, step = pl.pallas_call(
-        kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((num_devices, 1, ca), a.dtype),
-            jax.ShapeDtypeStruct((num_devices, 1, cb), b.dtype),
-            jax.ShapeDtypeStruct(rs.shape, rs.dtype),
-            jax.ShapeDtypeStruct(ag.shape, ag.dtype),
-            jax.ShapeDtypeStruct(step.shape, step.dtype),
-        ),
-        in_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pltpu.SMEM),
-        ],
-        out_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pltpu.SMEM),
-        ],
-        input_output_aliases={
-            2: 2,
-            3: 3,
-            4: 4
-        },
-        scratch_shapes=[
-            pltpu.VMEM((num_devices, 1, cols), a.dtype),
-            pltpu.VMEM((num_devices - 1, 1, cols), a.dtype),
-            pltpu.VMEM((1, cols), a.dtype),
-            pltpu.VMEM((num_devices, 1, cols), a.dtype),
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
-        ],
-        compiler_params=pltpu.CompilerParams(
-            collective_id=collective_id,
-            has_side_effects=has_side_effects,
-            disable_semaphore_checks=disable_semaphore_checks),
-    )(a.reshape(num_devices, 1, ca), b.reshape(num_devices, 1, cb), rs, ag,
-      step)
-    return (out_a.reshape(shape_a), out_b.reshape(shape_b), rs, ag, step)
-
-
-def make_two_shot_pair_workspace(numel_a: int, numel_b: int, dtype,
-                                 num_devices: int):
-    """Zeroed ``(rs, ag, step)`` for :func:`two_shot_all_reduce_pair_ws`.
-
-    Sized on the *padded* per-device width, not the sum of the operands: the
-    workspaces carry what the kernel actually exchanges.
-    """
-    import jax.numpy as jnp
-    _, _, _, cols = two_shot_pair_layout(numel_a, numel_b, num_devices)
-    return (jnp.zeros((2, num_devices - 1, 1, cols),
-                      dtype), jnp.zeros((2, num_devices, 1, cols),
-                                        dtype), jnp.zeros((1, ), jnp.int32))
-
-
-# -----------------------------------------------------------------------------
-# Two-shot: 2 hops, 2 * M * (N-1) / N bytes out per device.
-# -----------------------------------------------------------------------------
 
 
 def _two_shot_kernel(x_ref, o_ref, rs_ref, red_ref, local_sem, send_sem,
