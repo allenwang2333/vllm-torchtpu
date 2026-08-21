@@ -176,6 +176,11 @@ is real work, not a flag flip.
 
 ### Barrier #1 removed: `one_shot_all_reduce_ws` (~2.2x over XLA)
 
+> `one_shot_all_reduce_ws` no longer exists; see Recommendation #2. This section
+> is kept because it is where the persistent-workspace idea was established and
+> measured, and `two_shot_all_reduce_ws` -- the kernel that shipped -- inherits
+> it wholesale. The numbers below are one-shot's.
+
 Measured on 8 devices, bfloat16, one shape per process:
 
 | payload | XLA | `one_shot` | `one_shot_ws` | speedup |
@@ -629,48 +634,94 @@ gate entry.
 
 ## Recommendation
 
-1. **Confirm §4 first.** If torchtpu really adds ~130 µs per collective in
-   production graphs, that dwarfs everything else here — a 2x kernel win on a
-   9 µs op is irrelevant next to a 139 µs dispatch. If it is a microbenchmark
-   artifact, discard it and go to #2.
-2. **Ship the `_ws` kernels with a size/device dispatch gate.** Measured best
-   choice, bfloat16, `cols=1024`:
+Everything above is the record of how the numbers were arrived at, including the
+paths that lost. This section is what the code actually does now.
+
+1. **Ship `two_shot_all_reduce_ws` behind the dispatch gate, barrier-free.**
+   That is the whole shipping surface. At K3/TP=32 it is 187 calls per decode
+   step -- 95 post-attention `(1,7168)` and 92 concatenated latent-MoE
+   `(1,10752)` -- at 16.90 µs each, and the barrier-free steady state (§5) is
+   worth 15.22 -> 14.88 ms end to end, -2.2% (§5a).
+
+   Current gate, `(two_shot_min, two_shot_max)` by device count:
 
    | devices | payload | use | vs XLA |
    |--------:|--------:|-----|-------:|
-   | 8  | ≤ 32 KiB | `one_shot_all_reduce_ws` | 1.8-2.5x |
-   | 8  | 64 KiB - 512 KiB | `two_shot_all_reduce_ws` | 1.2-1.7x |
-   | 8  | > 512 KiB | XLA | — |
-   | 32 | ≤ 16 KiB | `one_shot_all_reduce_ws` | 1.1-2.0x |
-   | 32 | 64 - 256 KiB | `two_shot_all_reduce_ws` | 1.3-1.6x |
-   | 32 | 32 KiB, > 256 KiB | XLA | — |
+   | 8 | ≤ 64 KiB | `two_shot_all_reduce_ws` | 1.3x at 14-42 KiB |
+   | 16, 32 | ≤ 128 KiB | `two_shot_all_reduce_ws` | 1.3-1.4x |
+   | any | above those | XLA | — |
+   | 2, 4 | any | XLA | — |
 
-   The gate is mandatory, not an optimization: off-crossover the one-shot family
-   is catastrophically worse (857 µs at 1 MiB / 32 devices).
-3. **Cost of adoption.** Each call site needs a workspace and round counter
-   threaded through it (`make_workspace` / `make_two_shot_workspace`). On an
-   8-device TP decode with ~60 all-reduces/step, `one_shot_ws` saves ~5 µs each,
-   ≈ **300 µs/step**.
-4. **Cheap follow-up: drop the `rows % N == 0` constraint** by scattering the
-   flattened array. At 32 devices it is the only reason nothing beats XLA at
-   32 KiB, and it is much less work than another kernel.
-5. **Keep the `env_override.py` SparseCore threshold.** Worth 3.5x at ≥64 KiB,
-   and the `tpu7x` prefix match is what makes it fire.
+   The gate is mandatory, not an optimization: past the crossover the kernel is
+   0.61x XLA at 448 KiB, and the one-shot arm this table used to carry read
+   857 µs at 1 MiB / 32 devices.
+
+2. **The one-shot, pair and stateless kernels were removed, not deprecated.**
+   None were on K3's serving path. one_shot was *built* by the warmup for the
+   7 KiB `(1,3584)` latent and then never invoked, because `MOE_CONCAT` folds
+   that shape into the `(1,10752)` pair. The pair kernel lost to the concat path
+   at 101.53 µs/layer and never gained a `steady_barrier` parameter. The
+   stateless pair were benchmark scaffolding. All of it is recoverable from the
+   `llar-all-variants` tag, and the measurements that ranked them are in the
+   sections above.
+
+   The one cell this gives up is 8 devices at 14 KiB, where one_shot read
+   4.84 µs against two_shot's 7.76 -- a real 1.6x, in the pruned proxy rather
+   than a serving configuration. two_shot still beats XLA's 10.12 there, so
+   there is no hole.
+
+3. **§4's ~130 µs per-collective torchtpu dispatch cost did not survive
+   production.** It was recommendation #1 in an earlier revision of this
+   section, on the grounds that it would dwarf any kernel win. The K3 profile
+   bills the whole collective at 16.90 µs including its wait, so the figure was
+   a microbenchmark artifact. Discarded.
+
+4. **The `rows % N == 0` constraint is gone.** `_build_two_shot` reshapes the
+   flattened payload to `(num_devices, numel/N)`, so the real constraint is
+   `numel % N == 0`, which every decode shape satisfies. This was a "cheap
+   follow-up" in the earlier revision; it is done, and it is what let the gate
+   floor drop below one_shot's old boundary at all.
+
+5. **Keep the `env_override.py` SparseCore threshold.** Worth 3.5x at ≥64 KiB
+   (§1), and the `tpu7x` prefix match is what makes it fire. Unrelated to the
+   kernels and still live.
+
+6. **Still open.** `two_shot_all_reduce_variadic_ws` is wired but off by
+   default: it works, and it corrupts deterministically at equal per-device
+   chunk widths at 32 devices (guarded by a `ValueError`, cause unexplained).
+   The barrier-free steady state has never been tested under injected rank skew,
+   which is the one thing the lockstep stress test cannot see (§5). And the
+   8-device ceiling of 64 KiB is one step past the last measured point (42 KiB)
+   rather than a measurement.
 
 ## Files
 
-* `src/vllm_torchtpu/kernels/collectives/low_latency_all_reduce.py` — the kernels.
-* `scripts/allreduce_latency_bench.py` — JAX benchmark (XLA vs one-shot vs `_ws` vs two-shot).
+* `src/vllm_torchtpu/kernels/collectives/low_latency_all_reduce.py` — the
+  kernel. `two_shot_all_reduce_ws` plus the variadic variant and
+  `_full_barrier`; 620 lines after the narrowing.
+* `src/vllm_torchtpu/distributed/low_latency_all_reduce.py` — the dispatcher:
+  the `_GATE` table, per-shape plan building, the entry op, and the
+  `TPU_LOW_LATENCY_ALLREDUCE_*` switches.
+* `scripts/allreduce_latency_bench.py` — JAX benchmark (XLA vs `twoshot_ws` vs
+  `twoshot_ws_nb`).
 * `scripts/allreduce_ws_stress.py` — correctness stress for the workspace
-  kernels (`--kernel oneshot|twoshot`), float32 oracle. Run this to a clean exit
-  before trusting any `_ws` change; it caught every bug in both.
+  kernel, float32 oracle. Run this to a clean exit before trusting any change
+  to the kernel; it caught every bug in it.
 * `scripts/allreduce_breakdown.py` — latency attribution (launch / barrier / DMA).
 * `scripts/debug/probe_pairwise_latency.py` — pairwise ICI latency matrix
   (`idle` / `fanout` / `allpairs` / `matrix`). Run `--sweep-n` first on any new
   slice shape: the fixed cost of one blocked dispatch is ~1 ms, so a short chain
   measures noise, and the harness will happily report a figure below the launch
   floor if you let it.
-* `scripts/debug/slurm_stress_barrier_free_32.sbatch` — the 2x2 correctness
-  matrix (one-shot/two-shot x barriered/barrier-free) at 32 devices.
+* `scripts/debug/fusion_probe.py` — reproduces K3's collective *topology* rather
+  than one call, which is what made the earlier single-collective benchmarks
+  mispredict production. Read its docstring before writing another probe.
+* `scripts/debug/slurm_stress_barrier_free_32.sbatch` — barriered vs
+  barrier-free correctness at 32 devices.
+* `scripts/k3/slurm_launch_k3_tp32_tp.sbatch` — the end-to-end harness. Every
+  flag that changes decode speed is pinned here on purpose, and every one that
+  changes the emitted graph gets its own XLA cache tag; `POST_READY_CMD` runs
+  the measurement so two arms cannot drift in what they ran.
 * `scripts/slurm_allreduce_32.sbatch` — 32-device (16-chip) multi-host run.
-* `scripts/torchtpu_allreduce_bench.py` — torchrun benchmark of torchtpu's own all-reduce.
+* `scripts/torchtpu_allreduce_bench.py` — torchrun benchmark of torchtpu's own
+  all-reduce.
