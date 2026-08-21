@@ -68,6 +68,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.launch_rendezvous import lockstep_launches
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
@@ -4820,10 +4821,16 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_gather_logprobs()
 
     def capture_model(self) -> None:
-        """Precompile every torch.compile subgraph across all input buckets."""
+        """Precompile every torch.compile subgraph across all input buckets.
+
+        Compiled graphs are launched in lockstep across ranks here: each
+        launch waits until every rank has finished compiling, so a program
+        never sits pending on one device while a peer is still compiling.
+        """
         if self.enforce_eager:
             return
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with self.maybe_setup_dummy_loras(
+                self.lora_config), lockstep_launches():
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 
@@ -5385,7 +5392,7 @@ class TPUModelRunner(GPUModelRunner):
             # program-region reservation, and the kv=0-specialized graphs are
             # dead after the dynamo reset below — one throwaway program keeps
             # the region within budget for capture_model's full bucket ladder.
-            with self._profile_isolated_cache():
+            with self._profile_isolated_cache(), lockstep_launches():
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(num_tokens, self.num_reqs_max_model_len,
                                 self.max_num_blocks_per_req)

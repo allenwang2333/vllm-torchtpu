@@ -1101,9 +1101,15 @@ def _patch_vllm_piecewise_backend() -> None:
     which one a call needs by reading an argument that is a `SymInt`. A layer
     whose arguments are all tensors has no such argument, so vLLM assumes only
     one bucket was compiled and asserts when several were.
+
+    The dispatch is also where a compiled graph is launched, so while
+    `launch_rendezvous.lockstep_launches` is active it first meets the other
+    ranks of the model's world.
     """
     import torch
     from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    from vllm_torchtpu.compilation import launch_rendezvous
 
     original_call = PiecewiseBackend.__call__
     if getattr(original_call, "_tpu_piecewise_backend_patch", False):
@@ -1148,6 +1154,7 @@ def _patch_vllm_piecewise_backend() -> None:
             "All ranges should be compiled or loaded up front in "
             "PiecewiseBackend.__init__. "
             f"range_entry={range_entry.compile_range}")
+        launch_rendezvous.rendezvous_before_launch()
         return range_entry.runnable(*args, **kwargs)
 
     patched_call._tpu_piecewise_backend_patch = True

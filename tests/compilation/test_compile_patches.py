@@ -24,6 +24,7 @@ from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm_torchtpu import (_patch_vllm_compile_prefix_isolation,
                            _patch_vllm_piecewise_backend,
                            _patch_vllm_reset_compile_wrapper)
+from vllm_torchtpu.compilation import launch_rendezvous
 
 
 class _Wrapped(torch.nn.Module, TorchCompileWithNoGuardsWrapper):
@@ -135,6 +136,25 @@ class TestPiecewiseBackendDispatch:
         backend = self._backend(sym_shape_indices=[])
         with pytest.raises(AssertionError):
             PiecewiseBackend.__call__(backend, torch.zeros(999, 4))
+
+    def test_lockstep_launch_meets_peers_before_running(self, monkeypatch):
+        events = []
+        entries = {
+            16:
+            SimpleNamespace(compiled=True,
+                            compile_range=(16, 16),
+                            runnable=lambda *a, **k: events.append("run"))
+        }
+        backend = SimpleNamespace(sym_shape_indices=[],
+                                  range_entries=entries,
+                                  compile_sizes=[16],
+                                  compile_ranges=[(16, 16)],
+                                  _find_range_for_shape=entries.get)
+        monkeypatch.setattr(launch_rendezvous, "rendezvous_before_launch",
+                            lambda: events.append("rendezvous"))
+
+        PiecewiseBackend.__call__(backend, torch.zeros(16, 4))
+        assert events == ["rendezvous", "run"]
 
 
 class TestCompilePrefixIsolation:
