@@ -594,13 +594,38 @@ def shape_guard_enabled() -> bool:
     with this kernel off, so the mechanism works; this is about making our own
     branch legible to it.
 
-    ``get_entry_op`` records that reading a dim in traced python used to fail
-    outright with "Constraints violated (L['input_ids'].size()[0])". That was
-    measured before #474 and before vLLM traced this model under
+    MEASURED, AND IT DOES NOT WORK. Do not reach for this a third time.
+
+    ``get_entry_op`` records that reading a dim in traced python fails outright
+    with "Constraints violated (L['input_ids'].size()[0])". I assumed that was
+    stale -- recorded before #474 and before this model was traced under
     ``TorchCompileWithNoGuardsWrapper``, which drops guards rather than
-    rejecting them -- and the fold now leaves precisely such a guard and
-    compiles. Hence the flag: the old failure is expected to be stale, and this
-    is how to find out without giving up the path that is known to work.
+    rejecting them, while the fold leaves just such a guard and compiles. Job
+    332 (32 devices, buckets [2,16,512], this flag on) says otherwise:
+
+        ConstraintViolationError: Constraints violated
+          - You marked L['input_ids'].size()[0] as dynamic but your code
+            specialized it
+        User stack: ... tensor_model_parallel_all_reduce(output_parallel)
+
+    It does clear the original error -- zero ShapeSpecializationError against 6
+    in each of 305/307/308/309 -- so the guard is seen and #474 does partition
+    on it. The compile just dies earlier, at the constraint.
+
+    Why the fold gets away with it and this does not: the fold branches on
+    ``topk_weights.shape[0]``, a symbol derived inside the graph, whereas the
+    tensor here has a dim0 that *is* vLLM's marked-dynamic ``input_ids`` dim,
+    and that symbol carries a constraint forbidding specialization.
+
+    There is a deeper reason this direction cannot work, independent of the
+    constraint. #474 compiles one graph per bucket *from one trace*, feeding it
+    concrete sizes, so every bucket in a trace group shares one fx graph and
+    therefore one structure. A kernel wired to a single bucket needs the op
+    present for that bucket and absent for its neighbours in the same group,
+    which no single graph can express. Per-bucket kernel selection is only
+    possible *across* trace groups, never within one -- so the choice is to make
+    the op uniform (always emitted, shape checked inside, which ``_impl``
+    already does) or to keep this kernel to single-bucket configurations.
     """
     import os
 
