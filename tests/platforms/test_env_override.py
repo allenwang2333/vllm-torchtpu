@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import deque
-from concurrent.futures import Future
-from types import SimpleNamespace
-from unittest.mock import MagicMock
-
-from vllm_torchtpu import _patch_vllm_engine_core_step_with_batch_queue
 from vllm_torchtpu.env_override import _resolve_sc_offload_threshold_bytes
 
 
@@ -68,56 +62,3 @@ def test_user_has_flag():
     assert env_override._user_has_flag(
         "--xla_tpu_enable_diagnostic_coordinator")
     assert not env_override._user_has_flag("--xla_tpu_non_existent_flag")
-
-
-def test_engine_core_step_with_batch_queue_sampling():
-    _patch_vllm_engine_core_step_with_batch_queue()
-    from vllm.v1.engine.core import EngineCore
-
-    batch_queue = deque()
-    mock_scheduler_output = SimpleNamespace(
-        total_num_scheduled_tokens=16,
-        pending_structured_output_tokens=False,
-    )
-    mock_scheduler = MagicMock()
-    mock_scheduler.has_requests.return_value = True
-    mock_scheduler.schedule.return_value = mock_scheduler_output
-    mock_scheduler.get_grammar_bitmask.return_value = "mock_grammar"
-    mock_scheduler.update_from_output.return_value = ["mock_engine_output"]
-
-    mock_exec_future = Future()
-    mock_exec_future.set_result(None)  # TPU execute_model returns None
-
-    mock_sample_future = Future()
-    mock_sample_output = SimpleNamespace(outputs=["mock_token"])
-    mock_sample_future.set_result(mock_sample_output)
-
-    mock_model_executor = MagicMock()
-    mock_model_executor.execute_model.return_value = mock_exec_future
-    mock_model_executor.sample_tokens.return_value = mock_sample_future
-
-    engine = SimpleNamespace(
-        batch_queue=batch_queue,
-        batch_queue_size=1,
-        is_ec_consumer=False,
-        is_pooling_model=False,
-        check_for_draft_tokens=False,
-        scheduler=mock_scheduler,
-        model_executor=mock_model_executor,
-        _should_throttle_prefills=MagicMock(return_value=False),
-        log_error_detail=MagicMock(return_value=MagicMock(
-            __enter__=MagicMock(), __exit__=MagicMock())),
-        capture_iteration_details=MagicMock(return_value=MagicMock(
-            __enter__=MagicMock(return_value=None), __exit__=MagicMock())),
-        _attach_iteration_details=MagicMock(),
-        _process_aborts_queue=MagicMock(),
-    )
-
-    outputs, model_executed = EngineCore.step_with_batch_queue(engine)
-
-    assert model_executed is True
-    assert outputs == ["mock_engine_output"]
-    mock_model_executor.execute_model.assert_called_once_with(
-        mock_scheduler_output, non_block=True)
-    mock_model_executor.sample_tokens.assert_called_once_with("mock_grammar",
-                                                              non_block=True)

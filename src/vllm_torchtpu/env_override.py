@@ -157,12 +157,24 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
+        import sys
+        print(
+            "vllm_torchtpu.env_override: WARNING - TPU accelerator type not found in env or metadata. "
+            "Falling back to safe 64 MiB SparseCore offload threshold.",
+            file=sys.stderr,
+        )
         # Default to 64 MiB (safe for v7x/v5p) if GCE metadata is unavailable
         return 67108864
     tpu_type = tpu_type.strip().lower()
     for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
         if tpu_type.startswith(prefix):
             return size
+    import sys
+    print(
+        f"vllm_torchtpu.env_override: WARNING - Unrecognized TPU accelerator type {tpu_type!r}. "
+        "Falling back to safe 64 MiB SparseCore offload threshold.",
+        file=sys.stderr,
+    )
     return 67108864
 
 
