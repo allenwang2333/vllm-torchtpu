@@ -215,6 +215,26 @@ def _apply_scoring_fn(scoring_fn: str,
 #     chain     2162.4    +6.85     left-to-right accumulate
 #     late      1514.2    -0.20     divide after the expert combine
 #
+# End-to-end on 32 devices (Kimi-K3, TP=32, batch 1, three reps per arm), which
+# is the number to trust -- the isolated probe above under-predicts by a third:
+#
+#     arm        TPOT ms (3 reps)              mean       delta
+#     sum      14.8754 14.8707 14.8782       14.8748       --
+#     fold     14.6475 14.6387 14.6466       14.6443     -0.2305 ms  (-1.55%)
+#
+# = 2.505 us/layer over 92 layers, against 1.89 predicted in isolation and 2.771
+# attributed in-situ from a profile. The distributions do not overlap (max fold
+# < min sum) and a fourth run reproduced 14.6425. The lesson worth keeping is
+# that the isolated probe was the least accurate of the three estimates: a
+# kernel measured without its real downstream consumer under-measures the stall
+# it causes, so prefer profile attribution when the two disagree.
+#
+# Correctness: gsm8k 5-shot, limit 100, at the serving config
+# (compile_sizes [2,16,512], so buckets 2 and 16 take the fold and 512 takes the
+# plain sum -- both sides of the token gate in one run) scores exact_match 1.0
+# strict and 1.0 flexible, stderr 0, matching the pre-change reference in
+# results/k3-concat{2,3}/gsm8k-100 exactly.
+#
 # Two negative results worth keeping. `chain` (left-to-right accumulate) is far
 # *worse* than the reduce it replaces, so the win is not "avoid the reduce HLO"
 # -- dependency depth matters, and only the log2-depth fold pays off. And `late`
