@@ -3,12 +3,14 @@
 from dataclasses import dataclass
 
 # Architectures whose recurrent layers read and write their state through the
-# attention-shaped pool. These build on QwenGatedDeltaNetAttention, which the
-# TPU backend replaces with VllmGatedDeltaNetAttention; that subclass is what
-# accepts a single pooled buffer instead of a separate conv/ssm pair. Other
-# hybrid architectures unpack two state tensors unconditionally, so they stay
-# on the per-layer KV caches until they grow a pooled path. Extend this set in
-# the same change that adds one.
+# attention-shaped pool. The Qwen3 families build on QwenGatedDeltaNetAttention,
+# which the TPU backend replaces with VllmGatedDeltaNetAttention; that subclass
+# accepts a single pooled buffer instead of a separate conv/ssm pair.
+# KimiLinearForCausalLM runs its KDA layers through the gather/scatter pooled
+# op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3 kernel)
+# instead. Other hybrid architectures unpack two state tensors unconditionally,
+# so they stay on the per-layer KV caches until they grow a pooled path.
+# Extend this set in the same change that adds one.
 POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3NextForCausalLM",
     "Qwen3_5ForConditionalGeneration",
