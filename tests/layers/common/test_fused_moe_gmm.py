@@ -650,9 +650,10 @@ def test_prepare_routed_metadata_skip_padded_tokens():
     assert int(np.asarray(group_sizes).sum()) == num_tokens // 2 * topk
 
 
-# Below the block, exactly one, and both sides of padding; no sentinel here, so
-# the totals pin the padding accounting too.
-@pytest.mark.parametrize("num_rows", [1, 51, 511, 512, 513, 800, 1024, 1025])
+# Each block the divisor can pick (512; 256 at 1280; 128 at 640), both sides of
+# padding, and below it; no sentinel here, so the totals pin the padding too.
+@pytest.mark.parametrize("num_rows",
+                         [1, 51, 511, 512, 513, 640, 800, 1024, 1025, 1280])
 def test_counting_sort_positions_matches_stable_argsort(num_rows):
     num_buckets = 9
     keys = np.random.default_rng(num_rows).integers(0,

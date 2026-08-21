@@ -189,6 +189,12 @@ def _counting_sort_positions(sort_keys: jax.Array,
     Keys must be in ``[0, num_buckets)`` or the result is not a permutation."""
     m = sort_keys.shape[0]
     block = min(_COUNTING_SORT_BLOCK, m)
+    # Prefer a block that divides m -- padding is pure overhead. Powers of two
+    # only: the largest divisor (480 at m=41280) costs more than it saves.
+    for size in (512, 256, 128):
+        if size <= block and m % size == 0:
+            block = size
+            break
     pad = -m % block
     if pad:
         # Pad rows sort after every real one; only that bucket's total is off.
@@ -208,7 +214,9 @@ def _counting_sort_positions(sort_keys: jax.Array,
                       preferred_element_type=jnp.float32)
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
     if pad:
-        counts = counts.at[-1].add(-pad)
+        # Constant subtract: counts.at[-1].add(-pad) breaks the reduce fusion.
+        counts = counts - jnp.where(
+            jnp.arange(num_buckets) == num_buckets - 1, float(pad), 0.0)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
