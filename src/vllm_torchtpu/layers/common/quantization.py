@@ -85,6 +85,36 @@ def quantize_kv(
     return key, value
 
 
+def quantize_kv_fp4_per_tensor(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dynamic per-token FP4 quantization for key and value tensors.
+
+    Returns:
+        k_packed: uint8 tensor with shape [..., head_dim // 2]
+        v_packed: uint8 tensor with shape [..., head_dim // 2]
+        k_scale: scale_dtype tensor with shape [..., 1]
+        v_scale: scale_dtype tensor with shape [..., 1]
+    """
+    head_dim = key.shape[-1]
+
+    # Quantize K and V to FP4 index values (0-15) with dynamic per-token scale
+    k_indices, k_scale = quantize_tensor_to_fp4(key, axis=-1, block_size=head_dim)
+    v_indices, v_scale = quantize_tensor_to_fp4(value, axis=-1, block_size=head_dim)
+
+    # Bit-pack FP4 indices 2-per-byte into uint8 (halving head dimension)
+    k_packed = pack_fp4_indices(k_indices)
+    v_packed = pack_fp4_indices(v_indices)
+
+    # Cast scale factors to target scale_dtype (e.g. torch.bfloat16)
+    k_scale = k_scale.to(scale_dtype)
+    v_scale = v_scale.to(scale_dtype)
+
+    return k_packed, v_packed, k_scale, v_scale
+
+
 def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     """Convert e8m0 (8-bit exponent only) to float32.
 

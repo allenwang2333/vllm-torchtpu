@@ -222,6 +222,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
+    # Specifies the scale factor data type for per-token KV cache quantization.
+    # Supported options: "bfloat16" (or "bf16"), "float32" (or "fp32").
+    # Defaults to "bfloat16".
+    "TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE":
+    env_with_choices("TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE",
+                     "bfloat16",
+                     ["bfloat16", "bf16", "float32", "fp32"],
+                     case_sensitive=False),
+
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors

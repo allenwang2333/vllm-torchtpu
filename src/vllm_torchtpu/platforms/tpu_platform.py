@@ -943,7 +943,7 @@ class TpuPlatform(Platform):
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,
                                     _model_config: ModelConfig) -> bool:
-        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
+        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}
         return kv_cache_dtype in supported
 
     @classmethod

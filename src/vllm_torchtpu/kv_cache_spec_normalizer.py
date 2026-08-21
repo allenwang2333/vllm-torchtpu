@@ -5,7 +5,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
 from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+                                                 PallasMLAttentionBackend,
+                                                 _resolve_kv_cache_dtype)
 
 
 def normalize_kv_cache_specs_for_tpu(
@@ -50,9 +51,11 @@ def _normalize_one_spec(
         )
     padded_page_size = spec.page_size_padded or 0
     page_size = max(page_size, spec.real_page_size_bytes, padded_page_size)
-    if spec.page_size_padded == page_size and spec.dtype == kv_cache_dtype:
+    target_dtype = (_resolve_kv_cache_dtype(kv_cache_dtype)
+                    if isinstance(kv_cache_dtype, str) else kv_cache_dtype)
+    if spec.page_size_padded == page_size and spec.dtype == target_dtype:
         return spec
-    return replace(spec, dtype=kv_cache_dtype, page_size_padded=page_size)
+    return replace(spec, dtype=target_dtype, page_size_padded=page_size)
 
 
 def _has_hybrid_attention_and_mamba(

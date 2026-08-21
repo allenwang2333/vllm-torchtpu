@@ -45,73 +45,144 @@ def prepare_inputs(
     v: jax.Array,
     q_dtype: jnp.dtype,
     kv_dtype: jnp.dtype,
+    k_scale: jax.Array | None = None,
+    v_scale: jax.Array | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+    page_size: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
 
-    total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
-    _, actual_num_kv_heads, _ = k.shape
-    num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+  total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
+  _, actual_num_kv_heads, actual_kv_head_dim = k.shape
+  num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    q_packing = utils.get_dtype_packing(q_dtype)
-    kv_packing = utils.get_dtype_packing(kv_dtype)
+  q_packing = utils.get_dtype_packing(q_dtype)
+  kv_packing = utils.get_dtype_packing(kv_dtype)
 
-    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head,
-                                                     q_packing)
+  aligned_num_q_heads_per_kv_head = utils.align_to(
+      num_q_heads_per_kv_head, q_packing
+  )
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  num_sublanes = pltpu.get_tpu_info().num_sublanes
+  aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
+
+  # Compute aligned kv head dimension, accounting for per-token scale if
+  # present.
+  if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    if k_scale is not None and v_scale is not None:
+      scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+      kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+      num_scale_channels = max(1, scale_bits // kv_bits)
+      aligned_kv_head_dim = utils.align_to(
+          actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
+      )
+    else:
+      aligned_kv_head_dim = utils.align_to(
+          actual_kv_head_dim, num_sublanes * kv_packing
+      )
+  else:
+    aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
+
+  # queries: (T, H, D) -> (T, H_kv, G, D)
+  o_hbm_alias_q_hbm = (
+      jnp.pad(
+          q.reshape(
+              total_q_tokens,
+              actual_num_kv_heads,
+              num_q_heads_per_kv_head,
+              actual_q_head_dim,
+          ),
+          (
+              (0, 0),
+              (0, 0),
+              (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+              (0, aligned_q_head_dim - actual_q_head_dim),
+          ),
+          constant_values=0,
+      )
+      .reshape(
+          total_q_tokens,
+          actual_num_kv_heads,
+          aligned_num_q_heads_per_kv_head // q_packing,
+          q_packing,
+          aligned_q_head_dim,
+      )
+      .swapaxes(0, 1)
+  )
+
+  # Pad keys and values head_dim
+  actual_num_kv_heads_x2 = actual_num_kv_heads * 2
+  num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2, kv_packing)
+
+  if k_scale is not None and v_scale is not None:
+    k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
+    v_scale = v_scale.reshape(total_q_tokens, actual_num_kv_heads)
+
+    scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+    kv_bits = jax.dtypes.itemsize_bits(k.dtype)
+    num_scale_channels = max(1, scale_bits // kv_bits)
+
+    # Bitcast the scale factors to the kv dtype and reshape scale factors to
+    # (T, H_kv, num_scale_channels).
+    k_scale_split = jax.lax.bitcast_convert_type(
+        k_scale, k.dtype
+    ).reshape(total_q_tokens, actual_num_kv_heads, num_scale_channels)
+    v_scale_split = jax.lax.bitcast_convert_type(
+        v_scale, v.dtype
+    ).reshape(total_q_tokens, actual_num_kv_heads, num_scale_channels)
+
+    # k/v have shape (T, H_kv, D) -> (T, H_kv, D + num_scale_channels)
+    k = jnp.concatenate([k, k_scale_split], axis=-1)
+    v = jnp.concatenate([v, v_scale_split], axis=-1)
+
+    actual_kv_head_dim += num_scale_channels
+
+  if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
     num_lanes = pltpu.get_tpu_info().num_lanes
-    aligned_head_dim = utils.align_to(actual_head_dim, num_lanes)
-
-    # queries: (T, H, D) -> (T, H_kv, G, D)
-    o_hbm_alias_q_hbm = (jnp.pad(
-        q.reshape(
-            total_q_tokens,
-            actual_num_kv_heads,
-            num_q_heads_per_kv_head,
-            actual_head_dim,
-        ),
-        (
-            (0, 0),
-            (0, 0),
-            (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-            (0, aligned_head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
-        total_q_tokens,
-        actual_num_kv_heads,
-        aligned_num_q_heads_per_kv_head // q_packing,
-        q_packing,
-        aligned_head_dim,
-    ).swapaxes(0, 1))
-
-    # Pad keys and values head_dim
-    actual_num_kv_heads_x2 = actual_num_kv_heads * 2
-    num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2,
-                                             kv_packing)
-    assert num_kv_heads_x2_aligned % 2 == 0, (
-        f"kv_packing={kv_packing} produces an odd aligned head count "
-        f"{num_kv_heads_x2_aligned}")
+    align_tokens = max(num_lanes, page_size)
+    padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+    new_kv_hbm = (
+        jnp.pad(
+            jnp.concatenate([k, v], axis=-1).reshape(
+                total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+            ),
+            (
+                (0, padded_total_tokens - total_q_tokens),
+                (0, 0),
+                (0, aligned_kv_head_dim - actual_kv_head_dim),
+            ),
+            constant_values=0,
+        )
+        .reshape(
+            padded_total_tokens,
+            actual_num_kv_heads_x2,
+            aligned_kv_head_dim // kv_packing,
+            kv_packing,
+        )
+        .transpose(1, 2, 3, 0)
+    )
+  else:
     new_kv_hbm = jnp.pad(
-        jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
-                                                 actual_num_kv_heads_x2,
-                                                 actual_head_dim),
+        jnp.concatenate([k, v], axis=-1).reshape(
+            total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+        ),
         (
             (0, 0),
             (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
-            (0, aligned_head_dim - actual_head_dim),
+            (0, aligned_kv_head_dim - actual_kv_head_dim),
         ),
         constant_values=0,
     ).reshape(
         total_q_tokens,
         num_kv_heads_x2_aligned // kv_packing,
         kv_packing,
-        aligned_head_dim,
+        aligned_kv_head_dim,
     )
-
-    return o_hbm_alias_q_hbm, new_kv_hbm
+  return o_hbm_alias_q_hbm, new_kv_hbm
 
 
 def prepare_outputs(out: jax.Array) -> jax.Array:
-    kv_heads, max_tokens, q_per_kv_packed, q_packing, d = out.shape
-    return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
+  kv_heads, max_tokens, q_per_kv_packed, q_packing, d = out.shape
+  return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
 
 
 def get_kv_cache_shape(
@@ -120,16 +191,59 @@ def get_kv_cache_shape(
     actual_num_kv_heads,
     actual_head_dim,
     kv_dtype,
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+    use_per_token_scale: bool = False,
+    scale_dtype: jnp.dtype | None = None,
 ):
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    kv_packing = utils.get_dtype_packing(kv_dtype)
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  num_sublanes = pltpu.get_tpu_info().num_sublanes
+  kv_packing = utils.get_dtype_packing(kv_dtype)
+  if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    num_scale_channels = 0
+    if use_per_token_scale:
+      kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+      scale_bits = jax.dtypes.itemsize_bits(scale_dtype)
+      num_scale_channels = max(1, scale_bits // kv_bits)
+    base_dim = actual_head_dim + num_scale_channels
     return (
         total_num_pages,
-        page_size,
-        utils.align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
+        actual_num_kv_heads * 2,
+        utils.align_to(base_dim, num_sublanes * kv_packing)
+        // kv_packing,
         kv_packing,
-        utils.align_to(actual_head_dim, num_lanes),
+        page_size,
     )
+  return (
+      total_num_pages,
+      page_size,
+      utils.align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
+      kv_packing,
+      utils.align_to(actual_head_dim, num_lanes),
+  )
+
+
+def get_storage_kv_cache_shape(
+    total_num_pages,
+    page_size,
+    actual_num_kv_heads,
+    actual_head_dim,
+    kv_dtype,
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+    use_per_token_scale: bool = False,
+    scale_dtype: jnp.dtype | None = None,
+    is_nvfp4: bool = False,
+):
+  """Returns host/device uint8 storage container shape for memory allocation."""
+  return get_kv_cache_shape(
+      total_num_pages=total_num_pages,
+      page_size=page_size,
+      actual_num_kv_heads=actual_num_kv_heads,
+      actual_head_dim=actual_head_dim,
+      kv_dtype=kv_dtype,
+      kv_layout=kv_layout,
+      use_per_token_scale=use_per_token_scale,
+      scale_dtype=scale_dtype,
+  )
 
 
 def calculate_block_sizes(
@@ -137,196 +251,480 @@ def calculate_block_sizes(
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+  """Calculate optimal block size for decode and prefill."""
 
-    tpu_info = pltpu.get_tpu_info()
-    num_lanes = tpu_info.num_lanes
-    mxu_column_size = tpu_info.mxu_column_size
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
+  mxu_column_size = tpu_info.mxu_column_size
 
-    # Calculate aligned model dimensions.
-    aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
-    aligned_num_q_heads_per_kv_head = utils.align_to(
-        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
-    aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
-                           model_cfgs.num_kv_heads)
+  # Calculate aligned model dimensions.
+  aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
+  num_sublanes = tpu_info.num_sublanes
 
+  aligned_num_q_heads_per_kv_head = utils.align_to(
+      model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+  )
+  aligned_num_q_heads = (
+      aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
+  )
+
+  if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
+  else:
     bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
     if utils.has_bank_conflicts(bkv_stride):
-        bkv_stride += 1
+      bkv_stride += 1
     aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
 
-    q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
-    kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
-    out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
+  q_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_q) / 8
+  kv_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_kv) / 8
+  out_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_out) / 8
 
-    def calculate_vmem_usage(batch_size: int, n_buffer: int, bq_sz: int,
-                             bkv_sz: int) -> int:
-        """Given tile size, calculate VMEM usage of the kernel."""
+  is_packed_fp4 = serve_cfgs.dtype_kv == jnp.uint8
+  physical_kv_head_dim = model_cfgs.head_dim
+  if is_packed_fp4:
+    physical_kv_head_dim = physical_kv_head_dim // 2
 
-        # Step 1: Calculate buffer sizes.
+  num_sublanes = tpu_info.num_sublanes
+  packing_kv = serve_cfgs.packing_kv
 
-        # Calculate size bq & bkv arrays for a single buffer.
-        bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-        bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
+  if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    num_scale_channels = serve_cfgs.scale_channels
+    base_dim = physical_kv_head_dim + num_scale_channels
+    aligned_kv_head_dim_val = utils.align_to(
+        base_dim, num_sublanes * packing_kv
+    )
+  else:
+    aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
 
-        # Get output buffer size as well - which has same size as query size.
-        bo_array_size = bq_array_size
+  def calculate_vmem_usage(
+      batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
+  ) -> int:
+    """Given tile size, calculate VMEM usage of the kernel."""
 
-        # Convert to bytes.
-        bq_bytes = bq_array_size * q_bytes
-        bkv_bytes = bkv_array_size * kv_bytes
-        bo_bytes = bo_array_size * out_bytes
+    # Step 1: Calculate buffer sizes.
 
-        # Account for multiple buffers. For output, we always use double buffer.
-        bq_bytes *= n_buffer
-        bkv_bytes *= n_buffer
-        bo_bytes *= 2
+    # Calculate size bq & bkv arrays for a single buffer.
+    bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+      bkv_array_size = (
+          (bkv_sz + 2 * serve_cfgs.page_size)
+          * aligned_num_kv_heads_x2
+          * aligned_kv_head_dim_val
+      )
+    else:
+      bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_kv_head_dim_val
 
-        # Sum up all buffer memory usage.
-        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
+    # Get output buffer size as well - which has same size as query size.
+    bo_array_size = bq_array_size
 
-        # Step 2: Calculate worst case memory usage during computation.
+    # Convert to bytes.
+    bq_bytes = bq_array_size * q_bytes
+    bkv_bytes = bkv_array_size * kv_bytes
+    bo_bytes = bo_array_size * out_bytes
 
-        # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
-        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
+    # Account for multiple buffers. For output, we always use double buffer.
+    bq_bytes *= n_buffer
+    bkv_bytes *= n_buffer
+    bo_bytes *= 2
 
-        # Calculate peak memory requirement of output - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+    # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
+    buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
 
-        # Convert to bytes.
-        loaded_bq_bytes = loaded_bq_size * q_bytes
-        loaded_bkv_bytes = loaded_bkv_size * kv_bytes
-        qk_bytes = qk_size * out_bytes
+    # Step 2: Calculate worst case memory usage during computation.
 
-        # Sum up all compute memory usage.
-        compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
+    # Calculate the size of loaded bq and bkv size.
+    loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
+    loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
 
-        # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
+    # Calculate peak memory requirement of otuput - which is attention weight.
+    qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
 
-        # Account for batch size.
-        total_bytes *= batch_size
+    # Convert to bytes.
+    loaded_bq_bytes = loaded_bq_size * q_bytes
+    compute_kv_bytes = kv_bytes
+    if is_packed_fp4:
+      compute_kv_bytes = 0.5
+    loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
+    qk_bytes = qk_size * out_bytes
 
-        return total_bytes
+    # Calculate VMEM contribution of active unpacked scale arrays during
+    # compute. Note: since flash_attention consumes quantized k/v directly
+    # along with our active k_scale and v_scale tensors (no upfront dequantized
+    # intermediate copy), we only need to account for unpacked k_scale + v_scale
+    # during compute.
+    loaded_scale_bytes = 0
+    if serve_cfgs.per_token_scale:
+      scale_bits = jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype)
+      scale_bytes = scale_bits // 8
+      # Active k_scale and v_scale each have shape (num_kv_heads, bkv_sz)
+      loaded_scale_bytes = 2 * bkv_sz * model_cfgs.num_kv_heads * scale_bytes
 
-    def calculate_compute_buffer_time(batch_size: int, bq_c_sz: int,
-                                      bkv_sz: int) -> int:
-        """Calculate computational complexity of a single compute block."""
+    # Sum up all compute memory usage.
+    compute_bytes = (
+        loaded_bq_bytes + loaded_bkv_bytes + qk_bytes + loaded_scale_bytes
+    )
 
-        num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
-        num_k_cols = pl.cdiv(model_cfgs.head_dim, mxu_column_size)
-        num_k = num_k_rows * num_k_cols
-        num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
+    # Step 3: Sum up all memory usage.
+    total_bytes = buffer_bytes + compute_bytes
 
-        return batch_size * num_muls
+    # Account for batch size.
+    total_bytes *= batch_size
 
-    def find_best_block_sizes(
-            max_batch_size: int,
-            max_n_buffer: int,
-            fixed_bq_sz: int | None = None) -> configs.BlockSizes:
-        """Loop through different block sizes to find the most optimal one."""
+    return total_bytes
 
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+  def calculate_compute_buffer_time(
+      batch_size: int, bq_c_sz: int, bkv_sz: int
+  ) -> int:
+    """Calculate computational complexity of a single compute block."""
 
-        bkv_sz = bkv_stride = mxu_column_size
-        if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
-        else:
-            bq_sz = fixed_bq_sz
-            bq_stride = 0
-        batch_size = max_batch_size
-        n_buffer = max_n_buffer
+    num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
+    num_k_cols = pl.cdiv(model_cfgs.head_dim, mxu_column_size)
+    num_k = num_k_rows * num_k_cols
+    num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
 
-        # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
-        # size can trigger OOM.
+    return batch_size * num_muls
 
-        # If current batch size triggers OOM, decrease batch size until the kernel
-        # fits within VMEM limit.
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               > capped_vmem_limit_bytes):
-            batch_size -= 1
+  def find_best_block_sizes(
+      max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
+  ) -> configs.BlockSizes:
+    """Loop through different block sizes to find the most optimal one."""
 
-        # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               > capped_vmem_limit_bytes):
-            n_buffer -= 1
+    # Even if we loose some potential performance, we want to avoid OOM at all
+    # costs. Therefore, we conservatively only use 80% of the VMEM budget.
+    capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-        # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
-        # NOTE: If the function does not exit at this point even when either values
-        # are zero, it will trigger infinite loop at the next while loop.
-        if batch_size == 0 or n_buffer == 0:
-            raise ValueError(
-                "Cannot find batch size that fits within VMEM limit.")
+    bkv_sz = bkv_stride = mxu_column_size
+    if fixed_bq_sz is None:
+      bq_sz = bq_stride = bkv_sz
+    else:
+      bq_sz = fixed_bq_sz
+      bq_stride = 0
+    batch_size = max_batch_size
+    n_buffer = max_n_buffer
 
-        # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-               < capped_vmem_limit_bytes):
-            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
-            # size. When using causal masking, if bq size is larger than bkv size,
-            # entire kv tile can be masked out for some query tokens. Similarly, if
-            # bkv size is larger than bq size, entire query tile can be masked out for
-            # some kv tokens.
-            bkv_sz += bkv_stride
-            bq_sz += bq_stride
+    # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
+    # size can trigger OOM.
 
-        # Rollback one step since the last attempted value triggered OOM.
-        bkv_sz -= bkv_stride
+    # If current batch size triggers OOM, decrease batch size until the kernel
+    # fits within VMEM limit.
+    while (
+        batch_size > 1
+        and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+        > capped_vmem_limit_bytes
+    ):
+      batch_size -= 1
+
+    # As a last resort, attempt to decrease number of buffers to avoid OOM.
+    while (
+        calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+        > capped_vmem_limit_bytes
+    ):
+      n_buffer -= 1
+
+    # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
+    # NOTE: If the function does not exit at this point even when either values
+    # are zero, it will trigger infinite loop at the next while loop.
+    if batch_size == 0 or n_buffer == 0:
+      raise ValueError("Cannot find batch size that fits within VMEM limit.")
+
+    max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+    # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
+    max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+    while (
+        calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+        < capped_vmem_limit_bytes
+        and bkv_sz <= max_seq_len
+        and bkv_sz <= 4096
+    ):
+      # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
+      # size. When using causal masking, if bq size is larger than bkv size,
+      # entire kv tile can be masked out for some query tokens. Similarly, if
+      # bkv size is larger than bq size, entire query tile can be masked out for
+      # some kv tokens.
+      bkv_sz += bkv_stride
+      bq_sz += bq_stride
+
+    # Rollback one step since the last attempted value triggered OOM.
+    if bkv_sz > bkv_stride:
+      bkv_sz -= bkv_stride
+      if fixed_bq_sz is None:
         bq_sz -= bq_stride
 
-        # Indicates OOM was triggered from the starting bkv size.
-        if bkv_sz == 0:
-            raise ValueError(
-                "Cannot find block sizes that fit within VMEM limit.")
+    # Indicates OOM was triggered from the starting bkv size.
+    if bkv_sz == 0:
+      raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
-        # Step 3: Given current tile size, calculate compute tile size.
+    # Step 3: Given current tile size, calculate compute tile size.
 
-        # Fixed threshold value based on hardware spec.
-        # TODO(kyuyeunk): Use different threshold based on hardware and precision.
-        threshold = 1500
+    # Fixed threshold value based on hardware spec.
+    # TODO(kyuyeunk): Use different threshold based on hardware and precision.
+    threshold = 1500
 
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
+    num_bq_c = 1
+    last_valid_bq_c_sz = bq_c_sz = bq_sz
+    bq_c_rem = 0
 
-        while (calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz)
-               > threshold or bq_c_rem != 0) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+    while (
+        calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+        or bq_c_rem != 0
+    ) and num_bq_c < bq_sz:
+      if bq_c_rem == 0:
+        last_valid_bq_c_sz = bq_c_sz
+      num_bq_c += 1
+      bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
 
-        return configs.BlockSizes(
-            bq_sz=bq_sz,
-            bq_c_sz=last_valid_bq_c_sz,
-            bkv_sz=bkv_sz,
-            batch_size=batch_size,
-            n_buffer=n_buffer,
-        )
+    return configs.BlockSizes(
+        bq_sz=bq_sz,
+        bq_c_sz=last_valid_bq_c_sz,
+        bkv_sz=bkv_sz,
+        batch_size=batch_size,
+        n_buffer=n_buffer,
+    )
 
-    # Default to triple buffer as its almost always beneficial.
-    n_buffer = 3
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
-    prefill_batch_size = 2
+  # Default to triple buffer as its almost always beneficial.
+  n_buffer = 3
+  # Fixed value based on experimental results.
+  decode_batch_size = 8
+  prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+  decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+  prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
-    return decode_block_sizes, prefill_block_sizes
+  return decode_block_sizes, prefill_block_sizes
 
 
-@jax.jit(
+def _ragged_paged_attention_inner(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = None,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    q_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
+    k_scale_tensor: jax.Array | None = None,
+    v_scale_tensor: jax.Array | None = None,
+    chunk_prefill_size: int | None = None,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    debug_mode: bool = False,
+    out_dtype: jnp.dtype | None = None,
+    use_causal_mask: bool = True,
+    skip_kv_update: bool = False,
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+) -> tuple[jax.Array, jax.Array]:
+  """Perform batched ragged paged attention.
+
+  Args:
+    queries: [max_num_tokens, num_q_heads, head_dim]. Output of q projection.
+    keys: [max_num_tokens, num_kv_heads, head_dim]. Output of k projection.
+    values: [max_num_tokens, num_kv_heads, head_dim]. Output of v projection.
+    kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
+      kv_packing, head_dim]. Stores existing kv cache data where k & vs are
+      concatenated along num kv heads dim.
+    kv_lens: [max_num_seqs]. Existing kv cache length of each sequence.
+    page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
+      sequence.
+    cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
+      length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
+      b=cu_q_lens[i+1] represents q/k/v of sequence i.
+    distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
+      sequences. distribution[2] represents total number of sequences.
+    sm_scale: Softmax scale value.
+    sliding_window: Size of sliding window (also known as local attention). kvs
+      outside of the window is not fetched from hbm and masked out during
+      computation.
+    soft_cap: Cap values of softmax inputs.
+    mask_value: Value to use for causal masking. Defaults to smallest
+      representable value of the activation dtype.
+    use_per_token_scale: Whether to use per-token quantization.
+    per_token_scale_dtype: Dtype of per-token scale. Defaults to None.
+    q_scale: Quantization scale value of queries.
+    k_scale: Quantization scale value of keys.
+    v_scale: Quantization scale value of values.
+    chunk_prefill_size: Not used.
+    decode_block_sizes: Kernel block size to use during decode.
+    prefill_block_sizes: Kernel block size to use during prefill.
+    vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
+      size of the hardware.
+    debug_mode: Not used.
+    out_dtype: Dtype of output. Defaults to dtype of queries.
+    use_causal_mask: Not used.
+
+  Returns:
+    out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
+    new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
+      kv_packing, head_dim]. Result of new kv cache where k & vs are
+      concatenated along num kv heads dim.
+  """
+
+
+  if not use_causal_mask:
+    raise ValueError("Only causal attention is supported.")
+  if chunk_prefill_size is not None:
+    raise ValueError("Specifying chunk prefill size is not supported.")
+  if debug_mode:
+    raise ValueError("Debug mode is not supported.")
+
+  if out_dtype is None:
+    out_dtype = queries.dtype
+  if mask_value is None:
+    mask_value = jnp.finfo(out_dtype).min
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+
+  max_num_seqs = kv_lens.shape[0]
+  kv_packing = utils.get_dtype_packing(kv_cache.dtype)
+  if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+    page_size = kv_cache.shape[4]
+  else:
+    page_size = kv_cache.shape[1]
+
+  num_q_heads = queries.shape[1]
+  head_dim = queries.shape[2]
+  num_kv_heads = keys.shape[1]
+  num_page_indices = page_indices.shape[0]
+
+  model_cfgs = configs.ModelConfigs(
+      num_q_heads=num_q_heads,
+      num_kv_heads=num_kv_heads,
+      head_dim=head_dim,
+      sliding_window=sliding_window,
+      sm_scale=sm_scale,
+      soft_cap=soft_cap,
+      mask_value=mask_value,
+  )
+
+  k_scale_config = k_scale_scalar
+  v_scale_config = v_scale_scalar
+  per_token_scale = None
+
+  if use_per_token_scale:
+    per_token_scale = True
+    k_scale_config = None
+    v_scale_config = None
+  elif k_scale_scalar is not None and v_scale_scalar is not None:
+    per_token_scale = False
+
+  serve_cfgs = configs.ServingConfigs(
+      num_seqs=max_num_seqs,
+      num_page_indices=num_page_indices,
+      total_q_tokens=queries.shape[0],
+      dtype_q=queries.dtype,
+      dtype_kv=kv_cache.dtype,
+      dtype_out=out_dtype,
+      page_size=page_size,
+      per_token_scale=per_token_scale,
+      per_token_scale_dtype=per_token_scale_dtype,
+      scale_q=q_scale,
+      scale_k=k_scale_config,
+      scale_v=v_scale_config,
+      kv_layout=kv_layout,
+  )
+
+  q_hbm, new_kv_hbm = prepare_inputs(
+      queries,
+      keys,
+      values,
+      queries.dtype,
+      kv_cache.dtype,
+      k_scale_tensor,
+      v_scale_tensor,
+      kv_layout=kv_layout,
+      page_size=page_size,
+  )
+
+  default_decode, default_prefill = calculate_block_sizes(
+      model_cfgs, serve_cfgs, vmem_limit_bytes
+  )
+
+  def run_rpa_kernel(
+      mode: configs.RpaCase,
+      o_hbm_alias_q_hbm: jax.Array,
+      kv_cache: jax.Array,
+  ):
+    if mode == configs.RpaCase.DECODE:
+      effective_blocks = decode_block_sizes or default_decode
+    else:
+      effective_blocks = prefill_block_sizes or default_prefill
+
+    cfgs = configs.RpaConfigs(
+        block=effective_blocks,
+        model=model_cfgs,
+        serve=serve_cfgs,
+        vmem_limit_bytes=vmem_limit_bytes,
+        mode=mode,
+    )
+    cfgs.validate_inputs(
+        q=queries,
+        k=keys,
+        v=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+    )
+
+    schedule_hbm = schedule.generate_rpa_metadata(
+        cu_q_lens, kv_lens, distribution, cfgs=cfgs
+    )
+    return kernel.rpa_kernel(
+        cu_q_lens,
+        kv_lens,
+        page_indices,
+        schedule_hbm,
+        o_hbm_alias_q_hbm,
+        new_kv_hbm,
+        kv_cache,
+        cfgs=cfgs,
+    )
+
+  o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+      configs.RpaCase.DECODE, q_hbm, kv_cache
+  )
+  o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+      configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+  )
+
+  # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+  o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+  # after: [kv_heads, max_tokens, q_per_kv, d]
+
+  # slice back to original shape if padded
+  num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+  o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+  o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+
+  return o_hbm, kv_cache
+
+
+# For standard (not per-token) quantization, all the scale factors are constants
+# and so we can denote them as static.
+_ragged_paged_attention_standard = jax.jit(
+    _ragged_paged_attention_inner,
     static_argnames=(
         "sm_scale",
         "sliding_window",
         "soft_cap",
         "mask_value",
+        "use_per_token_scale",
+        "per_token_scale_dtype",
         "q_scale",
-        "k_scale",
-        "v_scale",
+        "k_scale_scalar",
+        "v_scale_scalar",
         "chunk_prefill_size",
         "decode_block_sizes",
         "prefill_block_sizes",
@@ -335,9 +733,41 @@ def calculate_block_sizes(
         "out_dtype",
         "use_causal_mask",
         "skip_kv_update",
+        "kv_layout",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
+
+# For per-token quantization, the k and v scale factors are tensors, and not
+# constants, so we cannot denote them as static.
+_ragged_paged_attention_per_token = jax.jit(
+    _ragged_paged_attention_inner,
+    static_argnames=(
+        "sm_scale",
+        "sliding_window",
+        "soft_cap",
+        "mask_value",
+        "use_per_token_scale",
+        "per_token_scale_dtype",
+        "q_scale",
+        "k_scale_scalar",
+        "v_scale_scalar",
+        "chunk_prefill_size",
+        "decode_block_sizes",
+        "prefill_block_sizes",
+        "vmem_limit_bytes",
+        "debug_mode",
+        "out_dtype",
+        "use_causal_mask",
+        "skip_kv_update",
+        "kv_layout",
+    ),
+    donate_argnames=("queries", "keys", "values", "kv_cache"),
+)
+
+
+# Wrapper function to select either standard or per-token quantization based on
+# the value of use_per_token_scale.
 def ragged_paged_attention(
     queries: jax.Array,
     keys: jax.Array,
@@ -352,9 +782,13 @@ def ragged_paged_attention(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = None,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
     q_scale: float | None = None,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
+    k_scale_tensor: jax.Array | None = None,
+    v_scale_tensor: jax.Array | None = None,
     chunk_prefill_size: int | None = None,
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
@@ -363,163 +797,40 @@ def ragged_paged_attention(
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
-) -> tuple[jax.Array, jax.Array]:
-    """Perform batched ragged paged attention.
-
-    Args:
-        queries: [max_num_tokens, num_q_heads, head_dim]. Output of q projection.
-        keys: [max_num_tokens, num_kv_heads, head_dim]. Output of k projection.
-        values: [max_num_tokens, num_kv_heads, head_dim]. Output of v projection.
-        kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Stores existing kv cache data where k & vs are
-            concatenated along num kv heads dim.
-        kv_lens: [max_num_seqs]. Existing kv cache length of each sequence.
-            page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
-            sequence.
-        cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-            b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences. distribution[2] represents total number of sequences.
-        sm_scale: Softmax scale value.
-        sliding_window: Size of sliding window (also known as local attention). kvs
-            outside of the window is not fetched from hbm and masked out during
-            computation.
-        soft_cap: Cap values of softmax inputs.
-        mask_value: Value to use for causal masking. Defaults to smallest
-            representable value of the activation dtype.
-        q_scale: Quantization scale value of queries.
-        k_scale: Quantization scale value of keys.
-        v_scale: Quantization scale value of values.
-        chunk_prefill_size: Not used.
-        decode_block_sizes: Kernel block size to use during decode.
-        prefill_block_sizes: Kernel block size to use during prefill.
-        vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
-            size of the hardware.
-        debug_mode: Not used.
-        out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
-        skip_kv_update: Cross-layer KV cache sharing. When True, this (shared)
-            layer reads its entire K/V span from the cache slot written by its
-            target layer earlier in the same forward pass, ignores its own k/v
-            inputs, and does not write the cache back. Inverse of upstream
-            tpu-inference's `update_kv_cache`.
-
-    Returns:
-        out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
-        new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Result of new kv cache where k & vs are
-            concatenated along num kv heads dim.
-    """
-
-    if not use_causal_mask:
-        raise ValueError("Only causal attention is supported.")
-    if chunk_prefill_size is not None:
-        raise ValueError("Specifying chunk prefill size is not supported.")
-    if debug_mode:
-        raise ValueError("Debug mode is not supported.")
-
-    if out_dtype is None:
-        out_dtype = queries.dtype
-    if mask_value is None:
-        mask_value = jnp.finfo(out_dtype).min
-    if vmem_limit_bytes is None:
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-
-    max_num_seqs = kv_lens.shape[0]
-    page_size = kv_cache.shape[1]
-
-    num_q_heads = queries.shape[1]
-    head_dim = queries.shape[2]
-    num_kv_heads = keys.shape[1]
-    num_page_indices = page_indices.shape[0]
-
-    model_cfgs = configs.ModelConfigs(
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        sliding_window=sliding_window,
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        mask_value=mask_value,
-    )
-    serve_cfgs = configs.ServingConfigs(
-        num_seqs=max_num_seqs,
-        num_page_indices=num_page_indices,
-        total_q_tokens=queries.shape[0],
-        dtype_q=queries.dtype,
-        dtype_kv=kv_cache.dtype,
-        dtype_out=out_dtype,
-        page_size=page_size,
-        scale_q=q_scale,
-        scale_k=k_scale,
-        scale_v=v_scale,
-    )
-
-    q_hbm, new_kv_hbm = prepare_inputs(queries, keys, values, queries.dtype,
-                                       kv_cache.dtype)
-
-    default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes)
-
-    def run_rpa_kernel(
-        mode: configs.RpaCase,
-        o_hbm_alias_q_hbm: jax.Array,
-        kv_cache: jax.Array,
-    ):
-        if mode == configs.RpaCase.DECODE:
-            effective_blocks = decode_block_sizes or default_decode
-        else:
-            effective_blocks = prefill_block_sizes or default_prefill
-
-        cfgs = configs.RpaConfigs(
-            block=effective_blocks,
-            model=model_cfgs,
-            serve=serve_cfgs,
-            vmem_limit_bytes=vmem_limit_bytes,
-            mode=mode,
-        )
-        cfgs.validate_inputs(
-            q=queries,
-            k=keys,
-            v=values,
-            kv_cache=kv_cache,
-            kv_lens=kv_lens,
-            page_indices=page_indices,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-        )
-
-        schedule_hbm = schedule.generate_rpa_metadata(
-            cu_q_lens,
-            kv_lens,
-            distribution,
-            cfgs=cfgs,
-            skip_kv_update=skip_kv_update,
-        )
-        return kernel.rpa_kernel(
-            cu_q_lens,
-            kv_lens,
-            page_indices,
-            schedule_hbm,
-            o_hbm_alias_q_hbm,
-            new_kv_hbm,
-            kv_cache,
-            cfgs=cfgs,
-        )
-
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
-                                                 kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
-                                                 o_hbm_alias_q_hbm, kv_cache)
-
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-    # after: [kv_heads, max_tokens, q_per_kv, d]
-
-    # slice back to original shape if padded
-    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-
-    return o_hbm, kv_cache
+    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+  fn = (
+      _ragged_paged_attention_per_token
+      if use_per_token_scale
+      else _ragged_paged_attention_standard
+  )
+  return fn(
+      queries,
+      keys,
+      values,
+      kv_cache,
+      kv_lens,
+      page_indices,
+      cu_q_lens,
+      distribution,
+      sm_scale=sm_scale,
+      sliding_window=sliding_window,
+      soft_cap=soft_cap,
+      mask_value=mask_value,
+      use_per_token_scale=use_per_token_scale,
+      per_token_scale_dtype=per_token_scale_dtype,
+      q_scale=q_scale,
+      k_scale_scalar=k_scale_scalar,
+      v_scale_scalar=v_scale_scalar,
+      k_scale_tensor=k_scale_tensor,
+      v_scale_tensor=v_scale_tensor,
+      chunk_prefill_size=chunk_prefill_size,
+      decode_block_sizes=decode_block_sizes,
+      prefill_block_sizes=prefill_block_sizes,
+      vmem_limit_bytes=vmem_limit_bytes,
+      debug_mode=debug_mode,
+      out_dtype=out_dtype,
+      use_causal_mask=use_causal_mask,
+      skip_kv_update=skip_kv_update,
+      kv_layout=kv_layout,
+  )

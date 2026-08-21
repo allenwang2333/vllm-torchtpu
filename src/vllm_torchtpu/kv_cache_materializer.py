@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
 from vllm.v1.worker.utils import AttentionGroup
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_QUANTIZED_DTYPES = _FP8_DTYPES + (torch.uint8,)
 
 LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
 
@@ -151,7 +152,7 @@ def allocate_raw_kv_cache_tensors(
             spec.head_size,
             cache_dtype_str=cache_dtype,
         )
-        if spec.dtype in _FP8_DTYPES:
+        if spec.dtype in _QUANTIZED_DTYPES:
             raw = torch.empty(tuple(shape), dtype=spec.dtype, device=device)
         else:
             raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
