@@ -45,6 +45,34 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 # Independent of the flag above: shards the latent-MoE down/up projections
 # across a chip's two cores instead of replicating them.
 export TPU_LATENT_PROJ_INTRA_CHIP_TP="${TPU_LATENT_PROJ_INTRA_CHIP_TP:-0}"
+
+# Routed-row count at/below which the MoE permute/combine run as TensorCore
+# one-hot matmuls instead of the SparseCore gather/reduce kernels. Dispatch is
+# `if token_indices_sorted.shape[0] <= threshold`, and the count is
+# num_tokens * topk.
+#
+# This has to be set explicitly now. It used to be `int | None` where unset
+# meant auto -- resolve_onehot_permute_threshold() derived it from SparseCore
+# geometry -- but #485 reverted that (#371), so the default is a bare 0, and 0
+# makes the one-hot branch unreachable at every size.
+#
+# That is a correctness issue at K3's decode buckets, not a tuning knob. Below
+# one SparseCore block ragged_gather_v2 pads to a whole block, and at bucket 1
+# that padding path fails outright in Mosaic:
+#
+#   ragged_gather_v2.py:182 -> emit_pipeline -> _make_pipeline_allocations
+#   ValueError: Expected input and output shapes are the same after
+#              multiplying the second-minor dimension by the bitwidths.
+#
+# 64 is what the reverted auto-derivation resolved to on TPU7x, recomputed from
+# the hardware rather than guessed: SparseCoreInfo(num_cores=2, num_subcores=16,
+# num_lanes=16) gives block_rows = 512, and threshold = min(512-1, cap 64) = 64.
+# It splits the buckets exactly where the observed failures split -- bucket 1
+# (16 rows) and bucket 2 (32) take one-hot, bucket 16 (256) stays on SparseCore,
+# and only the first two ever crashed.
+#
+# Set 0 to force everything back onto the SparseCore path.
+export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-64}"
 # Default ON here, unlike the launcher, which defaults it off. With async
 # scheduling off the host scheduler does not overlap device execution and adds
 # ~8.4 ms to every decode step -- half again the step time -- which swamps any
@@ -230,6 +258,10 @@ _LLAR_TAG=""
 # for the same reason the flags above must not.
 [[ -n "${COMPILE_SIZES:-}" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-cs${COMPILE_SIZES//,/_}"
+# Selects between the one-hot matmul and SparseCore gather kernels, so the
+# emitted programs differ and the cache trees must too.
+[[ "${ONEHOT_MOE_PERMUTE_THRESHOLD}" != "64" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-oh${ONEHOT_MOE_PERMUTE_THRESHOLD}"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -435,6 +467,7 @@ report_split() {
        "moe_renormalize_fold=${TPU_MOE_RENORMALIZE_FOLD}" \
        "compile_sizes=[${COMPILE_SIZES:-launcher default}]" \
        "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-launcher default}" \
+       "onehot_moe_permute_threshold=${ONEHOT_MOE_PERMUTE_THRESHOLD}" \
        "xla_cache=${VLLM_XLA_CACHE_PATH}"
   local ll_one ll_two ll_xla
   ll_one=$(grep -c -- "-> one_shot" "${SERVER_LOG}" 2>/dev/null || true)
