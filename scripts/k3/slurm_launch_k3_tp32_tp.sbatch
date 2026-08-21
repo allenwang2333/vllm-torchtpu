@@ -90,6 +90,33 @@ export TPU_LOW_LATENCY_ALLREDUCE_SHAPE="${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}"
 # collectives, but it is A/B'd through the same harness, so it gets the same
 # treatment -- an explicit default and its own cache tag.
 export TPU_MOE_RENORMALIZE_FOLD="${TPU_MOE_RENORMALIZE_FOLD:-1}"
+
+# Which token buckets get compiled, and the scheduler's token budget. Both are
+# consumed by launch_kimi_k3_tp32_ep.sh, which already builds the
+# --compilation-config and --max-num-batched-tokens flags from them and, at its
+# lines 28-31, refuses to start unless COMPILE_SIZES contains a bucket for
+# MAX_NUM_BATCHED_TOKENS.
+#
+# They are re-exported here, rather than left to the submitting shell, because
+# they change decode speed and the graph -- the same argument the flags above
+# make. Getting there took four launches of the MoE-fold A/B:
+#
+#   1-3. compile_sizes left at the inner default [2, 16, 512] while the run
+#        being reproduced had [1]. A different decode regime, and at 224/336 KiB
+#        past the all-reduce gate's ceiling, so the kernel under test was not
+#        exercised at all. Rounds 2 and 3 also proved buckets do not follow
+#        max_num_seqs.
+#   4.   Passed as a trailing --compilation-config argument instead. That works
+#        -- it reached vLLM as compile_sizes [1] -- but it *bypassed the guard*,
+#        which then validated the inner default 512 against the inner default
+#        bucket list and passed, while the program was actually compiled for 1.
+#        The server came up and died on its first request in _prepare_inputs,
+#        writing 12 prompt positions into a buffer sized for one token.
+#
+# So route through the variables, never a trailing argument: the guard is the
+# thing that catches an incoherent pair, and only the variables reach it.
+export COMPILE_SIZES="${COMPILE_SIZES:-}"
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 LOG_DIR="${KIMI_K3_LOG_ROOT:-${REPO_DIR}/results/kimi-k3-verify-${SLURM_JOB_ID}}"
 # Set PROFILE_DIR to make /start_profile work. Both halves are required and
 # neither can be turned on after the server is up: the phased profiler is read
@@ -199,6 +226,10 @@ _LLAR_TAG=""
 # replay whichever program was compiled first and the A/B would measure noise.
 [[ "${TPU_MOE_RENORMALIZE_FOLD:-1}" == "0" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-nofold"
+# Different buckets are different programs, so they must not share a cache tree
+# for the same reason the flags above must not.
+[[ -n "${COMPILE_SIZES:-}" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-cs${COMPILE_SIZES//,/_}"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -402,6 +433,8 @@ report_split() {
        "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
        "shape=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-auto}" \
        "moe_renormalize_fold=${TPU_MOE_RENORMALIZE_FOLD}" \
+       "compile_sizes=[${COMPILE_SIZES:-launcher default}]" \
+       "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-launcher default}" \
        "xla_cache=${VLLM_XLA_CACHE_PATH}"
   local ll_one ll_two ll_xla
   ll_one=$(grep -c -- "-> one_shot" "${SERVER_LOG}" 2>/dev/null || true)
