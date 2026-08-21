@@ -27,12 +27,31 @@ arrive in one of two states, neither of which has the files locally:
 * Ray V1 executor (``ray_distributed_executor.py``): the URI restored
   into ``model`` and ``model_weights`` cleared, i.e. the pre-pull state.
 
-Either way a per-rank config/tokenizer re-parse (custom-config models
-such as Kimi-K3) dies with "Repo id must be in the form 'repo_name'"
-naming the missing dir. ``ensure_runai_aux_files`` runs upstream's own
-pull on such ranks — same dir, same file set, same field rewrites, so
-nothing here can drift from the API server — serialized per host by
-upstream's ``get_lock`` on the URI.
+Why only some models notice: most architectures never read that path
+again on a worker, so stock-config models served from GCS (the GLM
+v7x-16 nightly) run fine. Models with a custom config class and/or
+custom tokenizer code — Kimi-K3 — make vLLM re-parse the config per rank
+during model init (``get_config(model=<local dir>)``); on a remote host
+the dir is absent, HF falls through to repo-id validation, and every
+rank there dies with "Repo id must be in the form 'repo_name' or
+'namespace/repo_name': '/root/.cache/vllm/assets/model_streamer/<hash>'".
+
+``ensure_runai_aux_files`` runs upstream's own pull on such ranks —
+``maybe_pull_model_tokenizer_for_runai`` under upstream's ``get_lock``
+on the URI — so the dir name, the file set and the field rewrites are
+exactly what the API server did and cannot drift from it. The lock
+serializes the ranks sharing a host: one pulls, the rest wait and skip.
+
+Why here and not upstream: the gap is in vLLM's multi-host worker
+handoff, but it is reached only through this plugin's executors on a
+pinned vLLM, and this repo already patches the object-storage load path
+(``model_loader_patches.py``). The V1 executor restores the URI for
+remote nodes on the assumption that each worker re-pulls; this module is
+what makes that assumption hold. It is a no-op unless the model comes
+from object storage (``is_runai_obj_uri`` on ``model_weights``/``model``),
+so models served from local disk or the HF hub are untouched. The
+observable trace on an affected rank is one ``[runai-repull] pulling aux
+files for <uri> on this host`` log line per host.
 
 Completion is tracked with two sentinel files in the pulled dir rather
 than by ``config.json`` existing: upstream downloads in place (no
