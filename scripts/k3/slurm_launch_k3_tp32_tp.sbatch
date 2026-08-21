@@ -71,11 +71,22 @@ export TPU_LATENT_PROJ_INTRA_CHIP_TP="${TPU_LATENT_PROJ_INTRA_CHIP_TP:-0}"
 #   artifact_compile_range_2_2_subgraph_0 was compiled by another trace of this
 #   model whose inputs differ
 #
-# Measured both ways: [2,16,512] boots at 0 (job 293, SERVER_READY 1873s) and
-# never comes up at 64 (jobs 305/306); [1] is the reverse (302/304 vs earlier).
-# That the one-hot path cannot be *partially* enabled across buckets is the
-# likely reason #371 was reverted at all, so treat 64 as a decode-only setting
-# and not as a fix to carry everywhere.
+# Measured: [2,16,512] never comes up at 64 (jobs 305/306), and [1] needs a
+# non-zero threshold (302/304 vs earlier). That the one-hot path cannot be
+# *partially* enabled across buckets is the likely reason #371 was reverted at
+# all, so treat 64 as a decode-only setting and not as a fix to carry everywhere.
+#
+# CAUTION: threshold 0 is necessary but *not* sufficient for a multi-bucket
+# config. Job 307 ran [2,16,512] at 0, on a fresh cache, and still died with the
+# same ShapeSpecializationError at artifact_compile_range_2_2_subgraph_0. An
+# earlier version of this comment claimed 293 proved [2,16,512] boots at 0;
+# 293 did boot, but with a different flag set, so it never licensed that
+# generalisation. Verified for 307 vs 293: identical src (no src/ commits
+# between them), identical max_model_len/max_num_batched_tokens/max_num_seqs/
+# compile_sizes, and identical threshold -- explicit 0 is indistinguishable from
+# unset, since envs.py reads `int(os.getenv(...) or "0")`. The failure is
+# deterministic (6 occurrences in each of 305/306/307, 0 in 293) and its cause is
+# still unidentified. GSM8K on a multi-bucket config is therefore UNVALIDATED.
 #
 # So: single bucket -> 64, several buckets -> 0. 64 is what the reverted
 # auto-derivation computed on TPU7x: SparseCoreInfo(num_cores=2,
@@ -383,6 +394,36 @@ echo "Kimi-K3 endpoint will be http://${HEAD_IP}:${PORT}/v1"
 echo "Ray log: ${RAY_LOG}"
 
 echo "Hierarchical MoE parallelism: TPU_MOE_HIERARCHICAL_EP=${TPU_MOE_HIERARCHICAL_EP}"
+
+# Echo the requested configuration *before* the server starts, rather than only
+# in report_split below. These are two different things and only one of them
+# needs a running server: this is the set of env vars the job was submitted
+# with, known already, whereas report_split greps SERVER_LOG for what the
+# dispatcher actually did.
+#
+# Keeping them together cost three slices on 2026-08-21. Jobs 305, 306 and 307
+# all died during engine-core startup, so report_split never ran and each run
+# discarded the only record of its own configuration. Diagnosing 307 then had to
+# proceed by inference from a hand-set cache-path name, which produced two wrong
+# root causes in a row -- the failure was blamed on
+# ONEHOT_MOE_PERMUTE_THRESHOLD, which is in fact identical (0) in both the
+# failing run and the passing one it was compared against. A failed startup is
+# when this information is most needed, so it must be printed unconditionally.
+echo "Requested config:" \
+     "moe_concat=${TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT}" \
+     "moe_variadic=${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC}" \
+     "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
+     "shape=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-auto}" \
+     "two_shot=${TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT:-unset}" \
+     "moe_renormalize_fold=${TPU_MOE_RENORMALIZE_FOLD}" \
+     "latent_proj_intra_chip=${TPU_LATENT_PROJ_INTRA_CHIP_TP:-unset}" \
+     "compile_sizes=[${COMPILE_SIZES:-launcher default}]" \
+     "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-launcher default}" \
+     "max_num_seqs=${MAX_NUM_SEQS}" \
+     "async_scheduling=${ASYNC_SCHEDULING}" \
+     "onehot_moe_permute_threshold=${ONEHOT_MOE_PERMUTE_THRESHOLD}" \
+     "hierarchical_ep=${TPU_MOE_HIERARCHICAL_EP}" \
+     "xla_cache=${VLLM_XLA_CACHE_PATH}"
 
 # The server runs as a background job step so this script can detect readiness,
 # report the endpoint, and then simply hold the allocation. Extra arguments
