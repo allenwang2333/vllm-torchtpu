@@ -24,6 +24,7 @@ one either way.
 """
 
 import pytest
+import torch
 from vllm import forward_context as fc
 from vllm.forward_context import BatchDescriptor
 
@@ -94,3 +95,47 @@ def test_reads_an_int_not_a_tensor(context):
     # module is arranged to avoid.
     ctx = context(2)
     assert type(ctx.batch_descriptor.num_tokens) is int
+
+
+# --- shape-guard mode (TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD=1) --------------
+#
+# The context path above folds to a constant, which leaves no ShapeEnv guard for
+# compilation/shape_variants (#474) to partition on, so on a multi-bucket config
+# two traces claim the same bucket with different graph inputs and startup dies
+# with ShapeSpecializationError. These cover the alternative: read the dim, so
+# the branch is visible to the guard machinery.
+
+
+def test_shape_guard_uses_the_payload_not_the_context(context, monkeypatch):
+    # The context says bucket 512, the payload says 2 rows. Under the flag the
+    # payload wins -- that is what makes the branch legible to #474.
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD", "1")
+    context(512)
+    assert bucket_matches(ENTRY, torch.empty(2, 3584)) is True
+
+
+@pytest.mark.parametrize("rows", [16, 512])
+def test_shape_guard_rejects_larger_payloads(context, monkeypatch, rows):
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD", "1")
+    context(2)
+    assert bucket_matches(ENTRY, torch.empty(rows, 3584)) is False
+
+
+def test_shape_guard_needs_the_payload(context, monkeypatch):
+    # No payload means the caller could not supply one, so fall back to the
+    # context path rather than silently answering from nothing.
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD", "1")
+    context(2)
+    assert bucket_matches(ENTRY) is True
+    context(512)
+    assert bucket_matches(ENTRY) is False
+
+
+def test_payload_is_ignored_while_the_flag_is_off(context, monkeypatch):
+    # Default path must be untouched: every measurement on this branch was taken
+    # with the context deciding, so passing a payload must not change it.
+    monkeypatch.delenv("TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD", raising=False)
+    context(2)
+    assert bucket_matches(ENTRY, torch.empty(512, 3584)) is True
+    context(512)
+    assert bucket_matches(ENTRY, torch.empty(2, 3584)) is False

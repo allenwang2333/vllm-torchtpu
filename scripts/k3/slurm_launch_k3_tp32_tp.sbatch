@@ -106,6 +106,13 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD
 # effect being measured. Job 688 recorded 16.1 ms/step of device work and a
 # 24.5 ms TPOT for exactly this reason, and looked like a 29% regression next to
 # a baseline that had the flag on. Comparisons across this flag are meaningless.
+# Decide the kernel's token bucket from a tensor dim rather than the forward
+# context, so the branch leaves a ShapeEnv guard that compilation/shape_variants
+# (#474) can partition on. Off by default: every measurement on this branch was
+# taken with the context path. Needed for multi-bucket configs, where the
+# guardless branch makes two traces claim the same bucket with different graph
+# inputs and startup dies with ShapeSpecializationError.
+export TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD="${TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD:-0}"
 export ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
 # Pinned for the same reason as the flags above: job 643 ran with 16 (exported
 # interactively) while the launcher's own default is 8, so its concurrency sweep
@@ -289,6 +296,10 @@ _LLAR_TAG=""
 # emitted programs differ and the cache trees must too.
 [[ "${ONEHOT_MOE_PERMUTE_THRESHOLD}" != "0" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-oh${ONEHOT_MOE_PERMUTE_THRESHOLD}"
+# Moves the bucket branch from a folded constant to a real guard, which changes
+# the traced graph and the number of traces, so it needs its own cache tree.
+[[ "${TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD}" == "1" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-sg"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -415,6 +426,7 @@ echo "Requested config:" \
      "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
      "shape=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-auto}" \
      "two_shot=${TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT:-unset}" \
+     "shape_guard=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD}" \
      "moe_renormalize_fold=${TPU_MOE_RENORMALIZE_FOLD}" \
      "latent_proj_intra_chip=${TPU_LATENT_PROJ_INTRA_CHIP_TP:-unset}" \
      "compile_sizes=[${COMPILE_SIZES:-launcher default}]" \

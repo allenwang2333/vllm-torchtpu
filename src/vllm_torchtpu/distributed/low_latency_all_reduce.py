@@ -564,7 +564,51 @@ _ENTRY_OPS: dict[str, Any] = {}
 _ROWPARALLEL_ENTRY: tuple | None = None
 
 
-def bucket_matches(entry: tuple) -> bool:
+def shape_guard_enabled() -> bool:
+    """Whether to decide the bucket from a tensor dim instead of the context.
+
+    Off by default: it changes what dynamo records, and the forward-context
+    path below is what every measurement on this branch was taken with.
+
+    The context path folds to a constant, which is correct at runtime and
+    invisible to ``compilation/shape_variants.py`` (upstream #474). That module
+    partitions the model into one trace per *structurally distinct* group using
+    the ShapeEnv guards a trace leaves behind, then hands each token bucket to
+    the trace whose guards accept it. A constant leaves no guard, so with the
+    kernel wired on one bucket every trace believes it can serve every bucket,
+    and two traces that disagree about whether the workspaces are graph inputs
+    both claim the same one. The hand-over then fails the signature check:
+
+        ShapeSpecializationError: artifact_compile_range_2_2_subgraph_0 was
+        compiled by another trace of this model whose inputs differ
+
+    The signatures differ by exactly six placeholders -- (2, 31, 1, 224),
+    (2, 32, 1, 224), (1,) and the same three at width 672 -- which are this
+    kernel's two_shot workspaces at 32 devices, present in the trace that took
+    the kernel and absent from the one that did not.
+
+    Comparing a dim instead leaves the guard, so #474 can see the branch and
+    partition on it the way it already does for the MoE renormalize fold, whose
+    ``tokens <= 64`` gate shows up as ``s72 <= 64`` and hands buckets over
+    cleanly. Jobs 310 and 315 boot and score gsm8k 1.0 on exactly that path
+    with this kernel off, so the mechanism works; this is about making our own
+    branch legible to it.
+
+    ``get_entry_op`` records that reading a dim in traced python used to fail
+    outright with "Constraints violated (L['input_ids'].size()[0])". That was
+    measured before #474 and before vLLM traced this model under
+    ``TorchCompileWithNoGuardsWrapper``, which drops guards rather than
+    rejecting them -- and the fold now leaves precisely such a guard and
+    compiles. Hence the flag: the old failure is expected to be stale, and this
+    is how to find out without giving up the path that is known to work.
+    """
+    import os
+
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_SHAPE_GUARD", "0") == "1"
+
+
+def bucket_matches(entry: tuple,
+                   payload: "torch.Tensor | None" = None) -> bool:
     """Whether this step's padded token count is the one ``entry`` was built for.
 
     A kernel is compiled for exactly one shape, and warmup can only wire one of
@@ -595,6 +639,14 @@ def bucket_matches(entry: tuple) -> bool:
     Missing context or a missing descriptor means "cannot tell", which resolves
     to False -- the caller keeps the path it would have had without any of this.
     """
+    if payload is not None and shape_guard_enabled():
+        # A SymInt comparison, so dynamo discharges it into the ShapeEnv and
+        # #474 gets a guard to partition on. `<=` rather than `==` for the same
+        # reason the fold uses it: a range guard is what the ShapeEnv keeps
+        # cleanly, and the wired bucket is the smallest payload that takes a
+        # kernel, so nothing below it exists to be caught by mistake.
+        return payload.shape[0] <= entry[0]
+
     from vllm.forward_context import (get_forward_context,
                                       is_forward_context_available)
 

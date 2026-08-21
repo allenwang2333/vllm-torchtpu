@@ -64,7 +64,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # the forward context and folds away at trace time; see
         # low_latency_all_reduce.bucket_matches.
         entry = getattr(self, "_ll_entry", None)
-        if entry is not None and _llar.bucket_matches(entry):
+        if entry is not None and _llar.bucket_matches(entry, input_):
             _, op, buffers = entry
             return op(input_, *buffers)
         return super().all_reduce(input_)

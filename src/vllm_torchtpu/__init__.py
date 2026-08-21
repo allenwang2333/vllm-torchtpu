@@ -441,7 +441,8 @@ def _patch_rowparallel_defer_bias() -> None:
             # other buckets this asks for a plain reduction instead. It compares
             # two Python ints out of the forward context and folds away too.
             entry = _llar._ROWPARALLEL_ENTRY
-            if entry is not None and _llar.bucket_matches(entry):
+            if entry is not None and _llar.bucket_matches(
+                    entry, output_parallel):
                 _, op, buffers = entry
                 output = op(output_parallel, *buffers)
             else:
@@ -606,7 +607,7 @@ def _patch_latent_moe_concat_allreduce() -> None:
         # that: two_shot is bandwidth-bound past ~112 KiB and only gets worse.
         variadic = _llar._MOE_VARIADIC_ENTRY
         if (mergeable and variadic is not None
-                and _llar.bucket_matches(variadic)):
+                and _llar.bucket_matches(variadic, shared_output)):
             # One kernel, two operands, no join: each tensor keeps the layout
             # its producer emitted, so the torch.cat below and its two slices
             # disappear entirely. Measured 16.66 vs 17.35 us on the 21 KiB pair
@@ -617,7 +618,7 @@ def _patch_latent_moe_concat_allreduce() -> None:
                                              shared_output.contiguous(),
                                              *buffers)
             fused_output_is_reduced = True
-        elif mergeable and _llar.bucket_matches(entry):
+        elif mergeable and _llar.bucket_matches(entry, shared_output):
             n_latent = fused_output.numel()
             pair = torch.cat(
                 [fused_output.reshape(-1),
