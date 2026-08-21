@@ -42,7 +42,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
-    from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -1269,13 +1269,33 @@ class TPURaidenConnectorWorker:
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
         self.transfer_stats = TpuKVConnectorStats()
+        dist_utils.configure_raiden_telemetry()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
             self.host_ip, self.kv_transfer_port, self.is_producer,
             self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
 
+    def _get_raiden_stats(self):
+        # Get metrics from raiden library
+        try:
+            telemetry = dist_utils.get_raiden_telemetry_module()
+            raiden_samples = {}
+            if telemetry is not None:
+                if hasattr(telemetry, "get_and_reset_metric_samples"):
+                    raiden_samples = telemetry.get_and_reset_metric_samples()
+
+                for metric_name, values in raiden_samples.items():
+                    if metric_name not in self.transfer_stats.data:
+                        self.transfer_stats.data[metric_name] = []
+                    self.transfer_stats.data[metric_name].extend(values)
+        except Exception as e:
+            logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        self._get_raiden_stats()
+
+        # Instrument corresponding queue lengths
         if self.tp_rank == 0:
             if self.is_producer:
                 prefill_queue_len = (len(self._stage3_registered_sends)
@@ -1614,20 +1634,22 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
-        from tpu_raiden.rpc.raiden_controller import \
-            RaidenControllerClientFacade
+        # The reshard surface moved off the Python controller and behind this
+        # client, which fronts the native implementation. The work-unit and
+        # request-block calls below keep the names and arguments they had.
+        from tpu_sync.api.torch.reshard_client import ReshardClient
 
-        return RaidenControllerClientFacade(controller_address)
+        return ReshardClient(controller_address)
 
     @staticmethod
     def _new_raiden_id(fields: dict[str, Any]) -> Any:
-        from tpu_raiden.rpc.raiden_controller import RaidenId
+        from tpu_sync.rpc.raiden_controller import RaidenId
 
         return RaidenId(**fields)
 
     @staticmethod
     def _new_raiden_manager(**kwargs: Any) -> "KVCacheManager":
-        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         return KVCacheManager(**kwargs)
 
@@ -1643,9 +1665,9 @@ class TPURaidenConnectorWorker:
             return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
-        from vllm_torchtpu.distributed.pcp import get_pcp_rank
+        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
-        return int(get_pcp_rank())
+        return int(get_pcp_cache_rank())
 
     def _raiden_interleave_tokens(self, page_tokens: int,
                                   transfer_parallelism: int) -> int:
@@ -2274,7 +2296,7 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _raiden_hbm_memory_type() -> Any:
-        from tpu_raiden.rpc.raiden_controller import RaidenMemoryType
+        from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
         return RaidenMemoryType.HBM
 
