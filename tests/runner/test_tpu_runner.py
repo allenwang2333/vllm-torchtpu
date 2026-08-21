@@ -397,14 +397,16 @@ class TestStartStopPhasedProfiling:
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
             standard_opts={
-                'host_tracer_level': 2,
+                'host_tracer_level': 0,
                 'device_tracer_level': 1,
-                'python_tracer_level': 1
+                'python_tracer_level': 0
             },
             advanced_opts={
-                'tpu_trace_mode': 'TRACE_COMPUTE',
-                'tpu_num_sparse_cores_to_trace': 1,
-                'tpu_num_sparse_core_tiles_to_trace': 1
+                'tpu_trace_mode': 'TRACE_ONLY_XLA',
+                'tpu_num_sparse_cores_to_trace': 0,
+                'tpu_num_sparse_core_tiles_to_trace': 0,
+                'tpu_sc_dma': False,
+                'tpu_num_chips_to_profile_per_task': 1,
             },
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value

@@ -9,14 +9,16 @@ def test_resolve_profile_dir_only():
         "/tmp/base", "my_run_123")
     assert profile_dir == "/tmp/base/my_run_123"
     assert standard == {
-        "host_tracer_level": 2,
+        "host_tracer_level": 0,
         "device_tracer_level": 1,
-        "python_tracer_level": 1,
+        "python_tracer_level": 0,
     }
     assert advanced == {
-        "tpu_trace_mode": "TRACE_COMPUTE",
-        "tpu_num_sparse_cores_to_trace": 1,
-        "tpu_num_sparse_core_tiles_to_trace": 1,
+        "tpu_trace_mode": "TRACE_ONLY_XLA",
+        "tpu_num_sparse_cores_to_trace": 0,
+        "tpu_num_sparse_core_tiles_to_trace": 0,
+        "tpu_sc_dma": False,
+        "tpu_num_chips_to_profile_per_task": 1,
     }
 
 
@@ -27,14 +29,16 @@ def test_resolve_with_options():
     assert standard == {
         "host_tracer_level": 3,
         "device_tracer_level": 1,
-        "python_tracer_level": 1,
+        "python_tracer_level": 0,
     }
     assert advanced == {
         "e2e_true": True,
         "random_str": "hello",
-        "tpu_trace_mode": "TRACE_COMPUTE",
-        "tpu_num_sparse_cores_to_trace": 1,
-        "tpu_num_sparse_core_tiles_to_trace": 1,
+        "tpu_trace_mode": "TRACE_ONLY_XLA",
+        "tpu_num_sparse_cores_to_trace": 0,
+        "tpu_num_sparse_core_tiles_to_trace": 0,
+        "tpu_sc_dma": False,
+        "tpu_num_chips_to_profile_per_task": 1,
     }
 
 
