@@ -37,8 +37,10 @@ def _vllm_config(*,
                  pcp_size: int = 1,
                  interleave_size: int = 16,
                  block_size: int = 16,
-                 mamba_page_size_padded: int | None = None):
+                 mamba_page_size_padded: int | None = None,
+                 architecture: str = "Qwen3_5MoeForConditionalGeneration"):
     return SimpleNamespace(
+        model_config=SimpleNamespace(architecture=architecture),
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
             cp_kv_cache_interleave_size=interleave_size,
@@ -160,6 +162,19 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
         assert torch.all(z == 2)
+
+    def test_get_kv_cache_spec_declares_the_pool_conv_dtype(self):
+        attn = _qwen35_397b_gdn_attn(
+            "language_model.model.layers.0.linear_attn")
+        # The op keeps the conv state in fp32, but the pool stores bf16 rows.
+        attn.get_state_dtype = lambda: (torch.float32, torch.float32)
+
+        pooled = attn.get_kv_cache_spec(_vllm_config())
+        separate = attn.get_kv_cache_spec(
+            _vllm_config(architecture="KimiLinearForCausalLM"))
+
+        assert pooled.dtypes[0] == torch.bfloat16
+        assert separate.dtypes[0] == torch.float32
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(

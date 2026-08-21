@@ -40,6 +40,8 @@ from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    pooled_gdn_state_dtypes, unified_kv_layout_enabled)
 
 
 def gdn_attention_core_tpu(
@@ -290,6 +292,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
+        if unified_kv_layout_enabled(vllm_config):
+            # Pooled state lives in the attention page at the kernel's fixed
+            # dtypes; the declared ones only budget that page, so declaring
+            # the op's fp32 conv would reserve twice the conv region.
+            spec = dataclasses.replace(spec, dtypes=pooled_gdn_state_dtypes())
         return _localize_gdn_mamba_spec_for_pcp(spec,
                                                 _get_pcp_size(vllm_config))
 

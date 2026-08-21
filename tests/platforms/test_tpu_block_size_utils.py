@@ -86,6 +86,13 @@ class FakeCompactMambaModel:
         return (torch.bfloat16, torch.float32)
 
 
+class FakeFp32ConvMambaModel(FakeCompactMambaModel):
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.float32, torch.float32)
+
+
 class FakeNonShardingMambaModel(FakeQwenMambaModel):
 
     @staticmethod
@@ -188,6 +195,17 @@ def test_fit_has_no_fixed_16_token_alignment(vllm_config):
 
     assert vllm_config.cache_config.block_size == 257
     assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
+
+
+def test_page_ignores_the_declared_conv_dtype(vllm_config):
+    """The pool stores bf16 conv rows whatever the model class declares."""
+    _configure_hybrid(vllm_config)
+
+    _update(vllm_config,
+            backend_cls=FakePlainAttentionBackend,
+            model_cls=FakeFp32ConvMambaModel)
+
+    assert vllm_config.cache_config.block_size == 257
 
 
 def test_user_block_size_below_fit_is_promoted(vllm_config):

@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_ARCHITECTURES,
+                                           POOLED_GDN_CONV_STATE_DTYPE,
+                                           POOLED_GDN_SSM_STATE_DTYPE,
                                            PooledGDNStateLayout,
                                            derive_pooled_gdn_state_layout)
 from vllm_torchtpu.logger import init_logger
@@ -33,6 +35,18 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     if override is not None:
         return override
     return vllm_config.model_config.architecture in POOLED_GDN_ARCHITECTURES
+
+
+def pooled_gdn_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
+    """The pool's fixed GDN state dtypes, as torch dtypes.
+
+    `gdn_pool_layout` names them as strings so it stays importable without
+    torch; torch-side consumers of pool bytes resolve them here.
+    """
+    conv, ssm = (getattr(torch, name.removeprefix("torch."))
+                 for name in (POOLED_GDN_CONV_STATE_DTYPE,
+                              POOLED_GDN_SSM_STATE_DTYPE))
+    return conv, ssm
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
@@ -118,7 +132,10 @@ def _hybrid_mamba_state_layout(
         model_config.architecture,
         model_config=model_config,
     )
-    dtypes = tuple(model_cls.get_mamba_state_dtype_from_config(vllm_config))
+    # The pool stores the state at the kernel's fixed dtypes, not at the ones
+    # the model class declares; sizing the page from the declaration budgets a
+    # region the kernel never uses.
+    dtypes = pooled_gdn_state_dtypes()
     full_shapes = tuple(
         model_cls.get_mamba_state_shape_from_config(vllm_config))
     parallel_config = vllm_config.parallel_config
