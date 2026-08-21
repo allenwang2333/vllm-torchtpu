@@ -90,6 +90,7 @@ def _main_kernel(
     num_column_partitions: int,
     blocks_per_row_partition: int,
     topk: int,
+    skip_compute: bool = False,
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -129,13 +130,14 @@ def _main_kernel(
         # Scatter-add below reads the previous accumulator value, so initialize
         # the complete dense destination block first.  This also supplies zeros
         # for tokens with no local route.
-        def zero_column(col_offset):
-            col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-            zero = jnp.zeros((_TOKEN_SUBCHUNK, ), jnp.float32)
-            for token_row in range(_TOKEN_BLOCK):
-                accum_vmem_ref[token_row, col_slice] = zero
+        if not skip_compute:
+            def zero_column(col_offset):
+                col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                zero = jnp.zeros((_TOKEN_SUBCHUNK, ), jnp.float32)
+                for token_row in range(_TOKEN_BLOCK):
+                    accum_vmem_ref[token_row, col_slice] = zero
 
-        plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(zero_column)
+            plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(zero_column)
 
         def route_indices_slice(route_chunk):
             start = route_chunk * _TOKEN_SUBCHUNK
@@ -158,6 +160,9 @@ def _main_kernel(
             out_specs=(),
         )
         def route_pipeline(gather_ref):
+            if skip_compute:
+                return
+
             route_chunk = pl.program_id(0)
             metadata_start = route_chunk * _TOKEN_SUBCHUNK
             metadata_slice = pl.ds(metadata_start, _TOKEN_SUBCHUNK)
@@ -266,21 +271,22 @@ def _main_kernel(
                 token_subchunk = token_subchunk_pair * 2 + output_buffer
                 accum_row_start = token_subchunk * _TOKEN_SUBCHUNK
 
-                def cast_column(col_offset):
-                    col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-                    for token_lane in range(0, _TOKEN_SUBCHUNK, 2):
-                        accum_row = accum_row_start + token_lane
-                        packed_bf16 = plsc.pack(
-                            accum_vmem_ref[accum_row, col_slice],
-                            accum_vmem_ref[accum_row + 1, col_slice],
-                            format=plsc.PackFormat.INTERLEAVED,
-                        )
-                        out_tile_vmem_ref[output_buffer, token_lane // 2,
-                                          col_slice] = (plsc.bitcast(
-                                              packed_bf16, jnp.uint32))
+                if not skip_compute:
+                    def cast_column(col_offset):
+                        col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                        for token_lane in range(0, _TOKEN_SUBCHUNK, 2):
+                            accum_row = accum_row_start + token_lane
+                            packed_bf16 = plsc.pack(
+                                accum_vmem_ref[accum_row, col_slice],
+                                accum_vmem_ref[accum_row + 1, col_slice],
+                                format=plsc.PackFormat.INTERLEAVED,
+                            )
+                            out_tile_vmem_ref[output_buffer, token_lane // 2,
+                                              col_slice] = (plsc.bitcast(
+                                                  packed_bf16, jnp.uint32))
 
-                plsc.parallel_loop(0, col_size,
-                                   step=_TOKEN_SUBCHUNK)(cast_column)
+                    plsc.parallel_loop(0, col_size,
+                                       step=_TOKEN_SUBCHUNK)(cast_column)
 
                 output_row = (global_block_id * _TOKEN_BLOCK +
                               token_subchunk * _TOKEN_SUBCHUNK)
@@ -307,15 +313,33 @@ def _main_kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size", ))
+@functools.partial(
+    jax.jit,
+    static_argnames=("reduce_group_size", "num_sparse_cores", "skip_compute"),
+)
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    num_sparse_cores: int = 1,
+    skip_compute: bool = False,
 ) -> jax.Array:
-    """Destination-major prototype for MoE output combine."""
+    """Destination-major prototype for MoE output combine.
+
+    Args:
+        x: Gather activation buffer of shape (num_source_rows, hidden_size).
+        indices: Gather indices of shape (num_routes,).
+        topk_weights: Routing weights of shape (num_routes,).
+        valid_rows_mask: Boolean validity mask of shape (num_routes,).
+        reduce_group_size: Number of routes per destination token (topk).
+        num_sparse_cores: Number of physical SparseCores to utilize (default: 1).
+        skip_compute: If True, skips ALU compute and only executes HBM reads/writes.
+
+    Returns:
+        Reduced output tensor of shape (num_tokens, hidden_size).
+    """
     sc_info = pltpu.get_tpu_info().sparse_core
     if (sc_info is None or x.dtype != jnp.bfloat16
             or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0):
@@ -345,7 +369,9 @@ def ragged_gather_reduce(
     if x.shape[0] % 2:
         x = jnp.pad(x, ((0, 1), (0, 0)))
     num_tokens = input_size // reduce_group_size
-    num_cores = sc_info.num_cores * sc_info.num_subcores
+    target_num_sc_cores = (min(num_sparse_cores, sc_info.num_cores)
+                           if num_sparse_cores is not None else 1)
+    num_cores = target_num_sc_cores * sc_info.num_subcores
     num_lanes = pltpu.get_tpu_info().num_lanes
     hidden_size = x.shape[-1]
     if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
@@ -420,7 +446,7 @@ def ragged_gather_reduce(
     col_size = hidden_size // num_column_partitions
     blocks_per_row_partition = num_blocks // num_row_partitions
     vector_mesh = plsc.VectorSubcoreMesh(
-        num_cores=sc_info.num_cores,
+        num_cores=target_num_sc_cores,
         num_subcores=sc_info.num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
@@ -434,6 +460,7 @@ def ragged_gather_reduce(
             num_column_partitions=num_column_partitions,
             blocks_per_row_partition=blocks_per_row_partition,
             topk=reduce_group_size,
+            skip_compute=skip_compute,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size),
                                       jnp.bfloat16),
