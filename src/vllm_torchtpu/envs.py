@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_XPROF_RANK: int = -1
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
@@ -277,6 +278,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER":
     env_bool("USE_PHASED_PROFILER"),
+    # Restrict TPU trace collection to one slice-global worker rank. A negative
+    # value preserves the default behavior of profiling every worker.
+    "TPU_XPROF_RANK":
+    lambda: int(os.getenv("TPU_XPROF_RANK") or "-1"),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

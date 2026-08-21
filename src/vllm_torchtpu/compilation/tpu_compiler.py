@@ -50,6 +50,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
+    "TPU_XPROF_RANK",
     "USE_PHASED_PROFILER",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.

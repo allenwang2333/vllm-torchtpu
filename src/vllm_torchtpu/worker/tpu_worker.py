@@ -510,6 +510,15 @@ class TPUWorker(WorkerBase):
     def profile(self,
                 is_start: bool = True,
                 profile_prefix: str | None = None):
+        xprof_rank = envs.TPU_XPROF_RANK
+        if xprof_rank >= 0 and self.profile_rank != xprof_rank:
+            if is_start:
+                logger.info(
+                    "Skipping TPU profiler on rank %d; TPU_XPROF_RANK=%d.",
+                    self.profile_rank,
+                    xprof_rank,
+                )
+            return
         if envs.USE_PHASED_PROFILER:
             # A phased run captures one trace per inference phase rather than
             # a single continuous one, driven from TPUModelRunner since phase
