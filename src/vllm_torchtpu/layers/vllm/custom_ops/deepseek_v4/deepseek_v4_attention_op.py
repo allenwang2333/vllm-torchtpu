@@ -84,7 +84,7 @@ def _run_swa(
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(2, 2, 2),
         num_queries_per_block=(1, 32, 32),
-        q_compute_block_size=2,
+        q_compute_block_size=4,
         unnormalized_output=not swa_only,
     )
 
