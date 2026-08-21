@@ -14,7 +14,7 @@
 """Tests for the per-rank Run:AI aux-file pull (runai_repull)."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -170,3 +170,10 @@ def test_v2_separate_tokenizer_dir_missing_is_reported(cache_root):
     messages = [str(c.args[0]) % c.args[1:] for c in log.error.call_args_list]
     assert any("[runai-repull] tokenizer dir" in m and missing_tok in m
                for m in messages), messages
+
+
+def test_noop_for_mock_model_config():
+    # TPUWorker unit tests construct the worker with MagicMock configs.
+    cfg = MagicMock()
+    ensure_runai_aux_files(cfg)
+    cfg.maybe_pull_model_tokenizer_for_runai.assert_not_called()
