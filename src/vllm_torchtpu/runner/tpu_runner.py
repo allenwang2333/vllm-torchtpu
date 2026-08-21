@@ -3219,23 +3219,6 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
-        if self.phase_based_profiler:
-            self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings,
-                scheduler_output.total_num_scheduled_tokens)
-            batch_composition_stats = runner_utils.get_batch_composition_stats(
-                batch_id=self.batch_counter,
-                input_batch=self.input_batch,
-                total_num_scheduled_tokens=scheduler_output.
-                total_num_scheduled_tokens,
-                num_reqs=self.input_batch.num_reqs,
-                padded_total_num_scheduled_tokens=padded_total_tokens,
-                scheduler_output=scheduler_output,
-            )
-            self.phase_based_profiler.step(batch_composition_stats)
-
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
         # all scheduled tokens (req order); mm_embeds_flat is the concatenated
@@ -3271,6 +3254,29 @@ class TPUModelRunner(GPUModelRunner):
         # and the coordinated chunk count from this one all-reduce is the shared
         # bound — no additional draft-side collective is needed.
         self._dp_step_num_chunks = target_num_chunks
+
+        # Profile only after the DP-wide token bucket is known, so a rank-local
+        # decode batch cannot be mislabeled when another DP rank is prefilling.
+        if self.phase_based_profiler:
+            self.batch_counter += 1
+            padded_total_tokens = _get_padded_token_len(
+                self.num_tokens_paddings,
+                scheduler_output.total_num_scheduled_tokens)
+            batch_composition_stats = runner_utils.get_batch_composition_stats(
+                batch_id=self.batch_counter,
+                input_batch=self.input_batch,
+                total_num_scheduled_tokens=scheduler_output.
+                total_num_scheduled_tokens,
+                num_reqs=self.input_batch.num_reqs,
+                padded_total_num_scheduled_tokens=padded_total_tokens,
+                scheduler_output=scheduler_output,
+            )
+            batch_composition_stats[
+                "dp_padded_total_num_scheduled_tokens"] = (
+                    self._dp_target_bucket
+                    if self._dp_target_bucket is not None else
+                    padded_total_tokens)
+            self.phase_based_profiler.step(batch_composition_stats)
 
         start_index = 0
         chunk_index = 0

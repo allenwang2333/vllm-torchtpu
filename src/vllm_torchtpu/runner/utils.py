@@ -24,6 +24,11 @@ BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+PHASED_PROFILER_DECODE_ONLY_MIN_REQS = max(
+    0, int(os.getenv("TPU_XPROF_DECODE_MIN_REQS") or "0"))
+PHASED_PROFILER_DECODE_ONLY_MAX_DP_BUCKET = max(
+    0, int(os.getenv("TPU_XPROF_DECODE_MAX_DP_BUCKET") or "0"))
+TPU_XPROF_CAPTURE_CPU = os.getenv("TPU_XPROF_CAPTURE_CPU", "0") == "1"
 
 # Tuning knob with no `profiler_config` equivalent, so it stays in
 # `additional_config`.
@@ -161,6 +166,10 @@ class PhaseBasedProfiler:
         # Wait for KV cache to reach a certain length before profiling decode-only phase
         # to ensure we capture traces of longer, steady-state context lengths.
         self.decode_kv_len_threshold: int = decode_kv_len_threshold
+        self.decode_min_reqs: int = (
+            PHASED_PROFILER_DECODE_ONLY_MIN_REQS)
+        self.decode_max_dp_bucket: int = (
+            PHASED_PROFILER_DECODE_ONLY_MAX_DP_BUCKET)
         self.standard_opts = standard_opts or {}
         self.advanced_opts = advanced_opts or {}
         self.profile_dir: str = profile_dir
@@ -191,6 +200,16 @@ class PhaseBasedProfiler:
                 "Will skip decode-only steps until min KV len >= %d.",
                 self.decode_kv_len_threshold,
             )
+        if self.decode_min_reqs > 0:
+            logger.info(
+                "Will skip decode-only steps until num requests >= %d.",
+                self.decode_min_reqs,
+            )
+        if self.decode_max_dp_bucket > 0:
+            logger.info(
+                "Will skip decode-only steps until DP bucket <= %d.",
+                self.decode_max_dp_bucket,
+            )
 
     def _write_batch_composition_stats_to_file_helper(
             self, batch_composition_stats: dict) -> None:
@@ -215,6 +234,54 @@ class PhaseBasedProfiler:
         return profiler_trace.resolve_canonical_dst_ts(phase_dir,
                                                        self.worker_rank)
 
+    def _start_capture(self, capture_name: str,
+                       batch_composition_stats: dict) -> bool:
+        """Open one named TPU trace capture."""
+        self.current_phase = capture_name
+        logger.info("Starting profiling for %s", capture_name)
+        logger.info("Batch composition stats: %s", batch_composition_stats)
+        capture_dir = os.path.join(self.profile_dir, capture_name)
+        os.makedirs(capture_dir, exist_ok=True)
+
+        self._canonical_dst_ts = self._resolve_canonical_dst_ts(capture_dir)
+        self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
+            capture_dir, self.worker_rank)
+        os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
+
+        self._write_batch_composition_stats_to_file_helper(
+            batch_composition_stats)
+
+        handler = torch.profiler.tensorboard_trace_handler(
+            dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
+        config = TpuProfilerConfig(
+            run_dir=self.profile_dir_with_phase_suffix,
+            host_tracer_level=self.standard_opts["host_tracer_level"],
+            device_tracer_level=self.standard_opts["device_tracer_level"],
+            python_tracer_level=self.standard_opts["python_tracer_level"],
+            experimental_options=self.advanced_opts,
+        )
+        activities = [torch.profiler.ProfilerActivity.PrivateUse1]
+        if TPU_XPROF_CAPTURE_CPU:
+            activities.insert(0, torch.profiler.ProfilerActivity.CPU)
+        self.profile_context = torch.profiler.profile(
+            activities=activities,
+            on_trace_ready=handler,
+            experimental_config=config,
+        )
+        try:
+            # Model execution is asynchronous. Drain work submitted by the
+            # preceding host batches before enabling the device profiler so a
+            # phase capture cannot inherit TPU work from an earlier phase.
+            torch.tpu.synchronize()
+            self.profile_context.__enter__()
+        except Exception as e:
+            logger.error("Failed to start PyTorch profiler: %s", e)
+            self.profile_context = None
+            self.current_phase = ""
+            self.profiling_n_steps_left = 0
+            return False
+        return True
+
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """Starts profiling if the current phase is unseen."""
         current_determined_phase = determine_phase_from_batch_composition_stats(
@@ -232,6 +299,27 @@ class PhaseBasedProfiler:
                     self.num_decode_steps_to_skip,
                 )
                 break
+
+            if (phase == InferencePhase.DECODE_ONLY
+                    and self.decode_min_reqs > 0):
+                num_reqs = batch_composition_stats.get("num_reqs", 0)
+                if num_reqs < self.decode_min_reqs:
+                    logger.debug(
+                        "Skipping decode-only step as num requests %d < %d.",
+                        num_reqs, self.decode_min_reqs)
+                    break
+
+            if (phase == InferencePhase.DECODE_ONLY
+                    and self.decode_max_dp_bucket > 0):
+                dp_bucket = batch_composition_stats.get(
+                    "dp_padded_total_num_scheduled_tokens",
+                    batch_composition_stats.get(
+                        "padded_total_num_scheduled_tokens", 0))
+                if dp_bucket > self.decode_max_dp_bucket:
+                    logger.debug(
+                        "Skipping decode-only step as DP bucket %d > %d.",
+                        dp_bucket, self.decode_max_dp_bucket)
+                    break
 
             if (phase == InferencePhase.DECODE_ONLY
                     and self.decode_kv_len_threshold >= 0):
