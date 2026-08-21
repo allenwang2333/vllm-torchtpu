@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""SparseCore custom Pallas kernels."""
+
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import ragged_gather_reduce_v4
+
+__all__ = ["ragged_gather_reduce_v4"]
