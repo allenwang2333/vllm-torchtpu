@@ -892,6 +892,7 @@ class TpuPlatform(Platform):
                 min_token_size=16,
                 max_token_size=scheduler_config.max_num_batched_tokens,
                 extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+                override_bucket_sizes=envs.TPU_TOKEN_BUCKET_OVERRIDES,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -1220,17 +1221,28 @@ def _get_exponential_token_paddings(min_token_size: int,
 def _get_token_paddings(
         min_token_size: int,
         max_token_size: int,
-        extra_bucket_sizes: list[int] | None = None) -> list[int]:
+        extra_bucket_sizes: list[int] | None = None,
+        override_bucket_sizes: list[int] | None = None) -> list[int]:
     """Generate a list of padding size, starting from min_token_size,
     ending with a number that can cover max_token_size.
 
-    ``extra_bucket_sizes`` are merged into the list.
+    ``extra_bucket_sizes`` are merged into the default exponential list.
+    When ``override_bucket_sizes`` is set, it replaces that list and extras.
+    Values above ``max_token_size`` are dropped, and ``max_token_size`` is
+    always retained so every scheduled token count can be padded safely.
     """
     # assert min_token_size is power of 2
     assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
 
-    paddings = _get_exponential_token_paddings(min_token_size, max_token_size)
-    if extra_bucket_sizes:
+    if override_bucket_sizes:
+        paddings = sorted({
+            size
+            for size in override_bucket_sizes if 0 < size < max_token_size
+        } | {max_token_size})
+    else:
+        paddings = _get_exponential_token_paddings(min_token_size,
+                                                   max_token_size)
+    if extra_bucket_sizes and not override_bucket_sizes:
         paddings = sorted(
             set(paddings)
             | {

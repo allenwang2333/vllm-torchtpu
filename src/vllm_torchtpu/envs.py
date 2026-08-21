@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_OVERRIDES: list[int] | None = None
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
@@ -359,6 +360,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Replace the default exponential token buckets. Entries above the run's
+    # max token size are ignored, and the max token size is always included.
+    "TPU_TOKEN_BUCKET_OVERRIDES":
+    lambda: [
+        int(v)
+        for v in os.getenv("TPU_TOKEN_BUCKET_OVERRIDES", "").split(",")
+        if v.strip()
+    ] or None,
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),

@@ -28,9 +28,29 @@ import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TpuPlatform,
-    _validate_phased_profiling_config, get_tpu_multihost_topology)
+    _get_token_paddings, _validate_phased_profiling_config,
+    get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
+
+
+def test_token_bucket_overrides_replace_defaults_and_extras():
+    overrides = [16, 128, 4096, 16384]
+
+    assert _get_token_paddings(
+        min_token_size=16,
+        max_token_size=4096,
+        extra_bucket_sizes=[4, 8, 48],
+        override_bucket_sizes=overrides,
+    ) == [16, 128, 4096]
+
+
+def test_token_bucket_overrides_always_include_local_max():
+    assert _get_token_paddings(
+        min_token_size=16,
+        max_token_size=2048,
+        override_bucket_sizes=[16, 128, 4096, 16384],
+    ) == [16, 128, 2048]
 
 
 def test_pcp_v2_validation_skips_gpu_only_checks(monkeypatch):
