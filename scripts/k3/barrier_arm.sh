@@ -52,12 +52,20 @@ for rep in 1 2 3; do
     "${REPO_ROOT}/scripts/k3/concurrency_sweep.sh" 2>&1 | tail -12
   # The sweep tool exits 0 with "completed":0 when the endpoint refuses the
   # connection, so its exit status proves nothing. Read the result instead.
-  for res in "${OUT}/sweep-r${rep}"/*.json; do
-    [[ -e "${res}" ]] || continue
+  # Glob c<digits>.json, not *.json: the sweep directory also holds
+  # canary.json and canary-request.json, which have no "completed" key, so a
+  # bare *.json glob reads 0 out of them and fails a passing run. That is
+  # exactly what it did to job 302, which had completed=5 failed=0
+  # tpot_med=14.6425 and was aborted anyway.
+  shopt -s nullglob
+  for res in "${OUT}/sweep-r${rep}"/c[0-9]*.json; do
     python3 -c "
 import json, sys
 d = json.load(open('${res}'))
-done_, failed = d.get('completed', 0), d.get('failed', 0)
+if 'completed' not in d:
+    print(f'  ${res##*/}: no completed key, skipping')
+    sys.exit(0)
+done_, failed = d['completed'], d.get('failed', 0)
 print(f'  ${res##*/}: completed={done_} failed={failed} '
       f'tpot_med={d.get(\"median_tpot_ms\")}')
 sys.exit(0 if done_ > 0 and failed == 0 else 5)
