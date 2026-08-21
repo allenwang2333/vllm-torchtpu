@@ -17,6 +17,17 @@ WORKDIR /workspace/vllm-torchtpu
 # Copy pyproject.toml to extract dependencies and read settings
 COPY pyproject.toml .
 
+# Which upstream vLLM commit to build against.
+#
+# Empty -- the default, and what every normal build uses -- keeps the last
+# known good (LKG) ref already pinned in pyproject.toml. Only the integration
+# pipeline passes a ref here, so it can test vLLM main HEAD without committing
+# a new pin. vllm_pin.sh rewrites pyproject.toml in-image so every
+# `uv pip install` below resolves the same vLLM.
+ARG VLLM_COMMIT_HASH=""
+COPY docker/vllm_pin.sh docker/vllm_pin.sh
+RUN bash docker/vllm_pin.sh write "${VLLM_COMMIT_HASH}"
+
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -35,6 +46,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
       -r pyproject.toml
+
+# Record how to identify the vLLM that actually landed in the image, so CI can
+# prove the image holds the vLLM it asked for instead of trusting the tag
+# (verify_image_vllm). Per PEP 610 an installer records a git dependency's
+# origin in direct_url.json, but whether it keeps the requested ref, the
+# resolved commit, or both is installer-specific -- so write every identifier,
+# one per line, and let the verifier match any of them.
+RUN python3 -c "import importlib.metadata as m, json; d = m.distribution('vllm'); r = d.read_text('direct_url.json'); i = json.loads(r).get('vcs_info', {}) if r else {}; print(chr(10).join(filter(None, [i.get('requested_revision'), i.get('commit_id'), d.version])))" \
+      > /etc/vllm-revision && cat /etc/vllm-revision
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -73,6 +93,12 @@ ENV VLLM_TARGET_DEVICE="empty"
 # It installs testing and benchmarking tools in editable mode.
 FROM ci AS dev
 COPY . .
+# `COPY . .` restores the repo's own pyproject.toml, undoing the base-stage pin
+# rewrite. Re-apply it, or the editable install below would resolve vLLM back
+# to the committed LKG ref and quietly downgrade an upstream-HEAD build.
+# No-op for normal builds, where VLLM_COMMIT_HASH is empty.
+ARG VLLM_COMMIT_HASH=""
+RUN bash docker/vllm_pin.sh write "${VLLM_COMMIT_HASH}"
 # Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step. With a
 # cold uv cache, resolving ".[...]" rebuilds metadata for the vllm git
@@ -106,6 +132,9 @@ CMD ["/bin/bash"]
 FROM base AS prod
 WORKDIR /workspace/vllm-torchtpu
 COPY . .
+# See the dev stage: `COPY . .` undoes the base-stage pin rewrite.
+ARG VLLM_COMMIT_HASH=""
+RUN bash docker/vllm_pin.sh write "${VLLM_COMMIT_HASH}"
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
     uv pip install --system .

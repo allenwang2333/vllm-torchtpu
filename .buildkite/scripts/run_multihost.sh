@@ -58,12 +58,16 @@ if [ -f /etc/environment ]; then
   source /etc/environment || true
 fi
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${VLLM_TORCHTPU_IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/configs/pipeline_config.sh"
+
+# Honours VLLM_TORCHTPU_IMAGE_TAG; otherwise this repo's commit + the build's
+# vLLM ref, matching what the build step pushed.
+IMAGE_TAG="$(ci_image_tag)"
+
 RUN_CLUSTER="${REPO_DIR}/scripts/multihost/run_cluster.sh"
 RUN_CLUSTER_MP="${REPO_DIR}/scripts/multihost/run_cluster_mp.sh"
 

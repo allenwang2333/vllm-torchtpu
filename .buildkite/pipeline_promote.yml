@@ -1,0 +1,37 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Uploaded only by the integration pipeline, which builds vLLM main HEAD
+# instead of the pinned LKG. If the whole suite passes on that vLLM, this step
+# promotes it into the pin in pyproject.toml on main, and every other pipeline
+# picks it up from there.
+#
+# Report-only until LKG_PROMOTE_PUSH=1: it logs the promotion it would make and
+# commits nothing. See update_lkg_version.sh.
+
+steps:
+  # Gate on every step uploaded before this one. A promotion is only as
+  # trustworthy as the suite that preceded it.
+  - wait: ~
+
+  # Runs on the cpu queue because those agents have the GitHub App git
+  # credential helper installed, so once pushing is enabled `git push`
+  # authenticates with a short-lived installation token and needs no secret
+  # handling here.
+  - label: ":arrow_up: Promote vLLM to Last Known Good (LKG)"
+    key: "promote_lkg"
+    agents:
+      queue: cpu
+    commands:
+      - bash .buildkite/scripts/update_lkg_version.sh

@@ -86,9 +86,22 @@ fi
 
 echo "--- Starting Buildkite Bootstrap"
 
+# Resolve the vLLM commit this build tests, once, and publish it so the build
+# step and every downstream test step agree. Defaults to the LKG ref pinned in
+# pyproject.toml; the integration pipeline resolves vLLM main HEAD instead.
+publish_vllm_ref
+
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.
+
+# Uploaded first so it lands last, after every test step it gates on. Only the
+# pipeline that tests upstream HEAD can promote: the LKG pin may only advance
+# to a commit that this build actually tested.
+if tracks_vllm_head; then
+  echo "Uploading LKG Promotion Pipeline"
+  upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
+fi
 
 echo "Uploading Perf and Eval Pipeline"
 upload_with_priority .buildkite/pipeline_perf.yml "$JOB_PRIORITY"

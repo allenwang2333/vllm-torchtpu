@@ -32,11 +32,15 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/configs/pipeline_config.sh"
+
+# Tagged with this repo's commit AND the build's vLLM ref, so this step pulls
+# the exact image the build step produced.
+IMAGE_TAG="$(ci_image_tag)"
+
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 

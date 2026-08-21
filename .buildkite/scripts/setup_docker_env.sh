@@ -16,16 +16,24 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/configs/pipeline_config.sh"
+
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
+VLLM_REF="$(build_vllm_ref)"
+IMAGE_TAG="$(ci_image_tag)"
 
-echo "--- Building Docker Image: ${IMAGE_TAG}"
+echo "--- Building Docker Image: ${IMAGE_TAG} (vLLM ${VLLM_REF})"
 # Run the existing build_image.sh script with target dev
-./docker/build_image.sh --target dev -t "${IMAGE_TAG}"
+./docker/build_image.sh --target dev -t "${IMAGE_TAG}" --vllm-ref "${VLLM_REF}"
+
+# Prove the image holds the vLLM this build resolved before anything is pushed,
+# tested against, or promoted off the back of it.
+echo "--- Verifying the built image contains vLLM ${VLLM_REF}"
+verify_image_vllm "${IMAGE_TAG}" "${VLLM_REF}"
 
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"

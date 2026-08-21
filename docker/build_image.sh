@@ -11,11 +11,17 @@ set -e
 #
 # 3. Build with local vLLM source:
 #    ./docker/build_image.sh -s /path/to/vllm/source
+#
+# 4. Build against a specific upstream vLLM commit instead of the ref pinned in
+#    pyproject.toml (used by the integration CI pipeline):
+#    ./docker/build_image.sh --vllm-ref 752a3a504485790a2e8491cacbb35c137339ad34
 
 # Default values
 IMAGE_TAG="vllm-torchtpu-local"
 BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 VLLM_SOURCE=""
+# Empty means "use the vLLM ref pinned in pyproject.toml" (see docker/vllm_pin.sh).
+VLLM_REF=""
 TARGET="prod"
 
 # Parse arguments
@@ -33,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       VLLM_SOURCE="$2"
       shift 2
       ;;
+    -r|--vllm-ref)
+      VLLM_REF="$2"
+      shift 2
+      ;;
     --target)
       TARGET="$2"
       shift 2
@@ -47,6 +57,7 @@ done
 echo "===> Building vllm-torchtpu image..."
 echo "Image Tag: $IMAGE_TAG"
 echo "Base Image: $BASE_IMAGE"
+echo "vLLM Ref: ${VLLM_REF:-<pinned in pyproject.toml>}"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +106,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
+  --build-arg VLLM_COMMIT_HASH="${VLLM_REF}" \
 )
 
 if [ -n "${ACCESS_TOKEN:-}" ]; then

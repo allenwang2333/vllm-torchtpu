@@ -32,6 +32,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
+# Dev builds always test the LKG vLLM pinned in pyproject.toml — they exist to
+# debug this repo, not upstream. Set VLLM_COMMIT_HASH_OVERRIDE in the build's
+# env to try a different vLLM without editing the pin.
+publish_vllm_ref
+
 # Dev builds are experiments — they must never outrank real CI on a shared
 # queue. Default to PRIORITY_DEFAULT (1); override per build with
 # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.

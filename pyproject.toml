@@ -25,7 +25,15 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # Note: we **intentionally** build vllm from source, see README.
-    # vllm==0.27.0 is required for Kimi K3 compatibility
+    #
+    # This ref is the vLLM "last known good" (LKG): the newest upstream commit
+    # that passed our full suite. It is the single source of truth -- CI, the
+    # prod image and a plain `pip install` all resolve vLLM from this line.
+    # The integration pipeline advances it automatically on green; see
+    # .buildkite/README.md. Edit it via docker/vllm_pin.sh rather than by hand,
+    # and keep the line's shape intact -- CI parses it.
+    #
+    # Pinned to v0.27.0 for Kimi K3 compatibility until the first promotion.
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
