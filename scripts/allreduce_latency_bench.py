@@ -63,8 +63,9 @@ def _parse_args(argv=None):
         "so (2,3584) and (16,1024) are the same 14/16 KiB but not the same "
         "amount of parallelism.")
     p.add_argument("--impls",
-                   default="xla,oneshot,twoshot",
-                   help="Comma-separated subset of xla,oneshot,twoshot.")
+                   default="xla,twoshot_ws,twoshot_ws_nb",
+                   help="Comma-separated subset of xla, twoshot_ws, "
+                   "twoshot_ws_nb, twoshot_ws_rs.")
     # No --profile-dir here: jax.profiler.trace segfaults in this venv
     # ("Unexpected PLUGIN_Profiler_Api size: expected 80, got 104" -- libtpu
     # 0.0.44.1 against xprof 2.22.3). For device self time per op, which is
@@ -168,21 +169,15 @@ def build_mesh(num_devices: int) -> Mesh:
 
 
 def make_op(impl: str, num_devices: int):
-    """Returns a fn mapping a local shard to its all-reduced value."""
+    """Returns a fn mapping a local shard to its all-reduced value.
+
+    Only the XLA reference survives here. The stateless `oneshot`, `oneshot_sb`
+    and `twoshot` arms went with their kernels; every kernel arm below is a
+    workspace kernel and is built in make_chain instead, because the workspace
+    has to be threaded across the whole chain rather than per op.
+    """
     if impl == "xla":
         return lambda v: jax.lax.psum(v, axis_name=AXIS)
-    if impl == "oneshot":
-        return lambda v: llar.one_shot_all_reduce(
-            v, axis_name=AXIS, num_devices=num_devices)
-    if impl == "oneshot_sb":
-        # Diagnostic only: drops the second (re-entrancy) barrier to expose how
-        # much of the kernel's floor is barrier cost rather than data movement.
-        # NOT safe to ship as-is -- see the kernel docstring.
-        return lambda v: llar.one_shot_all_reduce(
-            v, axis_name=AXIS, num_devices=num_devices, double_barrier=False)
-    if impl == "twoshot":
-        return lambda v: llar.two_shot_all_reduce(
-            v, axis_name=AXIS, num_devices=num_devices)
     raise ValueError(f"unknown impl {impl!r}")
 
 
@@ -236,24 +231,6 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
                     v,
                     rs,
                     ag,
-                    step,
-                    axis_name=AXIS,
-                    num_devices=num_devices,
-                    steady_barrier=steady)
-                v = v * scale
-            return v[None]
-    elif impl in ("oneshot_ws", "oneshot_ws_nb"):
-        steady = impl == "oneshot_ws"
-
-        # Persistent workspace threaded call-to-call; that liveness is what
-        # lets the kernel barrier after its sends instead of before.
-        def body(local_x):
-            v = local_x[0]
-            ws, step = llar.make_workspace(v.shape, v.dtype, num_devices)
-            for _ in range(n_ops):
-                v, ws, step = llar.one_shot_all_reduce_ws(
-                    v,
-                    ws,
                     step,
                     axis_name=AXIS,
                     num_devices=num_devices,
@@ -406,9 +383,8 @@ def main():
                     if not ARGS.no_verify:
                         err = (verify_chain(impl, mesh, num_devices, x_dev,
                                             ARGS.iters_lo) if impl
-                               in ("oneshot_ws", "oneshot_ws_nb", "twoshot_ws",
-                                   "twoshot_ws_nb") else verify(
-                                       impl, mesh, num_devices, x_dev))
+                               in ("twoshot_ws", "twoshot_ws_nb") else verify(
+                                   impl, mesh, num_devices, x_dev))
                         # bfloat16 sums N-1 peers in a different order than
                         # psum, and that drift grows with rounds and devices
                         # (0.02 at 8 devices, 0.05 at 32). A fixed threshold

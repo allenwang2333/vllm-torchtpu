@@ -84,100 +84,50 @@ def _replicated_spec():
 
 
 # Dispatch thresholds in bytes, read off the measured sweep in
-# docs/low_latency_allreduce.md (bfloat16, cols=1024). Both kernels lose to
-# XLA's ring once the payload is large enough for bandwidth to dominate hop
-# count, and one-shot's egress is M*(N-1), so its useful range shrinks as the
-# device count grows.
+# docs/low_latency_allreduce.md (bfloat16). two_shot loses to XLA's ring once
+# the payload is large enough for bandwidth to dominate hop count, so each
+# entry is a window rather than a ceiling.
 #
-#   (one_shot_max, two_shot_min, two_shot_max)
+#   (two_shot_min, two_shot_max)
 #
-# The 32-device gap at 32 KiB is real and deliberate: one-shot is already
-# bandwidth-bound at 31 peers (0.70x) and two-shot's measured range starts at
-# 64 KiB, so that cell stays on XLA.
-_GATE: dict[int, tuple[int, int, int]] = {
-    2: (256 * 1024, 0, 0),
-    4: (128 * 1024, 0, 0),
-    # two_shot's floor was 64 KiB only because the original sweep started
-    # there, the same stale bound already corrected for 16/32 devices below.
-    # Measured at 8 devices, device self time:
-    #
-    #   payload   XLA    one_shot   two_shot
-    #    14 KiB  10.12       4.84       7.76
-    #    42 KiB  10.61          -       8.21
-    #
-    # two_shot beats XLA at 42 KiB and one_shot still wins under 32 KiB, so
-    # dropping the floor to one_shot_max closes the gap with no overlap. The
-    # gap mattered: K3's concatenated latent-MoE pair is 42 KiB and fell
-    # straight through it to XLA, which made the 8-device pruned-K3 proxy
-    # unable to exercise the concat path at all.
-    8: (32 * 1024, 32 * 1024, 512 * 1024),
-    # two_shot's floor starts well below the 64 KiB the original sweep began
-    # at. That sweep could not measure lower because plain two_shot scatters
-    # along rows and needs rows % N == 0; _build_two_shot reshapes to
-    # (N, numel/N) instead, so the real constraint is numel % N == 0 and
-    # decode shapes qualify. Measured at 32 devices, device self time:
-    #
-    #   payload   XLA    one_shot   two_shot
-    #    14 KiB  17.31     13.59     12.36
-    #    28 KiB  17.97     22.39     12.67
-    #    42 KiB  18.93     33.20     13.20
-    #
-    # two_shot wins everywhere in that band and is nearly flat in payload
-    # (egress 2M(N-1)/N), where one_shot's M(N-1) egress makes it lose past
-    # ~16 KiB.
-    #
-    # The one_shot boundary is 13 KiB, just under the smallest payload where
-    # two_shot is measured, because at 14 KiB two_shot is the faster of the two
-    # -- 12.36 against one_shot's 13.59, 9% -- and a 16 KiB boundary handed that
-    # payload to one_shot. 14 KiB is not a corner case: it is K3's
-    # post-attention reduction at a single-token compile bucket, and it is the
-    # same kernel invocation as the (2,3584) the row was measured at, since
-    # _build_two_shot flattens both to (32, 224). The effect was backwards --
-    # halving the tokens from bucket 2 to bucket 1 moved that collective from
-    # two_shot at 12.67 to one_shot at 13.59, so a smaller batch reduced
-    # *slower*. Below 13 KiB two_shot is genuinely unmeasured and one_shot keeps
-    # the small end.
-    #
-    # two_shot_min moves with it, and must: leaving the floor at 16 KiB while
-    # dropping one_shot_max to 13 opens a 13-16 KiB hole that falls through to
-    # XLA. That is exactly the gap that sent K3's 42 KiB pair to XLA at 8
-    # devices and left the pruned-K3 proxy unable to exercise the concat path.
-    #
-    # The ceiling is 128 KiB because two_shot is only *locally* flat in
-    # payload. Extending the same sweep upwards (job 143, 32 devices, device
-    # self time; the slope metric agrees to within 4%):
-    #
-    #     shape        payload   XLA   two_shot   ratio
-    #     (2,10752)     42 KiB  18.95    13.19    1.44x
-    #     (16,3584)    112 KiB  21.88    17.38    1.26x
-    #     (16,7168)    224 KiB  23.27    25.69    0.91x
-    #     (16,10752)   336 KiB  25.99    34.49    0.75x
-    #     (16,14336)   448 KiB  26.78    43.71    0.61x
-    #     (32,10752)   672 KiB  34.48    65.41    0.53x
-    #
-    # Past ~112 KiB two_shot is linear in payload (+8.5 us per 112 KiB) while
-    # XLA's ring is nearly flat -- 21.88 to 26.78 across four times the bytes.
-    # two_shot is bandwidth-bound there and the ring amortises, so they cross
-    # at roughly 150 KiB and two_shot loses by more the further past it goes.
-    # 128 KiB sits inside the measured winning region rather than on the
-    # crossover.
-    #
-    # This ceiling used to be 256 KiB, which was not a measurement: it was the
-    # top of the original sweep's range, exactly as the 64 KiB floor above was
-    # the bottom of it. At 256 KiB (16,7168) took a kernel 9% slower than the
-    # XLA it replaced, which is the opposite of what this gate exists to do.
-    #
-    # The 8-device entry is deliberately left alone: it is measured only up to
-    # 42 KiB, so its 512 KiB ceiling is an extrapolation of the same kind and
-    # should be swept before being relied on above ~64 KiB.
-    #
-    # 16 devices keeps the 16 KiB one_shot boundary rather than inheriting 32's
-    # 13 KiB. The table above is a 32-device sweep, one_shot's egress is M(N-1)
-    # and two_shot's 2M(N-1)/N, so the crossover between them genuinely moves
-    # with the device count -- and extrapolating a threshold across device
-    # counts is how the 42 KiB hole at 8 devices got there.
-    16: (16 * 1024, 16 * 1024, 128 * 1024),
-    32: (13 * 1024, 13 * 1024, 128 * 1024),
+# This table used to carry a one_shot arm and entries for 2 and 4 devices. Both
+# are gone with the one_shot kernel: at 2 and 4 devices one_shot was the *only*
+# arm, so those device counts now fall through to XLA, and the small-payload end
+# of 8/16/32 devices moved to two_shot.
+#
+# Extending two_shot *downwards* to cover what one_shot used to hold is safe in
+# a way extending it upwards would not be. two_shot is nearly flat in payload
+# across this range and XLA is flat but higher -- at 32 devices two_shot reads
+# 12.36 / 12.67 / 13.20 us at 14 / 28 / 42 KiB against XLA's 17.31 / 17.97 /
+# 18.93 -- so shrinking the payload makes two_shot's job easier while XLA stays
+# put. The gap only closes going the other way.
+#
+# Measured, device self time, us:
+#
+#            payload    XLA   two_shot
+#    8 dev    14 KiB  10.12       7.76
+#    8 dev    42 KiB  10.61       8.21
+#   32 dev    14 KiB  17.31      12.36
+#   32 dev    28 KiB  17.97      12.67
+#   32 dev    42 KiB  18.93      13.20
+#   32 dev   112 KiB  21.88      17.38
+#   32 dev   224 KiB  23.27      25.69   <- past the crossover
+#
+# The 32- and 16-device ceiling is 128 KiB because two_shot is only *locally*
+# flat: past ~112 KiB it goes linear at +8.5 us per 112 KiB while XLA's ring
+# amortises, and they cross near 150 KiB. 128 KiB sits inside the measured
+# winning region rather than on the crossover.
+#
+# The 8-device ceiling is 64 KiB, not the 512 KiB it used to be. That 512 KiB
+# was never a measurement -- it was the top of the original sweep's range, the
+# same way its 64 KiB floor was the bottom -- and 8 devices is only measured to
+# 42 KiB. 64 KiB is one modest step past the last measured point instead of an
+# order of magnitude past it. K3's pruned 8-device proxy tops out at the 42 KiB
+# pair, so nothing in use crosses it.
+_GATE: dict[int, tuple[int, int]] = {
+    8: (0, 64 * 1024),
+    16: (0, 128 * 1024),
+    32: (0, 128 * 1024),
 }
 
 
@@ -192,7 +142,7 @@ class _Plan:
                  buffers: tuple,
                  shape: tuple = (),
                  dtype: Any = None):
-        self.kernel = kernel  # "one_shot" | "two_shot" | "xla"
+        self.kernel = kernel  # "two_shot" | "xla"
         self.op = op
         self.buffers = buffers
         # The kernel is compiled for exactly this shape; the entry op checks
@@ -202,22 +152,32 @@ class _Plan:
 
 
 def _two_shot_enabled() -> bool:
-    """Whether two-shot may be used. Off unless explicitly asked for.
+    """Whether two-shot may be used. On by default now that it is the only arm.
 
-    two-shot is correct -- it matches ``funcol`` exactly in float32 across
-    every shape and a 6-round chain -- but it is not yet *reliable*: a 256 KiB
-    reduction that had passed twice took the core down on the third run with
-    ``RuntimeUnexpectedCoreHalt``. That nondeterminism is the same shape as the
-    semaphore-overlap fragility documented in docs/low_latency_allreduce.md
-    section 3a, and it has not been root-caused for this call path.
+    This used to default *off*, on the argument that "K3 decode at TP=32
+    reduces 7-28 KiB, which is one-shot territory" -- so the cost of leaving it
+    off was small. Removing the one-shot kernel inverts that: two-shot is the
+    only kernel left, and defaulting it off would send every payload to XLA and
+    make the whole dispatcher a no-op.
 
-    Leaving it off costs little at the sizes that matter here: K3 decode at
-    TP=32 reduces 7-28 KiB, which is one-shot territory. Set
-    ``TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=1`` to include it.
+    The reliability caveat that motivated the old default is real and is kept
+    here rather than dropped: a 256 KiB reduction that had passed twice once
+    took the core down on a third run with ``RuntimeUnexpectedCoreHalt``, the
+    same shape as the semaphore-overlap fragility in section 3a of
+    docs/low_latency_allreduce.md, and it was never root-caused. Two things
+    bound it. It was seen at 256 KiB, and the gate's ceiling is now 128 KiB at
+    16/32 devices and 64 KiB at 8, so that payload can no longer reach the
+    kernel through this path. And the kernel has since run three full K3
+    end-to-end jobs at TP=32 (286, 287 and the barrier-free A/B), each with a
+    coherent canary and 3x1024-token sweeps, without a halt.
+
+    Set ``TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT=0`` to force everything back to
+    XLA, which is also the fastest way to tell whether a suspected regression
+    is this kernel's fault.
     """
     import os
 
-    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "0") == "1"
+    return os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT", "1") != "0"
 
 
 def donation_enabled() -> bool:
@@ -275,9 +235,7 @@ def _choose_kernel(num_devices: int, payload_bytes: int, numel: int) -> str:
     gate = _GATE.get(num_devices)
     if gate is None:
         return "xla"
-    one_shot_max, two_shot_min, two_shot_max = gate
-    if payload_bytes <= one_shot_max:
-        return "one_shot"
+    two_shot_min, two_shot_max = gate
     if (two_shot_max and _two_shot_enabled()
             and two_shot_min <= payload_bytes <= two_shot_max
             and numel % num_devices == 0):
@@ -383,58 +341,6 @@ class LowLatencyAllReduce:
             return None
 
     # -- op construction ----------------------------------------------------
-
-    def _build_one_shot(self, shape: tuple[int, ...], dtype: torch.dtype):
-        import jax
-
-        from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
-            one_shot_all_reduce_ws
-        from vllm_torchtpu.kernels.collectives.sharded_jax_op import \
-            sharded_jax_op
-
-        mesh = self._mesh
-        axis = self._axis
-        n = self._world_size
-        _REPLICATED = _replicated_spec()
-        collective_id = self._next_collective_id
-        self._next_collective_id += 1
-        steady = steady_barrier_enabled()
-
-        def _fn(x: jax.Array, ws: jax.Array,
-                step: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-
-            def body(x, ws, step):
-                # has_side_effects=False is required to compile through
-                # torch_tpu, and is safe here; see the kernel's docstring.
-                return one_shot_all_reduce_ws(x,
-                                              ws,
-                                              step,
-                                              axis_name=axis,
-                                              num_devices=n,
-                                              collective_id=collective_id,
-                                              steady_barrier=steady,
-                                              has_side_effects=False)
-
-            return jax.shard_map(body,
-                                 mesh=mesh,
-                                 in_specs=(_REPLICATED, ) * 3,
-                                 out_specs=(_REPLICATED, ) * 3,
-                                 check_vma=False)(x, ws, step)
-
-        name = (f"vllm_torchtpu::ll_all_reduce_one_shot_{collective_id}")
-        op = sharded_jax_op(
-            name,
-            _fn,
-            mesh=mesh,
-            input_partition_specs=(_REPLICATED, ) * 3,
-            output_partition_specs=(_REPLICATED, ) * 3,
-            # ws, step -- args 1..2. See donation_enabled().
-            donate_argnums=(1, 2) if donation_enabled() else None,
-        )
-        device = self._comm.device
-        ws = torch.zeros((2, n - 1, *shape), dtype=dtype, device=device)
-        step = torch.zeros(1, dtype=torch.int32, device=device)
-        return op, (ws, step)
 
     def _build_two_shot_variadic(self, shape_a: tuple[int, ...],
                                  shape_b: tuple[int, ...], dtype: torch.dtype):
@@ -593,10 +499,7 @@ class LowLatencyAllReduce:
             plan = _Plan("xla", None, ())
         else:
             try:
-                if kernel == "one_shot":
-                    op, buffers = self._build_one_shot(tuple(x.shape), x.dtype)
-                else:
-                    op, buffers = self._build_two_shot(tuple(x.shape), x.dtype)
+                op, buffers = self._build_two_shot(tuple(x.shape), x.dtype)
                 plan = _Plan(kernel, op, buffers, tuple(x.shape), x.dtype)
             except Exception as e:  # noqa: BLE001
                 logger.warning(

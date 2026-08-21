@@ -62,7 +62,8 @@ export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 # as everything above: it changes decode speed, so it must come from the batch
 # script and not from whatever shell happened to submit the job.
 export TPU_LOW_LATENCY_ALLREDUCE="${TPU_LOW_LATENCY_ALLREDUCE:-0}"
-export TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT="${TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT:-0}"
+# Default 1: two-shot is the only kernel left, so 0 makes LLAR a no-op.
+export TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT="${TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT:-1}"
 # Reduce K3's latent-MoE pair as one collective instead of upstream's two.
 export TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT="${TPU_LOW_LATENCY_ALLREDUCE_MOE_CONCAT:-0}"
 # Do it with the two-operand kernel, dropping the torch.cat and both reshapes.
@@ -84,6 +85,11 @@ export TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER="${TPU_LOW_LATENCY_ALLREDUCE_
 # 15.31 for the same nominal config. Set it to the hidden size to put the
 # post-attention reduce on the kernel.
 export TPU_LOW_LATENCY_ALLREDUCE_SHAPE="${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}"
+
+# MoE routing renormalize: fold vs .sum(dim=-1). Nothing to do with the
+# collectives, but it is A/B'd through the same harness, so it gets the same
+# treatment -- an explicit default and its own cache tag.
+export TPU_MOE_RENORMALIZE_FOLD="${TPU_MOE_RENORMALIZE_FOLD:-1}"
 LOG_DIR="${KIMI_K3_LOG_ROOT:-${REPO_DIR}/results/kimi-k3-verify-${SLURM_JOB_ID}}"
 # Set PROFILE_DIR to make /start_profile work. Both halves are required and
 # neither can be turned on after the server is up: the phased profiler is read
@@ -188,6 +194,11 @@ _LLAR_TAG=""
 # arity hazard as the flags above.
 [[ -n "${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-}" ]] && \
   _LLAR_TAG="${_LLAR_TAG}-s${TPU_LOW_LATENCY_ALLREDUCE_SHAPE}"
+# The fold changes the emitted HLO for every MoE layer, so it needs its own
+# cache tree for the same reason the flags above do: a shared cache would
+# replay whichever program was compiled first and the A/B would measure noise.
+[[ "${TPU_MOE_RENORMALIZE_FOLD:-1}" == "0" ]] && \
+  _LLAR_TAG="${_LLAR_TAG}-nofold"
 export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
@@ -390,6 +401,7 @@ report_split() {
        "moe_variadic=${TPU_LOW_LATENCY_ALLREDUCE_MOE_VARIADIC}" \
        "no_steady_barrier=${TPU_LOW_LATENCY_ALLREDUCE_NO_STEADY_BARRIER}" \
        "shape=${TPU_LOW_LATENCY_ALLREDUCE_SHAPE:-auto}" \
+       "moe_renormalize_fold=${TPU_MOE_RENORMALIZE_FOLD}" \
        "xla_cache=${VLLM_XLA_CACHE_PATH}"
   local ll_one ll_two ll_xla
   ll_one=$(grep -c -- "-> one_shot" "${SERVER_LOG}" 2>/dev/null || true)

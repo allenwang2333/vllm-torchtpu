@@ -10,36 +10,39 @@ their per-step synchronization dominate end-to-end time.
 
 These kernels trade bandwidth for hop count, following the standard taxonomy
 for low-latency collectives (cf. arXiv:2607.16100, which develops the same
-one-shot / two-shot split for NVLink):
-
-``one_shot_all_reduce``
-    A single all-to-all broadcast round: every device pushes its whole local
-    buffer straight to every peer, then reduces locally.  **1 hop**, but
-    ``M * (N-1)`` bytes out per device.  Lowest achievable latency; the right
-    choice while the payload is small enough that ICI bandwidth is free.
-
-``one_shot_all_reduce_ws``
-    Same single round, but over a caller-owned persistent workspace, which
-    lets the barrier move *after* the sends so it overlaps the transfer.
-    Roughly 2x faster than ``one_shot_all_reduce`` at 2-16 KiB.  Requires the
-    caller to thread a workspace and round counter through every call.
-
-``two_shot_all_reduce``
-    Reduce-scatter then all-gather, but with each phase done as a *direct*
-    (non-ring) all-to-all round rather than ``N-1`` ring steps.  **2 hops**
-    and only ``2 * M * (N-1) / N`` bytes out per device.  Wins once one-shot
-    goes bandwidth-bound.
+one-shot / two-shot split for NVLink).
 
 ``two_shot_all_reduce_ws``
-    The workspace treatment applied to two-shot: barrier overlapped with the
-    phase-1 sends, worth ~2 us at 8 devices and ~3 us at 32.  Note the
-    all-gather destination has to live in the workspace too -- the plain
-    version writes peers' *output* buffers, which are as short-lived as
-    scratch.  Best choice above the one-shot crossover.
+    Reduce-scatter then all-gather, each phase a *direct* (non-ring)
+    all-to-all round rather than ``N-1`` ring steps: **2 hops** and
+    ``2 * M * (N-1) / N`` bytes out per device.  Runs over a caller-owned
+    persistent workspace, which is what lets the barrier sit *after* the
+    phase-1 sends so it overlaps the transfer -- worth ~2 us at 8 devices and
+    ~3 us at 32.  The all-gather destination has to live in the workspace too;
+    writing peers' *output* buffers would target memory as short-lived as
+    scratch.  This is the only kernel K3 invokes: 187 calls per decode step,
+    95 post-attention and 92 MoE pairs.
 
-    Both ``_ws`` kernels need ``rows % num_devices == 0`` for two-shot, and
-    both need their workspace threaded call-to-call; see ``make_workspace`` and
-    ``make_two_shot_workspace``.
+``two_shot_all_reduce_variadic_ws``
+    The same collective over two operands in one launch, so K3's latent-MoE
+    pair needs no ``torch.cat`` beforehand.  Off by default: it corrupts
+    deterministically when the two operands land on equal per-device chunk
+    widths at 32 devices, guarded by a ``ValueError``, cause unexplained.
+
+The workspace must be threaded call-to-call; see ``make_two_shot_workspace``
+and ``make_two_shot_variadic_workspace``.  ``numel % num_devices == 0`` is the
+real constraint -- the dispatcher reshapes to ``(num_devices, numel/N)`` rather
+than scattering along rows, so decode's row count does not matter.
+
+An earlier revision of this module also carried ``one_shot_all_reduce`` (a
+single all-to-all broadcast round: 1 hop, ``M * (N-1)`` bytes out, faster than
+two-shot below ~13 KiB at 32 devices and ~32 KiB at 8), a two-operand
+``two_shot_all_reduce_pair_ws``, and stateless non-workspace versions of both
+shapes.  None of them were on K3's serving path -- one_shot was built by the
+warmup for the ``(1,3584)`` latent and then never invoked, because the concat
+path folds that shape into the ``(1,10752)`` pair -- so they were removed rather
+than carried.  They are recoverable from the ``llar-all-variants`` tag, and the
+measurements that ranked them are in ``docs/low_latency_allreduce.md``.
 
 All kernels are written for a 1-D device mesh and must be called inside
 ``shard_map`` over that mesh.  Peer addressing uses ``DeviceIdType.MESH``, so
@@ -47,34 +50,33 @@ the mesh axis order determines the physical routing.
 
 Buffer-reuse safety
 -------------------
-``one_shot_all_reduce`` and ``two_shot_all_reduce`` open with an all-to-all
-double barrier.  The first barrier guarantees every peer has entered the kernel
-before any DMA lands in its scratch.  The second one closes the race the single
-barrier leaves open: a fast peer could otherwise exit, re-enter on the *next*
-invocation, and signal the (identically numbered) barrier semaphore a second
-time, releasing us while a slower peer is still draining the previous call's
-buffers.  This is the same double-barrier idiom as
+The barrier is what guarantees the destination is *owned by this kernel on the
+receiver* when the data lands.  Kernel scratch is only live while the kernel
+runs, so an early write would otherwise scribble on VMEM that XLA has handed to
+some other op.  That is why the barrier cannot simply be moved after the sends
+in a stateless kernel, and why this one needs a persistent workspace to do so.
+
+The double barrier closes a second race that a single barrier leaves open: a
+fast peer could exit, re-enter on the *next* invocation, and signal the
+(identically numbered) barrier semaphore again, releasing us while a slower peer
+is still draining the previous call's buffers.  Same idiom as
 :func:`vllm_torchtpu.kernels.collectives.util.local_barrier`, widened from
 left/right neighbors to the full mesh.
 
-That leading barrier is not just about buffer reuse -- it is what guarantees
-the destination is *owned by this kernel on the receiver* when the data lands.
-Kernel scratch is only live while the kernel runs, so an early write would
-otherwise scribble on VMEM that XLA has handed to some other op.  That is why
-the barrier cannot simply be moved after the sends, and why
-``one_shot_all_reduce_ws`` needs a persistent workspace to do so.
+``steady_barrier=False`` removes the barrier from every round past round 0; see
+that argument's docstring for why the data dependency alone is then sufficient.
 
-Why the ``_ws`` kernels disable semaphore checks
------------------------------------------------
-Both set ``disable_semaphore_checks=True``, and must.  Overlapping the barrier
-with the sends means a peer that has passed round k's barrier issues its round
-k+1 sends before its own round k+1 barrier, so those DMAs bump our
-``recv_sem[(k+1)%2]`` while we are still finishing round k.  The data is fine --
-that is the other slot -- but Mosaic asserts every scratch semaphore is zero on
-kernel exit, and this design deliberately violates that.  Leaving the check on
-kills the slice with ``SLICE_FAILURE_SW_INJECT_ERROR``; the driver log under
-``/tmp/tpu_logs_<user>/`` names the semaphore.  The early counts are consumed
-by the next round's wait, verified exact against ``psum`` in float32.
+Why the kernels disable semaphore checks
+----------------------------------------
+``disable_semaphore_checks=True`` is required.  Overlapping the barrier with the
+sends means a peer that has passed round k's barrier issues its round k+1 sends
+before its own round k+1 barrier, so those DMAs bump our ``recv_sem[(k+1)%2]``
+while we are still finishing round k.  The data is fine -- that is the other
+slot -- but Mosaic asserts every scratch semaphore is zero on kernel exit, and
+this design deliberately violates that.  Leaving the check on kills the slice
+with ``SLICE_FAILURE_SW_INJECT_ERROR``; the driver log under
+``/tmp/tpu_logs_<user>/`` names the semaphore.  The early counts are consumed by
+the next round's wait, verified exact against ``psum`` in float32.
 """
 
 import functools
@@ -87,10 +89,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 __all__ = [
-    "one_shot_all_reduce",
-    "one_shot_all_reduce_ws",
-    "make_workspace",
-    "two_shot_all_reduce",
     "two_shot_all_reduce_ws",
     "make_two_shot_workspace",
     "two_shot_all_reduce_variadic_ws",
@@ -127,332 +125,6 @@ def _full_barrier(my_id, num_devices: int, double_barrier: bool = True):
 
 # -----------------------------------------------------------------------------
 # One-shot: 1 hop, M * (N-1) bytes out per device.
-# -----------------------------------------------------------------------------
-
-
-def _one_shot_kernel(x_ref, o_ref, recv_ref, send_sem, recv_sem, *,
-                     num_devices: int, axis_name: str, double_barrier: bool):
-    my_id = lax.axis_index(axis_name)
-    _full_barrier(my_id, num_devices, double_barrier)
-
-    # Slot assignment is fully static: the copy I push to my ``+i`` neighbor
-    # always lands in that neighbor's slot ``i-1``.  Since every device follows
-    # the same rule, device r's slot ``i-1`` receives from device ``r - i``,
-    # so the N-1 slots are filled by N-1 distinct senders with no dynamic
-    # indexing and no need to stage my own contribution into a slot.
-    copies = []
-    for i in range(1, num_devices):
-        copy = pltpu.make_async_remote_copy(
-            src_ref=x_ref,
-            dst_ref=recv_ref.at[i - 1],
-            send_sem=send_sem,
-            recv_sem=recv_sem,
-            device_id=(lax.rem(my_id + i, num_devices), ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-    for copy in copies:
-        copy.wait()
-
-    acc = x_ref[...]
-    for i in range(num_devices - 1):
-        acc = acc + recv_ref[i]
-    o_ref[...] = acc
-
-
-def one_shot_all_reduce(x: jax.Array,
-                        *,
-                        axis_name: str,
-                        num_devices: int,
-                        collective_id: int = 0,
-                        double_barrier: bool = True) -> jax.Array:
-    """Single-round all-to-all broadcast + local reduce. Call under shard_map.
-
-    Args:
-      x: The local shard to reduce. Any shape; lives in VMEM.
-      axis_name: Mesh axis to reduce over.
-      num_devices: Size of that mesh axis.
-      collective_id: Barrier-semaphore id. Must differ between kernels that can
-        be in flight concurrently.
-      double_barrier: Keep the second barrier. Only safe to disable when the
-        kernel cannot be re-entered while a peer is still draining.
-
-    Returns:
-      The sum of ``x`` across the mesh axis, same shape and dtype.
-    """
-    if num_devices < 2:
-        return x
-    kernel = functools.partial(_one_shot_kernel,
-                               num_devices=num_devices,
-                               axis_name=axis_name,
-                               double_barrier=double_barrier)
-    return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
-        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
-        scratch_shapes=[
-            pltpu.VMEM((num_devices - 1, *x.shape), x.dtype),
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-        ],
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id,
-                                             has_side_effects=True),
-    )(x)
-
-
-# -----------------------------------------------------------------------------
-# One-shot over a persistent workspace: 1 hop, barrier overlapped with the DMA.
-# -----------------------------------------------------------------------------
-
-
-def _one_shot_ws_kernel(x_ref,
-                        ws_in_ref,
-                        step_in_ref,
-                        o_ref,
-                        ws_ref,
-                        step_ref,
-                        recv_vmem,
-                        local_sem,
-                        send_sem,
-                        recv_sem,
-                        *,
-                        num_devices: int,
-                        axis_name: str,
-                        barrier_first: bool = False,
-                        steady_barrier: bool = True):
-    del ws_in_ref  # aliased onto ws_ref; write through the output view
-    my_id = lax.axis_index(axis_name)
-    step = step_in_ref[0]
-    slot = lax.rem(step, 2)
-
-    # Exactly one double barrier per round, in every round.
-    #
-    # Round 0 puts it first: nothing has synchronized yet, so a peer may not
-    # have reached this kernel at all. Every later round puts it *after* the
-    # sends, so the synchronization overlaps the transfer instead of
-    # serializing ahead of it -- which is the whole point of this variant.
-    #
-    # Safety in the steady state rests on two things being double-buffered:
-    #   data: round k writes ws[k%2], last read by round k-2. Passing round
-    #     k-1's barrier proves every peer finished round k-2's reduce.
-    #   DMA semaphores: round k uses sem[k%2], last drained at round k-2. With
-    #     one shared semaphore a round-k send could satisfy a peer's still
-    #     pending round k-1 byte-count wait.
-    # barrier_first is a diagnostic: it puts the barrier ahead of the sends in
-    # every round, giving up the overlap. Comparing against the default
-    # separates "the workspace/slot/semaphore machinery is wrong" from "the
-    # overlap itself is unsafe" at a given device count.
-    if barrier_first:
-        _full_barrier(my_id, num_devices, double_barrier=True)
-    else:
-
-        @pl.when(step == 0)
-        def _():
-            _full_barrier(my_id, num_devices, double_barrier=True)
-
-    copies = []
-    for i in range(1, num_devices):
-        copy = pltpu.make_async_remote_copy(
-            src_ref=x_ref,
-            dst_ref=ws_ref.at[slot, i - 1],
-            send_sem=send_sem.at[slot],
-            recv_sem=recv_sem.at[slot],
-            device_id=(lax.rem(my_id + i, num_devices), ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-
-    # steady_barrier=False removes the barrier from every round *except* round
-    # 0, on the argument that the recv wait already establishes the ordering the
-    # barrier was buying. This is the TPU analogue of the barrier-free (Lamport)
-    # collectives used on NVLink: there the data word doubles as the ready flag
-    # so no separate flag round-trip is needed; here the DMA's recv semaphore is
-    # already delivered by the same hardware transaction as the data, so
-    # arrival detection was never what cost us anything. What the barrier
-    # actually buys is the *buffer-reuse* guarantee -- exactly the job Lamport's
-    # rotating buffers do -- and that can come from the data dependency instead:
-    #
-    #   Phase 1 is all-to-all, so completing round k-1 required receiving from
-    #   *every* peer in round k-1. Being in round k therefore proves every peer
-    #   entered round k-1, which (ws and step are aliased, so the rounds are
-    #   strictly ordered on each device) proves every peer completed round k-2 --
-    #   including its reads of slot (k-2)%2 == k%2, the slot we are about to
-    #   write. That is precisely the invariant the barrier was purchasing.
-    #
-    #   Symmetrically, skew is bounded at one round: peer j cannot enter round
-    #   k+1 until our round-k sends land, so while we are in round k, j is at
-    #   most in k+1 and touches the *other* slot. Two slots suffice.
-    #
-    # Round 0 keeps its barrier and must: nothing has synchronized yet, the
-    # workspace may not be allocated on every peer, and the collective_id may
-    # not be registered.
-    #
-    # This holds only while every rank calls the collective the same number of
-    # times in the same order. Rank-divergent control flow -- speculative
-    # decode, early exit, a dummy_run that fires on some ranks only, a
-    # non-unanimous bucket switch -- makes skew unbounded and no slot count is
-    # safe. That is why it is gated rather than default.
-    if not barrier_first and steady_barrier:
-
-        @pl.when(step != 0)
-        def _():
-            _full_barrier(my_id, num_devices, double_barrier=True)
-
-    for copy in copies:
-        copy.wait()
-
-    # ws lives in HBM so its address survives between kernels; stage the slot
-    # into VMEM to reduce it.
-    local = pltpu.make_async_copy(src_ref=ws_ref.at[slot],
-                                  dst_ref=recv_vmem,
-                                  sem=local_sem)
-    local.start()
-    local.wait()
-
-    acc = x_ref[...]
-    for i in range(num_devices - 1):
-        acc = acc + recv_vmem[i]
-    o_ref[...] = acc
-    step_ref[0] = step + 1
-
-
-def one_shot_all_reduce_ws(x: jax.Array,
-                           ws: jax.Array,
-                           step: jax.Array,
-                           *,
-                           axis_name: str,
-                           num_devices: int,
-                           collective_id: int = 0,
-                           barrier_first: bool | None = None,
-                           disable_semaphore_checks: bool = True,
-                           has_side_effects: bool = True,
-                           steady_barrier: bool = True):
-    """One-shot all-reduce over a caller-owned persistent workspace.
-
-    Removes barrier #1 from the critical path. :func:`one_shot_all_reduce`
-    must barrier *before* sending, because its receive buffer is kernel scratch
-    and is only live while the kernel runs -- a write that arrives early lands
-    in VMEM that XLA has handed to some other op. Here the destination is a
-    caller-owned buffer threaded through every call, so it stays live between
-    kernels and an early write is harmless. That lets the barrier move after
-    the sends, where it overlaps the transfer.
-
-    Args:
-      x: The local shard to reduce.
-      ws: Workspace of shape ``(2, num_devices - 1, *x.shape)``, same dtype as
-        ``x``. Must be threaded call-to-call; see :func:`make_workspace`.
-      step: int32 ``(1,)`` round counter, also threaded. Must start at 0.
-      axis_name: Mesh axis to reduce over.
-      num_devices: Size of that mesh axis.
-      collective_id: Barrier-semaphore id.
-      barrier_first: Put the barrier ahead of the sends, giving up the overlap
-        and most of the speedup. Defaults to off; kept as an escape hatch, and
-        as the control that isolated the bug below.
-      has_side_effects: Marks the Pallas call side-effecting, which is what a
-        collective normally wants. It must be False to compile this kernel
-        through torch_tpu: XLA's partitioner rejects a side-effecting custom
-        call inside the manual region a shard_map lowers to
-        ("Side-effect HLO must have sharding"). Dropping it is safe *for this
-        kernel* only because the properties the flag protects are already
-        guaranteed by other means -- the output is consumed so it cannot be
-        dead-code eliminated, each call site gets its own collective_id so two
-        call sites cannot be CSE'd together, and the aliased ws/step chain
-        serializes successive calls that share a workspace. Do not copy this
-        reasoning to a stateless collective.
-      disable_semaphore_checks: Must stay True for the overlap. Mosaic
-        otherwise asserts every scratch semaphore is zero on kernel exit, and
-        this design *deliberately* violates that: a peer that has passed round
-        k's barrier issues its round k+1 sends before its own round k+1
-        barrier, so those DMAs land in our ws[(k+1)%2] and bump
-        recv_sem[(k+1)%2] while we are still finishing round k. The data is
-        fine -- that is the other slot, which is what double buffering is for
-        -- but the semaphore is legitimately nonzero at exit, and the check
-        fires as "Semaphore (scratch argument 3) has a nonzero value upon exit
-        from a Mosaic kernel", killing the slice. The early counts carry over
-        and are consumed by the next round, verified exact against psum in
-        float32 over 440 executions at 8 and 32 devices.
-
-      steady_barrier: Keep the barrier in rounds past round 0. Setting it False
-        removes the last synchronization primitive from the steady state, on the
-        argument that the all-to-all recv wait already proves every peer
-        finished the round that last read this slot -- the TPU analogue of a
-        barrier-free (Lamport) NVLink collective, where the buffer-reuse
-        guarantee comes from buffer rotation rather than a barrier. Measured
-        cost of what this removes: ~2.9 us per barrier at 32 devices
-        (``scripts/debug/two_shot_ablation.py``, jobs 118/119), against a
-        near-to-far ICI distance spread of only ~3.5 us
-        (``scripts/debug/probe_pairwise_latency.py``, job 250) -- so this is the
-        larger of the two terms available to attack.
-
-        Only sound while every rank calls the collective the same number of
-        times in the same order; rank-divergent control flow makes skew
-        unbounded. Validate with ``scripts/allreduce_ws_stress.py
-        --no-steady-barrier`` before trusting it, and see the kernel body for
-        the full argument.
-
-    Returns:
-      ``(out, ws, step)``. The caller must pass the returned ``ws``/``step``
-      into the next call -- that is what keeps the buffer live and the parity
-      advancing.
-    """
-    if num_devices < 2:
-        return x, ws, step
-
-    if barrier_first is None:
-        barrier_first = False
-
-    kernel = functools.partial(_one_shot_ws_kernel,
-                               num_devices=num_devices,
-                               axis_name=axis_name,
-                               barrier_first=barrier_first,
-                               steady_barrier=steady_barrier)
-    return pl.pallas_call(
-        kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct(x.shape, x.dtype),
-            jax.ShapeDtypeStruct(ws.shape, ws.dtype),
-            jax.ShapeDtypeStruct(step.shape, step.dtype),
-        ),
-        in_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pltpu.SMEM),
-        ],
-        out_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pl.ANY),
-            pl.BlockSpec(memory_space=pltpu.SMEM),
-        ],
-        # Alias ws and step so the kernel updates them in place and the buffer
-        # identity is stable across calls.
-        input_output_aliases={
-            1: 1,
-            2: 2
-        },
-        scratch_shapes=[
-            pltpu.VMEM((num_devices - 1, *x.shape), x.dtype),
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA((2, )),
-            pltpu.SemaphoreType.DMA((2, )),
-        ],
-        compiler_params=pltpu.CompilerParams(
-            collective_id=collective_id,
-            has_side_effects=has_side_effects,
-            disable_semaphore_checks=disable_semaphore_checks),
-    )(x, ws, step)
-
-
-def make_workspace(x_shape, dtype, num_devices: int):
-    """Zeroed ``(ws, step)`` for :func:`one_shot_all_reduce_ws`."""
-    return (jnp.zeros((2, num_devices - 1, *x_shape),
-                      dtype), jnp.zeros((1, ), jnp.int32))
-
-
-# -----------------------------------------------------------------------------
-# Two-shot over a persistent workspace: 2 hops, barrier overlapped with phase 1.
 # -----------------------------------------------------------------------------
 
 
@@ -505,11 +177,11 @@ def _two_shot_ws_kernel(x_ref,
         copy.start()
         copies.append(copy)
 
-    # Overlapped barrier, same reasoning as one_shot_all_reduce_ws: round k
-    # writes slot k%2, last read at round k-2, and passing round k-1's barrier
-    # proves every peer finished round k-2. It also covers phase 2, whose sends
-    # come later still.
-    # See _one_shot_ws_kernel for why the steady-state barrier is removable.
+    # Overlapped barrier: round k writes slot k%2, last read at round k-2, and
+    # passing round k-1's barrier proves every peer finished round k-2. It also
+    # covers phase 2, whose sends come later still.
+    # See two_shot_all_reduce_ws's `steady_barrier` argument for why the
+    # steady-state barrier is removable.
     # The argument is if anything stronger here: phase 2's sends come after the
     # phase-1 recv wait, so by the time they are issued every peer is known to
     # have entered this round, not merely the previous one.
@@ -578,19 +250,18 @@ def two_shot_all_reduce_ws(x: jax.Array,
                            steady_barrier: bool = True):
     """Two-shot all-reduce over a caller-owned persistent workspace.
 
-    Does for :func:`two_shot_all_reduce` what :func:`one_shot_all_reduce_ws`
-    does for one-shot: moves both the reduce-scatter staging *and* the
-    all-gather destination out of kernel-owned memory, so the barrier can move
-    after the phase-1 sends and overlap the transfer.
+    Moves both the reduce-scatter staging *and* the all-gather destination out
+    of kernel-owned memory, so the barrier can move after the phase-1 sends and
+    overlap the transfer. This is the kernel K3 runs.
 
-    The all-gather is the extra piece here -- ``two_shot_all_reduce`` writes
+    The all-gather is the extra piece here -- a stateless two-shot writes
     peers' *output* buffers directly, which are as short-lived as scratch, so
     they had to move into the workspace too and be copied out at the end.
 
     ``x`` must be 2-D with ``x.shape[0] % num_devices == 0``.
     ``disable_semaphore_checks`` must stay True and ``has_side_effects`` must
-    be False to compile through torch_tpu; see :func:`one_shot_all_reduce_ws`
-    for both.
+    be False to compile through torch_tpu; see this module's docstring for
+    both.
 
       steady_barrier: Keep the barrier in rounds past round 0. Setting it False
         removes the last synchronization primitive from the steady state, on the
@@ -741,7 +412,8 @@ def _two_shot_variadic_ws_kernel(a_ref, b_ref, rsa_in, rsb_in, aga_in, agb_in,
             copy.start()
             copies.append(copy)
 
-    # See _one_shot_ws_kernel for why the steady-state barrier is removable.
+    # See two_shot_all_reduce_ws's `steady_barrier` argument for why the
+    # steady-state barrier is removable.
     if not barrier_first and steady_barrier:
 
         @pl.when(step != 0)
@@ -845,7 +517,7 @@ def two_shot_all_reduce_variadic_ws(a: jax.Array,
     internally and restored on the way out. **Equal per-device chunk widths are
     rejected** -- see the ValueError below for the measured failure and why it is
     a hard error rather than a warning. See
-    :func:`one_shot_all_reduce_ws` for ``disable_semaphore_checks`` and
+    this module's docstring for ``disable_semaphore_checks`` and
     ``has_side_effects``, and :func:`two_shot_all_reduce_ws` for what
     ``steady_barrier`` trades.
 
@@ -945,106 +617,3 @@ def make_two_shot_workspace(x_shape, dtype, num_devices: int):
 # multiple of this is the case Mosaic lowers badly or refuses, so the pair
 # kernel below pads each operand's per-device slice up to it.
 _LANE = 128
-
-
-def _two_shot_kernel(x_ref, o_ref, rs_ref, red_ref, local_sem, send_sem,
-                     recv_sem, send_sem2, recv_sem2, *, num_devices: int,
-                     axis_name: str, double_barrier: bool):
-    # x_ref / o_ref: (num_devices, chunk_rows, cols); rs_ref: (N-1, chunk, cols)
-    my_id = lax.axis_index(axis_name)
-    _full_barrier(my_id, num_devices, double_barrier)
-
-    # Phase 1 -- reduce-scatter. Push the chunk that peer ``+i`` owns to it;
-    # by the same static rule as one-shot it lands in that peer's slot i-1.
-    copies = []
-    for i in range(1, num_devices):
-        peer = lax.rem(my_id + i, num_devices)
-        copy = pltpu.make_async_remote_copy(
-            src_ref=x_ref.at[peer],
-            dst_ref=rs_ref.at[i - 1],
-            send_sem=send_sem,
-            recv_sem=recv_sem,
-            device_id=(peer, ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-    for copy in copies:
-        copy.wait()
-
-    acc = x_ref[my_id]
-    for i in range(num_devices - 1):
-        acc = acc + rs_ref[i]
-    red_ref[...] = acc
-
-    # Phase 2 -- all-gather. My reduced chunk goes into slot ``my_id`` of every
-    # device's output, mine included.
-    local = pltpu.make_async_copy(src_ref=red_ref,
-                                  dst_ref=o_ref.at[my_id],
-                                  sem=local_sem)
-    local.start()
-    copies = []
-    for i in range(1, num_devices):
-        copy = pltpu.make_async_remote_copy(
-            src_ref=red_ref,
-            dst_ref=o_ref.at[my_id],
-            send_sem=send_sem2,
-            recv_sem=recv_sem2,
-            device_id=(lax.rem(my_id + i, num_devices), ),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        copies.append(copy)
-    local.wait()
-    for copy in copies:
-        copy.wait()
-
-
-def two_shot_all_reduce(x: jax.Array,
-                        *,
-                        axis_name: str,
-                        num_devices: int,
-                        collective_id: int = 0,
-                        double_barrier: bool = True) -> jax.Array:
-    """Direct reduce-scatter + all-gather all-reduce. Call under shard_map.
-
-    ``x`` must be 2-D with ``x.shape[0] % num_devices == 0``; the leading axis
-    is what gets scattered.
-
-    Returns:
-      The sum of ``x`` across the mesh axis, same shape and dtype.
-    """
-    if num_devices < 2:
-        return x
-    if x.ndim != 2:
-        raise ValueError(
-            f"two_shot_all_reduce expects a 2-D shard, got {x.shape}")
-    rows, cols = x.shape
-    if rows % num_devices != 0:
-        raise ValueError(
-            f"two_shot_all_reduce needs rows ({rows}) divisible by "
-            f"num_devices ({num_devices})")
-    chunk = rows // num_devices
-
-    kernel = functools.partial(_two_shot_kernel,
-                               num_devices=num_devices,
-                               axis_name=axis_name,
-                               double_barrier=double_barrier)
-    out = pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((num_devices, chunk, cols), x.dtype),
-        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
-        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
-        scratch_shapes=[
-            pltpu.VMEM((num_devices - 1, chunk, cols), x.dtype),
-            pltpu.VMEM((chunk, cols), x.dtype),
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-            pltpu.SemaphoreType.DMA,
-        ],
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id,
-                                             has_side_effects=True),
-    )(x.reshape(num_devices, chunk, cols))
-    return out.reshape(rows, cols)

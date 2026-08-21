@@ -80,10 +80,6 @@ def _parse_args():
                    "synchronization primitive, and its failure mode is a "
                    "timing-dependent stale read that a short smoke test will "
                    "not surface. Expect to need long chains and many repeats.")
-    p.add_argument("--kernel",
-                   default="oneshot",
-                   choices=["oneshot", "twoshot"],
-                   help="Which workspace kernel to stress.")
     p.add_argument("--enable-sem-checks",
                    action="store_true",
                    default=None,
@@ -154,7 +150,7 @@ def make_chain(use_ws: bool, mesh: Mesh, n: int, rounds: int, shape, dtype):
 
     def body(local_x):
         v = local_x[0]
-        if use_ws and ARGS.kernel == "twoshot":
+        if use_ws:
             rs, ag, step = llar.make_two_shot_workspace(shape, dtype, n)
             for j in range(rounds):
                 v, rs, ag, step = llar.two_shot_all_reduce_ws(
@@ -165,21 +161,6 @@ def make_chain(use_ws: bool, mesh: Mesh, n: int, rounds: int, shape, dtype):
                     axis_name=AXIS,
                     num_devices=n,
                     barrier_first=bool(ARGS.barrier_first),
-                    steady_barrier=not ARGS.no_steady_barrier,
-                    disable_semaphore_checks=(False if ARGS.enable_sem_checks
-                                              else True))
-                v = v * (1.0 / n) + jnp.asarray(j % 3, dtype) * 0.25
-        elif use_ws:
-            ws, step = llar.make_workspace(shape, dtype, n)
-            for j in range(rounds):
-                v, ws, step = llar.one_shot_all_reduce_ws(
-                    v,
-                    ws,
-                    step,
-                    axis_name=AXIS,
-                    num_devices=n,
-                    barrier_first=(False if ARGS.force_overlap else
-                                   ARGS.barrier_first),
                     steady_barrier=not ARGS.no_steady_barrier,
                     disable_semaphore_checks=(False if ARGS.enable_sem_checks
                                               else True))

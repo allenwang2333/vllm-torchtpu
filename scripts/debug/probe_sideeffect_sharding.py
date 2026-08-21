@@ -41,7 +41,12 @@ from torch.distributed._functional_collectives import \
 
 
 def _build_one_shot(has_side_effects: bool):
-    """A copy of one_shot_all_reduce with the side-effect flag exposed."""
+    """A self-contained one-shot all-reduce with the side-effect flag exposed.
+
+    Deliberately a local copy rather than an import: the point is to vary
+    has_side_effects, which the shipped kernels fix. It outlived the
+    one_shot_all_reduce it was originally copied from.
+    """
     import jax
     from jax import lax
     from jax.experimental import pallas as pl

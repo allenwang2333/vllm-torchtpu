@@ -45,32 +45,31 @@ echo "== results: ${RUN_DIR}"
 echo "== rows=${SB_ROWS} cols=${SB_COLS} rounds=${SB_ROUNDS} repeats=${SB_REPEATS}"
 
 rc_all=0
-for kernel in oneshot twoshot; do
-  for mode in control nosteady; do
-    flag=""
-    [[ "${mode}" == nosteady ]] && flag="--no-steady-barrier"
-    echo ""
-    echo "##### kernel=${kernel} mode=${mode} #####"
-    export SB_KERNEL="${kernel}" SB_FLAG="${flag}"
-    # SC2016 off: the ${...} below are expanded by the remote shell srun starts,
-    # not by this one. They reach it via --export=ALL.
-    # shellcheck disable=SC2016
-    srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --unbuffered --export=ALL \
-      bash -c '
-        exec "${PYTHON}" -u "${STRESS}" \
-          --multihost \
-          --devices 32 \
-          --kernel "${SB_KERNEL}" \
-          --rows "${SB_ROWS}" \
-          --cols "${SB_COLS}" \
-          --rounds "${SB_ROUNDS}" \
-          --repeats "${SB_REPEATS}" \
-          ${SB_FLAG}
-      ' 2>&1 | tee "${RUN_DIR}/${kernel}-${mode}.log" | tail -24
-    rc=${PIPESTATUS[0]}
-    echo "##### kernel=${kernel} mode=${mode} rc=${rc} #####"
-    [[ ${rc} -ne 0 ]] && rc_all=1
-  done
+# The kernel loop is gone with the one_shot kernel: two_shot_all_reduce_ws is
+# the only workspace kernel left, so only the barrier mode varies.
+for mode in control nosteady; do
+  flag=""
+  [[ "${mode}" == nosteady ]] && flag="--no-steady-barrier"
+  export SB_FLAG="${flag}"
+  echo ""
+  echo "##### mode=${mode} #####"
+  # SC2016 off: the ${...} below are expanded by the remote shell srun starts,
+  # not by this one. They reach it via --export=ALL.
+  # shellcheck disable=SC2016
+  srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --unbuffered --export=ALL \
+    bash -c '
+      exec "${PYTHON}" -u "${STRESS}" \
+        --multihost \
+        --devices 32 \
+        --rows "${SB_ROWS}" \
+        --cols "${SB_COLS}" \
+        --rounds "${SB_ROUNDS}" \
+        --repeats "${SB_REPEATS}" \
+        ${SB_FLAG}
+    ' 2>&1 | tee "${RUN_DIR}/${mode}.log" | tail -24
+  rc=${PIPESTATUS[0]}
+  echo "##### mode=${mode} rc=${rc} #####"
+  [[ ${rc} -ne 0 ]] && rc_all=1
 done
 
 echo ""

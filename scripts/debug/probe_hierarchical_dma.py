@@ -60,7 +60,7 @@ docs/low_latency_allreduce.md section 6 -- but for measuring a DMA pattern,
 ``DeviceIdType.MESH`` maps mesh index to device either way.
 
 Barrier: every arm opens with the same double barrier and uses scratch-VMEM
-destinations, like ``one_shot_all_reduce`` rather than the ``_ws`` variants. That
+destinations, i.e. a stateless kernel rather than a workspace one. That
 inflates all arms equally and keeps the comparison clean; absolute numbers are
 therefore not comparable to the ``_ws`` figures in the doc, only to each other.
 
