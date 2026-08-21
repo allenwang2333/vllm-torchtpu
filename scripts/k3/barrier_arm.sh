@@ -26,13 +26,18 @@ printf '{"model":"moonshotai/Kimi-K3","prompt":"Question: What is 7 plus 5?\nAns
   > "${OUT}/canary-req.json"
 curl -sf "${ENDPOINT}/v1/completions" -H 'Content-Type: application/json' \
   --data @"${OUT}/canary-req.json" > "${OUT}/canary.json" || true
-python3 -c "
+if ! python3 -c "
 import json
-try:
-    print('canary:', repr(json.load(open('${OUT}/canary.json'))['choices'][0]['text'][:160]))
-except Exception as exc:
-    print('canary UNREADABLE:', exc)
-"
+print('canary:', repr(json.load(open('${OUT}/canary.json'))['choices'][0]['text'][:160]))
+"; then
+  # Abort rather than continue. A dead endpoint makes every number below
+  # meaningless, and this script's exit status is what the launcher reports --
+  # job 297 printed '### done' and 'POST_READY_CMD exited 0' having measured
+  # nothing at all, because the canary failure was swallowed and the sweep's
+  # own 'completed=0 failed=5' was never inspected.
+  echo "### [${ARM}] FATAL: canary did not return a completion; endpoint is not serving." >&2
+  exit 4
+fi
 
 # Decode speed. Repeated so the reported TPOT carries a spread rather than a
 # single sample -- the job-154 baseline was stable to +/-0.01 ms over three runs,
@@ -45,6 +50,22 @@ for rep in 1 2 3; do
     OUTPUT_DIR="${OUT}/sweep-r${rep}" \
     CONCURRENCIES="${CONCURRENCIES}" OUTPUT_LEN="${OUTPUT_LEN}" \
     "${REPO_ROOT}/scripts/k3/concurrency_sweep.sh" 2>&1 | tail -12
+  # The sweep tool exits 0 with "completed":0 when the endpoint refuses the
+  # connection, so its exit status proves nothing. Read the result instead.
+  for res in "${OUT}/sweep-r${rep}"/*.json; do
+    [[ -e "${res}" ]] || continue
+    python3 -c "
+import json, sys
+d = json.load(open('${res}'))
+done_, failed = d.get('completed', 0), d.get('failed', 0)
+print(f'  ${res##*/}: completed={done_} failed={failed} '
+      f'tpot_med={d.get(\"median_tpot_ms\")}')
+sys.exit(0 if done_ > 0 and failed == 0 else 5)
+" || {
+      echo "### [${ARM}] FATAL: sweep rep ${rep} completed no requests." >&2
+      exit 5
+    }
+  done
 done
 
 # Profiling last: it leaves the profiler session closed and writes gigabytes, so
