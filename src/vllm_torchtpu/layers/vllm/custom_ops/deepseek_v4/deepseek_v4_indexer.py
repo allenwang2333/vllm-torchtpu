@@ -100,8 +100,7 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            # TODO(hwanginho): tune num_kv_pages_per_block,
-            # num_queries_per_block.
+            # The following parameters are tuned based on microbenchmark results.
             num_kv_pages_per_block=(3, 2, 2),
             num_queries_per_block=(1, 128, 128),
         )

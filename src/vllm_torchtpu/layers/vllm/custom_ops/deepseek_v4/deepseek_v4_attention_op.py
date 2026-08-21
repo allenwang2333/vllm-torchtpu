@@ -44,9 +44,21 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _run_swa(q, new_kv, sw_cache, swa_kv_lens, swa_page_indices, swa_cu_q_lens,
-             swa_distribution, attention_sinks, *, sm_scale, sliding_window,
-             logical_page_size, swa_only):
+def _run_swa(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    swa_only: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
     When a compressed-KV pass follows, the output is left unnormalized so
@@ -69,11 +81,11 @@ def _run_swa(q, new_kv, sw_cache, swa_kv_lens, swa_page_indices, swa_cu_q_lens,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
-        # TODO: tune num_kv_pages_per_block & num_queries_per_block.
+        # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(2, 2, 2),
         num_queries_per_block=(1, 32, 32),
         q_compute_block_size=2,
-        unnormalized_output=False if swa_only else True,
+        unnormalized_output=not swa_only,
     )
 
 
@@ -110,14 +122,14 @@ def _attention_hca(
     main_page_indices = main_page_indices.flatten()
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
-        q,
-        new_kv,
-        sw_cache,
-        swa_kv_lens,
-        swa_page_indices,
-        swa_cu_q_lens,
-        swa_distribution,
-        attention_sinks,
+        q=q,
+        new_kv=new_kv,
+        sw_cache=sw_cache,
+        swa_kv_lens=swa_kv_lens,
+        swa_page_indices=swa_page_indices,
+        swa_cu_q_lens=swa_cu_q_lens,
+        swa_distribution=swa_distribution,
+        attention_sinks=attention_sinks,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
@@ -145,7 +157,7 @@ def _attention_hca(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        # TODO: tune num_kv_pages_per_block & num_queries_per_block.
+        # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(16, 16, 16),
         num_queries_per_block=(1, 32, 32),
     )
@@ -183,14 +195,14 @@ def _attention_csa(
     main_page_indices = main_page_indices.flatten()
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
-        q,
-        new_kv,
-        sw_cache,
-        swa_kv_lens,
-        swa_page_indices,
-        swa_cu_q_lens,
-        swa_distribution,
-        attention_sinks,
+        q=q,
+        new_kv=new_kv,
+        sw_cache=sw_cache,
+        swa_kv_lens=swa_kv_lens,
+        swa_page_indices=swa_page_indices,
+        swa_cu_q_lens=swa_cu_q_lens,
+        swa_distribution=swa_distribution,
+        attention_sinks=attention_sinks,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
@@ -200,6 +212,8 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
+    # `gather_and_attention_chunk_size` and `attention_kernel_batch_size` are
+    # tuned based on microbenchmark results.
     gather_and_attention_chunk_size = 64 if (q.shape[0] % 64 == 0) else None
     if gather_and_attention_chunk_size is None:
         # The kernel falls back to a single chunk of q.shape[0]; the batch
@@ -221,8 +235,6 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        # TODO: tune attention_kernel_batch_size &
-        # gather_and_attention_chunk_size.
         gather_and_attention_chunk_size=gather_and_attention_chunk_size,
         attention_kernel_batch_size=attention_kernel_batch_size,
     )
