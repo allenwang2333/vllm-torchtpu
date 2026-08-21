@@ -80,14 +80,17 @@ def ensure_runai_aux_files(model_config) -> None:
 
     No-op unless the model comes from object storage (see module doc).
     """
-    model_weights = getattr(model_config, "model_weights", None) or ""
-    if is_runai_obj_uri(model_weights):
+    model = model_config.model
+    model_weights = getattr(model_config, "model_weights", None)
+    # isinstance guards: both fields are str on a real ModelConfig; tests
+    # drive TPUWorker with MagicMock configs, which must stay a no-op.
+    if isinstance(model_weights, str) and is_runai_obj_uri(model_weights):
         # Ray V2: rewritten on the head; the local dir may be missing here.
         uri = model_weights
         rewritten = True
-    elif is_runai_obj_uri(model_config.model):
+    elif isinstance(model, str) and is_runai_obj_uri(model):
         # Ray V1: pre-pull state, nobody has pulled on this host yet.
-        uri = model_config.model
+        uri = model
         rewritten = False
     else:
         return
