@@ -1,0 +1,157 @@
+# Qwen3.5-397B-A17B-FP8 on TPU: attention, linear attention and MoE, split
+# into parts.
+#
+# An example of what a model-specific taxonomy looks like. `default.yaml` stays
+# generic and gets you a first read; this file knows the model's shapes and so
+# can name the individual projections. Use it with:
+#
+#   analyze.py breakdown CAPTURE --taxonomy taxonomies/qwen35_397b.yaml
+#
+# Every rule below was derived from a trace, not from the model config. Three
+# distinct projection shapes appear in the module, and each is a different
+# projection:
+#
+#   out bf16[2048,20480]  <- fp8[2048,4096] x fp8[20480,4096]
+#                 the linear-attention input projection  -> linear_attn_in_proj
+#   out bf16[2048,17408]  <- fp8[2048,4096] x fp8[17408,4096]
+#                 the attention QKV projection                 -> attn_qkv_proj
+#   out bf16[2048,2048]   <- fp8[2048,4096] x fp8[2048,4096]
+#                 the output projection, shared by both        -> out_proj
+#
+# Note that none of these is called anything like a projection in the trace.
+# All three arrive named `multiply_convert_fusion` -- XLA fused the fp8 dequant
+# onto the dot and named the fusion after the multiply. The `hlo:` field is
+# what makes them separable; the op name cannot do it.
+#
+# The shapes are specific to this model AND this sharding (attn dp8 · ep8). Any
+# change to either invalidates the rules, and the symptom is a large
+# `unclassified` bucket -- which `breakdown` warns about.
+
+name: qwen35_397b
+
+categories:
+  # --- attention, split into its parts --------------------------------------
+  # 1. Projections. QKV in, and the output projection, which both layer
+  #    types share.
+  - {name: attn_qkv_proj,    block: attn,        hlo: 'kind=kOutput.* out=\w+\[\d+,17408\]'}
+  - {name: out_proj,         block: attn,        hlo: 'kind=kOutput.* out=\w+\[\d+,2048\] in=f8\S*\[\d+,4096\],f8\S*\[\d+,4096\]'}
+
+  # 2. Core attention -- the QK and AV einsums. Ragged paged attention: `RPAm`
+  #    is the mixed/prefill variant, `RPAd` the decode one. The suffix carries
+  #    the block shape (`-p256-b1-q256-k256`), so it changes with the schedule
+  #    and must not be anchored on.
+  #
+  #    `rpa_metadata_schedule` (11.6 us) is deliberately in here rather than in
+  #    a row of its own. It had one, below this rule, where `^rpa_` claimed the
+  #    op first and the row never appeared -- a dead rule, which the report now
+  #    names. Splitting 11.6 us out needs this pattern narrowed, not a second
+  #    rule underneath it; the metadata is attention work either way.
+  - {name: attn_core,        block: attn,        pattern: '^RPA[md]?[-_]|^rpa_|attn_metadata'}
+
+  # 3. Rotary embedding. Named `copy`, `reshape` and `concatenate` by the
+  #    compiler, so only the source line identifies it; without this rule it
+  #    scatters into `layout` and `elementwise`. Safe this early because rope
+  #    emits no matmul and no collective for an earlier rule to want.
+  - {name: attn_rope,        block: attn,        src: 'rotary_embedding/'}
+
+  # --- linear attention (gated delta net kernels) ---------------------------
+  - {name: linear_attn_in_proj, block: linear_attn, hlo: 'kind=kOutput.* out=\w+\[\d+,20480\]'}
+  - {name: linear_attn_core,    block: linear_attn, pattern: 'gdn|delta[-_]?net|conv1d'}
+
+  # --- mixture of experts ---------------------------------------------------
+  # Expert dispatch and combine. Despite the name, `sc_ragged_gather_reduce_v2`
+  # is MoE routing, not attention: under ep8 it collects each expert's token
+  # rows and reduces the expert outputs back. Gather and reduce are one Pallas
+  # kernel and one trace event, so they cannot be separated here; splitting the
+  # number needs the kernel instrumented or a roofline model. Kept as one
+  # honestly-named row rather than split by a guess. `sc_ragged_gather_v2`
+  # without the reduce is a genuinely separate (and tiny) op.
+  - {name: moe_gather_reduce, block: moe,        pattern: 'sc_ragged_gather_reduce'}
+  - {name: moe_gather,       block: moe,        pattern: 'sc_ragged_gather'}
+  - {name: moe_gmm,          block: moe,        pattern: '^gmm|grouped[-_]?matmul|ragged[-_]?dot'}
+  - {name: moe_sort,         block: moe,        pattern: '^sort|argsort|top[-_]?k'}
+
+  # The rest of the router: the softmax over the logits, the renormalise, and
+  # the gather of the chosen weights. All arrive as anonymous fusions, so the
+  # source file is the only handle. Must come *after* `moe_sort` -- the topk
+  # lives in the same file, and this rule would otherwise swallow the largest
+  # single row in the report.
+  - {name: moe_route,        block: moe,        src: 'layers/vllm/moe_routing\.py'}
+
+  # --- everything else, as in default.yaml ----------------------------------
+  # `block: moe` because this deployment is attn dp8 · ep8: attention is data
+  # parallel and emits no collective at all, so every one of these is the
+  # expert dispatch or combine. Checked, not assumed -- baseline_a/prefill_heavy
+  # holds 0 all-reduce instructions, and its 120 reduce-scatter and 120
+  # all-gather are the ep8 pair around the grouped matmul. That pair is 90% of
+  # what this rule claims; the other 2.53% of the step is booked here on the
+  # sharding argument alone, itemised in the README. Under tensor-parallel
+  # attention this line silently books attention's collectives to the MoE and
+  # nothing in the trace would contradict it; see the README, "Declaring
+  # blocks", for why no rule can split them.
+  - {name: collective,       block: moe,        pattern: 'all[-_]reduce|all[-_]gather|reduce[-_]scatter|all[-_]to[-_]all|collective[-_]permute|async[-_](start|done)|copy[-_](start|done)'}
+  - {name: sparsecore_glue,  pattern: 'sparse[-_]?core|(^|[-_])sc_|PrepareAsyncCall|offload'}
+  - {name: norm,             pattern: 'layer_?norm|rms_?norm|rsqrt'}
+  # XLA names a fused norm after nothing in particular; on this stack every one
+  # of them arrived as `fusion` and the `norm` row read 0.00%, which was false.
+  - {name: norm,             src: 'layernorm\.py'}
+  - {name: matmul_other,     pattern: '^dot|convolution|matmul|einsum'}
+  - {name: matmul_other,     hlo: 'kind=kOutput.* out=\w+\[\d+,\d+\] in=\S*\[\d+,\d+\],\S*\[\d+,\d+\]'}
+  # `torch.nn.functional.linear` on an unquantised weight. A matmul the hlo rule
+  # above misses because XLA fused it into something not shaped like a dot.
+  - {name: matmul_other,     src: 'model_executor/layers/utils\.py'}
+
+  # Kept although it matches nothing on this capture -- the report names it on
+  # every run, next to `embedding`, and for the same harmless reason: not one
+  # op name here contains `quant`, `fp8` or `int8` (checked with this pattern
+  # alone against the whole step: 0.0 us). It is *not* shadowed -- the rules
+  # above it are shapes, source files and specific kernel names -- so putting
+  # it earlier would change nothing. XLA names the quantised fusions after
+  # their interior arithmetic, which is why the `src` rule below is the one
+  # that does the work; this one catches the day a kernel is named honestly.
+  - {name: quant,            pattern: 'quant|dequant|fp8|int8'}
+  # `quantize_block` -- abs-max, divide, clip, cast. Nothing in the op name says
+  # quantise, so without this it reads as generic `elementwise` arithmetic. The
+  # quantised matmuls themselves are already claimed by the projection rules
+  # above, which is why this rule sits here and not at the top of the file.
+  - {name: quant,            src: 'quantized_matmul/util\.py'}
+  # Kept although it matches nothing on this capture -- the report says so on
+  # every run. It is dead for the harmless reason (the embedding lookup is not
+  # in the traced module), not the dangerous one (shadowed by an earlier rule),
+  # and without it a `gather` that *is* an embedding would land in `layout`.
+  - {name: embedding,        pattern: 'embedding|one[-_]?hot|lookup'}
+  # --- kernel glue, attributed by caller ------------------------------------
+  # The reshapes, slices and pads a kernel wrapper emits around its call. The op
+  # name says only `reshape`, so a name-only taxonomy piles all of it into
+  # `layout` and undercounts each kernel by its own setup cost. The caller frame
+  # says whose it is (see `opstats.PLUMBING`), and it is the only thing that
+  # does: these ops are named for what they do, never for what they serve.
+  #
+  # These are last-but-one on purpose. Each claims a whole file, so every rule
+  # naming specific work in that file -- the MoE kernels, RPA, the collectives
+  # -- must already have had its turn above.
+  #
+  # `parameter.py:127` is vLLM's `BasevLLMParameter.__torch_function__`, a
+  # trampoline that swallowed the frame we actually wanted. It is read as the
+  # linear-attention path here because of what sits under it
+  # (`fused_conv1d_gdn_*` and its reshapes), not because the frame says so --
+  # which is why `linear_attn_glue` is a declaration like every other block.
+  - {name: moe_glue,         block: moe,        src: 'layers/vllm/fused_moe\.py'}
+  - {name: linear_attn_glue, block: linear_attn, src: 'model_executor/parameter\.py'}
+  - {name: attn_glue,        block: attn,        src: 'layers/vllm/attention\.py'}
+
+  - {name: layout,           pattern: '^(copy|reshape|transpose|bitcast|broadcast|concatenate|slice|pad|gather|scatter|iota|select|as_strided|dynamic[-_](slice|update))'}
+  - {name: elementwise,      pattern: '^(add|multiply|subtract|divide|maximum|minimum|compare|convert|exponential|log|tanh|logistic|reduce|not|and|or|clamp|argmax|argmin|eq|abs|negate|sign|round|power|sqrt|rem)'}
+  - {name: fusion,           pattern: 'fusion'}
+
+# Three blocks: `attn`, `linear_attn`, `moe`. A block is the sum of the ops
+# declared to be in it, so a row is what that part of the model costs *per
+# step*, not per layer. No rule here knows how many layers of each kind the
+# model has, and none needs to. Dividing by a layer count to get a per-layer
+# figure is left to the reader, who knows whether their question is about one
+# layer or about the step.
+#
+# `norm`, `matmul_other`, `quant` and the layout catchalls are deliberately
+# unassigned: each holds work from more than one block, and the only handle that
+# could split them -- the source line -- points at a shared utility file. They
+# show up under `(no block)`, which is the honest place for them.

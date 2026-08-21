@@ -1,0 +1,107 @@
+# Default op taxonomy: a generic transformer-on-TPU serving stack.
+#
+# Nothing here names a specific model or kernel. Copy this file, add the rules
+# your stack needs, and pass `--taxonomy path/to/yours.yaml`. See the README
+# sections "Adding a taxonomy rule" and "Declaring blocks".
+#
+# `categories` is a list of {name, pattern, hlo, src, block}. The FIRST matching
+# rule wins, so the list reads top-to-bottom as "most specific first". Put a new
+# rule above the generic `layout` / `elementwise` / `fusion` catchalls or it will
+# never fire. Two rules may share a name; they fold into one row.
+#
+#   pattern:  regex against the op name (`multiply_convert_fusion.44`)
+#   hlo:      regex against the HLO signature -- what the instruction *is*:
+#               kind=kOutput out=bf16[2048,17408] in=f8e4m3fn[2048,4096],...
+#             Fields present: kind, target, thread, replica_groups, out, in.
+#   src:      regex against `file.py:123` -- whose code asked for the op, from
+#             the profiler's op-stats sidecar. Covers about three quarters of
+#             op time; a compiler-generated collective has one, but it is the
+#             *compilation* stack and is identical for every collective in the
+#             module, so no `src` rule can tell two of them apart.
+#   block:    which part of the model these ops belong to. Not a condition: it
+#             is the answer to a different question, and it is what the "by
+#             block" table sums. Optional -- a category with no `block` is
+#             reported outside every block. Rules sharing a `name` must agree.
+#
+# All three are case-insensitive, and a rule may use any combination; when it
+# has several, all must match. `hlo` is the one to reach for when the op name
+# lies about what the instruction *is* -- see the `matmul` rule below. `src` is
+# for when the name says nothing at all: a stack emits a dozen different
+# `fusion.N` and only the source line says which is the norm and which is the
+# quantise.
+#
+# SparseCore is NOT a category here. It is a *device*, reported on its own axis
+# (`thread=sparsecore` in the signature), because an op like a ragged gather is
+# both attention work and SparseCore work and needs to be counted as both.
+
+name: default
+
+categories:
+  # --- named kernels -------------------------------------------------------
+  # Hand-written kernels keep the names they were given, so these are exact
+  # rather than heuristic. Linear/recurrent attention comes first because its
+  # kernel names are the more specific of the two.
+  - {name: linear_attention, block: attn, pattern: 'gdn|delta[-_]?net|mamba|recurrent|ssm_|conv1d'}
+  - {name: attention,        block: attn, pattern: 'attention|flash|paged|kv[-_]?cache|ragged|^RPA|rpa_'}
+  - {name: moe,              block: moe,  pattern: 'moe|expert|grouped[-_]?matmul|gmm|ragged[-_]?dot'}
+
+  # `sort` is its own row and not folded into `moe`. On a mixture-of-experts
+  # model the routing sort can be the single largest family in the step --
+  # larger than attention -- and a row that big should be visible rather than
+  # buried in whatever it probably belongs to.
+  - {name: sort,             block: moe, pattern: '^sort|argsort|top[-_]?k'}
+
+  # --- communication and offload ------------------------------------------
+  # `block: moe` is a *claim about the sharding*, not a measurement, and it is
+  # the one declaration in this file most likely to be wrong for you. It holds
+  # when the experts are sharded and attention is replicated or data-parallel,
+  # which is the common serving configuration: every collective in the step is
+  # then the expert dispatch or combine. Under tensor-parallel attention it is
+  # wrong, and wrong by tens of microseconds per layer, with no symptom -- the
+  # attention all-reduces would be booked to `moe`. Nothing in the trace can
+  # correct it: two all-reduces from different parts of the model have the same
+  # name, the same shapes, the same replica groups and byte-identical source
+  # stacks. Delete the `block` here, or split this rule, if you shard otherwise.
+  - {name: collective,       block: moe, pattern: 'all[-_]reduce|all[-_]gather|reduce[-_]scatter|all[-_]to[-_]all|collective[-_]permute|async[-_](start|done)|copy[-_](start|done)'}
+  - {name: sparsecore,       pattern: 'sparse[-_]?core|(^|[-_])sc_|PrepareAsyncCall|offload'}
+
+  # --- generic compute -----------------------------------------------------
+  - {name: norm,             pattern: 'layer_?norm|rms_?norm|rsqrt'}
+  - {name: matmul,           pattern: '^dot|convolution|matmul|einsum'}
+
+  # A matmul XLA did not name after the matmul. `kind=kOutput` is the TPU
+  # marker for a fusion rooted at a dot, and XLA names such a fusion after two
+  # of its *interior* ops -- so the QKV projection arrives called
+  # `multiply_convert_fusion` and a name-only taxonomy files 7% of the step
+  # under `elementwise`. There is no `dot` op in the module at all.
+  #
+  # The output must be 2-D and at least two operands must be 2-D, which is what
+  # separates a real matmul from a kOutput fusion rooted at a reduction
+  # (`multiply_reduce_fusion`: two 2-D operands, but a 1-D result).
+  - {name: matmul,           hlo: 'kind=kOutput.* out=\w+\[\d+,\d+\] in=\S*\[\d+,\d+\],\S*\[\d+,\d+\]'}
+  # These two are a generic file's job and neither fires on the capture behind
+  # the README -- the report names both, on every run, as rules that claimed no
+  # op. **The floor for this file is 2**: an out-of-the-box run reporting "2
+  # rule(s) claimed no op" is reporting nothing, and it is a third that is worth
+  # looking at. That is the expected reading for `default.yaml`: it is written
+  # for stacks it has not seen, so on any one capture some of it is dead. In a
+  # model-specific file the same line means something quite different, and the
+  # report cannot tell the two apart, which is why it says so and stops there.
+  - {name: quant,            pattern: 'quant|dequant|scale|fp8|int8'}
+  - {name: embedding,        pattern: 'embedding|one[-_]?hot|lookup'}
+
+  # --- catchalls -----------------------------------------------------------
+  # Data movement the compiler inserted, then pointwise maths, then anything
+  # still unnamed that XLA fused. Order matters: `fusion` last, because a fused
+  # region named for its first op should be filed by that op.
+  - {name: layout,           pattern: '^(copy|reshape|transpose|bitcast|broadcast|concatenate|slice|pad|gather|scatter|iota|select|as_strided|dynamic[-_](slice|update))'}
+  - {name: elementwise,      pattern: '^(add|multiply|subtract|divide|maximum|minimum|compare|convert|exponential|log|tanh|logistic|reduce|not|and|or|clamp|argmax|argmin|eq|abs|negate|sign|round|power|sqrt|rem)'}
+  - {name: fusion,           pattern: 'fusion'}
+
+# The blocks this file declares are `attn` and `moe`. Everything else -- the
+# norms, the generic matmuls, the layout churn -- is left unassigned rather than
+# guessed at, because a name-only rule cannot tell whose reshape it is. The way
+# to move that time into a block is a `src:` rule with a `block:` on it: the
+# caller frame names the kernel wrapper that emitted the glue. See
+# `qwen35_397b.yaml`, which does exactly that, and the README section
+# "Declaring blocks".
