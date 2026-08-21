@@ -201,8 +201,9 @@ steps:
       # disk that fits it. Runs through run_multihost.sh (Ray head+worker
       # containers), same as the GLM v7x-16 steps above. The generous
       # timeout covers checkpoint stream + cold XLA compile; a warm run
-      # completes in about an hour. pipeline_dev_k3_gcs.yml runs this
-      # same step ungated for validation / baseline recalibration.
+      # completes in about an hour. To validate or recalibrate, run this
+      # step from a branch-local dev yml (see pipeline_dev.yml) and feed
+      # two runs' perf_eval_results to check_regression.py --calibrate.
       - label: "Perf: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
         key: "perf_nightly_kimi_k3_tp32_ep"
         if: 'build.env("NIGHTLY") == "1"'
