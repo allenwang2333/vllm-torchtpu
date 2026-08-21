@@ -96,7 +96,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -e /workspace/vllm-torchtpu/vllm ; \
     fi
 
-ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:/root/torchtpu-vllm/src:/root/torchtpu-vllm"
+ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
 
@@ -113,5 +113,5 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN mkdir -p /root /workspace && \
     ln -sfnT /workspace/vllm-torchtpu /root/torchtpu-vllm && \
     ln -sfnT /workspace/vllm-torchtpu /workspace/torchtpu-vllm
-ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:/root/torchtpu-vllm/src:/root/torchtpu-vllm"
+ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
