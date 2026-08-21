@@ -100,7 +100,7 @@ def _attention_hca(
     swa_distribution: jax.Array,
     main_cache_kv: jax.Array,
     main_kv_lens: jax.Array,
-    extra: jax.Array,
+    extra: jax.Array,  # pass kv_lens_to_attend for HCA
     main_page_indices: jax.Array,
     main_cu_q_lens: jax.Array,
     main_distribution: jax.Array,
@@ -174,7 +174,7 @@ def _attention_csa(
     swa_distribution: jax.Array,
     main_cache_kv: jax.Array,
     main_kv_lens: jax.Array,
-    extra: jax.Array,
+    extra: jax.Array,  # pass topk_indices for CSA
     main_page_indices: jax.Array,
     main_cu_q_lens: jax.Array,
     main_distribution: jax.Array,
@@ -300,7 +300,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
-            head_size=512 * 2,
+            head_size=1024,
             dtype=torch.uint8,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,

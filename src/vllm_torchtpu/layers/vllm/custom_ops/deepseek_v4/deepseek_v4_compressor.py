@@ -46,19 +46,19 @@ BATCH_AXIS = None
 
 
 def _run_compressor(
-    hidden_states,
-    wkv_wgate,
-    ape,
-    norm_weight,
-    cos_sin_cache,
-    positions,
-    state_block_tables,
-    query_start_loc,
-    k_block_tables,
-    request_distribution,
-    cache,
-    rope_cache,
-    state_cache,
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    rope_cache: jax.Array | None,
+    state_cache: jax.Array | None,
     *,
     state_block_size: int,
     head_dim: int,
@@ -66,14 +66,8 @@ def _run_compressor(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
-):
-    """Shared body of the three op variants.
-
-    Nothing here derives slot mappings: `compressor_forward` re-derives the
-    whole page geometry from the array shapes, and a second model of it
-    outside the kernel only agrees for CSA -- it diverges by 2x for HCA and
-    4x for the indexer, scattering writes onto the wrong pages.
-    """
+) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
+    """Shared body of the three op variants, for CSA compressor, HCA compressor, and CSA indexer compressor respectively."""
     return compressor_forward(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,
