@@ -76,6 +76,77 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
         assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "raises_after_retry"),
+    [
+        ([False, True], False),
+        ([False, False], True),
+    ],
+)
+def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
+    attempts = MagicMock(side_effect=outcomes)
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4096],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_pcp_mtp_prefill=attempts,
+    )
+
+    expectation = (pytest.raises(
+        RuntimeError, match="PCP MTP prefill warmup failed after retry")
+                   if raises_after_retry else contextlib.nullcontext())
+    with patch.object(tpu_runner,
+                      "_suspend_kv_transfer_group",
+                      return_value=contextlib.nullcontext()), expectation:
+        TPUModelRunner._warmup_pcp_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((4096, ), {
+            "quiet": True
+        }),
+        ((4096, ), {}),
+    ]
+
+
+def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
+    executed = []
+    runner = SimpleNamespace(
+        max_model_len=64,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=100,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8)),
+            ],
+        ),
+        execute_model=MagicMock(side_effect=lambda so: executed.append(so)),
+        sample_tokens=MagicMock(),
+        take_draft_token_ids=MagicMock(),
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    )
+
+    assert TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 31) is True
+
+    assert len(executed) == 1
+    scheduler_output = executed[0]
+    assert scheduler_output.total_num_scheduled_tokens == 31
+    assert scheduler_output.num_scheduled_tokens == {"__pcp_mtp_warmup__": 31}
+    assert len(scheduler_output.scheduled_new_reqs) == 1
+    request = scheduler_output.scheduled_new_reqs[0]
+    assert request.req_id == "__pcp_mtp_warmup__"
+    assert len(request.prompt_token_ids) == 31
+    assert request.block_ids == ([98, 99], [96, 97, 98, 99])
+    assert scheduler_output.scheduled_cached_reqs.req_ids == []
+    runner.sample_tokens.assert_called_once_with(None)
+    runner.take_draft_token_ids.assert_called_once_with()
+    runner._warmup_spec_decode_cleanup.assert_called_once_with(
+        "__pcp_mtp_warmup__")
+
+
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     """Run _prepare_async_token_substitution_indices with a minimal fake self.
     req_id_to_index_copy holds each request's *position*; with spec_k set the
@@ -2496,9 +2567,15 @@ def test_tpu_platform_block_size_override_is_dsv4_only():
 
 
 def test_spec_token_room_guard_caps_writes_at_context_limit():
-    """The wrapped update_req_spec_token_ids caps scheduled drafts to the
-    exact remaining token-buffer room at call time; unchecked, the write
-    overflows and kills the engine for requests near max_model_len."""
+    """The wrapped update_req_spec_token_ids clamps the staged write to the
+    remaining token-buffer room (unclamped it overflows and kills the engine
+    near max_model_len) while leaving the scheduled draft count untouched.
+
+    The count has to survive: num_scheduled_tokens is already fixed at 1+K and
+    get_spec_decode_metadata anchors the logits window at the end of each
+    request's query, so a trimmed count slides the verify window forward and
+    the sampler validates the wrong drafts.
+    """
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(
             token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
@@ -2508,6 +2585,7 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
                 "edge": 1,
                 "full": 2
             },
+            spec_token_ids=[[] for _ in range(4)],
         ),
         requests={},
     )
@@ -2518,14 +2596,26 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     TPUModelRunner._install_spec_token_room_guard(runner)
 
     scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
+    requests = {
+        rid: SimpleNamespace(req_id=rid, prev_num_draft_len=0)
+        for rid in ("roomy", "edge", "full")
+    }
     for rid in ("roomy", "edge", "full"):
-        runner.input_batch.update_req_spec_token_ids(
-            SimpleNamespace(req_id=rid), scheduled)
+        runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
+
+    # Only what fits is staged into token_ids_cpu.
     assert [(r, len(ids)) for r, ids in calls] \
         == [("roomy", 15), ("edge", 10), ("full", 0)]
-    # in-place dict trim keeps downstream consumers consistent
+    # ...and the clamped write keeps the first drafts, not the last.
+    assert calls[1][1] == [2] * 10
+    # The scheduler's counts are restored, so the verify window stays aligned
+    # with num_scheduled_tokens.
     assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
-        == [15, 10, 0]
+        == [15, 15, 15]
+    assert [requests[r].prev_num_draft_len
+            for r in ("roomy", "edge", "full")] == [0, 15, 15]
+    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] \
+        == [15, 15]
 
 
 class TestUpdateAttentionPageSizePadded:
