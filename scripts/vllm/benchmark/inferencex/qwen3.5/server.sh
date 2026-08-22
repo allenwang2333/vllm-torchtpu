@@ -94,10 +94,14 @@ MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-24576}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
-# The token and sequence limits are node-wide targets. vLLM runs one scheduler
-# per DP rank, so divide both by DP_SIZE (rounding up for robustness). TP has
-# DP_SIZE=1 and therefore keeps the full values.
+# The global token target is normally divided across DP ranks. The measured
+# DP8 high-concurrency points use smaller per-rank chunks instead.
 DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
+case "$SHARDING:$CONC" in
+  DP8_EP:128) DEFAULT_MAX_NUM_BATCHED_TOKENS=256 ;;
+  DP8_EP:256) DEFAULT_MAX_NUM_BATCHED_TOKENS=512 ;;
+esac
+# Max sequences is a node-wide target divided across DP ranks.
 DEFAULT_MAX_NUM_SEQS=$(((CONC + DP_SIZE - 1) / DP_SIZE))
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-$DEFAULT_MAX_NUM_SEQS}"
