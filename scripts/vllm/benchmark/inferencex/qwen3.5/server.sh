@@ -51,6 +51,9 @@ case "$SHARDING" in
     export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
     export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
+    # Decode buckets below 256 tokens/rank use gather -> fused GMM -> combine;
+    # prefill buckets at 256 tokens/rank or above use the fully fused EP kernel.
+    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-256}"
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
