@@ -38,7 +38,6 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 from typing import Optional
 
 import torch
-from torch_tpu._internal import sync
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
@@ -66,10 +65,12 @@ from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
                                                  requant_load_kmajor_fp4)
 from vllm_torchtpu.layers.vllm.linear_common import quantized_matmul_fp4
+from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -186,6 +187,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        # We need to take control of collective communication (AllGather/ReduceScatter)
+        # to pipeline them with MoE computation when chunking is enabled.
+        return enable_pipelined_collective_and_compute()
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -308,10 +315,12 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
                                                    requires_grad=False)
 
         if layer.w13_weight.device.type == "tpu":
-            sync.synchronize(layer.w13_weight, wait=True)
-            sync.synchronize(layer.w2_weight, wait=True)
-            sync.synchronize(layer.w13_weight_scale, wait=True)
-            sync.synchronize(layer.w2_weight_scale, wait=True)
+            synchronize_tensors([
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            ])
 
         logger.info_once(
             f"NVFP4 MoE weights prepared ({mode}): "
@@ -338,39 +347,36 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
-        custom_routing_fn = layer.custom_routing_function
-        if custom_routing_fn is not None:
-            # custom_routing_fn bypasses select_experts, so apply the
-            # random-routing profiling override here too (a no-op by default).
-            topk_weights, topk_ids = custom_routing_fn(
-                hidden_states=x,
-                gating_output=moe_routing.maybe_force_random_routing(
-                    router_logits),
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-            )
-        else:
-            topk_weights, topk_ids = moe_routing.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                topk=layer.moe_config.experts_per_token,
-                renormalize=layer.renormalize,
-                scoring_fn=layer.scoring_func,
-            )
-        return fused_moe_gmm(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            w1_bias=None,
-            w2_bias=None,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            experts_start=layer._experts_start,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-        )
+        # Quantization-independent routing decision (simulation override ->
+        # custom_routing_function -> select_experts); shared across all TPU MoE
+        # methods so the routing-simulation hook lives in exactly one place.
+        #
+        # Behavior note: this previously called select_experts() without
+        # `layer=`, which silently skipped grouped-topk routing for any NVFP4
+        # model with use_grouped_topk=True (that attribute is set on every MoE
+        # layer at construction, not specific to a quantization scheme, and
+        # the other three TPU MoE methods already passed it). moe_routing.route
+        # passes `layer` uniformly, which fixes that -- flagging separately as
+        # it's a behavior change, not just a refactor.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_bias": None,
+            "w2_bias": None,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
+        return fused_moe_gmm(**kwargs)
 
 
 class _NullInputQuantKernel:
@@ -451,8 +457,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
                           torch.nn.Parameter(scale_4d, requires_grad=False))
 
         if layer.weight.device.type == "tpu":
-            sync.synchronize(layer.weight, wait=True)
-            sync.synchronize(layer.weight_scale, wait=True)
+            synchronize_tensors([layer.weight, layer.weight_scale])
 
         logger.info_once(
             "NVFP4 linear weights prepared (W4A16): "

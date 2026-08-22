@@ -8,6 +8,41 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _patch_vllm_pcp_v2_validation() -> None:
+    """Allow TPU PCP through GPU-specific Model Runner V2 checks."""
+    from vllm.config import vllm as vllm_config
+
+    cls = vllm_config.VllmConfig
+    original_validate = cls._validate_v2_model_runner
+    if getattr(original_validate, "_tpu_pcp_v2_validation_patch", False):
+        return
+    original_unsupported = cls._get_v2_model_runner_unsupported_features
+
+    def get_unsupported(self):
+        unsupported = original_unsupported(self)
+        if self.parallel_config.prefill_context_parallel_size > 1:
+            unsupported = [
+                feature for feature in unsupported
+                if feature != "prefill context parallelism"
+            ]
+        return unsupported
+
+    def validate(self):
+        if self.parallel_config.prefill_context_parallel_size <= 1:
+            return original_validate(self)
+        has_triton = vllm_config.HAS_TRITON
+        vllm_config.HAS_TRITON = True
+        try:
+            return original_validate(self)
+        finally:
+            vllm_config.HAS_TRITON = has_triton
+
+    validate._tpu_pcp_v2_validation_patch = True
+    cls._get_v2_model_runner_unsupported_features = get_unsupported
+    cls._validate_v2_model_runner = validate
+    logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
+
+
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     """Require a common local prefix hit on a hybrid KV producer.
 
@@ -63,7 +98,8 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
 
 
 def _patch_vllm_aot_compile_cache_key() -> None:
-    """Include the TPU compiler hash in vLLM's outer AOT cache key."""
+    """Include the TPU compiler hash, and the trace ordinal, in vLLM's outer
+    AOT cache key."""
     from vllm.compilation import caching
 
     original = caching.aot_compile_hash_factors
@@ -71,11 +107,13 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         return
 
     def tpu_aot_compile_hash_factors(vllm_config):
+        from vllm_torchtpu.compilation import shape_variants
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
+            *filter(None, [shape_variants.aot_cache_tag()]),
         ]
 
     tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
@@ -280,6 +318,71 @@ def _patch_vllm_disable_compile_ranges() -> None:
                 "compile_sizes only).")
 
 
+def _patch_vllm_compile_all_ranges() -> None:
+    """Patch vllm compile all ranges to support compilation rotation.
+
+    Compilation rotation allows vllm to compile multiple sizes at the same time,
+    which greatly reduce the vllm startup time.
+    """
+    import os
+    from collections import deque
+
+    from vllm.compilation.piecewise_backend import (PiecewiseBackend,
+                                                    create_concrete_args,
+                                                    get_fake_args_from_graph)
+
+    def compile_all_ranges(self) -> None:
+        """Compile all range entries for this piecewise subgraph up front."""
+        assert self.graph is not None, (
+            "Cannot compile without a graph. "
+            "When loading from cache/AOT artifacts, "
+            "compile_all_ranges should not be called.")
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        range_entry_list = list(self.range_entries.values())
+
+        range_entry_len = len(range_entry_list)
+
+        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
+        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
+        d.rotate(-local_rank * (len(d) // 8))
+        indexes = list(d)
+
+        for i in indexes:
+            if i >= len(range_entry_list):
+                continue
+
+            range_entry = range_entry_list[i]
+
+            if range_entry.compiled:
+                continue
+
+            self._log_compile_start(range_entry.compile_range)
+
+            if range_entry.compile_range.is_single_size():
+                args_list = create_concrete_args(
+                    self.graph, range_entry.compile_range.start)
+            else:
+                args_list = get_fake_args_from_graph(self.graph)
+
+            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                self.graph,
+                args_list,
+                self.vllm_backend.inductor_config,
+                self.compilation_config,
+                compile_range=range_entry.compile_range,
+                graph_index=self.piecewise_compile_index,
+                num_graphs=self.total_piecewise_compiles,
+                is_encoder=self.vllm_backend.is_encoder,
+            )
+
+            range_entry.compiled = True
+
+    if envs.TPU_PARALLEL_PRECOMPILE:
+        PiecewiseBackend.compile_all_ranges = compile_all_ranges
+        logger.info("Applied TPU patch: compile_all_ranges.")
+
+
 def _patch_rowparallel_defer_bias() -> None:
     """Defer RowParallelLinear bias past the TP all-reduce on TPU.
 
@@ -454,20 +557,6 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             binding.world_size, binding.local_world_size, rank, local_rank,
             binding.dp_rank, binding.dp_size, binding.local_rank_offset,
             binding.init_local_rank)
-        if binding.pcp_local_rank_remap is not None:
-            logger.info(
-                "Applied TPU patch: PCP native-rank worker spawn binding "
-                "native_local_rank=%d local_rank_env=%d "
-                "tpu_local_rank_env=%d local_world=%d tpu_local_world=%d "
-                "remap=%s source=%s",
-                binding.native_local_rank,
-                binding.init_local_rank,
-                binding.local_rank,
-                binding.world_size,
-                binding.local_world_size,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
-            )
         return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
@@ -483,6 +572,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # Install this constructor patch at the engine-core boundary instead, before
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
+    _patch_vllm_merge_multimodal_embeddings()
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -623,7 +713,7 @@ def _patch_vllm_offloading_connector_spec() -> None:
                 spec, vllm_config, kv_cache_config)
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(
-                spec, kv_cache_config)
+                spec, vllm_config, kv_cache_config)
 
     OffloadingConnector.__init__ = _init_with_tpu_spec
     OffloadingConnector._tpu_offloading_spec_patch = True
@@ -869,6 +959,33 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if module is not None:
             setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
 
+    # Upstream _promote_local_kv_cache_specs asserts that all workers share a
+    # uniform KV cache spec across groups, raising ValueError when encountering
+    # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
+    # pure linear state layers, or disaggregated PCP configurations with
+    # per-group block sizing). We patch it to catch ValueError and return an
+    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
+    # cache coordinator without crashing.
+    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs",
+                               None)
+    if original_promote is not None and not getattr(
+            original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(specs):
+            try:
+                return original_promote(specs)
+            except ValueError:
+                return {}
+
+        patched_promote._tpu_hybrid_promote_patch = True
+        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
+        for module_name in ("vllm.v1.engine.core",
+                            "vllm.v1.core.kv_cache_utils"):
+            mod = sys.modules.get(module_name)
+            if mod is not None and hasattr(mod,
+                                           "_promote_local_kv_cache_specs"):
+                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
             EngineCoreProc.run_engine_core)
@@ -881,6 +998,286 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     "block sizes.")
 
 
+def _patch_vllm_merge_multimodal_embeddings() -> None:
+    """Patch vLLM's _merge_multimodal_embeddings to use static indexing on TPU.
+
+    PyTorch boolean indexing (inputs[mask] = values) internally lowers to
+    `nonzero()` + `index_put_`, which creates dynamic coordinate shapes
+    parameterized by the number of True entries. On TPU, this causes
+    `tt_jit_index_put__nonzero` to recompile on every request with a different
+    image token count (~15s compilation each). We replace it with static prefix-sum
+    indexing and `torch.where`, which avoids `nonzero` and eliminates recompilation.
+    """
+    import sys
+
+    import torch
+    import vllm.model_executor.models.utils as vllm_utils
+    from vllm.multimodal import NestedTensors
+
+    if not getattr(vllm_utils, "_tpu_static_merge_mm_patch", False):
+        orig_merge = vllm_utils._merge_multimodal_embeddings
+
+        def static_merge_multimodal_embeddings(
+            inputs_embeds: torch.Tensor,
+            multimodal_embeddings: NestedTensors,
+            is_multimodal: torch.Tensor,
+        ) -> torch.Tensor:
+            if len(multimodal_embeddings) == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = vllm_utils._flatten_embeddings(
+                multimodal_embeddings)
+            if mm_embeds_flat.numel() == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = mm_embeds_flat.to(dtype=inputs_embeds.dtype,
+                                               device=inputs_embeds.device)
+
+            idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
+            idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
+            gathered = mm_embeds_flat[idx]
+            condition = is_multimodal.unsqueeze(-1)
+            return torch.where(condition, gathered, inputs_embeds)
+
+        vllm_utils._original_merge_multimodal_embeddings = orig_merge
+        vllm_utils._merge_multimodal_embeddings = static_merge_multimodal_embeddings
+        vllm_utils._tpu_static_merge_mm_patch = True
+        logger.info("Applied TPU patch: static _merge_multimodal_embeddings")
+
+    # Re-run the sweep across imported model modules on every invocation so that
+    # models imported after the first call also have their bindings updated.
+    patched_fn = vllm_utils._merge_multimodal_embeddings
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("vllm.model_executor.models") and hasattr(
+                mod, "_merge_multimodal_embeddings"):
+            if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
+                setattr(mod, "_merge_multimodal_embeddings", patched_fn)
+
+
+def _patch_vllm_reset_compile_wrapper() -> None:
+    """Reset the compile wrapper on every decoder layer, not just the model.
+
+    `support_torch_compile` makes each decorated module its own compile
+    wrapper, so compiling per layer puts a wrapper on all 40+ layers. vLLM's
+    `reset_compile_wrapper` only looks at the object it is handed and that
+    object's `.model` attribute; finding no wrapper there, it returns and
+    resets nothing.
+    """
+    import torch
+    import vllm.compilation.wrapper as wrapper_mod
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_reset = wrapper_mod.reset_compile_wrapper
+    if getattr(original_reset, "_tpu_reset_compile_wrapper_patch", False):
+        return
+
+    def reset_compile_wrapper_tpu(model: torch.nn.Module) -> None:
+        if model is None:
+            return
+        if isinstance(model, TorchCompileWithNoGuardsWrapper):
+            original_reset(model)
+            return
+
+        found_wrapper = False
+        for m in model.modules():
+            if isinstance(m, TorchCompileWithNoGuardsWrapper):
+                found_wrapper = True
+                original_reset(m)
+
+        if not found_wrapper:
+            original_reset(model)
+
+    reset_compile_wrapper_tpu._tpu_reset_compile_wrapper_patch = True
+    wrapper_mod.reset_compile_wrapper = reset_compile_wrapper_tpu
+    logger.info(
+        "Applied TPU patch: recursive reset_compile_wrapper for per-layer compilation."
+    )
+
+
+def _patch_vllm_piecewise_backend() -> None:
+    """Pick the compiled token-count bucket from a tensor's leading dimension.
+
+    A graph is compiled once per bucket of token counts, and vLLM decides
+    which one a call needs by reading an argument that is a `SymInt`. A layer
+    whose arguments are all tensors has no such argument, so vLLM assumes only
+    one bucket was compiled and asserts when several were.
+    """
+    import torch
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    original_call = PiecewiseBackend.__call__
+    if getattr(original_call, "_tpu_piecewise_backend_patch", False):
+        return
+
+    def patched_call(self, *args, **kwargs):
+        if self.sym_shape_indices:
+            runtime_shape = args[self.sym_shape_indices[0]]
+            range_entry = self._find_range_for_shape(runtime_shape)
+            assert range_entry is not None, (
+                f"Shape: {runtime_shape} out of considered ranges: "
+                f"{self.compile_ranges}")
+        elif len(self.range_entries) > 1 or (self.compile_sizes
+                                             and len(self.compile_sizes) > 1):
+            # Dynamic token count from tensor dimension 0
+            first_tensor = next(
+                (x for x in args if isinstance(x, torch.Tensor)), None)
+            if first_tensor is not None:
+                runtime_shape = first_tensor.shape[0]
+                range_entry = self._find_range_for_shape(runtime_shape)
+                assert range_entry is not None, (
+                    f"Shape: {runtime_shape} out of considered ranges: "
+                    f"{self.compile_ranges}")
+            else:
+                compiled_entries = [
+                    re for re in self.range_entries.values() if re.compiled
+                ]
+                assert len(compiled_entries) == 1, (
+                    f"Expected exactly one compiled range_entry for static shape "
+                    f"compilation, but found {len(compiled_entries)}")
+                range_entry = compiled_entries[0]
+        else:
+            compiled_entries = [
+                re for re in self.range_entries.values() if re.compiled
+            ]
+            assert len(compiled_entries) == 1, (
+                f"Expected exactly one compiled range_entry for static shape "
+                f"compilation, but found {len(compiled_entries)}")
+            range_entry = compiled_entries[0]
+
+        assert range_entry.compiled, (
+            "All ranges should be compiled or loaded up front in "
+            "PiecewiseBackend.__init__. "
+            f"range_entry={range_entry.compile_range}")
+        return range_entry.runnable(*args, **kwargs)
+
+    patched_call._tpu_piecewise_backend_patch = True
+    PiecewiseBackend.__call__ = patched_call
+    logger.info(
+        "Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+
+
+def _patch_vllm_compile_prefix_isolation() -> None:
+    """Give each support_torch_compile'd instance its own cache identity.
+
+    vLLM's shared `compile_prefix=""` is only safe when all instances of a
+    class close over identically-shaped buffers; DSv4's KV cache overlay
+    breaks that, and one layer's executable can be reused by another (XLA
+    e0102). Keying on self.prefix is a no-op for shape-uniform models.
+    """
+    import itertools
+
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    original_init = TorchCompileWithNoGuardsWrapper.__init__
+    if getattr(original_init, "_tpu_compile_prefix_isolation_patch", False):
+        return
+
+    counter = itertools.count()
+
+    def patched_init(self,
+                     compile_prefix: str = "",
+                     is_encoder: bool = False) -> None:
+        if not compile_prefix and not is_encoder:
+            prefix = getattr(self, "prefix", None)
+            if prefix:
+                compile_prefix = prefix
+            else:
+                # No self.prefix: fall back to a counter. Stable within a
+                # process but not across restarts, so the cache won't persist.
+                compile_prefix = f"_tpu_instance_{next(counter)}"
+                logger.warning(
+                    "compile_prefix isolation: %s has no self.prefix; using "
+                    "non-deterministic fallback %s (its on-disk compile "
+                    "cache will not persist across restarts).",
+                    type(self).__name__, compile_prefix)
+        original_init(self,
+                      compile_prefix=compile_prefix,
+                      is_encoder=is_encoder)
+
+    patched_init._tpu_compile_prefix_isolation_patch = True
+    TorchCompileWithNoGuardsWrapper.__init__ = patched_init
+    logger.info(
+        "Applied TPU patch: per-instance compile-artifact cache isolation "
+        "(compile_prefix keyed off self.prefix).")
+
+
+def _patch_dflash_bypass_v2_runner_check() -> None:
+    """Bypass V2 model runner check in DFlash for TPU execution.
+
+    Upstream ``qwen3_dflash._resolve_layer_attention`` enforces
+    ``use_v2_model_runner`` for mixed SWA/full attention DFlash drafters.
+    TPU uses TPUModelRunner which handles mixed attention without Triton V2 runner.
+    """
+    try:
+        from vllm.model_executor.models import qwen3_dflash
+    except ImportError:
+        return
+
+    if getattr(qwen3_dflash, "_tpu_bypass_v2_runner_patch", False):
+        return
+
+    original_resolve = qwen3_dflash._resolve_layer_attention
+    _FLAG = "use_v2_model_runner"
+
+    def patched_resolve(config, layer_idx: int):
+        # Force the flag True for the duration of the upstream call only, by
+        # swapping the class attribute and restoring it. Deliberately not
+        # `unittest.mock.patch`: a test helper has no business in the load
+        # path, and — more usefully — looking the attribute up explicitly
+        # means that if upstream ever moves or renames it, this raises here
+        # instead of silently no-op'ing and letting the original V2 check
+        # reject the drafter with an unrelated-looking error.
+        from vllm.config import get_current_vllm_config
+        cfg_cls = type(get_current_vllm_config())
+        if not hasattr(cfg_cls, _FLAG):
+            raise RuntimeError(
+                f"VllmConfig no longer defines {_FLAG!r}; the TPU DFlash "
+                "bypass needs updating for this vLLM version.")
+
+        # Restore exactly what was there: if the flag is inherited rather than
+        # defined on this class, putting it back with setattr would leave a
+        # permanent shadow on the subclass.
+        had_own = _FLAG in cfg_cls.__dict__
+        original_flag = cfg_cls.__dict__.get(_FLAG)
+        setattr(cfg_cls, _FLAG, property(lambda self: True))
+        try:
+            return original_resolve(config, layer_idx)
+        finally:
+            if had_own:
+                setattr(cfg_cls, _FLAG, original_flag)
+            else:
+                delattr(cfg_cls, _FLAG)
+
+    qwen3_dflash._resolve_layer_attention = patched_resolve
+    qwen3_dflash._tpu_bypass_v2_runner_patch = True
+    logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
+
+
+def _patch_vllm_config_triton_tpu() -> None:
+    """Bypass V2 model runner Triton check on TPU.
+
+    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
+    When it validates V2, it crashes on TPU because HAS_TRITON is False.
+    TPU uses TPUModelRunner instead, so we can safely bypass this.
+    """
+    from vllm.config.vllm import VllmConfig
+
+    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
+        return
+
+    original_validate = VllmConfig._validate_v2_model_runner
+
+    def patched_validate(self):
+        if getattr(self, "device_config",
+                   None) and self.device_config.device_type == "tpu":
+            return
+        return original_validate(self)
+
+    VllmConfig._validate_v2_model_runner = patched_validate
+    VllmConfig._tpu_triton_patch_applied = True
+    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
+
+
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")
     # Must run pathwaysutils.initialize() before any JAX operations
@@ -891,6 +1288,7 @@ if "proxy" in envs.JAX_PLATFORMS:
         import vllm
         from vllm.platforms import (resolve_current_platform_cls_qualname,
                                     resolve_obj_by_qualname)
+
         pathwaysutils.initialize()
         logger.info("Module pathwaysutils is imported.")
 
@@ -912,3 +1310,41 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             f"Error occurred while importing pathwaysutils or logging TPU info: {e}"
         )
+
+
+def _patch_vllm_block_pool_lifo_free() -> None:
+    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
+
+    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
+    of a small hot set of block ids) to append (FIFO) when prefix caching
+    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
+    space under sustained load and an indexed SparseCore-offloaded op on
+    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
+    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
+    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
+    Behavior with prefix caching enabled is unchanged. Remove once the
+    SparseCore index handling is fixed in the TPU runtime.
+    """
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
+        return
+
+    def free_blocks(self, ordered_blocks) -> None:
+        blocks_with_hash = []
+        blocks_without_hash = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.block_hash is None:
+                    blocks_without_hash.append(block)
+                else:
+                    blocks_with_hash.append(block)
+        self.free_block_queue.prepend_n(blocks_without_hash)
+        self.free_block_queue.append_n(blocks_with_hash)
+
+    BlockPool.free_blocks = free_blocks
+    BlockPool._tpu_lifo_free_patch = True
+    from vllm_torchtpu.logger import init_logger
+    init_logger(__name__).info(
+        "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")

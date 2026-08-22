@@ -13,15 +13,26 @@ def normalize_kv_cache_specs_for_tpu(
     kv_cache_dtype: str | torch.dtype,
     *,
     enable_unified_kv_layout: bool = False,
+    exempt_layers: set[str] | None = None,
 ) -> dict[str, KVCacheSpec]:
+    """Normalize KV cache specs to the TPU's real page geometry.
+
+    `exempt_layers` pass through untouched: their packed, compressed layout is
+    not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
+    """
+    exempt = exempt_layers or set()
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
+        if layer_name in exempt:
+            normalized[layer_name] = spec
+            continue
         normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
     if (enable_unified_kv_layout
             and _has_hybrid_attention_and_mamba(normalized)):
         page_size = max(spec.page_size_bytes for spec in normalized.values())
         normalized = {
-            layer_name: _pad_page_size(spec, page_size)
+            layer_name:
+            (spec if layer_name in exempt else _pad_page_size(spec, page_size))
             for layer_name, spec in normalized.items()
         }
     return normalized
@@ -33,6 +44,15 @@ def _normalize_one_spec(
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
+
+    if isinstance(spec, MLAAttentionSpec) and not spec.dtype.is_floating_point:
+        # An integer-typed MLA cache is a packed layout: quantized float KV
+        # values and their scale factors share one byte row (DSA indexer K
+        # rows). That layout is fixed by the kernel reading it, so the fp8/bf16
+        # KV normalization must not retype it -- keep the declared dtype.
+        # Regular attention specs marked uint8 (vLLM's fp8-KV convention) still
+        # normalize to the TPU fp8 dtype below.
+        kv_cache_dtype = spec.dtype
 
     if isinstance(spec, MLAAttentionSpec):
         page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(

@@ -46,7 +46,8 @@ def _make_runner(*,
                  prompt_tokens,
                  scheduled_tokens,
                  token_paddings,
-                 uses_mrope=False):
+                 uses_mrope=False,
+                 pcp_mtp_k1_enabled=False):
     num_reqs = len(scheduled_tokens)
     max_model_len = max(64, max(prompt_tokens) + 16)
     max_num_reqs = 8
@@ -68,6 +69,7 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
+    runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=2,
@@ -223,16 +225,23 @@ def _scheduler_output(scheduled_tokens):
 
 
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
+
+    def capture_forward_context(attn_metadata, *_args, **_kwargs):
+        runner._captured_dummy_attn_metadata = attn_metadata
+        return contextlib.nullcontext()
+
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.set_forward_context",
-        lambda *_args, **_kwargs: contextlib.nullcontext(),
+        capture_forward_context,
     )
     monkeypatch.setattr(
         "vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
-    monkeypatch.setattr("vllm_torchtpu.runner.tpu_runner.sync.synchronize",
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
+        lambda *_args, **_kwargs: None,
+    )
 
     runner.maybe_select_dummy_loras = (
         lambda *_args, **_kwargs: contextlib.nullcontext())
@@ -247,7 +256,7 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         runner.input_batch.block_table[0].max_num_blocks_per_req,
         use_max_model_len=True,
     )
-    return runner._attn_metadata_builder_ctx
+    return getattr(runner, "_attn_metadata_builder_ctx", None)
 
 
 def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
@@ -281,6 +290,76 @@ def test_prepare_inputs_builds_rank_local_partial_layout(monkeypatch):
     torch.testing.assert_close(
         logits_indices.cpu(), torch.tensor([271] + [-1] * 7,
                                            dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_mtp_snapshots_request_major_tokens_before_pack(
+        monkeypatch):
+    scheduled = [25]
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[256],
+                          pcp_mtp_k1_enabled=True)
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    prepared = TPUModelRunner._prepare_inputs(runner,
+                                              _scheduler_output(scheduled), 0,
+                                              0)
+
+    request_major_input_ids, sequence_layout_plan = prepared[-2:]
+    assert sequence_layout_plan is not None
+    assert request_major_input_ids is not None
+    assert request_major_input_ids.shape == (512, )
+    torch.testing.assert_close(request_major_input_ids[:25].cpu(),
+                               torch.arange(100, 125, dtype=torch.int32))
+    torch.testing.assert_close(request_major_input_ids[25:].cpu(),
+                               torch.zeros(487, dtype=torch.int32))
+    # The target input still owns the packed rank-local representation.
+    torch.testing.assert_close(runner.input_ids[:9].cpu(),
+                               torch.arange(116, 125, dtype=torch.int32))
+
+
+def test_prepare_inputs_pcp_mtp_returns_each_chunks_own_plan(monkeypatch):
+    scheduled = [17, 25]
+    runner = _make_runner(num_computed_tokens=[0, 0],
+                          prompt_tokens=scheduled,
+                          scheduled_tokens=scheduled,
+                          token_paddings=[32],
+                          pcp_mtp_k1_enabled=True)
+    runner.num_reqs_max_model_len = 1
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    first_prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+    first_input_ids, first_plan = first_prepared[-2:]
+    assert first_plan is not None
+    first_packed_to_request = (
+        first_plan._packed_to_request_major_token_indices.copy())
+
+    second_prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 1, 0)
+    second_input_ids, second_plan = second_prepared[-2:]
+
+    assert second_plan is not None
+    assert first_plan is not second_plan
+    assert first_plan.global_padded_num_tokens == 64
+    assert second_plan.global_padded_num_tokens == 64
+    assert not np.array_equal(
+        first_plan._packed_to_request_major_token_indices,
+        second_plan._packed_to_request_major_token_indices,
+    )
+    np.testing.assert_array_equal(
+        first_plan._packed_to_request_major_token_indices,
+        first_packed_to_request,
+    )
+    torch.testing.assert_close(first_input_ids[:17].cpu(),
+                               torch.arange(100, 117, dtype=torch.int32))
+    torch.testing.assert_close(second_input_ids[:25].cpu(),
+                               torch.arange(200, 225, dtype=torch.int32))
 
 
 def test_prepare_inputs_builds_rank_local_multi_request_partial_layout(
@@ -398,7 +477,83 @@ def test_dummy_run_partial_layout_decode_like_metadata_routes_to_streaming(
     )
 
 
-def test_prepare_inputs_builds_rank_local_pcp_decode(monkeypatch):
+def test_dummy_run_marks_inactive_request_rows_after_cache_init(monkeypatch):
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=[64],
+                          scheduled_tokens=[1],
+                          token_paddings=[256])
+
+    ctx = _run_dummy_run(monkeypatch, runner, num_tokens=3)
+    md = runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert ctx is not None
+    torch.testing.assert_close(
+        md.query_start_loc.cpu(),
+        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(md.request_distribution.cpu(),
+                               torch.tensor([3, 3, 3], dtype=torch.int32))
+
+
+def test_dummy_run_marks_inactive_request_rows_before_cache_init(monkeypatch):
+    runner = _make_runner(num_computed_tokens=[0],
+                          prompt_tokens=[64],
+                          scheduled_tokens=[1],
+                          token_paddings=[256])
+    runner.kv_cache_config = None
+    runner._attn_layer_names = ["layer.0"]
+
+    ctx = _run_dummy_run(monkeypatch, runner, num_tokens=3)
+    md = runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert ctx is None
+    torch.testing.assert_close(
+        md.query_start_loc.cpu(),
+        torch.tensor([0, 1, 2, 3, 3, 3, 3, 3, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(md.request_distribution.cpu(),
+                               torch.tensor([3, 3, 3], dtype=torch.int32))
+    assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
+    assert md.sequence_layout_protocol == "pcp_streaming"
+    assert md.sequence_layout_version == 1
+
+
+def test_dummy_run_preinit_and_postinit_share_metadata_pytree(monkeypatch):
+    import jax
+
+    def make_runner():
+        return _make_runner(num_computed_tokens=[0],
+                            prompt_tokens=[64],
+                            scheduled_tokens=[1],
+                            token_paddings=[256])
+
+    postinit_runner = make_runner()
+    _run_dummy_run(monkeypatch, postinit_runner, num_tokens=3)
+    postinit_md = postinit_runner._captured_dummy_attn_metadata["layer.0"]
+
+    preinit_runner = make_runner()
+    preinit_runner.kv_cache_config = None
+    preinit_runner._attn_layer_names = ["layer.0"]
+    _run_dummy_run(monkeypatch, preinit_runner, num_tokens=3)
+    preinit_md = preinit_runner._captured_dummy_attn_metadata["layer.0"]
+
+    assert jax.tree_util.tree_structure(preinit_md) == (
+        jax.tree_util.tree_structure(postinit_md))
+    for field in (
+            "input_positions",
+            "block_tables",
+            "seq_lens",
+            "query_start_loc",
+            "request_distribution",
+    ):
+        preinit_value = getattr(preinit_md, field)
+        postinit_value = getattr(postinit_md, field)
+        assert preinit_value.shape == postinit_value.shape
+        assert preinit_value.dtype == postinit_value.dtype
+
+
+def test_prepare_inputs_batch_flat_decode_can_leave_rank_with_only_padding(
+        monkeypatch):
     scheduled = [1, 1]
     runner = _make_runner(num_computed_tokens=[16, 16],
                           prompt_tokens=[16, 16],
@@ -415,19 +570,19 @@ def test_prepare_inputs_builds_rank_local_pcp_decode(monkeypatch):
     assert runner.input_ids.shape[0] == 2
     assert runner.position_ids.shape[0] == 2
     torch.testing.assert_close(runner.input_ids.cpu(),
-                               torch.tensor([116, 216], dtype=torch.int32))
+                               torch.zeros(2, dtype=torch.int32))
     torch.testing.assert_close(runner.position_ids.cpu(),
-                               torch.tensor([16, 16], dtype=torch.int32))
+                               torch.zeros(2, dtype=torch.int32))
     assert md.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
     assert md.sequence_layout_protocol == "pcp_streaming"
     torch.testing.assert_close(md.request_distribution.cpu(),
                                torch.tensor([2, 2, 2], dtype=torch.int32))
     torch.testing.assert_close(
-        logits_indices.cpu(), torch.tensor([2, 3] + [-1] * 6,
+        logits_indices.cpu(), torch.tensor([0, 1] + [-1] * 6,
                                            dtype=torch.int32))
 
 
-def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
+def test_prepare_inputs_pcp_owner_does_not_rotate_with_absolute_q_start(
         monkeypatch):
     scheduled = [1]
     runner = _make_runner(num_computed_tokens=[16],
@@ -441,7 +596,9 @@ def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
     _, logits_indices, *_ = TPUModelRunner._prepare_inputs(
         runner, _scheduler_output(scheduled), 0, 1)
     torch.testing.assert_close(logits_indices.cpu(),
-                               torch.tensor([8] + [-1] * 7, dtype=torch.int32))
+                               torch.tensor([0] + [-1] * 7, dtype=torch.int32))
+    torch.testing.assert_close(runner.position_ids.cpu()[:1],
+                               torch.tensor([16], dtype=torch.int32))
 
     runner.input_batch.num_computed_tokens_cpu[0] = 32
     _, logits_indices, *_ = TPUModelRunner._prepare_inputs(
@@ -449,3 +606,47 @@ def test_prepare_inputs_pcp_decode_refreshes_logits_indices_when_q_start_moves(
 
     torch.testing.assert_close(logits_indices.cpu(),
                                torch.tensor([0] + [-1] * 7, dtype=torch.int32))
+    torch.testing.assert_close(runner.position_ids.cpu()[:1],
+                               torch.tensor([32], dtype=torch.int32))
+
+
+def test_prepare_inputs_batch_flat_owner_preserves_history_positions_and_logits(
+        monkeypatch):
+    scheduled = [25, 23]
+    runner = _make_runner(
+        num_computed_tokens=[100, 200],
+        prompt_tokens=[125, 223],
+        scheduled_tokens=scheduled,
+        token_paddings=[32],
+    )
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    attn_metadata, logits_indices, *_ = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0)
+
+    expected_ids = torch.cat((
+        torch.arange(216, 225, dtype=torch.int32),
+        torch.arange(400, 407, dtype=torch.int32),
+        torch.zeros(16, dtype=torch.int32),
+    ))
+    expected_positions = torch.cat((
+        torch.arange(116, 125, dtype=torch.int32),
+        torch.arange(200, 207, dtype=torch.int32),
+        torch.zeros(16, dtype=torch.int32),
+    ))
+    torch.testing.assert_close(runner.input_ids.cpu(), expected_ids)
+    torch.testing.assert_close(runner.position_ids.cpu(), expected_positions)
+    torch.testing.assert_close(
+        logits_indices.cpu(),
+        torch.tensor([40, 31] + [-1] * 6, dtype=torch.int32),
+    )
+
+    md = attn_metadata["layer.0"]
+    torch.testing.assert_close(md.query_start_loc.cpu()[:3],
+                               torch.tensor([0, 25, 48], dtype=torch.int32))
+    torch.testing.assert_close(md.seq_lens.cpu()[:2],
+                               torch.tensor([125, 223], dtype=torch.int32))
+    assert not hasattr(runner._attn_metadata_builder_ctx,
+                       "token_owner_start_offsets")

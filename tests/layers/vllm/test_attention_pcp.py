@@ -100,8 +100,10 @@ def _capture_kernel(monkeypatch):
 
     monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
                         fake_build)
-    monkeypatch.setattr("vllm_torchtpu.layers.vllm.attention.sync.synchronize",
-                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.vllm.attention.synchronize_tensors",
+        lambda *_args, **_kwargs: None,
+    )
     return captured
 
 
@@ -448,12 +450,16 @@ def test_adapter_scoped_callable_uses_lowered_out_shardings(monkeypatch):
         out_tree = FakeOutTree()
         mlir_module_serialized = b"mlir"
 
+        def mlir_module(self):
+            return "module {}"
+
     class FakePcpCallable(pcp_adapter._PcpStreamingJaxCallable):
 
         def __init__(self):
             self.trace_key = "trace"
             self.static_argnums = ()
             self.output_shapes = {}
+            self.kernel_key_to_mlir_fingerprint = {}
             self.mesh = "mesh"
             self.input_partition_specs = ("input_spec", )
             self.name = "op"

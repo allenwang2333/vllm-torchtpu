@@ -97,7 +97,6 @@ class PcpSequenceLayoutEligibility:
         dcp_size: int = 1,
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
-        speculative_enabled: bool = False,
         is_kv_producer: bool | None = None,
     ):
         self.pcp_size = pcp_size
@@ -105,7 +104,6 @@ class PcpSequenceLayoutEligibility:
         self.dcp_size = dcp_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
-        self.speculative_enabled = bool(speculative_enabled)
         self.is_kv_producer = is_kv_producer
 
     @classmethod
@@ -128,7 +126,6 @@ class PcpSequenceLayoutEligibility:
             dcp_size=parallel_config.decode_context_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
-            speculative_enabled=vllm_config.speculative_config is not None,
             is_kv_producer=is_kv_producer,
         )
 
@@ -256,10 +253,6 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support pipeline "
                 "parallelism yet.")
-        if self.speculative_enabled:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support speculative "
-                "decoding yet.")
         if self.interleave_size <= 0:
             raise ValueError("PCP partial sequence layout requires "
                              "cp_kv_cache_interleave_size > 0.")
@@ -289,10 +282,13 @@ class PcpSequenceLayoutEligibility:
                             dtype=np.int32)
         absolute_query_starts = np.asarray(
             [span.absolute_query_start for span in spans], dtype=np.int64)
-        # The current layout assigns ownership in request-absolute token
-        # coordinates. Keep a distinct array so the ownership policy can be
-        # changed without changing attention/cache coordinates.
-        token_owner_starts = absolute_query_starts.copy()
+        # Assign the current batch's request-major query rows as one flat token
+        # stream. This is exactly query_start_loc[:-1]: ownership is local to
+        # this runner chunk, while attention positions and KV-cache slots keep
+        # using the independent request-absolute coordinates above.
+        token_owner_starts = np.zeros(q_lens.shape, dtype=np.int64)
+        if q_lens.size > 1:
+            np.cumsum(q_lens[:-1], dtype=np.int64, out=token_owner_starts[1:])
         local_counts = pcp_local_token_counts(
             q_lens,
             self.pcp_size,
@@ -341,6 +337,7 @@ class PcpPreparedBatch:
     logits_indices_cpu: torch.Tensor
     logits_local_indices_cpu: torch.Tensor
     logits_owner_mask_cpu: torch.Tensor
+    packed_to_request_major_token_indices: np.ndarray
     request_major_to_packed_token_indices: np.ndarray
 
 
@@ -435,6 +432,8 @@ class PcpSequenceLayoutPlanner:
             logits_local_indices_cpu=prepared.logits_local_indices_cpu,
             logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
             requires_hidden_state_gather=True,
+            _packed_to_request_major_token_indices=(
+                prepared.packed_to_request_major_token_indices),
             _request_major_to_packed_token_indices=(
                 prepared.request_major_to_packed_token_indices),
         )
@@ -446,11 +445,12 @@ class PcpSequenceLayoutPlanner:
         num_reqs: int,
         kv_cache_initialized: bool,
     ) -> SequenceLayoutPlan:
-        if not (self.enabled and kv_cache_initialized):
+        del kv_cache_initialized
+        if not self.enabled:
             return self._all_planner.prepare_dummy(
                 num_tokens=num_tokens,
                 num_reqs=num_reqs,
-                kv_cache_initialized=kv_cache_initialized,
+                kv_cache_initialized=False,
             )
         num_tokens = int(num_tokens)
         return SequenceLayoutPlan(
@@ -662,6 +662,11 @@ def prepare_pcp_sequence_layout(
         mrope_slice,
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     )
+    packed_to_request_major_token_indices = np.full(
+        padded_total_num_scheduled_tokens, -1, dtype=np.int64)
+    packed_to_request_major_token_indices[
+        request_major_to_packed_token_indices] = np.arange(
+            request_major_to_packed_token_indices.size, dtype=np.int64)
 
     local_padded_total_num_scheduled_tokens = (
         padded_total_num_scheduled_tokens // pcp_size)
@@ -735,6 +740,8 @@ def prepare_pcp_sequence_layout(
         logits_indices_cpu=logits_indices_cpu,
         logits_local_indices_cpu=logits_local_indices_cpu,
         logits_owner_mask_cpu=logits_owner_mask_cpu,
+        packed_to_request_major_token_indices=(
+            packed_to_request_major_token_indices),
         request_major_to_packed_token_indices=(
             request_major_to_packed_token_indices),
     )

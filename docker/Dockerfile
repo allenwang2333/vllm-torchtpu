@@ -1,4 +1,4 @@
-# Dockerfile for torchtpu-vllm.
+# Dockerfile for vllm-torchtpu.
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
@@ -12,7 +12,7 @@ FROM $BASE_IMAGE AS base
 # Install curl for health checks (minimal for base)
 RUN apt-get update && apt-get install -y curl git build-essential gcc g++ cmake ninja-build && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /root/torchtpu-vllm
+WORKDIR /workspace/vllm-torchtpu
 
 # Copy pyproject.toml to extract dependencies and read settings
 COPY pyproject.toml .
@@ -56,25 +56,17 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
 # Clear PYTHONPATH inherited from base image if any
 ENV PYTHONPATH=""
 
-WORKDIR /root/torchtpu-vllm
+WORKDIR /workspace/vllm-torchtpu
 
-# Mark mounted directory as safe for git
-RUN git config --global --add safe.directory /root/torchtpu-vllm
-RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
+# Mark mounted directory as safe for git and maintain backward compatibility
+RUN git config --global --add safe.directory /workspace/vllm-torchtpu && \
+    git config --global --add safe.directory /root/torchtpu-vllm && \
+    mkdir -p /root /workspace && \
+    ln -sfnT /workspace/vllm-torchtpu /root/torchtpu-vllm && \
+    ln -sfnT /workspace/vllm-torchtpu /workspace/torchtpu-vllm
 
-ARG VLLM_SOURCE
-# Copy vllm source (might be empty if not provided)
-COPY vllm /root/torchtpu-vllm/vllm
-
-# Install vllm from source if requested.
-# If VLLM_SOURCE is provided, we build it in editable mode.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$VLLM_SOURCE" ]; then \
-      sed -i 's/vllm==[^"]*/vllm/' pyproject.toml && \
-      VLLM_TARGET_DEVICE="tpu" uv pip install --system \
-        -e /root/torchtpu-vllm/vllm ; \
-    fi
-
+# Note: we **intentionally** set VLLM_TARGET_DEVICE="empty", see README.
+ENV VLLM_TARGET_DEVICE="empty"
 
 # Variant 3: Developer Image (Dev Variant with test/benchmark tools)
 # This variant contains all source code and is intended for active development.
@@ -88,9 +80,23 @@ COPY . .
 # versioned wheel from the base stage.
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    VLLM_TARGET_DEVICE=empty uv pip install --system -e ".[test,benchmarking]"
+    uv pip install --system -e ".[test,benchmarking]"
 
-ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
+# Install vLLM from source if requested.
+# If VLLM_SOURCE is provided, we build it in editable mode.
+ARG VLLM_SOURCE
+# Copy vllm source (might be empty if not provided)
+COPY vllm /workspace/vllm-torchtpu/vllm
+
+# Install vllm from source if requested.
+# If VLLM_SOURCE is provided, we build it in editable mode.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$VLLM_SOURCE" ]; then \
+      uv pip install --system --no-deps \
+        -e /workspace/vllm-torchtpu/vllm ; \
+    fi
+
+ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
 
@@ -98,12 +104,14 @@ CMD ["/bin/bash"]
 # This variant copies all source code and installs the package regularly
 # without extra dev/testing tools, starting directly from the runtime base.
 FROM base AS prod
-WORKDIR /root/torchtpu-vllm
+WORKDIR /workspace/vllm-torchtpu
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
-    VLLM_TARGET_DEVICE=empty uv pip install --system .
+    uv pip install --system .
 
-RUN mkdir -p /workspace && ln -sfnT /root/torchtpu-vllm /workspace/torchtpu-vllm
-ENV PYTHONPATH="/root/torchtpu-vllm/src:/root/torchtpu-vllm"
+RUN mkdir -p /root /workspace && \
+    ln -sfnT /workspace/vllm-torchtpu /root/torchtpu-vllm && \
+    ln -sfnT /workspace/vllm-torchtpu /workspace/torchtpu-vllm
+ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]

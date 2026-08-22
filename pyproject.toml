@@ -24,20 +24,21 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # vllm==0.26.0 is officially pinned to torch 2.11, hence pinning to a commit compatible with torch 2.13
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.26.1rc0",
+    # Note: we **intentionally** build vllm from source, see README.
+    # vllm==0.27.0 is required for Kimi K3 compatibility
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. We must explicitly pin torchvision statically
     # matching our torch==2.13.0 constraint to prevent the CI Docker base image
     # from leaking structurally incompatible pre-compiled nms operators!
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260804130134",
+    "torch-tpu==0.1.1.dev20260813160135",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260808010148",
+    "tpu-raiden-torch==0.0.1.dev20260819190323",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -81,7 +82,15 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
-    "evalscope",
+    "evalscope==1.10.0",
+    # Stream gs:// checkpoints via --load-format runai_streamer (multihost
+    # v7x-16 hosts have no disk for an HF download).
+    "runai-model-streamer[gcs]",
+]
+
+# vLLM-Omni optional dependency
+omni = [
+    "vllm-omni==0.27.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -89,6 +98,9 @@ benchmarking = [
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
+
+[project.entry-points."vllm_omni.platform_plugins"]
+torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
@@ -128,9 +140,12 @@ ignore-missing-imports = [
     "sympy", "sympy.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
-    "tpu_raiden", "tpu_raiden.*",
+    "runai_model_streamer", "runai_model_streamer.*",
+    "tpu_sync", "tpu_sync.*",
+    "tqdm", "tqdm.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",
+    "vllm_omni", "vllm_omni.*",
     "zmq", "zmq.*",
 ]
 

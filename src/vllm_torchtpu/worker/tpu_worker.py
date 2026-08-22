@@ -28,6 +28,8 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
+from vllm_torchtpu.distributed.pcp_rank_order import (
+    pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -184,6 +186,12 @@ class TPUWorker(WorkerBase):
                     pc.data_parallel_rank_local = dp_rank
             else:
                 pc.data_parallel_size = 1
+                # ParallelConfig's own validator requires
+                # data_parallel_size_local <= data_parallel_size. vLLM core's
+                # own analogous single-engine collapse (run_engine_core's
+                # non-MoE DP path) sets both fields together for the same
+                # reason: https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L1044
+                pc.data_parallel_size_local = 1
                 pc.data_parallel_rank = 0
                 pc.data_parallel_rank_local = 0
 
@@ -195,10 +203,81 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_PORT"] = str(master_port)
 
             if pc.enable_expert_parallel:
-                init_rank = binding.init_rank
+                # Setting data_parallel_size above puts
+                # init_distributed_environment() on its DP path, where it
+                # discards the rank and the init method it was handed and
+                # recomputes both: rank becomes
+                # `data_parallel_rank * world_size + rank`, and the rendezvous
+                # becomes data_parallel_master_ip plus a port popped from the
+                # DP port list. Both predate this worker having an
+                # executor-assigned slice placement, and both are wrong here.
+                #
+                # The address is wrong outright: data_parallel_master_ip
+                # defaults to 127.0.0.1, so each host's workers rendezvous on
+                # their own loopback and the two halves of the slice never
+                # meet -- init_process_group then blocks until the engine
+                # start timeout. Point it at the host holding slice rank 0,
+                # which every worker derived identically in Step 7 of the
+                # executor. The port needs no such fixup: it is popped from a
+                # list built once on the driver and carried unchanged into
+                # every worker, so all of them already agree on it. Leave
+                # data_parallel_master_port alone -- MASTER_PORT below is
+                # torch_tpu's own slice rendezvous, and forcing it here would
+                # collide with that.
+                pc.data_parallel_master_ip = master_addr
+                # Ray hands each engine whichever chips were free, so slice
+                # ranks do not run dp-rank-major and binding.rank is not
+                # `dp_rank * per_engine_world + self.rank`. Pre-subtract the
+                # offset the rewrite is about to add, so it lands back on the
+                # slice rank this worker is actually bound to. The subtraction
+                # can go negative for an engine placed early in the slice;
+                # that value is consumed by the rewrite before torch sees it.
+                init_rank = binding.rank - dp_rank * per_engine_world
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
             else:
+                # Dense DP has no cross-rank collective, so each replica
+                # should bootstrap its own isolated torch_tpu slice instead
+                # of sharing check_and_update_config's full DP*TP-wide one
+                # (RANK/WORLD_SIZE above are already replica-local via
+                # binding.as_env()). Narrow the inherited full-slice
+                # TORCH_TPU_SLICEBUILDER_ADDRESSES down to just this
+                # replica's own per_engine_world workers -- narrowing
+                # (rather than each worker picking fresh ports
+                # independently) keeps the address list agreed upon by
+                # every worker in this replica, since it's sliced
+                # deterministically out of the same parent-established list
+                # every sibling worker also inherited.
+                full_sb_addresses = os.environ.get(
+                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", "")
+                sb_addresses = full_sb_addresses.split(
+                    ",") if full_sb_addresses else []
+                start = dp_rank * per_engine_world
+                my_sb_addresses = sb_addresses[start:start + per_engine_world]
+                if len(my_sb_addresses) == per_engine_world:
+                    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                        my_sb_addresses)
+                else:
+                    logger.warning(
+                        "Expected %d slicebuilder addresses for dp_rank=%d "
+                        "at offset %d, found %d in inherited list %r; "
+                        "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
+                        per_engine_world, dp_rank, start, len(my_sb_addresses),
+                        full_sb_addresses)
+                from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+                os.environ["TORCH_TPU_TOPOLOGY"] = \
+                    TpuPlatform._get_tpu_topology(per_engine_world)
+                # Request this worker's own physical chip explicitly,
+                # instead of relying on the flattened-rank chip binding EP
+                # uses, so independent replicas don't contend for the same
+                # chips. Both TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES must
+                # be set -- TorchTPU only honors the chip pin under the
+                # RANK/WORLD_SIZE distributed bootstrap when both agree.
+                os.environ["TPU_VISIBLE_CHIPS"] = str(
+                    binding.native_local_rank)
+                os.environ["TPU_VISIBLE_DEVICES"] = str(
+                    binding.native_local_rank)
+                os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
@@ -208,7 +287,7 @@ class TPUWorker(WorkerBase):
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "init_local_rank=%d pcp_remap=%s source=%s "
+                "init_local_rank=%d "
                 "(vllm_init_rank=%d vllm_init_world=%d)",
                 dp_size,
                 dp_rank,
@@ -219,8 +298,6 @@ class TPUWorker(WorkerBase):
                 binding.local_rank,
                 binding.world_size,
                 binding.init_local_rank,
-                binding.pcp_local_rank_remap,
-                binding.pcp_remap_source,
                 init_rank,
                 init_world,
             )
@@ -236,15 +313,13 @@ class TPUWorker(WorkerBase):
                     "PCP native-rank TPU binding | rank=%d "
                     "native_local_rank=%d local_rank_env=%d "
                     "tpu_local_rank_env=%d local_world=%s "
-                    "tpu_local_world=%d remap=%s source=%s",
+                    "tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
                     binding.init_local_rank,
                     binding.local_rank,
                     binding.world_size,
                     binding.local_world_size,
-                    binding.pcp_local_rank_remap,
-                    binding.pcp_remap_source,
                 )
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
@@ -303,7 +378,13 @@ class TPUWorker(WorkerBase):
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
             )
-        with set_current_vllm_config(self.vllm_config):
+        # Ring order is the PCP group's rank order, and the group is built
+        # below. topology_aware_mesh needs open chips and a live process
+        # group, so this is the first point it can be asked -- and the last
+        # point the answer can still be applied.
+        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
+        with set_current_vllm_config(self.vllm_config), \
+                pcp_topology_order(group_ranks_by_name):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.
                 tensor_parallel_size,
@@ -311,6 +392,10 @@ class TPUWorker(WorkerBase):
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
             )
+        # The patch above substitutes rank lists on the way in; this reads the
+        # built groups back, so a patch that silently stopped applying fails
+        # here rather than costing a few percent unnoticed.
+        verify_pcp_topology_order(group_ranks_by_name)
 
         # TODO: Enable PP support. The old JAX-based PP init
         # (jax_parallel_state.init_pp_distributed_environment) was removed
@@ -445,9 +530,10 @@ class TPUWorker(WorkerBase):
                 logger.warning(
                     "Profiler is already running. Ignoring start request.")
                 return
-            profile_dir = self.profile_dir
-            if profile_prefix:
-                profile_dir = os.path.join(profile_dir, profile_prefix)
+            from vllm_torchtpu.tracing.options import \
+                resolve_profile_dir_and_opts
+            profile_dir, standard_opts, advanced_opts = resolve_profile_dir_and_opts(
+                self.profile_dir, profile_prefix)
             os.makedirs(profile_dir, exist_ok=True)
             # All ranks capture concurrently, so each writes into its own
             # sandbox under a run directory they agree on; stop merges them.
@@ -467,9 +553,10 @@ class TPUWorker(WorkerBase):
                 dir_name=self.profile_capture_dir, use_gzip=True)
             config = TpuProfilerConfig(
                 run_dir=self.profile_capture_dir,
-                host_tracer_level=2,
-                device_tracer_level=1,
-                python_tracer_level=1,
+                host_tracer_level=standard_opts["host_tracer_level"],
+                device_tracer_level=standard_opts["device_tracer_level"],
+                python_tracer_level=standard_opts["python_tracer_level"],
+                experimental_options=advanced_opts,
             )
             self.profile_context = torch.profiler.profile(
                 activities=[

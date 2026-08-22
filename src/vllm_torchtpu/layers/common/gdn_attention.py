@@ -26,7 +26,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
+                                           pooled_gdn_conv_state_bytes,
+                                           pooled_gdn_ssm_state_bytes)
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
@@ -561,11 +563,9 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # The current public metadata format assigns tokens by request-absolute
-        # position. Keep the owner coordinate separate so a later layout can
-        # change only this source; state/conv still consume ``seq_lens_`` below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State/conv semantics remain request-absolute through ``seq_lens_``.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,
@@ -735,8 +735,11 @@ def _build_v3_pool_state_plan(
     per_tok_elems = math.prod(pool.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
     state_layout = derive_pooled_gdn_state_layout(
-        ssm_bytes=n_v * d_k * d_v * 4,
-        conv_bytes=(kernel_size - 1) * conv_dim * 2,
+        ssm_bytes=pooled_gdn_ssm_state_bytes(num_v_heads=n_v,
+                                             head_k_dim=d_k,
+                                             head_v_dim=d_v),
+        conv_bytes=pooled_gdn_conv_state_bytes(kernel_size=kernel_size,
+                                               conv_dim=conv_dim),
         token_bytes=tok_bytes,
     )
     if state_layout.required_tokens > pool_block_tokens:
@@ -1078,10 +1081,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                              axis=-1).reshape(local_b.shape[0], -1)
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # Preserve today's public layout while keeping token ownership
-        # independent from the absolute positions used by GDN state below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State semantics remain request-absolute through ``seq_lens_`` below.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,
@@ -1289,10 +1291,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
 
-        q_lens = query_start_loc_[1:] - query_start_loc_[:-1]
-        # Preserve today's public layout while keeping token ownership
-        # independent from the absolute positions used by GDN state below.
-        token_owner_starts = seq_lens_[:q_lens.shape[0]] - q_lens
+        # PCP ownership follows the batch-flat request-major coordinate.
+        # State semantics remain request-absolute through ``seq_lens_`` below.
+        token_owner_starts = query_start_loc_[:-1]
         full_reorder = _derive_pcp_rank_major_reorder_indices(
             query_start_loc_,
             token_owner_starts,
