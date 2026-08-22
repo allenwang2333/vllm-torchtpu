@@ -979,6 +979,7 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_dim=packed_width,
                 kv_dtype=None,
                 kv_packing=kv_packing,
+                transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE,
             )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         kv_packing = (envs.MLA_KV_PACKING_SIZE
@@ -990,6 +991,7 @@ class PallasMLAttentionBackend(AttentionBackend):
             kv_dim=head_size,
             kv_dtype=None,
             kv_packing=kv_packing,
+            transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE,
         )
 
     @staticmethod
@@ -1033,6 +1035,10 @@ class PallasMLAttentionBackend(AttentionBackend):
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False, ) -> tuple[int, ...]:
+        if envs.MLA_TRANSPOSE_KV_CACHE:
+            if include_num_layers_dimension:
+                return (1, 0, 2, 3)
+            return (0, 1, 2)
         if include_num_layers_dimension:
             return (1, 0, 2, 3, 4)
         return (0, 1, 2, 3)

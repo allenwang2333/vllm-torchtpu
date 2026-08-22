@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MLA_KV_PACKING_SIZE: int | None = None
+    MLA_TRANSPOSE_KV_CACHE: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
@@ -279,6 +280,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MLA_KV_PACKING_SIZE":
     lambda: int(val)
     if (val := os.getenv("MLA_KV_PACKING_SIZE")) is not None else None,
+    "MLA_TRANSPOSE_KV_CACHE":
+    lambda: env_bool("MLA_TRANSPOSE_KV_CACHE")() or env_bool("MLA_KV_TRANSPOSE")(),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),

@@ -13,6 +13,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import \
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.envs as envs
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
@@ -570,7 +571,8 @@ def mla_attention(
             decode_batch_size=decode_batch_size,
             q_scale=q_scale,
             k_scale=k_scale,
-            v_scale=v_scale)
+            v_scale=v_scale,
+            transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE)
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))
