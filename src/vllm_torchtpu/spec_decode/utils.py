@@ -145,6 +145,14 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
         share_embed = True
     elif hasattr(draft_model, "has_own_embed_tokens"):
         share_embed = not draft_model.has_own_embed_tokens
+    elif "gemma4_assistant" in getattr(draft_model.config, "model_type",
+                                       "").lower():
+        # Gemma 4 MTP drafters have a different hidden size (1024) from the target (5376)
+        # and must use their own embed_tokens weights loaded from the checkpoint.
+        logger.info(
+            "Draft model is Gemma4 Assistant; keeping independent embed_tokens."
+        )
+        share_embed = False
     else:
         logger.info("Draft model does not declare `has_own_embed_tokens`; "
                     "defaulting to share embed_tokens with the target.")
@@ -165,6 +173,44 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
                 "Sharing the target's sharded embed_tokens with the sharded draft."
             )
             draft_model.model.embed_tokens = target_embed
+
+    # Share target's masked_embedding centroids and token_ordering with the draft
+    draft_masked_embed = getattr(draft_model, "masked_embedding", None)
+    target_masked_embed = getattr(target_lm, "masked_embedding", None)
+    if draft_masked_embed is not None and target_masked_embed is not None:
+        logger.info(
+            "Sharing the target's masked_embedding centroids and token_ordering with the draft."
+        )
+        draft_model.masked_embedding = target_masked_embed
+
+    # Unconditionally patch draft model's final RMSNorm to GemmaRMSNorm on TPU.
+    # Standard RMSNorm does not support Gemma's zero-centered weights, crushing activations to 0.
+    model_impl = getattr(draft_model, "model", draft_model)
+    if hasattr(model_impl, "norm") and type(
+            model_impl.norm).__name__ == "RMSNorm":
+
+        class GemmaRMSNormPure(torch.nn.Module):
+
+            def __init__(self, weight, eps=1e-6):
+                super().__init__()
+                self.weight = torch.nn.Parameter(weight.clone(),
+                                                 requires_grad=False)
+                self.variance_epsilon = eps
+
+            def forward(self, x):
+                orig_dtype = x.dtype
+                x_f32 = x.to(torch.float32)
+                variance = x_f32.pow(2).mean(-1, keepdim=True)
+                norm_x = x_f32 * torch.rsqrt(variance + self.variance_epsilon)
+                scale = 1.0 + self.weight.to(torch.float32)
+                return (norm_x * scale).to(orig_dtype)
+
+        norm_layer = model_impl.norm
+        model_impl.norm = GemmaRMSNormPure(norm_layer.weight,
+                                           eps=norm_layer.variance_epsilon)
+        logger.info(
+            "TPU Model Loader: Unconditionally patched draft model's final RMSNorm to GemmaRMSNormPure."
+        )
 
 
 def populate_draft_lm_head_from_target(

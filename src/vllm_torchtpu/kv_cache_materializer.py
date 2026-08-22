@@ -153,6 +153,7 @@ def allocate_raw_kv_cache_tensors(
         )
         if spec.dtype in _FP8_DTYPES:
             raw = torch.empty(tuple(shape), dtype=spec.dtype, device=device)
+            raw.zero_()
         else:
             raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
         fa_page_bytes = (raw.numel() * raw.element_size() //

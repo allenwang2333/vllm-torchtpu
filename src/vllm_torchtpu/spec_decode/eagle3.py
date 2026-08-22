@@ -114,6 +114,7 @@ class Eagle3Proposer:
             "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
             draft_tp)
         self.draft_model = None
+        self.target_embed = None
         # Attention-layer names belonging to the draft model. Populated in
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
@@ -128,9 +129,8 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
-        self.constant_draft_positions = (getattr(
-            self.speculative_config, "use_gemma4_mtp",
-            None) is not None and self.speculative_config.use_gemma4_mtp())
+        self.constant_draft_positions = (
+            self.speculative_config.method == "mtp")
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -149,8 +149,47 @@ class Eagle3Proposer:
         self._draft_attn_layer_names = (set(all_attn_layers.keys()) -
                                         target_attn_layer_names)
 
-        maybe_share_embeddings(self.draft_model, target_model,
-                               self._draft_replicated)
+        is_gemma4_mtp = (getattr(self.speculative_config, "use_gemma4_mtp",
+                                 None) is not None
+                         and self.speculative_config.use_gemma4_mtp())
+        if is_gemma4_mtp:
+            self.draft_model.has_own_embed_tokens = True
+            target_lm = target_model.get_language_model() if hasattr(
+                target_model, "get_language_model") else target_model
+            target_lm_model = getattr(target_lm, "model", target_lm)
+            self.target_embed = getattr(target_lm_model, "embed_tokens", None)
+
+            # Unconditionally patch draft model's final RMSNorm to GemmaRMSNorm on TPU.
+            model_impl = getattr(self.draft_model, "model", self.draft_model)
+            if hasattr(model_impl, "norm") and type(
+                    model_impl.norm).__name__ == "RMSNorm":
+
+                class GemmaRMSNormPure(torch.nn.Module):
+
+                    def __init__(self, weight, eps=1e-6):
+                        super().__init__()
+                        self.weight = torch.nn.Parameter(weight.clone(),
+                                                         requires_grad=False)
+                        self.variance_epsilon = eps
+
+                    def forward(self, x):
+                        orig_dtype = x.dtype
+                        x_f32 = x.to(torch.float32)
+                        variance = x_f32.pow(2).mean(-1, keepdim=True)
+                        norm_x = x_f32 * torch.rsqrt(variance +
+                                                     self.variance_epsilon)
+                        scale = 1.0 + self.weight.to(torch.float32)
+                        return (norm_x * scale).to(orig_dtype)
+
+                norm_layer = model_impl.norm
+                model_impl.norm = GemmaRMSNormPure(
+                    norm_layer.weight, eps=norm_layer.variance_epsilon)
+                logger.info(
+                    "TPU Model Loader: Unconditionally patched draft model's final RMSNorm to GemmaRMSNormPure in Gemma4 MTP path."
+                )
+        else:
+            maybe_share_embeddings(self.draft_model, target_model,
+                                   self._draft_replicated)
         self._maybe_share_lm_head(target_model)
         if (getattr(self.speculative_config, "use_gemma4_mtp", None)
                 is not None and self.speculative_config.use_gemma4_mtp()):
@@ -321,9 +360,42 @@ class Eagle3Proposer:
 
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            logger.info(
+                "Gemma4 MTP: Binding draft layer %d to %s. Target layers in dict: %s",
+                draft_idx, target_layer_name, list(target_layers.keys()))
             if target_layer_name in target_layers:
                 target_layer = target_layers[target_layer_name]
                 attn.kv_cache = getattr(target_layer, "kv_cache", None)
+                logger.info(
+                    "Gemma4 MTP: Successfully bound draft layer %d to target %s KV cache. kv_cache: %s",
+                    draft_idx, target_layer_name, attn.kv_cache is not None)
+
+                # Directly reference and share the target layers' allocated KV cache and implementation objects
+                if hasattr(target_layer, "impl") and hasattr(attn, "impl"):
+                    attn.impl = target_layer.impl
+                    attn.impl.kv_sharing_target_layer_name = target_layer_name
+                    logger.info(
+                        "Gemma4 MTP: Successfully shared target layer %s's backend implementation object with draft layer %d.",
+                        target_layer_name, draft_idx)
+
+                # Copy dynamic scales and log their values
+                for scale_attr in [
+                        "_q_scale", "_k_scale", "_v_scale", "_q_scale_cpu",
+                        "_k_scale_cpu", "_v_scale_cpu", "_q_scale_float",
+                        "_k_scale_float", "_v_scale_float",
+                        "calculate_kv_scales", "q_range", "k_range", "v_range"
+                ]:
+                    if hasattr(target_layer, scale_attr):
+                        val = getattr(target_layer, scale_attr)
+                        setattr(attn, scale_attr, val)
+                        if "scale_float" in scale_attr:
+                            logger.info(
+                                "Gemma4 MTP: Copied scale %s = %s from target to draft layer %d",
+                                scale_attr, val, draft_idx)
+            else:
+                logger.warning(
+                    "Gemma4 MTP WARNING: Target layer %s NOT found in target_layers!",
+                    target_layer_name)
 
     def _maybe_share_lm_head(self, target_model) -> None:
         """Override of LLMBaseProposer._maybe_share_lm_head.
@@ -353,23 +425,34 @@ class Eagle3Proposer:
                 "vLLM may have renamed it.")
             lp._gather_logits = lambda logits: logits
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        # Draft lm-head + greedy argmax, wrapped in one torch.compile region
-        # keyed on input shape only (mirrors the target's compute_selected_logits).
-        # Run raw, compute_logits + argmax + the int32 cast are eager ops the
-        # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
-        # the K-step propose loop -> a fresh fused program per context. Enclosing
-        # them makes a fixed, bucketed program per [n, hidden] shape.
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
-            return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(
-                torch.int32)
-        draft_id = self.draft_model.logits_processor(self.draft_model.lm_head,
-                                                     hidden).argmax(dim=-1)
+            if (hasattr(self.draft_model, "get_top_tokens") and getattr(
+                    self.draft_model, "masked_embedding", None) is not None):
+                tokens = self.draft_model.get_top_tokens(hidden).to(
+                    torch.int32)
+                return tokens
+
+            logits = self.draft_model.compute_logits(hidden)
+            lp = getattr(self.draft_model, "logits_processor", None)
+            if lp is not None and hasattr(lp, "_gather_logits"):
+                logits = lp._gather_logits(logits)
+
+            if not torch.compiler.is_compiling():
+                top_vals, top_indices = logits[0].topk(5)
+                logger.info("DEBUG draft logits top5: tokens=%s, values=%s",
+                            top_indices.cpu().tolist(),
+                            top_vals.cpu().tolist())
+
+            return logits.argmax(dim=-1).to(torch.int32)
+
+        logits = self.draft_model.logits_processor(self.draft_model.lm_head,
+                                                   hidden)
+        draft_id = logits.argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
     def _draft_gather_carries(
@@ -518,6 +601,41 @@ class Eagle3Proposer:
                                      next_tokens_per_chunk[ci]),
                  device_seed=device_seed,
              )
+
+            if is_async:
+                knr = (runner.num_reqs_max_model_len
+                       if chunk.attn_ctx.use_max_model_len else
+                       runner.num_reqs_most_model_len)
+                num_rejected_dev = _maybe_pad_dim0(num_rejected, knr)
+            else:
+                num_rejected_dev = None
+
+            is_gemma4_mtp = (getattr(self.speculative_config, "use_gemma4_mtp",
+                                     None) is not None
+                             and self.speculative_config.use_gemma4_mtp())
+
+            if self.speculative_config.method == "mtp":
+                target_hidden_states = torch.index_select(
+                    target_hidden_states, 0, last_token_indices)
+                input_ids = torch.index_select(input_ids, 0,
+                                               last_token_indices)
+                if positions.ndim == 2:
+                    positions = torch.index_select(positions, 1,
+                                                   last_token_indices)
+                else:
+                    positions = torch.index_select(positions, 0,
+                                                   last_token_indices)
+                if not is_gemma4_mtp:
+                    positions = positions + 1
+
+                    # Since the tensors are now sliced to length `num_reqs_padded`,
+                    # the valid tokens are at indices 0, 1, ..., num_reqs_padded - 1.
+                    # Update last_token_indices so `_draft_gather_carries` picks the right elements.
+                    last_token_indices = torch.arange(
+                        last_token_indices.shape[0],
+                        dtype=last_token_indices.dtype,
+                        device=last_token_indices.device)
+
             rejected_per_chunk.append(num_rejected)
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
@@ -528,13 +646,20 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=(None if is_async else num_rejected),
                 num_tokens_padded=input_ids.shape[0],
+                num_rejected_dev=num_rejected_dev,
             )
+
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            hidden_carry, positions_carry, last_hidden_carry = (
-                self._draft_gather_carries(hidden, positions, last_hidden,
-                                           last_token_indices))
+            if is_gemma4_mtp:
+                hidden_carry = hidden
+                last_hidden_carry = last_hidden
+                positions_carry = positions
+            else:
+                hidden_carry, positions_carry, last_hidden_carry = (
+                    self._draft_gather_carries(hidden, positions, last_hidden,
+                                               last_token_indices))
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -639,12 +764,19 @@ class Eagle3Proposer:
             torch.stack(toks, dim=1) for toks in draft_tokens_per_chunk
         ]
         if return_device:
-            return torch.cat(
+            dev_res = torch.cat(
                 [s[:c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)],
                 dim=0)
+            logger.info(
+                "Gemma4 MTP: propose() returning device draft proposed tokens: %s",
+                dev_res.tolist())
+            return dev_res
         result = []
         for s, c in zip(per_chunk_stacked, chunks):
             result.extend(s.cpu().tolist()[:c.num_reqs])
+        logger.info(
+            "Gemma4 MTP: propose() returning draft proposed tokens: %s",
+            result)
         return result
 
     def _prepare_draft_inputs(
@@ -909,7 +1041,11 @@ class Eagle3Proposer:
         kernel_num_reqs = (runner.num_reqs_max_model_len if use_max_model_len
                            else runner.num_reqs_most_model_len)
 
-        if step_idx == 0:
+        is_gemma4_mtp = (getattr(self.speculative_config, "use_gemma4_mtp",
+                                 None) is not None
+                         and self.speculative_config.use_gemma4_mtp())
+        is_mtp = (self.speculative_config.method == "mtp")
+        if step_idx == 0 and not is_mtp:
             seq_lens = chunk_ctx.seq_lens
             query_start_loc = chunk_ctx.query_start_loc
             request_distribution = chunk_ctx.request_distribution
@@ -918,6 +1054,7 @@ class Eagle3Proposer:
             # the TPU backend never reads it. Any value is correct here.
             max_query_len = 1
         else:
+            p = self._loop_bucket(num_reqs) if is_gemma4_mtp else num_reqs
             num_tokens = num_reqs
             # query_start_loc / request_distribution depend only on num_reqs;
             # the loop hoists them across steps. Fall back to building them here
@@ -926,41 +1063,53 @@ class Eagle3Proposer:
                 query_start_loc = loop_query_start_loc
             else:
                 qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
-                qsl_np = np.minimum(qsl_np, num_reqs)
+                qsl_np = np.minimum(qsl_np, p)
                 query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
-            # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
-            # [num_reqs:] gets the same delta / a zero subtraction but is ignored
-            # by the kernel (query_start_loc caps queries at num_reqs), so this
-            # stays correct while avoiding a per-num_reqs slice-assign that
-            # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
-            # chunk_ctx.seq_lens is not mutated — no .clone() needed.)
-            seq_lens = chunk_ctx.seq_lens + seq_lens_delta
-            # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
-            # program is ONE shape — the variant WITH a num_rejected operand —
-            # regardless of whether this step actually had rejections. The spec
-            # warmup's synthetic request is all-accept (dummy logits ->
-            # draft==target -> zero rejections), so it only ever exercised the
-            # add-only branch; the sub-with-num_rejected variant then recompiled
-            # cold on the first real serving rejection (the residual tt_jit_sub at
-            # the first reject step). Subtracting zeros is value-identical to the
-            # add-only path, and building num_rejected via from_numpy().to(device)
-            # keeps it a runtime PARAMETER (matching the real-rejection program),
-            # not a folded constant. num_rejected_dev (async) is already
-            # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
-            # (query_start_loc caps queries at num_reqs).
-            if num_rejected_dev is None:
-                padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
-                if num_rejected_np is not None:
-                    padded_rej[:num_reqs] = num_rejected_np
-                num_rejected_dev = torch.from_numpy(padded_rej).to(
-                    runner.device)
-            seq_lens = seq_lens - num_rejected_dev
+
+            if is_mtp and step_idx == 0:
+                # In Step 0 of MTP, the sequence length in the KV cache is chunk_ctx.seq_lens minus any rejected tokens
+                if num_rejected_dev is None:
+                    padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
+                    if num_rejected_np is not None:
+                        padded_rej[:num_reqs] = num_rejected_np
+                    num_rejected_dev = torch.from_numpy(padded_rej).to(
+                        runner.device)
+                seq_lens = chunk_ctx.seq_lens - num_rejected_dev
+            else:
+                # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
+                # [num_reqs:] gets the same delta / a zero subtraction but is ignored
+                # by the kernel (query_start_loc caps queries at num_reqs), so this
+                # stays correct while avoiding a per-num_reqs slice-assign that
+                # recompiles as the batch shrinks. (`+` returns a fresh tensor, so
+                # chunk_ctx.seq_lens is not mutated — no .clone() needed.)
+                seq_lens = chunk_ctx.seq_lens + seq_lens_delta
+                # ALWAYS subtract a (possibly all-zero) num_rejected so this metadata
+                # program is ONE shape — the variant WITH a num_rejected operand —
+                # regardless of whether this step actually had rejections. The spec
+                # warmup's synthetic request is all-accept (dummy logits ->
+                # draft==target -> zero rejections), so it only ever exercised the
+                # add-only branch; the sub-with-num_rejected variant then recompiled
+                # cold on the first real serving rejection (the residual tt_jit_sub at
+                # the first reject step). Subtracting zeros is value-identical to the
+                # add-only path, and building num_rejected via from_numpy().to(device)
+                # keeps it a runtime PARAMETER (matching the real-rejection program),
+                # not a folded constant. num_rejected_dev (async) is already
+                # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
+                # (query_start_loc caps queries at num_reqs).
+                if num_rejected_dev is None:
+                    padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
+                    if num_rejected_np is not None:
+                        padded_rej[:num_reqs] = num_rejected_np
+                    num_rejected_dev = torch.from_numpy(padded_rej).to(
+                        runner.device)
+                seq_lens = seq_lens - num_rejected_dev
+
             # Pure decode distribution; matches precompile loop-step shape.
             if loop_request_distribution is not None:
                 request_distribution = loop_request_distribution
             else:
                 request_distribution = torch.tensor(
-                    [num_reqs, num_reqs, num_reqs],
+                    [p, p, p],
                     dtype=torch.int32,
                     device=runner.device,
                 )
@@ -999,13 +1148,84 @@ class Eagle3Proposer:
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
 
-        assert self._draft_attn_layer_names is not None, (
-            "draft attn layer names were not captured during load_model")
+        # Gemma 4 MTP: Broadcast the first request's block table and seq_lens
+        # to requests 1 to p-1 to prevent Pallas attention from reading
+        # zero/uninitialized block IDs and triggering softmax NaNs.
+        # This is restricted strictly to draft-specific attention layers.
+        speculator_layers = self._draft_attn_layer_names or set()
+        if is_gemma4_mtp:
+            model_impl = getattr(self.draft_model, "model", self.draft_model)
+            if hasattr(model_impl, "layers"):
+                for layer in model_impl.layers:
+                    if hasattr(layer, "self_attn"):
+                        attn = getattr(layer.self_attn, "attn", None)
+                        if attn is not None:
+                            target_name = getattr(
+                                attn, "kv_sharing_target_layer_name", None)
+                            if target_name is not None:
+                                speculator_layers = speculator_layers | {
+                                    target_name
+                                }
+
+        # Print debug diagnostics
+        print(f"[DEBUG BRCAST] speculator_layers={speculator_layers}",
+              flush=True)
+        print(
+            f"[DEBUG BRCAST] per_layer_attn_metadata keys={list(per_layer_attn_metadata.keys())[:10]} ... total={len(per_layer_attn_metadata)}",
+            flush=True)
+
+        if is_gemma4_mtp:
+            p = self._loop_bucket(num_reqs)
+            if p > 1:
+                for name, md in per_layer_attn_metadata.items():
+                    if name in speculator_layers:
+                        if md.block_tables is not None:
+                            total_elements = md.block_tables.numel()
+                            target_num_blocks = total_elements // kernel_num_reqs
+                            bt_2d = md.block_tables.view(
+                                kernel_num_reqs, target_num_blocks)
+                            bt_2d[1:p] = bt_2d[0:1].expand(p - 1, -1)
+                        if md.seq_lens is not None:
+                            md.seq_lens[1:p] = md.seq_lens[0:1].expand(p - 1)
+
         result = {
             name: md
             for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
+            if name in speculator_layers
         }
+
+        # Redirect/alias draft layer metadata to use their shared target layer metadata
+        if is_gemma4_mtp:
+            model_impl = getattr(self.draft_model, "model", self.draft_model)
+            if hasattr(model_impl, "layers"):
+                for idx, layer in enumerate(model_impl.layers):
+                    if hasattr(layer, "self_attn"):
+                        attn = getattr(layer.self_attn, "attn", None)
+                        if attn is not None:
+                            target_name = getattr(
+                                attn, "kv_sharing_target_layer_name", None)
+                            draft_name = getattr(
+                                attn, "layer_name",
+                                f"draft_model.layers.{idx}.self_attn.attn")
+                            if target_name is not None and target_name in result:
+                                result[draft_name] = result[target_name]
+                                print(
+                                    f"[DEBUG BRCAST] Aliased draft layer {draft_name} to target layer {target_name} metadata.",
+                                    flush=True)
+
+        # Print the resolved seq_lens and block_tables
+        for name in [
+                "draft_model.layers.0.self_attn.attn",
+                "language_model.model.layers.58.self_attn.attn"
+        ]:
+            if name in result:
+                md = result[name]
+                print(
+                    f"[DEBUG BRCAST] {name}: seq_lens={md.seq_lens.tolist() if md.seq_lens is not None else 'None'}",
+                    flush=True)
+                print(
+                    f"[DEBUG BRCAST] {name}: block_tables={md.block_tables.tolist() if md.block_tables is not None else 'None'}",
+                    flush=True)
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
         return result
@@ -1025,10 +1245,8 @@ class Eagle3Proposer:
                 raise RuntimeError(
                     f"Draft model returned a {len(out)}-element tuple; expected "
                     "a tensor or a 2-element (last_hidden, aux_hidden) tuple.")
-            last_hidden, hidden = out
-        else:
-            last_hidden = hidden = out
-        return last_hidden, hidden
+            return out[0], out[1]
+        return out, out
 
     def _forward_draft(
         self,
@@ -1044,6 +1262,88 @@ class Eagle3Proposer:
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        inputs_embeds = None
+        if self.speculative_config.method == "mtp":
+            vocab_size = getattr(
+                self.draft_model, "vocab_size",
+                getattr(self.draft_model.config, "vocab_size", 256000))
+
+            # Step 1: Sanitizing input_ids to remove placeholder/sentinel token IDs
+            input_ids = torch.where(input_ids >= vocab_size,
+                                    torch.zeros_like(input_ids), input_ids)
+            input_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids),
+                                    input_ids)
+
+            # Step 2: Sanitizing target_hidden_states to clear NaNs
+            orig_dtype = target_hidden_states.dtype
+            target_hidden_states = target_hidden_states.to(torch.bfloat16)
+            target_hidden_states = torch.nan_to_num(target_hidden_states,
+                                                    nan=0.0)
+
+            # Step 3: Masking padding slots to prevent NaNs from propagating in attention softmax
+            num_tokens_active = chunk.num_reqs
+            mask = (torch.arange(target_hidden_states.shape[0],
+                                 device=target_hidden_states.device)
+                    < num_tokens_active).unsqueeze(1).to(torch.bfloat16)
+            target_hidden_states = (target_hidden_states * mask).to(orig_dtype)
+
+            # Gemma 4 MTP projection logic: embed via target's embedding table and optionally scale
+            is_gemma4_mtp = (getattr(self.speculative_config, "use_gemma4_mtp",
+                                     None) is not None
+                             and self.speculative_config.use_gemma4_mtp())
+            if is_gemma4_mtp and getattr(self, "target_embed",
+                                         None) is not None:
+                target_embedded = self.target_embed(input_ids)
+                normalizer = getattr(self.draft_model.model, "normalizer",
+                                     None)
+                if normalizer is not None:
+                    target_embedded = target_embedded * normalizer
+                else:
+                    backbone_h = getattr(self.draft_model.model,
+                                         "backbone_hidden_size", 5376)
+                    target_embedded = target_embedded * (backbone_h**0.5)
+                inputs_embeds = torch.nan_to_num(target_embedded, nan=0.0)
+
+            # Gemma 4 MTP broadcast padding: Broadcast first request to all padded rows on step 0
+            # to prevent division-by-zero NaN output in attention softmax.
+            if is_gemma4_mtp and step_idx == 0:
+                num_reqs = chunk.num_reqs
+
+                if target_hidden_states.shape[0] > num_reqs:
+                    first_hidden = target_hidden_states[0:1]
+                    target_hidden_states = torch.cat([
+                        target_hidden_states[:num_reqs],
+                        first_hidden.expand(
+                            target_hidden_states.shape[0] - num_reqs, -1)
+                    ],
+                                                     dim=0)
+
+                if inputs_embeds is not None and inputs_embeds.shape[
+                        0] > num_reqs:
+                    first_embed = inputs_embeds[0:1]
+                    inputs_embeds = torch.cat([
+                        inputs_embeds[:num_reqs],
+                        first_embed.expand(inputs_embeds.shape[0] - num_reqs,
+                                           -1)
+                    ],
+                                              dim=0)
+
+                if input_ids.shape[0] > num_reqs:
+                    first_id = input_ids[0:1]
+                    input_ids = torch.cat([
+                        input_ids[:num_reqs],
+                        first_id.expand(input_ids.shape[0] - num_reqs)
+                    ],
+                                          dim=0)
+
+                if positions.shape[0] > num_reqs:
+                    first_pos = positions[0:1]
+                    positions = torch.cat([
+                        positions[:num_reqs],
+                        first_pos.expand(positions.shape[0] - num_reqs)
+                    ],
+                                          dim=0)
+
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=step_idx,
@@ -1064,6 +1364,20 @@ class Eagle3Proposer:
         }
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
+            if inputs_embeds is not None:
+                kwargs["inputs_embeds"] = inputs_embeds
+
+        # Debug diagnostics print block
+        rank = torch.distributed.get_rank(
+        ) if torch.distributed.is_initialized() else 0
+        if self.speculative_config.method == "mtp":
+            print(
+                f"[DEBUG Rank {rank}] target_hidden_states: nan={torch.isnan(target_hidden_states).any()}, shape={target_hidden_states.shape}, sum={target_hidden_states.sum().item():.4f}",
+                flush=True)
+            if inputs_embeds is not None:
+                print(
+                    f"[DEBUG Rank {rank}] inputs_embeds: nan={torch.isnan(inputs_embeds).any()}, shape={inputs_embeds.shape}, sum={inputs_embeds.sum().item():.4f}",
+                    flush=True)
 
         draft_vllm_cfg = getattr(self.draft_model, "vllm_config",
                                  self.vllm_config)
@@ -1076,7 +1390,15 @@ class Eagle3Proposer:
         ), set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             out = self.draft_model(**kwargs)
 
-        return self._unwrap_model_out(out)
+        last_hidden_out, carry_hidden_out = self._unwrap_model_out(out)
+        if self.speculative_config.method == "mtp":
+            print(
+                f"[DEBUG Rank {rank}] last_hidden_out: nan={torch.isnan(last_hidden_out).any()}, shape={last_hidden_out.shape}, sum={last_hidden_out.sum().item():.4f}",
+                flush=True)
+            print(
+                f"[DEBUG Rank {rank}] carry_hidden_out: nan={torch.isnan(carry_hidden_out).any()}, shape={carry_hidden_out.shape}, sum={carry_hidden_out.sum().item():.4f}",
+                flush=True)
+        return last_hidden_out, carry_hidden_out
 
     def precompile(self) -> None:
         """Precompile the draft-side @torch.compile wrapper subgraphs.

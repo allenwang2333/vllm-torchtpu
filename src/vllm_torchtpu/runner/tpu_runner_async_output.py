@@ -110,6 +110,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output
+        selected_token_ids = selected_token_ids.to(torch.int32)
         if selected_token_ids.dim() == 1:
             selected_token_ids = selected_token_ids.unsqueeze(-1)
 

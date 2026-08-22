@@ -1048,3 +1048,88 @@ def test_eagle3_mtp_kv_caches_binding():
 
     # The draft layer's kv_cache should now point directly to target layer's kv_cache sentinel!
     assert draft_layer.self_attn.attn.kv_cache is mock.sentinel.target_kv_cache
+
+
+def test_eagle3_mtp_gemma4_embedding_and_projection():
+    """Verify that Gemma 4 MTP avoids sharing embeddings and correctly uses target_embed in forward."""
+    speculative_config = SimpleNamespace(
+        draft_tensor_parallel_size=1,
+        method="mtp",
+        use_gemma4_mtp=lambda: True,
+    )
+    parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+    )
+
+    proposer = Eagle3Proposer(runner=mock.MagicMock(), vllm_config=vllm_config)
+
+    # 1. Test load_model embedding setup
+    draft_model = SimpleNamespace(has_own_embed_tokens=False)
+    proposer.draft_model = draft_model
+    proposer._load_draft_model = mock.MagicMock()
+    proposer._maybe_share_lm_head = mock.MagicMock()
+    proposer._setup_gemma4_kv_sharing = mock.MagicMock()
+
+    # Mock target_model and resolve embed_tokens
+    target_embed_mock = mock.MagicMock()
+    target_model = SimpleNamespace(get_language_model=lambda: SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed_mock)))
+
+    with mock.patch("vllm_torchtpu.spec_decode.eagle3.maybe_share_embeddings") as mock_maybe_share, \
+         mock.patch("vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config") as mock_get_layers:
+        mock_get_layers.return_value = {}
+        proposer.load_model(target_model)
+
+        # Verify maybe_share_embeddings was bypassed/skipped for Gemma 4 MTP
+        mock_maybe_share.assert_not_called()
+        # Verify has_own_embed_tokens is set
+        assert proposer.draft_model.has_own_embed_tokens is True
+        # Verify target_embed is saved
+        assert proposer.target_embed is target_embed_mock
+
+    # 2. Test _forward_draft embedding projection logic
+    input_ids = torch.tensor([1, 2, 3])
+    positions = torch.tensor([0, 1, 2])
+    target_hidden_states = torch.zeros((3, 8))
+    chunk = SimpleNamespace(
+        num_reqs=3, attn_ctx=SimpleNamespace(position_ids_override=None))
+
+    # Mock target_embed to return mock embedded tokens
+    mock_embedded_output = torch.ones((3, 5376))
+    proposer.target_embed = mock.MagicMock(return_value=mock_embedded_output)
+
+    # Mock normalizer and draft model model
+    proposer.draft_model = mock.MagicMock()
+    proposer.draft_model.vocab_size = 256000
+    proposer.draft_model.model = SimpleNamespace(
+        normalizer=2.0,
+        backbone_hidden_size=5376,
+    )
+
+    # Mock _build_draft_attn_metadata and set_forward_context
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value=None)
+    proposer._unwrap_model_out = mock.MagicMock(
+        return_value=(torch.zeros(3, 8), torch.zeros(3, 8)))
+
+    with mock.patch("vllm_torchtpu.spec_decode.eagle3.set_forward_context"), \
+         mock.patch("vllm_torchtpu.spec_decode.eagle3.set_vllm_model_wrapper_context"):
+        proposer._forward_draft(
+            chunk=chunk,
+            input_ids=input_ids,
+            positions=positions,
+            target_hidden_states=target_hidden_states,
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=None,
+        )
+
+        # Verify target_embed was called with sanitized input_ids
+        proposer.target_embed.assert_called_once()
+
+        # Verify the inputs_embeds passed to the draft model was scaled by normalizer (2.0)
+        _, kwargs = proposer.draft_model.call_args
+        assert "inputs_embeds" in kwargs
+        # target_embedded = mock_embedded_output * normalizer (2.0) = all 2.0
+        assert torch.all(kwargs["inputs_embeds"] == 2.0)

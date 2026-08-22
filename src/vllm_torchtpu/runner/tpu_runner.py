@@ -133,9 +133,11 @@ class ExecuteModelState:
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
-        input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
+        input_ids: torch.Tensor,
+        token_in_tpu_cur_input_indices: torch.Tensor,
         token_in_tpu_pre_next_tokens_indices: torch.Tensor,
-        next_tokens: torch.Tensor):
+        next_tokens: torch.Tensor,
+        vocab_size: int = 262144):
     """Substitute placeholder tokens from TPU for async scheduler.
 
     Padding scheme (set up by `_apply_async_token_substitution`):
@@ -153,16 +155,21 @@ def _substitute_placeholder_token(
         token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
             in `next_tokens`; -1 marks a padding slot to leave unchanged.
         next_tokens: int tensor of tokens from the previous async step.
+        vocab_size: vocab size of the active model configuration.
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
     assert input_ids.shape[0] == token_in_tpu_cur_input_indices.shape[
         0] == token_in_tpu_pre_next_tokens_indices.shape[0]
-    mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    raw_token_values = next_tokens[safe_idx]
+    # Filter out both -1 sentinels and all out-of-bounds token underflows (including 21-bit and 31-bit underflows)
+    # This prevents any invalid/placeholder sentinel values from reaching Embedding layers.
+    mask = (token_in_tpu_pre_next_tokens_indices
+            > -1) & (raw_token_values >= 0) & (raw_token_values < vocab_size)
+    new_token_values = raw_token_values.to(input_ids.dtype)
     # Clamp any negative values (like rejection/padding -1 sentinels) to 0
     # to prevent out-of-bounds index access in downstream Embedding layers on SparseCore.
     new_token_values = torch.clamp_min(new_token_values, 0)
@@ -2261,7 +2268,7 @@ class TPUModelRunner(GPUModelRunner):
 
         return _substitute_placeholder_token(
             input_ids, cur_input_indices, pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu)
+            self._pre_async_results.next_tokens_tpu, self.vocab_size)
 
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
@@ -2296,6 +2303,7 @@ class TPUModelRunner(GPUModelRunner):
 
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
+        pre_next_tokens_cpu = pre_next_tokens_cpu.to(torch.int32)
 
         pre_next_tokens_cpu = pre_next_tokens_cpu[:len(pre_req_ids)]
         max_gen_len = pre_next_tokens_cpu.shape[-1]
@@ -3169,6 +3177,14 @@ class TPUModelRunner(GPUModelRunner):
 
             input_ids, inputs_embeds = self._get_model_inputs(
                 input_ids, chunk_mm_inputs)
+            if input_ids is not None:
+                # Clamp out-of-bounds sentinel and placeholder values >= vocab_size to 0
+                # to prevent NaNs from propagating in the target model's projection/embedding layers.
+                input_ids = torch.where(input_ids >= self.vocab_size,
+                                        torch.zeros_like(input_ids), input_ids)
+                input_ids = torch.where(input_ids < 0,
+                                        torch.zeros_like(input_ids), input_ids)
+
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -3198,6 +3214,21 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
+
+            logger.info(
+                "DEBUG _execute_model_chunk forward_model: num_reqs=%d, input_ids=%s, hidden_states stats: min=%s, max=%s, mean=%s, has_nan=%s, shape=%s",
+                num_reqs,
+                input_ids.cpu().tolist()[:10],
+                hidden_states.min().cpu().item() if hasattr(
+                    hidden_states, "min") else "None",
+                hidden_states.max().cpu().item() if hasattr(
+                    hidden_states, "max") else "None",
+                hidden_states.mean().cpu().item() if hasattr(
+                    hidden_states, "mean") else "None",
+                torch.isnan(hidden_states).any().cpu().item() if hasattr(
+                    hidden_states, "isnan") else "None",
+                list(hidden_states.shape)
+                if hasattr(hidden_states, "shape") else "None")
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -5504,6 +5535,15 @@ class TPUModelRunner(GPUModelRunner):
                     "kv_transfer_config / uniform mamba layout).")
             self.mamba_slot_read_offsets = torch.zeros(
                 allocated_mamba_num_blocks, dtype=torch.int32).to(self.device)
+
+        # Bind target KV cache tensors and dynamic FP8 scales to the draft model
+        # before we initialize attention kernels and precompile, ensuring the
+        # compiled draft forward graph is baked with the correct target scales (not 1.0).
+        if (self.speculative_config and getattr(
+                self.speculative_config, "use_gemma4_mtp", None) is not None
+                and self.speculative_config.use_gemma4_mtp()
+                and hasattr(self, "drafter") and self.drafter is not None):
+            self.drafter._bind_gemma4_shared_kv_caches()
 
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
