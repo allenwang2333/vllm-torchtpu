@@ -834,10 +834,20 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        del input_ids
         activation_str = layer._tpu_activation_str
+        fused_ep_step_min_tokens = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+        if fused_ep_step_min_tokens < 0:
+            raise ValueError(
+                "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0")
         if self.supports_internal_mk:
-            return self._apply_owning_dispatch(layer, x, router_logits,
-                                               activation_str)
+            return self._apply_owning_dispatch(
+                layer,
+                x,
+                router_logits,
+                activation_str,
+                use_fused_kernel=x.shape[0] >= fused_ep_step_min_tokens,
+            )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -871,6 +881,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         activation_str: str,
+        *,
+        use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         """Run the layer when this method owns the EP exchange.
 
@@ -885,7 +897,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             fused_moe_ep, fused_moe_ep_supported)
 
         topk = layer.moe_config.experts_per_token
-        if fused_moe_ep_supported():
+        if use_fused_kernel and fused_moe_ep_supported():
             return fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
                                 layer.w13_weight_scale_inv,
                                 layer.w2_weight_scale_inv, router_logits)
