@@ -38,10 +38,8 @@ case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # New prefills are admitted every this many steps. Larger value trades
-    # TTFT for throughput. 256 was picked for maximizing 8k1k concurrency 256
-    # throughput. May need more tuning to work well across more concurrencies.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
+    # The measured c128/c256 configurations admit prefills every step.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-1}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
@@ -49,6 +47,7 @@ case "$SHARDING" in
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
     export DP_SCHED_ENABLED=1
+    export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
@@ -57,7 +56,10 @@ case "$SHARDING" in
       --tensor-parallel-size=8
       --data-parallel-size=1
       --enable-expert-parallel
-    ) ;;
+    )
+    # The fused EP kernel refuses tensor parallelism and cannot help here.
+    export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
+    ;;
   DP4TP2_EP)
     # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
     # on the same chip + expert-parallel MoE.
@@ -70,6 +72,8 @@ case "$SHARDING" in
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
     export DP_SCHED_ENABLED=1
+    # The fused EP kernel also refuses the TP2 component of this sharding.
+    export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
     ;;
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac
@@ -80,16 +84,30 @@ MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
-# Overridable: the derived value sizes a step to hold a whole prompt, which
-# makes prefill steps efficient but expensive to mix into a decode step -- under
-# DP lockstep every rank pads up to the same bucket. A smaller chunk trades a
-# little per-token prefill efficiency for much cheaper mixing, which is what a
-# tight TTFT target needs.
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))}"
-
-# Overridable so one server can be measured at several concurrencies without
-# a fresh 25-minute compile for each; leave unset for the per-concurrency value.
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-$((CONC * 2 / DP_SIZE))}"
+# Defaults reproduce the branch owner's measured configuration. TP8 uses one
+# server for c4-c64 with fixed compile limits. DP8 c128/c256 use independently
+# measured local scheduler chunks. Other configurations keep the derived
+# fallback and every value remains directly overridable.
+case "$SHARDING:$CONC" in
+  TP8_EP:*)
+    DEFAULT_MAX_NUM_BATCHED_TOKENS="$GLOBAL_BATCHED_TOKEN"
+    DEFAULT_MAX_NUM_SEQS=256
+    ;;
+  DP8_EP:128)
+    DEFAULT_MAX_NUM_BATCHED_TOKENS=256
+    DEFAULT_MAX_NUM_SEQS=32
+    ;;
+  DP8_EP:256)
+    DEFAULT_MAX_NUM_BATCHED_TOKENS=512
+    DEFAULT_MAX_NUM_SEQS=64
+    ;;
+  *)
+    DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
+    DEFAULT_MAX_NUM_SEQS=$((CONC * 2 / DP_SIZE))
+    ;;
+esac
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-$DEFAULT_MAX_NUM_SEQS}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
 
 # Increase API-server frontend wait time since cold init may take long.
