@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Sweep 8k1k with a 16k node-wide token budget. Each server is compiled for the
+# Sweep 8k1k with a 24k node-wide token budget. Each server is compiled for the
 # point's concurrency; DP8 divides both token and sequence limits across its
 # eight schedulers.
 # Usage: bash sweep.sh
@@ -123,7 +123,7 @@ for wl in "${WORKLOADS[@]}"; do
           ;;
         *) echo "ERROR: cannot derive DP_SIZE for SHARDING='$sharding'" >&2; exit 1 ;;
       esac
-      global_batched_tokens_min="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
+      global_batched_tokens_min="${GLOBAL_BATCHED_TOKENS_MIN:-24576}"
       global_batched_tokens=$(( ISL > global_batched_tokens_min ? ISL : global_batched_tokens_min ))
       max_batched_tokens=$(((global_batched_tokens + dp_size - 1) / dp_size))
       max_seqs=$(((CONC + dp_size - 1) / dp_size))
