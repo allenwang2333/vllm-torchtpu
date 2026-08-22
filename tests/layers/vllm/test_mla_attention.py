@@ -40,7 +40,7 @@ def test_pallas_mla_attention_backend():
     )
     assert shape_auto == (10, 16, 1, 640)
 
-    # Test get_kv_cache_shape with fp8
+    # Test get_kv_cache_shape with fp8 (default kv_packing=4 from dtype)
     shape_fp8 = PallasMLAttentionBackend.get_kv_cache_shape(
         num_blocks=10,
         block_size=16,
@@ -54,6 +54,22 @@ def test_pallas_mla_attention_backend():
     page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
         block_size=16, num_kv_heads=1, head_size=576, cache_dtype_str="fp8")
     assert page_size == 10240
+
+
+def test_pallas_mla_attention_backend_custom_kv_packing():
+    with patch.dict("os.environ", {"MLA_KV_PACKING_SIZE": "32"}):
+        shape_fp8_32 = PallasMLAttentionBackend.get_kv_cache_shape(
+            num_blocks=10,
+            block_size=128,
+            num_kv_heads=1,
+            head_size=576,
+            cache_dtype_str="fp8",
+        )
+        assert shape_fp8_32 == (10, 4, 32, 640)
+
+        page_size_128 = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size=128, num_kv_heads=1, head_size=576, cache_dtype_str="fp8")
+        assert page_size_128 == 81920
 
 
 def test_pallas_mla_attention_backend_fp8_ds_mla():

@@ -437,7 +437,7 @@ class VllmTPUMLAAttention(MLAAttention):
             if getattr(self, "quant_config", None)
             else None
         )
-        from vllm.model_executor.layers.quantization.base_config import (
+        from vllm.model_executor.layers.attention.attention import (
             set_default_quant_scales, should_load_quant_weights)
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)

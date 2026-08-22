@@ -970,7 +970,9 @@ class PallasMLAttentionBackend(AttentionBackend):
                 nope_dim = head_size - rope_head_dim
                 packed_width = sparse_packed_width(nope_dim, rope_head_dim,
                                                    quant_block)
-            kv_packing = get_dtype_packing(torch.uint8)
+            kv_packing = (envs.MLA_KV_PACKING_SIZE
+                          if envs.MLA_KV_PACKING_SIZE is not None
+                          else get_dtype_packing(torch.uint8))
             return mla_v2_kernel.get_kv_cache_shape(
                 total_num_pages=num_blocks,
                 page_size=block_size,
@@ -979,7 +981,9 @@ class PallasMLAttentionBackend(AttentionBackend):
                 kv_packing=kv_packing,
             )
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(kv_dtype)
+        kv_packing = (envs.MLA_KV_PACKING_SIZE
+                      if envs.MLA_KV_PACKING_SIZE is not None
+                      else get_dtype_packing(kv_dtype))
         return mla_v2_kernel.get_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
