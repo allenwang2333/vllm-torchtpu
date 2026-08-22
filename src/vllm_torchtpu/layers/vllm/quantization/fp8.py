@@ -875,6 +875,42 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             activation=activation_str,
         )
 
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run after the runner dispatched activations and router logits.
+
+        Small token buckets deliberately retain vLLM's baseline DP contract:
+        gather logits, route globally, run the local GMM, then let the runner
+        combine the result. Keeping those collectives at the runner boundary
+        also gives every shape-specialized trace a stable set of lifted graph
+        inputs.
+        """
+        del input_ids
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = (
+                token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights))
+        return fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, 'w13_bias', None),
+            w2_bias=getattr(layer, 'w2_bias', None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=layer._tpu_activation_str,
+        )
+
     def _apply_owning_dispatch(
         self,
         layer: RoutedExperts,

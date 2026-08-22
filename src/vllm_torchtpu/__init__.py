@@ -271,6 +271,111 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 
 
+def _patch_moe_fused_ep_threshold_contract() -> None:
+    """Restore vLLM's external DP contract below the fused-EP threshold.
+
+    ``supports_internal_mk`` is a static quant-method property. Arming fused
+    EP therefore makes vLLM skip its dispatch/combine for every compiled token
+    bucket. For buckets below the shape threshold, run the baseline external
+    path explicitly. Besides selecting the GMM kernel, this keeps the
+    shape-specialized graph's lifted inputs stable across the threshold.
+    """
+    from torch.nn import functional as F
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    threshold = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+    if not envs.USE_MOE_FUSED_EP_KERNEL or threshold <= 0:
+        return
+
+    runner_cls = moe_runner.MoERunner
+    if getattr(runner_cls, "_tpu_fused_ep_threshold_patch", False):
+        return
+    original_forward_impl = runner_cls._forward_impl
+
+    def forward_impl(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+    ):
+        config = self.moe_config
+        if config.dp_size <= 1 or hidden_states.shape[0] >= threshold:
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        quant_method = self.routed_experts.quant_method
+        external_apply = getattr(
+            quant_method, "apply_monolithic_external_dispatch", None)
+        if external_apply is None:
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        # This is the small-shape branch of vLLM's _forward_impl with the
+        # naive dispatch/combine made explicit. supports_internal_mk remains
+        # true because large shapes use the fused EP kernel.
+        self.routed_experts._ensure_moe_quant_config_init()
+        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        if self.gate is not None:
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states,
+                                         self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+        with self._sequence_parallel_context():
+            ep_group = moe_runner.get_ep_group()
+            result = ep_group.dispatch_router_logits(
+                hidden_states,
+                router_logits,
+                config.is_sequence_parallel,
+            )
+            assert len(result) == 2
+            hidden_states, router_logits = result
+
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.NO_OVERLAP,
+            )
+            fused_output = external_apply(
+                layer=self.routed_experts,
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+
+            fused_output = ep_group.combine(
+                fused_output,
+                config.is_sequence_parallel,
+            )
+            if self._shared_experts is None:
+                return fused_output
+            return self._shared_experts.output, fused_output
+
+    runner_cls._tpu_original_fused_ep_threshold_forward_impl = (
+        original_forward_impl)
+    runner_cls._forward_impl = forward_impl
+    runner_cls._tpu_fused_ep_threshold_patch = True
+    logger.info(
+        "Applied TPU patch: use external MoE dispatch below %d tokens.",
+        threshold)
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Keep PCP MoE dispatch/combine explicit for TorchTPU.
 
