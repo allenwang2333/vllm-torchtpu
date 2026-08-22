@@ -123,8 +123,8 @@ for wl in "${WORKLOADS[@]}"; do
         *) echo "ERROR: cannot derive DP_SIZE for SHARDING='$sharding'" >&2; exit 1 ;;
       esac
       max_batched_tokens=""
-      max_seqs=$(((CONC + dp_size - 1) / dp_size))
-      prefill_interval=8
+      max_seqs=""
+      prefill_interval=""
       server_key="$ISL:$OSL:$sharding:$max_batched_tokens:$max_seqs:$prefill_interval:$fused_ep"
     fi
     [ -n "$sharding" ] || { echo "ERROR: no sharding in SHARDING_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }

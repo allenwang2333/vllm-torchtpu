@@ -38,20 +38,18 @@ case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # Coordinate prefill admission every 16 scheduler steps by default.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-16}"
+    # Match the measured-best DP8 jobs: admit prefills every 2 scheduler steps.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-2}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    # Coordinate DP prefill cohorts by default. Set DP_SCHED_ENABLED=0 and
-    # TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0 to compare against the stock scheduler
-    # without coordinated cohort flushing.
-    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2000}"
-    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
+    # Disable the locally ported coordinated scheduler for this reproduction.
+    export DP_SCHED_ENABLED=0
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
+    export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     ;;
   TP8_EP)
@@ -76,12 +74,10 @@ case "$SHARDING" in
       --enable-expert-parallel
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
-    # Coordinate DP prefill cohorts by default. Set DP_SCHED_ENABLED=0 and
-    # TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0 to compare against the stock scheduler
-    # without coordinated cohort flushing.
-    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2000}"
-    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
+    # Keep the coordinated DP scheduler disabled for reproduction runs.
+    export DP_SCHED_ENABLED=0
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
+    export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     # The fused EP kernel also refuses the TP2 component of this sharding.
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
     ;;
@@ -98,11 +94,13 @@ GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_
 # DP8 high-concurrency points use smaller per-rank chunks instead.
 DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
 case "$SHARDING:$CONC" in
-  DP8_EP:128) DEFAULT_MAX_NUM_BATCHED_TOKENS=256 ;;
-  DP8_EP:256) DEFAULT_MAX_NUM_BATCHED_TOKENS=512 ;;
+  DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_BATCHED_TOKENS=256 ;;
 esac
 # Max sequences is a node-wide target divided across DP ranks.
 DEFAULT_MAX_NUM_SEQS=$(((CONC + DP_SIZE - 1) / DP_SIZE))
+case "$SHARDING:$CONC" in
+  DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_SEQS=64 ;;
+esac
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-$DEFAULT_MAX_NUM_SEQS}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
