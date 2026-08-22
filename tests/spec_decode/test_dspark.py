@@ -21,13 +21,18 @@ class _FakeHFConfig:
         return out
 
 
-def _make_proposer(hf_dict, num_speculative_tokens=4):
+def _make_proposer(hf_dict,
+                   num_speculative_tokens=4,
+                   draft_sample_method="greedy",
+                   async_scheduling=False):
     speculative_config = SimpleNamespace(
         num_speculative_tokens=num_speculative_tokens,
         draft_tensor_parallel_size=1,
+        draft_sample_method=draft_sample_method,
         draft_model_config=SimpleNamespace(hf_config=_FakeHFConfig(hf_dict)))
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         model_config=SimpleNamespace(max_model_len=2048),
         compilation_config=SimpleNamespace(
             static_forward_context={
@@ -124,3 +129,35 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+_BASE = {"dspark_noise_token_id": 7, **_LAYER_IDS}
+
+
+def test_greedy_mode_has_no_sampling_state():
+    p = _make_proposer(_BASE)
+    assert p.draft_sample_probabilistic is False
+    assert p.draft_logits_cache is None
+    assert p._chunk_sample_args(SimpleNamespace(num_reqs=1, start_index=0),
+                                8) == ()
+    assert p._dummy_sample_args(8) == ()
+
+
+def test_probabilistic_mode_flag_and_dummy_args():
+    p = _make_proposer(_BASE, draft_sample_method="probabilistic")
+    assert p.draft_sample_probabilistic is True
+    # Buffers appear at load_model; give the proposer a small fake cache and
+    # check the dummy args mirror the compiled signature (seeds int64, temps
+    # fp32, rows aimed at the trash row).
+    p.draft_logits_cache = torch.zeros(5, 4, 16)
+    seeds, temps, rows = p._dummy_sample_args(8)
+    assert seeds.dtype == torch.int64 and seeds.shape == (8, )
+    assert temps.dtype == torch.float32 and (temps == 1.0).all()
+    assert rows.dtype == torch.int64 and (rows == 4).all()
+
+
+def test_probabilistic_rejects_async_scheduling():
+    with pytest.raises(NotImplementedError, match="async"):
+        _make_proposer(_BASE,
+                       draft_sample_method="probabilistic",
+                       async_scheduling=True)

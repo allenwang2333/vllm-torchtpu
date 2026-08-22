@@ -116,6 +116,16 @@ class DFlashProposer:
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
 
+    def _chunk_sample_args(self, chunk, padded_num_reqs: int) -> tuple:
+        """Extra per-chunk tensors for _dflash_forward_and_sample. DFlash's
+        greedy sampling needs none; DSpark's probabilistic mode overrides
+        this (and _dummy_sample_args, which must emit matching shapes so
+        warmup compiles the same program as the live path)."""
+        return ()
+
+    def _dummy_sample_args(self, padded_num_reqs: int) -> tuple:
+        return ()
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
@@ -469,7 +479,8 @@ class DFlashProposer:
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size)
+                    input_ids, positions, block_size,
+                    *self._chunk_sample_args(chunk, padded_len // block_size))
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
         for _ in range(extra_chunks):
@@ -708,7 +719,8 @@ class DFlashProposer:
                     set_vllm_model_wrapper_context(mesh=self.runner.mesh, ),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size)
+                    input_ids, positions, block_size,
+                    *self._dummy_sample_args(num_tokens // block_size))
                 synchronize_tensors(draft_tokens_chunk)
 
         finally:
@@ -750,7 +762,11 @@ class DFlashProposer:
         the shape `_prepare_dflash_inputs` pins every rank to under
         lockstep, derived from the same `_dp_coordinated_step` all-reduce."""
         runner = self.runner
-        block_size = self.speculative_config.num_speculative_tokens + 1
+        # Route through _query_block_size: dense DSpark shrinks the query
+        # block to K, and a K+1 dummy here would emit a mismatched draft
+        # bucket under EP-DP lockstep.
+        block_size = self._query_block_size(
+            self.speculative_config.num_speculative_tokens)
         coordinated_reqs = max(1, runner._dp_step_max_reqs)
         draft_bucket = self._get_padded_len(coordinated_reqs * block_size)
         self._dummy_draft_forward(
@@ -933,7 +949,8 @@ class DFlashProposer:
             position_ids: 1D Tensor containing position IDs.
             draft_lengths: Number of verified drafts per request (0 for prompt chunks).
             num_reqs: Number of active requests.
-            block_size: K + 1 (1 base token + K draft mask slots).
+            block_size: the drafter's query block (K + 1 for DFlash's
+                1 base token + K mask slots; K for dense DSpark).
             padded_len: Total length of the flattened tensors (padded_num_reqs * block_size).
             mask_token_id: The vocabulary ID for the MASK token.
             invalid_token_id: The ID denoting unused/padding tokens in next_tokens_device.

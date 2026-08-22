@@ -940,6 +940,15 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}")
+            if (getattr(self.speculative_config, "draft_sample_method",
+                        "greedy") != "greedy"
+                    and not getattr(self.drafter, "draft_sample_probabilistic",
+                                    False)):
+                raise NotImplementedError(
+                    "draft_sample_method="
+                    f"'{self.speculative_config.draft_sample_method}' is only "
+                    "supported for method='dspark' on TPU; other drafters "
+                    "sample greedily.")
 
     def _truncate_rope_caches(self) -> None:
         """Slice rotary cos_sin caches to max_model_len which can reduce
@@ -3080,8 +3089,12 @@ class TPUModelRunner(GPUModelRunner):
                                         dtype=np.int32)
             if num_draft_tokens.any():
                 spec_decode_metadata = self.spec_decode_manager.get_spec_decode_metadata(
-                    num_draft_tokens, self.query_start_loc_np[1:num_reqs + 1],
-                    padded_num_reqs)
+                    num_draft_tokens,
+                    self.query_start_loc_np[1:num_reqs + 1],
+                    padded_num_reqs,
+                    req_ids=list(
+                        self.input_batch.req_ids[start_index:start_index +
+                                                 num_reqs]))
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -3710,6 +3723,25 @@ class TPUModelRunner(GPUModelRunner):
             return None
         return self.spec_decode_manager.take_draft_token_ids()
 
+    def get_spec_seed(self, req_id: str) -> int:
+        """Per-request Gumbel seed for coupled speculative sampling.
+
+        The drafter and the rejection sampler both key their noise on this
+        value, so it must be identical across TP ranks and across the draft
+        and verify steps of a request. A user-provided SamplingParams.seed
+        wins; otherwise derive a stable value from the request id (identical
+        on every rank, unlike an RNG stream whose offset can drift) mixed
+        with the engine seed.
+        """
+        req_state = self.requests.get(req_id)
+        params = req_state.sampling_params if req_state is not None else None
+        if params is not None and params.seed is not None:
+            return params.seed
+        import hashlib
+        digest = hashlib.blake2b(req_id.encode(), digest_size=8).digest()
+        base = int.from_bytes(digest, "little", signed=True)
+        return base ^ int(self.model_config.seed or 0)
+
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
 
@@ -3913,6 +3945,41 @@ class TPUModelRunner(GPUModelRunner):
                 self.spec_bonus_and_target_logits(logits,
                                                   md.bonus_logits_indices,
                                                   md.target_logits_indices))
+            return self.rejection_sampler(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.
+                num_speculative_tokens,
+            )
+        elif md.req_seeds is not None and grammar_output is None:
+            # Gumbel-coupled probabilistic dspark: verification
+            # re-derives the drafter's keyed noise, so no
+            # generator draws and no separate bonus sampling.
+            bonus_logits, target_logits = (
+                self.spec_gather_bonus_and_target_logits(
+                    logits, md.bonus_logits_indices, md.target_logits_indices))
+            req_temperatures, _, _ = (self._build_padded_sampling_params(
+                cur_start_idx, cur_end_idx, bonus_logits))
+            return self.rejection_sampler.coupled_forward(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_logits=target_logits,
+                bonus_logits=bonus_logits,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.
+                num_speculative_tokens,
+                req_temperatures=req_temperatures.view(-1),
+                req_seeds=md.req_seeds,
+                key_positions=md.key_positions,
+                bonus_key_positions=md.bonus_key_positions,
+                draft_logits_cache=self.drafter.draft_logits_cache,
+                cache_rows=md.cache_rows,
+            )
         else:
             bonus_logits, target_logits = (
                 self.spec_gather_bonus_and_target_logits(
@@ -3939,7 +4006,24 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_k,
                     req_top_p,
                     all_greedy=False).view(-1)
-        if all_greedy:
+            if all_greedy:
+                return self.rejection_sampler(
+                    draft_token_ids=md.draft_token_ids,
+                    num_draft_tokens=md.draft_lengths,
+                    target_logits=target_logits,
+                    bonus_token_ids=bonus_token_ids,
+                    segment_ids=md.segment_ids,
+                    group_indices=md.group_indices,
+                    max_draft_tokens=self.speculative_config.
+                    num_speculative_tokens,
+                )
+            accept_u = torch.rand(md.draft_token_ids.shape,
+                                  dtype=torch.float32,
+                                  device=target_logits.device,
+                                  generator=sampling_generator)
+            recover_u = torch.rand_like(target_logits,
+                                        dtype=torch.float32,
+                                        generator=sampling_generator)
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
@@ -3949,29 +4033,13 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.
                 num_speculative_tokens,
+                temperatures=req_temperatures[md.segment_ids],
+                top_k=req_top_k[md.segment_ids],
+                top_p=req_top_p[md.segment_ids],
+                accept_u=accept_u,
+                recover_u=recover_u,
+                do_sampling=True,
             )
-        accept_u = torch.rand(md.draft_token_ids.shape,
-                              dtype=torch.float32,
-                              device=target_logits.device,
-                              generator=sampling_generator)
-        recover_u = torch.rand_like(target_logits,
-                                    dtype=torch.float32,
-                                    generator=sampling_generator)
-        return self.rejection_sampler(
-            draft_token_ids=md.draft_token_ids,
-            num_draft_tokens=md.draft_lengths,
-            target_logits=target_logits,
-            bonus_token_ids=bonus_token_ids,
-            segment_ids=md.segment_ids,
-            group_indices=md.group_indices,
-            max_draft_tokens=self.speculative_config.num_speculative_tokens,
-            temperatures=req_temperatures[md.segment_ids],
-            top_k=req_top_k[md.segment_ids],
-            top_p=req_top_p[md.segment_ids],
-            accept_u=accept_u,
-            recover_u=recover_u,
-            do_sampling=True,
-        )
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -4840,7 +4908,9 @@ class TPUModelRunner(GPUModelRunner):
         reachable and must be pre-compiled here; the greedy + structured-output
         combination reuses graphs warmed by these two passes.
         """
-        if not (self._is_async_drafter):
+        drafter_coupled = getattr(getattr(self, "drafter", None),
+                                  "draft_sample_probabilistic", False)
+        if not (self._is_async_drafter or drafter_coupled):
             return
         k = self.speculative_config.num_speculative_tokens
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
@@ -4895,42 +4965,85 @@ class TPUModelRunner(GPUModelRunner):
                         max_draft_tokens=k,
                     )
                     synchronize_tensors(out)
-                    # --- non-greedy verify path (do_sampling=True) ---
-                    _, target_logits_ng = (
-                        self.spec_gather_bonus_and_target_logits(
-                            dummy_logits, bonus_logits_indices,
-                            target_logits_indices))
-                    warm_temps = torch.zeros((num_tokens, 1),
-                                             dtype=self._hidden_states_dtype,
-                                             device=self.device)
-                    warm_top_k = torch.zeros((num_tokens, 1),
-                                             dtype=torch.int32,
-                                             device=self.device)
-                    warm_top_p = torch.ones((num_tokens, 1),
-                                            dtype=torch.float32,
-                                            device=self.device)
-                    warm_accept_u = torch.zeros(num_tokens,
+                    if self._is_async_drafter:
+                        # --- non-greedy verify path (do_sampling=True) ---
+                        _, target_logits_ng = (
+                            self.spec_gather_bonus_and_target_logits(
+                                dummy_logits, bonus_logits_indices,
+                                target_logits_indices))
+                        warm_temps = torch.zeros(
+                            (num_tokens, 1),
+                            dtype=self._hidden_states_dtype,
+                            device=self.device)
+                        warm_top_k = torch.zeros((num_tokens, 1),
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+                        warm_top_p = torch.ones((num_tokens, 1),
                                                 dtype=torch.float32,
                                                 device=self.device)
-                    warm_recover_u = torch.zeros((num_tokens, self.vocab_size),
-                                                 dtype=torch.float32,
+                        warm_accept_u = torch.zeros(num_tokens,
+                                                    dtype=torch.float32,
+                                                    device=self.device)
+                        warm_recover_u = torch.zeros(
+                            (num_tokens, self.vocab_size),
+                            dtype=torch.float32,
+                            device=self.device)
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                        )
+                        synchronize_tensors(out)
+                    if drafter_coupled:
+                        # --- Gumbel-coupled verify path (probabilistic
+                        # dspark, sync) --- shapes/dtypes mirror
+                        # _coupled_sampling_extras + sample_tokens.
+                        bonus_logits_c, target_logits_c = (
+                            self.spec_gather_bonus_and_target_logits(
+                                dummy_logits, bonus_logits_indices,
+                                target_logits_indices))
+                        warm_req_temps = torch.zeros(
+                            (num_reqs, 1),
+                            dtype=self._hidden_states_dtype,
+                            device=self.device).view(-1)
+                        warm_seeds = torch.zeros(num_reqs,
+                                                 dtype=torch.int64,
                                                  device=self.device)
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_ng,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        temperatures=warm_temps,
-                        top_k=warm_top_k,
-                        top_p=warm_top_p,
-                        accept_u=warm_accept_u,
-                        recover_u=warm_recover_u,
-                        do_sampling=True,
-                    )
-                    synchronize_tensors(out)
+                        warm_key_pos = torch.zeros(num_tokens,
+                                                   dtype=torch.int32,
+                                                   device=self.device)
+                        warm_bonus_key = torch.zeros(num_reqs,
+                                                     dtype=torch.int32,
+                                                     device=self.device)
+                        warm_cache_rows = torch.zeros(num_reqs,
+                                                      dtype=torch.int64,
+                                                      device=self.device)
+                        out = self.rejection_sampler.coupled_forward(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_c,
+                            bonus_logits=bonus_logits_c,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            req_temperatures=warm_req_temps,
+                            req_seeds=warm_seeds,
+                            key_positions=warm_key_pos,
+                            bonus_key_positions=warm_bonus_key,
+                            draft_logits_cache=self.drafter.draft_logits_cache,
+                            cache_rows=warm_cache_rows,
+                        )
+                        synchronize_tensors(out)
                     logger.info("  -- padded_logits_length: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):

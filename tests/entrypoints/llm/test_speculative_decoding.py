@@ -712,6 +712,46 @@ def test_dspark_performance_greedy(
 
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
+    "max_num_seqs, min_acceptance_rate",
+    [pytest.param(1, 0.10, id="bs1"),
+     pytest.param(4, 0.10, id="bs4")])
+def test_dspark_performance_probabilistic(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_seqs: int,
+    min_acceptance_rate: float,
+):
+    """Gumbel-coupled probabilistic drafting keeps a useful acceptance rate.
+
+    temperature > 0 routes the drafter through the keyed-Gumbel proposal
+    path and verification through the coupled Leviathan test against the
+    cached draft logits. The floor is a collapse guard: a broken coupling
+    (mismatched noise keys, wrong cache rows, bad d2t scatter) collapses
+    acceptance to near zero because accepted tokens then require the
+    independent ratio test to pass by luck. Sync-only: probabilistic +
+    async scheduling is rejected at init (see DSparkProposer).
+    """
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        _make_sampling_config(temperature=1.0),
+        {
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
+            "draft_tensor_parallel_size": 1,
+            "draft_sample_method": "probabilistic",
+        },
+        min_acceptance_rate=min_acceptance_rate,
+        max_num_seqs=max_num_seqs,
+        model_name="Qwen/Qwen3-4B",
+        async_scheduling=False,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
     "async_scheduling",
     [pytest.param(False, id="sync"),
      pytest.param(True, id="async")])

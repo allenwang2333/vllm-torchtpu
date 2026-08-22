@@ -37,6 +37,18 @@ class SpecDecodeMetadata:
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
 
+    # --- Gumbel-coupled (probabilistic dspark) extras; None otherwise. ---
+    # [padded_logits_length] Gumbel key: sequence position of each draft
+    # row's predecessor token (the drafter keyed its noise identically).
+    key_positions: torch.Tensor | None = None
+    # [padded_num_reqs] Gumbel key for each request's bonus sample.
+    bonus_key_positions: torch.Tensor | None = None
+    # [padded_num_reqs] per-request coupled-sampling seed.
+    req_seeds: torch.Tensor | None = None
+    # [padded_num_reqs] row of the drafter's draft_logits_cache holding each
+    # request's cached proposal logits (trash row when absent).
+    cache_rows: torch.Tensor | None = None
+
 
 class SpeculativeDecodingManager:
     """Manages speculative decoding operations, including draft proposal and metadata generation."""
@@ -52,9 +64,10 @@ class SpeculativeDecodingManager:
         # step at steady state. Only draft_token_ids carries per-step values.
         self._meta_cache_key: Optional[tuple] = None
         self._meta_cache: Optional[SpecDecodeMetadata] = None
-        # (logits_indices, target_logits_indices, padded_logits_length) from
-        # the cached build — needed to re-extract draft_token_ids on a hit.
-        self._meta_cache_np: Optional[tuple[np.ndarray, np.ndarray,
+        # (logits_indices, target_logits_indices, bonus_logits_indices,
+        # padded_logits_length) from the cached build — needed to re-extract
+        # draft_token_ids and the coupled-sampling extras on a hit.
+        self._meta_cache_np: Optional[tuple[np.ndarray, np.ndarray, np.ndarray,
                                             int]] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
@@ -152,11 +165,60 @@ class SpeculativeDecodingManager:
                 "Speculative decoding method "
                 f"'{self.runner.speculative_config.method}' is not supported.")
 
+    def _coupled_sampling_extras(
+        self,
+        req_ids: list[str] | None,
+        logits_indices: np.ndarray,
+        target_logits_indices: np.ndarray,
+        bonus_logits_indices: np.ndarray,
+        padded_logits_length: int,
+        padded_num_reqs: int,
+    ) -> dict:
+        """Per-step tensors for Gumbel-coupled (probabilistic dspark) verify.
+
+        Rebuilt on every call -- positions and drafter cache rows change each
+        step even when the index cache hits.
+        """
+        drafter = getattr(self.runner, "drafter", None)
+        if (req_ids is None
+                or not getattr(drafter, "draft_sample_probabilistic", False)
+                or drafter.draft_logits_cache is None):
+            return {}
+
+        positions_np = self.runner.positions_np
+        trash_row = drafter.draft_logits_cache.shape[0] - 1
+        num_reqs = len(req_ids)
+
+        key_pos = np.zeros(padded_logits_length, dtype=np.int32)
+        key_pos[:target_logits_indices.shape[0]] = positions_np[
+            logits_indices[target_logits_indices]]
+
+        bonus_key = np.zeros(padded_num_reqs, dtype=np.int32)
+        bonus_key[:num_reqs] = positions_np[logits_indices[
+            bonus_logits_indices[:num_reqs]]]
+
+        seeds = np.zeros(padded_num_reqs, dtype=np.int64)
+        rows = np.full(padded_num_reqs, trash_row, dtype=np.int64)
+        for r, req_id in enumerate(req_ids):
+            seeds[r] = self.runner.get_spec_seed(req_id)
+            rows[r] = drafter.draft_cache_rows.get(req_id, trash_row)
+
+        device = self.runner.device
+        return dict(
+            key_positions=torch.from_numpy(key_pos).to(device,
+                                                       non_blocking=True),
+            bonus_key_positions=torch.from_numpy(bonus_key).to(
+                device, non_blocking=True),
+            req_seeds=torch.from_numpy(seeds).to(device, non_blocking=True),
+            cache_rows=torch.from_numpy(rows).to(device, non_blocking=True),
+        )
+
     def get_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        req_ids: list[str] | None = None,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and rejection sampling.
 
@@ -174,8 +236,8 @@ class SpeculativeDecodingManager:
         if cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
-            logits_indices, target_logits_indices, padded_logits_length = (
-                self._meta_cache_np)
+            (logits_indices, target_logits_indices, bonus_logits_indices,
+             padded_logits_length) = self._meta_cache_np
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
@@ -194,6 +256,11 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                **self._coupled_sampling_extras(req_ids, logits_indices,
+                                                target_logits_indices,
+                                                bonus_logits_indices,
+                                                padded_logits_length,
+                                                padded_num_reqs),
             )
 
         # [num_reqs]
@@ -296,6 +363,11 @@ class SpeculativeDecodingManager:
                 device, non_blocking=True),
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True),
+            **self._coupled_sampling_extras(req_ids, logits_indices,
+                                            target_logits_indices,
+                                            bonus_logits_indices,
+                                            padded_logits_length,
+                                            padded_num_reqs),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
@@ -303,5 +375,5 @@ class SpeculativeDecodingManager:
         self._meta_cache_key = cache_key
         self._meta_cache = metadata
         self._meta_cache_np = (logits_indices, target_logits_indices,
-                               padded_logits_length)
+                               bonus_logits_indices, padded_logits_length)
         return metadata

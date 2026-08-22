@@ -15,6 +15,8 @@
 
 import torch
 
+from vllm_torchtpu.layers.vllm.sample.keyed_gumbel import (keyed_gumbel_noise,
+                                                           keyed_uniform)
 from vllm_torchtpu.layers.vllm.sample.top_k_top_p import apply_top_k_top_p
 
 # Placeholder token ID for rejected tokens
@@ -62,6 +64,43 @@ class RejectionSampler:
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=do_sampling,
+        )
+
+    def coupled_forward(
+        self,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        target_logits: torch.Tensor,
+        bonus_logits: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        req_temperatures: torch.Tensor,
+        req_seeds: torch.Tensor,
+        key_positions: torch.Tensor,
+        bonus_key_positions: torch.Tensor,
+        draft_logits_cache: torch.Tensor,
+        cache_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gumbel-coupled verification for probabilistic DSpark drafting.
+
+        Unlike forward(), takes raw bonus-row logits (the bonus token is
+        sampled in-graph with keyed noise) and needs no external uniforms.
+        """
+        return _coupled_rejection_sample_with_segment(
+            draft_token_ids,
+            target_logits,
+            num_draft_tokens,
+            bonus_logits,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            req_temperatures,
+            req_seeds,
+            key_positions,
+            bonus_key_positions,
+            draft_logits_cache,
+            cache_rows,
         )
 
     def forward(
@@ -263,6 +302,159 @@ def _greedy_rejection_sample_with_segment(
     bonus_token_at_accepted_count = torch.where(
         should_get_bonus,
         bonus_token_ids.to(torch.int32),
+        selected_tokens[batch_range, accepted_count],
+    )
+    selected_tokens[batch_range,
+                    accepted_count] = bonus_token_at_accepted_count
+
+    return selected_tokens
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _coupled_rejection_sample_with_segment(
+    draft_token_ids: torch.Tensor,
+    target_logits: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_logits: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    req_temperatures: torch.Tensor,
+    req_seeds: torch.Tensor,
+    key_positions: torch.Tensor,
+    bonus_key_positions: torch.Tensor,
+    draft_logits_cache: torch.Tensor,
+    cache_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Gumbel-coupled Leviathan verification against cached draft logits.
+
+    Ports upstream rejection_sampler_utils semantics: per-row uniforms and
+    Gumbel vectors are deterministic functions of (request seed, predecessor
+    position) -- the same keys the DSpark drafter sampled with -- so draft
+    q(x) is recomputed from the cached pre-temperature proposal logits and
+    the accept test is `log p(x) > log u + log q(x)`. On the first rejection
+    the token resamples from the residual max(0, p - q); on full acceptance
+    the bonus token samples from the target's bonus-row logits. Rows with
+    temperature 0 verify greedily (argmax equality). Top-k/top-p are
+    deliberately not applied -- the coupling is defined on the plain
+    temperature-scaled distributions, matching upstream.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+    vocab_size = target_logits.shape[-1]
+
+    draft_ids = draft_token_ids.to(torch.int64)
+    row_seeds = req_seeds[segment_ids]
+    row_temps = req_temperatures[segment_ids]
+    is_greedy_row = row_temps == 0.0
+    safe_temp = torch.where(is_greedy_row, torch.ones_like(row_temps),
+                            row_temps).unsqueeze(-1)
+
+    target_logp = torch.log_softmax(target_logits.to(torch.float32) /
+                                    safe_temp,
+                                    dim=-1)
+    cached = draft_logits_cache[
+        cache_rows[segment_ids].clamp(min=0),
+        group_indices.to(torch.int64).clamp(min=0, max=max_draft_tokens - 1)]
+    draft_logp = torch.log_softmax(cached.to(torch.float32) / safe_temp,
+                                   dim=-1)
+
+    tp = target_logp.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
+    dp = draft_logp.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
+    u = keyed_uniform(row_seeds, key_positions)
+    accepted_random = tp > torch.log(u) + dp
+
+    target_argmax = target_logits.argmax(dim=-1)
+    accepted = torch.where(is_greedy_row, draft_ids == target_argmax,
+                           accepted_random)
+
+    # Residual resample for the first rejected slot, computed for every row
+    # and selected below (branch-free): r(x) = max(p(x) - q(x), 0), sampled
+    # by Gumbel-argmax with the same (seed, position) key the drafter used.
+    ratio = torch.exp(draft_logp - target_logp)
+    residual_logp = torch.where(
+        ratio < 1.0,
+        target_logp + torch.log1p(-torch.clamp(ratio, max=1.0 - 1e-7)),
+        torch.tensor(float("-inf"), dtype=torch.float32, device=device),
+    )
+    gumbel = keyed_gumbel_noise(row_seeds, key_positions, vocab_size)
+    recovered_random = (residual_logp + gumbel).argmax(dim=-1)
+    recovered_token_ids = torch.where(is_greedy_row, target_argmax,
+                                      recovered_random).to(torch.int32)
+
+    # First rejection per segment (same mask-min trick as the other paths).
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    match_mask = segment_ids.unsqueeze(0) == batch_indices
+    large_value = total_tokens
+
+    rejection_indices = torch.where(
+        accepted,
+        torch.tensor(large_value, dtype=torch.int32, device=device),
+        group_indices,
+    )
+    masked_rejection_indices = torch.where(
+        match_mask,
+        rejection_indices.unsqueeze(0),
+        torch.tensor(large_value, dtype=torch.int32, device=device),
+    )
+    first_rejection_idx_per_segment = torch.min(masked_rejection_indices,
+                                                dim=1).values
+
+    first_rejection_idx_broadcast = first_rejection_idx_per_segment[
+        segment_ids]
+    before_rejection = group_indices < first_rejection_idx_broadcast
+    at_rejection = group_indices == first_rejection_idx_broadcast
+    main_tokens = torch.where(
+        before_rejection,
+        draft_ids.to(torch.int32),
+        torch.where(
+            at_rejection,
+            recovered_token_ids,
+            torch.tensor(PLACEHOLDER_TOKEN_ID,
+                         dtype=torch.int32,
+                         device=device),
+        ),
+    )
+
+    # Bonus sample (all drafts accepted): Gumbel-argmax over the bonus row,
+    # keyed at the bonus position; greedy rows take the plain argmax.
+    bonus_greedy = req_temperatures == 0.0
+    bonus_safe_temp = torch.where(bonus_greedy,
+                                  torch.ones_like(req_temperatures),
+                                  req_temperatures).unsqueeze(-1)
+    bonus_gumbel = keyed_gumbel_noise(req_seeds, bonus_key_positions,
+                                      vocab_size)
+    bonus_noisy = (bonus_logits.to(torch.float32) /
+                   bonus_safe_temp) + torch.where(
+                       bonus_greedy.unsqueeze(-1),
+                       torch.zeros_like(bonus_gumbel), bonus_gumbel)
+    bonus_token_ids = bonus_noisy.argmax(dim=-1).to(torch.int32)
+
+    all_accepted = first_rejection_idx_per_segment == large_value
+    no_draft_tokens = num_draft_tokens == 0
+    should_get_bonus = all_accepted | no_draft_tokens
+
+    selected_tokens = torch.full(
+        (batch_size, max_draft_tokens + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    segment_ids = segment_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+    selected_tokens[segment_ids, group_indices] = main_tokens
+
+    accepted_count = torch.where(
+        all_accepted,
+        num_draft_tokens,
+        first_rejection_idx_per_segment,
+    ).to(torch.int64)
+
+    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+    bonus_token_at_accepted_count = torch.where(
+        should_get_bonus,
+        bonus_token_ids,
         selected_tokens[batch_range, accepted_count],
     )
     selected_tokens[batch_range,
