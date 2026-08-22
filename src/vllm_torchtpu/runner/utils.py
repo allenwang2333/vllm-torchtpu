@@ -334,46 +334,9 @@ class PhaseBasedProfiler:
 
             self.inference_phase_seen[phase] = True
             self.profiling_n_steps_left = self.num_steps_to_profile_for
-            self.current_phase = phase.name.lower()
-
-            logger.info(f"Starting profiling for {self.current_phase} phase")
-            logger.info(f"Batch composition stats: {batch_composition_stats}")
-            phase_dir = os.path.join(self.profile_dir, self.current_phase)
-            os.makedirs(phase_dir, exist_ok=True)
-
-            self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
-            self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
-                phase_dir, self.worker_rank)
-            os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
-
-            self._write_batch_composition_stats_to_file_helper(
-                batch_composition_stats)
-
-            # Start PyTorch/XLA profiler
-            handler = torch.profiler.tensorboard_trace_handler(
-                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True)
-
-            config = TpuProfilerConfig(
-                run_dir=self.profile_dir_with_phase_suffix,
-                host_tracer_level=self.standard_opts["host_tracer_level"],
-                device_tracer_level=self.standard_opts["device_tracer_level"],
-                python_tracer_level=self.standard_opts["python_tracer_level"],
-                experimental_options=self.advanced_opts,
-            )
-            self.profile_context = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.PrivateUse1,
-                ],
-                on_trace_ready=handler,
-                experimental_config=config,
-            )
-            try:
-                self.profile_context.__enter__()
-            except Exception as e:
-                logger.error("Failed to start PyTorch profiler: %s", e)
-                self.profile_context = None
-                self.current_phase = ""
+            if not self._start_capture(phase.name.lower(),
+                                       batch_composition_stats):
+                self.inference_phase_seen[phase] = False
                 self.profiling_n_steps_left = 0
             break
 
