@@ -654,11 +654,13 @@ def test_prepare_routed_metadata_skip_padded_tokens():
 # padding, and below it; no sentinel here, so the totals pin the padding too.
 @pytest.mark.parametrize("num_rows",
                          [1, 51, 511, 512, 513, 640, 800, 1024, 1025, 1280])
-def test_counting_sort_positions_matches_stable_argsort(num_rows):
+# Concentrated keys drive the within-block rank past 2**8: the fp32 pin.
+@pytest.mark.parametrize("spread", [True, False])
+def test_counting_sort_positions_matches_stable_argsort(num_rows, spread):
     num_buckets = 9
-    keys = np.random.default_rng(num_rows).integers(0,
-                                                    num_buckets,
-                                                    size=num_rows)
+    rng = np.random.default_rng(num_rows)
+    keys = (rng.integers(0, num_buckets, size=num_rows)
+            if spread else np.zeros(num_rows, dtype=np.int64))
     pos, counts = fused_moe_gmm._counting_sort_positions(
         jnp.asarray(keys, jnp.int32), num_buckets)
     want = np.argsort(np.argsort(keys, kind="stable"), kind="stable")
