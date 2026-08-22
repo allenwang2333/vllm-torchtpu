@@ -72,6 +72,27 @@ def test_pallas_mla_attention_backend_custom_kv_packing():
         assert page_size_128 == 81920
 
 
+def test_pallas_mla_attention_backend_transposed_kv_cache():
+    with patch.dict("os.environ", {"MLA_TRANSPOSE_KV_CACHE": "1"}):
+        shape_fp8_transpose = PallasMLAttentionBackend.get_kv_cache_shape(
+            num_blocks=10,
+            block_size=128,
+            num_kv_heads=1,
+            head_size=576,
+            cache_dtype_str="fp8",
+        )
+        assert shape_fp8_transpose == (10, 576, 128)
+
+        page_size_128 = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size=128, num_kv_heads=1, head_size=576, cache_dtype_str="fp8")
+        assert page_size_128 == 576 * 128
+
+        assert PallasMLAttentionBackend.get_kv_cache_stride_order(
+            include_num_layers_dimension=False) == (0, 1, 2)
+        assert PallasMLAttentionBackend.get_kv_cache_stride_order(
+            include_num_layers_dimension=True) == (1, 0, 2, 3)
+
+
 def test_pallas_mla_attention_backend_fp8_ds_mla():
     """Verify DeepSeek-V4 packed MLA KV-cache format shape computation."""
     assert "fp8_ds_mla" in PallasMLAttentionBackend.supported_kv_cache_dtypes
