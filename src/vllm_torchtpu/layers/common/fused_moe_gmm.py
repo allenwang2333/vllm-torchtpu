@@ -179,8 +179,9 @@ def gmm_wrapper(lhs,
     )
 
 
-# 512 is the best worst case and median over 16..160 buckets and M 2560..81920;
-# halve from there to the largest power of two that divides m.
+# Rank matmul is m*block*num_buckets MACs, so above 512 cost grows with no
+# return; below 256 it nearly doubles at production num_buckets. Smaller steps
+# exist to avoid padding when 512 does not divide m (0.55x at m=640).
 _COUNTING_SORT_BLOCKS = (512, 256, 128)
 
 
@@ -189,11 +190,11 @@ def _counting_sort_positions(sort_keys: jax.Array,
     """Stable counting sort: row -> its position, plus the bucket totals.
     Keys must be in ``[0, num_buckets)`` or the result is not a permutation."""
     m = sort_keys.shape[0]
-    # Largest ladder step dividing m; a non-power-of-two divisor costs more
-    # than the padding it saves (480 at m=41280).
-    cap = min(_COUNTING_SORT_BLOCKS[0], m)
-    divisors = [s for s in _COUNTING_SORT_BLOCKS if s <= cap and m % s == 0]
-    block = max(divisors, default=cap)
+    block = min(_COUNTING_SORT_BLOCKS[0], m)
+    for size in _COUNTING_SORT_BLOCKS:
+        if size <= block and m % size == 0:
+            block = size
+            break
     pad = -m % block
     sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
     onehot = jax.nn.one_hot(sort_keys.reshape(-1, block),
@@ -211,7 +212,7 @@ def _counting_sort_positions(sort_keys: jax.Array,
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
     # Pad rows sort after every real one, so only that bucket's total is off.
     # pad is static; this measures 1.08-1.32x faster than .at[-1].add(-pad).
-    counts = counts - jnp.where(
+    counts -= jnp.where(
         jnp.arange(num_buckets) == num_buckets - 1, float(pad), 0.0)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
