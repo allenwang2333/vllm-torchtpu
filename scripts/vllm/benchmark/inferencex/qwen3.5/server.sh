@@ -52,10 +52,11 @@ case "$SHARDING" in
       --data-parallel-size=8
       --enable-expert-parallel
     )
-    # Disable the locally ported coordinated scheduler for this reproduction.
-    export DP_SCHED_ENABLED=0
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
-    export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
+    # Defaults preserve the reproduction path. Experiments can opt into the
+    # coordinated scheduler without editing this launcher.
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-0}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-0}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-1.0}"
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     # Pick the MoE path per compiled token bucket: fused EP for prefill, vLLM's
     # own dispatch onto the fused GMM for decode, which is the cheaper of the
@@ -108,10 +109,10 @@ case "$SHARDING" in
       --data-parallel-size=4
       --enable-expert-parallel
     )
-    # Keep the coordinated DP scheduler disabled for reproduction runs.
-    export DP_SCHED_ENABLED=0
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
-    export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
+    # Keep the coordinated DP scheduler disabled by default for reproductions.
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-0}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-0}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-1.0}"
     # The fused EP kernel also refuses the TP2 component of this sharding.
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
     ;;

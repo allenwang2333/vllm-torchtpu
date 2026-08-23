@@ -493,6 +493,7 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
+        stats_step_id = runner._begin_dp_batch_stats_step()
         bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
@@ -502,10 +503,13 @@ class TPUWorker(WorkerBase):
                               runner.num_reqs_max_model_len,
                               runner.max_num_blocks_per_req,
                               use_max_model_len=True)
+            runner._stage_dummy_dp_batch_stats(stats_step_id, dummy_tokens, 1)
             return
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)
+        runner._stage_dummy_dp_batch_stats(stats_step_id, bucket,
+                                           target_num_chunks)
 
     def profile(self,
                 is_start: bool = True,

@@ -1,9 +1,11 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 
-from vllm_torchtpu.core.tpu_scheduler import TpuDpScheduler
+from vllm_torchtpu.core.tpu_scheduler import (TpuBatchStatsScheduler,
+                                              TpuDpScheduler)
 
 
 def _make_scheduler(waiting=(), drain_prefill=False):
@@ -85,3 +87,23 @@ def test_pause_state_restored_when_schedule_raises():
             pass
 
     assert scheduler._pause_state is PauseState.UNPAUSED
+
+
+def test_batch_stats_scheduler_preserves_upstream_decision(monkeypatch):
+    monkeypatch.setenv("TPU_DP_BATCH_STATS_DIR", "/tmp/stats")
+    scheduler = TpuBatchStatsScheduler.__new__(TpuBatchStatsScheduler)
+    scheduler.requests = {
+        "prefill":
+        SimpleNamespace(num_prompt_tokens=8192, num_computed_tokens=256),
+        "decode":
+        SimpleNamespace(num_prompt_tokens=8192, num_computed_tokens=9000),
+    }
+    expected = SimpleNamespace()
+
+    with patch.object(AsyncScheduler, "schedule",
+                      return_value=expected) as schedule:
+        result = scheduler.schedule(throttle_prefills=True)
+
+    assert result is expected
+    schedule.assert_called_once_with(throttle_prefills=True)
+    assert result._tpu_queued_prefill_tokens == 8192 - 256

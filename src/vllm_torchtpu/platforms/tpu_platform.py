@@ -1143,6 +1143,20 @@ class TpuPlatform(Platform):
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size)
+        elif (envs.TPU_DP_BATCH_STATS_DIR
+              and parallel_config.data_parallel_size > 1):
+            stats_sched_cls = (
+                "vllm_torchtpu.core.tpu_scheduler.TpuBatchStatsScheduler")
+            if scheduler_config.scheduler_cls != stats_sched_cls:
+                assert scheduler_config.scheduler_cls is None, (
+                    "TPU_DP_BATCH_STATS_DIR cannot be combined with a custom "
+                    "scheduler class when DP_SCHED_ENABLED=0.")
+                scheduler_config.scheduler_cls = stats_sched_cls
+                logger.info(
+                    "Enabled behavior-identical DP batch-stats scheduler for "
+                    "DP=%d; output_dir=%s.",
+                    parallel_config.data_parallel_size,
+                    envs.TPU_DP_BATCH_STATS_DIR)
         _refuse_kv_head_dim_fold(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config

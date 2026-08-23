@@ -18,11 +18,37 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.core.dp_prefill_coordinator import \
     get_prefill_cohort_settings
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _queued_prefill_tokens(scheduler) -> int:
+    """Return prompt work remaining after the current scheduling decision."""
+    return sum(
+        max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+        for request in scheduler.requests.values())
+
+
+def _attach_batch_stats(scheduler, output: SchedulerOutput) -> SchedulerOutput:
+    if envs.TPU_DP_BATCH_STATS_DIR:
+        # SchedulerOutput is an unslotted dataclass and the executor transports
+        # it with pickle, so this diagnostics-only attribute reaches the worker
+        # without changing upstream's wire schema.
+        output._tpu_queued_prefill_tokens = _queued_prefill_tokens(  # type: ignore[attr-defined]
+            scheduler)
+    return output
+
+
+class TpuBatchStatsScheduler(AsyncScheduler):
+    """Behavior-identical AsyncScheduler that only annotates its output."""
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        return _attach_batch_stats(
+            self, super().schedule(throttle_prefills=throttle_prefills))
 
 
 class TpuDpScheduler(AsyncScheduler):
@@ -62,17 +88,20 @@ class TpuDpScheduler(AsyncScheduler):
             # Local monotonic eligibility tracking never initiates a
             # collective; the cohort state advances only at engine-core sync.
             self._tpu_refresh_prefill_eligibility()
-            return self._schedule_prefill_cohort()
-
-        if not throttle_prefills:
-            # Open window for draining accumulated prefills.
-            self._drain_prefill = True
-        if self._drain_prefill and not (self.waiting or self.skipped_waiting):
-            # In drain mode until all accumulated prefills are scheduled.
-            self._drain_prefill = False
-        if self._drain_prefill:
-            return super().schedule(False)
-        return self._schedule_paused_new()
+            output = self._schedule_prefill_cohort()
+        else:
+            if not throttle_prefills:
+                # Open window for draining accumulated prefills.
+                self._drain_prefill = True
+            if self._drain_prefill and not (self.waiting
+                                            or self.skipped_waiting):
+                # In drain mode until all accumulated prefills are scheduled.
+                self._drain_prefill = False
+            if self._drain_prefill:
+                output = super().schedule(False)
+            else:
+                output = self._schedule_paused_new()
+        return _attach_batch_stats(self, output)
 
     @staticmethod
     def _tpu_is_unadmitted_prefill(request) -> bool:

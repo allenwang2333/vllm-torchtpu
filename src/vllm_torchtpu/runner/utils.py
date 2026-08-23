@@ -89,6 +89,7 @@ def get_batch_composition_stats(
     """Logs batch composition stats and returns them as a dict."""
     num_prefill_tokens = 0
     num_decode_tokens = 0
+    active_decode_requests = 0
 
     # Get the number of scheduled tokens for each request.
     num_scheduled_tokens_per_req_list = []
@@ -123,18 +124,21 @@ def get_batch_composition_stats(
                 # Verifying draft tokens for an ongoing request — count the
                 # target token plus the draft tokens as decode.
                 num_decode_tokens += num_scheduled_for_req
+                active_decode_requests += 1
             elif num_scheduled_for_req > 1:
                 # It's a multi-token request, so it's chunked prefill
                 num_prefill_tokens += num_scheduled_for_req
             else:
                 # It's a single token for an ongoing request, so it's decode
                 num_decode_tokens += 1
+                active_decode_requests += 1
 
     stats = {
         "batch_id": batch_id,
         "total_num_scheduled_tokens": total_num_scheduled_tokens,
         "num_prefill_tokens": num_prefill_tokens,
         "num_decode_tokens": num_decode_tokens,
+        "active_decode_requests": active_decode_requests,
         "padded_total_num_scheduled_tokens": padded_total_num_scheduled_tokens,
         "num_reqs": num_reqs,
         "min_kv_len": min_kv_len if min_kv_len != float("inf") else 0,

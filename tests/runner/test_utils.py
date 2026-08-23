@@ -1,12 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 from unittest.mock import MagicMock, mock_open, patch
 
+import numpy as np
 import pytest
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
-    PhaseBasedProfiler, determine_phase_from_batch_composition_stats)
+    PhaseBasedProfiler, determine_phase_from_batch_composition_stats,
+    get_batch_composition_stats)
+
+
+def test_batch_composition_counts_active_decode_requests():
+    input_batch = MagicMock()
+    input_batch.req_ids = ["prefill", "decode", "spec"]
+    input_batch.num_computed_tokens_cpu = np.array([0, 8192, 8192])
+    scheduler_output = MagicMock()
+    scheduler_output.num_scheduled_tokens = {
+        "prefill": 256,
+        "decode": 1,
+        "spec": 5,
+    }
+    scheduler_output.scheduled_spec_decode_tokens = {
+        "spec": [1, 2, 3, 4],
+    }
+
+    stats = get_batch_composition_stats(
+        batch_id=1,
+        input_batch=input_batch,
+        total_num_scheduled_tokens=262,
+        num_reqs=3,
+        padded_total_num_scheduled_tokens=512,
+        scheduler_output=scheduler_output,
+    )
+
+    assert stats["num_prefill_tokens"] == 256
+    assert stats["num_decode_tokens"] == 6
+    assert stats["active_decode_requests"] == 2
 
 
 @pytest.fixture

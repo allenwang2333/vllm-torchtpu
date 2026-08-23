@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     TPU_DP_PREFILL_FLUSH_TIMEOUT_MS: int = 0
     TPU_DP_PREFILL_QUORUM_FRACTION: float = 1.0
     TPU_DP_PREFILL_STATS: bool = False
+    TPU_DP_BATCH_STATS_DIR: str = ""
 
 
 def env_with_choices(
@@ -325,6 +326,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # widens the per-sync state exchange by two columns; off by default.
     "TPU_DP_PREFILL_STATS":
     env_bool("TPU_DP_PREFILL_STATS", default=False),
+    # Full-run, all-rank batch-composition JSONL. This is diagnostics-only:
+    # unlike TPU_DP_PREFILL_STATS, it is independent of cohort scheduling and
+    # does not add a device collective or synchronization.
+    "TPU_DP_BATCH_STATS_DIR":
+    lambda: os.getenv("TPU_DP_BATCH_STATS_DIR", ""),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

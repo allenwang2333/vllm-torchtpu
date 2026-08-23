@@ -96,6 +96,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.dp_batch_stats import DPBatchStatsLogger
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -686,11 +687,71 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+        self.dp_batch_stats_logger: DPBatchStatsLogger | None = None
+        self._init_dp_batch_stats()
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
 
         self._init_phased_profiling()
+
+    def _init_dp_batch_stats(self) -> None:
+        output_dir = envs.TPU_DP_BATCH_STATS_DIR
+        if not output_dir:
+            return
+        # TP peers see identical batch composition. Keep one writer per DP
+        # replica, selected using the slice-global rank modulo the per-engine
+        # TP/PP world size.
+        per_engine_world = max(1, int(self.parallel_config.world_size))
+        if self._profiler_rank % per_engine_world != 0:
+            return
+        dp_rank = int(self.parallel_config.data_parallel_rank or 0)
+        self.dp_batch_stats_logger = DPBatchStatsLogger(
+            output_dir=output_dir,
+            rank=dp_rank,
+            worker_rank=self._profiler_rank,
+        )
+        logger.info("DP batch-composition stats enabled on DP rank %d: %s",
+                    dp_rank, self.dp_batch_stats_logger.path)
+
+    def _begin_dp_batch_stats_step(
+        self,
+        *,
+        monotonic_ns: int | None = None,
+        unix_ns: int | None = None,
+    ) -> int | None:
+        if self.dp_batch_stats_logger is None:
+            return None
+        return self.dp_batch_stats_logger.begin_step(
+            monotonic_ns=monotonic_ns, unix_ns=unix_ns)
+
+    def _note_idle_dp_batch_stats(self, scheduler_output: Any) -> None:
+        if self.dp_batch_stats_logger is not None:
+            self.dp_batch_stats_logger.note_idle_scheduler_output(
+                scheduler_output)
+
+    def _stage_dummy_dp_batch_stats(
+        self,
+        step_id: int | None,
+        compiled_bucket: int,
+        num_chunks: int,
+    ) -> None:
+        stats_logger = self.dp_batch_stats_logger
+        if stats_logger is None or step_id is None:
+            return
+        capacity = compiled_bucket * max(1, num_chunks)
+        stats_logger.stage_step({
+            "real_prefill_tokens": 0,
+            "real_decode_tokens": 0,
+            "padded_tokens": capacity,
+            "compiled_bucket": compiled_bucket,
+            "active_decode_requests": 0,
+            "queued_prefill_tokens":
+            stats_logger.take_idle_queued_prefill_tokens(),
+            "step_duration": None,
+            "num_chunks": max(1, num_chunks),
+            "phase": "DUMMY",
+        })
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3186,6 +3247,8 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | None:
+        stats_start_monotonic_ns = time.monotonic_ns()
+        stats_start_unix_ns = time.time_ns()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
@@ -3194,6 +3257,7 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            self._note_idle_dp_batch_stats(scheduler_output)
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -3203,6 +3267,10 @@ class TPUModelRunner(GPUModelRunner):
             # triggered.
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
+        dp_stats_step_id = self._begin_dp_batch_stats_step(
+            monotonic_ns=stats_start_monotonic_ns,
+            unix_ns=stats_start_unix_ns,
+        )
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
@@ -3257,7 +3325,8 @@ class TPUModelRunner(GPUModelRunner):
 
         # Profile only after the DP-wide token bucket is known, so a rank-local
         # decode batch cannot be mislabeled when another DP rank is prefilling.
-        if self.phase_based_profiler:
+        batch_composition_stats = None
+        if self.phase_based_profiler or dp_stats_step_id is not None:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
                 self.num_tokens_paddings,
@@ -3276,7 +3345,34 @@ class TPUModelRunner(GPUModelRunner):
                     self._dp_target_bucket
                     if self._dp_target_bucket is not None else
                     padded_total_tokens)
+        if self.phase_based_profiler:
+            assert batch_composition_stats is not None
             self.phase_based_profiler.step(batch_composition_stats)
+        if dp_stats_step_id is not None:
+            assert self.dp_batch_stats_logger is not None
+            assert batch_composition_stats is not None
+            compiled_bucket = int(
+                self._dp_target_bucket
+                if self._dp_target_bucket is not None else padded_total_tokens)
+            num_chunks = max(1, target_num_chunks)
+            real_tokens = scheduler_output.total_num_scheduled_tokens
+            self.dp_batch_stats_logger.stage_step({
+                "real_prefill_tokens":
+                batch_composition_stats["num_prefill_tokens"],
+                "real_decode_tokens":
+                batch_composition_stats["num_decode_tokens"],
+                "padded_tokens": max(
+                    0, compiled_bucket * num_chunks - real_tokens),
+                "compiled_bucket": compiled_bucket,
+                "active_decode_requests":
+                batch_composition_stats["active_decode_requests"],
+                "queued_prefill_tokens": int(
+                    getattr(scheduler_output,
+                            "_tpu_queued_prefill_tokens", 0)),
+                "step_duration": None,
+                "num_chunks": num_chunks,
+                "phase": batch_composition_stats["phase"],
+            })
 
         start_index = 0
         chunk_index = 0
@@ -3370,8 +3466,7 @@ class TPUModelRunner(GPUModelRunner):
             trace_kwargs = extract_request_ids_for_tracing(
                 self.input_batch.req_ids, start_index, num_reqs)
 
-            if self.phase_based_profiler and 'batch_composition_stats' in locals(
-            ):
+            if self.phase_based_profiler and batch_composition_stats is not None:
                 stats_map = {
                     "num_prefill_tokens": "num_prefill_tokens",
                     "num_decode_tokens": "num_decode_tokens",
