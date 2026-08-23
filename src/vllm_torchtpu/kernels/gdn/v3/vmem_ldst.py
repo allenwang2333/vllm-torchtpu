@@ -176,6 +176,8 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
         arr = jnp.concat([arr[p][None] for p in region.rows_perm], axis=0)
+    if region.load_dtype is not None:
+        arr = arr.astype(region.load_dtype)
     return arr.reshape(shape)
 
 

@@ -454,8 +454,9 @@ def v3_state_source(
     for these regions, without the external round trip.
 
     The ssm region is at the start of the manager window and viewed as
-    ``ssm_dtype`` with the ``d_v`` lane split; the conv region is
-    ``conv_ntok`` token rows inside a
+    ``ssm_dtype``. FP32 uses the ``d_v`` lane split; BF16 stays at the pool's
+    native lane width until it is numerically widened on load. The conv region
+    is ``conv_ntok`` token rows inside a
     single kernel block, viewed bf16 with the tail rows zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
@@ -486,14 +487,20 @@ def v3_state_source(
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    ssm_lane_split = (1 if ssm_dtype == jnp.dtype(pool.dtype) else
+                      lanes // d_v)
+    ssm_view_lanes = lanes // ssm_lane_split
+    ssm_rows_used = ssm_rows * d_v // ssm_view_lanes
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
         nrows=ssm_nrows,
         view_dtype=ssm_dtype,
-        lane_split=lanes // d_v,
-        rows_used=ssm_rows,
+        lane_split=ssm_lane_split,
+        rows_used=ssm_rows_used,
+        load_dtype=(jnp.dtype(jnp.float32)
+                    if ssm_dtype == jnp.dtype(jnp.bfloat16) else None),
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)

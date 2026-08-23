@@ -22,9 +22,6 @@ before the load. Reshaping the ref keeps every access one whole vector
 register; splitting lanes after the load costs a lane-crossing relayout
 instead (measured on v7: 366 bundles / 448 vrot for the post-load split
 against 87 / 0 for the ref-level reshape, on a 256 KiB pool block).
-When the source and view have the same dtype, Mosaic cannot narrow the
-minormost ref dimension. That case uses aligned 128-lane slices and stacks
-them in row order instead.
 The pool gather/scatter kernels and the GDN V3 state seam share these
 helpers so the bytes they exchange are identical.
 """
@@ -41,29 +38,11 @@ def _typed_view(block_ref, view_dtype, lane_split: int):
 
 def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
     """Reads a raw block ref as ``(rows, lanes // lane_split)`` view_dtype."""
-    if (lane_split > 1
-            and jnp.dtype(block_ref.dtype) == jnp.dtype(view_dtype)):
-        lanes = block_ref.shape[-1]
-        out_lanes = lanes // lane_split
-        wide_ref = block_ref.reshape(-1, lanes)
-        parts = [
-            wide_ref[..., i * out_lanes:(i + 1) * out_lanes]
-            for i in range(lane_split)
-        ]
-        return jnp.stack(parts, axis=1).reshape(-1, out_lanes)
     return _typed_view(block_ref, view_dtype, lane_split)[...]
 
 
 def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
     """Inverse of ``load_typed``: stores ``values`` through a typed view of
     the raw block ref, which is fully written."""
-    if (lane_split > 1
-            and jnp.dtype(block_ref.dtype) == jnp.dtype(values.dtype)):
-        lanes = block_ref.shape[-1]
-        out_lanes = lanes // lane_split
-        rows = values.reshape(-1, lane_split, out_lanes)
-        block_ref.reshape(-1, lanes)[...] = jnp.concat(
-            [rows[:, i, :] for i in range(lane_split)], axis=-1)
-        return
     ref = _typed_view(block_ref, values.dtype, lane_split)
     ref[...] = values.reshape(ref.shape)

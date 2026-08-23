@@ -91,8 +91,9 @@ class TestV3StateSourcePlan:
         r = plan.recurrent
         assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, KBS)
         assert r.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert r.lane_split == LANES // D_V
-        assert r.rows_used == N_V * D_K
+        assert r.lane_split == 1
+        assert r.rows_used == N_V * D_K * D_V // LANES
+        assert r.load_dtype == jnp.dtype(jnp.float32)
         c = plan.conv
         assert (c.kb0, c.nblocks, c.row0, c.nrows) == (1, 1, 0, CONV_NTOK)
         assert c.rows_used == CONV_ROWS
@@ -231,7 +232,7 @@ def _write_states_bf16(pool, ssm, conv, idx):
     n = idx.shape[0]
     pool = pool_adapters.scatter_region(
         pool,
-        ssm.astype(jnp.bfloat16).reshape(n, N_V * D_K, D_V),
+        ssm.astype(jnp.bfloat16).reshape(n, -1, LANES),
         idx,
         tok0=0,
         ntok=BF16_SSM_NTOK,
@@ -254,7 +255,7 @@ def _read_states_bf16(pool, idx):
                                       ntok=BF16_SSM_NTOK,
                                       split=SPLIT,
                                       out_dtype=jnp.bfloat16,
-                                      out_lanes=D_V)
+                                      out_lanes=LANES)
     ssm = ssm.reshape(n, N_V, D_K, D_V).astype(jnp.float32)
     conv = pool_adapters.gather_region(pool,
                                        idx,
