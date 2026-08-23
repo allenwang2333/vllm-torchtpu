@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MLA_KV_PACKING_SIZE: int | None = None
     MLA_TRANSPOSE_KV_CACHE: bool = False
+    MIXED_Q_SPLIT: int = 1
+    MIXED_NUM_QUERIES_PER_BLOCK: int = 16
+    MIXED_NUM_KV_PAGES_PER_BLOCK: int = 1
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
@@ -282,6 +285,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if (val := os.getenv("MLA_KV_PACKING_SIZE")) is not None else None,
     "MLA_TRANSPOSE_KV_CACHE":
     lambda: env_bool("MLA_TRANSPOSE_KV_CACHE")() or env_bool("MLA_KV_TRANSPOSE")(),
+    "MIXED_Q_SPLIT":
+    lambda: int(os.getenv("MIXED_Q_SPLIT", "1")),
+    "MIXED_NUM_QUERIES_PER_BLOCK":
+    lambda: int(os.getenv("MIXED_NUM_QUERIES_PER_BLOCK", "16")),
+    "MIXED_NUM_KV_PAGES_PER_BLOCK":
+    lambda: int(os.getenv("MIXED_NUM_KV_PAGES_PER_BLOCK", "1")),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
