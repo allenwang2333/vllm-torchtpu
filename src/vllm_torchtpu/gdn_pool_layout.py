@@ -15,18 +15,21 @@ POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3_5MoeForConditionalGeneration",
 })
 
-# The pooled GDN kernel's state dtypes inside the unified pool are fixed:
-# conv rows are bf16 and the SSM region is fp32, independent of the layer's
-# declared MambaSpec dtypes (which only drive vLLM's page-size accounting).
-# Everything that describes pool bytes — the kernel's state plan and the
-# Raiden reshard manifest — must take its dtypes and sizes from here, so no
-# two consumers can disagree about the physical layout.
+# The pooled GDN kernel's state dtypes inside the unified pool are controlled
+# here: conv rows are always bf16 and the SSM region defaults to fp32. The
+# env-gated experiment may store SSM checkpoints as bf16 while the kernel
+# still computes in fp32. These physical dtypes are independent of the layer's
+# declared MambaSpec dtypes.
+# The default ABI constants below remain fp32 for page sizing and Raiden.
+# The bf16 selector is consumed only by the single-server mixed-mode kernel
+# plan, which uses a compact prefix of that unchanged allocation.
 #
 # These are torch dtype *names*, not torch.dtype objects: this module is
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
 POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
 POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
+POOLED_GDN_SSM_BF16_STATE_DTYPE = "torch.bfloat16"
 
 # Derived from the dtypes above rather than declared separately, so changing
 # a state dtype cannot leave a stale byte width behind.
@@ -36,6 +39,18 @@ POOLED_GDN_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[
 POOLED_GDN_SSM_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[POOLED_GDN_SSM_STATE_DTYPE]
 
 
+def pooled_gdn_ssm_state_dtype(*, use_bf16: bool = False) -> str:
+    """Physical pooled SSM checkpoint dtype for the selected ABI."""
+    return (POOLED_GDN_SSM_BF16_STATE_DTYPE
+            if use_bf16 else POOLED_GDN_SSM_STATE_DTYPE)
+
+
+def pooled_gdn_ssm_state_itemsize(*, use_bf16: bool = False) -> int:
+    """Bytes per physical pooled SSM checkpoint element."""
+    return _ITEMSIZE_BY_DTYPE[
+        pooled_gdn_ssm_state_dtype(use_bf16=use_bf16)]
+
+
 def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
@@ -43,11 +58,14 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     return (kernel_size - 1) * conv_dim * POOLED_GDN_CONV_STATE_ITEMSIZE
 
 
-def pooled_gdn_ssm_state_bytes(*, num_v_heads: int, head_k_dim: int,
-                               head_v_dim: int) -> int:
-    """Live bytes of one slot's SSM region: fp32, head-major and dense."""
+def pooled_gdn_ssm_state_bytes(*,
+                               num_v_heads: int,
+                               head_k_dim: int,
+                               head_v_dim: int,
+                               use_bf16: bool = False) -> int:
+    """Live bytes of one slot's dense, head-major SSM checkpoint."""
     return (num_v_heads * head_k_dim * head_v_dim *
-            POOLED_GDN_SSM_STATE_ITEMSIZE)
+            pooled_gdn_ssm_state_itemsize(use_bf16=use_bf16))
 
 
 @dataclass(frozen=True)

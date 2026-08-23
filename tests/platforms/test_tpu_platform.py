@@ -188,6 +188,56 @@ def set_mock_attn_to_vllm_config(vllm_config, page_size, min_page_size):
     return new_vllm_config, mock_impl
 
 
+def _gdn_bf16_mixed_config():
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="Qwen3_5MoeForConditionalGeneration"),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+
+
+def test_gdn_bf16_accepts_single_server_mixed_pool(monkeypatch):
+    monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "0")
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+
+    tpu_platform._validate_gdn_recurrent_state_bf16(
+        _gdn_bf16_mixed_config())
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("unpooled", "unified GDN pool is disabled"),
+        ("transfer", "KV transfer/PD disaggregation"),
+        ("raiden", "Raiden KV cache manager"),
+        ("pcp", "prefill context parallelism"),
+        ("spec", "speculative decoding"),
+    ],
+)
+def test_gdn_bf16_rejects_paths_outside_single_server_mixed(
+        monkeypatch, case, message):
+    config = _gdn_bf16_mixed_config()
+    if case == "unpooled":
+        config.model_config.architecture = "KimiLinearForCausalLM"
+    elif case == "transfer":
+        config.kv_transfer_config = SimpleNamespace()
+    elif case == "pcp":
+        config.parallel_config.prefill_context_parallel_size = 2
+    elif case == "spec":
+        config.speculative_config = SimpleNamespace()
+
+    monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                       "1" if case == "raiden" else "0")
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+
+    with pytest.raises(ValueError, match=message):
+        tpu_platform._validate_gdn_recurrent_state_bf16(config)
+
+
 class TestTpuPlatform:
 
     @pytest.fixture

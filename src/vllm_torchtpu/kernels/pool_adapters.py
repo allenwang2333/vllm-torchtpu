@@ -446,15 +446,16 @@ def v3_state_source(
         d_k: int,
         d_v: int,
         kernel_size: int,
+        ssm_dtype: jnp.dtype = jnp.float32,
         qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
     for these regions, without the external round trip.
 
-    The ssm region is the whole kernel blocks at the start of the manager
-    window (one contiguous DMA per slot), viewed f32 with the ``d_v``
-    lane split; the conv region is ``conv_ntok`` token rows inside a
+    The ssm region is at the start of the manager window and viewed as
+    ``ssm_dtype`` with the ``d_v`` lane split; the conv region is
+    ``conv_ntok`` token rows inside a
     single kernel block, viewed bf16 with the tail rows zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
@@ -468,13 +469,18 @@ def v3_state_source(
     """
     block_size, payload, lanes = _pool_geometry(pool)
     tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+    ssm_dtype = jnp.dtype(ssm_dtype)
+    if ssm_dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16)):
+        raise ValueError("pooled GDN SSM state must be float32 or bfloat16, "
+                         f"got {ssm_dtype}")
+    ssm_itemsize = ssm_dtype.itemsize
 
     assert lanes % d_v == 0, (lanes, d_v)
     ssm_rows = n_v * d_k
-    # The caller sizes the ssm region to exactly the f32 state bytes, so
+    # The caller sizes the SSM region to exactly the selected state bytes, so
     # the kernel's write covers the whole region (no padding rows).
-    assert ssm_ntok * tok_bytes == ssm_rows * d_v * 4, (ssm_ntok, tok_bytes,
-                                                        n_v, d_k, d_v)
+    assert ssm_ntok * tok_bytes == ssm_rows * d_v * ssm_itemsize, (
+        ssm_ntok, tok_bytes, n_v, d_k, d_v, ssm_dtype)
     if ssm_ntok % block_size == 0:
         ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
     else:
@@ -485,7 +491,7 @@ def v3_state_source(
         nblocks=ssm_nblocks,
         row0=0,
         nrows=ssm_nrows,
-        view_dtype=jnp.dtype(jnp.float32),
+        view_dtype=ssm_dtype,
         lane_split=lanes // d_v,
         rows_used=ssm_rows,
     )

@@ -734,10 +734,12 @@ def _build_v3_pool_state_plan(
     split = pool_block_tokens // pool.shape[1]
     per_tok_elems = math.prod(pool.shape[2:])
     tok_bytes = per_tok_elems * jnp.dtype(pool.dtype).itemsize
+    use_bf16 = tpu_envs.TPU_GDN_RECURRENT_STATE_BF16
     state_layout = derive_pooled_gdn_state_layout(
         ssm_bytes=pooled_gdn_ssm_state_bytes(num_v_heads=n_v,
                                              head_k_dim=d_k,
-                                             head_v_dim=d_v),
+                                             head_v_dim=d_v,
+                                             use_bf16=use_bf16),
         conv_bytes=pooled_gdn_conv_state_bytes(kernel_size=kernel_size,
                                                conv_dim=conv_dim),
         token_bytes=tok_bytes,
@@ -757,6 +759,7 @@ def _build_v3_pool_state_plan(
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
+        ssm_dtype=jnp.bfloat16 if use_bf16 else jnp.float32,
         qk_pair_layout=qk_pair_layout,
     )
 

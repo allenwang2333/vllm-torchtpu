@@ -303,6 +303,37 @@ def _refuse_kv_head_dim_fold(vllm_config: "VllmConfig") -> None:
             "Running with the unfolded KV page.", reason)
 
 
+def _validate_gdn_recurrent_state_bf16(vllm_config: "VllmConfig") -> None:
+    """Keep the compact GDN checkpoint experiment on its validated path.
+
+    The kernel stores the recurrent-state prefix as bf16 while the unified
+    manager page and all external consumers still use the fp32-sized ABI.
+    Until those consumers learn the compact layout, reject configurations
+    that could copy or reinterpret the page outside a single mixed server.
+    """
+    if not envs.TPU_GDN_RECURRENT_STATE_BF16:
+        return
+
+    unsupported = []
+    if not unified_kv_layout_enabled(vllm_config):
+        unsupported.append("the unified GDN pool is disabled")
+    if vllm_config.kv_transfer_config is not None:
+        unsupported.append("KV transfer/PD disaggregation is configured")
+    if envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
+        unsupported.append("the Raiden KV cache manager is enabled")
+    if getattr(vllm_config.parallel_config,
+               "prefill_context_parallel_size", 1) > 1:
+        unsupported.append("prefill context parallelism is enabled")
+    if vllm_config.speculative_config is not None:
+        unsupported.append("speculative decoding is enabled")
+
+    if unsupported:
+        raise ValueError(
+            "TPU_GDN_RECURRENT_STATE_BF16 currently supports only the "
+            "single-server mixed-mode unified GDN pool; " +
+            "; ".join(unsupported) + ".")
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -1112,6 +1143,7 @@ class TpuPlatform(Platform):
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size)
         _refuse_kv_head_dim_fold(vllm_config)
+        _validate_gdn_recurrent_state_bf16(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

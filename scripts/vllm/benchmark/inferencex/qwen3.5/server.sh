@@ -208,6 +208,9 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
+# Experimental: halve unified-pool GDN recurrent-state traffic while keeping
+# recurrent arithmetic in fp32. Default off until the quality run passes.
+export TPU_GDN_RECURRENT_STATE_BF16="${TPU_GDN_RECURRENT_STATE_BF16:-0}"
 # The selector counts routed rows (tokens * top-k). Qwen3.5's c128 decode
 # shape has 128 * 10 = 1280 rows, so 2048 retains its fast dense one-hot
 # matmul while larger grouped-GMM shapes can use the SparseCore gather.

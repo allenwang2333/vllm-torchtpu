@@ -28,6 +28,8 @@ CONV_TOK0 = SSM_NTOK
 CONV_NTOK = 16
 CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
 CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
+BF16_SSM_NTOK = N_V * D_K * D_V * 2 // TOK_BYTES  # 256
+BF16_CONV_TOK0 = BF16_SSM_NTOK
 NUM_MGR = 5  # null block + 4 slots
 POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES, )
 
@@ -48,6 +50,23 @@ def _plan(pool=None, **overrides):
     return pool_adapters.v3_state_source(pool, **kwargs)
 
 
+def _bf16_plan(pool=None):
+    if pool is None:
+        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
+    return pool_adapters.v3_state_source(
+        pool,
+        split=SPLIT,
+        ssm_ntok=BF16_SSM_NTOK,
+        conv_tok0=BF16_CONV_TOK0,
+        conv_ntok=CONV_NTOK,
+        conv_dim=DIM,
+        n_v=N_V,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+        ssm_dtype=jnp.bfloat16)
+
+
 class TestV3StateSourcePlan:
     """Plan-construction math only; runs on CPU."""
 
@@ -64,6 +83,18 @@ class TestV3StateSourcePlan:
         assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
         assert c.view_dtype == jnp.dtype(jnp.bfloat16)
         assert c.lane_split == 1
+        assert c.rows_used == CONV_ROWS
+        assert plan.stride == SPLIT
+
+    def test_bf16_ssm_region_uses_one_block_and_moves_conv_earlier(self):
+        plan = _bf16_plan()
+        r = plan.recurrent
+        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, KBS)
+        assert r.view_dtype == jnp.dtype(jnp.bfloat16)
+        assert r.lane_split == LANES // D_V
+        assert r.rows_used == N_V * D_K
+        c = plan.conv
+        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (1, 1, 0, CONV_NTOK)
         assert c.rows_used == CONV_ROWS
         assert plan.stride == SPLIT
 
@@ -193,6 +224,106 @@ def _run_seam(pool, idx, kwargs):
                                     state_source=pool,
                                     state_plan=_plan(pool),
                                     **kwargs)
+
+
+def _write_states_bf16(pool, ssm, conv, idx):
+    """Write the compact checkpoint ABI: bf16 SSM followed by bf16 conv."""
+    n = idx.shape[0]
+    pool = pool_adapters.scatter_region(
+        pool,
+        ssm.astype(jnp.bfloat16).reshape(n, N_V * D_K, D_V),
+        idx,
+        tok0=0,
+        ntok=BF16_SSM_NTOK,
+        split=SPLIT)
+    rows = conv.astype(jnp.bfloat16).reshape(n, CONV_ROWS, LANES)
+    rows = jnp.pad(rows, ((0, 0), (0, CONV_SLOT_ROWS - CONV_ROWS), (0, 0)))
+    return pool_adapters.scatter_region(pool,
+                                        rows,
+                                        idx,
+                                        tok0=BF16_CONV_TOK0,
+                                        ntok=CONV_NTOK,
+                                        split=SPLIT)
+
+
+def _read_states_bf16(pool, idx):
+    n = idx.shape[0]
+    ssm = pool_adapters.gather_region(pool,
+                                      idx,
+                                      tok0=0,
+                                      ntok=BF16_SSM_NTOK,
+                                      split=SPLIT,
+                                      out_dtype=jnp.bfloat16,
+                                      out_lanes=D_V)
+    ssm = ssm.reshape(n, N_V, D_K, D_V).astype(jnp.float32)
+    conv = pool_adapters.gather_region(pool,
+                                       idx,
+                                       tok0=BF16_CONV_TOK0,
+                                       ntok=CONV_NTOK,
+                                       split=SPLIT,
+                                       out_dtype=jnp.bfloat16)
+    conv = conv[:, :CONV_ROWS, :].reshape(n, KERNEL_SIZE - 1, DIM)
+    return ssm, conv
+
+
+class TestBf16RecurrentState:
+
+    def test_decode_trajectory_rounds_only_at_state_checkpoint(self):
+        n = 4
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        identity = jnp.arange(n, dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(50), 2))
+        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
+        conv0 = jax.random.normal(
+            next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
+        pool = _write_states_bf16(_garbage_pool(51), ssm0, conv0, idx)
+        initial_pool = jnp.copy(pool)
+
+        # Dense reference performs the same explicit HBM-boundary rounding;
+        # the wrapper itself still receives and computes recurrent state fp32.
+        dense_ssm = ssm0.astype(jnp.bfloat16).astype(jnp.float32)
+        dense_conv = conv0
+        for step in range(4):
+            kwargs = _rand_inputs(52 + step, n) | dict(
+                query_start_loc=jnp.arange(n + 1),
+                distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                seq_lens=jnp.full((n, ), 9 + step, dtype=jnp.int32),
+            )
+            (dense_conv, new_dense_ssm), out_dense = (
+                wrapper.fused_conv1d_gdn(conv_state=dense_conv,
+                                         recurrent_state=dense_ssm,
+                                         state_indices=identity,
+                                         **kwargs))
+            dense_ssm = new_dense_ssm.astype(jnp.bfloat16).astype(jnp.float32)
+            pool, out_pooled = wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=idx,
+                state_source=pool,
+                state_plan=_bf16_plan(pool),
+                **kwargs)
+            np.testing.assert_allclose(np.asarray(out_pooled),
+                                       np.asarray(out_dense),
+                                       rtol=3e-2,
+                                       atol=3e-2,
+                                       err_msg=f"step {step}")
+
+        pooled_ssm, pooled_conv = _read_states_bf16(pool, idx)
+        np.testing.assert_allclose(np.asarray(pooled_ssm),
+                                   np.asarray(dense_ssm),
+                                   rtol=3e-2,
+                                   atol=3e-2)
+        np.testing.assert_allclose(np.asarray(pooled_conv, dtype=np.float32),
+                                   np.asarray(dense_conv, dtype=np.float32),
+                                   rtol=3e-2,
+                                   atol=3e-2)
+
+        # The compact state uses manager sub-blocks 0 and 1; the old fp32
+        # tail sub-block remains allocation slack and must stay byte-exact.
+        for mgr in np.asarray(idx):
+            kb = int(mgr) * SPLIT + 2
+            assert jnp.array_equal(pool[kb].view(jnp.int16),
+                                   initial_pool[kb].view(jnp.int16)), mgr
 
 
 class TestSeamMatchesRoundTrip:
@@ -561,6 +692,26 @@ class TestPooledSpecWindows:
 
 
 class TestPooledCallerV3:
+
+    def test_caller_selects_compact_bf16_plan(self, monkeypatch):
+        gdn_attention = pytest.importorskip(
+            "vllm_torchtpu.layers.common.gdn_attention")
+        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
+        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
+
+        plan = gdn_attention._build_v3_pool_state_plan(
+            pool,
+            conv_dim=DIM,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            pool_block_tokens=SPLIT * KBS,
+            qk_pair_layout=False)
+
+        assert plan == _bf16_plan(pool)
+        assert plan.recurrent.view_dtype == jnp.dtype(jnp.bfloat16)
+        assert plan.conv.kb0 == 1
 
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip(

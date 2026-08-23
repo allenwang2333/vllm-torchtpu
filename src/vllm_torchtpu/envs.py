@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_RECURRENT_STATE_BF16: bool = False
     TPU_RPA_FOLD_KV_HEAD_DIM: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -162,6 +163,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # Store the pooled GDN recurrent/SSM state as bf16 in HBM. The V3
+    # kernels immediately widen it to fp32 and retain fp32 compute/scratch;
+    # only the state checkpoint crossing the kernel boundary is rounded.
+    # This experiment is restricted to the single-server mixed path; startup
+    # refuses KV transfer, Raiden, PCP, and speculative decoding.
+    "TPU_GDN_RECURRENT_STATE_BF16":
+    env_bool("TPU_GDN_RECURRENT_STATE_BF16", default=False),
     # Reinterpret the KV cache's dead packing slots as head_dim segments, so a
     # rank whose num_kv_heads * 2 is not a multiple of the packing factor stops
     # paying for the slots it pads out (TP8 on a 2-KV-head model: 1024 B/token

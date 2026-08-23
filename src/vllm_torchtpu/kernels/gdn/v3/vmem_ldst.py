@@ -223,7 +223,8 @@ def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
         return slot_ref[idx, 0]
     return load_state_region(
         slot_ref.at[idx, 0], cfg.state_plan.recurrent,
-        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
+        (cfg.num_v_heads, cfg.kq_head_dim,
+         cfg.v_head_dim)).astype(jnp.float32)
 
 
 def load_and_select_states(
