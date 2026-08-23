@@ -443,8 +443,10 @@ class Eagle3Proposer:
                 logits = lp._gather_logits(logits)
 
             if not torch.compiler.is_compiling():
-                top_vals, top_indices = logits[0].topk(5)
-                logger.info("DEBUG draft logits top5: tokens=%s, values=%s",
+                k = min(5, logits[0].shape[-1])
+                top_vals, top_indices = logits[0].topk(k)
+                logger.info("DEBUG draft logits top%d: tokens=%s, values=%s",
+                            k,
                             top_indices.cpu().tolist(),
                             top_vals.cpu().tolist())
 

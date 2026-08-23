@@ -1075,3 +1075,54 @@ def _patch_vllm_unify_page_sizes() -> None:
         return _orig(new_specs)
 
     kv_cache_utils.unify_kv_cache_spec_page_size = _wrapped
+
+
+def _patch_vllm_gemma4_mtp_attention() -> None:
+    """Dynamic monkey patch to swap uninitialized `torch.empty` with `torch.zeros`
+    in Gemma4MTPAttention to prevent NaN leakage on TPU.
+    """
+    import torch
+    try:
+        from vllm.model_executor.models.gemma4_mtp import Gemma4MTPAttention
+    except ImportError:
+        # If gemma4_mtp model is not imported or available, don't crash.
+        return
+
+    if getattr(Gemma4MTPAttention, "_tpu_gemma4_mtp_zeros_patch", False):
+        return
+
+    original_forward = Gemma4MTPAttention.forward
+
+    def patched_forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        q, _ = self.q_proj(hidden_states)
+
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = self.q_norm(q)
+        q = q.flatten(-2, -1)
+
+        q, _ = self.rotary_emb(positions, q, None)
+
+        # Attention reads K/V from the target's cache via KV sharing;
+        # these dummy tensors are never consumed but required by the API.
+        num_tokens = q.shape[0]
+        kv_dummy = torch.zeros(
+            num_tokens,
+            self.num_kv_heads * self.head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        # Log query tensor stats if diagnostic stats are imported
+        try:
+            from vllm.model_executor.models.gemma4_mtp import _DIAGNOSTIC_STATS
+            _DIAGNOSTIC_STATS.append((f"query_q_layer", q))
+        except Exception:
+            pass
+
+        attn_output = self.attn(q, kv_dummy, kv_dummy)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    Gemma4MTPAttention.forward = patched_forward
+    Gemma4MTPAttention._tpu_gemma4_mtp_zeros_patch = True
+    init_logger(__name__).info("Applied TPU patch: Gemma4MTPAttention initialized kv_dummy with torch.zeros.")
+

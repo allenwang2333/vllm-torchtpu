@@ -1133,3 +1133,14 @@ def test_eagle3_mtp_gemma4_embedding_and_projection():
         assert "inputs_embeds" in kwargs
         # target_embedded = mock_embedded_output * normalizer (2.0) = all 2.0
         assert torch.all(kwargs["inputs_embeds"] == 2.0)
+
+
+def test_vllm_gemma4_mtp_attention_zeros_patch():
+    """Verify that _patch_vllm_gemma4_mtp_attention correctly installs the monkey-patch on Gemma4MTPAttention."""
+    from vllm_torchtpu import _patch_vllm_gemma4_mtp_attention
+    from vllm.model_executor.models.gemma4_mtp import Gemma4MTPAttention
+    
+    # Check that calling the patch installs it and marks it as patched
+    _patch_vllm_gemma4_mtp_attention()
+    assert getattr(Gemma4MTPAttention, "_tpu_gemma4_mtp_zeros_patch", False) is True
+
