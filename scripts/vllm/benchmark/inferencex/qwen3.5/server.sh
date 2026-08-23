@@ -51,11 +51,15 @@ case "$SHARDING" in
     export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
     export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
-    # Picking the MoE path per compiled token bucket forks the backbone trace,
-    # and the two forks lift different graph inputs, so warmup dies handing a
-    # bucket between them (job j-a0850720). Keep every bucket on the fused EP
-    # kernel until both paths lift the same inputs. Override for a single run.
-    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-0}"
+    # Pick the MoE path per compiled token bucket. A bucket carrying 32 or
+    # more tokens per rank runs the fused EP kernel, and the smaller decode
+    # buckets take vLLM's own dispatch onto the fused GMM, which is the
+    # cheaper of the two once a step is only a few rows per expert. Forking
+    # the backbone trace this way used to kill warmup, because the two paths
+    # lifted different graph inputs and a bucket could not be handed between
+    # them (job j-a0850720). The base stabilizes those inputs now and hands a
+    # reordering over, so the fork is safe to take again.
+    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-32}"
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
