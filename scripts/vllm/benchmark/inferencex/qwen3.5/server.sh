@@ -57,15 +57,35 @@ case "$SHARDING" in
     export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
     export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
-    # Pick the MoE path per compiled token bucket. A bucket carrying 32 or
-    # more tokens per rank runs the fused EP kernel, and the smaller decode
-    # buckets take vLLM's own dispatch onto the fused GMM, which is the
-    # cheaper of the two once a step is only a few rows per expert. Forking
-    # the backbone trace this way used to kill warmup, because the two paths
-    # lifted different graph inputs and a bucket could not be handed between
-    # them (job j-a0850720). The base stabilizes those inputs now and hands a
-    # reordering over, so the fork is safe to take again.
-    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-32}"
+    # Pick the MoE path per compiled token bucket: fused EP for prefill, vLLM's
+    # own dispatch onto the fused GMM for decode, which is the cheaper of the
+    # two once a step is only a few rows per expert. DP only, the contract
+    # patch returns early at dp_size 1.
+    #
+    # A decode-only step carries one token per running sequence, so its width
+    # is the point's concurrency divided over the 8 ranks: 16 at c128 and 32 at
+    # c256. Buckets here are 4 8 16 32 48 64 128 256 and the test is
+    # shape[0] >= threshold, so 33 is the smallest value that leaves both decode
+    # widths on the GMM. 32 would not, it puts c256 back on fused EP by one
+    # token. Going higher, to max_num_seqs + 1, would also pull the 48 and 64
+    # buckets over, and those carry prefill tails that we have never measured on
+    # the GMM, so keep the split as tight as the two swept points need.
+    #
+    # The width it compares against is DP-wide, not per rank. EP-DP runs in
+    # lockstep, an all_reduce MAX over the ranks' scheduled tokens picks one
+    # bucket and every rank runs it. A step reaches the decode buckets only when
+    # all eight ranks are decode-only at once, which a saturating client rarely
+    # allows, so expect this to matter at low load and in the drain tail rather
+    # than in the middle of a sweep point.
+    #
+    # Forking the backbone trace this way used to kill warmup, because the two
+    # paths lifted different graph inputs and a bucket could not be handed
+    # between them (job j-a0850720). The base stabilizes those inputs now, so
+    # the fork is safe to take, but moving where it falls is what that failure
+    # was sensitive to.
+    if [ "$USE_MOE_FUSED_EP_KERNEL" = "1" ]; then
+      export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-33}"
+    fi
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
