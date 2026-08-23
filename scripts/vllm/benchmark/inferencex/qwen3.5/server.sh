@@ -87,6 +87,12 @@ case "$SHARDING" in
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac
 
+# For small worker-local DP buckets, gather hidden states before recomputing
+# routing logits and top-k. This removes the separate router-logits gather.
+if [ "$DP_SIZE" -gt 1 ]; then
+  export TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS="${TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS:-32}"
+fi
+
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 
 # Global num of batched tokens == max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
