@@ -151,6 +151,17 @@ export USE_FUSED_MOE_GMM="${USE_FUSED_MOE_GMM:-1}"
 # Leave USE_BATCHED_RPA_SEQ_ON_LANE off: that layout is slower here and, unlike
 # this one, is not bit-identical to the mainline kernel.
 export USE_BATCHED_RPA_LONGCTX="${USE_BATCHED_RPA_LONGCTX:-1}"
+# Spend the packing slots that num_kv_heads * 2 leaves empty on head_dim.
+# TP8 gives each rank a single KV head of this model, and an fp8 cache packs
+# four values into a 32-bit word, so half of every cached token is structural
+# zeros. The runner already says so: "KV cache pages are 2.00x larger than
+# num_kv_heads=1 at head_size=256 ... requires". Decode rereads that cache
+# every step, which is where the TP8 c32 point trails the reference by 4% on
+# median ITL at an identical median TTFT. kv_head_dim_fold() returns 1 when
+# there is nothing to reclaim, so DP8, whose ranks keep all eight KV heads,
+# is unaffected, and tpu_platform refuses the fold outright on the layouts
+# that cannot read it.
+export TPU_RPA_FOLD_KV_HEAD_DIM="${TPU_RPA_FOLD_KV_HEAD_DIM:-1}"
 
 args=(
   "$MODEL"
