@@ -33,6 +33,8 @@ scheduler's largest batch, whether to build this operation for the deployment.
 When it is built, ``TPU_MOE_FUSED_EP_STEP_MIN_TOKENS`` can keep smaller compiled
 token shapes on the gather/grouped-matmul/combine path while larger shapes use
 this fully fused path. Its default of zero preserves fused EP for every shape.
+``TPU_MOE_FUSED_EP_TILE_M`` independently selects the expert row tile and
+defaults to the validated 128-row behavior.
 """
 
 from typing import Any
@@ -46,14 +48,11 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import ragged_stride_bound
+from vllm_torchtpu.kernels.fused_moe.v2.host import (ROWBLK,
+                                                     ragged_stride_bound)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# The tile height the kernel slabs rows into, and the unit its ragged stride
-# rounds to. Matches the value tpu-inference's serving adapter asks for.
-_TILE_M = 128
 
 # SMEM the kernel's prefetched routing tables have to fit in, in bytes. The
 # tables are i32 and `ragged_stride_bound` long; see the gate in
@@ -111,7 +110,17 @@ def fused_moe_ep_supported() -> bool:
     return _OP is not None
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str):
+def _configured_tile_m() -> int:
+    """Return the opt-in expert row tile after enforcing kernel alignment."""
+    tile_m = envs.TPU_MOE_FUSED_EP_TILE_M
+    if tile_m <= 0 or tile_m % ROWBLK:
+        raise ValueError("TPU_MOE_FUSED_EP_TILE_M must be a positive multiple "
+                         f"of {ROWBLK}, got {tile_m}")
+    return tile_m
+
+
+def _build_op(mesh, topk: int, renormalize: bool, activation: str,
+              tile_m: int):
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
@@ -138,7 +147,7 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
                                topk=topk,
                                renormalize=renormalize,
                                mesh=mesh,
-                               capacity=_TILE_M,
+                               capacity=tile_m,
                                block=None,
                                ragged_stride=None,
                                weight_format=WeightFormat.FP8,
@@ -260,6 +269,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     global _EP_SIZE
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return
+    tile_m = _configured_tile_m()
     # Two separate things stop this kernel serving under tensor parallelism,
     # and they were conflated for a long time. Both are gated here.
     #
@@ -355,7 +365,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     global_tokens = _max_node_tokens(ep)
     if global_tokens:
         table_bytes = ragged_stride_bound(
-            global_tokens, topk, layer.global_num_experts, _TILE_M) * 4
+            global_tokens, topk, layer.global_num_experts, tile_m) * 4
         if table_bytes > _ROUTING_TABLE_SMEM_BUDGET:
             logger.warning_once(
                 "Fused EP MoE not engaged: at %d global tokens its routing "
@@ -364,7 +374,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                 "the kernel sees fewer tokens.", global_tokens, table_bytes,
                 _ROUTING_TABLE_SMEM_BUDGET,
                 _max_node_tokens_fitting_smem(topk, layer.global_num_experts,
-                                              ep))
+                                              ep, tile_m))
             return
     global _RANK_BUFFER, _EXPERT_ORDER
     # The kernel's index is this rank's position in the mesh, which is ordered
@@ -397,10 +407,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return
 
-    _build_op(mesh, topk, renormalize, activation)
+    _build_op(mesh, topk, renormalize, activation, tile_m)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d", hidden, inter, local_experts, ep, topk, _TILE_M)
+        "topk=%d capacity=%d", hidden, inter, local_experts, ep, topk, tile_m)
 
 
 def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,
@@ -445,7 +455,8 @@ def _max_node_tokens(ep: int) -> int:
     return int(cap) * ep if isinstance(cap, int) else 0
 
 
-def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int) -> int:
+def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int,
+                                  tile_m: int) -> int:
     """Largest per-step node-wide token count whose routing tables fit SMEM.
 
     Reported in the refusal so the operator is told the number to set rather
@@ -456,8 +467,8 @@ def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int) -> int:
     lo, hi = 1, 1 << 20
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        fits = ragged_stride_bound(mid, topk, e_total,
-                                   _TILE_M) * 4 <= _ROUTING_TABLE_SMEM_BUDGET
+        fits = (ragged_stride_bound(mid, topk, e_total, tile_m) * 4 <=
+                _ROUTING_TABLE_SMEM_BUDGET)
         lo, hi = (mid, hi) if fits else (lo, mid - 1)
     return lo // max(ep, 1)
 

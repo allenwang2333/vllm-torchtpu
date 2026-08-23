@@ -15,12 +15,32 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.runner import \
     moe_runner as moe_runner_mod
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu import _patch_moe_fused_ep_threshold_contract
+from vllm_torchtpu.layers.vllm.fused_moe_ep import _configured_tile_m
+
+
+def test_fused_ep_tile_m_defaults_to_validated_capacity(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_FUSED_EP_TILE_M", raising=False)
+    getter = envs.environment_variables["TPU_MOE_FUSED_EP_TILE_M"]
+
+    assert getter() == 128
+
+    monkeypatch.setenv("TPU_MOE_FUSED_EP_TILE_M", "64")
+    assert getter() == 64
+
+
+@pytest.mark.parametrize("tile_m", [0, -8, 63])
+def test_fused_ep_tile_m_rejects_invalid_alignment(monkeypatch, tile_m):
+    monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_TILE_M", tile_m)
+
+    with pytest.raises(ValueError, match="positive multiple of 8"):
+        _configured_tile_m()
 
 
 class _FakeEpGroup:

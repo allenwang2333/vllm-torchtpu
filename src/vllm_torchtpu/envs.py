@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_FUSED_EP_TILE_M: int = 128
     TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -352,6 +353,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # wide fused-EP behavior.
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS":
     lambda: int(os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")),
+    # Row tile used by each fused-EP expert FFN. 128 preserves the validated
+    # production kernel; smaller multiples of eight are an opt-in experiment
+    # for sparse prefill routing, where the last expert tile is mostly padding.
+    "TPU_MOE_FUSED_EP_TILE_M":
+    lambda: int(os.getenv("TPU_MOE_FUSED_EP_TILE_M", "128")),
     # For small DP token buckets, gather hidden states first and recompute the
     # router logits on the gathered rows. This removes the separate router-
     # logits all-gather. Zero disables the optimization and preserves the

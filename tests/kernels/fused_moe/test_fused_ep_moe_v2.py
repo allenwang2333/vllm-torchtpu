@@ -52,8 +52,8 @@ pytestmark = [
         "collective and this host reports fewer than 8 JAX devices"),
 ]
 
-# The expert-parallel width, and the tile height the serving adapter passes
-# the kernel as its capacity (moe_fused_ep._TILE_M upstream).
+# The expert-parallel width, and the serving adapter's default tile height.
+# The c64 production-shape case below exercises the opt-in alternative.
 EP = 8
 CAPACITY = 128
 
@@ -230,7 +230,8 @@ def _worst_token_relative_l2(actual, want):
 
 
 def _check_against_the_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating,
-                                 *, topk, batch_bound, token_bound):
+                                 *, topk, batch_bound, token_bound,
+                                 capacity=CAPACITY):
     """Run the layer, hold it to the dense reference, and rotate the experts.
 
     The rotation is the control the bands need: both are wide enough to
@@ -246,7 +247,7 @@ def _check_against_the_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating,
                           topk=topk,
                           renormalize=True,
                           mesh=mesh,
-                          capacity=CAPACITY,
+                          capacity=capacity,
                           weight_format=(WeightFormat.FP8 if w1.dtype == FP8
                                          else WeightFormat.BF16))
     # [tokens, hidden] sharded the way x is: the combine leaves each token's
@@ -336,8 +337,11 @@ def production_weights():
     del weights
 
 
-@pytest.mark.parametrize("tokens", PROD_TOKENS)
-def test_production_shape_tracks_a_dense_reference(production_weights, tokens):
+@pytest.mark.parametrize(("tokens", "capacity"),
+                         [(tokens, CAPACITY) for tokens in PROD_TOKENS] +
+                         [(2048, 64)])
+def test_production_shape_tracks_a_dense_reference(production_weights, tokens,
+                                                   capacity):
     """Qwen3.5-397B's MoE block at the decode and prefill batch shapes."""
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = production_weights
@@ -355,7 +359,8 @@ def test_production_shape_tracks_a_dense_reference(production_weights, tokens):
                                  gating,
                                  topk=PROD["topk"],
                                  batch_bound=FP8_RELATIVE_BOUND,
-                                 token_bound=FP8_TOKEN_BOUND)
+                                 token_bound=FP8_TOKEN_BOUND,
+                                 capacity=capacity)
 
 
 def test_any_mesh_axis_name_works():
