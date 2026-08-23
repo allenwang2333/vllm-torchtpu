@@ -27,10 +27,13 @@ from vllm_torchtpu import (_patch_moe_fused_ep_threshold_contract,
 
 class _FakeDpGroup:
 
-    def __init__(self):
+    def __init__(self, events=None):
         self.gather_args = []
+        self.events = events
 
     def all_gather(self, tensor, dim=0):
+        if self.events is not None:
+            self.events.append("gather")
         self.gather_args.append((tensor, dim))
         return tensor.repeat(4, 1)
 
@@ -54,10 +57,18 @@ class _FakeEpGroup:
 
 class _FakeGate:
 
-    def __init__(self):
+    def __init__(self, events=None):
         self.input = None
+        self.events = events
+
+    def parameters(self):
+        if self.events is not None:
+            self.events.append("gate_parameters")
+        return iter(())
 
     def __call__(self, hidden_states):
+        if self.events is not None:
+            self.events.append("gate")
         self.input = hidden_states
         return hidden_states[:, :2], None
 
@@ -85,13 +96,14 @@ def test_small_dp_bucket_gathers_hidden_before_routing(monkeypatch):
                         raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS", 32)
 
-    dp_group = _FakeDpGroup()
+    events = []
+    dp_group = _FakeDpGroup(events)
     ep_group = _FakeEpGroup()
     monkeypatch.setattr(parallel_state, "get_dp_group", lambda: dp_group)
     monkeypatch.setattr(moe_runner_mod, "get_ep_group", lambda: ep_group)
     _patch_moe_gather_then_route()
 
-    gate = _FakeGate()
+    gate = _FakeGate(events)
     quant_method = _FakeQuantMethod()
     routed_experts = SimpleNamespace(
         quant_method=quant_method,
@@ -117,6 +129,7 @@ def test_small_dp_bucket_gathers_hidden_before_routing(monkeypatch):
                                       torch.empty(32, 2), None)
 
     assert not original_calls
+    assert events == ["gate_parameters", "gather", "gate"]
     assert len(dp_group.gather_args) == 1
     assert dp_group.gather_args[0][0] is hidden_states
     assert dp_group.gather_args[0][1] == 0
