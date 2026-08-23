@@ -151,7 +151,13 @@ if [ "$ISL:$OSL" = "8192:1024" ]; then
     TP8_EP:32)  REFERENCE_POINT="48   8192  64" ;;
     TP8_EP:64)  REFERENCE_POINT="64   8192  16" ;;
     DP8_EP:128) REFERENCE_POINT="64    256   2" ;;
-    DP8_EP:256) REFERENCE_POINT="64    320   2" ;;
+    # 256, not the record's 320, for the same reason c4 and c8 keep their own
+    # batch size. Buckets here are powers of two plus TPU_TOKEN_BUCKET_EXTRA,
+    # so 320 buys one more bucket and a longer step, while the record's build
+    # lays down a linear ladder (TPU_TOKEN_BUCKET_LINEAR_INTERVAL,
+    # TPU_TOKEN_BUCKET_LINEAR_UNTIL, neither read here) that 320 sits on
+    # neatly. Measured: 33595.5 at 256 against 31093.8 at 320.
+    DP8_EP:256) REFERENCE_POINT="64    256   2" ;;
     *)          REFERENCE_POINT="" ;;
   esac
   if [ -n "$REFERENCE_POINT" ]; then
