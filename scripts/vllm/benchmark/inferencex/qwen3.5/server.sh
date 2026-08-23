@@ -46,7 +46,7 @@ case "$SHARDING" in
     DP_SIZE=8
     # Admit prefills every 2 scheduler steps, unless the point table below
     # names its own interval.
-    SHARDING_PREFILL_SCHEDULE_INTERVAL=2
+    SHARDING_PREFILL_SCHEDULE_INTERVAL=8
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
@@ -54,9 +54,9 @@ case "$SHARDING" in
     )
     # Defaults preserve the reproduction path. Experiments can opt into the
     # coordinated scheduler without editing this launcher.
-    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-0}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-0}"
-    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-1.0}"
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2.0}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     # Pick the MoE path per compiled token bucket: fused EP for prefill, vLLM's
     # own dispatch onto the fused GMM for decode, which is the cheaper of the
@@ -110,9 +110,9 @@ case "$SHARDING" in
       --enable-expert-parallel
     )
     # Keep the coordinated DP scheduler disabled by default for reproductions.
-    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-0}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-0}"
-    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-1.0}"
+    export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2.0}"
+    export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     # The fused EP kernel also refuses the TP2 component of this sharding.
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
     ;;
@@ -127,7 +127,7 @@ esac
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 
 # Global num of batched tokens == max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
-GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-24576}"
+GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
 # Fallbacks for a point nobody has tuned: divide the node-wide token target
@@ -206,7 +206,6 @@ fi
 
 # Increase API-server frontend wait time since cold init may take long.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
-export TPU_GDN_RECURRENT_STATE_BF16="${TPU_GDN_RECURRENT_STATE_BF16:-0}"
 
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
