@@ -549,8 +549,12 @@ def mla_attention(
         decode_batch_size = tuned.decode_batch_size
 
         # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
-        num_kv_pages_per_blocks = (tuned.num_kv_pages_per_block, 1, 1)
-        num_queries_per_blocks = (tuned.num_queries_per_block, 16, 16)
+        num_kv_pages_per_blocks = (
+            tuned.num_kv_pages_per_block, 1, envs.MIXED_NUM_KV_PAGES_PER_BLOCK
+        )
+        num_queries_per_blocks = (
+            tuned.num_queries_per_block, 16, envs.MIXED_NUM_QUERIES_PER_BLOCK
+        )
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
@@ -569,6 +573,7 @@ def mla_attention(
             num_kv_pages_per_block=num_kv_pages_per_blocks,
             num_queries_per_block=num_queries_per_blocks,
             decode_batch_size=decode_batch_size,
+            mixed_q_split=envs.MIXED_Q_SPLIT,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,

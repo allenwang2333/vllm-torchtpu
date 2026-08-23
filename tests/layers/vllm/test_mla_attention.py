@@ -16,12 +16,29 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.vllm.attention import (PallasMLAttentionBackend,
                                                  PallasMLAttentionBackendImpl)
 from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import (
     VllmMLAAttention, VllmMultiHeadLatentAttentionWrapper)
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+
+def test_mixed_q_split_env_vars():
+    assert "MIXED_Q_SPLIT" in TpuPlatform.additional_env_vars
+    assert "MIXED_NUM_QUERIES_PER_BLOCK" in TpuPlatform.additional_env_vars
+    assert "MIXED_NUM_KV_PAGES_PER_BLOCK" in TpuPlatform.additional_env_vars
+
+    with patch.dict("os.environ", {
+        "MIXED_Q_SPLIT": "16",
+        "MIXED_NUM_QUERIES_PER_BLOCK": "64",
+        "MIXED_NUM_KV_PAGES_PER_BLOCK": "2",
+    }):
+        assert envs.MIXED_Q_SPLIT == 16
+        assert envs.MIXED_NUM_QUERIES_PER_BLOCK == 64
+        assert envs.MIXED_NUM_KV_PAGES_PER_BLOCK == 2
+
 
 
 def test_pallas_mla_attention_backend():
