@@ -53,9 +53,40 @@ WEIGHT_PREFETCH_DISTANCE = 2
 # prefetch distance's worth of earlier experts are still live, so the slot
 # count has to exceed the distance for all of them to stay distinct.
 NBUF = WEIGHT_PREFETCH_DISTANCE + 1
-# Every transport moves whole 8-row blocks; dynamic DMA offsets are
-# block-aligned.
-ROWBLK = 8
+# Every transport moves whole blocks of this many rows. Dynamic DMA offsets
+# are block-aligned, which is what the block exists for.
+#
+# It is also the padding granularity, and that is what sets its size. Routed
+# pairs bin by (expert, owning shard) and each run rounds up to a whole block,
+# so the rows the kernel moves that carry no token are about half a block per
+# run, over e_total * ep runs. The kernel's cost tracks rows MOVED rather than
+# rows contracted -- a tile height that contracts a third more rows costs
+# nothing measurable, while padding a fifth more rows into the transport costs
+# most of a fifth -- so the block wants to be as small as the alignment field
+# allows.
+#
+# What it costs depends entirely on the run length, which is
+# num_tokens * topk / (e_total * ep): 40 rows at 16384 tokens, 20 at 8192,
+# 10 at 4096 and 5 at 2048. Against four, eight cost 6.9% at 8192 and 1.5% at
+# 16384, where the runs are twice as long and the same half-block matters half
+# as much. At those two sizes one and two measure the same as four, inside
+# 1.3%, because a run of 20 or 40 rows is already close to a whole number of
+# blocks -- which is why four looked like the floor when only the long steps
+# had been measured.
+#
+# The short steps are where the block size decides the kernel. A DP8
+# deployment on a 256-token quantum hands the op 2048 rows, so a run is 5 and
+# four-row blocks pad 60% of the transport away. Kernel-only at capacity 128,
+# eight / four / two / one are 569, 446, 419 and 419 us at 2048 tokens, and
+# 609, 471, 443 and 428 us at 4096. One is 6% to 9% under four across the
+# short steps and neutral across the long ones, so it is the size to carry.
+#
+# One also retires the bound that used to cap this, in
+# `shard_transport_tables_in_blocks`: a run's alignment slot holds up to
+# (ROWBLK - 1) * (ep - 1) against an ALIGNMENT_SLOT_FIELD-wide field, which at
+# ep=8 refused 16 and left 8 with no headroom to spare. At one the product is
+# zero, so no mesh width can overflow it.
+ROWBLK = 1
 # A token row is a whole number of 128-lane blocks: the lane count of the
 # vector unit this kernel is built for.
 HIDDEN_LANE_BLOCK = 128
