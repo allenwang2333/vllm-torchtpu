@@ -379,12 +379,9 @@ def _split_graph_is_refused(cache_root):
     config, _ = prepare(cache_root,
                         splitting_ops=["tpu_shape_variants_test::wave"])
     model = build(WaveModel, config)
-    try:
+    with pytest.raises(shape_variants.ShapeSpecializationError,
+                       match="cannot be handed over"):
         warm(model, config)
-    except Exception as exc:
-        assert "TPU_KERNEL_ITER_MODE" in str(exc)
-    else:
-        raise AssertionError("a split graph handed a bucket over anyway")
 
 
 def test_split_graph_cannot_hand_buckets_between_traces(tmp_path):
@@ -491,6 +488,43 @@ def test_a_guard_the_range_cannot_express_still_refuses():
 
     assert unsupported_reason(env, 2049) is None  # 2049 % 3 == 0, holds
     assert unsupported_reason(env, 2048) is not None  # provably violated
+
+
+def test_signature_delta_names_the_few_inputs_that_differ():
+    """The whole point is not printing two thousand-entry lists.
+
+    Shaped after job j-a0850720: a DP8+EP backbone subgraph where the two
+    traces agreed on 1245 inputs and differed only in the per-layer
+    ``_experts_start`` scalars and a handful of singleton buffers.
+    """
+    shared = [("torch.bfloat16", (4096, ))] * 1245
+    cached = tuple(shared + [("torch.int32", ())] * 60 +
+                   [("torch.bool", (256, ))])
+    current = tuple(shared + [("torch.int32", (8, )), ("torch.int32", (1, 1))])
+
+    delta = shape_variants._signature_delta(cached, current)
+
+    assert "1306 inputs vs 1247" in delta
+    assert "60x ('torch.int32', ())" in delta
+    assert "1x ('torch.bool', (256,))" in delta
+    assert "1x ('torch.int32', (8,))" in delta
+    assert "('torch.bfloat16', (4096,))" not in delta  # the agreed 1245
+
+
+def test_signature_delta_when_only_the_order_differs():
+    """Same multiset, different order: the delta has nothing to report.
+
+    Whether the two traces can be swapped is _input_permutation's call, not
+    this one's. The delta only runs once that has refused, so it stays quiet
+    here rather than pointing at inputs both sides have.
+    """
+    a = (("torch.int32", ()), ("torch.bool", (4, )))
+    b = (("torch.bool", (4, )), ("torch.int32", ()))
+
+    assert a != b
+    assert shape_variants._signature_delta(a, b) == (
+        "2 inputs vs 2. Only in the earlier trace: nothing. "
+        "Only in this one: nothing")
 
 
 def test_env_override_keeps_the_mega_artifact_off():

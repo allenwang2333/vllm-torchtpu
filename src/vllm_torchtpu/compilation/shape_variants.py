@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import contextlib
 import operator
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Callable
 
 import sympy
@@ -148,8 +149,10 @@ def _meta_entry(value: Any) -> Any:
     """One placeholder's dtype/shape as a comparable entry.
 
     Symbolic dims compare as "?", so the token dimension matches across traces
-    but a structural difference -- a split graph whose subgraph takes one chunk
-    in one variant and two in another -- does not.
+    but a structural difference does not. Two ways one shows up: a split graph
+    whose subgraph takes one chunk in one variant and two in another, and a
+    branch whose two sides touch different module buffers, which lifts a
+    different set of placeholders into the graph.
     """
     if value is None:
         return None
@@ -207,6 +210,29 @@ def _input_permutation(old: list[tuple[str, Any]],
     return perm
 
 
+def _signature_delta(cached: Sequence[Any], current: Sequence[Any]) -> str:
+    """How two traces' input lists differ, short enough to read in a log.
+
+    A backbone subgraph has upwards of a thousand placeholders, so printing
+    both lists buries the handful of entries that actually diverge. The
+    multiset difference names them directly, which is usually enough to point
+    at the buffer one side touches and the other does not.
+    """
+
+    def render(counts: Counter) -> str:
+        if not counts:
+            return "nothing"
+        by_frequency = sorted(counts.items(),
+                              key=lambda kv: (-kv[1], str(kv[0])))
+        return ", ".join(f"{count}x {item}" for item, count in by_frequency)
+
+    return (f"{len(cached)} inputs vs {len(current)}. "
+            f"Only in the earlier trace: "
+            f"{render(Counter(cached) - Counter(current))}. "
+            f"Only in this one: "
+            f"{render(Counter(current) - Counter(cached))}")
+
+
 # ---------------------------------------------------------------------------
 # Handing a bucket from the trace that cannot serve it to the one that can
 # ---------------------------------------------------------------------------
@@ -249,20 +275,18 @@ class BucketExecutables:
         # compiled. A genuine input-set difference still refuses below.
         perm = _input_permutation(inputs, new_inputs)
         if perm is None:
-            paired = enumerate(zip(inputs, new_inputs))
-            diffs = [
-                f"slot {i}: {old} vs {new}"
-                for i, (old, new) in paired if old != new
-            ]
             raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"{len(inputs)} inputs differ from this trace's "
-                f"{len(new_inputs)} beyond reordering "
-                f"({'; '.join(diffs[:5]) or 'input count changed'}"
-                f"{'; ...' if len(diffs) > 5 else ''}). The graph is split, "
-                "so its subgraph boundaries move with the specialization and "
-                "a bucket cannot be handed between traces; unset "
-                "TPU_KERNEL_ITER_MODE to serve this model.")
+                f"{key} cannot be handed over: the trace that compiled it "
+                f"takes different inputs than this one, beyond a reordering "
+                f"({_signature_delta(inputs, new_inputs)}). Each trace's "
+                "executable receives its lifted buffers positionally, so "
+                "neither can stand in for the other, and the graph that "
+                "stays live needs one executable per bucket. Either give the "
+                "two sides of the branch that forked the trace the same "
+                "lifted inputs, or stop forking on the token count "
+                "(TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, "
+                "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS, "
+                "TPU_KERNEL_ITER_MODE).")
         if perm == list(range(len(perm))):
             return runnable
         moved = sum(1 for j, i in enumerate(perm) if j != i)
