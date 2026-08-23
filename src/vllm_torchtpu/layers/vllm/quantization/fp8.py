@@ -896,7 +896,9 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk_ids, topk_weights = (
                 token_padding.zero_routing_weights_for_padding(
                     topk_ids, topk_weights))
-        return fused_moe_gmm(
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            retain_fused_ep_graph_inputs)
+        out = fused_moe_gmm(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -910,6 +912,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=layer._tpu_activation_str,
         )
+        return retain_fused_ep_graph_inputs(out)
 
     def _apply_owning_dispatch(
         self,
@@ -930,13 +933,18 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         from vllm.distributed.parallel_state import get_ep_group
 
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            fused_moe_ep, fused_moe_ep_supported, retain_fused_ep_graph_inputs)
 
         topk = layer.moe_config.experts_per_token
         if use_fused_kernel and fused_moe_ep_supported():
-            return fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
-                                layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+            out = fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
+                               layer.w13_weight_scale_inv,
+                               layer.w2_weight_scale_inv, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                out = out + (value - value)
+            return token_padding.retain_padding_graph_input(out)
 
         ep = get_ep_group()
         gathered_x, gathered_logits = ep.dispatch_router_logits(
@@ -961,7 +969,8 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=topk,
             activation=activation_str,
         )
-        return ep.combine(out, False)
+        return retain_fused_ep_graph_inputs(
+            ep.combine(out, False))
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

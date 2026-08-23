@@ -188,6 +188,22 @@ def fused_moe_ep(
                _to_mesh_expert_order(router_logits), _RANK_BUFFER)
 
 
+def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
+    """Keep fused-EP rank buffers in the GMM shape-specialized graph.
+
+    The subtraction is identically zero and XLA removes it, but its dataflow
+    keeps the runtime rank buffers in the FX subgraph's lifted input list.
+    """
+    marker = None
+    for graph_input in (_RANK_BUFFER, _EXPERT_ORDER):
+        if graph_input is None:
+            continue
+        value = graph_input.reshape(-1)[0].to(output.dtype)
+        zero = value - value
+        marker = zero if marker is None else marker + zero
+    return output if marker is None else output + marker
+
+
 def _to_mesh_expert_order(router_logits: torch.Tensor) -> torch.Tensor:
     """Reindex the expert axis from EP-rank order to mesh order.
 
