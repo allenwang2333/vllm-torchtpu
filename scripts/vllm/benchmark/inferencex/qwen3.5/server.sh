@@ -106,8 +106,14 @@ DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE
 case "$SHARDING:$CONC" in
   DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_BATCHED_TOKENS=256 ;;
 esac
-# Max sequences is a node-wide target divided across DP ranks.
-DEFAULT_MAX_NUM_SEQS=$(((CONC + DP_SIZE - 1) / DP_SIZE))
+# Max sequences is a node-wide target divided across DP ranks, at twice the
+# client concurrency. Sizing it to the concurrency exactly leaves the engine no
+# slot to admit a new request while the batch drains, and none of the top TP8
+# results others recorded at 8k1k do it: the c16, c32 and c64 record holder
+# runs 24, 48 and 64, and the c4 and c8 record holder runs 256 throughout. Two
+# is a uniform stand-in for that hand-tuned table, close to the 1.5x those
+# middle points use, and long over the 1x the c64 point wants.
+DEFAULT_MAX_NUM_SEQS=$(((2 * CONC + DP_SIZE - 1) / DP_SIZE))
 case "$SHARDING:$CONC" in
   DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_SEQS=64 ;;
 esac
