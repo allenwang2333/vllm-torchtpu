@@ -176,8 +176,6 @@ def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
         arr = jnp.concat([arr[p][None] for p in region.rows_perm], axis=0)
-    if region.load_dtype is not None:
-        arr = arr.astype(region.load_dtype)
     return arr.reshape(shape)
 
 
@@ -223,9 +221,9 @@ def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
     """One slot's recurrent state, decoded through the plan when there is one."""
     if cfg.state_plan is None:
         return slot_ref[idx, 0]
-    return load_state_region(slot_ref.at[idx, 0], cfg.state_plan.recurrent,
-                             (cfg.num_v_heads, cfg.kq_head_dim,
-                              cfg.v_head_dim))
+    return load_state_region(
+        slot_ref.at[idx, 0], cfg.state_plan.recurrent,
+        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim))
 
 
 def load_and_select_states(

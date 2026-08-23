@@ -27,6 +27,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
 from vllm.model_executor.layers.mamba.mamba_utils import \
     is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+from vllm_torchtpu import envs as tpu_envs
 
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
@@ -297,6 +298,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
         # TODO: Support bf16 conv state
         conv_state_dtype = torch.float32
+        if tpu_envs.TPU_GDN_RECURRENT_STATE_BF16:
+            temporal_state_dtype = torch.bfloat16
         return conv_state_dtype, temporal_state_dtype
 
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:

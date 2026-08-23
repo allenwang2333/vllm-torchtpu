@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
+    TPU_GDN_RECURRENT_STATE_BF16: bool = False
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
@@ -48,7 +49,6 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
-    TPU_GDN_RECURRENT_STATE_BF16: bool = False
     TPU_RPA_FOLD_KV_HEAD_DIM: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -152,6 +152,11 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Store compact mixed-mode GDN recurrent checkpoints in native BF16.
+    # The platform selects the per-layer compact cache layout for this gate;
+    # pooled/disaggregated/PCP/speculative paths are rejected at startup.
+    "TPU_GDN_RECURRENT_STATE_BF16":
+    env_bool("TPU_GDN_RECURRENT_STATE_BF16", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -163,13 +168,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
-    # Store the pooled GDN recurrent/SSM state as bf16 in HBM and keep the
-    # live recurrence/inter-tile carry in bf16. MXU dots still request fp32
-    # accumulation; state checkpoints and elementwise recurrence are bf16.
-    # This experiment is restricted to the single-server mixed path; startup
-    # refuses KV transfer, Raiden, PCP, and speculative decoding.
-    "TPU_GDN_RECURRENT_STATE_BF16":
-    env_bool("TPU_GDN_RECURRENT_STATE_BF16", default=False),
     # Reinterpret the KV cache's dead packing slots as head_dim segments, so a
     # rank whose num_kv_heads * 2 is not a multiple of the packing factor stops
     # paying for the slots it pads out (TP8 on a 2-KV-head model: 1024 B/token

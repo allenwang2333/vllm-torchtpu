@@ -49,8 +49,7 @@ class StateRegion:
     of each — one contiguous DMA per slot. The raw bytes are accessed
     through a typed view (``view_dtype`` elements, ``lane_split``-way
     128-lane split); the leading ``rows_used`` typed rows carry the
-    state, the rest is zero padding. ``load_dtype`` optionally widens the
-    loaded array before its logical reshape.
+    state, the rest is zero padding.
     """
     kb0: int
     nblocks: int
@@ -59,7 +58,6 @@ class StateRegion:
     view_dtype: jnp.dtype
     lane_split: int
     rows_used: int
-    load_dtype: jnp.dtype | None = None
     # Optional static typed-row permutation between the pool's stored row
     # order and the kernel's logical row order: logical_rows[i] is stored
     # at typed row rows_perm[i].  None or the identity means the stored
@@ -205,8 +203,7 @@ class GDNConfig:
         # needed.
         if self.mode == GDNMode.PER_SEQ:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
-            carry_recurrent_scratch = pltpu.VMEM(
-                recurrent_shape, self.dtypes.recurrent_state)
+            carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,

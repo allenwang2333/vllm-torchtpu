@@ -31,23 +31,9 @@ import jax.numpy as jnp
 
 def _typed_view(block_ref, view_dtype, lane_split: int):
     """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
-    source_dtype = jnp.dtype(block_ref.dtype)
-    view_dtype = jnp.dtype(view_dtype)
-    view_lanes = block_ref.shape[-1] // lane_split
-    if source_dtype != view_dtype:
-        # The production FP8 pool already has a legal FP32 128-lane ref view.
-        # Reuse that layout before splitting each FP32 word into two BF16
-        # values; bitcasting FP8 directly to BF16 and then narrowing is an
-        # illegal minormost-dimension reshape in Mosaic.
-        if (source_dtype.itemsize < jnp.dtype(jnp.bfloat16).itemsize
-                and view_dtype == jnp.dtype(jnp.bfloat16)
-                and lane_split > 1):
-            block_ref = block_ref.bitcast(jnp.dtype(jnp.float32))
-            block_ref = block_ref.reshape(-1, view_lanes)
-            block_ref = block_ref.bitcast(view_dtype)
-        else:
-            block_ref = block_ref.bitcast(view_dtype)
-    return block_ref.reshape(-1, view_lanes)
+    if jnp.dtype(block_ref.dtype) != jnp.dtype(view_dtype):
+        block_ref = block_ref.bitcast(jnp.dtype(view_dtype))
+    return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
 
 
 def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:

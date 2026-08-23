@@ -71,6 +71,21 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
 class TestVllmGatedDeltaNetAttention:
 
     @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
+           "QwenGatedDeltaNetAttention.get_state_dtype",
+           return_value=(torch.bfloat16, torch.float32))
+    def test_bf16_gate_changes_only_compact_recurrent_dtype(
+            self, mock_super_dtype, monkeypatch):
+        attn = VllmGatedDeltaNetAttention.__new__(
+            VllmGatedDeltaNetAttention)
+
+        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "0")
+        assert attn.get_state_dtype() == (torch.float32, torch.float32)
+
+        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
+        assert attn.get_state_dtype() == (torch.float32, torch.bfloat16)
+        assert mock_super_dtype.call_count == 2
+
+    @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
            "run_jax_gdn_attention_pcp_tp_prefill")
     def test_pcp_core_updates_only_widened_conv_state_prefix(self, mock_run):
         kernel_size = 4

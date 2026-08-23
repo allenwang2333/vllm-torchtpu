@@ -18,6 +18,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.gdn_pool_layout import POOLED_GDN_ARCHITECTURES
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -40,6 +41,36 @@ else:
     SamplingType = None
 
 logger = init_logger(__name__)
+
+
+def _validate_gdn_recurrent_state_bf16(vllm_config: "VllmConfig") -> None:
+    """Restrict native BF16 GDN checkpoints to compact mixed-mode serving."""
+    if not envs.TPU_GDN_RECURRENT_STATE_BF16:
+        return
+
+    unsupported = []
+    architecture = vllm_config.model_config.architecture
+    if architecture not in POOLED_GDN_ARCHITECTURES:
+        unsupported.append(
+            f"architecture {architecture!r} is not a Qwen GDN model")
+    if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL is True:
+        unsupported.append("the unified GDN pool is explicitly enabled")
+    if vllm_config.kv_transfer_config is not None:
+        unsupported.append("KV transfer/PD disaggregation is configured")
+    if envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
+        unsupported.append("the Raiden KV cache manager is enabled")
+    if getattr(vllm_config.parallel_config,
+               "prefill_context_parallel_size", 1) > 1:
+        unsupported.append("prefill context parallelism is enabled")
+    if vllm_config.speculative_config is not None:
+        unsupported.append("speculative decoding is enabled")
+
+    if unsupported:
+        raise ValueError(
+            "TPU_GDN_RECURRENT_STATE_BF16 currently supports only "
+            "single-server mixed mode with compact per-layer GDN state; " +
+            "; ".join(unsupported) + ".")
+
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -301,37 +332,6 @@ def _refuse_kv_head_dim_fold(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "TPU_RPA_FOLD_KV_HEAD_DIM was requested but is refused: %s. "
             "Running with the unfolded KV page.", reason)
-
-
-def _validate_gdn_recurrent_state_bf16(vllm_config: "VllmConfig") -> None:
-    """Keep the compact GDN checkpoint experiment on its validated path.
-
-    The kernel stores the recurrent-state prefix as bf16 while the unified
-    manager page and all external consumers still use the fp32-sized ABI.
-    Until those consumers learn the compact layout, reject configurations
-    that could copy or reinterpret the page outside a single mixed server.
-    """
-    if not envs.TPU_GDN_RECURRENT_STATE_BF16:
-        return
-
-    unsupported = []
-    if not unified_kv_layout_enabled(vllm_config):
-        unsupported.append("the unified GDN pool is disabled")
-    if vllm_config.kv_transfer_config is not None:
-        unsupported.append("KV transfer/PD disaggregation is configured")
-    if envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
-        unsupported.append("the Raiden KV cache manager is enabled")
-    if getattr(vllm_config.parallel_config,
-               "prefill_context_parallel_size", 1) > 1:
-        unsupported.append("prefill context parallelism is enabled")
-    if vllm_config.speculative_config is not None:
-        unsupported.append("speculative decoding is enabled")
-
-    if unsupported:
-        raise ValueError(
-            "TPU_GDN_RECURRENT_STATE_BF16 currently supports only the "
-            "single-server mixed-mode unified GDN pool; " +
-            "; ".join(unsupported) + ".")
 
 
 def _register_tpu_kv_connectors() -> None:
@@ -868,6 +868,7 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
+        _validate_gdn_recurrent_state_bf16(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()
@@ -1143,7 +1144,6 @@ class TpuPlatform(Platform):
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size)
         _refuse_kv_head_dim_fold(vllm_config)
-        _validate_gdn_recurrent_state_bf16(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

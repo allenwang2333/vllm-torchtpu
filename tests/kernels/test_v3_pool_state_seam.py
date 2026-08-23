@@ -28,16 +28,8 @@ CONV_TOK0 = SSM_NTOK
 CONV_NTOK = 16
 CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
 CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
-BF16_SSM_NTOK = N_V * D_K * D_V * 2 // TOK_BYTES  # 256
-BF16_CONV_TOK0 = BF16_SSM_NTOK
-FP8_POOL_PAYLOAD = (1, 4)
-FP8_POOL_TOK_BYTES = 4 * LANES
-BF16_FP8_POOL_SSM_NTOK = N_V * D_K * D_V * 2 // FP8_POOL_TOK_BYTES
-BF16_FP8_POOL_CONV_TOK0 = BF16_FP8_POOL_SSM_NTOK
-BF16_FP8_POOL_CONV_NTOK = 16
 NUM_MGR = 5  # null block + 4 slots
 POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES, )
-FP8_POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + FP8_POOL_PAYLOAD + (LANES, )
 
 
 def _plan(pool=None, **overrides):
@@ -54,40 +46,6 @@ def _plan(pool=None, **overrides):
                   kernel_size=KERNEL_SIZE)
     kwargs.update(overrides)
     return pool_adapters.v3_state_source(pool, **kwargs)
-
-
-def _bf16_plan(pool=None):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
-    return pool_adapters.v3_state_source(
-        pool,
-        split=SPLIT,
-        ssm_ntok=BF16_SSM_NTOK,
-        conv_tok0=BF16_CONV_TOK0,
-        conv_ntok=CONV_NTOK,
-        conv_dim=DIM,
-        n_v=N_V,
-        d_k=D_K,
-        d_v=D_V,
-        kernel_size=KERNEL_SIZE,
-        ssm_dtype=jnp.bfloat16)
-
-
-def _bf16_fp8_pool_plan(pool=None):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(FP8_POOL_SHAPE, jnp.float8_e4m3fn)
-    return pool_adapters.v3_state_source(
-        pool,
-        split=SPLIT,
-        ssm_ntok=BF16_FP8_POOL_SSM_NTOK,
-        conv_tok0=BF16_FP8_POOL_CONV_TOK0,
-        conv_ntok=BF16_FP8_POOL_CONV_NTOK,
-        conv_dim=DIM,
-        n_v=N_V,
-        d_k=D_K,
-        d_v=D_V,
-        kernel_size=KERNEL_SIZE,
-        ssm_dtype=jnp.bfloat16)
 
 
 class TestV3StateSourcePlan:
@@ -109,32 +67,9 @@ class TestV3StateSourcePlan:
         assert c.rows_used == CONV_ROWS
         assert plan.stride == SPLIT
 
-    def test_bf16_ssm_region_uses_one_block_and_moves_conv_earlier(self):
-        plan = _bf16_plan()
-        r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, KBS)
-        assert r.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert r.lane_split == 1
-        assert r.rows_used == N_V * D_K * D_V // LANES
-        assert r.load_dtype is None
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (1, 1, 0, CONV_NTOK)
-        assert c.rows_used == CONV_ROWS
-        assert plan.stride == SPLIT
-
     def test_plan_is_static_hashable_and_stable(self):
         assert _plan() == _plan()
         assert hash(_plan()) == hash(_plan())
-
-    def test_bf16_ssm_in_fp8_pool_keeps_bf16_compute(self):
-        plan = _bf16_fp8_pool_plan()
-        r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (
-            0, 1, 0, BF16_FP8_POOL_SSM_NTOK)
-        assert r.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert r.lane_split == LANES // D_V
-        assert r.rows_used == N_V * D_K
-        assert r.load_dtype is None
 
     def test_subblock_regions_when_pool_is_manager_grained(self):
         pool = jax.ShapeDtypeStruct(
@@ -258,185 +193,6 @@ def _run_seam(pool, idx, kwargs):
                                     state_source=pool,
                                     state_plan=_plan(pool),
                                     **kwargs)
-
-
-def _write_states_bf16(pool, ssm, conv, idx):
-    """Write the compact checkpoint ABI: bf16 SSM followed by bf16 conv."""
-    n = idx.shape[0]
-    pool = pool_adapters.scatter_region(
-        pool,
-        ssm.astype(jnp.bfloat16).reshape(n, -1, LANES),
-        idx,
-        tok0=0,
-        ntok=BF16_SSM_NTOK,
-        split=SPLIT)
-    rows = conv.astype(jnp.bfloat16).reshape(n, CONV_ROWS, LANES)
-    rows = jnp.pad(rows, ((0, 0), (0, CONV_SLOT_ROWS - CONV_ROWS), (0, 0)))
-    return pool_adapters.scatter_region(pool,
-                                        rows,
-                                        idx,
-                                        tok0=BF16_CONV_TOK0,
-                                        ntok=CONV_NTOK,
-                                        split=SPLIT)
-
-
-def _read_states_bf16(pool, idx):
-    n = idx.shape[0]
-    ssm = pool_adapters.gather_region(pool,
-                                      idx,
-                                      tok0=0,
-                                      ntok=BF16_SSM_NTOK,
-                                      split=SPLIT,
-                                      out_dtype=jnp.bfloat16,
-                                      out_lanes=LANES)
-    ssm = ssm.reshape(n, N_V, D_K, D_V).astype(jnp.float32)
-    conv = pool_adapters.gather_region(pool,
-                                       idx,
-                                       tok0=BF16_CONV_TOK0,
-                                       ntok=CONV_NTOK,
-                                       split=SPLIT,
-                                       out_dtype=jnp.bfloat16)
-    conv = conv[:, :CONV_ROWS, :].reshape(n, KERNEL_SIZE - 1, DIM)
-    return ssm, conv
-
-
-class TestBf16RecurrentState:
-
-    def test_fp8_pool_bf16_state_matches_fp32_checkpoint_reference(
-            self, monkeypatch):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
-        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
-        n = 2
-        idx = jnp.array([1, 2], dtype=jnp.int32)
-        identity = jnp.arange(n, dtype=jnp.int32)
-        keys = iter(jax.random.split(jax.random.key(70), 2))
-        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
-        conv0 = jax.random.normal(
-            next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
-        rng = np.random.default_rng(71)
-        raw_pool = jnp.asarray(rng.standard_normal(FP8_POOL_SHAPE),
-                               dtype=jnp.float8_e4m3fn)
-        pool = gdn_attention._bitcast_pool_to_u16(raw_pool)
-        pool = pool_adapters.scatter_region(
-            pool,
-            ssm0.astype(jnp.bfloat16).reshape(n, -1, D_V),
-            idx,
-            tok0=0,
-            ntok=BF16_FP8_POOL_SSM_NTOK,
-            split=SPLIT)
-        view_conv_rows = (KERNEL_SIZE - 1) * DIM // D_V
-        view_conv_slot_rows = (BF16_FP8_POOL_CONV_NTOK *
-                               FP8_POOL_TOK_BYTES // (2 * D_V))
-        rows = conv0.reshape(n, view_conv_rows, D_V)
-        rows = jnp.pad(rows, ((0, 0),
-                              (0, view_conv_slot_rows - view_conv_rows),
-                              (0, 0)))
-        pool = pool_adapters.scatter_region(
-            pool,
-            rows,
-            idx,
-            tok0=BF16_FP8_POOL_CONV_TOK0,
-            ntok=BF16_FP8_POOL_CONV_NTOK,
-            split=SPLIT)
-        pool = gdn_attention._restore_u16_pool_carrier(
-            pool, raw_pool.shape, raw_pool.dtype)
-
-        dense_ssm = ssm0.astype(jnp.bfloat16).astype(jnp.float32)
-        dense_conv = conv0
-        for step in range(4):
-            kwargs = _rand_inputs(72 + step, n) | dict(
-                query_start_loc=jnp.arange(n + 1),
-                distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                seq_lens=jnp.full((n, ), 9 + step, dtype=jnp.int32),
-            )
-            (dense_conv, new_dense_ssm), out_dense = (
-                wrapper.fused_conv1d_gdn(conv_state=dense_conv,
-                                         recurrent_state=dense_ssm,
-                                         state_indices=identity,
-                                         **kwargs))
-            dense_ssm = new_dense_ssm.astype(jnp.bfloat16).astype(jnp.float32)
-            pool, out_pooled = gdn_attention.run_jax_gdn_attention_pooled_local(
-                mixed_qkv=kwargs["qkv"],
-                b=kwargs["b"],
-                a=kwargs["a"],
-                recurrent_state=pool,
-                conv_weight=kwargs["conv_weight"],
-                conv_bias=kwargs["conv_bias"],
-                A_log=kwargs["a_log"],
-                dt_bias=kwargs["dt_bias"],
-                query_start_loc=kwargs["query_start_loc"],
-                state_indices=idx,
-                distribution=kwargs["distribution"],
-                seq_lens=kwargs["seq_lens"],
-                n_kq=N_KQ,
-                n_v=N_V,
-                d_k=D_K,
-                d_v=D_V,
-                kernel_size=KERNEL_SIZE,
-                pool_block_tokens=SPLIT * KBS)
-            np.testing.assert_allclose(np.asarray(out_pooled),
-                                       np.asarray(out_dense),
-                                       rtol=4e-2,
-                                       atol=4e-2,
-                                       err_msg=f"step {step}")
-
-    def test_decode_bf16_trajectory_matches_fp32_checkpoint_reference(self):
-        n = 4
-        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
-        identity = jnp.arange(n, dtype=jnp.int32)
-        keys = iter(jax.random.split(jax.random.key(50), 2))
-        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
-        conv0 = jax.random.normal(
-            next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
-        pool = _write_states_bf16(_garbage_pool(51), ssm0, conv0, idx)
-        initial_pool = jnp.copy(pool)
-
-        # Compare the BF16 live recurrence against an FP32 recurrence with the
-        # same explicit HBM-boundary checkpoint rounding.
-        dense_ssm = ssm0.astype(jnp.bfloat16).astype(jnp.float32)
-        dense_conv = conv0
-        for step in range(4):
-            kwargs = _rand_inputs(52 + step, n) | dict(
-                query_start_loc=jnp.arange(n + 1),
-                distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                seq_lens=jnp.full((n, ), 9 + step, dtype=jnp.int32),
-            )
-            (dense_conv, new_dense_ssm), out_dense = (
-                wrapper.fused_conv1d_gdn(conv_state=dense_conv,
-                                         recurrent_state=dense_ssm,
-                                         state_indices=identity,
-                                         **kwargs))
-            dense_ssm = new_dense_ssm.astype(jnp.bfloat16).astype(jnp.float32)
-            pool, out_pooled = wrapper.fused_conv1d_gdn(
-                conv_state=None,
-                recurrent_state=None,
-                state_indices=idx,
-                state_source=pool,
-                state_plan=_bf16_plan(pool),
-                **kwargs)
-            np.testing.assert_allclose(np.asarray(out_pooled),
-                                       np.asarray(out_dense),
-                                       rtol=3e-2,
-                                       atol=3e-2,
-                                       err_msg=f"step {step}")
-
-        pooled_ssm, pooled_conv = _read_states_bf16(pool, idx)
-        np.testing.assert_allclose(np.asarray(pooled_ssm),
-                                   np.asarray(dense_ssm),
-                                   rtol=3e-2,
-                                   atol=3e-2)
-        np.testing.assert_allclose(np.asarray(pooled_conv, dtype=np.float32),
-                                   np.asarray(dense_conv, dtype=np.float32),
-                                   rtol=3e-2,
-                                   atol=3e-2)
-
-        # The compact state uses manager sub-blocks 0 and 1; the old fp32
-        # tail sub-block remains allocation slack and must stay byte-exact.
-        for mgr in np.asarray(idx):
-            kb = int(mgr) * SPLIT + 2
-            assert jnp.array_equal(pool[kb].view(jnp.int16),
-                                   initial_pool[kb].view(jnp.int16)), mgr
 
 
 class TestSeamMatchesRoundTrip:
@@ -806,47 +562,6 @@ class TestPooledSpecWindows:
 
 class TestPooledCallerV3:
 
-    def test_caller_selects_compact_bf16_plan(self, monkeypatch):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
-        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
-        raw_pool = jax.ShapeDtypeStruct(FP8_POOL_SHAPE, jnp.float8_e4m3fn)
-        pool = jax.eval_shape(gdn_attention._bitcast_pool_to_u16, raw_pool)
-
-        plan = gdn_attention._build_v3_pool_state_plan(
-            pool,
-            conv_dim=DIM,
-            n_v=N_V,
-            d_k=D_K,
-            d_v=D_V,
-            kernel_size=KERNEL_SIZE,
-            pool_block_tokens=SPLIT * KBS,
-            qk_pair_layout=False)
-
-        assert pool.shape == FP8_POOL_SHAPE[:-1] + (D_V, )
-        assert plan.recurrent.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert pool.dtype == jnp.dtype(jnp.uint16)
-        assert plan.recurrent.lane_split == 1
-        assert plan.recurrent.rows_used == N_V * D_K
-        assert plan.conv.kb0 == 1
-
-    def test_u16_pool_carrier_roundtrips_bytes(self):
-        gdn_attention = pytest.importorskip(
-            "vllm_torchtpu.layers.common.gdn_attention")
-        shape = (2, 3, 1, 4, 256)
-        raw = jnp.asarray(np.random.default_rng(81).standard_normal(shape),
-                          dtype=jnp.float8_e4m3fn)
-
-        view = gdn_attention._bitcast_pool_to_u16(raw)
-        restored = gdn_attention._restore_u16_pool_carrier(
-            view, raw.shape, raw.dtype)
-
-        assert view.shape == shape[:-1] + (128, )
-        assert view.dtype == jnp.dtype(jnp.uint16)
-        np.testing.assert_array_equal(
-            np.asarray(restored).view(np.uint8),
-            np.asarray(raw).view(np.uint8))
-
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip(
             "vllm_torchtpu.layers.common.gdn_attention")
@@ -893,3 +608,61 @@ class TestPooledCallerV3:
                                    atol=1e-5)
         assert jnp.array_equal(new_pool.view(jnp.int16),
                                pool_rt.view(jnp.int16))
+
+
+class TestCompactBf16RecurrentState:
+    """Native compact BF16 storage follows an explicitly rounded FP32
+    checkpoint trajectory without changing the FP32 conv cache."""
+
+    def test_multistep_decode_matches_rounded_fp32_checkpoints(self):
+        n = 4
+        state_indices = jnp.arange(n, dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(71), 2))
+        recurrent0 = (0.1 * jax.random.normal(
+            next(keys), (n, N_V, D_K, D_V))).astype(jnp.bfloat16)
+        conv0 = (0.1 * jax.random.normal(
+            next(keys), (n, KERNEL_SIZE - 1, DIM))).astype(jnp.float32)
+
+        bf16_conv = jnp.copy(conv0)
+        bf16_recurrent = jnp.copy(recurrent0)
+        fp32_conv = jnp.copy(conv0)
+        fp32_recurrent = recurrent0.astype(jnp.float32)
+
+        for step in range(4):
+            kwargs = _rand_inputs(72 + step, n) | dict(
+                query_start_loc=jnp.arange(n + 1, dtype=jnp.int32),
+                distribution=jnp.array([n, n, n], dtype=jnp.int32),
+                seq_lens=jnp.full((n, ), 9 + step, dtype=jnp.int32),
+            )
+            (fp32_conv, fp32_recurrent), fp32_out = (
+                wrapper.fused_conv1d_gdn(
+                    conv_state=fp32_conv,
+                    recurrent_state=fp32_recurrent,
+                    state_indices=state_indices,
+                    **kwargs,
+                ))
+            # Reference the same persistent checkpoint precision while
+            # retaining the old FP32 tensor carrier/kernel signature.
+            fp32_recurrent = fp32_recurrent.astype(jnp.bfloat16).astype(
+                jnp.float32)
+
+            (bf16_conv, bf16_recurrent), bf16_out = (
+                wrapper.fused_conv1d_gdn(
+                    conv_state=bf16_conv,
+                    recurrent_state=bf16_recurrent,
+                    state_indices=state_indices,
+                    **kwargs,
+                ))
+
+            assert bf16_recurrent.dtype == jnp.bfloat16
+            assert bf16_conv.dtype == jnp.float32
+            tol = dict(rtol=3e-2, atol=3e-2)
+            np.testing.assert_allclose(np.asarray(bf16_out),
+                                       np.asarray(fp32_out),
+                                       err_msg=f"output step {step}",
+                                       **tol)
+            np.testing.assert_allclose(
+                np.asarray(bf16_recurrent, dtype=np.float32),
+                np.asarray(fp32_recurrent),
+                err_msg=f"recurrent step {step}",
+                **tol)
