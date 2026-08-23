@@ -51,9 +51,11 @@ case "$SHARDING" in
     export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS=0
     export TPU_DP_PREFILL_QUORUM_FRACTION=1.0
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
-    # Decode buckets below 256 tokens/rank use gather -> fused GMM -> combine;
-    # prefill buckets at 256 tokens/rank or above use the fully fused EP kernel.
-    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-256}"
+    # Picking the MoE path per compiled token bucket forks the backbone trace,
+    # and the two forks lift different graph inputs, so warmup dies handing a
+    # bucket between them (job j-a0850720). Keep every bucket on the fused EP
+    # kernel until both paths lift the same inputs. Override for a single run.
+    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-0}"
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
@@ -87,11 +89,10 @@ case "$SHARDING" in
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac
 
-# For small worker-local DP buckets, gather hidden states before recomputing
-# routing logits and top-k. This removes the separate router-logits gather.
-if [ "$DP_SIZE" -gt 1 ]; then
-  export TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS="${TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS:-32}"
-fi
+# Gathering hidden states before recomputing routing logits would save one
+# collective per MoE layer on small DP buckets, but its token threshold forks
+# the backbone trace exactly like the fused EP threshold above. Left unset for
+# the same reason. Export TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS to try it.
 
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 
