@@ -3431,7 +3431,109 @@ class TestTPUConnectorStats(unittest.TestCase):
             }
             metrics.observe(mock_data, engine_idx=0)
 
-            mtype, per_engine_obj = metrics.dynamic_metrics[
+            mtype, per_engine_obj, label_names = metrics.dynamic_metrics[
                 "vllm:tpu_raiden_dma_latency_ms"]
             hist = per_engine_obj[0]
             assert hist._sum.get() == 20.0
+
+    def test_parse_labeled_metric_key(self):
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+            parse_labeled_metric_key)
+
+        base_name, labels = parse_labeled_metric_key("tpu_raiden_h2d_transfer_time_ms")
+        assert base_name == "tpu_raiden_h2d_transfer_time_ms"
+        assert labels == {}
+
+        base_name, labels = parse_labeled_metric_key(
+            'tpu_raiden_sent_bytes_total{direction="push"}')
+        assert base_name == "tpu_raiden_sent_bytes_total"
+        assert labels == {"direction": "push"}
+
+        base_name, labels = parse_labeled_metric_key(
+            'tpu_raiden_transfer_duration_ms{direction="pull",mode="direct"}')
+        assert base_name == "tpu_raiden_transfer_duration_ms"
+        assert labels == {"direction": "pull", "mode": "direct"}
+
+        base_name, labels = parse_labeled_metric_key(
+            'tpu_raiden_failures{error="msg=\\"timeout\\""}')
+        assert base_name == "tpu_raiden_failures"
+        assert labels == {"error": 'msg="timeout"'}
+
+        base_name, labels = parse_labeled_metric_key(
+            r'tpu_raiden_failures{error="line1\nline2",path="C:\\dir"}')
+        assert base_name == "tpu_raiden_failures"
+        assert labels == {"error": "line1\nline2", "path": "C:\\dir"}
+
+    def test_multi_dimensional_labeled_metrics_registration_and_observation(self):
+        mock_telemetry = MagicMock()
+        mock_desc1 = MagicMock()
+        mock_desc1.name = "sent_bytes_total"
+        mock_desc1.help = "Sent bytes"
+        mock_desc1.type = "counter"
+        mock_desc1.label_names = ["direction"]
+
+        mock_desc2 = MagicMock()
+        mock_desc2.name = "transfer_duration_ms"
+        mock_desc2.help = "Transfer duration"
+        mock_desc2.type = "histogram"
+        mock_desc2.buckets = [1.0, 10.0, 100.0]
+        mock_desc2.label_names = ["direction", "mode"]
+
+        mock_desc3 = MagicMock()
+        mock_desc3.name = "buffer_allocated_bytes"
+        mock_desc3.help = "Allocated buffer bytes"
+        mock_desc3.type = "gauge"
+        mock_desc3.label_names = ["buffer_type"]
+
+        mock_telemetry.get_metric_descriptors.return_value = [
+            mock_desc1, mock_desc2, mock_desc3
+        ]
+
+        mock_api = MagicMock()
+        mock_api.telemetry = mock_telemetry
+
+        with patch.dict(
+            "sys.modules", {
+                "tpu_raiden": MagicMock(),
+                "tpu_raiden.api": mock_api,
+            }):
+            registry = CollectorRegistry()
+            metric_types = {
+                Gauge: partial(Gauge, registry=registry),
+                Counter: partial(Counter, registry=registry),
+                Histogram: partial(Histogram, registry=registry),
+            }
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+
+            assert "sent_bytes_total" in metrics.dynamic_metrics
+            assert "transfer_duration_ms" in metrics.dynamic_metrics
+            assert "buffer_allocated_bytes" in metrics.dynamic_metrics
+
+            mock_data = {
+                'tpu_raiden_sent_bytes_total{direction="push"}': [1024.0],
+                'tpu_raiden_sent_bytes_total{direction="pull"}': [512.0],
+                'tpu_raiden_transfer_duration_ms{direction="pull",mode="direct"}': [15.5],
+                'tpu_raiden_buffer_allocated_bytes{buffer_type="host_dram"}': [4096.0],
+            }
+            metrics.observe(mock_data, engine_idx=0)
+
+            counter_obj = metrics.dynamic_metrics["sent_bytes_total"][1]
+            push_counter = counter_obj.labels(model_name="my_model", engine="0", direction="push")
+            pull_counter = counter_obj.labels(model_name="my_model", engine="0", direction="pull")
+            assert push_counter._value.get() == 1024.0
+            assert pull_counter._value.get() == 512.0
+
+            hist_obj = metrics.dynamic_metrics["transfer_duration_ms"][1]
+            pull_direct_hist = hist_obj.labels(
+                model_name="my_model", engine="0", direction="pull", mode="direct")
+            assert pull_direct_hist._sum.get() == 15.5
+
+            gauge_obj = metrics.dynamic_metrics["buffer_allocated_bytes"][1]
+            host_gauge = gauge_obj.labels(
+                model_name="my_model", engine="0", buffer_type="host_dram")
+            assert host_gauge._value.get() == 4096.0

@@ -15,6 +15,7 @@
 
 import copy
 from dataclasses import dataclass
+import re
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,30 @@ from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_LABELED_METRIC_PATTERN = re.compile(r"^([^\{]+)\{([^}]+)\}$")
+_LABEL_PAIR_PATTERN = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+_UNESCAPE_PATTERN = re.compile(r'\\([\\\"n])')
+
+
+def parse_labeled_metric_key(raw_key: str) -> tuple[str, dict[str, str]]:
+    """Parses a raw metric key with optional Prometheus canonical labels.
+
+    Examples:
+        'tpu_raiden_sent_bytes_total{direction="push"}' ->
+        ('tpu_raiden_sent_bytes_total', {'direction': 'push'})
+        'tpu_raiden_h2d_transfer_time_ms' -> ('tpu_raiden_h2d_transfer_time_ms', {})
+    """
+    match = _LABELED_METRIC_PATTERN.match(raw_key)
+    if not match:
+        return raw_key, {}
+    base_name, label_block = match.group(1), match.group(2)
+    labels: dict[str, str] = {}
+    for k, v in _LABEL_PAIR_PATTERN.findall(label_block):
+        v = _UNESCAPE_PATTERN.sub(
+            lambda m: {'n': '\n', '"': '"', '\\': '\\'}[m.group(1)], v)
+        labels[k] = v
+    return base_name, labels
 
 
 @dataclass
@@ -254,7 +279,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.gauge_tpu_decode_queue_length = create_metric_per_engine(
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues)
 
-        self.dynamic_metrics: dict[str, tuple[str, Any]] = {}
+        self.labelnames = labelnames
+        self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = {}
 
         # Dynamically load TPU Raiden C++ metric schema descriptors
         try:
@@ -269,6 +295,8 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             name = desc.name
             help_str = getattr(desc, "help", getattr(desc, "description", ""))
             mtype = str(getattr(desc.type, "name", desc.type)).lower()
+            metric_label_names = list(getattr(desc, "label_names", []))
+            combined_labels = list(labelnames) + metric_label_names
 
             if mtype == "histogram":
                 buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
@@ -276,27 +304,31 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                     name=name,
                     documentation=help_str,
                     buckets=buckets_val,
-                    labelnames=labelnames,
+                    labelnames=combined_labels,
                 )
             elif mtype == "counter":
                 metric_obj = self._counter_cls(
                     name=name,
                     documentation=help_str,
-                    labelnames=labelnames,
+                    labelnames=combined_labels,
                 )
             elif mtype == "gauge":
                 metric_obj = self._gauge_cls(
                     name=name,
                     documentation=help_str,
-                    labelnames=labelnames,
+                    labelnames=combined_labels,
                 )
             else:
                 continue
 
-            self.dynamic_metrics[name] = (
-                mtype,
-                create_metric_per_engine(metric_obj, self.per_engine_labelvalues)
-            )
+            if metric_label_names:
+                self.dynamic_metrics[name] = (mtype, metric_obj, metric_label_names)
+            else:
+                self.dynamic_metrics[name] = (
+                    mtype,
+                    create_metric_per_engine(metric_obj, self.per_engine_labelvalues),
+                    metric_label_names,
+                )
 
     def observe(self,
                 transfer_stats_data: dict[str, Any],
@@ -315,7 +347,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 "mb_transferred",
             ],
         ):
-            for list_item in transfer_stats_data[list_item_key]:
+            for list_item in transfer_stats_data.get(list_item_key, []):
                 prom_obj[engine_idx].observe(list_item)
 
         for counter_obj, counter_item_key in zip(
@@ -324,7 +356,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
             ["num_failed_transfers"],
         ):
-            for list_item in transfer_stats_data[counter_item_key]:
+            for list_item in transfer_stats_data.get(counter_item_key, []):
                 counter_obj[engine_idx].inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
@@ -342,17 +374,43 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
                 for list_item in transfer_stats_data[gauge_item_key]:
                     gauge_obj[engine_idx].set(list_item)
 
+        # Build engine label values map for dynamic multi-dimensional metrics
+        engine_labels = {}
+        resolved_labelnames = getattr(
+            self, "labelnames", getattr(self, "_labelnames", []))
+        if resolved_labelnames and engine_idx in self.per_engine_labelvalues:
+            engine_labels = dict(
+                zip(resolved_labelnames, self.per_engine_labelvalues[engine_idx]))
+
         # Dynamic metric observations
-        for name, (mtype, per_engine_obj) in self.dynamic_metrics.items():
-            vals = (transfer_stats_data.get(name) or
-                    transfer_stats_data.get(f"tpu_raiden_{name}") or
-                    (transfer_stats_data.get(name.removeprefix("tpu_raiden_"))
-                     if name.startswith("tpu_raiden_") else None))
-            if vals:
-                for val in vals:
-                    if mtype == "histogram":
-                        per_engine_obj[engine_idx].observe(val)
-                    elif mtype == "counter":
-                        per_engine_obj[engine_idx].inc(val)
-                    elif mtype == "gauge":
-                        per_engine_obj[engine_idx].set(val)
+        for raw_key, vals in transfer_stats_data.items():
+            if not vals:
+                continue
+            base_name, parsed_labels = parse_labeled_metric_key(raw_key)
+
+            info = (self.dynamic_metrics.get(base_name) or
+                    self.dynamic_metrics.get(f"tpu_raiden_{base_name}") or
+                    (self.dynamic_metrics.get(base_name.removeprefix("tpu_raiden_"))
+                     if base_name.startswith("tpu_raiden_") else None))
+            if not info:
+                continue
+
+            mtype, metric_or_per_engine, metric_label_names = info
+
+            if metric_label_names:
+                full_labels = {**engine_labels, **parsed_labels}
+                for k in metric_label_names:
+                    full_labels.setdefault(k, "")
+                target_obj = metric_or_per_engine.labels(**full_labels)
+            else:
+                target_obj = (metric_or_per_engine[engine_idx]
+                              if isinstance(metric_or_per_engine, dict)
+                              else metric_or_per_engine)
+
+            for val in vals:
+                if mtype == "histogram":
+                    target_obj.observe(val)
+                elif mtype == "counter":
+                    target_obj.inc(val)
+                elif mtype == "gauge":
+                    target_obj.set(val)
