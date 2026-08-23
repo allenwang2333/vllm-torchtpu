@@ -376,6 +376,109 @@ def _patch_moe_fused_ep_threshold_contract() -> None:
         threshold)
 
 
+def _patch_moe_gather_then_route() -> None:
+    """Gather small DP batches before computing their router logits.
+
+    The baseline external-dispatch path computes the gate locally and then
+    all-gathers both hidden states and router logits. At small decode shapes,
+    the gate matmul is weight-streaming-bound, so recomputing it after the
+    hidden-state gather costs little and removes one collective per MoE layer.
+
+    The threshold is the worker-local token count. Zero leaves the runner
+    untouched. Shapes above the threshold retain the existing path.
+    """
+    from torch.nn import functional as F
+    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    threshold = envs.TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS
+    if threshold < 0:
+        raise ValueError(
+            "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS must be >= 0")
+    if threshold == 0:
+        return
+
+    runner_cls = moe_runner.MoERunner
+    if getattr(runner_cls, "_tpu_gather_then_route_patch", False):
+        return
+    original_forward_impl = runner_cls._forward_impl
+
+    def forward_impl(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+    ):
+        config = self.moe_config
+        if (config.dp_size <= 1 or hidden_states.shape[0] > threshold
+                or self.gate is None or config.is_sequence_parallel
+                or getattr(config, "pcp_size", 1) > 1):
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        quant_method = self.routed_experts.quant_method
+        external_apply = getattr(
+            quant_method, "apply_monolithic_external_dispatch", None)
+        if external_apply is None:
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        self.routed_experts._ensure_moe_quant_config_init()
+        self._maybe_sync_shared_experts_stream(shared_experts_input)
+
+        with self._sequence_parallel_context():
+            # Use the same DP group as the TPU communicator's dispatch.
+            hidden_states = get_dp_group().all_gather(hidden_states, dim=0)
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states,
+                                         self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.NO_OVERLAP,
+            )
+            fused_output = external_apply(
+                layer=self.routed_experts,
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+
+            fused_output = moe_runner.get_ep_group().combine(
+                fused_output,
+                False,
+            )
+            if self._shared_experts is None:
+                return fused_output
+            return self._shared_experts.output, fused_output
+
+    runner_cls._tpu_original_gather_then_route_forward_impl = (
+        original_forward_impl)
+    runner_cls._forward_impl = forward_impl
+    runner_cls._tpu_gather_then_route_patch = True
+    logger.info(
+        "Applied TPU patch: gather before routing at or below %d tokens.",
+        threshold)
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Keep PCP MoE dispatch/combine explicit for TorchTPU.
 
