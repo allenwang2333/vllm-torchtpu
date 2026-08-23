@@ -296,12 +296,6 @@ class TestTpuPlatform:
         vllm_config.model_config.architecture = pooled_arch
         assert unified_kv_layout_enabled(vllm_config)
 
-        # Native BF16 recurrent state is a compact per-layer tensor, so the
-        # single feature gate selects that layout before cache sizing.
-        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
-        assert not unified_kv_layout_enabled(vllm_config)
-        monkeypatch.delenv("TPU_GDN_RECURRENT_STATE_BF16")
-
         # An explicit setting wins in either direction.
         with patch.dict("os.environ",
                         {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}):
@@ -564,63 +558,6 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
-
-
-def _gdn_bf16_mixed_config():
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            architecture="Qwen3_5MoeForConditionalGeneration"),
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
-        speculative_config=None,
-        kv_transfer_config=None,
-    )
-
-
-class TestGdnRecurrentStateBf16Validation:
-
-    @staticmethod
-    def _enable_clean_gate(monkeypatch):
-        monkeypatch.setenv("TPU_GDN_RECURRENT_STATE_BF16", "1")
-        monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL",
-                           raising=False)
-        monkeypatch.delenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", raising=False)
-
-    def test_accepts_compact_mixed_mode(self, monkeypatch):
-        self._enable_clean_gate(monkeypatch)
-        config = _gdn_bf16_mixed_config()
-
-        tpu_platform._validate_gdn_recurrent_state_bf16(config)
-
-    @pytest.mark.parametrize(
-        ("case", "message"),
-        [
-            ("architecture", "not a Qwen GDN model"),
-            ("unified", "unified GDN pool is explicitly enabled"),
-            ("transfer", "KV transfer/PD disaggregation"),
-            ("raiden", "Raiden KV cache manager"),
-            ("pcp", "prefill context parallelism"),
-            ("speculative", "speculative decoding"),
-        ],
-    )
-    def test_rejects_non_mixed_or_non_compact_paths(self, monkeypatch, case,
-                                                     message):
-        self._enable_clean_gate(monkeypatch)
-        config = _gdn_bf16_mixed_config()
-        if case == "architecture":
-            config.model_config.architecture = "KimiLinearForCausalLM"
-        elif case == "unified":
-            monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
-        elif case == "transfer":
-            config.kv_transfer_config = SimpleNamespace()
-        elif case == "raiden":
-            monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
-        elif case == "pcp":
-            config.parallel_config.prefill_context_parallel_size = 2
-        elif case == "speculative":
-            config.speculative_config = SimpleNamespace()
-
-        with pytest.raises(ValueError, match=message):
-            tpu_platform._validate_gdn_recurrent_state_bf16(config)
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():

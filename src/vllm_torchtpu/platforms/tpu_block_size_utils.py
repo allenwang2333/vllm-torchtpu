@@ -22,20 +22,13 @@ logger = init_logger(__name__)
 def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     """Whether the deployment uses the attention-shaped unified KV pool.
 
-    The native-BF16 GDN gate selects the compact layout; its platform
-    validator rejects an explicit pooled-layout conflict. Otherwise an
-    explicit TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL wins in either direction.
+    An explicit TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL wins in either direction.
     Unset selects the pool for the GDN architectures that read their recurrent
     state out of the attention pages; everything else keeps the per-layer KV
     caches, which is the only layout an attention-only model has and the only
     one the other hybrid families implement.
     """
     from vllm_torchtpu import envs as tpu_envs
-    # Native BF16 recurrent checkpoints live in the compact per-layer Mamba
-    # cache. Select it before cache specs and block counts are derived, so one
-    # environment variable controls both storage and kernel state dtype.
-    if tpu_envs.TPU_GDN_RECURRENT_STATE_BF16:
-        return False
     override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
     if override is not None:
         return override
