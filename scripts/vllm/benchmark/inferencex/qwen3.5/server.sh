@@ -133,10 +133,20 @@ DEFAULT_PREFILL_SCHEDULE_INTERVAL="$SHARDING_PREFILL_SCHEDULE_INTERVAL"
 #
 # The interval is inert at DP=1, where the throttle only engages in a
 # DPEngineCoreProc, but the TP8 records pass it and carrying it costs nothing.
+#
+# c4 and c8 deliberately do not carry the record's max_num_seqs of 256. The
+# attention kernels here size their metadata off it directly -- kv_lens and
+# page_indices are shaped [max_num_seqs, ...] and the decode step walks every
+# slot -- so 256 makes each step do 256 sequences of work to serve 4. The
+# record's build buckets that dimension (ATTN_BUCKETIZED_NUM_REQS,
+# ATTN_CUSTOM_NUM_REQS_BUCKETS), which is why 256 is free over there and not
+# here. Measured: c4 4317.7 at 8 versus 4204.3 at 256, c8 6709.9 at 16 versus
+# 6732.9 at 256. Twice the concurrency is what this engine wants until the
+# batch is big enough for the padding to disappear into it.
 if [ "$ISL:$OSL" = "8192:1024" ]; then
   case "$SHARDING:$CONC" in
-    TP8_EP:4)   REFERENCE_POINT="256 16384 256" ;;
-    TP8_EP:8)   REFERENCE_POINT="256 16384 256" ;;
+    TP8_EP:4)   REFERENCE_POINT="8  16384 256" ;;
+    TP8_EP:8)   REFERENCE_POINT="16 16384 256" ;;
     TP8_EP:16)  REFERENCE_POINT="24   8192  64" ;;
     TP8_EP:32)  REFERENCE_POINT="48   8192  64" ;;
     TP8_EP:64)  REFERENCE_POINT="64   8192  16" ;;
