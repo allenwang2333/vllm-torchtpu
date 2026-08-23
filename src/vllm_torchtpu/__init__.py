@@ -437,15 +437,6 @@ def _patch_moe_gather_then_route() -> None:
         self.routed_experts._ensure_moe_quant_config_init()
         self._maybe_sync_shared_experts_stream(shared_experts_input)
 
-        # The large-bucket path below evaluates the gate before dispatch, so
-        # Dynamo lifts the gate parameters before the DP metadata consumed by
-        # the collective. Keep that input order in this shape-specialized
-        # branch too. Merely materializing the parameter tuple is enough to
-        # establish the source order while the gate itself still runs exactly
-        # once, after the hidden-state gather.
-        if not self._fse_fuse_gate:
-            _ = tuple(self.gate.parameters())
-
         with self._sequence_parallel_context():
             # Use the same DP group as the TPU communicator's dispatch.
             hidden_states = get_dp_group().all_gather(hidden_states, dim=0)
