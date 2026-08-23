@@ -487,7 +487,7 @@ def v3_state_source(
     else:
         assert ssm_ntok < block_size, (ssm_ntok, block_size)
         ssm_nblocks, ssm_nrows = 1, ssm_ntok
-    ssm_lane_split = (1 if ssm_dtype == jnp.dtype(pool.dtype) else
+    ssm_lane_split = (1 if ssm_dtype == jnp.dtype(jnp.bfloat16) else
                       lanes // d_v)
     ssm_view_lanes = lanes // ssm_lane_split
     ssm_rows_used = ssm_rows * d_v // ssm_view_lanes
