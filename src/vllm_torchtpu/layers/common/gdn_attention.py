@@ -790,8 +790,8 @@ def run_jax_gdn_attention_pooled_local(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
-    ``recurrent_state`` is the attention-shaped pool holding the f32 ssm
-    region at token offset 0 and the conv region in the tokens right after
+    ``recurrent_state`` is the attention-shaped pool holding the selected
+    f32/bf16 SSM region at token offset 0 and the conv region right after
     it. All pool knowledge lives here: for the chunked impls, conv state
     is gathered/scattered through `pool_adapters` around the stock conv
     kernel and the ssm region is threaded into the stock delta-rule via
@@ -878,7 +878,7 @@ def run_jax_gdn_attention_pooled(
         j_a: Input tensor of shape `(num_tokens, n_v)`.
         recurrent_state: The attention-shaped pool
           `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV
-          dtype, carrying the f32 ssm region and the bf16 conv slot as
+          dtype, carrying the selected f32/bf16 SSM region and bf16 conv as
           token-ranges of each state block. Block 0 is the null block, only
           used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,

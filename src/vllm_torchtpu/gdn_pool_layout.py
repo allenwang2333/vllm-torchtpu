@@ -17,9 +17,9 @@ POOLED_GDN_ARCHITECTURES = frozenset({
 
 # The pooled GDN kernel's state dtypes inside the unified pool are controlled
 # here: conv rows are always bf16 and the SSM region defaults to fp32. The
-# env-gated experiment may store SSM checkpoints as bf16 while the kernel
-# still computes in fp32. These physical dtypes are independent of the layer's
-# declared MambaSpec dtypes.
+# env-gated experiment stores SSM checkpoints and live recurrence/carry as
+# bf16 while retaining fp32 MXU accumulation. These physical dtypes are
+# independent of the layer's declared MambaSpec dtypes.
 # The default ABI constants below remain fp32 for page sizing and Raiden.
 # The bf16 selector is consumed only by the single-server mixed-mode kernel
 # plan, which uses a compact prefix of that unchanged allocation.

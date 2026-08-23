@@ -205,7 +205,8 @@ class GDNConfig:
         # needed.
         if self.mode == GDNMode.PER_SEQ:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
-            carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
+            carry_recurrent_scratch = pltpu.VMEM(
+                recurrent_shape, self.dtypes.recurrent_state)
 
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,

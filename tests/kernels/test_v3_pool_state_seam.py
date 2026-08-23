@@ -116,7 +116,7 @@ class TestV3StateSourcePlan:
         assert r.view_dtype == jnp.dtype(jnp.bfloat16)
         assert r.lane_split == 1
         assert r.rows_used == N_V * D_K * D_V // LANES
-        assert r.load_dtype == jnp.dtype(jnp.float32)
+        assert r.load_dtype is None
         c = plan.conv
         assert (c.kb0, c.nblocks, c.row0, c.nrows) == (1, 1, 0, CONV_NTOK)
         assert c.rows_used == CONV_ROWS
@@ -126,7 +126,7 @@ class TestV3StateSourcePlan:
         assert _plan() == _plan()
         assert hash(_plan()) == hash(_plan())
 
-    def test_bf16_ssm_in_fp8_pool_uses_fp32_intermediate(self):
+    def test_bf16_ssm_in_fp8_pool_keeps_bf16_compute(self):
         plan = _bf16_fp8_pool_plan()
         r = plan.recurrent
         assert (r.kb0, r.nblocks, r.row0, r.nrows) == (
@@ -134,7 +134,7 @@ class TestV3StateSourcePlan:
         assert r.view_dtype == jnp.dtype(jnp.bfloat16)
         assert r.lane_split == LANES // D_V
         assert r.rows_used == N_V * D_K
-        assert r.load_dtype == jnp.dtype(jnp.float32)
+        assert r.load_dtype is None
 
     def test_subblock_regions_when_pool_is_manager_grained(self):
         pool = jax.ShapeDtypeStruct(
@@ -302,7 +302,7 @@ def _read_states_bf16(pool, idx):
 
 class TestBf16RecurrentState:
 
-    def test_fp8_pool_bf16_state_uses_fp32_intermediate(self):
+    def test_fp8_pool_bf16_state_matches_fp32_checkpoint_reference(self):
         n = 2
         idx = jnp.array([1, 2], dtype=jnp.int32)
         identity = jnp.arange(n, dtype=jnp.int32)
@@ -358,7 +358,7 @@ class TestBf16RecurrentState:
                                        atol=3e-2,
                                        err_msg=f"step {step}")
 
-    def test_decode_trajectory_rounds_only_at_state_checkpoint(self):
+    def test_decode_bf16_trajectory_matches_fp32_checkpoint_reference(self):
         n = 4
         idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
         identity = jnp.arange(n, dtype=jnp.int32)
@@ -369,8 +369,8 @@ class TestBf16RecurrentState:
         pool = _write_states_bf16(_garbage_pool(51), ssm0, conv0, idx)
         initial_pool = jnp.copy(pool)
 
-        # Dense reference performs the same explicit HBM-boundary rounding;
-        # the wrapper itself still receives and computes recurrent state fp32.
+        # Compare the BF16 live recurrence against an FP32 recurrence with the
+        # same explicit HBM-boundary checkpoint rounding.
         dense_ssm = ssm0.astype(jnp.bfloat16).astype(jnp.float32)
         dense_conv = conv0
         for step in range(4):

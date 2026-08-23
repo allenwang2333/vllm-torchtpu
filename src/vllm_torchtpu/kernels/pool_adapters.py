@@ -500,8 +500,7 @@ def v3_state_source(
         view_dtype=ssm_dtype,
         lane_split=ssm_lane_split,
         rows_used=ssm_rows_used,
-        load_dtype=(jnp.dtype(jnp.float32)
-                    if ssm_dtype == jnp.dtype(jnp.bfloat16) else None),
+        load_dtype=None,
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)

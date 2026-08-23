@@ -163,9 +163,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
-    # Store the pooled GDN recurrent/SSM state as bf16 in HBM. The V3
-    # kernels immediately widen it to fp32 and retain fp32 compute/scratch;
-    # only the state checkpoint crossing the kernel boundary is rounded.
+    # Store the pooled GDN recurrent/SSM state as bf16 in HBM and keep the
+    # live recurrence/inter-tile carry in bf16. MXU dots still request fp32
+    # accumulation; state checkpoints and elementwise recurrence are bf16.
     # This experiment is restricted to the single-server mixed path; startup
     # refuses KV transfer, Raiden, PCP, and speculative decoding.
     "TPU_GDN_RECURRENT_STATE_BF16":

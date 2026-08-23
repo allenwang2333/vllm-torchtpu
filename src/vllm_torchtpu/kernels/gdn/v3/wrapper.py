@@ -205,7 +205,8 @@ def inner_kernel(
                         functools.partial(vmem_ldst.store_state_region, *args))
 
     if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1].astype(
+            cfg.dtypes.recurrent_state)
 
 
 def outer_kernel(
@@ -543,7 +544,7 @@ def fused_conv1d_gdn(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
                 compute=compute_precision,
-                recurrent_state=(jnp.float32.dtype
+                recurrent_state=(state_plan.recurrent.view_dtype
                                  if pooled else in_recurrent_state.dtype),
                 conv_state=(jnp.float32.dtype
                             if pooled else in_conv_state.dtype),
