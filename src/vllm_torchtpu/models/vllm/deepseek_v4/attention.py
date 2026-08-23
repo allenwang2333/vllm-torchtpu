@@ -687,6 +687,24 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         object.__setattr__(self, "_o_proj_op_instance", op)
         return op
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Store `wo_a` in the layout the fused o-projection kernel wants. """
+        del act_dtype
+        weight = self.wo_a.weight
+        transposed = (self.n_local_heads * self.head_dim //
+                      self.n_local_groups,
+                      self.n_local_groups * self.o_lora_rank)
+        if tuple(weight.shape) == transposed:
+            # Already done -- a reload path can run this hook twice.
+            return
+        assert tuple(weight.shape) == transposed[::-1], (
+            f"{self.prefix}.wo_a: expected the linear to hold "
+            f"{list(transposed[::-1])}, got {list(weight.shape)}.")
+
+        out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
+        out.copy_(weight.data.t())
+        self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+
     def _assert_o_proj_supported(self) -> None:
         """Check what the fused `wo_a` kernel requires.
 
@@ -708,9 +726,9 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         # (ENABLE_QUANTIZED_MATMUL_KERNEL + REQUANTIZE_BLOCK_SIZE) reshapes
         # this to [n_in_blocks, 1, n_out], which the kernel cannot consume.
         assert scale is not None and scale.ndim == 1 and scale.shape[0] == (
-            weight.shape[0]), (
+            weight.shape[-1]), (
                 f"{self.prefix}.wo_a: the fused o-projection kernel needs a "
-                f"per-channel weight_scale of shape [{weight.shape[0]}], got "
+                f"per-channel weight_scale of shape [{weight.shape[-1]}], got "
                 f"{None if scale is None else list(scale.shape)}. Unset "
                 "REQUANTIZE_BLOCK_SIZE.")
 
@@ -735,9 +753,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
                 positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
-        # the per-group `wo_a` matmul into one pass, and consumes the heads in
-        # place -- no [t, g, h * d] reshape of the attention output. It needs
-        # `wo_a` as [d, g * r], the transpose of the torch [g * r, d] layout.
+        # the per-group `wo_a` matmul into one pass.
         assert o.dtype == torch.bfloat16, (
             f"{self.prefix}: the fused o-projection kernel needs bf16 "
             f"activations, got {o.dtype}.")
@@ -749,7 +765,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
-            self.wo_a.weight.T,
+            self.wo_a.weight,
             self.wo_a.weight_scale,
         )
 
