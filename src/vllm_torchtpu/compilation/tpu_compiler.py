@@ -58,6 +58,24 @@ class TpuCompilationHandle:
 
 _tpu_backend = TpuBackend()
 
+
+def _deserialize_entry(entry: Any) -> Callable[..., Any]:
+    """Rebuild a runnable from a bundled AOTAutograd entry.
+
+    Restores the aot_autograd wrapper *and* the executable from the one entry,
+    and returns a varargs callable over the graph's placeholders -- the same
+    calling convention TpuBackend hands back, so `compile` and `load` produce
+    interchangeable runnables.
+
+    Module-level, and paired with `_tpu_backend`: a test that swaps the backend
+    for a fake has to swap this too, since the fake's "entry" never came from
+    torch and cannot go back through it.
+    """
+    from torch._functorch._aot_autograd.aot_autograd_result import \
+        deserialize_bundled_cache_entry
+    return deserialize_bundled_cache_entry(entry)
+
+
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
@@ -432,12 +450,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             return None
 
         try:
-            # Restores the aot_autograd wrapper *and* the executable from the
-            # one entry, and returns a varargs callable over the graph's
-            # placeholders -- the same convention TpuBackend hands back.
-            from torch._functorch._aot_autograd.aot_autograd_result import \
-                deserialize_bundled_cache_entry
-            return deserialize_bundled_cache_entry(payload.entry)
+            return _deserialize_entry(payload.entry)
         except Exception as e:
             logger.warning(
                 "[TpuCompilerAdaptor] Could not replay artifact %s, "

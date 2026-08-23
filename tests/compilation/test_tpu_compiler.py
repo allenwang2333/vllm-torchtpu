@@ -254,10 +254,10 @@ class TestTpuCompilerCache:
     def test_replay_refuses_artifacts_it_cannot_vouch_for(self, tmp_path):
         """Stale or damaged artifacts recompile instead of being replayed.
 
-        The pre-versioning format stored a bare executable picked off a shared
-        list by index, with nothing tying it to the graph it was saved under,
-        so replaying one can run the wrong program. Unpickling it restores no
-        version of its own and it is refused on that basis.
+        The older format stored a bare executable picked off a shared list by
+        index, with nothing tying it to the graph it was saved under, so
+        replaying one can run the wrong program. Restoring such a pickle leaves
+        `entry` at its class default of None, and it is refused on that basis.
         """
         import pickle
 
