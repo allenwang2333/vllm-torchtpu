@@ -31,20 +31,26 @@ SERVED_NAME="${SERVED_NAME:-Qwen/Qwen3.5-397B-A17B-FP8}"
 case "$MODEL" in
   gs://*) LOAD_FORMAT="${LOAD_FORMAT:-runai_streamer}" ;;
 esac
-# Headroom over ISL+OSL (matches InferenceX qwen3.5: ISL+OSL+20)
-MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-20}"
+# Headroom over ISL+OSL. A kilotoken, so the 8k1k point serves at a round
+# 10240. The reference jobs all serve at 70000 regardless of the workload, but
+# max_model_len past the longest request only widens the block table the
+# attention kernel walks, and there is no reason to carry their number.
+MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-1024}"
+
+# Scheduler steps between prefill admissions. Empty means don't pass the flag.
+SHARDING_PREFILL_SCHEDULE_INTERVAL=""
 
 case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # Match the measured-best DP8 jobs: admit prefills every 2 scheduler steps.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-2}"
+    # Admit prefills every 2 scheduler steps, unless the point table below
+    # names its own interval.
+    SHARDING_PREFILL_SCHEDULE_INTERVAL=2
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
-      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
     # Disable the locally ported coordinated scheduler for this reproduction.
     export DP_SCHED_ENABLED=0
@@ -76,12 +82,11 @@ case "$SHARDING" in
     # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
     # on the same chip + expert-parallel MoE.
     DP_SIZE=4
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-256}"
+    SHARDING_PREFILL_SCHEDULE_INTERVAL=256
     SHARDING_ARGS=(
       --tensor-parallel-size=2
       --data-parallel-size=4
       --enable-expert-parallel
-      --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
     )
     # Keep the coordinated DP scheduler disabled for reproduction runs.
     export DP_SCHED_ENABLED=0
@@ -104,26 +109,56 @@ MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-24576}"
 GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
 
-# The global token target is normally divided across DP ranks. The measured
-# DP8 high-concurrency points use smaller per-rank chunks instead.
+# Fallbacks for a point nobody has tuned: divide the node-wide token target
+# across DP ranks, and give the engine twice the client concurrency in
+# sequence slots so it can admit a new request while the batch drains.
 DEFAULT_MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
-case "$SHARDING:$CONC" in
-  DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_BATCHED_TOKENS=256 ;;
-esac
-# Max sequences is a node-wide target divided across DP ranks, at twice the
-# client concurrency. Sizing it to the concurrency exactly leaves the engine no
-# slot to admit a new request while the batch drains, and none of the top TP8
-# results others recorded at 8k1k do it: the c16, c32 and c64 record holder
-# runs 24, 48 and 64, and the c4 and c8 record holder runs 256 throughout. Two
-# is a uniform stand-in for that hand-tuned table, close to the 1.5x those
-# middle points use, and long over the 1x the c64 point wants.
 DEFAULT_MAX_NUM_SEQS=$(((2 * CONC + DP_SIZE - 1) / DP_SIZE))
-case "$SHARDING:$CONC" in
-  DP8_EP:128|DP8_EP:256) DEFAULT_MAX_NUM_SEQS=64 ;;
-esac
+DEFAULT_PREFILL_SCHEDULE_INTERVAL="$SHARDING_PREFILL_SCHEDULE_INTERVAL"
+
+# The swept 8k1k points are not a formula. Each one below is the scheduler
+# configuration of the job that holds the record at that concurrency, read off
+# its serve line, so a run here differs from the record in the engine and not
+# in how the engine was asked to batch. Fields are max_num_seqs,
+# max_num_batched_tokens and prefill_schedule_interval, the last per DP rank.
+#
+#   conc  job                          total tok/s
+#      4  j-c6283d9b-ca2e-44a6-9a6d         4349.6
+#      8  j-edf3640d-b658-440d-815f         6886.2
+#     16  j-9cc87140-d980-4274-b154         9473.9
+#     32  j-09e874c0-0ea0-4749-8029        12491.6
+#     64  j-c68bdb9a-dbf9-4ec4-b8d2        16216.0
+#    128  j-71ee7d19-3bcb-42f2-8e3c        21858.7
+#    256  j-2386a47f-6bfb-4a1d-879a        32244.6
+#
+# The interval is inert at DP=1, where the throttle only engages in a
+# DPEngineCoreProc, but the TP8 records pass it and carrying it costs nothing.
+if [ "$ISL:$OSL" = "8192:1024" ]; then
+  case "$SHARDING:$CONC" in
+    TP8_EP:4)   REFERENCE_POINT="256 16384 256" ;;
+    TP8_EP:8)   REFERENCE_POINT="256 16384 256" ;;
+    TP8_EP:16)  REFERENCE_POINT="24   8192  64" ;;
+    TP8_EP:32)  REFERENCE_POINT="48   8192  64" ;;
+    TP8_EP:64)  REFERENCE_POINT="64   8192  16" ;;
+    DP8_EP:128) REFERENCE_POINT="64    256   2" ;;
+    DP8_EP:256) REFERENCE_POINT="64    320   2" ;;
+    *)          REFERENCE_POINT="" ;;
+  esac
+  if [ -n "$REFERENCE_POINT" ]; then
+    read -r DEFAULT_MAX_NUM_SEQS DEFAULT_MAX_NUM_BATCHED_TOKENS \
+      DEFAULT_PREFILL_SCHEDULE_INTERVAL <<<"$REFERENCE_POINT"
+  fi
+fi
+
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-$DEFAULT_MAX_NUM_SEQS}"
+# Colon-dash on purpose: the recipe exports PREFILL_SCHEDULE_INTERVAL="" when
+# its PSI knob is unset, and that has to mean "you decide", not "no flag".
+PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-$DEFAULT_PREFILL_SCHEDULE_INTERVAL}"
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
+if [ -n "$PREFILL_SCHEDULE_INTERVAL" ]; then
+  SHARDING_ARGS+=(--prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL")
+fi
 
 # Increase API-server frontend wait time since cold init may take long.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
@@ -131,6 +166,13 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
+
+# The XLA flags every record-holding job passes and we never did. In order:
+# shard a trivially-shardable major dimension on the minor one instead; keep
+# the reduce-scatter of a collective off SparseCore, which the MoE wants for
+# its own gathers; combine all-reduces regardless of size; and leave async
+# collectives unmerged. Set to empty to serve with stock XLA defaults.
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS- --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false}"
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8
