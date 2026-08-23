@@ -764,6 +764,35 @@ def _build_v3_pool_state_plan(
     )
 
 
+def _bitcast_pool_to_u16(pool: jnp.ndarray) -> jnp.ndarray:
+    """Return a byte-identical 16-bit carrier with native 128-lane vectors.
+
+    The carrier deliberately uses an integer dtype. Interpreting the entire
+    unified pool as BF16 at the XLA boundary can canonicalize BF16 subnormal
+    bit patterns and corrupt unrelated FP8 KV bytes. ``uint16`` preserves all
+    bytes while giving the Pallas state seam the same native 128-lane shape;
+    only the selected GDN state regions are viewed as BF16 inside Pallas.
+    """
+    source_dtype = jnp.dtype(pool.dtype)
+    if source_dtype == jnp.dtype(jnp.uint16):
+        return pool
+    if source_dtype.itemsize != 1 or pool.shape[-1] % 2:
+        raise ValueError("BF16 GDN pool carrier requires an 8-bit source "
+                         "dtype and an even minor dimension, got "
+                         f"{pool.dtype} and shape {pool.shape}.")
+    paired_shape = (*pool.shape[:-1], pool.shape[-1] // 2, 2)
+    return jax.lax.bitcast_convert_type(pool.reshape(paired_shape), jnp.uint16)
+
+
+def _restore_u16_pool_carrier(pool: jnp.ndarray, raw_shape: tuple[int, ...],
+                              raw_dtype: jnp.dtype) -> jnp.ndarray:
+    """Inverse of ``_bitcast_pool_to_u16`` without changing pool bytes."""
+    raw_dtype = jnp.dtype(raw_dtype)
+    if raw_dtype == jnp.dtype(jnp.uint16):
+        return pool
+    return jax.lax.bitcast_convert_type(pool, raw_dtype).reshape(raw_shape)
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -801,6 +830,14 @@ def run_jax_gdn_attention_pooled_local(
     """
 
     conv_dim = conv_weight.shape[0]
+    use_bf16 = tpu_envs.TPU_GDN_RECURRENT_STATE_BF16
+    raw_pool_shape = recurrent_state.shape
+    raw_pool_dtype = recurrent_state.dtype
+    if use_bf16:
+        # Repack pairs of FP8 lanes as byte-exact uint16 words before entering
+        # Pallas. The selected state regions get BF16 ref views in Pallas,
+        # while the carrier itself cannot canonicalize unrelated pool bytes.
+        recurrent_state = _bitcast_pool_to_u16(recurrent_state)
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter
@@ -842,6 +879,9 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
     )
+    if use_bf16:
+        recurrent_state = _restore_u16_pool_carrier(
+            recurrent_state, raw_pool_shape, raw_pool_dtype)
     return recurrent_state, output
 
 
