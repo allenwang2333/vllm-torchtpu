@@ -180,6 +180,17 @@ if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
   args+=("${extra_serve_args[@]}")
 fi
 
+# Print the resolved configuration and exit without serving. sweep.sh uses this
+# to decide whether two points can share one running server. Most of these are
+# derived from CONC, so a key the sweep builds from its own variables would call
+# two points identical and benchmark the second against the first one's server.
+if [ -n "${PRINT_CONFIG:-}" ]; then
+  echo "${args[*]}" \
+    "USE_MOE_FUSED_EP_KERNEL=${USE_MOE_FUSED_EP_KERNEL:-}" \
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-}"
+  exit 0
+fi
+
 set -x
 vllm serve "${args[@]}"
 set +x

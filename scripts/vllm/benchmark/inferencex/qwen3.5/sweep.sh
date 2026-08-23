@@ -63,21 +63,40 @@ stop_server() {
   sleep "${TPU_RELEASE_WAIT:-20}"
 }
 
+# Environment server.sh runs under for one point, in SERVER_ENV. Starting a
+# server and asking what that server would be both go through here, so the
+# reuse key always describes the server the point would actually get.
+build_server_env() {
+  local sharding="$1"
+  local max_batched_tokens="$2"
+  local max_seqs="$3"
+  local prefill_interval="$4"
+  local fused_ep="$5"
+  SERVER_ENV=(SHARDING="$sharding" CONC="$CONC")
+  [ -n "$max_batched_tokens" ] && SERVER_ENV+=(MAX_NUM_BATCHED_TOKENS="$max_batched_tokens")
+  [ -n "$max_seqs" ] && SERVER_ENV+=(MAX_NUM_SEQS="$max_seqs")
+  [ -n "$prefill_interval" ] && SERVER_ENV+=(PREFILL_SCHEDULE_INTERVAL="$prefill_interval")
+  [ -n "$fused_ep" ] && SERVER_ENV+=(USE_MOE_FUSED_EP_KERNEL="$fused_ep")
+  return 0
+}
+
+# The serve command line server.sh would build for this point, without serving.
+server_config() {
+  build_server_env "$@"
+  env "${SERVER_ENV[@]}" PRINT_CONFIG=1 bash "${SCRIPT_DIR}/server.sh"
+}
+
 start_server() {
   local sharding="$1"
   local max_batched_tokens="$2"
   local max_seqs="$3"
   local prefill_interval="$4"
   local fused_ep="$5"
-  local -a server_env=(SHARDING="$sharding" CONC="$CONC")
-  [ -n "$max_batched_tokens" ] && server_env+=(MAX_NUM_BATCHED_TOKENS="$max_batched_tokens")
-  [ -n "$max_seqs" ] && server_env+=(MAX_NUM_SEQS="$max_seqs")
-  [ -n "$prefill_interval" ] && server_env+=(PREFILL_SCHEDULE_INTERVAL="$prefill_interval")
-  [ -n "$fused_ep" ] && server_env+=(USE_MOE_FUSED_EP_KERNEL="$fused_ep")
+  build_server_env "$@"
 
   SERVER_LOG="/tmp/qwen3.5_sweep_server_isl${ISL}_osl${OSL}_${sharding}_conc${CONC}_$(date +%m%d-%H%M%S)_$$.log"
   echo "--- starting server SHARDING=$sharding ISL=$ISL OSL=$OSL CONC=$CONC MAX_NUM_BATCHED_TOKENS=${max_batched_tokens:-default} MAX_NUM_SEQS=${max_seqs:-default} PREFILL_SCHEDULE_INTERVAL=${prefill_interval:-default} USE_MOE_FUSED_EP_KERNEL=${fused_ep:-default} (log: $SERVER_LOG) ---"
-  env "${server_env[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee "$SERVER_LOG") 2>&1 &
+  env "${SERVER_ENV[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee "$SERVER_LOG") 2>&1 &
   SERVER_PID=$!
   local waited=0
   until grep -q "Application startup complete" "$SERVER_LOG" 2>/dev/null; do
@@ -125,7 +144,15 @@ for wl in "${WORKLOADS[@]}"; do
       max_batched_tokens=""
       max_seqs=""
       prefill_interval=""
-      server_key="$ISL:$OSL:$sharding:$max_batched_tokens:$max_seqs:$prefill_interval:$fused_ep"
+      # Key on what server.sh resolves, not on the sweep's own variables. The
+      # sequence and token limits come out of CONC, which the three empty
+      # variables above do not carry, so every TP8_EP point looked identical
+      # and c8 through c64 were measured against the server built for c4.
+      config="$(server_config "$sharding" "$max_batched_tokens" "$max_seqs" "$prefill_interval" "$fused_ep")" || {
+        echo "ERROR: server.sh could not resolve a config for $point" >&2
+        exit 1
+      }
+      server_key="$ISL:$OSL:$config"
     fi
     [ -n "$sharding" ] || { echo "ERROR: no sharding in SHARDING_TABLE for ISL=$ISL OSL=$OSL CONC=$CONC" >&2; exit 1; }
     if [ "$server_key" != "$current_server_key" ]; then
