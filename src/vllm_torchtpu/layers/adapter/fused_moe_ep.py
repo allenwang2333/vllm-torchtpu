@@ -101,6 +101,10 @@ _OPS: dict[tuple, Any] = {}
 # see the note in fused_ep_moe_v2 on why a value computed inside the traced
 # function turns into a `partition-id` XLA will not accept.
 _RANK_BUFFER: Any = None
+# Whether the armed ops take this rank's valid-prefix length as an operand, so
+# the kernel skips padded rows. Set by prebuild from TPU_MOE_SKIP_PADDED_TOKENS,
+# which is process-wide like the rank buffer.
+_SKIP_PADDED_TOKENS = False
 
 # The attribute prebuild's result is recorded under, on the quant method that
 # owns the layer. vLLM builds one quant method per MoE layer
@@ -161,6 +165,7 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    skip_padded_tokens=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -178,6 +183,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        skip_padded_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -222,7 +228,8 @@ def _build_op(
         )
 
     # Every operand is annotated jax.Array: torch_tpu infers static argnums
-    # from the signature and refuses an unannotated one.
+    # from the signature and refuses an unannotated one. `valid_tokens`, when
+    # the op takes it, is always the last operand.
     def moe(
         x: jax.Array,
         w1: jax.Array,
@@ -233,6 +240,20 @@ def _build_op(
         rank: jax.Array,
     ) -> jax.Array:
         return call(x, w1, w2, w1_scale, w2_scale, gating, rank)
+
+    def moe_with_valid_tokens(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        valid_tokens: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens=valid_tokens
+        )
 
     def moe_with_score_bias(
         x: jax.Array,
@@ -253,6 +274,29 @@ def _build_op(
             gating,
             rank,
             score_bias=score_bias.astype(jnp.float32),
+        )
+
+    def moe_with_score_bias_and_valid_tokens(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        valid_tokens: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            valid_tokens=valid_tokens,
         )
 
     def moe_with_hash_ids(
@@ -276,20 +320,43 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_with_hash_ids_and_valid_tokens(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        valid_tokens: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            valid_tokens=valid_tokens,
+        )
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
     # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
     # so a heterogeneous tuple is what it wants; the bias is NOT closed over
     # as a constant because it differs per layer and `_OPS` would then key one
-    # exported program per MoE layer.
+    # exported program per MoE layer. The valid-prefix length is one int32 per
+    # rank, sharded like the rows it describes.
     input_specs = (
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((spec,) if skip_padded_tokens else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -298,17 +365,25 @@ def _build_op(
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
     if has_score_bias:
-        fn = moe_with_score_bias
+        fn = (
+            moe_with_score_bias_and_valid_tokens
+            if skip_padded_tokens
+            else moe_with_score_bias
+        )
     elif has_hash_ids:
-        fn = moe_with_hash_ids
+        fn = (
+            moe_with_hash_ids_and_valid_tokens
+            if skip_padded_tokens
+            else moe_with_hash_ids
+        )
     else:
-        fn = moe
+        fn = moe_with_valid_tokens if skip_padded_tokens else moe
     op = jax_op(
         name,
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # -- and the single output is sharded on axis 0 like x.
+        # [, valid_tokens] -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
@@ -361,19 +436,42 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w2_scale),
         )
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    if _SKIP_PADDED_TOKENS:
+        extra += (_local_valid_tokens(),)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
+def _local_valid_tokens() -> torch.Tensor:
+    """This rank's valid-prefix length, [1] int32, for the padded-row skip."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    valid_tokens = token_padding.get_local_valid_tokens()
+    if valid_tokens is None:
+        raise RuntimeError(
+            "fused EP padding skipping is enabled but the runner did not "
+            "install padding state"
+        )
+    return valid_tokens
+
+
 def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
-    """Keep the fused-EP rank buffer in the GMM shape-specialized graph.
+    """Keep fused-EP buffers stable across shape-specific graphs.
 
     The subtraction is identically zero and XLA removes it, but its dataflow
-    keeps the runtime rank buffer in the FX subgraph's lifted input list.
+    keeps the runtime buffers in the FX subgraph's lifted input list, so the
+    GMM and fused variants of a bucket take the same inputs.
     """
-    if _RANK_BUFFER is None:
-        return output
-    value = _RANK_BUFFER.reshape(-1)[0].to(output.dtype)
-    return output + (value - value)
+    graph_inputs = [_RANK_BUFFER]
+    if _SKIP_PADDED_TOKENS:
+        graph_inputs.append(_local_valid_tokens())
+    marker = None
+    for graph_input in graph_inputs:
+        if graph_input is None:
+            continue
+        value = graph_input.reshape(-1)[0].to(output.dtype)
+        zero = value - value
+        marker = zero if marker is None else marker + zero
+    return output if marker is None else output + marker
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -636,6 +734,9 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
+    # The runner's padding state describes a valid prefix of this rank's own
+    # rows. Under PCP a rank's rows are not such a prefix, so padding stays.
+    skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS and pcp == 1
     op = _build_op(
         mesh,
         topk,
@@ -650,12 +751,15 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        skip_padded_tokens=skip_padded_tokens,
     )
+    global _SKIP_PADDED_TOKENS
+    _SKIP_PADDED_TOKENS = skip_padded_tokens
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "token_replica_groups=%s skip_padded_tokens=%s",
         hidden,
         inter,
         local_experts,
@@ -672,18 +776,22 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         routed_scale,
         token_replica_groups,
+        skip_padded_tokens,
     )
-    # Two knobs stop applying the moment this arms, and neither would say so on
-    # its own: the fused call returns before `apply_monolithic` reaches either
-    # the padding mask or the chunked path. Padding costs expert work and
-    # transport rather than correctness -- and it is not free at warmup, where
+    # Knobs that stop applying the moment this arms, and would not say so on
+    # their own: the fused call returns before `apply_monolithic` reaches the
+    # chunked path, and the padding mask only reaches the kernel as the
+    # valid-prefix operand above. Padding costs expert work and transport
+    # rather than correctness -- and it is not free at warmup, where
     # `_dummy_run` marks the whole batch as padding.
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    padding_ignored = envs.TPU_MOE_SKIP_PADDED_TOKENS and not skip_padded_tokens
+    if padding_ignored or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
         logger.warning_once(
-            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s and "
+            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s (pcp=%d) and "
             "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
             "layer: the kernel routes and exchanges inside its own program.",
             envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            pcp,
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op

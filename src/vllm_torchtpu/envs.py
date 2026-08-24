@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
     TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -681,6 +682,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": lambda: int(
         os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")
     ),
+    # Let the fused-EP activation-row all-gather overlap routing. Pair it with
+    # the async all-gather XLA flags; without them this only names the scope.
+    "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER": env_bool("TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER"),
     # For small DP token buckets, gather hidden states first and recompute the
     # router logits on the gathered rows. This removes the separate router-
     # logits all-gather. Zero disables the optimization and preserves the
