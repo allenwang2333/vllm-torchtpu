@@ -151,6 +151,7 @@ def _manifest_for_tensor(tensor: Any,
                     "block_size": case.block_tokens,
                     "num_kv_heads": 2,
                     "head_size": 256,
+                    "page_size_bytes": case.block_stride_bytes,
                 })(),
         })()
     return rpm.build_qwen35_pool_manifest(

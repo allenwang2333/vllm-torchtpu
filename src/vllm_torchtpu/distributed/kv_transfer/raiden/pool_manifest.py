@@ -29,9 +29,11 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any, Mapping, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu import gdn_pool_layout
 from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
                                            POOLED_GDN_CONV_STATE_ITEMSIZE,
                                            POOLED_GDN_SSM_STATE_DTYPE,
@@ -186,6 +188,30 @@ def _dtype_tag(tensor: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _dtype_itemsize(dtype: Any) -> int:
+    itemsize = getattr(dtype, "itemsize", None)
+    if itemsize is not None:
+        return int(itemsize)
+    # Test fakes and serialized specs may carry a dtype name rather than a
+    # torch.dtype.  Keep this module importable without importing torch/TPU.
+    name = str(dtype).removeprefix("torch.")
+    known = {
+        "bfloat16": 2,
+        "float16": 2,
+        "float32": 4,
+        "float64": 8,
+        "float8_e4m3fn": 1,
+        "float8_e5m2": 1,
+        "int8": 1,
+        "uint8": 1,
+    }
+    try:
+        return known[name]
+    except KeyError as exc:
+        raise ManifestError(f"cannot determine item size of dtype {dtype!r}") \
+            from exc
+
+
 @dataclasses.dataclass(frozen=True)
 class _PooledStateView:
     """Tensor-like metadata for one logical state inside a unified pool.
@@ -259,9 +285,28 @@ class GdnHeadGeometry:
                 self.local_value_heads * self.value_head_dim)
 
 
-def _fa_regions(*, block_size_tokens: int, token_stride_bytes: int,
-                num_kv_heads: int, head_size: int,
-                itemsize: int) -> tuple[RegionSpec, ...]:
+def _fa_regions(*,
+                block_size_tokens: int,
+                token_stride_bytes: int,
+                num_kv_heads: int,
+                head_size: int,
+                itemsize: int,
+                mla_latent: bool = False) -> tuple[RegionSpec, ...]:
+    if mla_latent:
+        # MLA stores one latent row per token (no separate K/V heads).
+        unit_bytes = head_size * itemsize
+        if unit_bytes > token_stride_bytes:
+            raise ManifestError(
+                "MLA live bytes per token exceed the physical token stride: "
+                f"live={unit_bytes} stride={token_stride_bytes}")
+        return (RegionSpec(
+            name="fa_payload",
+            offset_bytes=0,
+            stride_bytes=token_stride_bytes,
+            unit_bytes=unit_bytes,
+            num_units=block_size_tokens,
+            units_per_stride=1,
+        ), )
     unit_bytes = 2 * head_size * itemsize  # one K+V head pair per token
     live_per_token = unit_bytes * num_kv_heads
     if live_per_token > token_stride_bytes:
@@ -287,6 +332,10 @@ def _gdn_conv_regions(*, conv_shape: Sequence[int], itemsize: int,
         conv_shape = (conv_shape[0], conv_shape[1], conv_shape[3])
     elif len(conv_shape) == 4 and conv_shape[1] == 1:
         conv_shape = (conv_shape[0], conv_shape[2], conv_shape[3])
+    if len(conv_shape) == 5:
+        # KDA layout (blocks, taps, qkv, heads, head_dim): the qkv split is
+        # the middle axis, so flattening the tail keeps [Q | K | V] per tap.
+        conv_shape = (conv_shape[0], conv_shape[1], math.prod(conv_shape[2:]))
     if len(conv_shape) != 3:
         raise ManifestError("GDN conv state must be (blocks, taps, dim) or "
                             f"(blocks, taps, 1, dim): got {conv_shape}")
@@ -445,18 +494,45 @@ def _pooled_gdn_state_views(*, pool: Any, spec: Any,
             f"states={conv_bytes + ssm_bytes} page={manager_page_bytes}")
     num_blocks = raw_nbytes // manager_page_bytes
 
+    # The conv region starts after the SSM region's padded extent, not its
+    # raw byte size; a state that does not divide the pool row leaves the
+    # tail of its last row as padding (derive_pooled_gdn_state_layout). The
+    # row quantum is the pool's own shape[1] row — for token-axis-packed
+    # caches (MLA) that is a packed multi-token row, wider than one token —
+    # so derive it from the pool's trailing dims rather than the manager's
+    # token count.
+    pool_shape = tuple(int(dim) for dim in getattr(pool, "shape", ()))
+    if len(pool_shape) < 3:
+        # A flat byte pool carries no row geometry. Fall back to the raw
+        # state size, which coincides with the padded extent whenever the
+        # state divides the pool row (true for every flat-pool geometry
+        # today; only shaped pools pad).
+        ssm_extent_bytes = ssm_bytes
+    else:
+        fa_row_bytes = (math.prod(pool_shape[2:]) *
+                        _dtype_itemsize(getattr(pool, "dtype", None)))
+        rows_per_page, remainder = divmod(manager_page_bytes, fa_row_bytes)
+        if fa_row_bytes <= 0 or remainder:
+            raise ManifestError(
+                f"manager page bytes {manager_page_bytes} for {layer_name} "
+                f"are not a whole number of pool rows ({fa_row_bytes} B)")
+        layout = gdn_pool_layout.derive_pooled_gdn_state_layout(
+            ssm_bytes=ssm_bytes,
+            conv_bytes=conv_bytes,
+            token_bytes=fa_row_bytes,
+        )
+        if layout.required_tokens > rows_per_page:
+            raise ManifestError(
+                f"GDN state regions for {layer_name} exceed one manager page: "
+                f"{layout.required_tokens} rows > {rows_per_page}")
+        ssm_extent_bytes = layout.ssm_tokens * fa_row_bytes
+
     states: list[_PooledStateView] = []
     # The PR #106 pooled ABI places SSM first and conv immediately after it,
     # while the public/canonical manifest order remains conv then SSM.
-    for shape, dtype, itemsize, state_bytes, offset_bytes in ((conv_shape,
-                                                               conv_dtype,
-                                                               conv_itemsize,
-                                                               conv_bytes,
-                                                               ssm_bytes),
-                                                              (ssm_shape,
-                                                               ssm_dtype,
-                                                               ssm_itemsize,
-                                                               ssm_bytes, 0)):
+    for shape, dtype, itemsize, state_bytes, offset_bytes in (
+        (conv_shape, conv_dtype, conv_itemsize, conv_bytes, ssm_extent_bytes),
+        (ssm_shape, ssm_dtype, ssm_itemsize, ssm_bytes, 0)):
         absolute_offset_bytes = pool_offset_bytes + offset_bytes
         if (manager_page_bytes % itemsize != 0
                 or absolute_offset_bytes % itemsize != 0):
@@ -598,24 +674,29 @@ def build_qwen35_pool_manifest(
                 raise ManifestError(
                     f"full-attention cache {layer_name} needs a paged shape: "
                     f"got {shape}")
-            total_tokens = shape[0] * shape[1]
-            if total_tokens % block_size != 0:
-                raise ManifestError(
-                    f"full-attention cache {layer_name} token capacity "
-                    f"{total_tokens} is not divisible by the logical block "
-                    f"size {block_size}")
-            num_blocks = total_tokens // block_size
-            if nbytes % total_tokens != 0:
+            # Derive block counts from bytes, not the shape's row axis: for
+            # token-axis-packed caches (MLA) shape[1] is packed rows, not
+            # tokens.
+            page_bytes = int(spec.page_size_bytes)
+            if page_bytes <= 0 or nbytes % page_bytes != 0:
                 raise ManifestError(
                     f"full-attention cache {layer_name} nbytes {nbytes} is "
-                    f"not divisible by token capacity {total_tokens}")
-            token_stride = nbytes // total_tokens
-            live_stride = nbytes // num_blocks
+                    f"not divisible by the page size {page_bytes}")
+            num_blocks = nbytes // page_bytes
+            if page_bytes % block_size != 0:
+                raise ManifestError(
+                    f"full-attention cache {layer_name} page bytes "
+                    f"{page_bytes} are not token-linear over block size "
+                    f"{block_size}")
+            token_stride = page_bytes // block_size
+            live_stride = page_bytes
             regions = _fa_regions(block_size_tokens=block_size,
                                   token_stride_bytes=token_stride,
                                   num_kv_heads=num_kv_heads,
                                   head_size=head_size,
-                                  itemsize=itemsize)
+                                  itemsize=itemsize,
+                                  mla_latent=getattr(spec, "kv_lora_rank",
+                                                     None) is not None)
         else:
             if not shape:
                 raise ManifestError(f"GDN state {layer_name} has no shape")

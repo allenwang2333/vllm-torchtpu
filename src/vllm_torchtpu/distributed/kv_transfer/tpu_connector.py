@@ -1440,18 +1440,7 @@ class TPURaidenConnectorWorker:
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
-            gdn_geometry=rpm.GdnHeadGeometry(
-                local_key_heads=self._local_gdn_head_count(
-                    self._model_config_int("linear_num_key_heads", 0)),
-                local_value_heads=self._local_gdn_head_count(
-                    self._model_config_int("linear_num_value_heads", 0)),
-                key_head_dim=self._model_config_int("linear_key_head_dim", 1),
-                value_head_dim=self._model_config_int(
-                    "linear_value_head_dim",
-                    self._model_config_int("linear_key_head_dim", 1)),
-                conv_kernel_size=self._model_config_int(
-                    "linear_conv_kernel_dim", 4),
-            ),
+            gdn_geometry=self._gdn_head_geometry(),
         )
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.
@@ -1986,6 +1975,45 @@ class TPURaidenConnectorWorker:
                 f"TP-local GDN heads={tp_local_heads} must be divisible by "
                 f"pcp_size={pcp_size}")
         return tp_local_heads // pcp_size
+
+    def _gdn_head_geometry(self):
+        """Derive the per-rank linear-attention geometry for the manifest.
+
+        Qwen3.x GDN models expose ``linear_*`` fields on the (text) config.
+        Kimi KDA models carry the same facts in the ``linear_attn_config``
+        dict instead, and use one head count and one head dim for q/k/v.
+        """
+        from vllm_torchtpu.distributed.kv_transfer.raiden import \
+            pool_manifest as rpm
+
+        model_config = self.vllm_config.model_config
+        hf_config = model_config.hf_config
+        if hf_config is None:
+            hf_config = model_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        kda_config = getattr(text_config, "linear_attn_config", None)
+        if kda_config is not None:
+            local_heads = self._local_gdn_head_count(
+                int(kda_config["num_heads"]))
+            head_dim = int(kda_config["head_dim"])
+            return rpm.GdnHeadGeometry(
+                local_key_heads=local_heads,
+                local_value_heads=local_heads,
+                key_head_dim=head_dim,
+                value_head_dim=head_dim,
+                conv_kernel_size=int(kda_config["short_conv_kernel_size"]))
+        return rpm.GdnHeadGeometry(
+            local_key_heads=self._local_gdn_head_count(
+                self._model_config_int("linear_num_key_heads", 0)),
+            local_value_heads=self._local_gdn_head_count(
+                self._model_config_int("linear_num_value_heads", 0)),
+            key_head_dim=self._model_config_int("linear_key_head_dim", 1),
+            value_head_dim=self._model_config_int(
+                "linear_value_head_dim",
+                self._model_config_int("linear_key_head_dim", 1)),
+            conv_kernel_size=self._model_config_int("linear_conv_kernel_dim",
+                                                    4),
+        )
 
     def process_send_load(self,
                           metadata: TPUConnectorMetadata,

@@ -310,8 +310,11 @@ def test_hybrid_materialization_builds_raiden_logical_regions():
     assert all(pool.block_stride_bytes == 1024 for pool in manifest.pools)
     assert ssm.base_offset_bytes == 0
     # Kernel-tied SSM bytes from the geometry (1 V head × 4 × 2 fp32), not
-    # from the declared MambaSpec ssm shape.
-    assert conv.base_offset_bytes == 1 * 4 * 2 * torch.float32.itemsize
+    # from the declared MambaSpec ssm shape. The 32 B state does not fill the
+    # 64 B pool row (2*2*8 bf16), so the conv region starts after the padded
+    # whole-row extent.
+    pool_row_bytes = 2 * 2 * 8 * torch.bfloat16.itemsize
+    assert conv.base_offset_bytes == pool_row_bytes
     rpm.verify_storage_binding(manifest, materialized.kv_caches,
                                materialized.raw_tensors)
 

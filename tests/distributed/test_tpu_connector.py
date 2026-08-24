@@ -1325,7 +1325,8 @@ def _synthetic_qwen35_materialization(*, tp_size: int, pcp_size: int = 1):
             layer_names=tuple(fa_names),
             kv_cache_spec=SimpleNamespace(block_size=8,
                                           num_kv_heads=fa_kv_heads,
-                                          head_size=4),
+                                          head_size=4,
+                                          page_size_bytes=128),
         ),
         SimpleNamespace(layer_names=tuple(gdn_names[:15]),
                         kv_cache_spec=SimpleNamespace()),
@@ -1402,6 +1403,40 @@ class TestTPURaidenConnectorWorker:
         self.worker = _make_raiden_worker(is_producer=True)
         self.engine = _FakeRaidenEngine()
         self.worker._raiden_transfer_engine = self.engine
+
+    def test_gdn_head_geometry_kimi_linear_attn_config(self):
+        # Kimi KDA models carry the geometry in linear_attn_config rather
+        # than Qwen-style linear_* fields; KDA uses one head count and one
+        # head dim for q/k/v.
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, pcp_size=1)
+        worker.vllm_config.model_config.hf_config = SimpleNamespace(
+            linear_attn_config={
+                "num_heads": 32,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+            })
+
+        geometry = worker._gdn_head_geometry()
+
+        assert geometry.local_key_heads == 8
+        assert geometry.local_value_heads == 8
+        assert geometry.key_head_dim == 128
+        assert geometry.value_head_dim == 128
+        assert geometry.conv_kernel_size == 4
+
+    def test_gdn_head_geometry_qwen_linear_fields(self):
+        # _make_vllm_config declares linear_num_key_heads=16,
+        # linear_num_value_heads=32, and 2-dim heads; TP4/PCP2 localizes
+        # the GDN heads across both.
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, pcp_size=2)
+
+        geometry = worker._gdn_head_geometry()
+
+        assert geometry.local_key_heads == 2
+        assert geometry.local_value_heads == 4
+        assert geometry.key_head_dim == 2
+        assert geometry.value_head_dim == 2
+        assert geometry.conv_kernel_size == 4
 
     def test_stage3_request_id_binding_is_bijective(self):
         worker = _make_raiden_worker(is_producer=False)
