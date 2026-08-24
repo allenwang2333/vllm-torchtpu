@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS: int = 0
     USE_MOE_FUSED_EP_KERNEL: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
@@ -656,6 +657,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
+    ),
+    # Enable native hierarchical all-reduce above this token count.
+    "TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS", "0")
     ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
