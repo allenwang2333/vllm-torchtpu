@@ -347,6 +347,26 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = layer._tpu_activation_str
+        if enable_pipelined_collective_and_compute():
+            kwargs = {
+                "hidden_states": x,
+                "layer": layer,
+                "w1": layer.w13_weight,
+                "w2": layer.w2_weight,
+                "w1_scale": layer.w13_weight_scale,
+                "w2_scale": layer.w2_weight_scale,
+                "w1_bias": None,
+                "w2_bias": None,
+                "topk_weights": None,
+                "topk_ids": None,
+                "experts_start": layer._experts_start,
+                "topk": layer.moe_config.experts_per_token,
+                "activation": activation_str,
+                "router_logits": router_logits,
+                "input_ids": input_ids,
+            }
+            return pipelined_fused_moe_gmm(**kwargs)
+
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
@@ -358,7 +378,10 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         # the other three TPU MoE methods already passed it). moe_routing.route
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(layer,
+                                                   x,
+                                                   router_logits,
+                                                   input_ids=input_ids)
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,
@@ -373,9 +396,6 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
-
         return fused_moe_gmm(**kwargs)
 
 

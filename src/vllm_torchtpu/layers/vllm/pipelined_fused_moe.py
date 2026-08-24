@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 
 
@@ -89,24 +90,28 @@ def pipelined_fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    w1_bias: Optional[torch.Tensor],
-    w2_bias: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    experts_start: Optional[torch.Tensor],
-    topk: int,
-    activation: str,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    experts_start: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    activation: str = "silu",
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    layer=None,
+    router_logits: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP collectives and compute.
 
     This function wraps `fused_moe_gmm` by taking control of Data Parallel
-    collective communications (AllGather of activations/routing tensors and
-    ReduceScatter of outputs) and staging them in chunks to overlap network
-    communication with TPU matrix multiplication compute.
+    collective communications (AllGather of activations and ReduceScatter of outputs)
+    and staging them in chunks to overlap network communication with TPU matrix
+    multiplication compute. Routing is performed on the gathered activation tokens
+    locally on TPU MXU/VPU.
 
     When `enable_pipelined_collective_and_compute()` is True and DP world size > 1,
     the sequence is partitioned into balanced chunks and executed via a 3-stage
@@ -124,13 +129,16 @@ def pipelined_fused_moe_gmm(
         w2_scale: Optional second projection scale tensor.
         w1_bias: Optional first projection bias tensor.
         w2_bias: Optional second projection bias tensor.
-        topk_weights: Routing top-k weights [S, topk].
-        topk_ids: Routing top-k expert IDs [S, topk].
+        topk_weights: Optional routing top-k weights [S, topk].
+        topk_ids: Optional routing top-k expert IDs [S, topk].
         experts_start: Optional 0-d tensor of starting expert ID for this shard.
         topk: Number of experts selected per token.
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        layer: Optional RoutedExperts layer containing router parameters.
+        router_logits: Optional router logits tensor.
+        input_ids: Optional input IDs for hash routing.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
@@ -146,14 +154,25 @@ def pipelined_fused_moe_gmm(
     if num_chunks == 1 or dp_size == 1:
         if dp_size > 1:
             ag_hidden_states = dp_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (dp_group.all_gather(topk_weights, dim=0)
-                               if topk_weights is not None else None)
-            ag_topk_ids = (dp_group.all_gather(topk_ids, dim=0)
-                           if topk_ids is not None else None)
+            if layer is not None:
+                ag_topk_weights, ag_topk_ids = moe_routing.route_on_gathered_tokens(
+                    layer, ag_hidden_states, input_ids=input_ids)
+            else:
+                ag_topk_weights = (dp_group.all_gather(topk_weights, dim=0)
+                                   if topk_weights is not None else None)
+                ag_topk_ids = (dp_group.all_gather(topk_ids, dim=0)
+                               if topk_ids is not None else None)
         else:
             ag_hidden_states = hidden_states
-            ag_topk_weights = topk_weights
-            ag_topk_ids = topk_ids
+            if (topk_weights is None or topk_ids is None) and layer is not None:
+                ag_topk_weights, ag_topk_ids = moe_routing.route_on_gathered_tokens(
+                    layer,
+                    ag_hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids)
+            else:
+                ag_topk_weights = topk_weights
+                ag_topk_ids = topk_ids
 
         out = fused_moe_gmm(
             hidden_states=ag_hidden_states,
@@ -170,6 +189,9 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            layer=layer,
+            router_logits=router_logits,
+            input_ids=input_ids,
         )
 
         if dp_size > 1:
@@ -181,21 +203,9 @@ def pipelined_fused_moe_gmm(
         hidden_states[i * chunk_size_local:(i + 1) * chunk_size_local]
         for i in range(num_chunks)
     ]
-    weights_slices = [
-        topk_weights[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_weights is not None else [None] * num_chunks
-    ids_slices = [
-        topk_ids[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_ids is not None else [None] * num_chunks
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = dp_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (dp_group.all_gather(weights_slices[0], dim=0)
-                  if weights_slices[0] is not None else None)
-    ag_ti_curr = (dp_group.all_gather(ids_slices[0], dim=0)
-                  if ids_slices[0] is not None else None)
 
     rs_outputs = []
 
@@ -203,10 +213,20 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = dp_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (dp_group.all_gather(weights_slices[i + 1], dim=0)
-                          if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (dp_group.all_gather(ids_slices[i + 1], dim=0)
-                          if ids_slices[i + 1] is not None else None)
+
+        # Route on current gathered chunk activations
+        if layer is not None:
+            ag_tw_curr, ag_ti_curr = moe_routing.route_on_gathered_tokens(
+                layer, ag_hs_curr, input_ids=input_ids)
+        elif topk_weights is not None and topk_ids is not None:
+            ag_tw_curr = dp_group.all_gather(
+                topk_weights[i * chunk_size_local:(i + 1) * chunk_size_local],
+                dim=0)
+            ag_ti_curr = dp_group.all_gather(
+                topk_ids[i * chunk_size_local:(i + 1) * chunk_size_local],
+                dim=0)
+        else:
+            ag_tw_curr, ag_ti_curr = None, None
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -224,6 +244,9 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            layer=layer,
+            router_logits=router_logits,
+            input_ids=input_ids,
         )
 
         # Reduce-scatter partial output for current chunk
@@ -231,6 +254,6 @@ def pipelined_fused_moe_gmm(
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:
-            ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
+            ag_hs_curr = ag_hs_next
 
     return torch.cat(rs_outputs, dim=0)

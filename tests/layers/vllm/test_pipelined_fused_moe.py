@@ -244,9 +244,71 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids) and 2 reduce-scatters
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls
+    # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls in legacy fallback
     assert len(ag_calls) == 6
     # 1 tensor reduce-scattered per chunk * 2 chunks = 2 reduce_scatter calls
+    assert len(rs_calls) == 2
+
+
+def test_pipelined_moe_with_layer_routes_on_gathered_tokens_single_collective():
+    """Verify layer-based pipelining gathers activations only (1 AG per chunk) and routes locally."""
+    dp_group = _MockDPGroup(world_size=4, rank=0)
+    seq_len = 8192
+    hidden_dim = 128
+    topk = 2
+    num_experts = 4
+
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    w1 = torch.randn(num_experts,
+                     hidden_dim,
+                     hidden_dim * 2,
+                     dtype=torch.bfloat16)
+    w2 = torch.randn(num_experts,
+                     hidden_dim * 2,
+                     hidden_dim,
+                     dtype=torch.bfloat16)
+
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(experts_per_token=topk),
+        renormalize=True,
+        scoring_func="softmax",
+        gate=torch.nn.Linear(
+            hidden_dim, num_experts, bias=False, dtype=torch.bfloat16),
+    )
+
+    def mock_kernel_fn(hidden_states, topk_weights, topk_ids, *args, **kwargs):
+        assert topk_weights is not None
+        assert topk_ids is not None
+        assert topk_weights.shape[0] == hidden_states.shape[0]
+        assert topk_ids.shape[0] == hidden_states.shape[0]
+        return hidden_states * 2.0
+
+    with patch.object(envs, "VLLM_TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=None,
+            topk_ids=None,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+            layer=layer,
+        )
+
+    assert out.shape == (seq_len, hidden_dim)
+    torch.testing.assert_close(out, hidden_states * 2.0)
+
+    # With layer-based routing: 1 tensor gathered per chunk * 2 chunks = 2 all_gather calls
+    ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
+    rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
+    assert len(ag_calls) == 2
     assert len(rs_calls) == 2
 
 
@@ -284,10 +346,10 @@ class TestMoEForwardPrecisionBranches:
                                                 128,
                                                 dtype=torch.float32)
         layer.w2_weight_scale_inv = torch.ones(4,
-                                               1,
-                                               1,
-                                               64,
-                                               dtype=torch.float32)
+                                                1,
+                                                1,
+                                                64,
+                                                dtype=torch.float32)
         layer.w13_bias = torch.zeros(4, 1, 128, dtype=torch.float32)
         layer.w2_bias = torch.zeros(4, 1, 64, dtype=torch.float32)
         layer.moe_config.experts_per_token = 2
@@ -326,6 +388,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_unquantized_apply_monolithic_dispatches_with_exact_kwargs(
@@ -373,6 +442,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(
@@ -423,6 +499,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_nvfp4_apply_monolithic_dispatches_with_exact_kwargs(
@@ -470,6 +553,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_w4a16_apply_monolithic_dispatches_with_exact_kwargs(
@@ -517,6 +607,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight_packed
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_w4an_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(
@@ -564,6 +661,13 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        if pipelined:
+            assert bound.arguments["layer"] is layer
+            assert bound.arguments["topk_weights"] is None
+            assert bound.arguments["topk_ids"] is None
+        else:
+            assert bound.arguments["topk_weights"] is topk_weights
+            assert bound.arguments["topk_ids"] is topk_ids
 
 
 def test_pipelined_moe_single_chunk_dp_greater_than_one():

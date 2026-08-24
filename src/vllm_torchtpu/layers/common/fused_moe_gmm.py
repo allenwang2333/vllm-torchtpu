@@ -381,11 +381,13 @@ def fused_moe_func(
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and experts_start is not None:
-        local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights,
+        local_num_experts = w1.shape[0]
+        is_local = (topk_ids >= experts_start) & (
+            topk_ids < experts_start + local_num_experts)
+        local_expert_ids = jnp.where(is_local, topk_ids - experts_start, -1)
+        topk_weights = jnp.where(is_local, topk_weights,
                                  jnp.zeros_like(topk_weights))
-        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+        topk_ids = local_expert_ids
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat,
      valid_mask) = prepare_routed_gmm_inputs(

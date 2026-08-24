@@ -265,11 +265,35 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
         activation_str = layer._tpu_activation_str
+
+        if enable_pipelined_collective_and_compute():
+            kwargs = {
+                "hidden_states": x,
+                "layer": layer,
+                "w1": layer.w13_weight,
+                "w2": layer.w2_weight,
+                "w1_scale": None,
+                "w2_scale": None,
+                "w1_bias": getattr(layer, 'w13_bias', None),
+                "w2_bias": getattr(layer, 'w2_bias', None),
+                "topk_weights": None,
+                "topk_ids": None,
+                "experts_start": layer._experts_start,
+                "topk": layer.moe_config.experts_per_token,
+                "activation": activation_str,
+                "router_logits": router_logits,
+                "input_ids": input_ids,
+            }
+            return pipelined_fused_moe_gmm(**kwargs)
+
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(layer,
+                                                   x,
+                                                   router_logits,
+                                                   input_ids=input_ids)
 
         kwargs = {
             "hidden_states": x,
@@ -285,7 +309,4 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
-
         return fused_moe_gmm(**kwargs)

@@ -86,3 +86,53 @@ def test_validate_linear_ep_placement_rejects_round_robin():
     with pytest.raises(NotImplementedError, match="linear EP placement"):
         moe_routing.validate_linear_ep_placement(
             SimpleNamespace(expert_placement_strategy="round_robin"))
+
+
+def test_route_on_gathered_tokens_with_gate_module():
+    import torch
+
+    num_tokens = 4
+    hidden_size = 16
+    num_experts = 8
+    topk = 2
+
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(experts_per_token=topk),
+        renormalize=True,
+        scoring_func="softmax",
+        gate=torch.nn.Linear(hidden_size, num_experts, bias=False),
+    )
+    gathered_hidden_states = torch.randn(num_tokens, hidden_size)
+
+    topk_weights, topk_ids = moe_routing.route_on_gathered_tokens(
+        layer, gathered_hidden_states)
+
+    assert topk_weights.shape == (num_tokens, topk)
+    assert topk_ids.shape == (num_tokens, topk)
+    assert topk_weights.dtype == gathered_hidden_states.dtype
+    assert topk_ids.dtype == torch.int32
+    assert (topk_ids >= 0).all() and (topk_ids < num_experts).all()
+
+
+def test_route_on_gathered_tokens_with_gate_weight():
+    import torch
+
+    num_tokens = 4
+    hidden_size = 16
+    num_experts = 8
+    topk = 2
+
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(experts_per_token=topk),
+        renormalize=True,
+        scoring_func="softmax",
+        gate_weight=torch.randn(hidden_size, num_experts),
+    )
+    gathered_hidden_states = torch.randn(num_tokens, hidden_size)
+
+    topk_weights, topk_ids = moe_routing.route_on_gathered_tokens(
+        layer, gathered_hidden_states)
+
+    assert topk_weights.shape == (num_tokens, topk)
+    assert topk_ids.shape == (num_tokens, topk)
+    assert (topk_ids >= 0).all() and (topk_ids < num_experts).all()

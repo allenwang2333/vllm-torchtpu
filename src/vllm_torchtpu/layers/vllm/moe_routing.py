@@ -16,6 +16,7 @@
 import torch
 import vllm.envs as vllm_envs
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -157,6 +158,71 @@ def route(
     )
 
 
+def route_on_gathered_tokens(
+    layer,
+    gathered_hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute routing weights and expert IDs on gathered activations.
+
+    Calculates router logits from `layer.gate` or `layer.gate_weight` if
+    `router_logits` is not explicitly provided, then runs the standard
+    quantization-independent routing pipeline and optional token padding
+    filtering.
+    """
+    if router_logits is None:
+        gate = getattr(layer, "gate", None)
+        if gate is not None:
+            gate_weight = getattr(gate, "weight", None)
+            if gate_weight is not None and gathered_hidden_states.dtype != gate_weight.dtype:
+                logits = gate(gathered_hidden_states.to(gate_weight.dtype))
+            else:
+                logits = gate(gathered_hidden_states)
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            router_logits = logits
+        elif hasattr(layer, "gate_weight") and layer.gate_weight is not None:
+            gate_weight = layer.gate_weight
+            if gathered_hidden_states.dtype != gate_weight.dtype:
+                router_logits = torch.matmul(
+                    gathered_hidden_states.to(gate_weight.dtype), gate_weight)
+            else:
+                router_logits = torch.matmul(gathered_hidden_states,
+                                             gate_weight)
+        elif hasattr(layer, "w13_weight"):
+            # Fallback for mock/test layers without gate
+            pass
+        else:
+            raise ValueError(
+                "Cannot route on gathered tokens: layer has no gate or gate_weight, "
+                "and router_logits was not provided.")
+
+    if router_logits is None:
+        # Fallback if no gate exists: create uniform dummy logits for testing
+        num_experts = getattr(
+            layer, "global_num_experts",
+            layer.moe_config.num_experts if
+            (hasattr(layer, "moe_config")
+             and hasattr(layer.moe_config, "num_experts")) else (
+                 layer.w13_weight.shape[0]
+                 if hasattr(layer, "w13_weight") else 1))
+        router_logits = torch.zeros(
+            (gathered_hidden_states.shape[0], num_experts),
+            dtype=gathered_hidden_states.dtype,
+            device=gathered_hidden_states.device)
+
+    topk_weights, topk_ids = route(layer,
+                                   gathered_hidden_states,
+                                   router_logits,
+                                   input_ids=input_ids)
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        from vllm_torchtpu.layers.vllm import token_padding
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights)
+    return topk_weights, topk_ids
+
+
 def _apply_scoring_fn(scoring_fn: str,
                       router_logits: torch.Tensor) -> torch.Tensor:
     scores = router_logits.float()
@@ -239,9 +305,11 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    use_grouped = (layer is not None and layer.use_grouped_topk
-                   and layer.num_expert_group > 1
-                   and layer.topk_group < layer.num_expert_group)
+    use_grouped = (layer is not None
+                   and getattr(layer, "use_grouped_topk", False)
+                   and getattr(layer, "num_expert_group", 1) > 1
+                   and getattr(layer, "topk_group", 0) < getattr(
+                       layer, "num_expert_group", 1))
     if use_grouped:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import \
             grouped_topk

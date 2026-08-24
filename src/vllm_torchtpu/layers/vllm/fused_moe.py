@@ -196,19 +196,22 @@ def fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    w1_bias: Optional[torch.Tensor],
-    w2_bias: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    experts_start: Optional[torch.Tensor],
-    topk: int,
-    activation: str,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    experts_start: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    activation: str = "silu",
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    layer=None,
+    router_logits: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused MoE forward pass with precomputed routing.
+    """Fused MoE forward pass with precomputed or in-graph routing.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -220,6 +223,19 @@ def fused_moe_gmm(
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
+    if topk_weights is None or topk_ids is None:
+        if layer is not None:
+            from vllm_torchtpu.layers.vllm import moe_routing
+            topk_weights, topk_ids = moe_routing.route_on_gathered_tokens(
+                layer,
+                hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids)
+        else:
+            raise ValueError(
+                "fused_moe_gmm requires either precomputed (topk_weights, topk_ids) "
+                "or layer to compute routing.")
+
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,

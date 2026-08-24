@@ -508,6 +508,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         skip_topk: bool = False,
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
 
