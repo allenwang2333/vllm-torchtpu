@@ -18,6 +18,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 """
 
 import json
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1268,13 +1269,25 @@ class TPURaidenConnectorWorker:
         self._load_block_ids: dict[str, list[int]] = {}
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
+        local_rank = getattr(vllm_config.parallel_config, "local_rank", None)
+        if local_rank is None:
+            env_rank = os.environ.get("LOCAL_RANK")
+            local_rank = int(env_rank) if env_rank is not None and env_rank != "" else None
+        else:
+            local_rank = int(local_rank)
+        if local_rank is not None:
+            os.environ["LOCAL_RANK"] = str(local_rank)
+        dist_utils.configure_raiden_telemetry(backends=["prometheus_shm"],
+                                              local_rank=local_rank)
+        self.local_rank = local_rank
         self.transfer_stats = TpuKVConnectorStats()
-        dist_utils.configure_raiden_telemetry()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
-            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
+            "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | "
+            "dp_rank=%d | local_rank=%s",
             self.host_ip, self.kv_transfer_port, self.is_producer,
-            self.node_id, self.tp_rank, self.tp_size, self.dp_rank)
+            self.node_id, self.tp_rank, self.tp_size, self.dp_rank,
+            str(local_rank))
 
     def _get_raiden_stats(self):
         # Get metrics from raiden library

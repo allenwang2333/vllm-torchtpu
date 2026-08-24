@@ -102,7 +102,8 @@ class TestRaidenTelemetryUtils:
                             lambda: mock_telemetry)
 
         dist_utils.configure_raiden_telemetry()
-        mock_telemetry.configure_telemetry.assert_called_once_with(None)
+        mock_telemetry.configure_telemetry.assert_called_once_with(
+            backends=["prometheus_shm"], local_rank=None)
         assert dist_utils._RAIDEN_TELEMETRY_CONFIGURED is True
 
     def test_configure_raiden_telemetry_explicit_backends(self, monkeypatch):
@@ -114,11 +115,63 @@ class TestRaidenTelemetryUtils:
         dist_utils.configure_raiden_telemetry(
             backends=["buffered", "custom_exporter"])
         mock_telemetry.configure_telemetry.assert_called_with(
-            ["buffered", "custom_exporter"])
+            backends=["buffered", "custom_exporter"], local_rank=None)
 
         dist_utils.configure_raiden_telemetry(backends={"single_backend"})
         mock_telemetry.configure_telemetry.assert_called_with(
-            {"single_backend"})
+            backends=["single_backend"], local_rank=None)
+
+    def test_configure_raiden_telemetry_with_local_rank(self, monkeypatch):
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
+                            lambda: mock_telemetry)
+
+        dist_utils.configure_raiden_telemetry(local_rank=3)
+        mock_telemetry.configure_telemetry.assert_called_with(
+            backends=["prometheus_shm"], local_rank="3")
+        assert dist_utils._RAIDEN_TELEMETRY_CONFIGURED is True
+
+        dist_utils.configure_raiden_telemetry(
+            backends=["prometheus_shm"], local_rank="7")
+        mock_telemetry.configure_telemetry.assert_called_with(
+            backends=["prometheus_shm"], local_rank="7")
+
+    def test_configure_raiden_telemetry_rank_tier1_explicit_precedence(
+            self, monkeypatch):
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
+        monkeypatch.setenv("LOCAL_RANK", "9")
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
+                            lambda: mock_telemetry)
+
+        dist_utils.configure_raiden_telemetry(local_rank=2)
+        mock_telemetry.configure_telemetry.assert_called_once_with(
+            backends=["prometheus_shm"], local_rank="2")
+
+    def test_configure_raiden_telemetry_rank_tier2_env_fallback(
+            self, monkeypatch):
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
+        monkeypatch.setenv("LOCAL_RANK", "6")
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
+                            lambda: mock_telemetry)
+
+        dist_utils.configure_raiden_telemetry(local_rank=None)
+        mock_telemetry.configure_telemetry.assert_called_once_with(
+            backends=["prometheus_shm"], local_rank="6")
+
+    def test_configure_raiden_telemetry_rank_tier3_delegation_none(
+            self, monkeypatch):
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(dist_utils, "get_raiden_telemetry_module",
+                            lambda: mock_telemetry)
+
+        dist_utils.configure_raiden_telemetry(local_rank=None)
+        mock_telemetry.configure_telemetry.assert_called_once_with(
+            backends=["prometheus_shm"], local_rank=None)
 
     def test_configure_raiden_telemetry_telemetry_none(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
@@ -468,3 +521,65 @@ class TestTPURaidenConnectorWorkerTelemetry:
             stats = TPURaidenConnectorWorker.get_kv_connector_stats(worker)
 
         assert stats is None
+
+    def test_worker_init_sets_local_rank_and_configures_telemetry(self, monkeypatch):
+        import os
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.kv_transfer_config.is_kv_producer = True
+        mock_vllm_config.parallel_config = SimpleNamespace(
+            local_rank=3,
+            data_parallel_rank=0,
+        )
+
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry") as mock_conf, \
+             patch("vllm_torchtpu.distributed.utils.get_node_id", return_value=0), \
+             patch("vllm_torchtpu.distributed.utils.get_host_ip", return_value="127.0.0.1"), \
+             patch("vllm_torchtpu.distributed.utils.get_kv_transfer_port", return_value="9100"), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_rank", return_value=0), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_world_size", return_value=1):
+            worker = TPURaidenConnectorWorker(mock_vllm_config)
+            assert os.environ.get("LOCAL_RANK") == "3"
+            mock_conf.assert_called_once_with(
+                backends=["prometheus_shm"], local_rank=3)
+
+    def test_worker_init_fallback_to_env_local_rank(self, monkeypatch):
+        import os
+        monkeypatch.setenv("LOCAL_RANK", "5")
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.kv_transfer_config.is_kv_producer = False
+        mock_vllm_config.parallel_config = SimpleNamespace(
+            data_parallel_rank=1,
+        )
+
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry") as mock_conf, \
+             patch("vllm_torchtpu.distributed.utils.get_node_id", return_value=0), \
+             patch("vllm_torchtpu.distributed.utils.get_host_ip", return_value="127.0.0.1"), \
+             patch("vllm_torchtpu.distributed.utils.get_kv_transfer_port", return_value="9100"), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_rank", return_value=0), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_world_size", return_value=1):
+            worker = TPURaidenConnectorWorker(mock_vllm_config)
+            assert os.environ.get("LOCAL_RANK") == "5"
+            mock_conf.assert_called_once_with(
+                backends=["prometheus_shm"], local_rank=5)
+
+    def test_worker_init_none_local_rank_delegates_to_tier3(self, monkeypatch):
+        import os
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.kv_transfer_config.is_kv_producer = True
+        mock_vllm_config.parallel_config = SimpleNamespace(
+            data_parallel_rank=0,
+        )
+
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry") as mock_conf, \
+             patch("vllm_torchtpu.distributed.utils.get_node_id", return_value=0), \
+             patch("vllm_torchtpu.distributed.utils.get_host_ip", return_value="127.0.0.1"), \
+             patch("vllm_torchtpu.distributed.utils.get_kv_transfer_port", return_value="9100"), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_rank", return_value=0), \
+             patch("vllm_torchtpu.distributed.kv_transfer.tpu_connector.get_tensor_model_parallel_world_size", return_value=1):
+            worker = TPURaidenConnectorWorker(mock_vllm_config)
+            assert "LOCAL_RANK" not in os.environ
+            mock_conf.assert_called_once_with(
+                backends=["prometheus_shm"], local_rank=None)
+

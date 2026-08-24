@@ -269,14 +269,31 @@ def get_raiden_telemetry_module():
 
 
 def configure_raiden_telemetry(
-        backends: list[str] | set[str] | None = None) -> None:
+        backends: list[str] | set[str] | None = None,
+        local_rank: int | str | None = None) -> None:
     """Configures TPU Raiden C++ telemetry backends if available."""
     global _RAIDEN_TELEMETRY_CONFIGURED
+    if backends is None:
+        backends = ["prometheus_shm"]
+    elif isinstance(backends, set):
+        backends = list(backends)
+
+    if local_rank is not None:
+        local_rank_str = str(local_rank)
+    else:
+        env_rank = os.getenv("LOCAL_RANK")
+        local_rank_str = str(env_rank) if (
+            env_rank is not None and env_rank != "") else None
+
     try:
         telemetry = get_raiden_telemetry_module()
         if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
-            telemetry.configure_telemetry(backends)
+            telemetry.configure_telemetry(backends=backends,
+                                          local_rank=local_rank_str)
             _RAIDEN_TELEMETRY_CONFIGURED = True
-            logger.info("Configured TPU Raiden C++ telemetry backends")
+            logger.info(
+                "Configured TPU Raiden C++ telemetry backends: %s (local_rank=%s)",
+                backends, local_rank_str)
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
+
