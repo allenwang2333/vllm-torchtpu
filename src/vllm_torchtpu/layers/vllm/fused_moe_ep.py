@@ -78,6 +78,11 @@ _RANK_BUFFER: Any = None
 # Which EP rank's expert block sits at each mesh index, or None for the
 # identity. See `_to_mesh_expert_order`.
 _EXPERT_ORDER: Any = None
+# The tensor-parallel width to slice the replicated batch across, or None
+# under plain DP where each rank already holds its own tokens. See
+# `_slice_to_tensor_share`.
+_TP_SIZE: int | None = None
+_TP_RANK: int = 0
 
 
 def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
@@ -191,10 +196,52 @@ def fused_moe_ep(
     dispatch and combine happen inside the program, so the caller must not
     all-gather the input or reduce-scatter the output. Only call it when
     `fused_moe_ep_supported` said yes.
+
+    Under tensor parallelism the rank's "own tokens" are a replicated copy of
+    its engine's batch, shared with the rest of its tensor group. The batch is
+    then sliced across the group on the way in and gathered back on the way
+    out, so the kernel still sees one distinct shard per rank and the caller
+    still gets the layout it handed over.
     """
-    return _OP(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-               _squeeze_channel_scale_checked(w2_scale),
-               _to_mesh_expert_order(router_logits), _RANK_BUFFER)
+    hidden_states = _slice_to_tensor_share(hidden_states)
+    router_logits = _slice_to_tensor_share(router_logits)
+    out = _OP(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
+              _squeeze_channel_scale_checked(w2_scale),
+              _to_mesh_expert_order(router_logits), _RANK_BUFFER)
+    return _gather_tensor_shares(out)
+
+
+def _slice_to_tensor_share(rows: torch.Tensor) -> torch.Tensor:
+    """This rank's share of a batch its tensor group holds a copy of each.
+
+    Splits the token axis into `tp` equal blocks and keeps this rank's. Every
+    rank of the group starts from the same rows in the same order, so block t
+    going to tensor rank t makes the shares distinct and their concatenation
+    the original batch. That ordering is what lets `_gather_tensor_shares`
+    put it back with a plain all-gather.
+
+    `unflatten` rather than a slice off `shape[0]`: reading the token count
+    here would bake it into the traced graph and specialize the model to
+    whichever bucket compiled first, the same reason `_to_mesh_expert_order`
+    reshapes the expert axis the way it does.
+    """
+    if _TP_SIZE is None:
+        return rows
+    return rows.unflatten(0, (_TP_SIZE, -1))[_TP_RANK]
+
+
+def _gather_tensor_shares(rows: torch.Tensor) -> torch.Tensor:
+    """Undo `_slice_to_tensor_share`, so the caller gets the batch it gave.
+
+    A concatenating all-gather in tensor-rank order, which is the order the
+    shares were cut in. The kernel has already combined each token over every
+    expert, so the shares are disjoint finished rows and this is a gather, not
+    a reduction.
+    """
+    if _TP_SIZE is None:
+        return rows
+    from vllm.distributed import tensor_model_parallel_all_gather
+    return tensor_model_parallel_all_gather(rows, dim=0)
 
 
 def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
@@ -342,12 +389,14 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
 
     tp = _tensor_parallel_size()
-    if tp > 1:
+    if tp > 1 and not envs.TPU_MOE_FUSED_EP_ALLOW_TP:
         logger.warning_once(
             "Fused EP MoE not engaged: under tensor parallelism (tp_size=%d) "
             "it arms and compiles but then deadlocks during warmup, and with "
             "the batch replicated it would do %dx the expert work per batch "
-            "anyway. The grouped-matmul path serves every step.", tp, tp)
+            "anyway. Set TPU_MOE_FUSED_EP_ALLOW_TP=1 to slice the replicated "
+            "batch across the tensor group and try it. The grouped-matmul "
+            "path serves every step.", tp, tp)
         return
 
     mesh = build_ep_mesh()
@@ -358,11 +407,17 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
 
-    # `_max_node_tokens(ep)` is already the GLOBAL token count this kernel
-    # sees: under DP it is the per-engine cap times the engines, and under
-    # replicated TP it is the per-rank batch times the ranks, because every
-    # rank hands the op a full copy as its shard.
-    global_tokens = _max_node_tokens(ep)
+    # How many distinct engine batches the kernel's global token axis is made
+    # of. Under DP that is one per rank. Under replicated TP every rank of a
+    # tensor group hands the op a copy of the SAME batch, so without slicing
+    # the kernel's global T counts each engine's tokens tp times over; with
+    # slicing each rank contributes a distinct share and the count is honest
+    # again, which is the SMEM inflation the refusal above described.
+    shards = ep // tp if tp > 1 else ep
+
+    # `_max_node_tokens(shards)` is the GLOBAL token count this kernel sees:
+    # the per-engine cap times the number of distinct batches above.
+    global_tokens = _max_node_tokens(shards)
     if global_tokens:
         table_bytes = ragged_stride_bound(
             global_tokens, topk, layer.global_num_experts, tile_m) * 4
@@ -374,15 +429,22 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                 "the kernel sees fewer tokens.", global_tokens, table_bytes,
                 _ROUTING_TABLE_SMEM_BUDGET,
                 _max_node_tokens_fitting_smem(topk, layer.global_num_experts,
-                                              ep, tile_m))
+                                              shards, tile_m))
             return
-    global _RANK_BUFFER, _EXPERT_ORDER
+    global _RANK_BUFFER, _EXPERT_ORDER, _TP_SIZE, _TP_RANK
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
     _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
                                 dtype=torch.int32,
                                 device=layer.w13_weight.device)
     _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
+    _TP_SIZE, _TP_RANK = (tp, _tensor_parallel_rank()) if tp > 1 else (None, 0)
+    if _TP_SIZE is not None:
+        logger.info_once(
+            "Fused EP MoE: slicing the replicated batch across the tensor "
+            "group | tp_size=%d tp_rank=%d, so each rank contributes a "
+            "distinct 1/%d of its engine's tokens and the shares are "
+            "gathered back after the kernel.", tp, _TP_RANK, ep)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
@@ -393,7 +455,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # This load-time threshold decides whether the fused operation is worth
     # building at all. TPU_MOE_FUSED_EP_STEP_MIN_TOKENS independently keeps
     # smaller compiled shapes on gather/GMM/combine at execution time.
-    max_node_tokens = _max_node_tokens(ep)
+    max_node_tokens = _max_node_tokens(shards)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
@@ -443,8 +505,22 @@ def _tensor_parallel_size() -> int:
         return 1
 
 
-def _max_node_tokens(ep: int) -> int:
-    """The largest node-wide token count a step can carry, or 0 if unknown."""
+def _tensor_parallel_rank() -> int:
+    """This rank's position in its tensor group, or 0 if it cannot be read."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        return int(get_tp_group().rank_in_group)
+    except Exception:  # noqa: BLE001 - no group outside a served model
+        return 0
+
+
+def _max_node_tokens(shards: int) -> int:
+    """The largest node-wide token count a step can carry, or 0 if unknown.
+
+    `shards` is how many distinct engine batches make up the kernel's global
+    token axis, which is the EP width under DP and under a sliced TP, and the
+    EP width again under a replicated TP that counts each batch tp times.
+    """
     from vllm.config import get_current_vllm_config
 
     try:
@@ -452,17 +528,17 @@ def _max_node_tokens(ep: int) -> int:
     except Exception:  # noqa: BLE001 - no config outside a served model
         return 0
     cap = getattr(cfg.scheduler_config, "max_num_batched_tokens", None)
-    return int(cap) * ep if isinstance(cap, int) else 0
+    return int(cap) * shards if isinstance(cap, int) else 0
 
 
-def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int,
+def _max_node_tokens_fitting_smem(topk: int, e_total: int, shards: int,
                                   tile_m: int) -> int:
-    """Largest per-step node-wide token count whose routing tables fit SMEM.
+    """Largest per-step per-engine token count whose routing tables fit SMEM.
 
     Reported in the refusal so the operator is told the number to set rather
-    than left to bisect --max-num-batched-tokens by hand. Divided by the
-    tensor-parallel width because that is the factor by which a replicated
-    batch inflates the global token count the kernel sees.
+    than left to bisect --max-num-batched-tokens by hand. Divided by the same
+    shard count `_max_node_tokens` multiplied by, so the two are inverses of
+    each other.
     """
     lo, hi = 1, 1 << 20
     while lo < hi:
@@ -470,7 +546,7 @@ def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int,
         fits = (ragged_stride_bound(mid, topk, e_total, tile_m) * 4 <=
                 _ROUTING_TABLE_SMEM_BUDGET)
         lo, hi = (mid, hi) if fits else (lo, mid - 1)
-    return lo // max(ep, 1)
+    return lo // max(shards, 1)
 
 
 def _pcp_size(layer) -> int:

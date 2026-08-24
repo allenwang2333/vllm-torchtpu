@@ -113,8 +113,23 @@ case "$SHARDING" in
     export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
     export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2.0}"
     export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
-    # The fused EP kernel also refuses the TP2 component of this sharding.
-    export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
+    # The fused EP kernel runs expert-parallel over all 8 chips whatever the
+    # model above it calls them, and its output is the same global array DP8
+    # produces, only sharded differently. The bridge slices the TP-replicated
+    # batch so each rank contributes a distinct eighth and gathers the shares
+    # back, which is what TPU_MOE_FUSED_EP_ALLOW_TP turns on. Off by default
+    # everywhere else, because TP8 warmup deadlocked on 2026-08-20 and this
+    # run is what tells us whether TP2 does too.
+    export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
+    if [ "$USE_MOE_FUSED_EP_KERNEL" = "1" ]; then
+      export TPU_MOE_FUSED_EP_ALLOW_TP="${TPU_MOE_FUSED_EP_ALLOW_TP:-1}"
+      # Same split as DP8: keep decode-only steps on the grouped matmul, which
+      # is cheaper once a step is a few rows per expert. A decode step here is
+      # the point's concurrency over 4 engines, 32 rows at c128, and the test
+      # is shape[0] >= threshold against the per-engine width, so 33 leaves it
+      # on the GMM exactly as it does under DP8.
+      export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-33}"
+    fi
     ;;
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac

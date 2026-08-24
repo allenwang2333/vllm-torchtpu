@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     USE_MOE_FUSED_EP_KERNEL: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     TPU_MOE_FUSED_EP_TILE_M: int = 128
+    TPU_MOE_FUSED_EP_ALLOW_TP: bool = False
     TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -364,6 +365,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for sparse prefill routing, where the last expert tile is mostly padding.
     "TPU_MOE_FUSED_EP_TILE_M":
     lambda: int(os.getenv("TPU_MOE_FUSED_EP_TILE_M", "128")),
+    # Let the fused EP kernel serve a tensor-parallel deployment. Under
+    # replicated TP every rank is handed a full copy of its engine's batch, so
+    # the bridge slices that copy and gives each rank of a tensor group a
+    # distinct share, then gathers the shares back over the group. Off by
+    # default: the kernel was measured deadlocking during TP8 warmup on
+    # 2026-08-20, and whether the slice removes that or only the token-count
+    # inflation beside it is what enabling this finds out.
+    "TPU_MOE_FUSED_EP_ALLOW_TP":
+    env_bool("TPU_MOE_FUSED_EP_ALLOW_TP"),
     # For small DP token buckets, gather hidden states first and recompute the
     # router logits on the gathered rows. This removes the separate router-
     # logits all-gather. Zero disables the optimization and preserves the
