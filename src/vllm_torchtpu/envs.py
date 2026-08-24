@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     TPU_MOE_FUSED_EP_TILE_M: int = 128
     TPU_MOE_FUSED_EP_ALLOW_TP: bool = False
+    TPU_MOE_FUSED_EP_TP_CONST_OFFSET: bool = False
     TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -374,6 +375,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inflation beside it is what enabling this finds out.
     "TPU_MOE_FUSED_EP_ALLOW_TP":
     env_bool("TPU_MOE_FUSED_EP_ALLOW_TP"),
+    # Take the tensor group slice at a constant row rather than at one
+    # read out of a buffer. The constant makes each rank of the group a
+    # different HLO module, which lets XLA order the fused kernel and the
+    # group collectives differently on each and deadlock the pair, so this
+    # is here to reproduce that and not to serve with.
+    "TPU_MOE_FUSED_EP_TP_CONST_OFFSET":
+    env_bool("TPU_MOE_FUSED_EP_TP_CONST_OFFSET"),
     # For small DP token buckets, gather hidden states first and recompute the
     # router logits on the gathered rows. This removes the separate router-
     # logits all-gather. Zero disables the optimization and preserves the

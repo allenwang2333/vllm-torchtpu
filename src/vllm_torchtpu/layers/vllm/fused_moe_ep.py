@@ -83,6 +83,10 @@ _EXPERT_ORDER: Any = None
 # `_slice_to_tensor_share`.
 _TP_SIZE: int | None = None
 _TP_RANK: int = 0
+# This rank's position in its tensor group, as a device tensor, so the slice
+# offset reaches the graph as data rather than as a baked constant. See
+# `_slice_to_tensor_share`.
+_TP_RANK_BUFFER: Any = None
 
 
 def _squeeze_channel_scale(scale: torch.Tensor, experts: int,
@@ -224,10 +228,22 @@ def _slice_to_tensor_share(rows: torch.Tensor) -> torch.Tensor:
     here would bake it into the traced graph and specialize the model to
     whichever bucket compiled first, the same reason `_to_mesh_expert_order`
     reshapes the expert axis the way it does.
+
+    The block index arrives as a device tensor rather than as the Python int
+    `_TP_RANK`, which would make each rank's graph a different program: rank 0
+    slicing at row 0 and rank 1 at row t_local is two different HLO modules,
+    and XLA is free to schedule the fused kernel and the tensor group's
+    collectives in a different relative order in each. When it does, one rank
+    sits in the kernel waiting for a peer's DMA while that peer sits in an
+    all-reduce waiting for the first, which is the DP4TP2 warmup deadlock. An
+    index that lives in a buffer keeps every rank of the group on one program.
     """
     if _TP_SIZE is None:
         return rows
-    return rows.unflatten(0, (_TP_SIZE, -1))[_TP_RANK]
+    blocks = rows.unflatten(0, (_TP_SIZE, -1))
+    if _TP_RANK_BUFFER is None:
+        return blocks[_TP_RANK]
+    return torch.index_select(blocks, 0, _TP_RANK_BUFFER).squeeze(0)
 
 
 def _gather_tensor_shares(rows: torch.Tensor) -> torch.Tensor:
@@ -251,7 +267,7 @@ def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
     keeps the runtime rank buffers in the FX subgraph's lifted input list.
     """
     marker = None
-    for graph_input in (_RANK_BUFFER, _EXPERT_ORDER):
+    for graph_input in (_RANK_BUFFER, _EXPERT_ORDER, _TP_RANK_BUFFER):
         if graph_input is None:
             continue
         value = graph_input.reshape(-1)[0].to(output.dtype)
@@ -431,7 +447,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                 _max_node_tokens_fitting_smem(topk, layer.global_num_experts,
                                               shards, tile_m))
             return
-    global _RANK_BUFFER, _EXPERT_ORDER, _TP_SIZE, _TP_RANK
+    global _RANK_BUFFER, _EXPERT_ORDER, _TP_SIZE, _TP_RANK, _TP_RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
     _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
@@ -439,12 +455,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                                 device=layer.w13_weight.device)
     _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
     _TP_SIZE, _TP_RANK = (tp, _tensor_parallel_rank()) if tp > 1 else (None, 0)
+    _TP_RANK_BUFFER = None
+    if _TP_SIZE is not None and not envs.TPU_MOE_FUSED_EP_TP_CONST_OFFSET:
+        _TP_RANK_BUFFER = torch.tensor([_TP_RANK],
+                                       dtype=torch.int32,
+                                       device=layer.w13_weight.device)
     if _TP_SIZE is not None:
         logger.info_once(
             "Fused EP MoE: slicing the replicated batch across the tensor "
-            "group | tp_size=%d tp_rank=%d, so each rank contributes a "
-            "distinct 1/%d of its engine's tokens and the shares are "
-            "gathered back after the kernel.", tp, _TP_RANK, ep)
+            "group | tp_size=%d tp_rank=%d offset=%s, so each rank contributes "
+            "a distinct 1/%d of its engine's tokens and the shares are "
+            "gathered back after the kernel.", tp, _TP_RANK,
+            "constant" if _TP_RANK_BUFFER is None else "buffer", tp)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
