@@ -251,6 +251,14 @@ def fused_ep_moe_v2(x,
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
+        # Pallas takes a sublane block that is a multiple of 8, or the whole
+        # dimension. A shard whose token count is 4 modulo 8, say the 20 rows
+        # a 40-token engine batch leaves each half of a tensor pair, divides
+        # down to 4 and is neither, so the selector is refused at lowering.
+        # One block over the whole shard is the legal reading of the same
+        # work, and the rows still tile inside it.
+        if select_rows < 8:
+            select_rows = t_local
         topk_weights, topk_idx = pallas_select(scores,
                                                topk=topk,
                                                block_rows=select_rows)
