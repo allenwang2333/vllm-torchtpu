@@ -13,6 +13,7 @@ head_size neither 64 nor a multiple of 128 leaves lanes empty.
 """
 import contextlib
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -98,6 +99,40 @@ def test_fp8_should_halve_the_page(num_kv_heads, head_size):
     """These xfail today; the xfail turning green is the signal it is fixed."""
     assert page_bytes(num_kv_heads, head_size,
                       BF16) == 2 * page_bytes(num_kv_heads, head_size, FP8)
+
+
+# max_model_len -> the page the backend picks when no --block-size is given.
+# next_power_of_2(len) // 16, clamped to [16, 256].
+PAGE_LADDER = [
+    (128, 16),
+    (2048, 128),
+    (4096, 256),
+    (8192, 256),
+    # Everything past 8192 saturates the clamp. 9216 is the interesting one:
+    # it used to short-circuit to 16 as a VMEM-OOM guard, which cost ~39% on
+    # RPA decode for no benefit the clamp wasn't already providing.
+    (9216, 256),
+    (32768, 256),
+    (131072, 256),
+]
+
+
+@pytest.mark.parametrize("max_model_len,page_size", PAGE_LADDER)
+def test_page_size_ladder(max_model_len, page_size):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len))
+    assert PallasAttentionBackend.get_page_size(vllm_config) == page_size
+
+
+def test_page_size_is_monotonic_in_max_model_len():
+    """The guard that actually matters: no length may get a smaller page than
+    a shorter one. A cliff here is invisible in any single-point assertion."""
+    pages = [
+        PallasAttentionBackend.get_page_size(
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=n)))
+        for n in range(128, 1 << 17, 128)
+    ]
+    assert pages == sorted(pages)
 
 
 @pytest.fixture(autouse=True)
