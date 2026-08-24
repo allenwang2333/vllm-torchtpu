@@ -26,11 +26,12 @@ steps:
   - group: "Unit Tests on TPU"
     depends_on: "build_docker"
     steps:
-      # Every test in test_speculative_decoding.py is nightly-marked, so a
-      # dedicated PR step for it collected 37 items, deselected 37, and exited 5
-      # -- masked by the `|| [ $? -eq 5 ]` in unit_test_defaults. Folding the
-      # file into the general selection drops the step (and its agent) while
-      # keeping a future non-nightly spec-decode test gated at PR time.
+      # test_speculative_decoding.py is no longer nightly-marked, so its
+      # non-multichip tests are selected here and its multichip (DP) tests by
+      # the step below. The spec-decode suite is heavy -- eagle3 pulls a
+      # Llama-3.1-8B target plus an EAGLE3 draft, MTP pulls Qwen3.5-4B, and DP
+      # pulls Qwen3.5-35B-A3B-FP8 -- so these two steps carry most of the PR
+      # wall time. The nightly steps further below still run the same file.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
@@ -51,7 +52,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
