@@ -99,8 +99,7 @@ def _run_child(args: argparse.Namespace) -> None:
     import jax.numpy as jnp
     import numpy as np
 
-    from vllm_torchtpu.kernels.mla.v2.kernel import \
-        mla_ragged_paged_attention
+    from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
 
     if args.result_path is None:
         raise ValueError("--result-path is required in child mode")
