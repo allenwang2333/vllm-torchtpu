@@ -427,14 +427,13 @@ class PallasAttentionBackend(AttentionBackend):
     # can spill SREGs easily which leads to bad performance. The strategy we
     # apply here is trying to split max-model-len to 16 pages which make the
     # spill less likely. Meanwhile we make sure the page size is in [16, 256].
+    # max_model_len > 8192 used to short-circuit to 16 as a VMEM-OOM guard, but
+    # the 256 clamp below is the real bound: the decode kernel sizes its KV tile
+    # from bkv_sz, not from the page, so a bigger page only shrinks the block
+    # table. Reverting that cliff is worth ~39% on RPA decode (373 -> 228 us on
+    # Qwen3-Coder-30B-A3B at max_model_len 9216) with bit-identical output.
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
-        # TODO: This is a temporary fix for vmem OOM.
-        # For long model length, we use 16 page-size to avoid too much
-        # VMEM spill. A more robust solution should be implemented to
-        # handle VREG spills.
-        if vllm_config.model_config.max_model_len > 8192:
-            return 16
         page_size = next_power_of_2(
             vllm_config.model_config.max_model_len) // 16
         if page_size <= 16:
