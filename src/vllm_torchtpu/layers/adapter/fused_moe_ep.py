@@ -29,17 +29,10 @@ router's full 512-wide sort, both routed-row argsorts, the SparseCore permute,
 both grouped matmuls, the combine, and both collectives.
 
 ``MOE_FUSED_EP_KERNEL_MIN_TOKENS`` decides once, at weight load, against the
-scheduler's largest batch, whether to arm this for the deployment. Where it is
-armed it serves every step, decode included.
-
-Upstream's recipe instead picks per step and leaves decode on the grouped-matmul
-path, on the reasoning that decode is weight-bandwidth bound with no transport
-to hide. That is right for their configuration and wrong for Qwen3.5-397B at
-DP8+EP, measured: arming everything gives 33,304 tok/s against 30,888 for the
-grouped-matmul path, and decode gets *faster* too, 54.87 ms median TPOT against
-56.86. At hidden 4096 the combine this replaces is worth paying a kernel for
-even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
-usual story for anything that scales with hidden size.
+scheduler's largest batch, whether to build this operation for the deployment.
+When it is built, ``TPU_MOE_FUSED_EP_STEP_MIN_TOKENS`` can keep smaller compiled
+token shapes on the gather/grouped-matmul/combine path while larger shapes use
+this fully fused path. Its default of zero preserves fused EP for every shape.
 """
 
 from typing import Any
@@ -146,17 +139,9 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     process-wide answer would let a refused layer run through an armed one's
     program.
 
-    Takes no tensor on purpose. A per-step choice would have to branch on the
-    token count, and vLLM traces the backbone once with that dimension dynamic,
-    so the first bucket traced freezes the decision for every other bucket:
-    measured, gating that way fused one of eleven buckets and gave back the
-    whole win (30,667 tok/s against 33,304). vllm-torchtpu #474 exists to fix
-    exactly that, by reading Dynamo's shape guards and retracing per bucket. It
-    was tried here and reverted -- its warmup ladder goes out of step with a
-    partition that falls mid-ladder ("artifact_compile_range_8_8 was left to a
-    later trace (s18 >= 128) and never compiled"), and every request failed.
-    Revisit if that PR lands with the ladder issue resolved; the gain on offer
-    is decode steps skipping this kernel's ~180 us per-call fixed cost.
+    Shape selection belongs to the FP8 method, which owns the EP exchange and
+    selects fused EP or gather/GMM/combine for each compiled static shape.
+    This helper reports only whether the fused operation is available.
     """
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
@@ -379,6 +364,18 @@ def fused_moe_ep(
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
+def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
+    """Keep the fused-EP rank buffer in the GMM shape-specialized graph.
+
+    The subtraction is identically zero and XLA removes it, but its dataflow
+    keeps the runtime rank buffer in the FX subgraph's lifted input list.
+    """
+    if _RANK_BUFFER is None:
+        return output
+    value = _RANK_BUFFER.reshape(-1)[0].to(output.dtype)
+    return output + (value - value)
+
+
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
 # the name callers read back to hand to `fused_moe_ep`.
 FUSED_MOE_EP_SCORE_BIAS_ATTR = "_tpu_fused_score_bias"
@@ -588,11 +585,9 @@ def prebuild_fused_moe_ep(
     # width after the bridge converts the native FP4 tensor.
     inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
 
-    # The threshold is applied here rather than per step: the op is shape
-    # agnostic, so the only place a token count is known outside the traced
-    # forward is the scheduler's cap. A deployment whose largest batch is below
-    # the threshold never builds the op at all; one above it uses the kernel
-    # for every step, decode included.
+    # This load-time threshold decides whether the fused operation is worth
+    # building at all. TPU_MOE_FUSED_EP_STEP_MIN_TOKENS independently keeps
+    # smaller compiled shapes on gather/GMM/combine at execution time.
     max_node_tokens = _max_node_tokens(ep, pcp)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(

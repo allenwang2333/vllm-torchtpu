@@ -76,6 +76,8 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -672,11 +674,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8": env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
+    # Optional per-compiled-shape selector. A value greater than zero keeps
+    # smaller static token buckets on the grouped-matmul dispatch path while
+    # retaining fused EP for larger buckets. Zero preserves the deployment-
+    # wide fused-EP behavior.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")
+    ),
+    # For small DP token buckets, gather hidden states first and recompute the
+    # router logits on the gathered rows. This removes the separate router-
+    # logits all-gather. Zero disables the optimization and preserves the
+    # compute-then-gather path for every bucket.
+    "TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS", "0")
+    ),
     # Largest node-wide token count, out of the scheduler's cap, at or above
-    # which the fused kernel is armed for the whole deployment. Decided once at
-    # weight load, not per step: a per-step choice would need the token count
-    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
-    # arming everything. Below the threshold the grouped-matmul path serves.
+    # which the fused kernel is built at weight load. This is independent of
+    # TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, which selects the execution path for
+    # each compiled static token shape after the kernel has been armed.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
     ),
