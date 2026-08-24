@@ -16,39 +16,36 @@
 import torch
 from vllm import ir
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
 
 @GemmaRMSNorm.register_oot
 class WeightPreprocessedGemmaRMSNorm(GemmaRMSNorm):
 
     def __init__(
-            self,
-            hidden_size: int,
-            eps: float = 1e-6,
-        ) -> None:
-            super().__init__(hidden_size, eps)
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__(hidden_size, eps)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-            # super().process_weights_after_loading(act_dtype)
-            self.processed_weight = self.weight.float() + 1.0
-            logger.info("processed weight for GemmaRMSNorm has been computed and stored.")
+        # super().process_weights_after_loading(act_dtype)
+        self.processed_weight = self.weight.float() + 1.0
+        logger.info(
+            "processed weight for GemmaRMSNorm has been computed and stored.")
 
     def forward(
-            self,
-            x: torch.Tensor,
-            residual: torch.Tensor | None = None,
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            """PyTorch-native implementation equivalent to forward()."""
-            weight = self.processed_weight
-            if residual is None:
-                return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-            return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
-    
-
-
-
-
-
-
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """PyTorch-native implementation equivalent to forward()."""
+        weight = self.processed_weight
+        if residual is None:
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(x, residual, weight,
+                                         self.variance_epsilon)

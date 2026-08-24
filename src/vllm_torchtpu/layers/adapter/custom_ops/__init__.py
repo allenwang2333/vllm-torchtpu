@@ -24,9 +24,9 @@ def _register_custom_ops() -> None:
     """Explicitly imported to trigger custom operation registration decorators."""
     pass
 
-_OPS_PROCESS_WEIGHTS_AFTER_LOADING = (
-    "WeightPreprocessedGemmaRMSNorm",
-)
+
+_OPS_PROCESS_WEIGHTS_AFTER_LOADING = ("WeightPreprocessedGemmaRMSNorm", )
+
 
 def force_process_weights_after_loading(model: nn.Module) -> None:
     for _, module in model.named_modules():
