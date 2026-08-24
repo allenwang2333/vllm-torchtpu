@@ -25,6 +25,9 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
     ragged_gather_reduce_v2
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
+    ragged_gather_reduce_v4,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
 
@@ -33,6 +36,7 @@ def _select_ragged_gather_reduce(version: str):
         "v1": ragged_gather_reduce_v1,
         "v2": ragged_gather_reduce_v2,
         "v3": ragged_gather_reduce_v3,
+        "v4": ragged_gather_reduce_v4,
     }[version]
 
 

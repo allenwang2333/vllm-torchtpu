@@ -486,7 +486,7 @@ def ragged_gather_reduce_v4(
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
-    num_sparse_cores: int = 1,
+    num_sparse_cores: int = 2,
     skip_compute: bool = False,
 ) -> jax.Array:
     """SparseCore Ragged Gather-Reduce v4 with Continuous Inter-Block Prefetching.
@@ -504,7 +504,7 @@ def ragged_gather_reduce_v4(
         valid_rows_mask: 1D boolean validity mask of shape [num_tokens * topk].
         reduce_group_size: Number of routes per destination token (topk).
         num_sparse_cores: Target number of physical SparseCores to utilize (1 or
-          2).
+          2, default: 2).
         skip_compute: If True, executes memory movement without arithmetic for
           profiling.
 
@@ -544,7 +544,7 @@ def ragged_gather_reduce_v4(
     target_num_sc_cores = (
         min(num_sparse_cores, sc_info.num_cores)
         if num_sparse_cores is not None
-        else 1
+        else 2
     )
     num_cores = target_num_sc_cores * sc_info.num_subcores
     num_lanes = pltpu.get_tpu_info().num_lanes
@@ -674,3 +674,8 @@ def ragged_gather_reduce_v4(
     )(x, route_metadata, route_weights, route_counts)
 
     return out[:num_tokens]
+
+
+ragged_gather_reduce = ragged_gather_reduce_v4
+
+__all__ = ["ragged_gather_reduce", "ragged_gather_reduce_v4"]

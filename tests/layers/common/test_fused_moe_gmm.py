@@ -24,7 +24,7 @@ from vllm_torchtpu.layers.common import fused_moe_gmm
 from vllm_torchtpu.layers.common.fused_moe_gmm import fused_moe_func
 
 
-@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
+@pytest.mark.parametrize("version", ["v1", "v2", "v3", "v4"])
 def test_select_ragged_gather_reduce(version):
     selected = fused_moe_gmm._select_ragged_gather_reduce(version)
     expected = getattr(fused_moe_gmm, f"ragged_gather_reduce_{version}")
@@ -41,6 +41,12 @@ def test_ragged_gather_reduce_version_accepts_v3(monkeypatch):
     monkeypatch.setenv("RAGGED_GATHER_REDUCE_VERSION", "v3")
     getter = envs.environment_variables["RAGGED_GATHER_REDUCE_VERSION"]
     assert getter() == "v3"
+
+
+def test_ragged_gather_reduce_version_accepts_v4(monkeypatch):
+    monkeypatch.setenv("RAGGED_GATHER_REDUCE_VERSION", "v4")
+    getter = envs.environment_variables["RAGGED_GATHER_REDUCE_VERSION"]
+    assert getter() == "v4"
 
 
 def test_ragged_gather_reduce_uses_configured_version():
