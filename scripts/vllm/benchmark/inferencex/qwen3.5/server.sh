@@ -132,6 +132,14 @@ case "$SHARDING" in
       # is shape[0] >= threshold against the per-engine width, so 33 leaves it
       # on the GMM exactly as it does under DP8.
       export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-33}"
+      # Keep the all-gather off SparseCore. The fused program holds two
+      # eight-way all-gathers next to the kernel's own raw DMA transport, and
+      # offloading them deadlocks warmup at the 512-token bucket, with all
+      # eight ranks stopped in the same device sync and every SparseCore tile
+      # parked. Bisected out of the six offload flags on 2026-08-24, written
+      # up in exp/0822-qi-ix-fused-ep/results/dp4tp2-e2e.md. Only DP4TP2 needs
+      # it. DP8 has no tensor group, so it never builds the graph that hangs.
+      SHARDING_LIBTPU_ARGS=" --xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
     fi
     ;;
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
@@ -236,8 +244,10 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-2048}"
 # shard a trivially-shardable major dimension on the minor one instead; keep
 # the reduce-scatter of a collective off SparseCore, which the MoE wants for
 # its own gathers; combine all-reduces regardless of size; and leave async
-# collectives unmerged. Set to empty to serve with stock XLA defaults.
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS- --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false}"
+# collectives unmerged. The sharding block above may add its own flags on the
+# end. Set to empty to serve with stock XLA defaults, which also drops those.
+SHARDING_LIBTPU_ARGS="${SHARDING_LIBTPU_ARGS:-}"
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS- --xla_tpu_use_minor_sharding_for_major_trivial_input=true --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_ars_combiner_threshold_in_bytes=0 --xla_tpu_enable_async_collective_merger=false${SHARDING_LIBTPU_ARGS}}"
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8
