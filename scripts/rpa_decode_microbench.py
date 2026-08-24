@@ -110,12 +110,14 @@ def _make_inputs(args, rng: np.random.Generator) -> Inputs:
     q = jnp.asarray(
         rng.standard_normal((num_tokens, NUM_Q_HEADS, HEAD_DIM)) * 0.5,
         q_dtype)
+    # The kernel requires the incoming k/v to carry the cache's dtype -- it
+    # writes them straight into the paged cache before attending.
     k = jnp.asarray(
         rng.standard_normal((num_tokens, NUM_KV_HEADS, HEAD_DIM)) * 0.5,
-        q_dtype)
+        kv_dtype)
     v = jnp.asarray(
         rng.standard_normal((num_tokens, NUM_KV_HEADS, HEAD_DIM)) * 0.5,
-        q_dtype)
+        kv_dtype)
 
     cache_shape = get_kv_cache_shape(total_pages, page_size, NUM_KV_HEADS,
                                      HEAD_DIM, kv_dtype)
