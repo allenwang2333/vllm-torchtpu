@@ -3395,7 +3395,8 @@ class TestTPUConnectorStats(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# GLM-5.2 admission topology: prefill tp{N}/dp1 -> decode tp1/dp{M} only.
+# GLM-5.2 admission topology: prefill tp{N}/dp1 -> decode tp1/dp{M}, or the
+# reverse prefill tp1/dp{M} -> decode tp{N}/dp1 (multicast).
 # ---------------------------------------------------------------------------
 
 
@@ -3403,6 +3404,10 @@ class TestTPUConnectorStats(unittest.TestCase):
     (True, 8, 1, "tp8_prefill"),
     (False, 1, 8, "dp8_decode"),
     (False, 1, 1, "dp1_decode"),
+    (True, 1, 8, "dp8_prefill"),
+    (True, 1, 1, "tp1_prefill"),
+    (False, 8, 1, "tp8_decode"),
+    (False, 4, 1, "tp4_decode"),
 ])
 def test_glm_admission_topology_accepts_supported_shapes(
         is_producer, tp_size, dp_size, expected):
@@ -3418,10 +3423,11 @@ def test_glm_admission_topology_accepts_supported_shapes(
 @pytest.mark.parametrize(
     ("is_producer", "tp_size", "dp_size", "pcp_size", "message"),
     [
-        # A TP>1 decode engine would need one plan per destination worker
+        # A side sharded both ways at once has no plan shape on either role.
         (False, 4, 2, 1, "consumer tensor_parallel_size=4"),
-        # A DP>1 prefill engine has no single source unit set.
         (True, 8, 2, 1, "producer tensor_parallel_size=8"),
+        (True, 2, 4, 1, "producer tensor_parallel_size=2"),
+        (False, 2, 8, 1, "consumer tensor_parallel_size=2"),
         # PCP is not supported on either role.
         (False, 1, 8, 2, "prefill_context_parallel_size=2"),
     ])
@@ -3435,3 +3441,317 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+# ---------------------------------------------------------------------------
+# Reverse topology (prefill dp{M}/tp1 -> decode tp{N}/dp1): rank-qualified
+# consumer identities, sibling destination enumeration, single-submitter
+# multicast, and passive-worker completion.
+# ---------------------------------------------------------------------------
+
+
+def _glm_reverse_env_patches(engine_id="decode-engine", parallelism=1):
+    return [
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+              "raiden",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+              True,
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+              parallelism,
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", engine_id, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", "", create=True),
+    ]
+
+
+def _make_reverse_consumer_meta():
+    scheduler = _make_raiden_scheduler(is_producer=False, block_size=1024)
+    req = MagicMock()
+    req.request_id = "reverse-decode"
+    req.kv_transfer_params = {
+        "req_id": "reverse-prefill",
+        "uuid": 808,
+        "num_tokens": 65_023,
+        "src_controller_address": "source-controller.test:27000",
+        "src_job_name": "prefill",
+        "src_engine_id": "producer-engine",
+        "src_data_replica_idx": 3,
+        "src_parallelism": 1,
+    }
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = (list(range(300, 364)), )
+    with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+               "raiden",
+               create=True):
+        scheduler.update_state_after_alloc(req, blocks, 65_023)
+        return scheduler.build_connector_meta()
+
+
+def _make_reverse_consumer_worker(*, tp_rank):
+    worker = _make_raiden_worker(tp_rank=tp_rank,
+                                 tp_size=8,
+                                 is_producer=False,
+                                 dp_rank=0,
+                                 dp_size=1,
+                                 pcp_size=1)
+    engine = _FakeRaidenEngine()
+    facade = _FakeRaidenControllerFacade()
+    worker._raiden_transfer_engine = engine
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "dest-controller.test:28000"
+    worker._new_raiden_controller_facade = MagicMock(return_value=facade)
+    replica = ("decode-engine"
+               if tp_rank == 0 else f"decode-engine-rank{tp_rank}")
+    worker._raiden_work_unit = SimpleNamespace(job_name="decode",
+                                               job_replica_id=replica,
+                                               data_name="kv.fa",
+                                               data_replica_idx=0)
+    worker._new_raiden_id = MagicMock(
+        side_effect=lambda fields: SimpleNamespace(**fields))
+    worker._raiden_hbm_memory_type = MagicMock(return_value="HBM")
+    return worker, engine, facade
+
+
+@pytest.mark.parametrize(("is_producer", "transfer_rank", "expected"), [
+    (True, 0, "engine-rank0"),
+    (True, 3, "engine-rank3"),
+    (False, 0, "engine"),
+    (False, 3, "engine-rank3"),
+])
+def test_stage3_id_fields_rank_qualify_consumers(is_producer, transfer_rank,
+                                                 expected):
+    fields = stage3_fa_raiden_id_fields(job_name="decode",
+                                        engine_id="engine",
+                                        dp_rank=0,
+                                        transfer_rank=transfer_rank,
+                                        is_producer=is_producer)
+    assert fields["job_replica_id"] == expected
+
+
+def test_stage3_consumer_unit_ids_are_unique_across_tp_ranks():
+    replicas = {
+        stage3_fa_raiden_id_fields(job_name="decode",
+                                   engine_id="engine",
+                                   dp_rank=0,
+                                   transfer_rank=rank,
+                                   is_producer=False)["job_replica_id"]
+        for rank in range(8)
+    }
+    assert len(replicas) == 8
+
+
+def test_stage3_consumer_registration_uses_identity_rank():
+    """A TP8 decode worker registers a rank-qualified unit while keeping the
+    wire transfer_rank at 0 inside a parallelism-1 group."""
+    worker, _, _ = _make_reverse_consumer_worker(tp_rank=3)
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5]:
+        fields = worker._raiden_work_unit_fields(
+            worker._local_raiden_transfer_rank())
+        assert fields["job_replica_id"] == "decode-engine-rank3"
+        assert fields["data_replica_idx"] == 0
+        assert worker._local_raiden_transfer_rank() == 0
+        assert worker._consumer_identity_rank() == 3
+
+
+def test_stage3_destination_work_units_enumerates_siblings_in_rank_order():
+    worker, _, _ = _make_reverse_consumer_worker(tp_rank=3)
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5]:
+        units = worker._stage3_destination_work_units()
+    assert [unit.job_replica_id for unit in units
+            ] == ["decode-engine"
+                  ] + [f"decode-engine-rank{rank}" for rank in range(1, 8)]
+    assert {unit.job_name for unit in units} == {"decode"}
+    assert {unit.data_replica_idx for unit in units} == {0}
+    assert {unit.data_name for unit in units} == {"kv.fa"}
+    # This worker's own slot must match its registered unit (the admission
+    # self-consistency check relies on it).
+    own = units[3]
+    assert (own.job_replica_id, own.data_replica_idx) == (
+        worker._raiden_work_unit.job_replica_id,
+        worker._raiden_work_unit.data_replica_idx)
+
+
+def test_stage3_destination_work_units_identity_for_tp1_consumer():
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=False,
+                                 dp_rank=5,
+                                 dp_size=8,
+                                 pcp_size=1)
+    worker._raiden_work_unit = SimpleNamespace(job_replica_id="engine")
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5]:
+        units = worker._stage3_destination_work_units()
+    # The registered object itself: the old direction's wire payload stays
+    # byte-identical.
+    assert units == [worker._raiden_work_unit]
+    assert units[0] is worker._raiden_work_unit
+
+
+def test_stage3_rank0_submits_one_multicast_transfer():
+    meta = _make_reverse_consumer_meta()
+    worker, engine, facade = _make_reverse_consumer_worker(tp_rank=0)
+    engine.poll_results = [([], ["reverse-prefill"], [])]
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5], patch(f"{_MOD}.logger.info") as log:
+        worker.process_send_load(meta)
+        assert worker.get_finished() == (set(), {"reverse-decode"})
+
+    assert len(facade.start_transfer_calls) == 1
+    call = facade.start_transfer_calls[0]
+    assert [unit.job_replica_id
+            for unit in call["src_units"]] == ["producer-engine-rank0"]
+    assert {unit.data_replica_idx for unit in call["src_units"]} == {3}
+    assert [unit.job_replica_id for unit in call["dst_units"]
+            ] == ["decode-engine"
+                  ] + [f"decode-engine-rank{rank}" for rank in range(1, 8)]
+    assert {unit.data_replica_idx for unit in call["dst_units"]} == {0}
+    assert call["req_id"] == "reverse-prefill"
+    assert call["uuid"] == 808
+    assert call["transfer_pool_tags"] == ["fa", "dsa.idx"]
+    assert call["dst_device_block_ids"] == list(range(300, 364)) * 2
+    assert call["dst_block_counts"] == [64, 64]
+    info_messages = [
+        record.args[0] % record.args[1:] for record in log.call_args_list
+    ]
+    assert any('"event": "raiden_stage3_transfer_submitted"' in message
+               for message in info_messages)
+    assert not any('"event": "raiden_stage3_transfer_expected"' in message
+                   for message in info_messages)
+
+
+def test_stage3_passive_worker_expects_and_completes_without_submitting():
+    meta = _make_reverse_consumer_meta()
+    worker, engine, facade = _make_reverse_consumer_worker(tp_rank=3)
+    engine.poll_results = [([], [], []), ([], ["reverse-prefill"], [])]
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5], patch(f"{_MOD}.logger.info") as log:
+        worker.process_send_load(meta)
+        worker.process_send_load(meta)  # metadata replay dedups
+        assert worker._stage3_submitted_loads == {"reverse-decode": 808}
+        assert "reverse-decode" in worker._stage3_pending_controller_failures
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished() == (set(), {"reverse-decode"})
+        # At-most-once, then full cleanup on the scheduler-finished ack.
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_finished({"reverse-decode"}) == (set(), set())
+
+    assert facade.start_transfer_calls == []
+    assert worker._new_raiden_controller_facade.call_count == 0
+    assert worker._stage3_pending_controller_failures == {}
+    assert worker._stage3_source_req_ids == {}
+    assert worker._stage3_destination_req_ids == {}
+    assert worker.get_block_ids_with_load_errors() == set()
+    info_messages = [
+        record.args[0] % record.args[1:] for record in log.call_args_list
+    ]
+    assert any(
+        '"event": "raiden_stage3_transfer_expected"' in message and
+        '"req_id": "reverse-prefill"' in message and '"tp_rank": 3' in message
+        for message in info_messages)
+    assert not any('"event": "raiden_stage3_transfer_submitted"' in message
+                   for message in info_messages)
+
+
+def test_stage3_passive_worker_times_out_into_recompute():
+    meta = _make_reverse_consumer_meta()
+    worker, engine, facade = _make_reverse_consumer_worker(tp_rank=5)
+    engine.poll_results = [([], [], [])]
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5], patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                              return_value=0.0):
+        worker.process_send_load(meta)
+        assert worker.get_finished() == (set(), {"reverse-decode"})
+
+    assert facade.start_transfer_calls == []
+    assert worker.get_block_ids_with_load_errors() == set(range(300, 364))
+
+
+def test_stage3_rank0_fails_fast_on_single_destination_controller():
+    """An unpatched (pre-multicast) controller rejects >1 dst units during
+    plan build, before receiver arming; the consumer must recompute
+    immediately instead of waiting out the uncertain-outcome deadline."""
+    meta = _make_reverse_consumer_meta()
+    worker, engine, facade = _make_reverse_consumer_worker(tp_rank=0)
+    engine.poll_results = [([], [], [])]
+
+    def _reject(**kwargs):
+        raise RuntimeError(
+            "Pool resharding requires exactly one destination unit")
+
+    facade.start_transfer = _reject
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5]:
+        worker.process_send_load(meta)
+        assert worker.get_finished() == (set(), {"reverse-decode"})
+
+    assert worker._stage3_pending_controller_failures == {}
+    assert worker.get_block_ids_with_load_errors() == set(range(300, 364))
+
+
+def test_stage3_completion_aggregation_reverse_topology():
+    glm_env = [
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+              "raiden",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+              True,
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION", True, create=True),
+    ]
+    with glm_env[0], glm_env[1], glm_env[2]:
+        # Reverse: every TP worker of the decode engine reports its own recv.
+        assert _make_raiden_scheduler(is_producer=False,
+                                      tp_size=8).get_finished_count() == 8
+        # Old direction: one report per DP decode engine (tp_size == 1).
+        assert _make_raiden_scheduler(is_producer=False,
+                                      tp_size=1).get_finished_count() == 1
+        # DP prefill engines are single-worker producers.
+        assert _make_raiden_scheduler(is_producer=True,
+                                      tp_size=1).get_finished_count() == 1
+        assert _make_raiden_scheduler(is_producer=True,
+                                      tp_size=8).get_finished_count() == 8
+
+
+@pytest.mark.parametrize(
+    ("is_producer", "tp_rank", "tp_size", "dp_rank", "expected_node_id"),
+    [
+        (False, 3, 8, 0, 3),  # reverse: TP8 decode worker
+        (False, 0, 1, 5, 5),  # old direction: DP decode engine (unchanged)
+        (True, 0, 1, 3, 0),  # DP prefill producer (endpoint_rank)
+    ])
+def test_stage3_node_id_distinct_per_consumer_worker(is_producer, tp_rank,
+                                                     tp_size, dp_rank,
+                                                     expected_node_id):
+    worker = _make_raiden_worker(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        is_producer=is_producer,
+        dp_rank=dp_rank,
+        dp_size=8 if dp_rank or not is_producer else 1,
+        pcp_size=1)
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(transfer_address="10.0.0.1:1",
+                               listener_address="10.0.0.1:2")
+
+    worker._new_raiden_manager = _capture
+    patches = _glm_reverse_env_patches()
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+            patches[5]:
+        worker._construct_raiden_transfer_engine([], num_slots=1)
+    assert captured["node_id"] == expected_node_id

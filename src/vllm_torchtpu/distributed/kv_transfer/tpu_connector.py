@@ -188,9 +188,13 @@ def stage3_fa_raiden_id_fields(
     """Build the canonical Stage-3 FA work-unit identity.
 
     PCP ranks share a vLLM DP identity, so the transfer rank is part of the
-    producer's engine replica label.  Decode engines are already distinguished
-    by ``data_replica_idx``.  Keeping this in one helper lets the VB3 consumer
-    enumerate source units with exactly the same scheme.
+    producer's engine replica label.  TP1 decode engines are distinguished
+    by ``data_replica_idx`` and keep the bare engine id; the workers of a
+    TP>1 decode engine share one ``data_replica_idx`` and are distinguished
+    by their TP rank in the replica label (rank 0 keeps the bare form so
+    TP1 identities are unchanged).  Keeping this in one helper lets the VB3
+    consumer enumerate source units — and a multicast submitter its sibling
+    destination units — with exactly the same scheme.
     """
     job_name = str(job_name).strip()
     engine_id = str(engine_id).strip()
@@ -205,7 +209,7 @@ def stage3_fa_raiden_id_fields(
     if transfer_rank < 0:
         raise ValueError("Stage-3 Raiden transfer_rank must be non-negative")
     replica_id = (f"{engine_id}-rank{transfer_rank}"
-                  if is_producer else engine_id)
+                  if is_producer or transfer_rank > 0 else engine_id)
     return {
         "job_name": job_name,
         "job_replica_id": replica_id,
@@ -1171,10 +1175,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not _use_raiden_stage3_transport():
             # Preserve the legacy connector's model-runner-world aggregation.
             return 0
+        parallel_config = self.vllm_config.parallel_config
         if not self.is_producer:
+            if _use_raiden_glm_admission():
+                # Every TP worker of a GLM decode engine receives its own
+                # replicated copy and reports its own recv terminal; a DP
+                # decode engine has tp_size 1, preserving the one-report
+                # contract there.
+                return int(parallel_config.tensor_parallel_size or 1)
             # DP8 routes one request to one decode engine.
             return 1
-        parallel_config = self.vllm_config.parallel_config
         if _use_raiden_glm_admission():
             return int(parallel_config.tensor_parallel_size or 1)
         return int(parallel_config.prefill_context_parallel_size or 1)
@@ -1499,6 +1509,17 @@ class TPURaidenConnectorWorker:
             controller_address=controller_address,
         )
         summary["stage3_registration"] = registration
+        # The multicast submitter re-derives its siblings' destination units
+        # from env; drift between registration and enumeration would strand
+        # receivers, so pin the two derivations against each other here.
+        destination_units = self._stage3_destination_work_units()
+        if (not self.is_producer
+                and destination_units[self.tp_rank] != self._raiden_work_unit):
+            raise RuntimeError(
+                "Stage-3 destination enumeration disagrees with this "
+                f"worker's registered unit: enumerated="
+                f"{destination_units[self.tp_rank]}, "
+                f"registered={self._raiden_work_unit}")
 
         self._raiden_transfer_engine = engine
         self._raiden_manifest = manifest
@@ -1539,26 +1560,38 @@ class TPURaidenConnectorWorker:
             )
 
     def _raiden_glm_admission_topology(self) -> str:
-        """Validates the one supported topology. Anything else fails closed here."""
+        """Validates the supported topologies. Anything else fails closed here.
+
+        Two mirrored directions are supported: prefill tp{N}/dp1 -> decode
+        tp1/dp{M} (striped producer group, one receiver per request) and
+        prefill tp1/dp{M} -> decode tp{N}/dp1 (single producer rank,
+        multicast to every replicated decode worker).  A side that shards
+        both ways at once has no plan shape and is rejected.
+        """
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         supported = ("Raiden GLM admission supports prefill tp{N}/dp1 -> "
-                     "decode tp1/dp{M} only")
+                     "decode tp1/dp{M} or prefill tp1/dp{M} -> "
+                     "decode tp{N}/dp1 only")
         if pcp_size != 1:
             raise ValueError(f"{supported}; got "
                              f"prefill_context_parallel_size={pcp_size}")
         if self.is_producer:
-            if dp_size != 1:
+            if dp_size != 1 and tp_size != 1:
                 raise ValueError(f"{supported}; got producer "
                                  f"tensor_parallel_size={tp_size}, "
                                  f"data_parallel_size={dp_size}")
+            if dp_size != 1:
+                return f"dp{dp_size}_prefill"
             return f"tp{tp_size}_prefill"
-        if tp_size != 1:
+        if tp_size != 1 and dp_size != 1:
             raise ValueError(f"{supported}; got consumer "
                              f"tensor_parallel_size={tp_size}, "
                              f"data_parallel_size={dp_size}")
+        if tp_size != 1:
+            return f"tp{tp_size}_decode"
         return f"dp{dp_size}_decode"
 
     @staticmethod
@@ -1674,15 +1707,29 @@ class TPURaidenConnectorWorker:
                 f"cp_kv_cache_interleave_size={interleave_tokens}")
         return interleave_tokens
 
+    def _consumer_identity_rank(self) -> int:
+        """The rank distinguishing this consumer worker's Raiden identity.
+
+        A TP>1 GLM decode engine registers one destination work unit per TP
+        worker; the identity rank is decoupled from the wire transfer_rank,
+        which stays 0 (consumers never join the producer's transfer group).
+        """
+        if (not self.is_producer and _use_raiden_glm_admission()
+                and self.tp_size > 1):
+            return int(self.tp_rank)
+        return 0
+
     def _raiden_work_unit_fields(self, transfer_rank: int) -> dict[str, Any]:
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip()
         engine_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
+        identity_rank = (transfer_rank if self.is_producer else
+                         self._consumer_identity_rank())
         return stage3_fa_raiden_id_fields(
             job_name=job_name or default_job,
             engine_id=engine_id,
             dp_rank=self.dp_rank,
-            transfer_rank=transfer_rank,
+            transfer_rank=identity_rank,
             is_producer=self.is_producer,
         )
 
@@ -2298,6 +2345,39 @@ class TPURaidenConnectorWorker:
                 )) for rank in range(parallelism)
         ]
 
+    def _stage3_destination_work_units(self) -> list[Any]:
+        """Enumerates this consumer engine's destination unit set.
+
+        A TP>1 GLM decode engine receives one multicast transfer whose
+        destinations are all of its TP workers; the submitting worker
+        reconstructs its siblings' identities from the process-wide env,
+        exactly as ``_stage3_source_work_units`` reconstructs producer
+        units.  The list is in TP-rank order 0..N-1 — registration and
+        enumeration must agree, which the startup self-consistency check in
+        ``_admit_raiden_glm_kv_cache`` pins.  TP1 consumers return exactly
+        ``[self._raiden_work_unit]`` (the registered object), keeping the
+        old direction's wire payload byte-identical.
+        """
+        if self._raiden_work_unit is None:
+            raise RuntimeError(
+                "Stage-3 destination enumeration requires a registered "
+                "work unit")
+        if self.is_producer or not (_use_raiden_glm_admission()
+                                    and self.tp_size > 1):
+            return [self._raiden_work_unit]
+        job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or "decode"
+        engine_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
+        return [
+            self._new_raiden_id(
+                stage3_fa_raiden_id_fields(
+                    job_name=job_name,
+                    engine_id=engine_id,
+                    dp_rank=self.dp_rank,
+                    transfer_rank=rank,
+                    is_producer=False,
+                )) for rank in range(self.tp_size)
+        ]
+
     def _record_stage3_load_failure(self, req_id: str,
                                     block_ids: list[int]) -> None:
         self._failed_recving.add(req_id)
@@ -2583,6 +2663,36 @@ class TPURaidenConnectorWorker:
                 destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
+            if (not self.is_producer and _use_raiden_glm_admission()
+                    and self.tp_size > 1 and self.tp_rank != 0):
+                # Multicast passive worker: rank 0 submits the one transfer
+                # naming every sibling destination unit, and the source
+                # controller arms this worker's engine directly, so
+                # completion arrives through poll_stats exactly as for an
+                # accepted submission. The deadline bounds the case where
+                # rank 0 failed before receiver arming and this engine is
+                # never armed.
+                self._stage3_controller_accepted.add(destination_req_id)
+                deadline = (time.perf_counter() +
+                            float(dist_utils.get_p2p_wait_pull_timeout()))
+                self._stage3_pending_controller_failures[
+                    destination_req_id] = deadline
+                logger.info(
+                    "%s",
+                    json.dumps(
+                        {
+                            "event": "raiden_stage3_transfer_expected",
+                            "req_id": source_req_id,
+                            "destination_req_id": destination_req_id,
+                            "uuid": uuid,
+                            "num_tokens": num_tokens,
+                            "tp_rank": self.tp_rank,
+                            "destination_pages": len(local_blocks),
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                continue
             controller_contacted = False
             fa_accepted = False
             submit_ms = None
@@ -2632,7 +2742,7 @@ class TPURaidenConnectorWorker:
                 accepted = self._start_stage3_transfer_with_d5_retry(
                     source_facade,
                     src_units=src_units,
-                    dst_units=[self._raiden_work_unit],
+                    dst_units=self._stage3_destination_work_units(),
                     # D5 is keyed by the producer's internal request ID. The
                     # destination's independently randomized ID is strictly a
                     # local scheduler lifecycle key.
@@ -2655,7 +2765,13 @@ class TPURaidenConnectorWorker:
                 fa_accepted = True
             except Exception as exc:  # pylint: disable=broad-except
                 missing_d5 = "Missing producer block registration" in str(exc)
-                if not controller_contacted or (missing_d5
+                # A controller without multicast support rejects >1
+                # destination units during plan build, strictly before
+                # receiver arming — fail fast instead of waiting out the
+                # uncertain-outcome deadline.
+                pre_arm_reject = (missing_d5 or "exactly one destination unit"
+                                  in str(exc))
+                if not controller_contacted or (pre_arm_reject
                                                 and not fa_accepted):
                     # FA D5 lookup and local validation fail before receiver
                     # arming, so no late H2D is possible.
@@ -3058,8 +3174,12 @@ class TPURaidenConnectorWorker:
         stage3_enabled = self._raiden_stage3_enabled()
         endpoint_rank = (self._local_raiden_transfer_rank() if stage3_enabled
                          and self.is_producer else self.tp_rank)
+        # Stage-3 consumers: distinct per worker across both decode shapes —
+        # DP{M}xTP1 keeps dp_rank (0..M-1, one worker each) and TP{N}xDP1
+        # yields tp_rank (0..N-1 within the one engine).
         node_id = (endpoint_rank if stage3_enabled and self.is_producer else
-                   self.dp_rank if stage3_enabled else self.tp_rank)
+                   self.dp_rank * self.tp_size +
+                   self.tp_rank if stage3_enabled else self.tp_rank)
         local_control_port = self._rank_control_port(self.kv_transfer_port,
                                                      rank=endpoint_rank)
         manager_kwargs: dict[str, Any] = dict(
