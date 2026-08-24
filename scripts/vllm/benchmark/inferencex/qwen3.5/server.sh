@@ -53,9 +53,11 @@ case "$SHARDING" in
       --enable-expert-parallel
     )
     # Defaults preserve the reproduction path. Experiments can opt into the
-    # coordinated scheduler without editing this launcher.
+    # coordinated scheduler without editing this launcher. The flush timeout
+    # is whole milliseconds: envs.py reads it with int(), so "2.0" raises
+    # ValueError out of check_and_update_config before the engine ever starts.
     export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2.0}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2}"
     export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
     # Pick the MoE path per compiled token bucket: fused EP for prefill, vLLM's
@@ -109,9 +111,10 @@ case "$SHARDING" in
       --data-parallel-size=4
       --enable-expert-parallel
     )
-    # Keep the coordinated DP scheduler disabled by default for reproductions.
+    # Same coordinated-scheduler defaults as DP8, including the whole
+    # millisecond flush timeout that int() in envs.py requires.
     export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
-    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2.0}"
+    export TPU_DP_PREFILL_FLUSH_TIMEOUT_MS="${TPU_DP_PREFILL_FLUSH_TIMEOUT_MS:-2}"
     export TPU_DP_PREFILL_QUORUM_FRACTION="${TPU_DP_PREFILL_QUORUM_FRACTION:-0.75}"
     # The fused EP kernel runs expert-parallel over all 8 chips whatever the
     # model above it calls them, and its output is the same global array DP8
