@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -339,12 +340,19 @@ def main() -> None:
                 compile_s, chain_ms = _time(call, args.iterations)
                 if args.verify:
                     out = np.asarray(call()[0].astype(jnp.float32))
+                    # `max_abs_diff` only ever compares within one process.
+                    # Comparing two *kernel* variants means two processes, so
+                    # also emit a digest of the output: --seed fixes the inputs,
+                    # so equal digests across processes mean equal results.
+                    digest = hashlib.blake2b(np.ascontiguousarray(out).tobytes(),
+                                             digest_size=8).hexdigest()
                     if reference is None:
                         reference = out
                         max_diff = 0.0
                     else:
                         max_diff = float(np.abs(out - reference).max())
                 else:
+                    digest = None
                     max_diff = None
             except Exception as exc:  # noqa: BLE001 - candidate triage
                 text = str(exc).lower()
@@ -377,6 +385,7 @@ def main() -> None:
             }
             if max_diff is not None:
                 row["max_abs_diff"] = round(max_diff, 6)
+                row["out_digest"] = digest
             _emit(row)
 
 
