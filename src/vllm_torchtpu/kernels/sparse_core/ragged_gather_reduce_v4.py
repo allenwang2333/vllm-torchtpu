@@ -190,168 +190,175 @@ def _main_kernel_v4(
         if skip_compute:
             return
 
-        def zero_col(col_offset):
-            col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-            zero = jnp.zeros((_TOKEN_SUBCHUNK,), jnp.float32)
-            for r in range(_TOKEN_BLOCK):
-                accum_vmem_ref[r, col_slice] = zero
+        with jax.named_scope("v4_zero_accum"):
+            def zero_col(col_offset):
+                col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                zero = jnp.zeros((_TOKEN_SUBCHUNK,), jnp.float32)
+                for r in range(_TOKEN_BLOCK):
+                    accum_vmem_ref[r, col_slice] = zero
 
-        plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(zero_col)
+            plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(zero_col)
 
     def _issue_metadata_dma(block_idx, slot):
         """Asynchronously transfers metadata, weights, and counts for block_idx into VMEM."""
-        global_block_id = row_partition_id * blocks_per_row_partition + block_idx
-        meta_offset = global_block_id * metadata_block_size
-        counts_offset = global_block_id * _TOKEN_SUBCHUNK
-        vmem_meta_offset = slot * metadata_block_size
-        vmem_counts_offset = slot * _TOKEN_SUBCHUNK
+        with jax.named_scope("v4_meta_prefetch"):
+            global_block_id = row_partition_id * blocks_per_row_partition + block_idx
+            meta_offset = global_block_id * metadata_block_size
+            counts_offset = global_block_id * _TOKEN_SUBCHUNK
+            vmem_meta_offset = slot * metadata_block_size
+            vmem_counts_offset = slot * _TOKEN_SUBCHUNK
 
-        pltpu.make_async_copy(
-            route_metadata_hbm_ref.at[pl.ds(meta_offset, metadata_block_size)],
-            meta_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
-            meta_sem_ref.at[slot],
-        ).start()
-        pltpu.make_async_copy(
-            route_weights_hbm_ref.at[pl.ds(meta_offset, metadata_block_size)],
-            weights_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
-            weights_sem_ref.at[slot],
-        ).start()
-        pltpu.make_async_copy(
-            route_counts_hbm_ref.at[pl.ds(counts_offset, _TOKEN_SUBCHUNK)],
-            counts_buf_vmem_ref.at[pl.ds(vmem_counts_offset, _TOKEN_SUBCHUNK)],
-            counts_sem_ref.at[slot],
-        ).start()
+            pltpu.make_async_copy(
+                route_metadata_hbm_ref.at[pl.ds(meta_offset, metadata_block_size)],
+                meta_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
+                meta_sem_ref.at[slot],
+            ).start()
+            pltpu.make_async_copy(
+                route_weights_hbm_ref.at[pl.ds(meta_offset, metadata_block_size)],
+                weights_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
+                weights_sem_ref.at[slot],
+            ).start()
+            pltpu.make_async_copy(
+                route_counts_hbm_ref.at[pl.ds(counts_offset, _TOKEN_SUBCHUNK)],
+                counts_buf_vmem_ref.at[pl.ds(vmem_counts_offset, _TOKEN_SUBCHUNK)],
+                counts_sem_ref.at[slot],
+            ).start()
 
     def _wait_metadata_dma(slot):
         """Waits for metadata, weights, and counts DMAs for slot to complete."""
-        vmem_meta_offset = slot * metadata_block_size
-        vmem_counts_offset = slot * _TOKEN_SUBCHUNK
-        pltpu.make_async_copy(
-            route_metadata_hbm_ref.at[pl.ds(0, metadata_block_size)],
-            meta_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
-            meta_sem_ref.at[slot],
-        ).wait()
-        pltpu.make_async_copy(
-            route_weights_hbm_ref.at[pl.ds(0, metadata_block_size)],
-            weights_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
-            weights_sem_ref.at[slot],
-        ).wait()
-        pltpu.make_async_copy(
-            route_counts_hbm_ref.at[pl.ds(0, _TOKEN_SUBCHUNK)],
-            counts_buf_vmem_ref.at[pl.ds(vmem_counts_offset, _TOKEN_SUBCHUNK)],
-            counts_sem_ref.at[slot],
-        ).wait()
+        with jax.named_scope("v4_meta_wait"):
+            vmem_meta_offset = slot * metadata_block_size
+            vmem_counts_offset = slot * _TOKEN_SUBCHUNK
+            pltpu.make_async_copy(
+                route_metadata_hbm_ref.at[pl.ds(0, metadata_block_size)],
+                meta_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
+                meta_sem_ref.at[slot],
+            ).wait()
+            pltpu.make_async_copy(
+                route_weights_hbm_ref.at[pl.ds(0, metadata_block_size)],
+                weights_buf_vmem_ref.at[pl.ds(vmem_meta_offset, metadata_block_size)],
+                weights_sem_ref.at[slot],
+            ).wait()
+            pltpu.make_async_copy(
+                route_counts_hbm_ref.at[pl.ds(0, _TOKEN_SUBCHUNK)],
+                counts_buf_vmem_ref.at[pl.ds(vmem_counts_offset, _TOKEN_SUBCHUNK)],
+                counts_sem_ref.at[slot],
+            ).wait()
 
     def _issue_gather_dma(meta_slot, chunk_idx, gather_slot):
         """Issues indirect DMA gather for 16 activation rows into gather_buf_vmem_ref[gather_slot]."""
-        start = meta_slot * metadata_block_size + chunk_idx * _TOKEN_SUBCHUNK
-        meta_slice = meta_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
-        source_indices = jnp.bitwise_right_shift(
-            jnp.bitwise_and(meta_slice, _ROUTE_INDEX_MASK), 1
-        )
-        pltpu.make_async_copy(
-            x_32b_hbm_ref.at[source_indices, pl.ds(col_start, col_size)],
-            gather_buf_vmem_ref.at[gather_slot],
-            gather_sem_ref.at[gather_slot],
-        ).start()
+        with jax.named_scope("v4_prefetch_dma"):
+            start = meta_slot * metadata_block_size + chunk_idx * _TOKEN_SUBCHUNK
+            meta_slice = meta_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
+            source_indices = jnp.bitwise_right_shift(
+                jnp.bitwise_and(meta_slice, _ROUTE_INDEX_MASK), 1
+            )
+            pltpu.make_async_copy(
+                x_32b_hbm_ref.at[source_indices, pl.ds(col_start, col_size)],
+                gather_buf_vmem_ref.at[gather_slot],
+                gather_sem_ref.at[gather_slot],
+            ).start()
 
     def _wait_gather_dma(gather_slot):
         """Waits for DMA gather into gather_buf_vmem_ref[gather_slot] to complete."""
-        pltpu.make_async_copy(
-            x_32b_hbm_ref.at[pl.ds(0, _TOKEN_SUBCHUNK), pl.ds(col_start, col_size)],
-            gather_buf_vmem_ref.at[gather_slot],
-            gather_sem_ref.at[gather_slot],
-        ).wait()
+        with jax.named_scope("v4_wait_in"):
+            pltpu.make_async_copy(
+                x_32b_hbm_ref.at[pl.ds(0, _TOKEN_SUBCHUNK), pl.ds(col_start, col_size)],
+                gather_buf_vmem_ref.at[gather_slot],
+                gather_sem_ref.at[gather_slot],
+            ).wait()
 
     def _compute_chunk(meta_slot, chunk_idx, gather_slot, valid_count):
         """Unpacks BF16 values, multiplies by route weights, and vector scatter-adds to accumulator."""
         if skip_compute:
             return
 
-        start = meta_slot * metadata_block_size + chunk_idx * _TOKEN_SUBCHUNK
-        route_meta = meta_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
-        source_indices = jnp.bitwise_and(route_meta, _ROUTE_INDEX_MASK)
-        route_destinations = jnp.bitwise_right_shift(route_meta, _ROUTE_INDEX_BITS)
-        route_weights = weights_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
+        with jax.named_scope("v4_run_compute"):
+            start = meta_slot * metadata_block_size + chunk_idx * _TOKEN_SUBCHUNK
+            route_meta = meta_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
+            source_indices = jnp.bitwise_and(route_meta, _ROUTE_INDEX_MASK)
+            route_destinations = jnp.bitwise_right_shift(route_meta, _ROUTE_INDEX_BITS)
+            route_weights = weights_buf_vmem_ref[pl.ds(start, _TOKEN_SUBCHUNK)]
 
-        def compute_col(col_offset):
-            col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-            feature_indices = col_offset + jnp.arange(_TOKEN_SUBCHUNK, dtype=jnp.int32)
+            def compute_col(col_offset):
+                col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                feature_indices = col_offset + jnp.arange(_TOKEN_SUBCHUNK, dtype=jnp.int32)
 
-            for batch_start in range(0, _TOKEN_SUBCHUNK, 4):
-                for batch_lane in range(4):
-                    lane = batch_start + batch_lane
-                    val_i32 = gather_buf_vmem_ref[gather_slot, lane, col_slice]
-                    shift = jnp.where(
-                        jnp.bitwise_and(source_indices[lane], 1) == 0, 16, 0
-                    )
-                    val_f32 = plsc.bitcast(
-                        jnp.bitwise_and(
-                            jnp.left_shift(val_i32, shift), jnp.int32(-65536)
-                        ),
-                        jnp.float32,
-                    ) * route_weights[lane]
-                    dest = jnp.full_like(feature_indices, route_destinations[lane])
-                    route_valid = (chunk_idx * _TOKEN_SUBCHUNK + lane < valid_count)
-                    scatter_mask = jnp.broadcast_to(route_valid, (_TOKEN_SUBCHUNK,))
-                    plsc.addupdate_scatter(
-                        accum_vmem_ref,
-                        (dest, feature_indices),
-                        val_f32,
-                        mask=scatter_mask,
-                    )
+                for batch_start in range(0, _TOKEN_SUBCHUNK, 4):
+                    for batch_lane in range(4):
+                        lane = batch_start + batch_lane
+                        val_i32 = gather_buf_vmem_ref[gather_slot, lane, col_slice]
+                        shift = jnp.where(
+                            jnp.bitwise_and(source_indices[lane], 1) == 0, 16, 0
+                        )
+                        val_f32 = plsc.bitcast(
+                            jnp.bitwise_and(
+                                jnp.left_shift(val_i32, shift), jnp.int32(-65536)
+                            ),
+                            jnp.float32,
+                        ) * route_weights[lane]
+                        dest = jnp.full_like(feature_indices, route_destinations[lane])
+                        route_valid = (chunk_idx * _TOKEN_SUBCHUNK + lane < valid_count)
+                        scatter_mask = jnp.broadcast_to(route_valid, (_TOKEN_SUBCHUNK,))
+                        plsc.addupdate_scatter(
+                            accum_vmem_ref,
+                            (dest, feature_indices),
+                            val_f32,
+                            mask=scatter_mask,
+                        )
 
-        plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(compute_col)
+            plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(compute_col)
 
     def _pack_and_write_output(block_idx):
         """Packs pairs of FP32 accum rows into uint32 BF16 and streams tiles to HBM."""
-        global_block_id = row_partition_id * blocks_per_row_partition + block_idx
-        for token_subchunk in range(_NUM_TOKEN_SUBCHUNKS):
-            out_slot = token_subchunk % 2
-            accum_row_start = token_subchunk * _TOKEN_SUBCHUNK
+        with jax.named_scope("v4_output_pack_write"):
+            global_block_id = row_partition_id * blocks_per_row_partition + block_idx
+            for token_subchunk in range(_NUM_TOKEN_SUBCHUNKS):
+                out_slot = token_subchunk % 2
+                accum_row_start = token_subchunk * _TOKEN_SUBCHUNK
 
-            # Wait on previous DMA if reusing this output buffer slot
-            @pl.when((token_subchunk >= 2) | (block_idx > 0))
-            def _wait_prev_out_dma():
+                # Wait on previous DMA if reusing this output buffer slot
+                @pl.when((token_subchunk >= 2) | (block_idx > 0))
+                def _wait_prev_out_dma():
+                    pltpu.make_async_copy(
+                        packed_out_vmem_ref.at[out_slot],
+                        out_32b_hbm_ref.at[
+                            pl.ds(0, _TOKEN_SUBCHUNK // 2), pl.ds(col_start, col_size)
+                        ],
+                        output_sem_ref.at[out_slot],
+                    ).wait()
+
+                if not skip_compute:
+                    def pack_col(col_offset, row_start=accum_row_start, slot=out_slot):
+                        col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                        for token_lane in range(0, _TOKEN_SUBCHUNK, 2):
+                            accum_row = row_start + token_lane
+                            packed_bf16 = plsc.pack(
+                                accum_vmem_ref[accum_row, col_slice],
+                                accum_vmem_ref[accum_row + 1, col_slice],
+                                format=plsc.PackFormat.INTERLEAVED,
+                            )
+                            packed_out_vmem_ref[
+                                slot, token_lane // 2, col_slice
+                            ] = plsc.bitcast(packed_bf16, jnp.uint32)
+
+                    plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(pack_col)
+
+                output_row = (
+                    global_block_id * _TOKEN_BLOCK + token_subchunk * _TOKEN_SUBCHUNK
+                )
+                output_row_packed = pl.multiple_of(
+                    output_row // 2, _TOKEN_SUBCHUNK // 2
+                )
+
                 pltpu.make_async_copy(
                     packed_out_vmem_ref.at[out_slot],
                     out_32b_hbm_ref.at[
-                        pl.ds(0, _TOKEN_SUBCHUNK // 2), pl.ds(col_start, col_size)
+                        pl.ds(output_row_packed, _TOKEN_SUBCHUNK // 2),
+                        pl.ds(col_start, col_size),
                     ],
                     output_sem_ref.at[out_slot],
-                ).wait()
-
-            if not skip_compute:
-                def pack_col(col_offset, row_start=accum_row_start, slot=out_slot):
-                    col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-                    for token_lane in range(0, _TOKEN_SUBCHUNK, 2):
-                        accum_row = row_start + token_lane
-                        packed_bf16 = plsc.pack(
-                            accum_vmem_ref[accum_row, col_slice],
-                            accum_vmem_ref[accum_row + 1, col_slice],
-                            format=plsc.PackFormat.INTERLEAVED,
-                        )
-                        packed_out_vmem_ref[
-                            slot, token_lane // 2, col_slice
-                        ] = plsc.bitcast(packed_bf16, jnp.uint32)
-
-                plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(pack_col)
-
-            output_row = (
-                global_block_id * _TOKEN_BLOCK + token_subchunk * _TOKEN_SUBCHUNK
-            )
-            output_row_packed = pl.multiple_of(
-                output_row // 2, _TOKEN_SUBCHUNK // 2
-            )
-
-            pltpu.make_async_copy(
-                packed_out_vmem_ref.at[out_slot],
-                out_32b_hbm_ref.at[
-                    pl.ds(output_row_packed, _TOKEN_SUBCHUNK // 2),
-                    pl.ds(col_start, col_size),
-                ],
-                output_sem_ref.at[out_slot],
-            ).start()
+                ).start()
 
     # -------------------------------------------------------------------------
     # PROLOGUE: Fetch Block 0 metadata and prefetch Chunk 0
@@ -458,14 +465,15 @@ def _main_kernel_v4(
     # -------------------------------------------------------------------------
     # EPILOGUE: Drain pending output DMAs
     # -------------------------------------------------------------------------
-    for s in range(2):
-        pltpu.make_async_copy(
-            packed_out_vmem_ref.at[s],
-            out_32b_hbm_ref.at[
-                pl.ds(0, _TOKEN_SUBCHUNK // 2), pl.ds(col_start, col_size)
-            ],
-            output_sem_ref.at[s],
-        ).wait()
+    with jax.named_scope("v4_output_drain"):
+        for s in range(2):
+            pltpu.make_async_copy(
+                packed_out_vmem_ref.at[s],
+                out_32b_hbm_ref.at[
+                    pl.ds(0, _TOKEN_SUBCHUNK // 2), pl.ds(col_start, col_size)
+                ],
+                output_sem_ref.at[s],
+            ).wait()
 
 
 @functools.partial(
