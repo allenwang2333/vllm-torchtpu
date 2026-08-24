@@ -239,18 +239,27 @@ def _candidates(args, base: tuple[int, int, int, int],
     out = [base]
     if args.sweep == "none":
         return out
+    if args.sweep == "split":
+        # Hold the fetch block at whatever the heuristic picked -- that is the
+        # DMA tile, and shrinking it costs page-table walks -- and slice the
+        # compute inside it. `_validate_block_sizes` requires bkv_csz to both
+        # divide bkv_sz and be a multiple of page_size, so enumerate the sizes
+        # that actually satisfy that rather than a fixed list: at bkv_sz 9216
+        # and page 256 the legal set is 256..9216 stepping through the divisors
+        # of 36, which excludes round-looking values like 2048.
+        out.extend((bq_sz, bkv_sz, bq_csz, csz)
+                   for csz in range(args.page_size, bkv_sz + 1, args.page_size)
+                   if bkv_sz % csz == 0)
+        return _dedup(out)
     for bkv in (256, 512, 1024, 2048, 4096, 8192, max_kv):
         if bkv > max_kv or bkv % args.page_size:
             continue
-        if args.sweep == "bkv":
-            # Fetch block == compute block, the shape the heuristic uses.
-            cand = (bq_sz, bkv, bq_csz, bkv)
-        else:  # "split": fetch a large block, compute in smaller slices
-            for csz in (256, 512, 1024, 2048):
-                if csz <= bkv and bkv % csz == 0:
-                    out.append((bq_sz, bkv, bq_csz, csz))
-            continue
-        out.append(cand)
+        # Fetch block == compute block, the shape the heuristic uses.
+        out.append((bq_sz, bkv, bq_csz, bkv))
+    return _dedup(out)
+
+
+def _dedup(out):
     seen, unique = set(), []
     for c in out:
         if c not in seen:
