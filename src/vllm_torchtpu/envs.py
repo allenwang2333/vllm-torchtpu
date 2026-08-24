@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_LOW_LATENCY_ALLREDUCE: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -292,6 +293,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Route small TP all-reduces to the two-shot Pallas kernel instead of
+    # XLA's ring. Only batches at or below
+    # TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE whose payload is also inside the
+    # measured crossover are rerouted; everything else stays on XLA. See
+    # docs/low_latency_allreduce.md and distributed/low_latency_all_reduce.py.
+    "TPU_LOW_LATENCY_ALLREDUCE":
+    env_bool("TPU_LOW_LATENCY_ALLREDUCE"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.

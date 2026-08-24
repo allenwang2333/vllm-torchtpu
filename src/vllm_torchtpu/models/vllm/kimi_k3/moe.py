@@ -15,9 +15,11 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
+from .latent_moe_runner import KimiK3LatentMoERunner
 from .layers import KimiMLP
 
 
@@ -150,6 +152,14 @@ class KimiMoE(nn.Module):
                 routed_scaling_factor=config.routed_scaling_factor,
                 routed_input_transform=self.routed_expert_down_proj,
                 routed_output_transform=routed_output_transform,
+                # Reduces the latent and shared-expert partials as one
+                # collective instead of two. Passed only when asked for, so the
+                # default build gets upstream's runner and an unchanged graph;
+                # the runner itself falls back to super().forward() on any
+                # layer or token bucket it is not wired for. See
+                # latent_moe_runner.KimiK3LatentMoERunner.
+                runner_cls=(KimiK3LatentMoERunner
+                            if _llar.moe_concat_enabled() else None),
             )
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
