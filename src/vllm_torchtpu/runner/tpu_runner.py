@@ -1179,7 +1179,6 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1195,6 +1194,7 @@ class TPUModelRunner(GPUModelRunner):
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        attention_backends: dict[str, type[Any]] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
@@ -1251,8 +1251,10 @@ class TPUModelRunner(GPUModelRunner):
                     # The layout can pad a page past what its shape and dtype
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
+                    attention_backend = attn_module.get_attn_backend()
+                    attention_backends[layer_name] = attention_backend
                     _warn_if_kv_cache_is_padded(
-                        attn_module.get_attn_backend(),
+                        attention_backend,
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
@@ -1261,7 +1263,7 @@ class TPUModelRunner(GPUModelRunner):
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes
                         if self._hybrid_uniform_page_size_bytes is not None
-                        else backend_cls.get_kv_cache_page_size_bytes(
+                        else attention_backend.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1336,6 +1338,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            attention_backends=attention_backends,
         )
 
     def build_attention_metadata_for_layers(
@@ -2046,8 +2049,11 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
+                kernel_block_size = (raw.shape[-1]
+                                     if envs.USE_BATCHED_RPA_SEQ_ON_LANE else
+                                     raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
-                                          raw.shape[1])
+                                          kernel_block_size)
                 break
 
     def _collect_mamba_state_seed_copies(self, scheduler_output,

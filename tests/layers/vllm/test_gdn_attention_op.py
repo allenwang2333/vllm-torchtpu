@@ -20,11 +20,13 @@ import numpy as np
 import pytest
 import torch
 from jax.sharding import PartitionSpec
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu.layers.common.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention, gdn_attention_core_tpu_pcp_prefill)
+    VllmGatedDeltaNetAttention, _pooled_gdn_block_tokens,
+    _pooled_gdn_state_view, gdn_attention_core_tpu_pcp_prefill)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
 
@@ -69,6 +71,39 @@ def _qwen35_397b_gdn_attn(prefix: str, *, bias: bool = False):
 
 
 class TestVllmGatedDeltaNetAttention:
+
+    @pytest.mark.parametrize("page_size", [128, 256, 512])
+    @pytest.mark.parametrize("num_kv_heads,kv_packing,head_dim,dtype", [
+        (1, 4, 256, jnp.float8_e4m3fn),
+        (1, 2, 256, jnp.bfloat16),
+        (2, 2, 256, jnp.bfloat16),
+        (4, 4, 256, jnp.float8_e4m3fn),
+    ])
+    def test_seq_on_lane_preserves_manager_physical_page_split(
+            self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim,
+            dtype):
+        monkeypatch.setenv("USE_BATCHED_RPA_SEQ_ON_LANE", "1")
+        manager_block_size = 4096 if page_size == 512 else 4352
+        vllm_config = _vllm_config(block_size=manager_block_size)
+
+        num_kv_heads_x2 = num_kv_heads * 2
+        packed_head_dim = head_dim // kv_packing
+        recurrent_state = jnp.zeros(
+            (1, num_kv_heads_x2, packed_head_dim, kv_packing, page_size),
+            dtype=dtype,
+        )
+        pooled_state = _pooled_gdn_state_view(recurrent_state)
+
+        packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
+        expected_gdn_kernel_block_size = (
+            (num_kv_heads_x2 * packed_head_dim * kv_packing * page_size) //
+            (packed_num_heads * kv_packing * head_dim))
+        assert pooled_state.shape == (1, expected_gdn_kernel_block_size,
+                                      packed_num_heads, kv_packing, head_dim)
+        expected_tokens = (manager_block_size //
+                           page_size) * expected_gdn_kernel_block_size
+        assert _pooled_gdn_block_tokens(vllm_config, recurrent_state,
+                                        pooled_state) == expected_tokens
 
     @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
            "run_jax_gdn_attention_pcp_tp_prefill")
@@ -301,6 +336,7 @@ class TestVllmGatedDeltaNetAttention:
                  "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
                  "gdn_attention_pooled_core_tpu",
              ) as mock_core:
+            mock_core.return_value = (MagicMock(), MagicMock())
             attn._build_pooled_gdn_op()
 
             # The executor finalizes the manager block size only after
