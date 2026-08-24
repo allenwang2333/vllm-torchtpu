@@ -93,6 +93,7 @@ def make_cos_sin_cache(max_position, rotary_dim, seed=0):
                           axis=-1).astype(np.float32)
 
 
+# TODO: improve test coverage for the rope kernels.
 class RopeTest(parameterized.TestCase):
 
     def _run(

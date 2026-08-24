@@ -20,6 +20,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.layers.common.quantization import dtype_max
+from vllm_torchtpu.utils import largest_divisor
+
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
 
@@ -34,7 +37,8 @@ class CosSinRef(pltpu.BufferedRef):
     tile_n: int = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create(cls, *, spec, dtype, buffer_count, tile_n):
+    def create(cls, *, spec: pl.BlockSpec, dtype: jnp.dtype, buffer_count: int,
+               tile_n: int) -> "CosSinRef":
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
             dtype_or_type=dtype,
@@ -51,7 +55,8 @@ class CosSinRef(pltpu.BufferedRef):
             },
         )
 
-    def copy_in(self, src_ref, grid_indices):
+    def copy_in(self, src_ref: tuple[jax.Ref, jax.Ref],
+                grid_indices: tuple[int | jax.Array, ...]) -> None:
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
@@ -66,7 +71,8 @@ class CosSinRef(pltpu.BufferedRef):
             src = cos_sin_cache_ref.at[position, pl.ds(0, width)]
             pltpu.make_async_copy(src, dest_ref.at[i, :], sem).start()
 
-    def wait_in(self, src_ref, grid_indices):
+    def wait_in(self, src_ref: tuple[jax.Ref, jax.Ref],
+                grid_indices: tuple[int | jax.Array, ...]) -> None:
         del src_ref, grid_indices
         slot = self.current_wait_in_slot
         vmem_ref = self.window_ref.at[slot]
@@ -74,12 +80,11 @@ class CosSinRef(pltpu.BufferedRef):
                               self.sem_recvs.at[slot]).wait()
 
 
-def _lane_gather(operand, indices):
+def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
     """``out[b..., i] = operand[b..., indices[i]]`` over the last axis.
 
   The leading axes come along as batch dimensions. ``indices`` is a constant
-  1-D array, so this lowers to a lane shuffle rather than a real dynamic
-  gather.
+  1-D array.
   """
     rank = operand.ndim
     lanes = indices.shape[0]
@@ -102,7 +107,8 @@ def _lane_gather(operand, indices):
     )
 
 
-def _cos_sin_lanes(cos_sin, *, rotary_dim, inverse):
+def _cos_sin_lanes(cos_sin: jax.Array, *, rotary_dim: int,
+                   inverse: bool) -> tuple[jax.Array, jax.Array]:
     """The reference's ``np.split`` + ``np.repeat(..., 2)``, over a whole block.
 
   ``cos_sin`` is one packed ``[cos | sin]`` row per token. The reference splits
@@ -126,7 +132,6 @@ def _cos_sin_lanes(cos_sin, *, rotary_dim, inverse):
     # to keep the gather in bounds on the NoPE lanes, replaced just below.
     freq = jnp.maximum(channel, 0) // 2
 
-    cos_sin = cos_sin.astype(jnp.float32)
     cos = _lane_gather(cos_sin, freq)  # np.split(...)[0], repeated
     sin = _lane_gather(cos_sin, half + freq)  # np.split(...)[1], repeated
     if inverse:
@@ -134,7 +139,7 @@ def _cos_sin_lanes(cos_sin, *, rotary_dim, inverse):
     return jnp.where(is_rot, cos, 1.0), jnp.where(is_rot, sin, 0.0)
 
 
-def _rotate_gptj(x):
+def _rotate_gptj(x: jax.Array) -> jax.Array:
     """The reference's ``rotated``: ``[-x1, x0, -x3, x2, ...]`` along the lanes.
 
   ``np.stack([-x[..., 1::2], x[..., 0::2]], -1).reshape(...)`` says, lane by
@@ -147,21 +152,15 @@ def _rotate_gptj(x):
     return _lane_gather(x, lane ^ 1) * sign
 
 
-def _dtype_max(dtype):
-    info = (jnp.iinfo(dtype)
-            if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype))
-    return float(info.max)
-
-
 def _rope_body(
-    x_ref,
-    cos_sin_ref,
-    *out_refs,
-    rotary_dim,
-    inverse,
-    out_dtype,
-    quant_dtype,
-):
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    *out_refs: jax.Ref,
+    rotary_dim: int,
+    inverse: bool,
+    out_dtype: jnp.dtype,
+    quant_dtype: jnp.dtype | None,
+) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
   Without ``quant_dtype`` the rotation is written back into ``x_ref`` in place.
@@ -184,10 +183,10 @@ def _rope_body(
         return
 
     q_ref, scale_ref = out_refs
-    dtype_max = _dtype_max(quant_dtype)
+    qmax = dtype_max(quant_dtype)
     # One scale per row, i.e. over the whole ``LANE``-wide channel axis.
     abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
-    scale = abs_max / dtype_max
+    scale = abs_max / qmax
     scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
     q_ref[...] = (y * scale_inv).astype(quant_dtype)
     scale_ref[...] = scale.reshape(scale_ref.shape)
@@ -195,12 +194,12 @@ def _rope_body(
 
 def _kernel(
     # scalar prefetch
-    positions_ref,
+    positions_ref: jax.Ref,
     # HBM inputs
-    x_hbm_ref,
-    cos_sin_cache_hbm_ref,
+    x_hbm_ref: jax.Ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
     # HBM outputs: (out,) aliased onto x_hbm_ref, or (q, scales) when quantizing
-    *out_hbm_refs,
+    *out_hbm_refs: jax.Ref,
     num_tiles: int,
     tile_n: int,
     x_block_shape: tuple[int, ...],
@@ -212,7 +211,7 @@ def _kernel(
     out_dtype: jnp.dtype,
     cos_sin_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
-):
+) -> None:
 
     def x_index_map(i):
         if len(x_block_shape) == 3:
@@ -292,22 +291,21 @@ def _kernel(
 
 
 def _qnorm_rope_body(
-    x_ref,
-    cos_sin_ref,
-    out_ref,
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
     *,
-    rotary_dim,
-    eps,
-    inverse,
-    out_dtype,
-):
+    rotary_dim: int,
+    eps: float,
+    inverse: bool,
+    out_dtype: jnp.dtype,
+) -> None:
     """Process one ``(tile_n, num_heads, head_dim)`` chunk.
 
   Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
   rotation ``_rope_body`` applies.
   """
     x = x_ref[...].astype(jnp.float32)
-    # ``torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + eps)``.
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
 
@@ -328,12 +326,12 @@ def _qnorm_rope_body(
 
 def _qnorm_rope_kernel(
     # scalar prefetch
-    positions_ref,
+    positions_ref: jax.Ref,
     # HBM inputs
-    x_hbm_ref,
-    cos_sin_cache_hbm_ref,
+    x_hbm_ref: jax.Ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
     # HBM output, aliased onto x_hbm_ref
-    out_hbm_ref,
+    out_hbm_ref: jax.Ref,
     *,
     num_tiles: int,
     tile_n: int,
@@ -343,7 +341,7 @@ def _qnorm_rope_kernel(
     inverse: bool,
     in_dtype: jnp.dtype,
     cos_sin_dtype: jnp.dtype,
-):
+) -> None:
     x_spec = pl.BlockSpec(
         block_shape=x_block_shape,
         memory_space=pltpu.VMEM,
@@ -389,14 +387,6 @@ def _qnorm_rope_kernel(
     _run()
 
 
-def _largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of ``x`` that is <= ``cap``."""
-    for candidate in range(min(x, cap), 0, -1):
-        if x % candidate == 0:
-            return candidate
-    return 1
-
-
 def _rope_call(
     x: jax.Array,
     positions: jax.Array,
@@ -405,7 +395,7 @@ def _rope_call(
     inverse: bool,
     quant_dtype: jnp.dtype | None,
     name: str,
-):
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Builds the ``pallas_call``; see the public wrappers for the contract."""
     if x.ndim not in (2, 3):
         raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
@@ -426,7 +416,7 @@ def _rope_call(
         raise ValueError(
             f"quantization requires head_dim == {LANE}, got {head_dim}")
 
-    tile_n = _largest_divisor(num_tokens, cap=128)
+    tile_n = largest_divisor(num_tokens, cap=128)
     assert num_tokens % tile_n == 0
 
     x_block_shape = ((tile_n, rows_per_token, LANE) if x.ndim == 3 else
@@ -492,8 +482,7 @@ def _rope_call(
     donate_argnames=("x", ),
 )
 def rope(
-    x: jax.
-    Array,  # [num_tokens, head_dim] or [num_tokens, num_heads, head_dim]
+    x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
@@ -531,8 +520,7 @@ def rope(
     donate_argnames=("x", ),
 )
 def qnorm_rope(
-    x: jax.
-    Array,  # [num_tokens, num_heads, head_dim] or [num_tokens, head_dim]
+    x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, head_dim]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
@@ -551,7 +539,7 @@ def qnorm_rope(
     rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-    tile_n = _largest_divisor(num_tokens, cap=64)
+    tile_n = largest_divisor(num_tokens, cap=64)
 
     x_block_shape = (tile_n, rows_per_token, head_dim)
     kernel = functools.partial(
@@ -590,8 +578,7 @@ def qnorm_rope(
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
 def rope_quant(
-    x: jax.
-    Array,  # [num_tokens, head_dim] or [num_tokens, num_heads, head_dim]
+    x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,

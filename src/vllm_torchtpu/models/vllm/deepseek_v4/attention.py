@@ -408,7 +408,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
             return op
 
         eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_v1_e{_name_float(eps)}"
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
@@ -433,7 +433,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         if op is not None:
             return op
 
-        op_name = "pallas::deepseek_v4_kv_rope_v1"
+        op_name = "pallas::deepseek_v4_kv_rope"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
@@ -667,7 +667,7 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
 
         self._assert_o_proj_supported()
         head_dim = int(self.head_dim)
-        op_name = f"pallas::deepseek_v4_o_proj_v1_d{head_dim}"
+        op_name = f"pallas::deepseek_v4_o_proj_d{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
@@ -688,7 +688,10 @@ class VllmDeepseekV4MLAAttention(dsv4_attention.DeepseekV4Attention,
         return op
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Store `wo_a` in the layout the fused o-projection kernel wants. """
+        """Store `wo_a` in the layout the fused o-projection kernel wants,
+        which is (self.n_local_heads * self.head_dim // self.n_local_groups,
+                  self.n_local_groups * self.o_lora_rank).
+        """
         del act_dtype
         weight = self.wo_a.weight
         transposed = (self.n_local_heads * self.head_dim //

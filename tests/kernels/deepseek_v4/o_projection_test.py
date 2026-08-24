@@ -68,6 +68,7 @@ def make_inputs(rng,
     return activations, wo_a, wo_a_scale
 
 
+# TODO: improve test coverage.
 class OProjectionTest(parameterized.TestCase):
 
     @parameterized.named_parameters(

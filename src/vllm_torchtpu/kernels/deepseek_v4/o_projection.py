@@ -22,12 +22,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.rope import (LANE, CosSinRef,
                                                     _cos_sin_lanes,
                                                     _rotate_gptj)
+from vllm_torchtpu.layers.common.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 SUBLANE = 8
-
-FP8_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 
 
 def _largest_divisor(x: int, cap: int) -> int:
@@ -38,7 +37,8 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _cos_sin_body(cos_sin_ref, out_ref, *, rotary_dim, inverse, out_dtype):
+def _cos_sin_body(cos_sin_ref: jax.Ref, out_ref: jax.Ref, *, rotary_dim: int,
+                  inverse: bool, out_dtype: jnp.dtype) -> None:
     """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
     cos, sin = _cos_sin_lanes(cos_sin_ref[...],
                               rotary_dim=rotary_dim,
@@ -48,11 +48,11 @@ def _cos_sin_body(cos_sin_ref, out_ref, *, rotary_dim, inverse, out_dtype):
 
 def _cos_sin_kernel(
     # scalar prefetch
-    positions_ref,
+    positions_ref: jax.Ref,
     # HBM input
-    cos_sin_cache_hbm_ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
     # HBM output
-    out_hbm_ref,
+    out_hbm_ref: jax.Ref,
     *,
     num_tiles: int,
     tile_n: int,
@@ -60,7 +60,7 @@ def _cos_sin_kernel(
     inverse: bool,
     cos_sin_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
-):
+) -> None:
     cos_sin_spec = pl.BlockSpec(
         block_shape=(tile_n, rotary_dim),
         memory_space=pltpu.VMEM,
@@ -154,7 +154,8 @@ def gather_cos_sin(
     )(positions, cos_sin_cache)
 
 
-def _rope_heads(x, cos_sin, *, head_dim):
+def _rope_heads(x: jax.Array, cos_sin: jax.Array, *,
+                head_dim: int) -> jax.Array:
     """apply RoPE to the last rope dim of head dim of ``x``."""
     cos = cos_sin[:, :LANE]
     sin = cos_sin[:, LANE:]
@@ -166,18 +167,18 @@ def _rope_heads(x, cos_sin, *, head_dim):
 
 def _kernel(
     # inputs
-    x_ref,  # VMEM (tile_t, H, head_dim) bf16
-    w_ref,  # VMEM (D, tile_r) fp8
-    scale_ref,  # VMEM (1, tile_r) f32
-    cos_sin_ref,  # VMEM (tile_t, 2 * LANE) f32
+    x_ref: jax.Ref,  # VMEM (tile_t, H, head_dim) bf16
+    w_ref: jax.Ref,  # VMEM (D, tile_r) fp8
+    scale_ref: jax.Ref,  # VMEM (1, tile_r) f32
+    cos_sin_ref: jax.Ref,  # VMEM (tile_t, 2 * LANE) f32
     # output
-    out_ref,  # VMEM (tile_t, tile_r) out_dtype
+    out_ref: jax.Ref,  # VMEM (tile_t, tile_r) out_dtype
     *,
     tile_t: int,
     num_sub_t: int,
     quantize_activations: bool,
     head_dim: int,
-):
+) -> None:
     rhs = w_ref[...]
     scale = scale_ref[...]
     cos_sin = cos_sin_ref[...]
