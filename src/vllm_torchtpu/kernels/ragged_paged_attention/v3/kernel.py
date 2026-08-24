@@ -379,6 +379,11 @@ def _ragged_paged_attention_kernel_loop(
     assert head_dim % 128 == 0
     assert bkv_sz % page_size == 0
     bkv_p = bkv_sz // page_size
+    # When several KV heads share a packed word, `load_bkv` reads that word
+    # once for all of them, so the out-of-range tail can be zeroed there --
+    # once per chunk on a [bkv_csz, head_dim] uint32 -- instead of once per
+    # KV head on the unpacked V. See `load_bkv` for why zeroing K too is safe.
+    mask_kv_on_load = kv_packing > 1 and not skip_kv_mask
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
     num_seqs = end_seq_idx - start_seq_idx
 
@@ -480,8 +485,6 @@ def _ragged_paged_attention_kernel_loop(
             jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(int_ty)
         k_span = processed_kv_len_int + lax.broadcasted_iota(
             int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(
-            int_ty, v.shape, 0)
 
         mask = None
         if use_causal_mask:
@@ -490,7 +493,12 @@ def _ragged_paged_attention_kernel_loop(
 
         if not skip_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            if not mask_kv_on_load:
+                # `s` is already `mask_value` on these columns, so this only
+                # defends the `pv` matmul against `0 * NaN`.
+                v_span = processed_kv_len_int + lax.broadcasted_iota(
+                    int_ty, v.shape, 0)
+                v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
         if sliding_window is not None:
             mask = mask_and(mask, q_span < k_span + sliding_window)
@@ -836,7 +844,8 @@ def _ragged_paged_attention_kernel_loop(
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
-    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
+    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz, *, load_cache=None,
+                 valid_rows=None):
         start *= bkv_stride
         sz *= bkv_stride
         step = bkv_stride
@@ -854,7 +863,22 @@ def _ragged_paged_attention_kernel_loop(
         num_kv_per_load = kv_packing // 2
         offset = kv_head_idx // num_kv_per_load
         kv_idx_in_load = kv_head_idx % num_kv_per_load
-        kv = strided_load(kv_ref, start + offset, sz, step)
+        if load_cache is not None and offset in load_cache:
+            # Same word, same rows -- only the shift below differs.
+            kv = load_cache[offset]
+        else:
+            kv = strided_load(kv_ref, start + offset, sz, step)
+            if valid_rows is not None:
+                # Zero the tail past `effective_kv_len` while it is still one
+                # packed word, so the caller can drop its per-head V mask.
+                # This zeroes K as well as V, which is a no-op: the surviving
+                # `k_span < effective_kv_len` mask overwrites `s` with
+                # `mask_value` on exactly these columns.
+                kv = jnp.where(
+                    lax.broadcasted_iota(jnp.int32, kv.shape, 0) < valid_rows,
+                    kv, 0)
+            if load_cache is not None:
+                load_cache[offset] = kv
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         k = kv >> (kv_idx_in_load * 2 * bitwidth)
@@ -1004,6 +1028,9 @@ def _ragged_paged_attention_kernel_loop(
                     prev_v = None
                     prev_exp_m_diff = None
                     bkv_start = idx * bkv_csz
+                    # KV heads sharing a packed word read the same rows; keyed
+                    # by that word, so it is only valid for this chunk.
+                    load_cache = {}
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                         for kv_head_idx in range(actual_num_kv_heads):
@@ -1012,6 +1039,10 @@ def _ragged_paged_attention_kernel_loop(
                                 kv_head_idx,
                                 bkv_start,
                                 bkv_csz,
+                                load_cache=load_cache,
+                                valid_rows=(effective_kv_len -
+                                            (processed_kv_len + bkv_start))
+                                if mask_kv_on_load else None,
                             )
                             bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
                                            actual_bq_csz)
