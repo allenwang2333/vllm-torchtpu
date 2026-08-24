@@ -472,7 +472,16 @@ def _tile_row_scales(window, row_base, tile_m):
     rot = pltpu.roll(window, lanes - resid, 1)
     lane = lax.broadcasted_iota(jnp.int32, rot[:-1].shape, 1)
     rows = jnp.where(lane < lanes - resid, rot[:-1], rot[1:])
-    return rows.reshape(-1)[:tile_m][:, None]
+    # The cast that moves a lane block onto the sublane axis is written one
+    # sublane at a time. Mosaic infers a layout for [1, lanes] -> [lanes, 1]
+    # and refuses [s, lanes] -> [s * lanes, 1], so a tile at or below one
+    # lane block used to build and a taller one failed to compile, in a
+    # diagnostic naming a reshape rather than the tile height that caused
+    # it. The concatenation is in the same order the flat reshape had:
+    # sublane 0's lanes, then sublane 1's.
+    cols = [rows[s:s + 1].reshape(lanes, 1) for s in range(rows.shape[0])]
+    col = cols[0] if len(cols) == 1 else jnp.concatenate(cols, axis=0)
+    return col[:tile_m]
 
 
 def _build_fused_ep_moe_kernel(*,

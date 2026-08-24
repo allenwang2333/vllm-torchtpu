@@ -337,9 +337,13 @@ def production_weights():
     del weights
 
 
+# A tile taller than one lane block is the case the activation row scales
+# are read differently for: at 64 and 128 a tile's scales live on a single
+# sublane of the scale slab and at 256 they span two, which is the only
+# tile-height-dependent shape in the kernel body.
 @pytest.mark.parametrize(("tokens", "capacity"),
                          [(tokens, CAPACITY) for tokens in PROD_TOKENS] +
-                         [(2048, 64)])
+                         [(2048, 64), (2048, 256), (16384, 256)])
 def test_production_shape_tracks_a_dense_reference(production_weights, tokens,
                                                    capacity):
     """Qwen3.5-397B's MoE block at the decode and prefill batch shapes."""
