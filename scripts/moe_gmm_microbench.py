@@ -250,9 +250,15 @@ def _gmm_roofline(valid_rows: int, num_groups: int, size_k: int, size_n: int,
 
 
 def _scope(lhs, rhs, rhs_scale, group_sizes, tile_info, fuse_act,
-           maybe_quantize_lhs, out_dtype) -> tuple[str, TileSizes]:
+           maybe_quantize_lhs, out_dtype,
+           vmem_limit: int | None = None) -> tuple[str, TileSizes]:
     """Reproduce the trace scope name gmm_v2 emits, so a microbenchmark row can
     be matched against an xprof op by name."""
+    # gmm_v2 resolves a None vmem limit before it builds the configs; calling
+    # make_gmm_configs directly skips that, and calculate_tiling then compares
+    # its estimate against None. Mirror the same default here.
+    if vmem_limit is None:
+        vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
     cfgs = make_gmm_configs(
         lhs,
         rhs,
@@ -261,7 +267,7 @@ def _scope(lhs, rhs, rhs_scale, group_sizes, tile_info, fuse_act,
         group_sizes,
         jnp.array([0], dtype=jnp.int32),
         tile_info=tile_info,
-        vmem_limit_bytes=None,
+        vmem_limit_bytes=vmem_limit,
         out_dtype=out_dtype,
         acc_dtype=None,
         maybe_quantize_lhs=maybe_quantize_lhs,
@@ -323,7 +329,7 @@ def _bench_gmm(name: str, routed: Routed, lhs: jax.Array, rhs: jax.Array,
         try:
             scope, tiles = _scope(lhs, rhs, rhs_scale, routed.group_sizes,
                                   tile_info, fuse_act, maybe_quantize_lhs,
-                                  out_dtype)
+                                  out_dtype, vmem_limit)
 
             def call():
                 return gmm_v2(
@@ -404,12 +410,12 @@ def _bench_case(case: str, num_tokens: int, weights: Weights, args,
         base_1 = explicit or _scope(routed.x, weights.w1, weights.w1_scale,
                                     routed.group_sizes, calculate_tiling,
                                     ACTIVATION, not args.no_quantize_lhs,
-                                    None)[1]
+                                    None, args.vmem_limit)[1]
         base_2 = explicit or _scope(
             jax.ShapeDtypeStruct((routed.x.shape[0], args.inter),
                                  jnp.bfloat16), weights.w2, weights.w2_scale,
             routed.group_sizes, calculate_tiling, None,
-            not args.no_quantize_lhs, jnp.bfloat16)[1]
+            not args.no_quantize_lhs, jnp.bfloat16, args.vmem_limit)[1]
         tile_infos_1 = _tile_candidates(args.sweep, base_1, args.hidden,
                                         2 * args.inter)
         tile_infos_2 = _tile_candidates(args.sweep, base_2, args.inter,
