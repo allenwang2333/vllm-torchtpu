@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    TPU_DP_PREFILL_DEFER: bool = False
+    TPU_DP_PREFILL_HARD: bool = False
+    TPU_DP_PREFILL_DRAIN_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -324,6 +327,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Let TpuDpScheduler forward the DP prefill cadence to upstream vLLM so
+    # that in-progress prefill *chunks* can also be deferred to
+    # cadence-aligned steps. Off by default, which keeps the historical
+    # behaviour of only gating brand-new requests.
+    "TPU_DP_PREFILL_DEFER":
+    env_bool("TPU_DP_PREFILL_DEFER"),
+    # With TPU_DP_PREFILL_DEFER, pin ``prefill_capacity_bound`` to False so a
+    # backlogged waiting queue cannot re-open prefill admission mid-window.
+    # Under a saturated benchmark the queue is never empty, so without this
+    # upstream disables deferral on every step.
+    "TPU_DP_PREFILL_HARD":
+    env_bool("TPU_DP_PREFILL_HARD"),
+    # With TPU_DP_PREFILL_DEFER, close the prefill drain window this many
+    # steps after it opened, even if requests are still queued. 0 keeps the
+    # historical behaviour of draining until the queue empties -- which under
+    # saturation means the window never closes. The counter is driven purely
+    # by the DP-identical prefill cadence, so it stays in lockstep across
+    # ranks with no extra collective.
+    "TPU_DP_PREFILL_DRAIN_STEPS":
+    lambda: int(os.getenv("TPU_DP_PREFILL_DRAIN_STEPS") or "0"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
