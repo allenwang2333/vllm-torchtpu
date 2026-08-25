@@ -327,7 +327,9 @@ def test_embedding_first_layer_and_final_norm_boundaries() -> None:
     model.layers = nn.ModuleList([decoder])
     model.norm = final_norm
 
-    output = model(
+    # The instance intentionally bypasses KimiModel.__init__, so call the
+    # implementation directly instead of the vLLM compile-decorator wrapper.
+    output = model.forward(
         input_ids=torch.arange(8),
         positions=torch.arange(8),
     )
