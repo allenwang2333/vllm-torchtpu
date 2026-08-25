@@ -1126,6 +1126,25 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=256,
         vmem_limit_bytes=62914560,
     ),
+    # Kimi-Linear-48B single-chip (TP1) decode, e.g. disaggregated DP
+    # engines: at TP1 the unified-pool block holds all 32 KDA heads, so the
+    # pool page is 1704 tokens (852 packed rows x 2), and the default 3-page
+    # KV pipeline needs 62.25M scoped VMEM against the 60M budget. One page
+    # per block fits (verified by compile probe at this geometry).
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=64,
+        actual_num_q_heads=32,
+        actual_lkv_dim=128,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+    ):
+    TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    ),
 }
 
 
