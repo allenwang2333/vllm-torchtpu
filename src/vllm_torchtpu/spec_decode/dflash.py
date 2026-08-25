@@ -522,6 +522,7 @@ class DFlashProposer:
                     hidden_dim=hidden_dim,
                     dtype=dtype,
                     num_reqs=runner.num_reqs_max_model_len,
+                    sync=True,
                 )
 
                 # The draft model only runs speculation on decode steps, so it never processes
@@ -533,12 +534,14 @@ class DFlashProposer:
                     num_tokens=num_tokens,
                     num_reqs=runner.num_reqs_max_model_len,
                     use_max_model_len=True,
+                    sync=True,
                 )
                 if runner.most_model_len is not None:
                     self._dummy_draft_forward(
                         num_tokens=num_tokens,
                         num_reqs=runner.num_reqs_most_model_len,
                         use_max_model_len=False,
+                        sync=True,
                     )
 
     def _dummy_kv_update_inputs(
@@ -603,7 +606,15 @@ class DFlashProposer:
         hidden_dim: int,
         dtype: torch.dtype,
         num_reqs: int,
+        sync: bool,
     ) -> None:
+        """One KV-update pass on constant dummies.
+
+        `sync` blocks the host until the program is compiled and executed —
+        what `precompile` wants, and what the per-step lockstep replays must
+        NOT do: they run inside `propose` on the decode path, where a host
+        wait per padding chunk stalls every step.
+        """
         runner = self.runner
         dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
             num_tokens, hidden_dim, dtype, num_reqs)
@@ -614,14 +625,18 @@ class DFlashProposer:
                 dummy_hidden, dummy_positions,
                 tuple([dummy_attn_metadata] *
                       len(self.draft_model.model.layers)))
-            synchronize_tensors(out)
+            if sync:
+                synchronize_tensors(out)
 
     def _dummy_draft_forward(
         self,
         num_tokens: int,
         num_reqs: int,
         use_max_model_len: bool,
+        sync: bool,
     ) -> None:
+        """One draft forward on constant dummies; see
+        `_dummy_precompute_and_update_kv_cache` for `sync`."""
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
         block_size = K + 1
@@ -700,7 +715,8 @@ class DFlashProposer:
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
-                synchronize_tensors(draft_tokens_chunk)
+                if sync:
+                    synchronize_tensors(draft_tokens_chunk)
 
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
@@ -733,6 +749,7 @@ class DFlashProposer:
             hidden_dim=hidden_dim,
             dtype=dtype,
             num_reqs=runner.num_reqs_max_model_len,
+            sync=False,
         )
 
     @torch.no_grad()
@@ -748,6 +765,7 @@ class DFlashProposer:
             num_tokens=draft_bucket,
             num_reqs=runner.num_reqs_max_model_len,
             use_max_model_len=True,
+            sync=False,
         )
 
     @torch.no_grad()
