@@ -211,12 +211,16 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
 # invisible to the throughput benchmarks, to batch-1 smoke tests, and to the
 # num_concurrent=128 evals above (which lose only ~2 points from the drain-down
 # tail), so the canary pins client concurrency to 32 to hold the decode batch at
-# the shape being checked. No baseline file: the 0.5 floor is fixed, and any
-# score under it means the output is garbage rather than merely degraded.
+# the shape being checked. No baseline file: the floor is a fixed constant
+# (override with GSM8K_CANARY_FLOOR), and any score under it means the output
+# is garbage rather than merely degraded. It must sit well below every real
+# model's score -- the smallest model in CI (Qwen3-0.6B) legitimately scores
+# ~0.40 on this slice, while the guarded failure mode scores ~0.00 -- so 0.1
+# separates the two regimes with wide margin on both sides.
 run_corruption_canary() {
     local eval_log="${RESULTS_DIR}/eval_check_gsm8k_canary.md"
     local canary_dir="${RESULTS_DIR}/gsm8k_canary"
-    local floor="0.5"
+    local floor="${GSM8K_CANARY_FLOOR:-0.1}"
 
     echo "Running decode-batch corruption canary: gsm8k at num_concurrent=32..."
     lm_eval \
@@ -237,7 +241,7 @@ if not paths:
 score = json.load(open(paths[-1]))['results']['gsm8k']['exact_match,strict-match']
 print('gsm8k canary: exact_match,strict-match=%.4f (floor %.2f)' % (score, floor))
 sys.exit(0 if score >= floor else 1)
-" "$canary_dir" "$floor" 2>&1 | tee -a "$eval_log" || { echo "::error::Decode-batch corruption canary failed: gsm8k strict-match under $floor at num_concurrent=32 (decode output corrupt, not merely degraded), or no results json produced -- see the canary log lines above for which."; fail=1; }
+" "$canary_dir" "$floor" 2>&1 | tee -a "$eval_log" || { echo "::error::Decode-batch corruption canary failed: gsm8k strict-match under ${floor} at num_concurrent=32 (decode output corrupt, not merely degraded), or no results json produced -- see the canary log lines above for which."; fail=1; }
 }
 
 # ========================================================
