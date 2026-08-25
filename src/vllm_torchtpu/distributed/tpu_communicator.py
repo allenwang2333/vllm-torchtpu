@@ -19,8 +19,6 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
-from vllm_torchtpu.distributed import low_latency_all_reduce as _llar
-
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -40,32 +38,30 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """TP all-reduce, optionally through a low-latency Pallas kernel.
 
-        Only the tensor-parallel group is ever rerouted, and only for the
-        token buckets wired up at warmup; anything else goes to XLA.
-        Restricting it this way keeps every other group (DP, EP, world) on the
-        path it has always used.
+        Only the tensor-parallel group is ever rerouted. Every other group
+        (DP, EP, world) stays on the path it has always used, and inside the op
+        every payload but the one wired at warmup takes an ordinary ring
+        reduction, so this is a rerouting of one shape, not of the collective.
         """
-        # `_ll_entries` is set by low_latency_all_reduce.warmup(), before
-        # torch.compile traces anything, and is empty unless the kernel is
-        # enabled and at least one bucket was wired. Deciding anything here
-        # instead -- reading the payload shape, looking up an op by shape,
-        # registering one -- fails compilation outright: shapes pin vLLM's
-        # dynamic token dimension, and registration calls into code dynamo will
-        # not trace.
+        # `_ll_op` is set by low_latency_all_reduce.warmup(), before
+        # torch.compile traces anything, and is None unless the kernel is
+        # enabled and a plan was built. Deciding anything here instead --
+        # reading the payload shape, looking one op up by shape, registering
+        # one -- fails compilation outright: shapes pin vLLM's dynamic token
+        # dimension, and registration calls into code dynamo will not trace.
         #
-        # select_entry keeps every token bucket above the configured batch
-        # threshold off the op entirely. The op would fall back to XLA for them
-        # anyway and be correct, but inside an opaque custom call, where XLA can
-        # no longer fuse, combine, or reorder the collective -- so on any bucket
-        # that was not wired this asks for a plain reduction instead. It indexes
-        # a dict with a Python int from the forward context and folds away at
-        # trace time; see low_latency_all_reduce.select_entry.
-        entries = getattr(self, "_ll_entries", None)
-        if entries:
-            entry = _llar.select_entry(entries)
-            if entry is not None:
-                op, buffers = entry
-                return op(input_, *buffers)
+        # Note what is *not* here any more: no token-bucket test. The op is
+        # emitted on every bucket and chooses between the kernel and
+        # jax.lax.psum inside its own traced JAX body, where the shape is a
+        # concrete int. That is what makes the graph structurally identical
+        # across buckets, which is what vLLM's one-trace-many-buckets
+        # compilation requires; see _build_two_shot. The read below folds to a
+        # constant at trace time because warmup ran before any tracing, so
+        # dynamo emits the call unconditionally and no branch survives.
+        entry = getattr(self, "_ll_op", None)
+        if entry is not None:
+            op, buffers = entry
+            return op(input_, *buffers)
         return super().all_reduce(input_)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:

@@ -335,6 +335,41 @@ class LowLatencyAllReduce:
     # -- op construction ----------------------------------------------------
 
     def _build_two_shot(self, shape: tuple[int, ...], dtype: torch.dtype):
+        """The reduce op for this group: kernel where it wins, psum elsewhere.
+
+        One op, emitted at every call site on every bucket, choosing inside.
+        That uniformity is the point, not an accident of convenience. The
+        alternative -- emit the op only where the kernel applies -- makes the
+        workspaces graph inputs on some buckets and not others, and vLLM
+        compiles every bucket from *one* Dynamo trace: ``compile_all_ranges``
+        feeds one FX graph concrete inputs per size, so structure is fixed once
+        and shapes vary. ``compilation/shape_variants.py`` can re-trace per
+        group, but only from ShapeEnv guards, and the token count cannot leave
+        one here -- reading that dim pins vLLM's marked-dynamic input_ids
+        dimension and fails with ConstraintViolationError. The trace that stays
+        live then has to serve every bucket, and ``BucketExecutables.get``
+        checks each handed-over executable against ``_signature(graph)``, the
+        subgraph's placeholder list. Two placeholder lists cannot belong to one
+        live graph, which is the ShapeSpecializationError this design avoids by
+        never producing a second list.
+
+        The choice itself is free. ``sharded_jax_op`` lowers per input shape, so
+        inside the traced JAX function ``x.size`` is a concrete int and the
+        branch below is ordinary Python at trace time -- the same arrangement
+        ``layers/common/fused_moe_gmm.py`` uses for
+        ``onehot_moe_permute_threshold``, which is a ``jax.jit`` static argname
+        branching on ``token_indices_sorted.shape[0]`` inside the pallas op.
+        Nothing about it is visible to dynamo, so nothing about it can change
+        the torch graph.
+
+        The fallback is ``jax.lax.psum`` rather than the torch-level
+        ``xla_all_reduce``: it is the same ring reduction XLA would have
+        emitted, and it avoids the out-of-place clone the custom-op contract
+        forces on the torch path -- 7 MiB per reduction at a 512-token bucket.
+        What it does not avoid is the custom-call boundary: XLA's collective
+        combiner cannot merge a psum inside an opaque call with the collectives
+        around it. That is the cost of uniformity and it is unmeasured.
+        """
         import jax
 
         from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
@@ -355,12 +390,28 @@ class LowLatencyAllReduce:
             numel *= d
         cols = numel // n
         chunk = 1
+        # The workspaces are sized for this payload, so the kernel branch can
+        # only fire for it. Any other shape reaching this op takes the psum
+        # branch, which reads neither workspace.
+        # The kernel branch fires for exactly the payload the workspaces were
+        # sized for, tested by element count. build_reduce_op derives the same
+        # number from the same plan shape and gates its writeback on it; the two
+        # must agree, and this comment is the only thing holding them together.
+        # dtype is not part of the test because it cannot vary -- warmup takes
+        # it from model_config.dtype and builds one op per width -- and a
+        # mismatch would fail loudly at lowering rather than silently, since the
+        # workspaces would not type-check against the payload.
+        wired_numel = numel
 
         def _fn(
             x: jax.Array, rs: jax.Array, ag: jax.Array, step: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
 
             def body(x, rs, ag, step):
+                # Concrete ints at JAX trace time; this is not a lax branch and
+                # emits no select. See the docstring.
+                if x.size != wired_numel:
+                    return jax.lax.psum(x, axis_name=axis), rs, ag, step
                 flat = x.reshape(n, cols)
                 out, rs, ag, step = two_shot_all_reduce(
                     flat,
@@ -570,26 +621,37 @@ def build_reduce_op(dispatcher: LowLatencyAllReduce, plan: _Plan,
     is why warmup builds an op *per* wired bucket and hands the caller a dict to
     index rather than one op that dispatches internally.
 
-    Anything that is not this plan's shape reduces through XLA, which is always
-    correct. Reaching that branch means the caller skipped ``select_entry``.
+    Every bucket goes through this op; what varies is what the op does, chosen
+    inside the traced JAX body from a concrete shape. See ``_build_two_shot``
+    for why the uniformity is load-bearing rather than incidental.
     """
     existing = _ENTRY_OPS.get(name)
     if existing is not None:
         return existing
 
+    plan_numel = 1
+    for dim in plan.shape:
+        plan_numel *= dim
+
     def _impl(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
               step: torch.Tensor) -> torch.Tensor:
-        if (tuple(x.shape) == plan.shape and x.dtype == plan.dtype
-                and x.is_contiguous()):
-            out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
-            # The workspace has to be written back explicitly: the op returns
-            # fresh buffers, and the kernel needs the *same* buffer next call
-            # for its slot parity to mean anything.
+        out, new_rs, new_ag, new_step = plan.op(x, rs, ag, step)
+        # Only the kernel branch advances the workspace, so only it needs the
+        # writeback -- the op returns fresh buffers and the kernel needs the
+        # *same* buffer next call for its slot parity to mean anything. The psum
+        # branch returns them untouched, and copying them back would be pure
+        # cost on every bucket the kernel does not serve.
+        #
+        # This predicate must stay identical to the one inside _build_two_shot's
+        # traced body -- both are "element count equals the plan's". If torch
+        # thought a call took the psum branch while JAX emitted the kernel, the
+        # workspace would stop advancing and the slot parity would silently go
+        # stale: wrong numbers, not an error.
+        if x.numel() == plan_numel:
             rs.copy_(new_rs)
             ag.copy_(new_ag)
             step.copy_(new_step)
-            return out
-        return dispatcher.xla_all_reduce(x)
+        return out
 
     # mutates_args stays empty even though the implementation writes the
     # workspace in place. Declaring the mutation makes AOTAutograd add the
@@ -707,7 +769,7 @@ def warmup(vllm_config) -> None:
     # cannot leave stale entries pointing at workspaces the old group owned.
     global _MOE_CONCAT_ENTRIES
     _MOE_CONCAT_ENTRIES = {}
-    communicator._ll_entries = {}
+    communicator._ll_op = None
 
     rows = _candidate_rows(vllm_config)
     if not rows:
@@ -725,13 +787,18 @@ def warmup(vllm_config) -> None:
     # separately from the communicator's width and never competes with it: its
     # call site is explicit -- KimiK3LatentMoERunner -- so it gets its own ops
     # and its own workspaces.
-    targets = []
-    if hidden is not None:
-        targets.append((hidden, communicator._ll_entries, "ts"))
-    if concat is not None:
-        targets.append((concat, _MOE_CONCAT_ENTRIES, "moe_concat"))
+    def _wire(width: int, infix: str):
+        """One op for this width, bound to the smallest bucket that wins.
 
-    for width, entries, infix in targets:
+        Smallest rather than all of them: the op is emitted on *every* bucket,
+        so it can carry only one workspace and therefore serve the kernel at
+        only one shape. Widening that to several buckets means several workspace
+        sets as arguments of one fixed-arity op -- mechanical, and deliberately
+        not done here so this prototype changes one thing at a time.
+
+        Smallest is the right one of the several: it is the lowest-concurrency
+        decode step, where a latency-bound collective is worth the most.
+        """
         for tokens in rows:
             probe = torch.empty((tokens, width),
                                 dtype=dtype,
@@ -745,15 +812,38 @@ def warmup(vllm_config) -> None:
             # use would put it inside the traced forward and abort compilation.
             name = (f"vllm_torchtpu::ll_all_reduce_{infix}_"
                     f"{dispatcher.op_suffix}_{tokens}")
-            entries[tokens] = (build_reduce_op(dispatcher, plan,
-                                               name), plan.buffers)
+            return tokens, (build_reduce_op(dispatcher, plan,
+                                            name), plan.buffers)
+        return None, None
 
-    logger.info(
-        "Low-latency all-reduce warmup: buckets %s take the kernel at the "
-        "hidden width%s (limit %d tokens, candidates %s). Every other bucket "
-        "and every other shape uses XLA.", sorted(communicator._ll_entries),
-        f" and {sorted(_MOE_CONCAT_ENTRIES)} at the concatenated latent-MoE "
-        f"width" if concat is not None else "", max_batch_size(), rows)
+    if hidden is not None:
+        wired_at, entry = _wire(hidden, "ts")
+        communicator._ll_op = entry
+        logger.info(
+            "Low-latency all-reduce: the TP reduce op is emitted on every "
+            "bucket and runs the kernel at %s tokens, jax.lax.psum elsewhere. "
+            "Candidates %s, limit %d.", wired_at, rows, max_batch_size())
+
+    # The concatenated latent-MoE pair keeps the per-bucket dict: its call site
+    # prepares a payload (a cat and two slices) that is wasted when the kernel
+    # does not run, so it has to decide *before* committing, which means
+    # deciding in traced python. That leaves this path structurally
+    # bucket-dependent and so still single-trace-group only. Giving it the same
+    # treatment means always concatenating, whose cost is what the c4/c8
+    # regression measured -- a separate change with a separate measurement.
+    if concat is not None:
+        for tokens in rows:
+            probe = torch.empty((tokens, concat),
+                                dtype=dtype,
+                                device=communicator.device)
+            plan = dispatcher._build_plan(probe, ((tokens, concat), dtype))
+            del probe
+            if plan.kernel == "xla":
+                continue
+            name = (f"vllm_torchtpu::ll_all_reduce_moe_concat_"
+                    f"{dispatcher.op_suffix}_{tokens}")
+            _MOE_CONCAT_ENTRIES[tokens] = (build_reduce_op(
+                dispatcher, plan, name), plan.buffers)
 
     if concat is not None and not _MOE_CONCAT_ENTRIES:
         logger.warning(
