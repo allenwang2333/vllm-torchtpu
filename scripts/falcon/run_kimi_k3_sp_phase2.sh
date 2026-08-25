@@ -527,12 +527,13 @@ common_tokens = set(control_top) & set(sp_top)
 # The TP32 baseline performs one BF16 all-reduce, while SP4 uses the required
 # lane8 all-reduce followed by an SP4 reduce-scatter.  Their reduction trees
 # are mathematically equivalent but not bitwise identical, and the rounding
-# difference accumulates through the full model. The sampled top-1 token is
-# exact and has a tighter ULP budget; top-5 membership remains diagnostic
-# because several nearly tied tokens can straddle that arbitrary cutoff.
+# difference accumulates through the full model. Repeated TP32 control and SP4
+# starts each showed up to 8 BF16 ULPs of run-to-run EP reduction jitter, so
+# the paired budget covers both sides. The sampled top-1 token remains exact;
+# top-5 membership is diagnostic because nearly tied tokens can straddle it.
 top5_count = 5
 min_top20_overlap = 15
-max_sampled_bf16_ulps = 8.0
+max_sampled_bf16_ulps = 16.0
 max_common_bf16_ulps = 16.0
 
 
