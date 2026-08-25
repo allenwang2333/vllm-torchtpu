@@ -19,6 +19,10 @@ from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import \
     _layout_supported as _mega_kda_layout_supported
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
+from vllm_torchtpu.logger import init_logger
+
+
+logger = init_logger(__name__)
 
 
 def _token_sequence_ids(
@@ -333,6 +337,7 @@ def _get_kda_prefill_kernel() -> str:
         raise ValueError(
             "VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL must be 'chunked' or "
             f"'mega', got {kernel!r}.")
+    logger.info_once("Kimi-K3 KDA prefill kernel selected: %s", kernel)
     return kernel
 
 
