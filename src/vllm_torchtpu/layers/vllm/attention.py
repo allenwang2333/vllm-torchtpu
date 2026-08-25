@@ -107,6 +107,19 @@ def _resolve_kv_cache_scale_dtype(
         raise ValueError(f"Unsupported scale dtype: {scale_dtype}")
 
 
+def _resolve_hadamard_mode() -> str | None:
+    """Parse TPU_KV_CACHE_QUANT_HADAMARD into None / "k" / "kv"."""
+    value = str(envs.TPU_KV_CACHE_QUANT_HADAMARD).lower().strip()
+    if value in ("", "0", "false"):
+        return None
+    if value in ("1", "true", "k"):
+        return "k"
+    if value == "kv":
+        return "kv"
+    raise ValueError(
+        f"Unsupported TPU_KV_CACHE_QUANT_HADAMARD value: {value!r}")
+
+
 def _torch_to_jax_dtype(dtype: torch.dtype | str | jnp.dtype | None) -> jnp.dtype | None:
     if dtype is None:
         return None
@@ -201,6 +214,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -225,6 +239,7 @@ def _pallas_rpa_kernel_impl(
         v_scale_tensor=v_scale,
         use_per_token_scale=use_per_token_scale,
         per_token_scale_dtype=jax_scale_dtype,
+        hadamard_mode=hadamard_mode,
         sinks=sinks,
         attention_chunk_size=sliding_window,
         skip_kv_update=skip_kv_update,
@@ -262,6 +277,7 @@ def _pallas_rpa_kernel_default(
     use_causal_mask: bool = True,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -292,6 +308,7 @@ def _pallas_rpa_kernel_default(
         use_causal_mask=use_causal_mask,
         use_per_token_scale=use_per_token_scale,
         per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -326,6 +343,7 @@ def _pallas_rpa_kernel_local(
     use_causal_mask: bool = True,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -360,6 +378,7 @@ def _pallas_rpa_kernel_local(
         use_causal_mask=use_causal_mask,
         use_per_token_scale=use_per_token_scale,
         per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -387,6 +406,7 @@ def _pallas_rpa_kernel_batched(
     use_causal_mask: bool = True,
     use_per_token_scale: bool | None = None,
     per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -413,6 +433,7 @@ def _pallas_rpa_kernel_batched(
         use_causal_mask=use_causal_mask,
         use_per_token_scale=use_per_token_scale,
         per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -655,6 +676,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # as a method. Subclasses override this to select a different kernel.
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
+    # Only the batched RPA kernel implements the Q-rotation / output-unrotation
+    # needed for Hadamard-transform KV cache quantization.
+    _supports_hadamard: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -699,6 +723,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # None if per-token quantization is disabled.
         self.per_token_scale_dtype = _resolve_kv_cache_scale_dtype(self.per_token_fp4_quantization)
 
+        # Hadamard-rotated KV cache quantization (TPU_KV_CACHE_QUANT_HADAMARD).
+        # Mode "k": K is rotated along head_dim before FP4 quantization and
+        # the batched RPA wrapper rotates Q to compensate. Mode "kv":
+        # additionally V is rotated and the wrapper un-rotates the output.
+        self.hadamard_mode = _resolve_hadamard_mode()
+        if self.hadamard_mode is not None:
+            if not self.per_token_fp4_quantization:
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires per-token FP4 KV "
+                    "cache quantization (--kv-cache-dtype nvfp4), got "
+                    f"kv_cache_dtype={kv_cache_dtype!r}.")
+            if not self._supports_hadamard:
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires the batched RPA "
+                    "attention backend (--attention-backend CUSTOM).")
+            if head_size & (head_size - 1):
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires head_size to be a "
+                    f"power of two, got {head_size}.")
+
         # Store sinks for attention sink optimization
         self.sinks = sinks
         if self.sinks is not None:
@@ -737,7 +781,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale_key, v_scale_key, use_pcp_streaming,
                       cp_kv_cache_interleave_size, max_model_len,
-                      self.per_token_fp4_quantization, self.per_token_scale_dtype)
+                      self.per_token_fp4_quantization, self.per_token_scale_dtype,
+                      self.hadamard_mode)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -755,7 +800,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         id(mesh), q_scale, k_scale_key, v_scale_key, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
                         max_model_len, self.use_causal_mask,
-                        self.per_token_fp4_quantization, self.per_token_scale_dtype)
+                        self.per_token_fp4_quantization, self.per_token_scale_dtype,
+                        self.hadamard_mode)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -795,6 +841,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     use_causal_mask=self.use_causal_mask,
                     use_per_token_scale=False,
                     per_token_scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=None,
                 )
             else:
                 wrapped_fn = functools.partial(
@@ -810,6 +857,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     use_causal_mask=self.use_causal_mask,
                     use_per_token_scale=self.per_token_fp4_quantization,
                     per_token_scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=self.hadamard_mode,
                 )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -1027,7 +1075,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if self.kv_cache_quantized_dtype:
             if self.per_token_fp4_quantization:
                 key, value, k_scale_tensor, v_scale_tensor = quantize_kv_fp4_per_tensor(
-                    key, value, scale_dtype=self.per_token_scale_dtype
+                    key, value, scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=self.hadamard_mode,
                 )
             else:
                 k_scale_value = layer._k_scale_float
@@ -1113,6 +1162,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+    _supports_hadamard = True
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

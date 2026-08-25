@@ -33,8 +33,10 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
+import math
 from typing import Tuple
 
+import numpy as np
 import torch
 
 # MXFP4 block size as stored in checkpoints
@@ -85,12 +87,132 @@ def quantize_kv(
     return key, value
 
 
+# Cache of normalized Hadamard rotation matrices keyed by (dim, device).
+_HADAMARD_MATRICES: dict[tuple[int, torch.device], torch.Tensor] = {}
+# Cache of unnormalized +-1 Hadamard matrices keyed by (dim, device, dtype).
+_HADAMARD_PM1_MATRICES: dict[tuple[int, torch.device, torch.dtype],
+                             torch.Tensor] = {}
+
+
+def _hadamard_pm1_np(dim: int) -> np.ndarray:
+    """Unnormalized +-1 Sylvester-Hadamard matrix as float32 numpy."""
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError(
+            "Hadamard rotation requires head_dim to be a power of two, got"
+            f" {dim}.")
+    h = np.array([[1.0]], dtype=np.float32)
+    while h.shape[0] < dim:
+        h = np.block([[h, h], [h, -h]])
+    return h
+
+
+def _hadamard_np(dim: int) -> np.ndarray:
+    """Normalized Sylvester-Hadamard matrix as float32 numpy.
+
+    Must stay bitwise identical to
+    `vllm_torchtpu.kernels.experimental.batched_rpa.hadamard.hadamard_matrix_np`:
+    the K/V rotation applied here at quantization time is undone by the
+    Q-rotation / output-unrotation the batched RPA wrapper performs with its
+    own copy of the matrix.
+    """
+    return (_hadamard_pm1_np(dim) *
+            np.float32(1.0 / math.sqrt(dim))).astype(np.float32)
+
+
+def _hadamard_pm1_torch(dim: int, device: torch.device,
+                        dtype: torch.dtype) -> torch.Tensor:
+    """Same +-1 Sylvester recursion as `_hadamard_pm1_np`, in torch ops.
+
+    `apply_hadamard_transform` runs inside the traced model forward, and
+    Dynamo has no rule for `np.block`, so building the matrix through numpy
+    there aborts the `fullgraph=True` capture. The recursion is pure
+    constants, so XLA folds it away at compile time. Entries are +-1 exactly,
+    which is representable in any float dtype, so this stays bitwise
+    identical to the numpy reference (and hence to the JAX-side
+    `hadamard_pm1_np` the batched RPA wrapper un-rotates with).
+    """
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError(
+            "Hadamard rotation requires head_dim to be a power of two, got"
+            f" {dim}.")
+    h = torch.ones((1, 1), device=device, dtype=dtype)
+    while h.shape[0] < dim:
+        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)),
+                      dim=0)
+    return h
+
+
+def hadamard_pm1_matrix(dim: int,
+                        device: torch.device | None = None,
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Unnormalized +-1 Hadamard matrix; exact in any float dtype.
+
+    The cache is read but never written while tracing: storing a traced
+    tensor into a module-level dict is a side effect a `fullgraph=True`
+    capture cannot replay. Under tracing the construction is inlined into the
+    graph instead, where XLA constant-folds it.
+    """
+    device = device if device is not None else torch.device("cpu")
+    key = (dim, device, dtype)
+    cached = _HADAMARD_PM1_MATRICES.get(key)
+    if cached is not None:
+        return cached
+    built = _hadamard_pm1_torch(dim, device, dtype)
+    if not torch.compiler.is_compiling():
+        _HADAMARD_PM1_MATRICES[key] = built
+    return built
+
+
+def hadamard_matrix(dim: int,
+                    device: torch.device | None = None) -> torch.Tensor:
+    """Normalized Sylvester-Hadamard matrix as a float32 torch tensor.
+
+    H is symmetric and orthonormal (H == H.T == inv(H)), so applying it twice
+    is the identity up to float rounding.
+    """
+    device = device if device is not None else torch.device("cpu")
+    key = (dim, device)
+    cached = _HADAMARD_MATRICES.get(key)
+    if cached is None:
+        cached = torch.from_numpy(_hadamard_np(dim)).to(device)
+        _HADAMARD_MATRICES[key] = cached
+    return cached
+
+
+def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Rotates `x` by the normalized Hadamard matrix along the last dim.
+
+    The +-1 matmul runs in `x`'s own floating dtype -- products with +-1
+    entries are exact, so a bf16 input stays on the fast native MXU matmul
+    path instead of paying for an fp32 matmul. The 1/sqrt(d) normalization is
+    applied in float32 and the result stays float32 so the following
+    quantization step sees full precision.
+    """
+    dim = x.shape[-1]
+    if not x.is_floating_point():
+        x = x.to(torch.float32)
+    h = hadamard_pm1_matrix(dim, x.device, x.dtype)
+    return (x @ h).to(torch.float32) * (1.0 / math.sqrt(dim))
+
+
 def quantize_kv_fp4_per_tensor(
     key: torch.Tensor,
     value: torch.Tensor,
     scale_dtype: torch.dtype = torch.bfloat16,
+    hadamard_mode: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dynamic per-token FP4 quantization for key and value tensors.
+
+    `hadamard_mode` selects Hadamard rotation along head_dim before
+    quantization (see TPU_KV_CACHE_QUANT_HADAMARD in envs.py):
+      * None: no rotation.
+      * "k": rotate K only. The batched RPA wrapper (called with
+        hadamard_mode="k") rotates Q to match, so QK^T is preserved while
+        K's per-channel RoPE outliers get spread across head_dim. V keeps
+        plain per-token scaling and the attention output needs no rotation.
+      * "kv": additionally rotate V; the wrapper then un-rotates the
+        attention output.
+    Either mode leaves attention results unchanged up to quantization error.
 
     Returns:
         k_packed: uint8 tensor with shape [..., head_dim // 2]
@@ -99,6 +221,15 @@ def quantize_kv_fp4_per_tensor(
         v_scale: scale_dtype tensor with shape [..., 1]
     """
     head_dim = key.shape[-1]
+
+    if hadamard_mode is not None:
+        if hadamard_mode not in ("k", "kv"):
+            raise ValueError(
+                f"Unsupported hadamard_mode: {hadamard_mode!r} "
+                "(expected None, 'k' or 'kv').")
+        key = apply_hadamard_transform(key)
+        if hadamard_mode == "kv":
+            value = apply_hadamard_transform(value)
 
     # Quantize K and V to FP4 index values (0-15) with dynamic per-token scale
     k_indices, k_scale = quantize_tensor_to_fp4(key, axis=-1, block_size=head_dim)
