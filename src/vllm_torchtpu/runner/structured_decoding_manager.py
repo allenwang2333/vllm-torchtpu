@@ -85,18 +85,25 @@ class StructuredDecodingManager:
         self.require_structured_out_cpu[:padded_num_reqs].zero_()
 
         bitmask = grammar_output.grammar_bitmask
+        local_indices = []
+        mask_rows = []
         for mask_row, req_id in enumerate(
                 grammar_output.structured_output_request_ids):
             batch_index = req_id_to_index.get(req_id)
-            if (batch_index is None
-                    or not cur_start_idx <= batch_index < cur_end_idx):
-                continue
-            local_index = batch_index - cur_start_idx
-            self.grammar_bitmask_cpu[local_index] = torch.from_numpy(
-                bitmask[mask_row])
-            # Not all requests in the batch require structured output, so
-            # mark the rows that need masking.
-            self.require_structured_out_cpu[local_index] = True
+            if (batch_index is not None
+                    and cur_start_idx <= batch_index < cur_end_idx):
+                local_indices.append(batch_index - cur_start_idx)
+                mask_rows.append(mask_row)
+
+        if local_indices:
+            if len(local_indices) == 1:
+                self.grammar_bitmask_cpu[local_indices[0]].copy_(
+                    torch.from_numpy(bitmask[mask_rows[0]]))
+                self.require_structured_out_cpu[local_indices[0]] = True
+            else:
+                self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
+                    bitmask[mask_rows])
+                self.require_structured_out_cpu[local_indices] = True
 
         arange = (self.structured_decode_arange
                   if self.structured_decode_arange.device == logits.device else
