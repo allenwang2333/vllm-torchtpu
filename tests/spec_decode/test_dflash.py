@@ -25,12 +25,34 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
+_COMPILED_METHODS = (
+    "_tpu_precompute_and_update_kv_cache",
+    "_dflash_forward_and_sample",
+    "_tpu_build_dflash_inputs_next_tokens",
+    "_tpu_build_dflash_inputs_seed",
+)
+
+
+@pytest.fixture(autouse=True)
+def _eager_on_cpu(request, monkeypatch):
+    """The proposer's `@torch.compile(backend="tpu")` graphs only trace on
+    TPU tensors; run them eagerly when the `device` fixture resolves to CPU
+    so the input builders stay unit-testable without a chip."""
+    if "device" in request.fixturenames and request.getfixturevalue(
+            "device").type == "cpu":
+        for name in _COMPILED_METHODS:
+            monkeypatch.setattr(
+                DFlashProposer, name,
+                torch._dynamo.disable(getattr(DFlashProposer, name)))
+
+
 def _make_proposer(draft_tp: int | None = 1,
                    target_tp: int = 1) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
-            "mask_token_id": 0
+            "mask_token_id": 0,
+            "target_layer_ids": [1, 2],
         }
     }
 
@@ -353,9 +375,11 @@ def test_update_draft_kv_cache_from_target_unit(device):
                         device=device,
                         query_start_loc_np=np.array([0, 3]),
                         position_ids=torch.zeros(3),
-                        aux_hidden_states=torch.zeros((3, 32),
-                                                      dtype=torch.float32,
-                                                      device=device))
+                        aux_hidden_states=[
+                            torch.zeros((3, 32),
+                                        dtype=torch.float32,
+                                        device=device)
+                        ])
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
