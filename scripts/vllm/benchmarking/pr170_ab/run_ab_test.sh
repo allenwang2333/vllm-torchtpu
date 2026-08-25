@@ -128,7 +128,7 @@ echo "=== PR170_AB BENCHMARK END ARM=${ARM} ==="
 echo "=== PR170_AB GSM8K START ARM=${ARM} ==="
 HF_HUB_OFFLINE=0 lm_eval \
   --model local-completions \
-  --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=128,max_retries=3,tokenized_requests=False" \
+  --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False" \
   --tasks gsm8k \
   --seed "0,1234,None,1234" \
   --output_path "$RESULTS_DIR/gsm8k_${ARM}" \
