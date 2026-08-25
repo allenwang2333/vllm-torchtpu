@@ -46,12 +46,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+from .prefill_sp import K3PrefillSPLayout
 
 
 class KimiDecoderLayer(nn.Module):
@@ -61,20 +63,25 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        prefill_sp: K3PrefillSPLayout | None = None,
     ) -> None:
         super().__init__()
+        self.prefill_sp = prefill_sp or K3PrefillSPLayout.disabled()
+        reduce_attention_results = not self.prefill_sp.enabled
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         if config.is_kda_layer(self.layer_idx):
             self.self_attn = KimiDeltaAttention(
                 config,
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
+                reduce_results=reduce_attention_results,
             )
         else:
             self.self_attn = MultiHeadLatentAttention(
                 config,
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
+                reduce_results=reduce_attention_results,
             )
 
         is_moe = (config.num_experts is not None
@@ -125,6 +132,8 @@ class KimiDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
             hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.prefill_sp.finish_standard_attention(
+                hidden_states)
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -146,6 +155,8 @@ class KimiDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.prefill_sp.finish_standard_attention(
+            hidden_states)
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -153,6 +164,63 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+        return prefix_sum + hidden_states, block_residuals
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        block_residuals: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run one layer with only attention and compatibility MoE at full T."""
+        if self.attn_res_block_size is None:
+            with TraceAnnotation("attnres_sp"):
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            attention_input = self.prefill_sp.gather_next_attention(
+                hidden_states)
+            hidden_states = self.self_attn(positions, attention_input)
+            hidden_states = self.prefill_sp.reduce_attention(hidden_states)
+            with TraceAnnotation("attnres_sp"):
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+        else:
+            assert block_residuals is not None
+            with TraceAnnotation("attnres_sp"):
+                prefix_sum = hidden_states
+                if block_residuals.shape[-2] > 0:
+                    hidden_states = self.self_attention_res(
+                        prefix_sum, block_residuals)
+                if self.layer_idx % self.attn_res_block_size == 0:
+                    block_residuals = torch.cat(
+                        (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2)
+                    prefix_sum = None
+                hidden_states = self.input_layernorm(hidden_states)
+
+            attention_input = self.prefill_sp.gather_next_attention(
+                hidden_states)
+            hidden_states = self.self_attn(positions, attention_input)
+            hidden_states = self.prefill_sp.reduce_attention(hidden_states)
+            with TraceAnnotation("attnres_sp"):
+                prefix_sum = (hidden_states if prefix_sum is None else
+                              prefix_sum + hidden_states)
+                hidden_states = self.mlp_res(prefix_sum, block_residuals)
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # The Phase 1/2 reference deliberately leaves the current TP/EP
+        # feed-forward implementation untouched. It therefore needs full,
+        # identically ordered tokens on every rank, followed by a contiguous
+        # local reshard. Hybrid shared/routed MoE replaces this in Phase 3.
+        hidden_states = self.prefill_sp.gather_moe_compat(hidden_states)
+        if self.is_moe:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.prefill_sp.reshard_moe_compat(hidden_states)
+
+        if self.attn_res_block_size is None:
+            return residual + hidden_states, None
         return prefix_sum + hidden_states, block_residuals
 
 
@@ -167,6 +235,7 @@ class KimiModel(nn.Module):
         super().__init__()
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
+        self.prefill_sp = K3PrefillSPLayout.from_vllm_config(vllm_config)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -179,6 +248,7 @@ class KimiModel(nn.Module):
                 config,
                 vllm_config,
                 prefix=f"{prefix}.layers.{layer_idx}",
+                prefill_sp=self.prefill_sp,
             ) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -200,12 +270,32 @@ class KimiModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
+        assert hidden_states is not None
+        if self.prefill_sp.should_shard(hidden_states):
+            hidden_states = self.prefill_sp.shard_embeddings(hidden_states)
+            block_residuals = (hidden_states.new_empty(
+                hidden_states.shape[0],
+                0,
+                hidden_states.shape[1],
+            ) if self.attn_res_block_size is not None else None)
+            for layer in self.layers:
+                hidden_states, block_residuals = layer.forward_sp(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                )
+            with TraceAnnotation("attnres_sp"):
+                if block_residuals is not None:
+                    hidden_states = self.output_attn_res(
+                        hidden_states, block_residuals)
+                hidden_states = self.norm(hidden_states)
+            return self.prefill_sp.gather_final(hidden_states)
+
         block_residuals = (hidden_states.new_empty(
             hidden_states.shape[0],
             0,
             hidden_states.shape[1],
         ) if self.attn_res_block_size is not None else None)
-        assert hidden_states is not None
 
         for layer in self.layers:
             hidden_states, block_residuals = layer(

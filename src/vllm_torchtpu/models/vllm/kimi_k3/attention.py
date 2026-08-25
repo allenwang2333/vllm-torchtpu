@@ -150,6 +150,8 @@ class MultiHeadLatentAttention(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        *,
+        reduce_results: bool = True,
     ) -> None:
         if not config.mla_use_nope:
             raise ValueError("The TPU Kimi model supports NoPE MLA only")
@@ -262,6 +264,7 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -343,6 +346,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        *,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         if vllm_config.speculative_config is not None:
@@ -450,6 +455,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_results,
         )
         self.kv_cache = None
         # The dispatched op owns the short convolution as well: the fused decode

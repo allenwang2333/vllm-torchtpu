@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
+    VLLM_TORCHTPU_K3_PREFILL_SP_SIZE: int = 1
 
 
 def env_with_choices(
@@ -372,6 +373,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Experimental Kimi-K3 long-prefill sequence layout. 1 preserves the
+    # serving path; 4 enables the Phase 1/2 SP4 outer-layout bring-up. The
+    # number of replicated weight lanes is derived from TP at runtime.
+    "VLLM_TORCHTPU_K3_PREFILL_SP_SIZE":
+    lambda: int(os.getenv("VLLM_TORCHTPU_K3_PREFILL_SP_SIZE") or "1"),
 }
 
 
