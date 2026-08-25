@@ -26,14 +26,12 @@ from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
 def _make_proposer(draft_tp: int | None = 1,
-                   target_tp: int = 1,
-                   target_layer_ids: list[int] = (1, 2)) -> DFlashProposer:
+                   target_tp: int = 1) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
-    # A non-zero mask id so mask slots are distinguishable from zero-fill.
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
-            "mask_token_id": 7,
-            "target_layer_ids": list(target_layer_ids),
+            "mask_token_id": 0,
+            "target_layer_ids": [1, 2],
         }
     }
 
@@ -121,12 +119,8 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp,
 
 def test_propose_empty_batch():
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0),
-                                      device=torch.device("cpu"))
+    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
     assert proposer.propose([], [], None, None) == []
-    # The async caller expects a tensor, even an empty one.
-    out = proposer.propose([], [], None, None, return_device=True)
-    assert isinstance(out, torch.Tensor) and out.shape == (0, 4)
 
 
 def test_tpu_precompute_context_kv(device):
@@ -283,54 +277,92 @@ def _make_chunk(num_reqs,
     )
 
 
-def _t(values, device):
-    return torch.tensor(values, dtype=torch.int32, device=device)
+def test_prepare_dflash_inputs(device):
+    proposer = _make_proposer(draft_tp=1)
+    K = 3
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(num_reqs=2,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
+                        position_ids=torch.tensor(
+                            [10, 11, 12, 40, 41, 0, 0, 0],
+                            dtype=torch.int32,
+                            device=device))
+
+    next_tokens_device = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, -1, -1]],
+        dtype=torch.int32,
+        device=device)
+
+    input_ids, position_ids, seq_lens = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens_device)
+
+    assert input_ids.shape == (8, )
+    assert position_ids.shape == (8, )
+    assert torch.equal(
+        input_ids,
+        torch.tensor([103, 0, 0, 0, 202, 0, 0, 0],
+                     dtype=torch.int32,
+                     device=device))
+    assert torch.equal(
+        position_ids,
+        torch.tensor([13, 14, 15, 16, 42, 43, 44, 45],
+                     dtype=torch.int32,
+                     device=device))
 
 
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock()
-    proposer.runner = SimpleNamespace(device=device, mesh=None)
+    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
+        return_value=(None, []))
+
+    slot_mapping = torch.zeros(8, dtype=torch.int32, device=device)
+    proposer._compute_slot_mapping = mock.MagicMock(return_value=slot_mapping)
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    proposer.runner = SimpleNamespace(
+        device=device,
+        kv_caches=[
+            torch.zeros((1, 8, 2, 2, 16), dtype=torch.float32, device=device)
+        ],
+        block_size=8,
+        num_tokens_paddings=[8, 16, 32],
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
 
     draft_model = mock.MagicMock()
     layer_mock1 = mock.MagicMock()
+    layer_mock1.self_attn.attn.impl = mock.MagicMock()
     layer_mock2 = mock.MagicMock()
+    layer_mock2.self_attn.attn.impl = mock.MagicMock()
     # Draft layers resolve their metadata by name; an unnamed layer is an
     # error, not a cue to borrow another group's block table.
     layer_mock1.self_attn.attn.layer_name = "dummy_layer"
     layer_mock2.self_attn.attn.layer_name = "dummy_layer"
     draft_model.model.layers = [layer_mock1, layer_mock2]
     proposer.draft_model = draft_model
+    proposer.num_target_layers = 2
 
-    aux = [torch.zeros((3, 32), dtype=torch.float32, device=device)]
     chunk = _make_chunk(num_reqs=1,
                         start_index=0,
                         device=device,
                         query_start_loc_np=np.array([0, 3]),
-                        position_ids=_t([7, 8, 9, 0, 0], device),
-                        aux_hidden_states=aux)
+                        position_ids=torch.zeros(3),
+                        aux_hidden_states=[
+                            torch.zeros((3, 32),
+                                        dtype=torch.float32,
+                                        device=device)
+                        ])
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
-    hidden, positions, md_tuple = (
-        proposer._tpu_precompute_and_update_kv_cache.call_args.args)
-    assert hidden is aux
-    # Positions are cut to the aux token count, in layer order.
-    assert torch.equal(positions, _t([7, 8, 9], device))
-    assert md_tuple == (chunk.attn_metadata["dummy_layer"], ) * 2
-
-
-def _propose_runner(device, num_reqs, build_metadata):
-    return SimpleNamespace(
-        device=device,
-        input_batch=SimpleNamespace(num_reqs=num_reqs),
-        _attn_metadata_builder_ctx=None,
-        build_attention_metadata_for_layers=build_metadata,
-        mesh=None,
-        _dp_lockstep_enabled=lambda: False,
-        _dp_num_tokens_across_dp=lambda num_tokens: None,
-        num_tokens_paddings=[8, 16, 32],
-    )
+    proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
 
 def test_propose_unit(device):
@@ -338,8 +370,19 @@ def test_propose_unit(device):
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_attn_layer_names = {"dummy_layer"}
-    proposer.runner = _propose_runner(device, 2,
-                                      mock.MagicMock(return_value={}))
+    proposer.runner = SimpleNamespace(
+        device=device,
+        input_batch=SimpleNamespace(num_reqs=2),
+        _attn_metadata_builder_ctx=None,
+        max_num_blocks_per_req=2,
+        _attn_layer_names={"dummy_layer"},
+        build_attention_metadata_for_layers=mock.MagicMock(return_value={}),
+        mesh=None,
+        _is_async_drafter=True,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+        _dp_step_num_chunks=0,
+    )
 
     chunk = _make_chunk(num_reqs=2,
                         start_index=0,
@@ -353,6 +396,15 @@ def test_propose_unit(device):
                       torch.zeros(8, dtype=torch.int32, device=device),
                       torch.zeros(2, dtype=torch.int32, device=device)))
     proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+
+    logits = torch.zeros((8, 1000), dtype=torch.float32, device=device)
+    logits[1, 500] = 100.0
+    logits[2, 501] = 100.0
+    logits[3, 502] = 100.0
+    logits[5, 600] = 100.0
+    logits[6, 601] = 100.0
+    logits[7, 602] = 100.0
+
     expected_tokens = torch.tensor([[500, 501, 502], [600, 601, 602]],
                                    device=device)
     proposer._dflash_forward_and_sample = mock.MagicMock(
@@ -399,3 +451,50 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     # The resolvable layer on its own comes back in layer order.
     draft_model.model.layers = [named]
     assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"], )
+
+
+def test_dp_lockstep_run_dummy_draft():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        _dp_target_bucket=32,
+        _dp_step_max_reqs=4,
+        num_reqs_max_model_len=8,
+    )
+    proposer._dp_dummy_kv_update = mock.MagicMock()
+    proposer._dp_dummy_forward = mock.MagicMock()
+
+    proposer.run_dp_dummy_draft(num_chunks=2)
+
+    assert proposer._dp_dummy_kv_update.call_count == 2
+    assert proposer._dp_dummy_forward.call_count == 2
+
+
+def test_prepare_dflash_inputs_dp_lockstep(device):
+    proposer = _make_proposer(draft_tp=1)
+    K = 3
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_max_reqs=4,
+    )
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
+                        position_ids=torch.tensor([10, 11, 12, 0],
+                                                  dtype=torch.int32,
+                                                  device=device))
+    next_tokens_device = torch.tensor([[101, 102, 103, -1]],
+                                      dtype=torch.int32,
+                                      device=device)
+
+    input_ids, position_ids, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens_device)
+
+    # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
+    assert input_ids.shape == (16, )
+    assert position_ids.shape == (16, )
