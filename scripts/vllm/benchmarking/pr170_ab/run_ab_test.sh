@@ -97,6 +97,41 @@ echo "[pr170_ab] server ready after ~${WAITED}s"
 
 FAIL=0
 
+# Fixed-prompt greedy probe so raw completions are visible in the log at
+# known points of the server lifecycle (fresh, post-bench).
+probe() {
+  local tag="$1"
+  echo "=== PR170_AB PROBE ${tag} ARM=${ARM} ==="
+  curl -s "http://localhost:$PORT/v1/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"'"$MODEL"'","prompt":"Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\nAnswer:","max_tokens":64,"temperature":0}' \
+    | tee -a "$RESULTS_DIR/probes_${ARM}.json"
+  echo ""
+  echo "=== PR170_AB PROBE ${tag} END ==="
+}
+
+# Full GSM8K (5-shot) via lm_eval against the live server, with per-sample
+# outputs logged so wrong answers can be inspected, not just counted.
+run_gsm8k() {
+  local phase="$1"
+  echo "=== PR170_AB GSM8K ${phase} START ARM=${ARM} ==="
+  HF_HUB_OFFLINE=0 lm_eval \
+    --model local-completions \
+    --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False" \
+    --tasks gsm8k \
+    --seed "0,1234,None,1234" \
+    --log_samples \
+    --output_path "$RESULTS_DIR/gsm8k_${phase}_${ARM}" \
+    2>&1 | tee "$RESULTS_DIR/gsm8k_${phase}_${ARM}.log" || FAIL=1
+  echo "=== PR170_AB GSM8K ${phase} END ARM=${ARM} ==="
+}
+
+probe fresh
+
+# GSM8K on the fresh server, before any bench traffic: separates
+# "path is wrong from the start" from "bench traffic corrupts state".
+run_gsm8k pre
+
 # ------------------------------------------------------------------
 # 2. Perf: the golden benchmark_serving.py client, verbatim args.
 # ------------------------------------------------------------------
@@ -122,18 +157,11 @@ python3 "$SCRIPT_DIR/bench_serving/benchmark_serving.py" \
 echo "=== PR170_AB BENCHMARK END ARM=${ARM} ==="
 
 # ------------------------------------------------------------------
-# 3. Accuracy: full GSM8K (5-shot) via lm_eval against the SAME
-#    live server through the completions API.
+# 3. Accuracy: full GSM8K (5-shot) on the SAME live server, after the
+#    bench traffic (plus a fixed-prompt probe in between).
 # ------------------------------------------------------------------
-echo "=== PR170_AB GSM8K START ARM=${ARM} ==="
-HF_HUB_OFFLINE=0 lm_eval \
-  --model local-completions \
-  --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False" \
-  --tasks gsm8k \
-  --seed "0,1234,None,1234" \
-  --output_path "$RESULTS_DIR/gsm8k_${ARM}" \
-  2>&1 | tee "$RESULTS_DIR/gsm8k_${ARM}.log" || FAIL=1
-echo "=== PR170_AB GSM8K END ARM=${ARM} ==="
+probe post_bench
+run_gsm8k post
 
 # ------------------------------------------------------------------
 # 4. Compact summary for log scraping.
@@ -149,6 +177,6 @@ for k in sorted(keys):
     print(f"[metric] {k}={d[k]}")
 PYEOF
 fi
-grep -E "exact_match" "$RESULTS_DIR/gsm8k_${ARM}.log" | tail -5 || true
+grep -E "exact_match" "$RESULTS_DIR"/gsm8k_*_"${ARM}".log | tail -10 || true
 echo "=== PR170_AB DONE ARM=${ARM} FAIL=${FAIL} ==="
 exit "$FAIL"
