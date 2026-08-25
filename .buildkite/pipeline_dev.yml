@@ -27,7 +27,7 @@ steps:
   - label: "PR170 A/B: baseline @ 74d86c2fc (pre-#170)"
     key: ab_baseline
     depends_on: build_docker
-    timeout_in_minutes: 420
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_8_queue
     env:

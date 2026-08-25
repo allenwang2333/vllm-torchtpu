@@ -27,7 +27,7 @@ steps:
   - label: "PR170 MoE diag: baseline @ 74d86c2fc, conc sweep + SC on/off"
     key: moe_diag
     depends_on: build_docker
-    timeout_in_minutes: 420
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_8_queue
     env:
