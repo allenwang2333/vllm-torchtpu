@@ -39,12 +39,15 @@ def profile_session_id() -> str:
     """Return an id shared by every worker process of this server run.
 
     Markers are keyed by this id so that a stale marker left behind by an
-    earlier run is never mistaken for the current one. ``TORCH_TPU_DP_MASTER_PORT``
-    is picked once per server and inherited by every engine and worker, which
-    also covers DP>1 with TP>1, where workers of different DP replicas have
-    different parents. The parent pid is the fallback for DP=1, where the port
-    is unset and all workers are children of the same engine core.
+    earlier run is never mistaken for the current one. Multi-host bootstrap
+    explicitly synchronizes ``TORCH_TPU_XPROF_SESSION_ID`` across hosts. The
+    DP master port covers DP>1 with TP>1, where workers of different DP
+    replicas have different parents. The parent pid is the single-host DP=1
+    fallback, where all workers are children of the same engine core.
     """
+    xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID")
+    if xprof_session_id:
+        return f"xprof{xprof_session_id}"
     dp_master_port = os.environ.get("TORCH_TPU_DP_MASTER_PORT")
     if dp_master_port:
         return f"dp{dp_master_port}"

@@ -29,12 +29,22 @@ def _stage_capture(capture_dir, ts_name, filename, content):
 
 def test_profile_session_id_uses_dp_master_port(monkeypatch):
     """DP replicas have different parents, but share the DP master port."""
+    monkeypatch.delenv("TORCH_TPU_XPROF_SESSION_ID", raising=False)
     monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "12345")
 
     assert profiler_trace.profile_session_id() == "dp12345"
 
 
+def test_profile_session_id_prefers_multihost_xprof_session(monkeypatch):
+    """TP-sharded hosts get one explicit profiler session from bootstrap."""
+    monkeypatch.setenv("TORCH_TPU_XPROF_SESSION_ID", "slice-6789")
+    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "12345")
+
+    assert profiler_trace.profile_session_id() == "xprofslice-6789"
+
+
 def test_profile_session_id_falls_back_to_parent_pid(monkeypatch):
+    monkeypatch.delenv("TORCH_TPU_XPROF_SESSION_ID", raising=False)
     monkeypatch.delenv("TORCH_TPU_DP_MASTER_PORT", raising=False)
 
     assert profiler_trace.profile_session_id() == str(os.getppid())
