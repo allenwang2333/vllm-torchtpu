@@ -240,8 +240,16 @@ class K3PrefillSPLayout:
             local_tokens = 512
         else:
             local_tokens = 1024
-        shard = full_hidden_states.narrow(0, self.sp_rank * local_tokens,
-                                          local_tokens)
+
+        # Take the latter half from the end.  For sp_rank=3, a positive
+        # ``3 * local_tokens`` start plus ``local_tokens`` length would add
+        # ``T >= 4 * local_tokens`` to the range guard above. Together those
+        # constraints specialize a strict-dynamic T to the bucket's exact
+        # value on ranks 3/7. Negative offsets preserve the identical ordered
+        # shard while requiring only the non-specializing lower bound.
+        shard_start = (self.sp_rank * local_tokens if self.sp_rank < 2 else
+                       -(self.sp_size - self.sp_rank) * local_tokens)
+        shard = full_hidden_states.narrow(0, shard_start, local_tokens)
         # Break the full tensor's view lineage before the shard crosses a TPU
         # custom-op boundary. This also makes the local tensor contract visible
         # in XLA instead of retaining a full-hidden backing allocation.

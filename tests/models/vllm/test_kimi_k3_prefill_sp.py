@@ -128,10 +128,11 @@ def test_only_fixed_long_prefill_buckets_enter_sp() -> None:
     (2048, 512),
     (4096, 1024),
 ])
+@pytest.mark.parametrize("sp_rank", range(4))
 def test_sp_shard_has_concrete_local_token_dim_under_fullgraph_dynamo(
-        num_tokens: int, local_tokens: int) -> None:
+        num_tokens: int, local_tokens: int, sp_rank: int) -> None:
     plan = build_k3_prefill_sp_group_plan(tuple(range(8)), 4)
-    layout = K3PrefillSPLayout(plan=plan, sp_rank=2)
+    layout = K3PrefillSPLayout(plan=plan, sp_rank=sp_rank)
     graphs = []
 
     def backend(graph_module, _example_inputs):
@@ -155,6 +156,8 @@ def test_sp_shard_has_concrete_local_token_dim_under_fullgraph_dynamo(
         output = compiled(tensor)
 
         assert tuple(output.shape) == (local_tokens, 2, 2)
+        expected = tensor.chunk(4, dim=0)[sp_rank] @ torch.ones(4, 4)
+        torch.testing.assert_close(output.view(local_tokens, 4), expected)
         view = next(node for node in graphs[0].graph.nodes
                     if node.op == "call_method" and node.target == "view")
         assert view.args[1:] == (local_tokens, 2, 2)
