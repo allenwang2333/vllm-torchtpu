@@ -32,10 +32,9 @@ class StructuredDecodingManager:
                                                       dtype=torch.bool,
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
-        self.structured_decode_arange = torch.arange(0,
-                                                     32,
-                                                     device="cpu",
-                                                     pin_memory=PIN_MEMORY)
+        self.device = getattr(runner, "device", "cpu")
+        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
+        self.structured_decode_arange = torch.arange(0, 32, device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -99,11 +98,15 @@ class StructuredDecodingManager:
             # mark the rows that need masking.
             self.require_structured_out_cpu[local_index] = True
 
+        arange = (self.structured_decode_arange
+                  if self.structured_decode_arange.device == logits.device else
+                  self.structured_decode_arange.to(logits.device))
+
         return (
             self.require_structured_out_cpu[:padded_num_reqs].to(
                 logits.device),
             self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-            self.structured_decode_arange.to(logits.device),
+            arange,
         )
 
     def prepare_spec_structured_decoding_input(
@@ -180,6 +183,11 @@ class StructuredDecodingManager:
         else:
             require_target = None
             target_bitmask = None
+
+        arange = (self.structured_decode_arange if
+                  self.structured_decode_arange.device == bonus_logits.device
+                  else self.structured_decode_arange.to(bonus_logits.device))
+
         return (
             require_target,
             target_bitmask,
@@ -187,7 +195,7 @@ class StructuredDecodingManager:
                 bonus_logits.device),
             self.grammar_bitmask_cpu[:padded_bonus_rows].to(
                 bonus_logits.device),
-            self.structured_decode_arange.to(bonus_logits.device),
+            arange,
         )
 
     def mask_logits(
