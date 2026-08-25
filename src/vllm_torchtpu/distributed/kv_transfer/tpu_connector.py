@@ -1138,6 +1138,15 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "Stage-3 GLM producer transfer parallelism must equal "
                     f"TP size: parallelism={src_parallelism}, "
                     f"tp_size={tp_size}")
+        elif pcp_size == 1:
+            # Uniform-TP producer (Kimi-Linear): the transfer is sharded by
+            # TP rank, so parallelism equals the TP size.
+            tp_size = int(parallel_config.tensor_parallel_size or 1)
+            if src_parallelism != tp_size:
+                raise ValueError(
+                    "Stage-3 uniform-TP producer transfer parallelism must "
+                    f"equal TP size: parallelism={src_parallelism}, "
+                    f"tp_size={tp_size}")
         elif src_parallelism != pcp_size:
             raise ValueError(
                 "Stage-3 producer transfer parallelism must equal PCP size: "
@@ -1651,7 +1660,12 @@ class TPURaidenConnectorWorker:
     def _measure_stage3_layout(
             self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
-        if _use_raiden_glm_admission():
+        if _use_raiden_glm_admission() or self._kda_linear_config(
+        ) is not None:
+            # Kimi's MLA pool is a rank-4 [blocks, rows, packing, width]
+            # tensor in natural order — the GLM row-layout fingerprint's
+            # gates fit it exactly; the Qwen FA gate expects the rank-5 fp8
+            # RPA layout instead.
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
                 manifest, page_tokens)
@@ -1664,7 +1678,8 @@ class TPURaidenConnectorWorker:
     def _validate_stage3_transfer_parallelism(
             self, transfer_parallelism: int) -> None:
         """The producer must shard the transfer over exactly the rank set its
-        byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise."""
+        byte-span lowering assumes: TP ranks for GLM and for uniform-TP
+        producers (no PCP dimension), PCP ranks otherwise."""
         if _use_raiden_glm_admission():
             if transfer_parallelism != self.tp_size:
                 raise ValueError(
@@ -1676,6 +1691,14 @@ class TPURaidenConnectorWorker:
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
             or 1)
+        if pcp_size == 1:
+            # Uniform-TP producers shard the transfer by TP rank.
+            if transfer_parallelism != self.tp_size:
+                raise ValueError(
+                    "Uniform-TP producer transfer parallelism must equal the "
+                    f"TP rank count: parallelism={transfer_parallelism}, "
+                    f"tp_size={self.tp_size}")
+            return
         if transfer_parallelism != pcp_size:
             raise ValueError(
                 "Producer transfer parallelism must equal the complete "
@@ -1714,6 +1737,13 @@ class TPURaidenConnectorWorker:
         if not self.is_producer:
             return 0
         if _use_raiden_glm_admission():
+            return int(self.tp_rank)
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+            or 1)
+        if pcp_size == 1:
+            # Uniform-TP producers (e.g. Kimi-Linear) have no PCP dimension;
+            # shard the transfer by TP rank.
             return int(self.tp_rank)
         from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
@@ -1986,6 +2016,15 @@ class TPURaidenConnectorWorker:
                 f"pcp_size={pcp_size}")
         return tp_local_heads // pcp_size
 
+    def _kda_linear_config(self) -> Any | None:
+        """The model's ``linear_attn_config`` dict, or None for non-KDA."""
+        model_config = self.vllm_config.model_config
+        hf_config = model_config.hf_config
+        if hf_config is None:
+            hf_config = model_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        return getattr(text_config, "linear_attn_config", None)
+
     def _gdn_head_geometry(self):
         """Derive the per-rank linear-attention geometry for the manifest.
 
@@ -1996,12 +2035,7 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden import \
             pool_manifest as rpm
 
-        model_config = self.vllm_config.model_config
-        hf_config = model_config.hf_config
-        if hf_config is None:
-            hf_config = model_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        kda_config = getattr(text_config, "linear_attn_config", None)
+        kda_config = self._kda_linear_config()
         if kda_config is not None:
             local_heads = self._local_gdn_head_count(
                 int(kda_config["num_heads"]))

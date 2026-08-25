@@ -1466,6 +1466,25 @@ class TestTPURaidenConnectorWorker:
         with pytest.raises(ValueError, match="admission topology"):
             consumer._raiden_qwen35_admission_topology()
 
+    def test_uniform_tp_transfer_rank_and_parallelism(self):
+        # Uniform-TP producers shard the transfer by TP rank, not PCP rank
+        # (PCP is absent for Kimi-Linear), so every TP worker binds its own
+        # control port and parallelism equals tp_size.
+        worker = _make_raiden_worker(tp_rank=2,
+                                     tp_size=4,
+                                     pcp_size=1,
+                                     is_producer=True)
+        assert worker._local_raiden_transfer_rank() == 2
+        worker._validate_stage3_transfer_parallelism(4)
+        with pytest.raises(ValueError, match="Uniform-TP"):
+            worker._validate_stage3_transfer_parallelism(1)
+
+        consumer = _make_raiden_worker(tp_rank=2,
+                                       tp_size=4,
+                                       pcp_size=1,
+                                       is_producer=False)
+        assert consumer._local_raiden_transfer_rank() == 0
+
     def test_stage3_request_id_binding_is_bijective(self):
         worker = _make_raiden_worker(is_producer=False)
         worker._bind_stage3_request_ids("decode-a", "prefill-a")
