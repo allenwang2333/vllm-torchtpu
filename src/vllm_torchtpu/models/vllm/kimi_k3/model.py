@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import torch
@@ -46,7 +46,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
-from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention
@@ -56,8 +55,8 @@ from .moe import KimiMoE
 from .prefill_sp import K3PrefillSPLayout
 
 
-def _sp_trace(name: str) -> TraceAnnotation:
-    return TraceAnnotation(name, compile_safe=True)
+def _sp_trace(name: str) -> Any:
+    return torch.profiler.record_function(name)
 
 
 class KimiDecoderLayer(nn.Module):

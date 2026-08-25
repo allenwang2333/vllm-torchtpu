@@ -46,6 +46,32 @@ def test_sp4_group_plan_scales_from_phase1_to_phase2(
     assert plan.sp_groups == expected_sp_groups
 
 
+def test_native_sp_trace_is_preserved_by_fullgraph_dynamo() -> None:
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    old_capture = torch._dynamo.config.capture_profiler_record_function
+    torch._dynamo.reset()
+    try:
+        torch._dynamo.config.capture_profiler_record_function = True
+
+        @torch.compile(backend=backend, fullgraph=True)
+        def compiled(tensor: torch.Tensor) -> torch.Tensor:
+            with torch.profiler.record_function("attention_lane_ar"):
+                return tensor + 1
+
+        torch.testing.assert_close(compiled(torch.zeros(2)), torch.ones(2))
+        targets = [str(node.target) for node in graphs[0].graph.nodes]
+        assert any("_record_function_enter" in target for target in targets)
+        assert any("_record_function_exit" in target for target in targets)
+    finally:
+        torch._dynamo.config.capture_profiler_record_function = old_capture
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("world_size", [8, 32])
 def test_lane_ar_then_sp_rs_matches_tp_sum_and_token_order(
         world_size: int) -> None:

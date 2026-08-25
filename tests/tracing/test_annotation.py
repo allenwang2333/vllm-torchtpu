@@ -14,22 +14,6 @@ def test_trace_annotation_disabled(mock_profiler_enabled):
         mock_rf.assert_not_called()
 
 
-@patch("torch.autograd._profiler_enabled", return_value=False)
-def test_trace_annotation_compile_safe_bypasses_profiler_bool(
-        mock_profiler_enabled):
-    with patch("torch.profiler.record_function") as mock_rf:
-        mock_context = MagicMock()
-        mock_rf.return_value = mock_context
-
-        with TraceAnnotation("CompiledRegion", compile_safe=True):
-            pass
-
-        mock_profiler_enabled.assert_not_called()
-        mock_rf.assert_called_once_with("CompiledRegion")
-        mock_context.__enter__.assert_called_once()
-        mock_context.__exit__.assert_called_once()
-
-
 @patch("torch.autograd._profiler_enabled", return_value=True)
 def test_trace_annotation_enabled_no_kwargs(mock_profiler_enabled):
     assert is_trace_annotation_enabled()

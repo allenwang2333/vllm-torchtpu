@@ -24,7 +24,6 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -35,8 +34,12 @@ _PHASE_1_2_SP_SIZE = 4
 _PHASE_1_2_TOKEN_SIZES = (1024, 2048, 4096)
 
 
-def _sp_trace(name: str) -> TraceAnnotation:
-    return TraceAnnotation(name, compile_safe=True)
+def _sp_trace(name: str) -> Any:
+    # Keep this as the native context manager. Dynamo recognizes the WITH
+    # bytecode for record_function and, with capture enabled below, emits the
+    # profiler enter/exit ops into the compiled graph. Calling __enter__ from a
+    # wrapper context is unsupported in full-graph mode.
+    return torch.profiler.record_function(name)
 
 
 @dataclass(frozen=True)
