@@ -45,6 +45,17 @@ def test_ragged_gather_reduce_version_accepts_v3(monkeypatch):
     assert getter() == "v3"
 
 
+@pytest.mark.parametrize("value,expected", [(None, False), ("1", True),
+                                            ("0", False), ("true", True)])
+def test_use_moe_counting_sort_defaults_off(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("USE_MOE_COUNTING_SORT", raising=False)
+    else:
+        monkeypatch.setenv("USE_MOE_COUNTING_SORT", value)
+    getter = envs.environment_variables["USE_MOE_COUNTING_SORT"]
+    assert getter() is expected
+
+
 def test_ragged_gather_reduce_uses_configured_version():
     expected = fused_moe_gmm._select_ragged_gather_reduce(
         envs.RAGGED_GATHER_REDUCE_VERSION)
@@ -584,9 +595,12 @@ def _routing_reference(topk_indices,
 
 # M = 800 exercises the block padding (800 % 512), which lands in the sentinel
 # bucket this caller discards.
+@pytest.mark.parametrize("counting_sort", [True, False])
 @pytest.mark.parametrize("structure",
                          ["mixed", "all_non_local", "single_expert", "skewed"])
-def test_prepare_routed_metadata_matches_stable_sort(structure):
+def test_prepare_routed_metadata_matches_stable_sort(structure, counting_sort,
+                                                     monkeypatch):
+    monkeypatch.setattr(envs, "USE_MOE_COUNTING_SORT", counting_sort)
     num_tokens, topk, local_num_experts, hidden = 100, 8, 16, 4
     rng = np.random.default_rng(0)
     if structure == "mixed":

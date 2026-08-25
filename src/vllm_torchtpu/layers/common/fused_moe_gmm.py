@@ -252,19 +252,29 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    argsort_revert_indices, bucket_counts = _counting_sort_positions(
-        sort_keys, local_num_experts + 1)
-    group_sizes_local = bucket_counts[:local_num_experts]
+    if envs.USE_MOE_COUNTING_SORT:
+        argsort_revert_indices, bucket_counts = _counting_sort_positions(
+            sort_keys, local_num_experts + 1)
+        group_sizes_local = bucket_counts[:local_num_experts]
 
-    # int32 overflows only past num_tokens * local_num_experts >= 2**30.
-    token_bits = (num_tokens_local - 1).bit_length()
-    # (key, token) packed: no payload, no gather, and token_indices_flat is
-    # non-decreasing so this IS the stable order by row.
-    packed = jax.lax.sort(
-        jnp.left_shift(sort_keys.astype(jnp.int32), token_bits)
-        | token_indices_flat,
-        is_stable=False)
-    token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+        # int32 overflows only past num_tokens * local_num_experts >= 2**30.
+        token_bits = (num_tokens_local - 1).bit_length()
+        # (key, token) packed: no payload, no gather, and token_indices_flat is
+        # non-decreasing so this IS the stable order by row.
+        packed = jax.lax.sort(
+            jnp.left_shift(sort_keys.astype(jnp.int32), token_bits)
+            | token_indices_flat,
+            is_stable=False)
+        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+    else:
+        sorted_indices = jnp.argsort(sort_keys)
+        argsort_revert_indices = jnp.argsort(sorted_indices)
+        token_indices_sorted = token_indices_flat[sorted_indices]
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
