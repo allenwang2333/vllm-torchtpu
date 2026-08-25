@@ -362,12 +362,14 @@ PY
 capture_profile() {
   local event="$1"
   local output="$2"
-  local profile_dir="$OUT/$event/profile"
+  local profile_dir="$3"
+  local artifact_profile_dir="$OUT/$event/profile"
+  mkdir -p "$profile_dir" "$artifact_profile_dir"
   curl --fail-with-body -sS -X POST http://localhost:8000/start_profile \
-    >"$OUT/$event/start-profile.json"
+    | tee "$OUT/$event/start-profile.json"
   fixed_request "$event-profile" 4096 "$output"
   curl --fail-with-body -sS -X POST http://localhost:8000/stop_profile \
-    >"$OUT/$event/stop-profile.json"
+    | tee "$OUT/$event/stop-profile.json"
   local ready=0
   for _ in $(seq 1 120); do
     if find "$profile_dir" -type f \
@@ -380,28 +382,38 @@ capture_profile() {
   done
   if test "$ready" != 1; then
     printf 'No profile artifacts appeared for %s\n' "$event" >&2
+    find "$profile_dir" -maxdepth 6 -print | sort || true
+    grep -Ei 'profil|trace|xplane|kineto' "$SERVER_LOG" | tail -200 || true
     return 1
   fi
+  cp -a "$profile_dir/." "$artifact_profile_dir/"
   find "$profile_dir" -type f -size +0c -print | sort \
     >"$OUT/$event/profile-files.txt"
+  cat "$OUT/$event/profile-files.txt"
 }
 
 # Control: E0 is the measured 4096-token run. The extra fixed 1024/2048
 # requests provide same-source correctness references for E1 and E3.
-start_server E0-control-4096 1 "$OUT/E0-control-4096/profile"
+start_server E0-control-4096 1 "$CACHE_ROOT/profile-E0-control-4096"
 fixed_request control-1024 1024 "$OUT/correctness/control-1024.json"
 fixed_request control-2048 2048 "$OUT/correctness/control-2048.json"
 fixed_request control-4096 4096 "$OUT/correctness/control-4096.json"
 run_bench E0-control-4096 4096
-capture_profile E0-control-4096 "$OUT/correctness/control-4096-profile.json"
+capture_profile \
+  E0-control-4096 \
+  "$OUT/correctness/control-4096-profile.json" \
+  "$CACHE_ROOT/profile-E0-control-4096"
 stop_server "$OUT/E0-control-4096"
 
-start_server E2-sp4-4096 4 "$OUT/E2-sp4-4096/profile"
+start_server E2-sp4-4096 4 "$CACHE_ROOT/profile-E2-sp4-4096"
 fixed_request sp4-1024 1024 "$OUT/correctness/sp4-1024.json"
 run_bench E1-sp4-1024 1024
 fixed_request sp4-4096 4096 "$OUT/correctness/sp4-4096.json"
 run_bench E2-sp4-4096 4096
-capture_profile E2-sp4-4096 "$OUT/correctness/sp4-4096-profile.json"
+capture_profile \
+  E2-sp4-4096 \
+  "$OUT/correctness/sp4-4096-profile.json" \
+  "$CACHE_ROOT/profile-E2-sp4-4096"
 fixed_request sp4-2048 2048 "$OUT/correctness/sp4-2048.json"
 run_bench E3-sp4-2048 2048
 stop_server "$OUT/E2-sp4-4096"
