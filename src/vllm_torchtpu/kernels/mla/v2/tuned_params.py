@@ -1145,6 +1145,22 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=1,
         vmem_limit_bytes=62914560,
     ),
+    # Same Kimi TP1 geometry on a prefill engine, whose decode steps pad to
+    # the large prefill bucket.
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=2048,
+        actual_num_q_heads=32,
+        actual_lkv_dim=128,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+    ):
+    TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    ),
 }
 
 

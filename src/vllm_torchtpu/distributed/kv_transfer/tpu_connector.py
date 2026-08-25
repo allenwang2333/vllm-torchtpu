@@ -2607,7 +2607,8 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
             lower_gdn_state_shard_spans
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
-            EXPECTED_FA_MINOR_TO_MAJOR, EXPECTED_FA_TILES)
+            EXPECTED_FA_MINOR_TO_MAJOR, EXPECTED_FA_TILES,
+            GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA)
         from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
             BINDING_ALIASED_RAW
 
@@ -2623,18 +2624,22 @@ class TPURaidenConnectorWorker:
                 raise RuntimeError(
                     "aliased raw GDN lowering requires an admitted physical "
                     "layout fingerprint")
-            measured_minor_to_major = tuple(
-                int(value) for value in payload.get("minor_to_major", ()))
-            measured_tiles = tuple(
-                tuple(int(value) for value in tile)
-                for tile in payload.get("tiles", ()))
-            measured_element_bits = int(payload.get("element_size_in_bits", 0))
-            if (measured_minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR
-                    or measured_tiles != EXPECTED_FA_TILES
-                    or measured_element_bits != 8):
-                raise RuntimeError(
-                    "aliased raw GDN lowering is unsupported for the "
-                    "admitted physical layout")
+            glm_schema = payload.get(
+                "schema") == GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA
+            if not glm_schema:
+                measured_minor_to_major = tuple(
+                    int(value) for value in payload.get("minor_to_major", ()))
+                measured_tiles = tuple(
+                    tuple(int(value) for value in tile)
+                    for tile in payload.get("tiles", ()))
+                measured_element_bits = int(
+                    payload.get("element_size_in_bits", 0))
+                if (measured_minor_to_major != EXPECTED_FA_MINOR_TO_MAJOR
+                        or measured_tiles != EXPECTED_FA_TILES
+                        or measured_element_bits != 8):
+                    raise RuntimeError(
+                        "aliased raw GDN lowering is unsupported for the "
+                        "admitted physical layout")
 
         registrations = []
         for tag in _STAGE3_STATE_CLASS_TAGS:
@@ -2644,10 +2649,26 @@ class TPURaidenConnectorWorker:
                     matching_pools = tuple(
                         pool for pool in self._raiden_manifest.pools
                         if str(getattr(pool, "tag", "")) == exact_tag)
+                    # Alignment quantum: Qwen's fp8 physical token is 1024 B;
+                    # row-layout (GLM-schema) models use the pool row bytes
+                    # recorded by the admitted fingerprint (2,560 B for
+                    # Kimi's packed MLA row).
+                    if glm_schema:
+                        row_bytes = int(
+                            payload.get("layouts",
+                                        {}).get(exact_tag,
+                                                {}).get("row_bytes", 0))
+                        if row_bytes <= 0:
+                            raise RuntimeError(
+                                "row-layout fingerprint payload is missing "
+                                f"row_bytes for {exact_tag}")
+                        token_quantum = row_bytes
+                    else:
+                        token_quantum = 1024
                     if any(
                             int(pool.base_offset_bytes) %
-                            1024 or int(pool.block_stride_bytes) % 1024
-                            for pool in matching_pools):
+                            token_quantum or int(pool.block_stride_bytes) %
+                            token_quantum for pool in matching_pools):
                         raise RuntimeError(
                             "aliased raw GDN pool base and block stride must "
                             f"be physical-token aligned ({exact_tag})")
