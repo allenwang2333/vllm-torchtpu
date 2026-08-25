@@ -31,7 +31,7 @@ steps:
   - label: "PR170 A/B: after @ c94523a3c (#170, pool on)"
     key: ab_after
     depends_on: build_docker
-    timeout_in_minutes: 420
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_8_queue
     env:
@@ -45,7 +45,7 @@ steps:
   - label: "PR170 A/B: after @ c94523a3c (#170, pool forced OFF)"
     key: ab_after_pool_off
     depends_on: build_docker
-    timeout_in_minutes: 420
+    timeout_in_minutes: 60
     agents:
       queue: tpu_v7x_8_queue
     env:
