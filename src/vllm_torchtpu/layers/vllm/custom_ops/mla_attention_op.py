@@ -53,6 +53,12 @@ from vllm_torchtpu.utils import synchronize_tensors
 # into the kernel's throughput.
 STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
 STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
+# Skip indexer scoring when every sequence in the batch is shorter than
+# `index_topk`, where the top-k is the identity and the scores decide nothing.
+# The guard is batch-wide, so this fires during warmup and on short-context
+# traffic and not at all once any request in the batch is past `index_topk`
+# tokens.
+STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
 @SparseAttnIndexer.register_oot
@@ -114,6 +120,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
                 num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
+                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
             )
             return cache_kv, topk_indices
 
