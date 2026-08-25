@@ -16,6 +16,12 @@ readonly TORCHTPU_COMMIT="${EXPECTED_TORCHTPU_COMMIT:?EXPECTED_TORCHTPU_COMMIT i
 readonly OUT="${ARTIFACT_LOCAL_DIR:-/tmp/falcon-artifacts}"
 readonly CACHE_ROOT="/tmp/tpu_logs"
 readonly VENV="${CACHE_ROOT}/venv"
+readonly PHASE1_MODE="${KIMI_K3_SP_PHASE1_MODE:-full}"
+
+if test "$PHASE1_MODE" != full && test "$PHASE1_MODE" != sp-smoke; then
+  printf 'Unsupported KIMI_K3_SP_PHASE1_MODE=%s\n' "$PHASE1_MODE" >&2
+  exit 1
+fi
 
 export TMPDIR="${CACHE_ROOT}/tmp"
 export PIP_CACHE_DIR="${CACHE_ROOT}/pip-cache"
@@ -114,6 +120,7 @@ PY
 
 python -m pytest -q \
   /workspace/vllm-torchtpu/tests/models/vllm/test_kimi_k3_prefill_sp.py \
+  /workspace/vllm-torchtpu/tests/tracing/test_annotation.py \
   2>&1 | tee "$OUT/targeted-pytest.log"
 
 python - "$OUT/manifest.json" "$TORCHTPU_COMMIT" <<'PY'
@@ -391,6 +398,17 @@ capture_profile() {
     >"$OUT/$event/profile-files.txt"
   cat "$OUT/$event/profile-files.txt"
 }
+
+if test "$PHASE1_MODE" = sp-smoke; then
+  start_server E2-sp4-4096 4 "$CACHE_ROOT/profile-E2-sp4-4096"
+  fixed_request sp4-smoke-1024 1024 \
+    "$OUT/correctness/sp4-smoke-1024.json"
+  fixed_request sp4-smoke-4096 4096 \
+    "$OUT/correctness/sp4-smoke-4096.json"
+  stop_server "$OUT/E2-sp4-4096"
+  printf 'KIMI_K3_PREFILL_SP_PHASE1_SMOKE_OK\n' | tee "$OUT/success.marker"
+  exit 0
+fi
 
 # Control: E0 is the measured 4096-token run. The extra fixed 1024/2048
 # requests provide same-source correctness references for E1 and E3.

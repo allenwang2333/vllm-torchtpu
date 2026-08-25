@@ -35,6 +35,10 @@ _PHASE_1_2_SP_SIZE = 4
 _PHASE_1_2_TOKEN_SIZES = (1024, 2048, 4096)
 
 
+def _sp_trace(name: str) -> TraceAnnotation:
+    return TraceAnnotation(name, compile_safe=True)
+
+
 @dataclass(frozen=True)
 class K3PrefillSPGroupPlan:
     """Global-rank groups for the two axes of the logical SP mesh."""
@@ -180,6 +184,11 @@ class K3PrefillSPLayout:
                 "Kimi-K3 SP group order mismatch: expected "
                 f"{expected_sp_group}, got {tuple(sp_group.ranks)}")
 
+        # Preserve record_function enter/exit nodes through Dynamo fullgraph
+        # capture. This is opt-in with a valid K3 SP mesh so ordinary serving
+        # graphs and the default TraceAnnotation behavior remain unchanged.
+        torch._dynamo.config.capture_profiler_record_function = True
+
         logger.info(
             "Kimi-K3 prefill SP enabled | mapping: tp_rank = lane * %d + "
             "sp_rank | TP=%d SP=%d lanes=%d lane_groups=%s sp_groups=%s | "
@@ -225,22 +234,22 @@ class K3PrefillSPLayout:
 
     def shard_embeddings(self,
                          full_hidden_states: torch.Tensor) -> torch.Tensor:
-        with TraceAnnotation("embedding_sp_reshard"):
+        with _sp_trace("embedding_sp_reshard"):
             return self._local_shard(full_hidden_states)
 
     def gather_next_attention(
             self, local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
-        with TraceAnnotation("next_attention_sp_ag"):
+        with _sp_trace("next_attention_sp_ag"):
             return self.sp_group.all_gather(local_hidden_states, dim=0)
 
     def reduce_attention(self,
                          partial_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lane_group is not None
         assert self.sp_group is not None
-        with TraceAnnotation("attention_lane_ar"):
+        with _sp_trace("attention_lane_ar"):
             lane_reduced = self.lane_group.all_reduce(partial_hidden_states)
-        with TraceAnnotation("attention_sp_rs"):
+        with _sp_trace("attention_sp_rs"):
             return self.sp_group.reduce_scatter(lane_reduced, dim=0)
 
     def finish_standard_attention(
@@ -249,21 +258,21 @@ class K3PrefillSPLayout:
         if not self.enabled:
             return partial_hidden_states
         assert self.tp_group is not None
-        with TraceAnnotation("attention_tp_ar_fallback"):
+        with _sp_trace("attention_tp_ar_fallback"):
             return self.tp_group.all_reduce(partial_hidden_states)
 
     def gather_moe_compat(self,
                           local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
-        with TraceAnnotation("moe_compat_ag"):
+        with _sp_trace("moe_compat_ag"):
             return self.sp_group.all_gather(local_hidden_states, dim=0)
 
     def reshard_moe_compat(self,
                            full_hidden_states: torch.Tensor) -> torch.Tensor:
-        with TraceAnnotation("moe_compat_reshard"):
+        with _sp_trace("moe_compat_reshard"):
             return self._local_shard(full_hidden_states)
 
     def gather_final(self, local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
-        with TraceAnnotation("final_sp_ag"):
+        with _sp_trace("final_sp_ag"):
             return self.sp_group.all_gather(local_hidden_states, dim=0)

@@ -13,8 +13,13 @@ def is_trace_annotation_enabled() -> bool:
 
 class TraceAnnotation(contextlib.ContextDecorator):
 
-    def __init__(self, name: str, **kwargs: Any) -> None:
+    def __init__(self,
+                 name: str,
+                 *,
+                 compile_safe: bool = False,
+                 **kwargs: Any) -> None:
         self.name = name
+        self.compile_safe = compile_safe
         self.kwargs = kwargs
         self._rf = None
 
@@ -23,7 +28,11 @@ class TraceAnnotation(contextlib.ContextDecorator):
         return is_trace_annotation_enabled()
 
     def __enter__(self):
-        if self.is_enabled():
+        # Dynamo treats record_function as a null context by default, or
+        # preserves it when capture_profiler_record_function is enabled. The
+        # explicit mode must not call _profiler_enabled(): fullgraph capture
+        # cannot represent that op's bool result.
+        if self.compile_safe or self.is_enabled():
             name = self.name
             if self.kwargs:
                 args_str = ",".join(f"{k}={v}" for k, v in self.kwargs.items())

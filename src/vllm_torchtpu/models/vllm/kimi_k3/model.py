@@ -56,6 +56,10 @@ from .moe import KimiMoE
 from .prefill_sp import K3PrefillSPLayout
 
 
+def _sp_trace(name: str) -> TraceAnnotation:
+    return TraceAnnotation(name, compile_safe=True)
+
+
 class KimiDecoderLayer(nn.Module):
 
     def __init__(
@@ -174,20 +178,20 @@ class KimiDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run one layer with only attention and compatibility MoE at full T."""
         if self.attn_res_block_size is None:
-            with TraceAnnotation("attnres_sp"):
+            with _sp_trace("attnres_sp"):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             attention_input = self.prefill_sp.gather_next_attention(
                 hidden_states)
             hidden_states = self.self_attn(positions, attention_input)
             hidden_states = self.prefill_sp.reduce_attention(hidden_states)
-            with TraceAnnotation("attnres_sp"):
+            with _sp_trace("attnres_sp"):
                 hidden_states = residual + hidden_states
                 residual = hidden_states
                 hidden_states = self.post_attention_layernorm(hidden_states)
         else:
             assert block_residuals is not None
-            with TraceAnnotation("attnres_sp"):
+            with _sp_trace("attnres_sp"):
                 prefix_sum = hidden_states
                 if block_residuals.shape[-2] > 0:
                     hidden_states = self.self_attention_res(
@@ -202,7 +206,7 @@ class KimiDecoderLayer(nn.Module):
                 hidden_states)
             hidden_states = self.self_attn(positions, attention_input)
             hidden_states = self.prefill_sp.reduce_attention(hidden_states)
-            with TraceAnnotation("attnres_sp"):
+            with _sp_trace("attnres_sp"):
                 prefix_sum = (hidden_states if prefix_sum is None else
                               prefix_sum + hidden_states)
                 hidden_states = self.mlp_res(prefix_sum, block_residuals)
@@ -284,7 +288,7 @@ class KimiModel(nn.Module):
                     hidden_states,
                     block_residuals,
                 )
-            with TraceAnnotation("attnres_sp"):
+            with _sp_trace("attnres_sp"):
                 if block_residuals is not None:
                     hidden_states = self.output_attn_res(
                         hidden_states, block_residuals)
