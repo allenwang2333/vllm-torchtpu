@@ -476,25 +476,6 @@ def test_prepare_dflash_inputs_dp_lockstep_pads_to_coordinated_bound(device):
     assert torch.equal(positions[4:], _t([0, 1, 2, 3] * 3, device))
 
 
-def test_prepare_dflash_inputs_replicated_draft_ignores_lockstep(device):
-    """A TP-replicated, MoE-free draft is rank-local: it pads to its own
-    request count, not the DP-wide bound."""
-    proposer = _input_proposer(device, draft_tp=1, max_chunk_reqs=4)
-    proposer.draft_model = mock.MagicMock()
-    proposer._draft_has_moe_cache = False
-    chunk = _make_chunk(num_reqs=1,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
-                        position_ids=_t([10, 11, 12, 0], device),
-                        draft_lengths=[3])
-
-    input_ids, _, _ = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=_t([[101, 102, 103, -1]], device))
-
-    assert input_ids.shape == (8, )
-
-
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock()
@@ -688,7 +669,6 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
 def _lockstep_proposer(draft_tp, target_tp):
     proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
     proposer.draft_model = mock.MagicMock()
-    proposer._draft_has_moe_cache = False
     proposer.runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
         _dp_target_bucket=32,
@@ -723,11 +703,10 @@ def test_dp_lockstep_run_dummy_draft_replays_without_host_sync():
 
 
 @pytest.mark.parametrize("draft_tp,target_tp,num_chunks,loaded",
-                         [(1, 8, 2, True), (8, 8, 0, True), (8, 8, 2, False)])
+                         [(8, 8, 0, True), (8, 8, 2, False)])
 def test_dp_lockstep_run_dummy_draft_skips(draft_tp, target_tp, num_chunks,
                                            loaded):
-    """No replay for a replicated MoE-free draft (rank-local, no cross-DP
-    collectives), zero padding chunks, or an unloaded draft."""
+    """No replay for zero padding chunks or an unloaded draft."""
     proposer = _lockstep_proposer(draft_tp=draft_tp, target_tp=target_tp)
     if not loaded:
         proposer.draft_model = None

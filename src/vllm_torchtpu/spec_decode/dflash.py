@@ -55,10 +55,9 @@ class DFlashProposer:
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
         self.dflash_config = hf_dict.get("dflash_config", {})
         self.mask_token_id = self.dflash_config.get("mask_token_id")
-        if self.mask_token_id is None:
-            raise ValueError(
-                "DFlash requires `mask_token_id` in the draft model's "
-                "config.json under the `dflash_config` dictionary.")
+        assert self.mask_token_id is not None, (
+            "DFlash requires `mask_token_id` to be defined in the draft model's config.json "
+            "under the `dflash_config` dictionary.")
         # Without tagged target layers no aux hidden states flow to the
         # draft; the failure would otherwise surface much later as a width
         # mismatch inside the compiled KV update.
@@ -110,7 +109,6 @@ class DFlashProposer:
         # Keyed by the target chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
-        self._draft_has_moe_cache: bool | None = None
 
     @property
     def block_size(self) -> int:
@@ -205,12 +203,10 @@ class DFlashProposer:
             )
 
     def _get_padded_len(self, target_len: int) -> int:
-        """The runner's token bucket for `target_len`. Raises past the
-        largest bucket rather than returning an unbucketed shape that would
-        compile a one-off program."""
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-        return _get_padded_token_len(self.runner.num_tokens_paddings,
-                                     target_len)
+        for p in self.runner.num_tokens_paddings:
+            if p >= target_len:
+                return p
+        return target_len
 
     def _build_draft_attn_metadata(
         self,
@@ -282,7 +278,7 @@ class DFlashProposer:
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
-        if self._dp_lockstep_sharded():
+        if self.runner._dp_lockstep_enabled():
             # EP-DP lockstep: every rank must emit identical collective
             # shapes, and num_reqs is rank-local. Pad to the step's DP-wide
             # max per-chunk request count, coordinated by the same
@@ -451,7 +447,7 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         extra_chunks = 0
-        if self._dp_lockstep_sharded():
+        if runner._dp_lockstep_enabled():
             extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
@@ -765,31 +761,12 @@ class DFlashProposer:
             if sync:
                 synchronize_tensors(draft_tokens_chunk)
 
-    def _draft_has_moe(self) -> bool:
-        """Whether the draft carries expert-parallel MoE layers, which emit
-        cross-DP collectives even when the draft is TP-replicated. Cached
-        after the first query; False until the draft model is loaded."""
-        if self._draft_has_moe_cache is None:
-            if self.draft_model is None:
-                return False
-            from vllm.model_executor.models.interfaces import \
-                is_mixture_of_experts
-            self._draft_has_moe_cache = bool(
-                is_mixture_of_experts(self.draft_model))
-        return self._draft_has_moe_cache
-
     def _dp_lockstep_sharded(self) -> bool:
         """True when the draft emits cross-DP collectives under EP-DP
-        lockstep: it is TP-sharded (its TP collectives ride the same
-        program) or carries expert-parallel MoE. A replicated, MoE-free
-        draft is rank-local and needs neither coordinated shapes nor idle
-        replays. Same rule as Eagle3Proposer, and the single predicate
-        behind both the busy-rank padding and the idle-rank replay so the
-        two always agree.
+        lockstep. A DFlash draft always runs TP-sharded (draft_tp must equal
+        the target's TP), so this is simply whether lockstep is on.
         """
-        if not self.runner._dp_lockstep_enabled():
-            return False
-        return not self._draft_replicated or self._draft_has_moe()
+        return self.runner._dp_lockstep_enabled()
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step,
