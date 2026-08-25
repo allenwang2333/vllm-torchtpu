@@ -39,7 +39,18 @@ PORT=8000
 RESULTS_DIR="/perf_eval_results"
 READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 DUMP_DIR="/tmp/xla_dump_${MODE}"
-MAX_TGZ_BYTES=2147483648
+
+# The MoE lives inside the torch-compiled forward subgraph, which torch_tpu
+# names after its first op. Dumping only that module keeps the dump to a
+# handful of files per rank instead of ~25k modules / ~27GB: torch_tpu
+# compiles every small op as its own XLA module (hundreds of
+# tt_jit_copy__as_strided_inverse, tt_jit_compile_mlir_as_strided, ...).
+DUMP_MODULE_RE=".*layernorm_L59C0_fused_add_rms_norm.*"
+
+# Every module of interest carries the MoE grouped-GEMM kernel, whose op_name
+# encodes the shape: gmm_v2-g_<local_experts>-m_<num_tokens*topk>-k_... . This
+# is the content filter that keeps the MoE subgraph at EVERY token bucket.
+MOE_MARKER="gmm_v2-g_"
 
 SERVE_ENV=()
 case "$MODE" in
@@ -63,7 +74,7 @@ COMMIT="${BUILDKITE_COMMIT:-unknown}"
 FAIL=0
 
 # Append so an image-level XLA_FLAGS is preserved rather than clobbered.
-export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${DUMP_DIR} --xla_dump_hlo_as_text --xla_dump_include_timestamp=false"
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_dump_to=${DUMP_DIR} --xla_dump_hlo_as_text --xla_dump_include_timestamp=false --xla_dump_hlo_module_re=${DUMP_MODULE_RE}"
 
 echo "=== IRDUMP START MODE=${MODE} COMMIT=${COMMIT} ENV=[${SERVE_ENV[*]-}] ==="
 echo "[irdump] XLA_FLAGS=${XLA_FLAGS}"
@@ -156,8 +167,22 @@ run_gsm8k() {
   echo "=== IRDUMP GSM8K END MODE=${MODE} ==="
 }
 
-# Keep only the post-optimization HLO -- the pre-optimization and per-pass
-# files are many times larger and are not what the diff needs.
+# Keep exactly the post-optimization HLO of the MoE subgraph.
+#
+# Two traps this deliberately avoids, both of which destroyed a previous run's
+# artifact (build 255: 8596 matched files, then all decode buckets evicted):
+#
+#   1. XLA emits THREE files per module -- <name>.after_optimizations.txt (the
+#      HLO), plus -buffer-assignment.txt and -buffer-assignment-values.txt.
+#      The -values variant is ~100MB, two orders of magnitude larger than the
+#      HLO, so a substring match on 'after_optimizations' keeps mostly ballast.
+#      Match the exact '.after_optimizations.txt' suffix instead.
+#
+#   2. Selecting "the N largest" selects AGAINST the decode buckets: bucket
+#      16/32/64/128 modules are the smallest, prefill 2048/4096/8192 the
+#      largest, so size-ranking drops exactly the shapes under investigation.
+#      Select by content (the MoE marker), never by size, and take no cap --
+#      restricting the dump at the source keeps the set small already.
 prune_dumps() {
   echo "=== IRDUMP PRUNE MODE=${MODE} dir=${DUMP_DIR} ==="
   if [ ! -d "$DUMP_DIR" ]; then
@@ -167,31 +192,58 @@ prune_dumps() {
   echo "[irdump] files before prune: $(find "$DUMP_DIR" -type f | wc -l)"
   echo "[irdump] bytes before prune: $(du -sb "$DUMP_DIR" | cut -f1)"
 
-  find "$DUMP_DIR" -type f ! -name '*after_optimizations*' -delete 2>/dev/null
+  # 1. exact suffix only -- drops the two buffer-assignment variants.
+  find "$DUMP_DIR" -type f ! -name '*.after_optimizations.txt' -delete 2>/dev/null
 
-  local kept total
+  local kept
   kept=$(find "$DUMP_DIR" -type f | wc -l)
-  total=$(du -sb "$DUMP_DIR" | cut -f1)
-  echo "[irdump] after_optimizations files: ${kept} bytes: ${total}"
-
+  echo "[irdump] .after_optimizations.txt files: ${kept} bytes: $(du -sb "$DUMP_DIR" | cut -f1)"
   if [ "$kept" -eq 0 ]; then
-    echo "[irdump] WARNING: no after_optimizations files matched; the dump"
+    echo "[irdump] WARNING: no .after_optimizations.txt files matched; the dump"
     echo "[irdump] naming may differ in this XLA build -- nothing to package"
     return
   fi
 
-  if [ "$total" -gt "$MAX_TGZ_BYTES" ]; then
-    echo "[irdump] over ${MAX_TGZ_BYTES} bytes, keeping the 20 largest"
-    find "$DUMP_DIR" -type f -printf '%s\t%p\n' \
-      | sort -rn | tail -n +21 | cut -f2- \
-      | while IFS= read -r victim; do rm -f "$victim"; done
-    echo "[irdump] files after size cap: $(find "$DUMP_DIR" -type f | wc -l)"
-    echo "[irdump] bytes after size cap: $(du -sb "$DUMP_DIR" | cut -f1)"
-  fi
+  # 2. content filter: keep only modules carrying the MoE grouped-GEMM kernel.
+  find "$DUMP_DIR" -type f -print0 \
+    | xargs -0 grep -L "$MOE_MARKER" 2>/dev/null \
+    | while IFS= read -r victim; do rm -f "$victim"; done
 
+  kept=$(find "$DUMP_DIR" -type f | wc -l)
+  echo "[irdump] modules containing ${MOE_MARKER}: ${kept} bytes: $(du -sb "$DUMP_DIR" | cut -f1)"
+  if [ "$kept" -eq 0 ]; then
+    echo "[irdump] WARNING: no module contained ${MOE_MARKER}; either the MoE"
+    echo "[irdump] subgraph was not dumped (check --xla_dump_hlo_module_re="
+    echo "[irdump] ${DUMP_MODULE_RE}) or the kernel naming changed"
+    return
+  fi
+}
+
+# Per-file manifest that PROVES which token buckets are in the artifact.
+# gmm_v2's m_<N> is num_tokens*topk, and [B,4096] is the hidden-state shape at
+# bucket B, so a non-zero count on [32,4096] is direct evidence that the
+# bucket-32 graph -- the one that garbles -- was actually captured.
+print_manifest() {
   echo "=== IRDUMP MANIFEST MODE=${MODE} ==="
-  find "$DUMP_DIR" -type f -printf '%s\t%f\n' | sort -rn
+  echo "[irdump] columns: bytes file gmm_shape n32=[32,4096] n64=[64,4096]"
+  local f n32 n64 gmm
+  while IFS= read -r f; do
+    n32=$(grep -c '\[32,4096\]' "$f" 2>/dev/null || true)
+    n64=$(grep -c '\[64,4096\]' "$f" 2>/dev/null || true)
+    gmm=$(grep -oE "${MOE_MARKER}[0-9]+-m_[0-9]+" "$f" 2>/dev/null | head -1)
+    echo "[irdump] $(stat -c %s "$f") $(basename "$f") ${gmm:-none} n32=${n32:-0} n64=${n64:-0}"
+  done < <(find "$DUMP_DIR" -type f | sort)
   echo "=== IRDUMP MANIFEST MODE=${MODE} END ==="
+
+  local total32
+  total32=$(grep -rlc '\[32,4096\]' "$DUMP_DIR" 2>/dev/null | wc -l)
+  if [ "$total32" -eq 0 ]; then
+    echo "=== IRDUMP WARNING MODE=${MODE}: no module contains [32,4096] --"
+    echo "=== the bucket-32 graph was NOT captured; this artifact cannot"
+    echo "=== answer the bucket-32 question ==="
+  else
+    echo "=== IRDUMP BUCKET32 OK MODE=${MODE} modules=${total32} ==="
+  fi
 }
 
 package_dumps() {
@@ -210,6 +262,7 @@ run_gsm8k
 stop_server
 
 prune_dumps
+print_manifest
 package_dumps
 
 # The gsm8k score is the validity check on the whole artifact: onehot must
