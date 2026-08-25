@@ -1438,6 +1438,34 @@ class TestTPURaidenConnectorWorker:
         assert geometry.value_head_dim == 2
         assert geometry.conv_kernel_size == 4
 
+    def test_qwen35_admission_topology_uniform_tp(self):
+        # Kimi-Linear runs uniform TP on both sides (PCP is rejected by the
+        # pooled KDA path), so the gate admits tp{2,4,8}_prefill/decode.
+        producer = _make_raiden_worker(tp_rank=0,
+                                       tp_size=4,
+                                       pcp_size=1,
+                                       is_producer=True)
+        assert producer._raiden_qwen35_admission_topology() == "tp4_prefill"
+        consumer = _make_raiden_worker(tp_rank=0,
+                                       tp_size=4,
+                                       pcp_size=1,
+                                       is_producer=False)
+        assert consumer._raiden_qwen35_admission_topology() == "tp4_decode"
+
+    def test_qwen35_admission_topology_rejects_mixed_tp(self):
+        producer = _make_raiden_worker(tp_rank=0,
+                                       tp_size=4,
+                                       pcp_size=2,
+                                       is_producer=True)
+        with pytest.raises(ValueError, match="admission topology"):
+            producer._raiden_qwen35_admission_topology()
+        consumer = _make_raiden_worker(tp_rank=0,
+                                       tp_size=4,
+                                       dp_size=4,
+                                       is_producer=False)
+        with pytest.raises(ValueError, match="admission topology"):
+            consumer._raiden_qwen35_admission_topology()
+
     def test_stage3_request_id_binding_is_bijective(self):
         worker = _make_raiden_worker(is_producer=False)
         worker._bind_stage3_request_ids("decode-a", "prefill-a")

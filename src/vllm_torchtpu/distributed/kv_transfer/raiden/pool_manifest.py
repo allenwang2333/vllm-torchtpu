@@ -285,6 +285,22 @@ class GdnHeadGeometry:
                 self.local_value_heads * self.value_head_dim)
 
 
+def _is_mla_latent_spec(spec: Any) -> bool:
+    """Whether an FA spec describes MLA's one-latent-row-per-token cache.
+
+    Test fakes and serialized specs carry ``kv_lora_rank``; the real vLLM
+    ``MLAAttentionSpec`` does not, so also check the class. Imported lazily
+    to keep this module importable without vLLM.
+    """
+    if getattr(spec, "kv_lora_rank", None) is not None:
+        return True
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    except Exception:
+        return False
+    return isinstance(spec, MLAAttentionSpec)
+
+
 def _fa_regions(*,
                 block_size_tokens: int,
                 token_stride_bytes: int,
@@ -695,8 +711,7 @@ def build_qwen35_pool_manifest(
                                   num_kv_heads=num_kv_heads,
                                   head_size=head_size,
                                   itemsize=itemsize,
-                                  mla_latent=getattr(spec, "kv_lora_rank",
-                                                     None) is not None)
+                                  mla_latent=_is_mla_latent_spec(spec))
         else:
             if not shape:
                 raise ManifestError(f"GDN state {layer_name} has no shape")

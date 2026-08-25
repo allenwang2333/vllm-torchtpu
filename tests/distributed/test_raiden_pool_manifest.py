@@ -567,6 +567,18 @@ def test_unified_pool_manifest_kimi_linear_padded_ssm_extent():
     rpm.verify_storage_binding(manifest, named, raw_tensors=(pool, ))
 
 
+def test_is_mla_latent_spec_recognizes_real_mla_spec():
+    """Production MLA layers carry vLLM's MLAAttentionSpec, which has no
+    kv_lora_rank attribute; the manifest must detect MLA by class as well."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    real_mla = MLAAttentionSpec.__new__(MLAAttentionSpec)
+    assert rpm._is_mla_latent_spec(real_mla)
+    assert rpm._is_mla_latent_spec(types.SimpleNamespace(kv_lora_rank=512))
+    assert not rpm._is_mla_latent_spec(
+        types.SimpleNamespace(block_size=16, num_kv_heads=1))
+
+
 @pytest.mark.parametrize(
     ("shapes", "dtypes", "page_size", "raw_size", "match"),
     [

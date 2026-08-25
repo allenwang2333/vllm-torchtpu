@@ -1914,6 +1914,9 @@ class TPURaidenConnectorWorker:
                 return f"pcp{pcp_size}_prefill"
             if tp_size == 1 and pcp_size == 1 and dp_size in (4, 8, 16):
                 return f"dp{dp_size}_prefill"
+            if pcp_size == 1 and dp_size == 1 and tp_size in (2, 4, 8):
+                # Uniform-TP prefill (Kimi-Linear KDA, which rejects PCP).
+                return f"tp{tp_size}_prefill"
             raise ValueError(
                 "Raiden Qwen3.5 admission topology pcp8_prefill, "
                 "pcp4_prefill, dp8_prefill, dp4_prefill, or dp16_prefill requires "
@@ -1921,15 +1924,22 @@ class TPURaidenConnectorWorker:
                 "prefill_context_parallel_size in (4, 8), "
                 "data_parallel_size=1 or "
                 "prefill_context_parallel_size=1, "
-                "data_parallel_size in (4, 8, 16); got "
+                "data_parallel_size in (4, 8, 16), or a uniform "
+                "tensor_parallel_size in (2, 4, 8) with "
+                "prefill_context_parallel_size=1, data_parallel_size=1; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
+        if pcp_size == 1 and dp_size == 1 and tp_size in (2, 4, 8):
+            # Uniform-TP decode (Kimi-Linear KDA).
+            return f"tp{tp_size}_decode"
         if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp8_decode, dp4_decode, or dp16_decode requires "
                 "kv_consumer with prefill_context_parallel_size=1, "
-                "tensor_parallel_size=1, data_parallel_size in (4, 8, 16); got "
+                "tensor_parallel_size=1, data_parallel_size in (4, 8, 16), or a "
+                "uniform tensor_parallel_size in (2, 4, 8) with "
+                "prefill_context_parallel_size=1, data_parallel_size=1; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}")
