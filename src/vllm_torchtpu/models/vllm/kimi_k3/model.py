@@ -276,11 +276,12 @@ class KimiModel(nn.Module):
         assert hidden_states is not None
         if self.prefill_sp.should_shard(hidden_states):
             hidden_states = self.prefill_sp.shard_embeddings(hidden_states)
-            block_residuals = (hidden_states.new_empty(
-                hidden_states.shape[0],
-                0,
-                hidden_states.shape[1],
-            ) if self.attn_res_block_size is not None else None)
+            # Derive the empty AttnRes stack from the local shard instead of
+            # passing its symbolic T/4 dimension to new_empty. TorchTPU's FX
+            # exporter requires concrete SymIntArrayRef values, while this
+            # zero-length view preserves the same [T/4, 0, H] contract.
+            block_residuals = (hidden_states.unsqueeze(-2).narrow(-2, 0, 0) if
+                               self.attn_res_block_size is not None else None)
             for layer in self.layers:
                 hidden_states, block_residuals = layer.forward_sp(
                     positions,

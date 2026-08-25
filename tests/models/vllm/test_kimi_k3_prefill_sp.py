@@ -330,6 +330,7 @@ class _SPDecoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.sp_shapes: list[tuple[int, ...]] = []
+        self.block_residual_shapes: list[tuple[int, ...] | None] = []
 
     def forward(self, *args, **kwargs):
         raise AssertionError("SP bucket must not use the standard layer path")
@@ -338,6 +339,8 @@ class _SPDecoder(nn.Module):
                    block_residuals: torch.Tensor | None):
         assert tuple(positions.shape) == (8, )
         self.sp_shapes.append(tuple(hidden_states.shape))
+        self.block_residual_shapes.append(
+            None if block_residuals is None else tuple(block_residuals.shape))
         return hidden_states + 1, block_residuals
 
 
@@ -362,6 +365,30 @@ def test_embedding_first_layer_and_final_norm_boundaries() -> None:
 
     assert layout.shard_shape == (8, 4)
     assert decoder.sp_shapes == [(2, 4)]
+    assert decoder.block_residual_shapes == [None]
     assert final_norm.shapes == [(2, 4)]
     assert layout.final_shape == (2, 4)
+    assert tuple(output.shape) == (8, 4)
+
+
+def test_sp_attnres_empty_stack_uses_local_token_shape() -> None:
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    layout = _ModelSPLayout()
+    decoder = _SPDecoder()
+    output_attn_res = _ResidualRecorder()
+    model.prefill_sp = layout
+    model.attn_res_block_size = 2
+    model.embed_tokens = _Embedding()
+    model.layers = nn.ModuleList([decoder])
+    model.output_attn_res = output_attn_res
+    model.norm = _ShapeRecorder()
+
+    output = model.forward(
+        input_ids=torch.arange(8),
+        positions=torch.arange(8),
+    )
+
+    assert decoder.block_residual_shapes == [(2, 0, 4)]
+    assert output_attn_res.shapes == [((2, 4), (2, 0, 4))]
     assert tuple(output.shape) == (8, 4)
