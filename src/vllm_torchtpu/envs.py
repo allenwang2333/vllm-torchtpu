@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    TPU_MOE_ROUTING_PERMUTE: str = "sort"
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -373,15 +372,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
-    # MoE routing-permutation implementation: "sort" (default) is the pair of
-    # jnp.argsort calls, "count" is the equivalent stable counting sort, which
-    # also yields the inverse permutation and the group sizes for free. The
-    # keys have only local_num_experts+1 distinct values, so the comparison
-    # sort is pure overhead -- but the counting sort trades it for an
-    # [N, local_num_experts+1] prefix sum, so which one wins is shape
-    # dependent. Microbenchmark before switching.
-    "TPU_MOE_ROUTING_PERMUTE":
-    env_with_choices("TPU_MOE_ROUTING_PERMUTE", "sort", ["sort", "count"]),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
