@@ -47,12 +47,14 @@ def _eager_on_cpu(request, monkeypatch):
 
 
 def _make_proposer(draft_tp: int | None = 1,
-                   target_tp: int = 1) -> DFlashProposer:
+                   target_tp: int = 1,
+                   target_layer_ids: list[int] = (1, 2)) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
+    # A non-zero mask id so mask slots are distinguishable from zero-fill.
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
-            "mask_token_id": 0,
-            "target_layer_ids": [1, 2],
+            "mask_token_id": 7,
+            "target_layer_ids": list(target_layer_ids),
         }
     }
 
@@ -140,8 +142,12 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp,
 
 def test_propose_empty_batch():
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
+    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0),
+                                      device=torch.device("cpu"))
     assert proposer.propose([], [], None, None) == []
+    # The async caller expects a tensor, even an empty one.
+    out = proposer.propose([], [], None, None, return_device=True)
+    assert isinstance(out, torch.Tensor) and out.shape == (0, 4)
 
 
 def test_tpu_precompute_context_kv(device):
@@ -273,9 +279,14 @@ def _make_chunk(num_reqs,
                 query_start_loc_np,
                 position_ids,
                 aux_hidden_states=None,
-                seq_lens=None):
+                seq_lens=None,
+                draft_lengths=None):
     query_start_loc = torch.from_numpy(query_start_loc_np).to(
         device) if query_start_loc_np is not None else None
+    if draft_lengths is not None:
+        draft_lengths = torch.tensor(draft_lengths,
+                                     dtype=torch.int32,
+                                     device=device)
 
     return DraftChunkInputs(
         input_ids=None,
@@ -288,6 +299,7 @@ def _make_chunk(num_reqs,
         start_index=start_index,
         num_reqs=num_reqs,
         aux_hidden_states=aux_hidden_states,
+        draft_lengths=draft_lengths,
         attn_metadata={
             "dummy_layer":
             SimpleNamespace(block_tables=torch.ones(10,
@@ -298,92 +310,250 @@ def _make_chunk(num_reqs,
     )
 
 
-def test_prepare_dflash_inputs(device):
-    proposer = _make_proposer(draft_tp=1)
-    K = 3
+def _input_proposer(device, K=3, draft_tp=1, target_tp=1, max_chunk_reqs=0):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
     proposer.speculative_config.num_speculative_tokens = K
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
-        _dp_lockstep_enabled=lambda: False,
+        _dp_lockstep_enabled=lambda: max_chunk_reqs > 0,
+        _dp_step_max_reqs=max_chunk_reqs,
     )
+    return proposer
+
+
+def _t(values, device):
+    return torch.tensor(values, dtype=torch.int32, device=device)
+
+
+def test_prepare_dflash_inputs_verify_window_anchors_after_accepted(device):
+    """A verified request anchors at start + num_accepted, so a rejection
+    pulls the next window back. The prompt-chunk anchor (last + 1) would
+    give 14 for request 0; only the verify path gives 12."""
+    proposer = _input_proposer(device)
+    chunk = _make_chunk(num_reqs=2,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+                        position_ids=_t([10, 11, 12, 13, 40, 41, 42, 43],
+                                        device),
+                        draft_lengths=[3, 3])
+    next_tokens = _t([[101, 102, -1, -1], [201, 202, 203, 204]], device)
+
+    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens)
+
+    assert torch.equal(input_ids, _t([102, 7, 7, 7, 204, 7, 7, 7], device))
+    assert torch.equal(positions, _t([12, 13, 14, 15, 44, 45, 46, 47],
+                                     device))
+    assert torch.equal(seq_lens, _t([16, 48], device))
+
+
+def test_prepare_dflash_inputs_routes_prompt_chunk_in_a_spec_step(device):
+    """A request that finished prefill while others verified has
+    draft_lengths == 0 and must anchor one past its last token (45), not
+    at start + num_accepted (41)."""
+    proposer = _input_proposer(device)
+    chunk = _make_chunk(num_reqs=2,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 4, 9], dtype=np.int32),
+                        position_ids=_t([10, 11, 12, 13, 40, 41, 42, 43, 44],
+                                        device),
+                        draft_lengths=[3, 0])
+    next_tokens = _t([[101, 102, -1, -1], [201, -1, -1, -1]], device)
+
+    input_ids, positions, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens)
+
+    assert torch.equal(input_ids, _t([102, 7, 7, 7, 201, 7, 7, 7], device))
+    assert torch.equal(positions, _t([12, 13, 14, 15, 45, 46, 47, 48],
+                                     device))
+
+
+def test_prepare_dflash_inputs_without_spec_metadata_uses_prompt_anchor(
+        device):
+    """No spec metadata means nothing was verified: every request anchors
+    after its last token, and the zero draft_lengths that route it is
+    cached at the target chunk's padded request count."""
+    proposer = _input_proposer(device)
     chunk = _make_chunk(num_reqs=2,
                         start_index=0,
                         device=device,
                         query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
-                        position_ids=torch.tensor(
-                            [10, 11, 12, 40, 41, 0, 0, 0],
-                            dtype=torch.int32,
-                            device=device))
+                        position_ids=_t([10, 11, 12, 40, 41, 0, 0, 0], device))
+    next_tokens = _t([[101, -1, -1, -1], [201, -1, -1, -1]], device)
 
-    next_tokens_device = torch.tensor(
-        [[101, 102, 103, -1], [201, 202, -1, -1]],
-        dtype=torch.int32,
-        device=device)
+    _, positions, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens)
 
-    input_ids, position_ids, seq_lens = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=next_tokens_device)
+    assert torch.equal(positions, _t([13, 14, 15, 16, 42, 43, 44, 45],
+                                     device))
+    assert list(proposer._zero_draft_lengths_cache) == [2]
+    assert proposer._zero_draft_lengths_cache[2].shape == (2, )
+
+
+def test_prepare_dflash_inputs_seed_anchors_after_last_prompt_token(device):
+    """The post-prefill seed window starts one past the chunk's LAST prompt
+    token (13, 42), not at the chunk's first position (10, 40)."""
+    proposer = _input_proposer(device)
+    chunk = _make_chunk(num_reqs=2,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
+                        position_ids=_t([10, 11, 12, 40, 41, 0, 0, 0], device))
+
+    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
+        chunk, device_seed=_t([5, 9], device))
+
+    assert torch.equal(input_ids, _t([5, 7, 7, 7, 9, 7, 7, 7], device))
+    assert torch.equal(positions, _t([13, 14, 15, 16, 42, 43, 44, 45],
+                                     device))
+    assert torch.equal(seq_lens, _t([17, 46], device))
+
+
+@pytest.mark.parametrize("path", ["next_tokens", "seed"])
+def test_prepare_dflash_inputs_padding_rows_and_context_limit(device, path):
+    """One live request padded to a 2-row bucket at the context limit.
+
+    Padding rows carry the mask id (a -1 base token would index the
+    embedding table negatively), anchor at position 0, and keep a nonzero
+    seq_len so their null-block writes stay off the kernel's kv_len == 0
+    path. The
+    live row's positions clamp to max_model_len - 1 and its seq_len to
+    max_model_len.
+    """
+    proposer = _input_proposer(device)
+    max_len = proposer._max_model_len
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 4], dtype=np.int32),
+                        position_ids=_t(
+                            [max_len - 4, max_len - 3, max_len - 2, max_len - 1],
+                            device),
+                        draft_lengths=[3])
+    if path == "next_tokens":
+        kwargs = dict(next_tokens_device=_t([[101, -1, -1, -1]], device))
+        base = max_len - 3  # start + 1 accepted
+    else:
+        kwargs = dict(device_seed=_t([101], device))
+        base = max_len  # last + 1
+
+    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
+        chunk, **kwargs)
 
     assert input_ids.shape == (8, )
-    assert position_ids.shape == (8, )
-    assert torch.equal(
-        input_ids,
-        torch.tensor([103, 0, 0, 0, 202, 0, 0, 0],
-                     dtype=torch.int32,
-                     device=device))
-    assert torch.equal(
-        position_ids,
-        torch.tensor([13, 14, 15, 16, 42, 43, 44, 45],
-                     dtype=torch.int32,
-                     device=device))
+    assert input_ids[0] == 101
+    assert torch.equal(input_ids[1:], torch.full((7, ), 7, dtype=torch.int32,
+                                                 device=device))
+    expected = [min(base + i, max_len - 1) for i in range(4)] + [0, 1, 2, 3]
+    assert torch.equal(positions, _t(expected, device))
+    assert seq_lens[0] == min(base + 4, max_len)
+    assert seq_lens[1] == 4
+
+
+def test_prepare_dflash_inputs_dp_lockstep_pads_to_coordinated_bound(device):
+    proposer = _input_proposer(device,
+                               draft_tp=8,
+                               target_tp=8,
+                               max_chunk_reqs=4)
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
+                        position_ids=_t([10, 11, 12, 0], device),
+                        draft_lengths=[3])
+
+    input_ids, positions, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=_t([[101, 102, 103, -1]], device))
+
+    # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded; rows 1..3 are
+    # padding.
+    assert input_ids.shape == (16, )
+    assert torch.equal(input_ids[4:], torch.full((12, ), 7, dtype=torch.int32,
+                                                 device=device))
+    assert torch.equal(positions[4:], _t([0, 1, 2, 3] * 3, device))
+
+
+def test_prepare_dflash_inputs_replicated_draft_ignores_lockstep(device):
+    """A TP-replicated, MoE-free draft is rank-local: it pads to its own
+    request count, not the DP-wide bound."""
+    proposer = _input_proposer(device, draft_tp=1, max_chunk_reqs=4)
+    proposer.draft_model = mock.MagicMock()
+    proposer._draft_has_moe_cache = False
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
+                        position_ids=_t([10, 11, 12, 0], device),
+                        draft_lengths=[3])
+
+    input_ids, _, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=_t([[101, 102, 103, -1]], device))
+
+    assert input_ids.shape == (8, )
 
 
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
-    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
-        return_value=(None, []))
-
-    slot_mapping = torch.zeros(8, dtype=torch.int32, device=device)
-    proposer._compute_slot_mapping = mock.MagicMock(return_value=slot_mapping)
-    proposer._draft_attn_layer_names = {"dummy_layer"}
-    proposer.runner = SimpleNamespace(
-        device=device,
-        kv_caches=[
-            torch.zeros((1, 8, 2, 2, 16), dtype=torch.float32, device=device)
-        ],
-        block_size=8,
-        num_tokens_paddings=[8, 16, 32],
-        mesh=None,
-        _dp_lockstep_enabled=lambda: False,
-    )
+    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer.runner = SimpleNamespace(device=device, mesh=None)
 
     draft_model = mock.MagicMock()
     layer_mock1 = mock.MagicMock()
-    layer_mock1.self_attn.attn.impl = mock.MagicMock()
     layer_mock2 = mock.MagicMock()
-    layer_mock2.self_attn.attn.impl = mock.MagicMock()
     # Draft layers resolve their metadata by name; an unnamed layer is an
     # error, not a cue to borrow another group's block table.
     layer_mock1.self_attn.attn.layer_name = "dummy_layer"
     layer_mock2.self_attn.attn.layer_name = "dummy_layer"
     draft_model.model.layers = [layer_mock1, layer_mock2]
     proposer.draft_model = draft_model
-    proposer.num_target_layers = 2
 
+    aux = [torch.zeros((3, 32), dtype=torch.float32, device=device)]
+    chunk = _make_chunk(num_reqs=1,
+                        start_index=0,
+                        device=device,
+                        query_start_loc_np=np.array([0, 3]),
+                        position_ids=_t([7, 8, 9, 0, 0], device),
+                        aux_hidden_states=aux)
+
+    proposer._update_draft_kv_cache_from_target(chunk)
+
+    hidden, positions, md_tuple = (
+        proposer._tpu_precompute_and_update_kv_cache.call_args.args)
+    assert hidden is aux
+    # Positions are cut to the aux token count, in layer order.
+    assert torch.equal(positions, _t([7, 8, 9], device))
+    assert md_tuple == (chunk.attn_metadata["dummy_layer"], ) * 2
+
+
+def test_update_draft_kv_cache_from_target_rejects_missing_aux(device):
+    """The runner stores [] (never None) when the target yielded no aux
+    states; DFlash cannot fill its context KV without them."""
+    proposer = _make_proposer(draft_tp=1)
     chunk = _make_chunk(num_reqs=1,
                         start_index=0,
                         device=device,
                         query_start_loc_np=np.array([0, 3]),
                         position_ids=torch.zeros(3),
-                        aux_hidden_states=[
-                            torch.zeros((3, 32),
-                                        dtype=torch.float32,
-                                        device=device)
-                        ])
+                        aux_hidden_states=[])
 
-    proposer._update_draft_kv_cache_from_target(chunk)
+    with pytest.raises(RuntimeError, match="aux hidden states"):
+        proposer._update_draft_kv_cache_from_target(chunk)
 
-    proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
+
+def _propose_runner(device, num_reqs, build_metadata):
+    return SimpleNamespace(
+        device=device,
+        input_batch=SimpleNamespace(num_reqs=num_reqs),
+        _attn_metadata_builder_ctx=None,
+        build_attention_metadata_for_layers=build_metadata,
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+        num_tokens_paddings=[8, 16, 32],
+    )
 
 
 def test_propose_unit(device):
@@ -391,19 +561,8 @@ def test_propose_unit(device):
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_attn_layer_names = {"dummy_layer"}
-    proposer.runner = SimpleNamespace(
-        device=device,
-        input_batch=SimpleNamespace(num_reqs=2),
-        _attn_metadata_builder_ctx=None,
-        max_num_blocks_per_req=2,
-        _attn_layer_names={"dummy_layer"},
-        build_attention_metadata_for_layers=mock.MagicMock(return_value={}),
-        mesh=None,
-        _is_async_drafter=True,
-        _dp_lockstep_enabled=lambda: False,
-        _dp_num_tokens_across_dp=lambda num_tokens: None,
-        _dp_step_num_chunks=0,
-    )
+    proposer.runner = _propose_runner(device, 2,
+                                      mock.MagicMock(return_value={}))
 
     chunk = _make_chunk(num_reqs=2,
                         start_index=0,
@@ -417,15 +576,6 @@ def test_propose_unit(device):
                       torch.zeros(8, dtype=torch.int32, device=device),
                       torch.zeros(2, dtype=torch.int32, device=device)))
     proposer._update_draft_kv_cache_from_target = mock.MagicMock()
-
-    logits = torch.zeros((8, 1000), dtype=torch.float32, device=device)
-    logits[1, 500] = 100.0
-    logits[2, 501] = 100.0
-    logits[3, 502] = 100.0
-    logits[5, 600] = 100.0
-    logits[6, 601] = 100.0
-    logits[7, 602] = 100.0
-
     expected_tokens = torch.tensor([[500, 501, 502], [600, 601, 602]],
                                    device=device)
     proposer._dflash_forward_and_sample = mock.MagicMock(
@@ -445,6 +595,67 @@ def test_propose_unit(device):
     proposer._prepare_dflash_inputs.assert_called_once()
     proposer._update_draft_kv_cache_from_target.assert_called_once()
     proposer._dflash_forward_and_sample.assert_called_once()
+
+
+def test_propose_slices_seed_per_chunk_and_stages_real_num_reqs(device):
+    """Two chunks: each sees only its own slice of the batch-wide seed, and
+    the draft metadata context carries the chunk's REAL request count (the
+    staging walk copies exactly that many block-table rows; a padded count
+    would copy departed requests' freed blocks into the padding rows)."""
+    proposer = _make_proposer(draft_tp=1)
+    K = 3
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+
+    staged = []
+
+    def build_metadata(layer_names, padded_num_reqs):
+        ctx = proposer.runner._attn_metadata_builder_ctx
+        staged.append((ctx.num_reqs, ctx.start_index, padded_num_reqs,
+                       ctx.seq_lens))
+        return {}
+
+    proposer.runner = _propose_runner(device, 3, build_metadata)
+    chunks = [
+        _make_chunk(num_reqs=2,
+                    start_index=0,
+                    device=device,
+                    query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
+                    position_ids=_t([10, 11, 12, 40, 41, 0, 0, 0], device)),
+        _make_chunk(num_reqs=1,
+                    start_index=2,
+                    device=device,
+                    query_start_loc_np=np.array([0, 2], dtype=np.int32),
+                    position_ids=_t([70, 71, 0, 0], device)),
+    ]
+    proposer.draft_chunks = chunks
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        side_effect=lambda input_ids, positions, block_size: (torch.zeros(
+            (input_ids.shape[0] // block_size, K),
+            dtype=torch.int32,
+            device=device), None))
+
+    out = proposer.propose(None, [],
+                           None,
+                           None,
+                           return_device=True,
+                           device_seed=_t([5, 6, 9], device))
+
+    assert out.shape == (3, K)
+    # Chunk 2 anchors on its own seed (9), not on chunk 1's tokens.
+    seeds = [
+        call.args[0][::K + 1]
+        for call in proposer._dflash_forward_and_sample.call_args_list
+    ]
+    assert torch.equal(seeds[0], _t([5, 6], device))
+    assert torch.equal(seeds[1][:1], _t([9], device))
+    assert [(n, s, p) for n, s, p, _ in staged] == [(2, 0, 2), (1, 2, 2)]
+    # The staged seq_lens are the per-request draft lengths just built.
+    assert torch.equal(staged[0][3], _t([17, 46], device))
+    assert torch.equal(staged[1][3], _t([76, 4], device))
+    # The builder context is restored after each build.
+    assert proposer.runner._attn_metadata_builder_ctx is None
 
 
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
@@ -474,49 +685,157 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"], )
 
 
-def test_dp_lockstep_run_dummy_draft():
-    # A TP-sharded draft emits cross-DP collectives, so idle ranks replay.
-    proposer = _make_proposer(draft_tp=8, target_tp=8)
+def _lockstep_proposer(draft_tp, target_tp):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
     proposer.draft_model = mock.MagicMock()
+    proposer._draft_has_moe_cache = False
     proposer.runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
         _dp_target_bucket=32,
         _dp_step_max_reqs=4,
         num_reqs_max_model_len=8,
+        max_num_blocks_per_req=2,
+        num_tokens_paddings=[8, 16, 32],
     )
-    proposer._dp_dummy_kv_update = mock.MagicMock()
-    proposer._dp_dummy_forward = mock.MagicMock()
+    proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
+    return proposer
+
+
+def test_dp_lockstep_run_dummy_draft_replays_without_host_sync():
+    """A sharded draft replays KV-updates then forwards, phase by phase,
+    at the coordinated shapes -- and never waits on the host: these run
+    inside propose() on the decode path."""
+    proposer = _lockstep_proposer(draft_tp=8, target_tp=8)
 
     proposer.run_dp_dummy_draft(num_chunks=2)
 
-    assert proposer._dp_dummy_kv_update.call_count == 2
-    assert proposer._dp_dummy_forward.call_count == 2
+    kv_calls = proposer._dummy_precompute_and_update_kv_cache.call_args_list
+    fwd_calls = proposer._dummy_draft_forward.call_args_list
+    assert len(kv_calls) == 2 and len(fwd_calls) == 2
+    for call in kv_calls:
+        assert call.kwargs["num_tokens"] == 32
+        assert call.kwargs["sync"] is False
+    for call in fwd_calls:
+        # 4 coordinated reqs * block 5 = 20 -> bucket 32.
+        assert call.kwargs["num_tokens"] == 32
+        assert call.kwargs["sync"] is False
 
 
-def test_prepare_dflash_inputs_dp_lockstep(device):
-    proposer = _make_proposer(draft_tp=8, target_tp=8)
+@pytest.mark.parametrize("draft_tp,target_tp,num_chunks,loaded",
+                         [(1, 8, 2, True), (8, 8, 0, True), (8, 8, 2, False)])
+def test_dp_lockstep_run_dummy_draft_skips(draft_tp, target_tp, num_chunks,
+                                           loaded):
+    """No replay for a replicated MoE-free draft (rank-local, no cross-DP
+    collectives), zero padding chunks, or an unloaded draft."""
+    proposer = _lockstep_proposer(draft_tp=draft_tp, target_tp=target_tp)
+    if not loaded:
+        proposer.draft_model = None
+
+    proposer.run_dp_dummy_draft(num_chunks=num_chunks)
+
+    proposer._dummy_precompute_and_update_kv_cache.assert_not_called()
+    proposer._dummy_draft_forward.assert_not_called()
+
+
+def test_precompile_syncs_and_warms_the_runtime_kv_update_shape(device):
+    """precompile blocks on each dummy (sync=True) and feeds the KV update
+    the shape propose() will: one tensor per tagged target layer, at both
+    chunk geometries the target uses."""
+    import contextlib
+
+    proposer = _make_proposer(draft_tp=1)
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    draft_model = mock.MagicMock()
+    draft_model.model.fc.weight = torch.zeros((16, 64))
+    draft_model.model.embed_tokens.weight = torch.zeros((4, 16),
+                                                        dtype=torch.bfloat16)
+    draft_model.model.layers = [mock.MagicMock(), mock.MagicMock()]
+    proposer.draft_model = draft_model
     proposer.runner = SimpleNamespace(
         device=device,
-        num_tokens_paddings=[8, 16, 32],
-        _dp_lockstep_enabled=lambda: True,
-        _dp_step_max_reqs=4,
+        mesh=None,
+        num_tokens_paddings=[8, 16],
+        num_reqs_max_model_len=2,
+        num_reqs_most_model_len=4,
+        most_model_len=64,
+        max_num_blocks_per_req=3,
+        num_blocks_per_most_len_req=1,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
     )
-    chunk = _make_chunk(num_reqs=1,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 3], dtype=np.int32),
-                        position_ids=torch.tensor([10, 11, 12, 0],
-                                                  dtype=torch.int32,
-                                                  device=device))
-    next_tokens_device = torch.tensor([[101, 102, 103, -1]],
-                                      dtype=torch.int32,
-                                      device=device)
+    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
 
-    input_ids, position_ids, _ = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=next_tokens_device)
+    with mock.patch("vllm_torchtpu.spec_decode.dflash.synchronize_tensors"
+                    ) as sync:
+        proposer.precompile()
 
-    # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
-    assert input_ids.shape == (16, )
-    assert position_ids.shape == (16, )
+    kv_calls = proposer._tpu_precompute_and_update_kv_cache.call_args_list
+    # (8, 16) tokens x (max-model-len, most-model-len) geometries.
+    assert len(kv_calls) == 4
+    assert sync.call_count == 4
+    hidden, positions, md_tuple = kv_calls[0].args
+    # Two tagged target layers -> two aux tensors of fc_in / 2 = 32.
+    assert [t.shape for t in hidden] == [(8, 32), (8, 32)]
+    assert all(t.dtype == torch.bfloat16 for t in hidden)
+    assert positions.shape == (8, )
+    assert len(md_tuple) == 2
+    tables = [call.args[2][0].block_tables.shape[0] for call in kv_calls]
+    # num_reqs * num_blocks: 2*3 (max) then 4*1 (most), per token bucket.
+    assert tables == [6, 4, 6, 4]
+    # Draft forwards warm at both geometries and never below one block.
+    fwd_kwargs = [c.kwargs for c in proposer._dummy_draft_forward.call_args_list]
+    assert [(c["num_tokens"], c["use_max_model_len"], c["sync"])
+            for c in fwd_kwargs] == [(8, True, True), (8, False, True),
+                                     (16, True, True), (16, False, True)]
+
+
+def test_precompile_skips_buckets_below_one_block(device):
+    import contextlib
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 15  # block 16
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(
+        device=device,
+        mesh=None,
+        num_tokens_paddings=[8, 16, 32],
+        num_reqs_max_model_len=1,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        max_num_blocks_per_req=1,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
+
+    proposer.precompile()
+
+    assert [c.kwargs["num_tokens"]
+            for c in proposer._dummy_draft_forward.call_args_list] == [16]
+
+
+def test_dummy_forward_inputs_are_cached_per_bucket(device):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(device=device)
+
+    first = proposer._dummy_forward_inputs(16)
+    again = proposer._dummy_forward_inputs(16)
+    other = proposer._dummy_forward_inputs(8)
+
+    assert first is again and first is not other
+    input_ids, positions, query_start_loc, seq_lens, dist, num_reqs = first
+    assert num_reqs == 4
+    assert input_ids.shape == positions.shape == (16, )
+    assert torch.equal(query_start_loc, _t([0, 4, 8, 12, 16], device))
+    assert torch.equal(seq_lens, _t([4, 4, 4, 4], device))
+    assert torch.equal(dist, _t([0, 0, 4], device))
+
+
+def test_missing_target_layer_ids_is_rejected_at_construction():
+    with pytest.raises(ValueError, match="target_layer_ids"):
+        _make_proposer(draft_tp=1, target_layer_ids=[])
