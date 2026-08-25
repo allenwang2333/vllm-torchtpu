@@ -225,7 +225,22 @@ class K3PrefillSPLayout:
             raise ValueError(
                 f"Token count {full_hidden_states.shape[0]} is not divisible "
                 f"by Kimi-K3 prefill sp_size={self.sp_size}")
-        local_tokens = full_hidden_states.shape[0] // self.sp_size
+
+        # Dynamo captures the model with the full token dimension symbolic,
+        # but TorchTPU's FX exporter requires the token dimension passed to
+        # downstream linear reshapes to be concrete.  Make the three Phase
+        # 1/2 buckets structurally explicit here.  ``narrow`` with a literal
+        # length gives the shard a concrete first dimension; the branch guard
+        # is consumed by the existing shape-variant warmup, which retraces
+        # once per incompatible compile bucket before serving starts.
+        if full_hidden_states.shape[0] == 1024:
+            local_tokens = 256
+        elif full_hidden_states.shape[0] == 2048:
+            local_tokens = 512
+        elif full_hidden_states.shape[0] == 4096:
+            local_tokens = 1024
+        else:
+            local_tokens = full_hidden_states.shape[0] // self.sp_size
         shard = full_hidden_states.narrow(0, self.sp_rank * local_tokens,
                                           local_tokens)
         # Break the full tensor's view lineage before the shard crosses a TPU

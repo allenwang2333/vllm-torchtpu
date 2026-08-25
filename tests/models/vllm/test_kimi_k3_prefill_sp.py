@@ -123,6 +123,47 @@ def test_only_fixed_long_prefill_buckets_enter_sp() -> None:
         assert not layout.should_shard(torch.empty(num_tokens, 2))
 
 
+@pytest.mark.parametrize(("num_tokens", "local_tokens"), [
+    (1024, 256),
+    (2048, 512),
+    (4096, 1024),
+])
+def test_sp_shard_has_concrete_local_token_dim_under_fullgraph_dynamo(
+        num_tokens: int, local_tokens: int) -> None:
+    plan = build_k3_prefill_sp_group_plan(tuple(range(8)), 4)
+    layout = K3PrefillSPLayout(plan=plan, sp_rank=2)
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    torch._dynamo.reset()
+    try:
+
+        @torch.compile(backend=backend, fullgraph=True, dynamic=False)
+        def compiled(tensor: torch.Tensor) -> torch.Tensor:
+            local = layout._local_shard(tensor)
+            # Mirror the first downstream projection that previously emitted
+            # an _unsafe_view with a symbolic T/4 dimension.
+            projected = local @ torch.ones(4, 4)
+            return projected.view(projected.shape[0], 2, 2)
+
+        tensor = torch.arange(num_tokens * 4,
+                              dtype=torch.float32).view(num_tokens, 4)
+        torch._dynamo.mark_dynamic(tensor, 0)
+        output = compiled(tensor)
+
+        assert tuple(output.shape) == (local_tokens, 2, 2)
+        view = next(node for node in graphs[0].graph.nodes
+                    if node.op == "call_method" and node.target == "view")
+        assert view.args[1:] == (local_tokens, 2, 2)
+        assert not isinstance(view.meta["example_value"].shape[0],
+                              torch.SymInt)
+    finally:
+        torch._dynamo.reset()
+
+
 def test_sp_collective_buffers_are_derived_from_input_shapes(
         monkeypatch: pytest.MonkeyPatch) -> None:
 
