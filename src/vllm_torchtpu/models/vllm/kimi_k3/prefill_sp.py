@@ -240,11 +240,44 @@ class K3PrefillSPLayout:
         with _sp_trace("embedding_sp_reshard"):
             return self._local_shard(full_hidden_states)
 
+    @staticmethod
+    def _all_gather_dim0(group: Any, input_: torch.Tensor) -> torch.Tensor:
+        # vLLM's generic communicator passes ``world_size * SymInt`` to
+        # torch.empty. TorchTPU's FX exporter requires concrete shape lists,
+        # so derive the output from local-shape empty_like tensors instead.
+        output = torch.cat(
+            [torch.empty_like(input_) for _ in range(group.world_size)],
+            dim=0,
+        )
+        torch.distributed.all_gather_into_tensor(
+            output,
+            input_,
+            group=group.device_group,
+        )
+        return output
+
+    @staticmethod
+    def _reduce_scatter_dim0(group: Any, input_: torch.Tensor) -> torch.Tensor:
+        contiguous = input_.contiguous()
+        # unflatten uses only constants (world_size, -1), while preserving all
+        # trailing dimensions. empty_like then inherits the symbolic shard
+        # dimension without constructing a SymIntArrayRef.
+        shard_prototype = contiguous.unflatten(0,
+                                               (group.world_size, -1)).select(
+                                                   0, 0)
+        output = torch.empty_like(shard_prototype)
+        torch.distributed.reduce_scatter_tensor(
+            output,
+            contiguous,
+            group=group.device_group,
+        )
+        return output
+
     def gather_next_attention(
             self, local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
         with _sp_trace("next_attention_sp_ag"):
-            return self.sp_group.all_gather(local_hidden_states, dim=0)
+            return self._all_gather_dim0(self.sp_group, local_hidden_states)
 
     def reduce_attention(self,
                          partial_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -253,7 +286,7 @@ class K3PrefillSPLayout:
         with _sp_trace("attention_lane_ar"):
             lane_reduced = self.lane_group.all_reduce(partial_hidden_states)
         with _sp_trace("attention_sp_rs"):
-            return self.sp_group.reduce_scatter(lane_reduced, dim=0)
+            return self._reduce_scatter_dim0(self.sp_group, lane_reduced)
 
     def finish_standard_attention(
             self, partial_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -268,7 +301,7 @@ class K3PrefillSPLayout:
                           local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
         with _sp_trace("moe_compat_ag"):
-            return self.sp_group.all_gather(local_hidden_states, dim=0)
+            return self._all_gather_dim0(self.sp_group, local_hidden_states)
 
     def reshard_moe_compat(self,
                            full_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -278,4 +311,4 @@ class K3PrefillSPLayout:
     def gather_final(self, local_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.sp_group is not None
         with _sp_trace("final_sp_ag"):
-            return self.sp_group.all_gather(local_hidden_states, dim=0)
+            return self._all_gather_dim0(self.sp_group, local_hidden_states)

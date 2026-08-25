@@ -123,6 +123,41 @@ def test_only_fixed_long_prefill_buckets_enter_sp() -> None:
         assert not layout.should_shard(torch.empty(num_tokens, 2))
 
 
+def test_sp_collective_buffers_are_derived_from_input_shapes(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class Group:
+        world_size = 4
+        device_group = object()
+
+    group = Group()
+    calls = []
+
+    def all_gather_into_tensor(output, input_, *, group):
+        calls.append(("ag", tuple(output.shape), group))
+        output.copy_(torch.cat([input_] * 4, dim=0))
+
+    def reduce_scatter_tensor(output, input_, *, group):
+        calls.append(("rs", tuple(output.shape), group))
+        output.copy_(input_.chunk(4, dim=0)[0])
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor",
+                        all_gather_into_tensor)
+    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor",
+                        reduce_scatter_tensor)
+
+    local = torch.arange(6, dtype=torch.float32).view(2, 3)
+    gathered = K3PrefillSPLayout._all_gather_dim0(group, local)
+    scattered = K3PrefillSPLayout._reduce_scatter_dim0(group, gathered)
+
+    torch.testing.assert_close(gathered, torch.cat([local] * 4, dim=0))
+    torch.testing.assert_close(scattered, local)
+    assert calls == [
+        ("ag", (8, 3), group.device_group),
+        ("rs", (2, 3), group.device_group),
+    ]
+
+
 def test_sp_initialization_is_explicit_and_rejects_unsupported_meshes(
 ) -> None:
     config = SimpleNamespace(parallel_config=SimpleNamespace(
