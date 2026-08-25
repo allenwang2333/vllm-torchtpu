@@ -172,6 +172,7 @@ PY
 
 python -m pytest -q \
   /workspace/vllm-torchtpu/tests/models/vllm/test_kimi_k3_prefill_sp.py \
+  /workspace/vllm-torchtpu/tests/tracing/test_annotation.py \
   /workspace/vllm-torchtpu/tests/test_profiler_trace.py \
   2>&1 | tee "$OUT/targeted-pytest.log"
 
