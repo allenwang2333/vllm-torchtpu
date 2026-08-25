@@ -24,6 +24,11 @@ steps:
     agents:
       queue: cpu_64_core
     commands:
+      # The shared builders accumulate image layers until the disk fills
+      # (three consecutive bisect builds died of ENOSPC on one agent).
+      # Reclaim everything unused before building; CI rebuilds are cheap.
+      - docker system prune -af || true
+      - df -h / | tail -1
       - bash .buildkite/scripts/setup_docker_env.sh
 
   - label: "PR170 bisect: repro_ctrl @ conc32"
