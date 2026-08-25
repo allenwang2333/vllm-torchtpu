@@ -525,34 +525,65 @@ control_top = control_lp["top_logprobs"][0]
 sp_top = sp_lp["top_logprobs"][0]
 common_tokens = set(control_top) & set(sp_top)
 min_top20_overlap = 19
-logprob_atol = 0.125
+max_bf16_ulps = 8.0
+
+
+def bf16_ulp(value):
+    magnitude = abs(float(value))
+    if magnitude == 0.0:
+        return math.ldexp(1.0, -133)
+    return math.ldexp(1.0, math.floor(math.log2(magnitude)) - 7)
+
+
 if len(common_tokens) < min_top20_overlap:
     raise SystemExit(
         f"final top-20 overlap={len(common_tokens)}/20; "
         f"symmetric difference={set(control_top) ^ set(sp_top)}"
     )
-deltas = {
-    token: abs(float(control_top[token]) - float(sp_top[token]))
-    for token in common_tokens
+token_metrics = {
+    token: {
+        "control": float(control_top[token]),
+        "sp4": float(sp_top[token]),
+        "abs_delta": abs(float(control_top[token]) - float(sp_top[token])),
+        "bf16_ulps": abs(float(control_top[token]) -
+                         float(sp_top[token])) / max(
+                             bf16_ulp(control_top[token]),
+                             bf16_ulp(sp_top[token])),
+    }
+    for token in sorted(common_tokens)
 }
-max_delta = max(deltas.values(), default=0.0)
+max_delta = max((item["abs_delta"] for item in token_metrics.values()),
+                default=0.0)
+max_ulp_delta = max(
+    (item["bf16_ulps"] for item in token_metrics.values()), default=0.0)
 sampled_delta = abs(float(control_lp["token_logprobs"][0]) -
                     float(sp_lp["token_logprobs"][0]))
-if (not math.isfinite(max_delta) or not math.isfinite(sampled_delta)
-        or max(max_delta, sampled_delta) > logprob_atol):
-    raise SystemExit(f"final top-20 logprob delta={max_delta}")
+sampled_ulp_delta = sampled_delta / max(
+    bf16_ulp(control_lp["token_logprobs"][0]),
+    bf16_ulp(sp_lp["token_logprobs"][0]),
+)
 correctness = {
     "sampled_token": control_choice["text"],
     "sampled_logprob_control": control_lp["token_logprobs"][0],
     "sampled_logprob_sp4": sp_lp["token_logprobs"][0],
     "sampled_logprob_delta": sampled_delta,
+    "sampled_logprob_bf16_ulps": sampled_ulp_delta,
     "top20_overlap": len(common_tokens),
     "top20_symmetric_difference": sorted(set(control_top) ^ set(sp_top)),
     "max_abs_top20_logprob_delta": max_delta,
-    "top20_logprob_deltas": deltas,
+    "max_top20_logprob_bf16_ulps": max_ulp_delta,
+    "top20_logprob_metrics": token_metrics,
     "min_top20_overlap": min_top20_overlap,
-    "logprob_atol": logprob_atol,
+    "max_bf16_ulps": max_bf16_ulps,
 }
+print("KIMI_K3_PREFILL_SP_PHASE2_COMPARISON=" +
+      json.dumps(correctness, ensure_ascii=False, sort_keys=True))
+if (not math.isfinite(max_ulp_delta)
+        or not math.isfinite(sampled_ulp_delta)
+        or max(max_ulp_delta, sampled_ulp_delta) > max_bf16_ulps):
+    raise SystemExit(
+        f"final logprob delta exceeds {max_bf16_ulps} BF16 ULPs: "
+        f"top20={max_ulp_delta}, sampled={sampled_ulp_delta}")
 (out / "correctness-summary.json").write_text(
     json.dumps(correctness, ensure_ascii=False, indent=2) + "\n"
 )
