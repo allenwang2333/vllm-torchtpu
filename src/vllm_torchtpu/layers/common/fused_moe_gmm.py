@@ -172,6 +172,54 @@ def gmm_wrapper(lhs,
     )
 
 
+def _counting_sort_permutation(
+    sort_keys: jax.Array,
+    local_num_experts: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Stable sort of ``sort_keys`` by counting, not by comparison.
+
+    ``sort_keys`` holds one entry per (token, top-k slot) with only
+    ``local_num_experts + 1`` distinct values -- the local expert ids plus a
+    sentinel for rows this rank does not own. A comparison sort over that is
+    wasteful: ``jnp.argsort`` costs O(N log^2 N) compare-exchanges on TPU
+    where a histogram costs O(N) with log depth.
+
+    The one-hot of the keys gives everything in one materialization:
+      * column sums are the per-expert group sizes,
+      * an exclusive prefix sum down the token axis gives each row's rank
+        among rows with the same key, which is exactly what makes the sort
+        stable,
+      * an exclusive prefix sum across the key axis gives each key's base
+        offset in the sorted output.
+
+    ``base[key] + rank`` is the destination slot, so the inverse permutation
+    -- which the caller needs to undo the permutation after the GMM -- falls
+    out directly and the second ``jnp.argsort`` disappears too.
+
+    Returns ``(sorted_indices, revert_indices, group_sizes_local)``, matching
+    ``jnp.argsort(sort_keys)``, ``jnp.argsort(jnp.argsort(sort_keys))`` and
+    the masked per-expert counts element for element.
+    """
+    num_rows = sort_keys.shape[0]
+    # One extra column absorbs the sentinel, so invalid rows sort to the tail
+    # in their original order, exactly as a stable argsort leaves them.
+    onehot = jax.nn.one_hot(sort_keys,
+                            local_num_experts + 1,
+                            dtype=jnp.int32)
+    counts = onehot.sum(axis=0)
+    # Rank of each row among earlier rows carrying the same key.
+    rank = ((jnp.cumsum(onehot, axis=0) - onehot) * onehot).sum(axis=1)
+    # Where each key's run starts in the sorted output.
+    base = jnp.cumsum(counts) - counts
+    destination = (onehot * base).sum(axis=1) + rank
+
+    sorted_indices = jnp.zeros(num_rows, dtype=jnp.int32).at[destination].set(
+        jnp.arange(num_rows, dtype=jnp.int32))
+    # ``destination`` already *is* argsort(argsort(keys)): sorted_indices maps
+    # slot -> row, and destination maps row -> slot.
+    return sorted_indices, destination, counts[:local_num_experts]
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -207,15 +255,21 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    if envs.TPU_MOE_ROUTING_PERMUTE == "count":
+        (sorted_indices, argsort_revert_indices,
+         group_sizes_local) = _counting_sort_permutation(
+             sort_keys, local_num_experts)
+        token_indices_sorted = token_indices_flat[sorted_indices]
+    else:
+        sorted_indices = jnp.argsort(sort_keys)
+        argsort_revert_indices = jnp.argsort(sorted_indices)
 
-    token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
+        token_indices_sorted = token_indices_flat[sorted_indices]
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
