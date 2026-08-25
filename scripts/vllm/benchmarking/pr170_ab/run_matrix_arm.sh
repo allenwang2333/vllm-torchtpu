@@ -27,8 +27,17 @@
 #   no_ep            control minus --enable-expert-parallel
 #   flash_attn       control with --attention-backend=FLASH_ATTN
 #   skip_padded      control plus TPU_MOE_SKIP_PADDED_TOKENS=1
+#   bf16_kv          control minus --kv-cache-dtype=fp8
 #
 # Comparing an arm against repro_ctrl attributes (or exonerates) that knob.
+#
+# bf16_kv tests the uninitialized-memory hypothesis rather than a MoE knob:
+# kv_cache_materializer.py allocates the raw KV cache with torch.empty for fp8
+# dtypes and torch.zeros otherwise, and the failing config sets
+# --kv-cache-dtype=fp8. Dropping the flag takes the zeros branch naturally, so
+# a clean bf16_kv points at reads of uninitialized KV memory -- under which the
+# other "rescuing" arms above would only be moving buffer assignments so those
+# reads land on benign memory, not fixing anything.
 #
 # Note on the MoE env defaults (src/vllm_torchtpu/envs.py): USE_MOE_SPARSE_CORE
 # defaults to TRUE, so leaving it unset does NOT disable sparse core -- it must
@@ -50,17 +59,19 @@ READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 usage() {
   echo "usage: run_matrix_arm.sh <arm-name>"
-  echo "valid arms: repro_ctrl onehot_default sc_off no_ep flash_attn skip_padded"
+  echo "valid arms: repro_ctrl onehot_default sc_off no_ep flash_attn skip_padded bf16_kv"
 }
 
 # ------------------------------------------------------------------
 # Arm definition: SERVE_ENV holds the extra env assignments prepended to
-# the serve invocation; EP_FLAG / ATTN_FLAG hold the varied flags (an
-# empty EP_FLAG means the flag is dropped from the command line).
+# the serve invocation; EP_FLAG / ATTN_FLAG / KV_DTYPE_FLAG hold the varied
+# flags (an empty EP_FLAG or KV_DTYPE_FLAG means the flag is dropped from the
+# command line).
 # ------------------------------------------------------------------
 SERVE_ENV=()
 EP_FLAG="--enable-expert-parallel"
 ATTN_FLAG="--attention-backend=CUSTOM"
+KV_DTYPE_FLAG="--kv-cache-dtype=fp8"
 
 case "$ARM" in
   repro_ctrl)
@@ -89,6 +100,10 @@ case "$ARM" in
       TPU_MOE_SKIP_PADDED_TOKENS=1
     )
     ;;
+  bf16_kv)
+    SERVE_ENV=(ONEHOT_MOE_PERMUTE_THRESHOLD=32768 USE_MOE_SPARSE_CORE=1)
+    KV_DTYPE_FLAG=""
+    ;;
   *)
     echo "=== MATRIX ERROR: unknown arm '${ARM}' ==="
     usage
@@ -100,7 +115,7 @@ mkdir -p "$RESULTS_DIR"
 COMMIT="${BUILDKITE_COMMIT:-unknown}"
 FAIL=0
 
-echo "=== MATRIX ARM=${ARM} COMMIT=${COMMIT} ENV=[${SERVE_ENV[*]-}] EP=[${EP_FLAG}] ATTN=[${ATTN_FLAG}] ==="
+echo "=== MATRIX ARM=${ARM} COMMIT=${COMMIT} ENV=[${SERVE_ENV[*]-}] EP=[${EP_FLAG}] ATTN=[${ATTN_FLAG}] KV=[${KV_DTYPE_FLAG}] ==="
 
 # shellcheck disable=SC2317  # invoked indirectly via trap
 cleanup() {
@@ -127,9 +142,11 @@ start_server() {
     --tool-call-parser=qwen3_coder
     --reasoning-parser=qwen3
     '--limit-mm-per-prompt={"image": 0, "video": 0}'
-    --kv-cache-dtype=fp8
-    --tensor-parallel-size=8
   )
+  if [ -n "$KV_DTYPE_FLAG" ]; then
+    serve_args+=("$KV_DTYPE_FLAG")
+  fi
+  serve_args+=(--tensor-parallel-size=8)
   if [ -n "$EP_FLAG" ]; then
     serve_args+=("$EP_FLAG")
   fi

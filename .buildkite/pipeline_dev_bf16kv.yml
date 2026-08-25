@@ -1,0 +1,44 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Uninitialized-KV-memory hypothesis, supporting arm on the UNPATCHED branch.
+# kv_cache_materializer.py allocates the raw KV cache with torch.empty for fp8
+# dtypes and torch.zeros otherwise, and the failing config sets
+# --kv-cache-dtype=fp8. This runs the known-garbage trigger config with that
+# flag dropped, so the allocation takes the zeros branch with no code change.
+# Clean => reads of uninitialized KV memory, and the other matrix arms only
+# moved buffer assignments onto benign memory; garbage => hypothesis weakened.
+# Trigger with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_bf16kv.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "PR170 kvinit: bf16 KV (zeros path) @ conc32"
+    key: bf16kv_arm
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh bf16_kv
+    artifact_paths:
+      - "perf_eval_results/**/*"
