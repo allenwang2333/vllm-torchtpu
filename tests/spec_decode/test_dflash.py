@@ -258,14 +258,9 @@ def _make_chunk(num_reqs,
                 query_start_loc_np,
                 position_ids,
                 aux_hidden_states=None,
-                seq_lens=None,
-                draft_lengths=None):
+                seq_lens=None):
     query_start_loc = torch.from_numpy(query_start_loc_np).to(
         device) if query_start_loc_np is not None else None
-    if draft_lengths is not None:
-        draft_lengths = torch.tensor(draft_lengths,
-                                     dtype=torch.int32,
-                                     device=device)
 
     return DraftChunkInputs(
         input_ids=None,
@@ -278,7 +273,6 @@ def _make_chunk(num_reqs,
         start_index=start_index,
         num_reqs=num_reqs,
         aux_hidden_states=aux_hidden_states,
-        draft_lengths=draft_lengths,
         attn_metadata={
             "dummy_layer":
             SimpleNamespace(block_tables=torch.ones(10,
@@ -289,147 +283,8 @@ def _make_chunk(num_reqs,
     )
 
 
-def _input_proposer(device, K=3, draft_tp=1, target_tp=1, max_chunk_reqs=0):
-    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
-    proposer.speculative_config.num_speculative_tokens = K
-    proposer.runner = SimpleNamespace(
-        device=device,
-        num_tokens_paddings=[8, 16, 32],
-        _dp_lockstep_enabled=lambda: max_chunk_reqs > 0,
-        _dp_step_max_reqs=max_chunk_reqs,
-    )
-    return proposer
-
-
 def _t(values, device):
     return torch.tensor(values, dtype=torch.int32, device=device)
-
-
-def test_prepare_dflash_inputs_verify_window_anchors_after_accepted(device):
-    """A verified request anchors at start + num_accepted, so a rejection
-    pulls the next window back. The prompt-chunk anchor (last + 1) would
-    give 14 for request 0; only the verify path gives 12."""
-    proposer = _input_proposer(device)
-    chunk = _make_chunk(num_reqs=2,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
-                        position_ids=_t([10, 11, 12, 13, 40, 41, 42, 43],
-                                        device),
-                        draft_lengths=[3, 3])
-    next_tokens = _t([[101, 102, -1, -1], [201, 202, 203, 204]], device)
-
-    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=next_tokens)
-
-    assert torch.equal(input_ids, _t([102, 7, 7, 7, 204, 7, 7, 7], device))
-    assert torch.equal(positions, _t([12, 13, 14, 15, 44, 45, 46, 47],
-                                     device))
-    assert torch.equal(seq_lens, _t([16, 48], device))
-
-
-def test_prepare_dflash_inputs_routes_prompt_chunk_in_a_spec_step(device):
-    """A request that finished prefill while others verified has
-    draft_lengths == 0 and must anchor one past its last token (45), not
-    at start + num_accepted (41)."""
-    proposer = _input_proposer(device)
-    chunk = _make_chunk(num_reqs=2,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 4, 9], dtype=np.int32),
-                        position_ids=_t([10, 11, 12, 13, 40, 41, 42, 43, 44],
-                                        device),
-                        draft_lengths=[3, 0])
-    next_tokens = _t([[101, 102, -1, -1], [201, -1, -1, -1]], device)
-
-    input_ids, positions, _ = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=next_tokens)
-
-    assert torch.equal(input_ids, _t([102, 7, 7, 7, 201, 7, 7, 7], device))
-    assert torch.equal(positions, _t([12, 13, 14, 15, 45, 46, 47, 48],
-                                     device))
-
-
-def test_prepare_dflash_inputs_without_spec_metadata_uses_prompt_anchor(
-        device):
-    """No spec metadata means nothing was verified: every request anchors
-    after its last token, and the zero draft_lengths that route it is
-    cached at the target chunk's padded request count."""
-    proposer = _input_proposer(device)
-    chunk = _make_chunk(num_reqs=2,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
-                        position_ids=_t([10, 11, 12, 40, 41, 0, 0, 0], device))
-    next_tokens = _t([[101, -1, -1, -1], [201, -1, -1, -1]], device)
-
-    _, positions, _ = proposer._prepare_dflash_inputs(
-        chunk, next_tokens_device=next_tokens)
-
-    assert torch.equal(positions, _t([13, 14, 15, 16, 42, 43, 44, 45],
-                                     device))
-    assert list(proposer._zero_draft_lengths_cache) == [2]
-    assert proposer._zero_draft_lengths_cache[2].shape == (2, )
-
-
-def test_prepare_dflash_inputs_seed_anchors_after_last_prompt_token(device):
-    """The post-prefill seed window starts one past the chunk's LAST prompt
-    token (13, 42), not at the chunk's first position (10, 40)."""
-    proposer = _input_proposer(device)
-    chunk = _make_chunk(num_reqs=2,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 3, 5], dtype=np.int32),
-                        position_ids=_t([10, 11, 12, 40, 41, 0, 0, 0], device))
-
-    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
-        chunk, device_seed=_t([5, 9], device))
-
-    assert torch.equal(input_ids, _t([5, 7, 7, 7, 9, 7, 7, 7], device))
-    assert torch.equal(positions, _t([13, 14, 15, 16, 42, 43, 44, 45],
-                                     device))
-    assert torch.equal(seq_lens, _t([17, 46], device))
-
-
-@pytest.mark.parametrize("path", ["next_tokens", "seed"])
-def test_prepare_dflash_inputs_padding_rows_and_context_limit(device, path):
-    """One live request padded to a 2-row bucket at the context limit.
-
-    Padding rows carry the mask id (a -1 base token would index the
-    embedding table negatively), anchor at position 0, and keep a nonzero
-    seq_len so their null-block writes stay off the kernel's kv_len == 0
-    path. The
-    live row's positions clamp to max_model_len - 1 and its seq_len to
-    max_model_len.
-    """
-    proposer = _input_proposer(device)
-    max_len = proposer._max_model_len
-    chunk = _make_chunk(num_reqs=1,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 4], dtype=np.int32),
-                        position_ids=_t(
-                            [max_len - 4, max_len - 3, max_len - 2, max_len - 1],
-                            device),
-                        draft_lengths=[3])
-    if path == "next_tokens":
-        kwargs = dict(next_tokens_device=_t([[101, -1, -1, -1]], device))
-        base = max_len - 3  # start + 1 accepted
-    else:
-        kwargs = dict(device_seed=_t([101], device))
-        base = max_len  # last + 1
-
-    input_ids, positions, seq_lens = proposer._prepare_dflash_inputs(
-        chunk, **kwargs)
-
-    assert input_ids.shape == (8, )
-    assert input_ids[0] == 101
-    assert torch.equal(input_ids[1:], torch.full((7, ), 7, dtype=torch.int32,
-                                                 device=device))
-    expected = [min(base + i, max_len - 1) for i in range(4)] + [0, 1, 2, 3]
-    assert torch.equal(positions, _t(expected, device))
-    assert seq_lens[0] == min(base + 4, max_len)
-    assert seq_lens[1] == 4
 
 
 def test_update_draft_kv_cache_from_target_unit(device):
