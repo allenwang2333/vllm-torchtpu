@@ -27,7 +27,8 @@ from vllm import forward_context as fc
 from vllm.forward_context import BatchDescriptor
 
 from vllm_torchtpu.distributed.low_latency_all_reduce import (
-    _DEFAULT_MAX_BATCH_SIZE, _candidate_rows, max_batch_size, select_entry)
+    _DEFAULT_MAX_BATCH_SIZE, MultipleCompileSizesUnsupported, _candidate_rows,
+    _check_single_compile_size, max_batch_size, select_entry)
 
 # The value is never called here; only which one comes back is under test.
 ENTRIES = {1: ("op1", ()), 2: ("op2", ()), 8: ("op8", ())}
@@ -159,22 +160,49 @@ def test_only_buckets_within_the_threshold_get_plans(monkeypatch):
     assert _candidate_rows(_config([1, 2, 16, 512])) == [1, 2]
 
 
-def test_uncompiled_sizes_are_excluded(monkeypatch):
-    # A plan for a token count the model never runs at allocates a workspace
-    # nothing reads, and could never be selected anyway: the forward context
-    # only ever reports a compile bucket.
+def test_only_compile_sizes_count(monkeypatch):
+    # The runner's ladder *is* compile_sizes (num_tokens_paddings), so a plan
+    # for anything else allocates a workspace nothing reads and could never be
+    # selected: the forward context only ever reports a compile bucket.
     monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", "512")
     assert _candidate_rows(_config([2], max_num_batched_tokens=1024)) == [2]
-
-
-def test_max_batched_tokens_counts_when_it_is_small_enough(monkeypatch):
-    # A decode-only server can leave compile_sizes empty and still have one
-    # real shape, which is max_num_batched_tokens.
-    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", "8")
-    assert _candidate_rows(_config([], max_num_batched_tokens=4)) == [4]
 
 
 def test_nothing_within_the_threshold_is_not_an_error(monkeypatch):
     # warmup logs and leaves every all-reduce on XLA rather than raising.
     monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", "2")
     assert _candidate_rows(_config([16, 512])) == []
+
+
+# --- the single-compile-size requirement ------------------------------------
+
+
+@pytest.mark.parametrize("compile_sizes", [[2], [16], []])
+def test_one_bucket_or_none_is_accepted(compile_sizes):
+    _check_single_compile_size(_config(compile_sizes))
+
+
+@pytest.mark.parametrize("compile_sizes",
+                         [[2, 16], [2, 16, 512], [1, 2, 4, 8]])
+def test_several_buckets_are_refused_at_startup(compile_sizes):
+    # The alternative is a ShapeSpecializationError twenty-five minutes into
+    # compilation, naming placeholder shapes rather than a flag: the kernel's
+    # workspaces are custom-op arguments, so they sit in the compiled graph's
+    # interface, and vLLM compiles every bucket from one Dynamo trace.
+    with pytest.raises(MultipleCompileSizesUnsupported) as excinfo:
+        _check_single_compile_size(_config(compile_sizes))
+    message = str(excinfo.value)
+    # The message has to name the flag and what was found, or it just moves the
+    # confusion earlier.
+    assert "TPU_LOW_LATENCY_ALLREDUCE" in message
+    assert str(compile_sizes) in message
+
+
+def test_the_refusal_does_not_depend_on_the_batch_threshold(monkeypatch):
+    # A threshold that excludes every bucket would leave the kernel wired to
+    # nothing, which is harmless -- but the flag is still an explicit request
+    # the config cannot honour, and this module's worst failures have all been
+    # runs that logged "enabled" while doing the old thing.
+    monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", "1")
+    with pytest.raises(MultipleCompileSizesUnsupported):
+        _check_single_compile_size(_config([16, 512]))

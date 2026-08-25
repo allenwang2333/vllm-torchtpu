@@ -523,6 +523,59 @@ bucket at or below it gets its own op and workspaces, so nothing is chosen and
 nothing has to be named. `_GATE` still has the final say on payload size, so
 the threshold cannot widen the kernel past where it was measured to win.
 
+### 5b. One compile size, enforced
+
+The kernel requires a model compiled at exactly one token bucket, and refuses to
+start otherwise. This is structural, not a missing feature.
+
+The workspaces have to be *arguments* of a custom op -- a tensor the compiled
+program references but was never handed aborts it with "identified an argument
+that was not provided: DeviceBufferRef" -- so they sit in the op's interface,
+and therefore in the placeholder list of whichever subgraph holds the call. vLLM
+compiles every bucket from **one** Dynamo trace: `compile_all_ranges` feeds a
+single FX graph concrete inputs per compile size, so structure is fixed once and
+only shapes vary. An op bound to one bucket's workspaces is inherited by the
+rest, where its shape check fails and the reduction falls back to XLA inside an
+opaque call the compiler can no longer fuse or reorder -- correct, and slower
+than not having the kernel.
+
+`compilation/shape_variants.py` can re-trace per group, but only from ShapeEnv
+guards, and this decision cannot leave one: reading the token dimension of a
+traced tensor pins vLLM's marked-dynamic `input_ids` dim and dies with
+`ConstraintViolationError` (measured, job 332). Nor can the traces simply
+diverge -- `retrace` ends in `reset_compile_wrapper`, so one graph stays live and
+serves every bucket, invoking each handed-over executable with its own argument
+list. `BucketExecutables.get` checks precisely that, and raises
+`ShapeSpecializationError` when it does not match: six per run in jobs
+305/307/308/309, twenty-five minutes into compilation, naming placeholder shapes
+rather than a flag. Hence the startup check.
+
+Two ways out were prototyped on `gnovack/llar-uniform-op`, both worse than the
+kernel is worth:
+
+* **Emit the collective inside the op on every bucket** (`jax.lax.psum` where
+  the kernel does not apply, chosen below the custom-op boundary where the shape
+  is concrete -- the arrangement `ONEHOT_MOE_PERMUTE_THRESHOLD` uses). Uniform
+  structure, no clone, but XLA's combiner cannot merge a collective inside an
+  opaque call. Losing that fusion measured +5.5% device time when the MoE pair
+  was split.
+* **Return an identity from the op and reduce natively outside it.** Keeps the
+  collective combinable, but a custom op may not return an alias of an input --
+  enforced at runtime, "Please instead return a clone" -- so it costs a full
+  copy of the payload per reduction, ~7 MiB at a 512-token bucket.
+
+The untried third is declaring the op as mutating `x` and returning `None`: no
+alias, no copy. `build_reduce_op` records that declaring mutation on the
+*workspaces* made AOTAutograd add them to the graph outputs and broke the
+artifact with "expected 3 outputs, got 1"; whether `x` behaves differently is
+unknown.
+
+What would dissolve all of this is per-shape capture -- one program traced per
+bucket rather than one trace specialized per bucket. Then a token-count branch
+is an ordinary Python `if`, which is exactly why the JAX side never had this
+problem: `sharded_jax_op` lowers per input shape already. A move to
+`torch.export` with dynamic shapes would reproduce it unchanged.
+
 At ~1.5 us across K3's 187 collectives/step this is ~281 us predicted; measured
 end to end it is 340 us, **2.2% of TPOT**.
 

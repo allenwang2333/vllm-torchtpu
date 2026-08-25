@@ -633,27 +633,80 @@ def _moe_concat_width(vllm_config) -> int | None:
     return hidden + latent
 
 
+class MultipleCompileSizesUnsupported(RuntimeError):
+    """The kernel cannot be wired for a model compiled at several buckets."""
+
+
+def _check_single_compile_size(vllm_config) -> None:
+    """Refuse a multi-bucket config, at startup, with the reason.
+
+    This kernel needs its workspaces to be *arguments* of a custom op -- a
+    tensor the compiled program references but was never handed aborts it with
+    "identified an argument that was not provided: DeviceBufferRef" -- which
+    puts them in the op's interface, and therefore in the placeholder list of
+    whichever subgraph holds the call.
+
+    vLLM compiles every bucket from *one* Dynamo trace: ``compile_all_ranges``
+    feeds a single FX graph concrete inputs per compile size, so structure is
+    fixed once and only shapes vary. An op bound to one bucket's workspaces is
+    therefore inherited by every other bucket in the trace, where its shape
+    check fails and the reduction falls back to XLA *inside* an opaque custom
+    call the compiler can no longer fuse or reorder -- correct, and slower than
+    not having the kernel at all.
+
+    ``compilation/shape_variants.py`` can re-trace per group, but only from
+    ShapeEnv guards, and this decision cannot leave one: reading the token
+    dimension of a traced tensor pins vLLM's marked-dynamic ``input_ids`` dim
+    and fails with ``ConstraintViolationError``. Nor can the traces simply
+    diverge -- ``retrace`` ends in ``reset_compile_wrapper``, so one graph stays
+    live and serves every bucket, invoking each handed-over executable with its
+    own argument list. ``BucketExecutables.get`` checks exactly that and raises
+    ``ShapeSpecializationError`` when it does not match, which is how this
+    surfaces if it is not caught here: six per run, twenty-five minutes into
+    compilation, naming placeholder shapes rather than a flag.
+
+    So the restriction is structural rather than a missing feature, and the two
+    ways out are both worse than the kernel is worth: emit the collective inside
+    the op on every bucket (measured cost of losing that fusion: +5.5% device
+    time when the MoE pair was split) or return a clone from an identity op
+    (~7 MiB per reduction at a 512-token bucket). Both are on
+    ``gnovack/llar-uniform-op`` with their reasoning.
+
+    Raising rather than quietly declining to wire: the flag is an explicit
+    request, and a run that logs "enabled" while doing the old thing is the
+    failure mode this module has been bitten by most.
+    """
+    compile_sizes = list(
+        getattr(vllm_config.compilation_config, "compile_sizes", None) or [])
+    if len(compile_sizes) <= 1:
+        return
+    raise MultipleCompileSizesUnsupported(
+        f"TPU_LOW_LATENCY_ALLREDUCE=1 needs a model compiled at exactly one "
+        f"token bucket, but compile_sizes is {compile_sizes}. The kernel's "
+        f"workspaces are custom-op arguments, so they sit in the compiled "
+        f"graph's interface, and vLLM compiles every bucket from one Dynamo "
+        f"trace -- the buckets cannot have different interfaces. Serve with a "
+        f"single compile size (this kernel targets decode, where its measured "
+        f"win is at 1-2 tokens), or unset TPU_LOW_LATENCY_ALLREDUCE.")
+
+
 def _candidate_rows(vllm_config) -> list[int]:
     """Padded token counts worth building a plan for.
 
     The compile buckets, since a step is padded up to one of them, capped at
-    ``max_batch_size()``. Uncompiled sizes are excluded on purpose: a plan for a
-    token count the model never runs at would allocate a workspace nothing ever
-    reads, and the entry could never be selected because the forward context
-    only ever reports a bucket.
+    ``max_batch_size()``. Nothing outside ``compile_sizes`` is considered: the
+    runner's ladder *is* ``compile_sizes`` (``num_tokens_paddings``), so a plan
+    for anything else would allocate a workspace nothing ever reads and could
+    never be selected, because the forward context only reports a bucket.
     """
     limit = max_batch_size()
-    rows = set()
     compile_sizes = getattr(vllm_config.compilation_config, "compile_sizes",
                             None) or []
-    for size in compile_sizes:
-        if isinstance(size, int) and 0 < size <= limit:
-            rows.add(size)
-    max_batched = getattr(vllm_config.scheduler_config,
-                          "max_num_batched_tokens", None)
-    if isinstance(max_batched, int) and 0 < max_batched <= limit:
-        rows.add(max_batched)
-    return sorted(rows)
+    return sorted({
+        size
+        for size in compile_sizes
+        if isinstance(size, int) and 0 < size <= limit
+    })
 
 
 def _hidden_width(vllm_config) -> int | None:
@@ -700,6 +753,11 @@ def warmup(vllm_config) -> None:
         return
     if communicator is None or int(getattr(communicator, "world_size", 1)) < 2:
         return
+
+    # Before anything is registered or allocated, so a config this cannot
+    # support fails at startup naming the flag rather than mid-compilation
+    # naming placeholder shapes.
+    _check_single_compile_size(vllm_config)
 
     dispatcher = get_dispatcher(communicator)
 

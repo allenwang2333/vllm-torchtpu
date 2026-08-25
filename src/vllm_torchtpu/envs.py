@@ -296,8 +296,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route small TP all-reduces to the two-shot Pallas kernel instead of
     # XLA's ring. Only batches at or below
     # TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE whose payload is also inside the
-    # measured crossover are rerouted; everything else stays on XLA. See
-    # docs/low_latency_allreduce.md and distributed/low_latency_all_reduce.py.
+    # measured crossover are rerouted; everything else stays on XLA.
+    #
+    # Requires a model compiled at exactly ONE token bucket, and refuses to
+    # start otherwise. The kernel's workspaces are custom-op arguments, so they
+    # live in the compiled graph's interface, and vLLM compiles every bucket
+    # from one Dynamo trace -- the buckets cannot differ there. Not a
+    # limitation worth working around: this targets decode, where the measured
+    # win is at 1-2 tokens. See low_latency_all_reduce._check_single_compile_size
+    # and docs/low_latency_allreduce.md.
     "TPU_LOW_LATENCY_ALLREDUCE":
     env_bool("TPU_LOW_LATENCY_ALLREDUCE"),
 
