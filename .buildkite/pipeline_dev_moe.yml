@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MoE-focused diagnosis of the conc-32 gsm8k collapse on the per-layer KV
-# path (pre-#170 baseline). Trigger with
-# DEV_PIPELINE_FILE=.buildkite/pipeline_dev_moe.yml.
+# Compiled-graph cache carryover test for the conc-32 gsm8k collapse on the
+# per-layer KV path (pre-#170 baseline). Three server lifecycles in one job --
+# noenv / onehot / noenv on a shared, deliberately uncleared compile cache --
+# to check whether ONEHOT_MOE_PERMUTE_THRESHOLD is missing from the cache key.
+# Trigger with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_moe.yml.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -24,8 +26,8 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "PR170 MoE diag: baseline @ 74d86c2fc, conc sweep + SC on/off"
-    key: moe_diag
+  - label: "PR170 cache test: noenv/onehot/noenv"
+    key: cache_test
     depends_on: build_docker
     timeout_in_minutes: 60
     agents:

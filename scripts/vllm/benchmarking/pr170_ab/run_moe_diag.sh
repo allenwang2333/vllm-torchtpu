@@ -13,15 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MoE-focused diagnosis of the gsm8k accuracy collapse seen at eval
-# concurrency 32 (but not 128) on the per-layer KV path.
+# Compiled-graph cache carryover test for the gsm8k accuracy collapse seen at
+# eval concurrency 32 (but not 128) on the per-layer KV path.
 #
-# Phase A: server with USE_MOE_SPARSE_CORE=1 + ONEHOT_MOE_PERMUTE_THRESHOLD
-#   (the config under discussion) — sweep eval concurrency on a FRESH server
-#   to (a) check whether bench traffic is required to trigger the garbage and
-#   (b) map which decode batch shapes garble.
-# Phase B: identical server WITHOUT the MoE sparse-core envs — if conc-32
-#   recovers, the SC MoE path is implicated.
+# The arm matrix showed ONEHOT_MOE_PERMUTE_THRESHOLD=32768 is the load-bearing
+# knob: repro_ctrl scored 0.00 at conc 32 while every other arm scored ~0.85.
+# But an earlier two-phase run of this script saw its no-env phase B come back
+# garbage too, which that result cannot explain. Suspicion: the threshold is
+# baked into the pallas kernel closure but is likely NOT part of the compile
+# cache key, so phase B silently reused phase A's poisoned compiled graphs —
+# the default vLLM cache dir lives inside the container and survives across
+# server lifecycles within one job.
+#
+# Three sequential server lifecycles in ONE job, same cache dir throughout
+# (deliberately NOT cleared between them — reuse is the thing under test):
+#   1. noenv_first  no MoE envs      -> expect clean  (~0.85)
+#   2. onehot_mid   threshold=32768  -> expect garbage (~0.00)
+#   3. noenv_again  no MoE envs      -> the verdict
+#
+# If noenv_again is garbage, it was poisoned by lifecycle 2's cache and the
+# carryover theory holds. If noenv_again is clean, the carryover theory dies
+# and the earlier phase-B garbage needs a different explanation.
 #
 # Runs inside the CI docker image via .buildkite/scripts/run_in_docker.sh.
 set -uo pipefail
@@ -121,31 +133,60 @@ run_gsm8k() {
   echo "=== MOE_DIAG GSM8K END tag=${tag} ==="
 }
 
+# Snapshot of the compile cache so the log shows whether lifecycle N+1
+# actually reused what lifecycle N wrote (entry count + newest entries).
+cache_stat() {
+  local tag="$1"
+  local cache_root="${VLLM_CACHE_ROOT:-$HOME/.cache/vllm}"
+  echo "=== MOE_DIAG CACHE ${tag} root=${cache_root} ==="
+  if [ -d "$cache_root" ]; then
+    echo "[cache] entries: $(find "$cache_root" -type f 2>/dev/null | wc -l)"
+    echo "[cache] bytes:   $(du -sb "$cache_root" 2>/dev/null | cut -f1)"
+    echo "[cache] newest:"
+    find "$cache_root" -type f -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | head -5 | cut -d' ' -f2-
+  else
+    echo "[cache] root does not exist yet"
+  fi
+  echo "=== MOE_DIAG CACHE ${tag} END ==="
+}
+
 # ------------------------------------------------------------------
-# Phase A: MoE sparse-core ON (config under discussion), fresh server,
-# concurrency sweep. conc32/conc128 use the full 1319 questions; the
-# other points are 250-question spot checks.
+# 1. noenv_first: no MoE envs. Establishes the clean baseline for this
+#    job on whatever cache state the image ships with.
 # ------------------------------------------------------------------
-start_server sc_on ONEHOT_MOE_PERMUTE_THRESHOLD=32768 USE_MOE_SPARSE_CORE=1
-probe sc_on_fresh
-run_gsm8k sc_on_conc32 32 full
-run_gsm8k sc_on_conc128 128 full
-run_gsm8k sc_on_conc64 64 250
-run_gsm8k sc_on_conc16 16 250
-run_gsm8k sc_on_conc8 8 250
+cache_stat before_noenv_first
+start_server noenv_first
+probe noenv_first_fresh
+run_gsm8k noenv_first 32 250
 stop_server
 
 # ------------------------------------------------------------------
-# Phase B: identical server WITHOUT the MoE sparse-core envs.
+# 2. onehot_mid: the load-bearing threshold ON. Expected to garble, and
+#    to write the suspect compiled graphs into the shared cache.
 # ------------------------------------------------------------------
-start_server sc_off
-probe sc_off_fresh
-run_gsm8k sc_off_conc32 32 full
-run_gsm8k sc_off_conc128 128 250
+cache_stat before_onehot_mid
+start_server onehot_mid ONEHOT_MOE_PERMUTE_THRESHOLD=32768 USE_MOE_SPARSE_CORE=1
+probe onehot_mid_fresh
+run_gsm8k onehot_mid 32 250
 stop_server
 
 # ------------------------------------------------------------------
-# Summary
+# 3. noenv_again: byte-identical server config to lifecycle 1. The cache
+#    is deliberately NOT cleared, so garbage here means lifecycle 2's
+#    graphs were reused despite the env being gone — i.e. the threshold
+#    is missing from the compile cache key.
+# ------------------------------------------------------------------
+cache_stat before_noenv_again
+start_server noenv_again
+probe noenv_again_fresh
+run_gsm8k noenv_again 32 250
+stop_server
+cache_stat final
+
+# ------------------------------------------------------------------
+# Summary: compare noenv_first vs noenv_again — identical server configs,
+# so any delta between them is cache carryover from lifecycle 2.
 # ------------------------------------------------------------------
 echo "=== MOE_DIAG SUMMARY ==="
 grep -H -E "strict-match|flexible-extract" "$RESULTS_DIR"/gsm8k_*.log | grep exact_match || true
