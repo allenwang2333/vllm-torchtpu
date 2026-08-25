@@ -309,12 +309,16 @@ def _fa_regions(*,
                 itemsize: int,
                 mla_latent: bool = False) -> tuple[RegionSpec, ...]:
     if mla_latent:
-        # MLA stores one latent row per token (no separate K/V heads).
-        unit_bytes = head_size * itemsize
-        if unit_bytes > token_stride_bytes:
+        # MLA stores one latent row per token (no separate K/V heads). The
+        # unit covers the whole padded token slot, not just the live latent
+        # bytes: with unit < stride the controller would plan one iovec per
+        # token, and the transport rejects plans that shatter into
+        # per-token fragments (observed: INVALID_ARGUMENT #iovs=1704). The
+        # padding rides along; both sides zero it identically.
+        unit_bytes = token_stride_bytes
+        if unit_bytes <= 0:
             raise ManifestError(
-                "MLA live bytes per token exceed the physical token stride: "
-                f"live={unit_bytes} stride={token_stride_bytes}")
+                f"MLA token stride must be positive: {token_stride_bytes}")
         return (RegionSpec(
             name="fa_payload",
             offset_bytes=0,
