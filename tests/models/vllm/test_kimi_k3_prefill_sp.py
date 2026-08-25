@@ -202,6 +202,41 @@ def test_sp_collective_buffers_are_derived_from_input_shapes(
     ]
 
 
+def test_sp_attention_reduction_accumulates_bf16_in_fp32(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class LaneGroup:
+
+        def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+            assert input_.dtype == torch.float32
+            return input_ * 2
+
+    class SPGroup:
+        world_size = 4
+        device_group = object()
+
+    def reduce_scatter_tensor(output, input_, *, group):
+        assert input_.dtype == torch.float32
+        assert output.dtype == torch.float32
+        assert group is SPGroup.device_group
+        output.copy_(input_.chunk(4, dim=0)[0])
+
+    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor",
+                        reduce_scatter_tensor)
+    layout = K3PrefillSPLayout(
+        plan=build_k3_prefill_sp_group_plan(tuple(range(8)), 4),
+        lane_group=LaneGroup(),
+        sp_group=SPGroup(),
+    )
+    partial = torch.arange(16, dtype=torch.bfloat16).view(8, 2)
+
+    reduced = layout.reduce_attention(partial)
+
+    assert reduced.dtype == torch.bfloat16
+    torch.testing.assert_close(reduced, (partial.float() * 2).chunk(4)[0].to(
+        torch.bfloat16))
+
+
 def test_sp_initialization_is_explicit_and_rejects_unsupported_meshes(
 ) -> None:
     config = SimpleNamespace(parallel_config=SimpleNamespace(

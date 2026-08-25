@@ -305,10 +305,22 @@ class K3PrefillSPLayout:
                          partial_hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lane_group is not None
         assert self.sp_group is not None
+        output_dtype = partial_hidden_states.dtype
+        # A single TP all-reduce materializes only its final result. Splitting
+        # the same sum into lane-AR followed by SP-RS would otherwise
+        # materialize (and round) the intermediate lane sum in BF16 before the
+        # second collective. Keep both stages in FP32 so the SP decomposition
+        # adds no extra low-precision rounding point, then restore the model's
+        # activation dtype after the complete TP sum has been formed.
+        accumulator = (partial_hidden_states.float()
+                       if output_dtype in (torch.bfloat16, torch.float16) else
+                       partial_hidden_states)
         with _sp_trace("attention_lane_ar"):
-            lane_reduced = self.lane_group.all_reduce(partial_hidden_states)
+            lane_reduced = self.lane_group.all_reduce(accumulator)
         with _sp_trace("attention_sp_rs"):
-            return self._reduce_scatter_dim0(self.sp_group, lane_reduced)
+            reduced_shard = self._reduce_scatter_dim0(
+                self.sp_group, lane_reduced)
+        return reduced_shard.to(output_dtype)
 
     def finish_standard_attention(
             self, partial_hidden_states: torch.Tensor) -> torch.Tensor:
