@@ -25,27 +25,6 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
-_COMPILED_METHODS = (
-    "_tpu_precompute_and_update_kv_cache",
-    "_dflash_forward_and_sample",
-    "_tpu_build_dflash_inputs_next_tokens",
-    "_tpu_build_dflash_inputs_seed",
-)
-
-
-@pytest.fixture(autouse=True)
-def _eager_on_cpu(request, monkeypatch):
-    """The proposer's `@torch.compile(backend="tpu")` graphs only trace on
-    TPU tensors; run them eagerly when the `device` fixture resolves to CPU
-    so the input builders stay unit-testable without a chip."""
-    if "device" in request.fixturenames and request.getfixturevalue(
-            "device").type == "cpu":
-        for name in _COMPILED_METHODS:
-            monkeypatch.setattr(
-                DFlashProposer, name,
-                torch._dynamo.disable(getattr(DFlashProposer, name)))
-
-
 def _make_proposer(draft_tp: int | None = 1,
                    target_tp: int = 1,
                    target_layer_ids: list[int] = (1, 2)) -> DFlashProposer:
