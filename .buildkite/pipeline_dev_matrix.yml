@@ -1,0 +1,110 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# One-knob-at-a-time matrix for the conc-32 gsm8k collapse on the per-layer
+# KV path (pre-#170 baseline). Each arm varies a single serving knob against
+# the repro_ctrl control. Trigger with
+# DEV_PIPELINE_FILE=.buildkite/pipeline_dev_matrix.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "PR170 matrix: repro_ctrl"
+    key: matrix_repro_ctrl
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh repro_ctrl
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "PR170 matrix: onehot_default"
+    key: matrix_onehot_default
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh onehot_default
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "PR170 matrix: sc_off"
+    key: matrix_sc_off
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh sc_off
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "PR170 matrix: no_ep"
+    key: matrix_no_ep
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh no_ep
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "PR170 matrix: flash_attn"
+    key: matrix_flash_attn
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh flash_attn
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "PR170 matrix: skip_padded"
+    key: matrix_skip_padded
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - bash .buildkite/scripts/run_in_docker.sh bash scripts/vllm/benchmarking/pr170_ab/run_matrix_arm.sh skip_padded
+    artifact_paths:
+      - "perf_eval_results/**/*"
