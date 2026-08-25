@@ -106,8 +106,9 @@ class StructuredDecodingManager:
 
         return (
             self.require_structured_out_cpu[:padded_num_reqs].to(
-                logits.device),
-            self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
+                logits.device, non_blocking=True),
+            self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device,
+                                                          non_blocking=True),
             arange,
         )
 
@@ -177,11 +178,13 @@ class StructuredDecodingManager:
 
         if target_logits is not None:
             require_target = self.require_structured_out_target_cpu[:padded_target_rows].to(
-                bonus_logits.device)
+                bonus_logits.device, non_blocking=True)
             target_bitmask = self.target_grammar_bitmask_cpu[:
                                                              padded_target_rows].to(
                                                                  bonus_logits.
-                                                                 device)
+                                                                 device,
+                                                                 non_blocking=
+                                                                 True)
         else:
             require_target = None
             target_bitmask = None
@@ -194,9 +197,9 @@ class StructuredDecodingManager:
             require_target,
             target_bitmask,
             self.require_structured_out_cpu[:padded_bonus_rows].to(
-                bonus_logits.device),
+                bonus_logits.device, non_blocking=True),
             self.grammar_bitmask_cpu[:padded_bonus_rows].to(
-                bonus_logits.device),
+                bonus_logits.device, non_blocking=True),
             arange,
         )
 
