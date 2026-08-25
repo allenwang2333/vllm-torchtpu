@@ -400,7 +400,7 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
     return device_tensor
 
 
-def relayout_rope_caches(model: torch.nn.Module) -> int:
+def relayout_rope_caches(model: torch.nn.Module):
     """Re-materialize every rope cache with a row-major device layout. """
     num_changed = 0
     for name, module in model.named_modules():
@@ -425,7 +425,7 @@ def relayout_rope_caches(model: torch.nn.Module) -> int:
     logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
-def relayout_hash_tables(model: torch.nn.Module) -> int:
+def relayout_hash_tables(model: torch.nn.Module):
     """Re-materialize every MOE hash-routing table row-major. """
     seen: set[int] = set()
     num_changed = 0
