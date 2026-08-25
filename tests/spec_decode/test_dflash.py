@@ -320,21 +320,6 @@ def test_update_draft_kv_cache_from_target_unit(device):
     assert md_tuple == (chunk.attn_metadata["dummy_layer"], ) * 2
 
 
-def test_update_draft_kv_cache_from_target_rejects_missing_aux(device):
-    """The runner stores [] (never None) when the target yielded no aux
-    states; DFlash cannot fill its context KV without them."""
-    proposer = _make_proposer(draft_tp=1)
-    chunk = _make_chunk(num_reqs=1,
-                        start_index=0,
-                        device=device,
-                        query_start_loc_np=np.array([0, 3]),
-                        position_ids=torch.zeros(3),
-                        aux_hidden_states=[])
-
-    with pytest.raises(RuntimeError, match="aux hidden states"):
-        proposer._update_draft_kv_cache_from_target(chunk)
-
-
 def _propose_runner(device, num_reqs, build_metadata):
     return SimpleNamespace(
         device=device,

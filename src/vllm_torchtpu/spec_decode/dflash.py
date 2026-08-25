@@ -1055,11 +1055,6 @@ class DFlashProposer:
         positions = F.pad(positions_unpadded,
                           (0, padded_len - positions_unpadded.shape[0]),
                           value=0)
-        # Bound by max_model_len: a request at the limit must not index RoPE
-        # past the cache or walk the kernel off its block-table row. Without
-        # this the draft forward halts at startup (E0200) on some cold starts.
-        # Padding slots keep a nonzero seq_len -- the RPA kernel is not
-        # exercised with kv_len == 0 -- so their writes land in the null block.
         positions = torch.clamp(positions, max=self._max_model_len - 1)
         seq_lens = torch.clamp(base_pos.squeeze(1) + block_size,
                                max=self._max_model_len)
@@ -1136,11 +1131,6 @@ class DFlashProposer:
         positions = F.pad(positions_unpadded,
                           (0, padded_len - positions_unpadded.shape[0]),
                           value=0)
-        # Bound by max_model_len: a request at the limit must not index RoPE
-        # past the cache or walk the kernel off its block-table row. Without
-        # this the draft forward halts at startup (E0200) on some cold starts.
-        # Padding slots keep a nonzero seq_len -- the RPA kernel is not
-        # exercised with kv_len == 0 -- so their writes land in the null block.
         positions = torch.clamp(positions, max=self._max_model_len - 1)
         seq_lens = torch.clamp(base_pos.squeeze(1) + block_size,
                                max=self._max_model_len)
