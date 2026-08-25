@@ -106,7 +106,7 @@ class DFlashProposer:
         # Keyed by num_tokens; constant inputs of one dummy draft forward,
         # see `_dummy_forward_inputs`.
         self._dummy_forward_input_cache: dict[int, tuple] = {}
-        # Keyed by the target chunk's padded request count; the all-zero
+        # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
 
@@ -306,8 +306,7 @@ class DFlashProposer:
             # request anchors on the prompt-chunk path.
             draft_lengths = chunk.draft_lengths
             if draft_lengths is None:
-                draft_lengths = self._zero_draft_lengths(
-                    query_start_loc_device.shape[0] - 1)
+                draft_lengths = self._zero_draft_lengths(num_reqs)
             input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_next_tokens(
                 next_tokens_device,
                 query_start_loc_device,
@@ -336,13 +335,18 @@ class DFlashProposer:
 
         return input_ids, positions, seq_lens
 
-    def _zero_draft_lengths(self, padded_num_reqs: int) -> torch.Tensor:
+    def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
         """All-zero `draft_lengths` for a chunk without spec metadata.
 
-        Shaped like the real tensor (the target chunk's padded request
-        count) so both steps share one compiled input-builder program, and
-        cached so a non-spec step allocates nothing.
+        Padded exactly like the real tensor (`get_spec_decode_metadata`
+        pads to the chunk's padded request count) so both steps share one
+        compiled input-builder program, and cached so a non-spec step
+        allocates nothing.
         """
+        from vllm_torchtpu.runner.tpu_runner import \
+            _get_padded_num_reqs_with_upper_limit
+        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.runner.max_num_reqs)
         zeros = self._zero_draft_lengths_cache.get(padded_num_reqs)
         if zeros is None:
             zeros = torch.zeros(padded_num_reqs,
@@ -491,18 +495,21 @@ class DFlashProposer:
             self._dp_dummy_forward()
 
         # 3. Drop each chunk's padding rows; [total_num_reqs, K].
-        draft_tokens = [
-            tokens[:chunk.num_reqs]
-            for tokens, chunk in zip(draft_tokens_per_chunk, chunks)
-        ]
-        if len(draft_tokens) == 1:
-            draft_tokens = draft_tokens[0]
-        else:
-            draft_tokens = torch.cat(draft_tokens, dim=0)
         if return_device:
-            return draft_tokens
-        # Sync path: one D2H for the whole batch.
-        return draft_tokens.cpu().tolist()
+            draft_tokens = [
+                tokens[:chunk.num_reqs]
+                for tokens, chunk in zip(draft_tokens_per_chunk, chunks)
+            ]
+            if len(draft_tokens) == 1:
+                return draft_tokens[0]
+            return torch.cat(draft_tokens, dim=0)
+
+        # Sync path: transfer each chunk's ENTIRE padded tensor and slice on
+        # the host, so the D2H keeps a static shape per bucket.
+        draft_tokens_list = []
+        for tokens, chunk in zip(draft_tokens_per_chunk, chunks):
+            draft_tokens_list.extend(tokens.cpu().tolist()[:chunk.num_reqs])
+        return draft_tokens_list
 
     @torch.no_grad()
     def precompile(self) -> None:
@@ -567,19 +574,12 @@ class DFlashProposer:
         Model-static, so resolved once.
         """
         if self._dummy_kv_hidden_spec is None:
-            self_model = self.draft_model.model
-            fc_layer = getattr(self_model, "fc", None)
-            if fc_layer is not None:
-                concat_width = fc_layer.weight.shape[1]
-            else:
-                concat_width = self.vllm_config.model_config.get_hidden_size()
-            num_aux = max(1, len(self._target_layer_ids))
-            assert concat_width % num_aux == 0, (
-                f"fc input width {concat_width} is not a multiple of the "
-                f"{num_aux} tagged target layers")
+            # `load_model` tags exactly `target_layer_ids` target layers, and
+            # each yields one [num_tokens, target_hidden] tensor.
+            target_hidden = self.vllm_config.model_config.get_hidden_size()
             self._dummy_kv_hidden_spec = (
-                [concat_width // num_aux] * num_aux,
-                self_model.embed_tokens.weight.dtype,
+                [target_hidden] * len(self._target_layer_ids),
+                self.draft_model.model.embed_tokens.weight.dtype,
             )
         return self._dummy_kv_hidden_spec
 
@@ -649,10 +649,12 @@ class DFlashProposer:
     ) -> None:
         """One KV-update pass on constant dummies.
 
-        `sync` blocks the host until the program is compiled and executed —
-        what `precompile` wants, and what the per-step lockstep replays must
-        NOT do: they run inside `propose` on the decode path, where a host
-        wait per padding chunk stalls every step.
+        The dummy's result is never consumed, so the deferred program is
+        always materialized and enqueued here (in emission order, which the
+        cross-rank collective pairing relies on). `sync` additionally waits
+        on the host — what `precompile` wants, and what the per-step
+        lockstep replays must NOT do: they run inside `propose` on the
+        decode path, where a host wait per padding chunk stalls every step.
         """
         runner = self.runner
         dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
@@ -664,8 +666,7 @@ class DFlashProposer:
                 dummy_hidden, dummy_positions,
                 tuple([dummy_attn_metadata] *
                       len(self.draft_model.model.layers)))
-            if sync:
-                synchronize_tensors(out)
+            synchronize_tensors(out, wait=sync)
 
     def _dummy_forward_inputs(
         self,
@@ -755,8 +756,7 @@ class DFlashProposer:
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                 input_ids, positions, self.block_size)
-            if sync:
-                synchronize_tensors(draft_tokens_chunk)
+            synchronize_tensors(draft_tokens_chunk, wait=sync)
 
     def _dp_lockstep_sharded(self) -> bool:
         """True when the draft emits cross-DP collectives under EP-DP

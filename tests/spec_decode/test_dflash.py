@@ -284,6 +284,7 @@ def test_prepare_dflash_inputs(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
+        max_num_reqs=8,
         _dp_lockstep_enabled=lambda: False,
     )
     chunk = _make_chunk(num_reqs=2,
@@ -480,6 +481,7 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
         num_tokens_paddings=[8, 16, 32],
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
+        max_num_reqs=8,
     )
     chunk = _make_chunk(num_reqs=1,
                         start_index=0,
