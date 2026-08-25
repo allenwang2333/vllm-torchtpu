@@ -15,6 +15,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    force_process_weights_after_loading,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -229,6 +232,7 @@ class DFlashProposer:
                 vllm_config=draft_vllm_config,
                 model_config=draft_model_config,
             )
+            force_process_weights_after_loading(self.draft_model)
 
     def _get_padded_len(self, target_len: int) -> int:
         for p in self.runner.num_tokens_paddings:

@@ -17,6 +17,9 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    force_process_weights_after_loading,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -688,6 +691,7 @@ class Eagle3Proposer:
                 vllm_config=self.draft_vllm_config,
                 model_config=draft_model_config,
             )
+            force_process_weights_after_loading(self.draft_model)
 
     def _validate_pcp_draft_model(self, draft_attn_layer_names: set[str]) -> None:
         """Validate draft KV-cache capabilities known only after model load."""
