@@ -111,7 +111,7 @@ class DFlashProposer:
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
 
     @property
-    def draft_block_size(self) -> int:
+    def block_size(self) -> int:
         """Tokens per request in a draft forward: 1 base + K mask slots."""
         return self.speculative_config.num_speculative_tokens + 1
 
@@ -220,7 +220,7 @@ class DFlashProposer:
         """
         runner = self.runner
         chunk_ctx = chunk.attn_ctx
-        block_size = self.draft_block_size
+        block_size = self.block_size
         # `num_tokens_padded` is a bucket of at least one full block.
         padded_num_reqs = num_tokens_padded // block_size
 
@@ -274,7 +274,7 @@ class DFlashProposer:
         """
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
-        block_size = self.draft_block_size
+        block_size = self.block_size
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
@@ -440,7 +440,7 @@ class DFlashProposer:
             raise RuntimeError(
                 "DFlash propose called but no draft chunks captured.")
 
-        block_size = self.draft_block_size
+        block_size = self.block_size
 
         # EP-DP lockstep: a rank whose step produced fewer chunks than the
         # DP-group max must pad each draft phase to the group's chunk count —
@@ -522,7 +522,7 @@ class DFlashProposer:
         logger.info("Precompiling DFlash draft model buckets...")
 
         runner = self.runner
-        block_size = self.draft_block_size
+        block_size = self.block_size
         # A most-model-len chunk holds up to num_reqs_most_model_len
         # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
         # coordinated bucket is sized from the DP-wide max chunk request
@@ -684,7 +684,7 @@ class DFlashProposer:
             return entry
 
         device = self.runner.device
-        block_size = self.draft_block_size
+        block_size = self.block_size
         num_reqs = num_tokens // block_size
         assert num_reqs >= 1, (
             f"dummy draft forward at {num_tokens} tokens < block {block_size}")
@@ -755,7 +755,7 @@ class DFlashProposer:
                 set_vllm_model_wrapper_context(mesh=self.runner.mesh),
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                input_ids, positions, self.draft_block_size)
+                input_ids, positions, self.block_size)
             synchronize_tensors(draft_tokens_chunk, wait=sync)
 
     def _dp_lockstep_sharded(self) -> bool:
@@ -769,7 +769,7 @@ class DFlashProposer:
         """Draft-forward token bucket every lockstep rank runs this step,
         from the DP-wide max per-chunk request count."""
         coordinated_reqs = max(1, self.runner._dp_step_max_reqs)
-        return self._get_padded_len(coordinated_reqs * self.draft_block_size)
+        return self._get_padded_len(coordinated_reqs * self.block_size)
 
     @torch.no_grad()
     def _dp_dummy_kv_update(self) -> None:
