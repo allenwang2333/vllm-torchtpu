@@ -20,11 +20,20 @@ standalone on a bare TPU pod.
 Correctness is checked, not assumed: every page size is fed the *same logical*
 K/V content, merely paged differently, so all page sizes must produce the same
 attention output. Page size 16 is the reference.
+
+Calibration. The harness is only useful if it lands near the 259 us/call the
+serving profile reports. The first version did not — it read 2826 us/call,
+because the outer ``jax.jit`` did not donate ``kv_cache`` and XLA therefore
+copied the whole 1.93 GiB cache on every call, adding ~1 ms of page-size
+independent HBM traffic. Compare ``us_per_call`` against 259 us before trusting
+any ratio this script prints; ``--profile-dir`` captures an xprof trace per arm
+so the remaining time can be attributed op by op.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.util
 import json
 import statistics
@@ -43,7 +52,12 @@ DEFAULT_NUM_SEQS = 64  # --max-num-seqs
 DEFAULT_KV_LEN = 8192  # steady-state context at ISL 8192
 DEFAULT_MAX_MODEL_LEN = 9216  # --max-model-len, sets pages_per_seq
 DEFAULT_NUM_Q_HEADS = 4  # 32 q heads / TP8
-DEFAULT_NUM_KV_HEADS = 2  # 4 kv heads / TP8
+# 4 kv heads at TP8: vLLM's get_num_kv_heads is max(1, 4 // 8) == 1, so each
+# rank holds one kv head and the head is replicated across ranks. Note this
+# does NOT halve the bytes the kernel moves: the fp8 cache layout pads to
+# align_to(num_kv_heads * 2, kv_packing) == align_to(2, 4) == 4 merged head
+# slots, so half of every DMA'd byte is padding at this config.
+DEFAULT_NUM_KV_HEADS = 1
 DEFAULT_HEAD_DIM = 128
 # 235066 pages x 16 tokens in the profiled run. Held constant across page sizes
 # so the HBM footprint and the page-scatter pattern stay comparable.
@@ -199,7 +213,13 @@ def _build_inputs(
 def _make_runner(kernel_mod, head_dim: int):
     sm_scale = head_dim**-0.5
 
-    @jax.jit
+    # kv_cache (argument 3) MUST be donated. The kernel's `pl.pallas_call`
+    # declares `input_output_aliases={7: 0, 9: 1}`, so it updates the cache in
+    # place; without donation at this outer boundary XLA has to materialize a
+    # copy of the whole ~1.93 GiB cache on every call. That copy is ~1 ms of
+    # pure HBM traffic, it is identical in every arm, and it flattens the
+    # page-size comparison this script exists to make.
+    @functools.partial(jax.jit, donate_argnums=(3, ))
     def run(queries, keys, values, kv_cache, kv_lens, page_indices, cu_q_lens,
             distribution):
         return kernel_mod.ragged_paged_attention(
@@ -217,18 +237,28 @@ def _make_runner(kernel_mod, head_dim: int):
     return run
 
 
-def _latencies(run, inputs: dict[str, jax.Array], *, warmups: int,
-               iterations: int) -> tuple[float, list[float], jax.Array]:
+def _latencies(
+    run,
+    inputs: dict[str, jax.Array],
+    *,
+    warmups: int,
+    iterations: int,
+    batch: int,
+    profile_dir: Path | None = None,
+) -> tuple[float, list[float], jax.Array]:
     """Time the kernel with every operand already resident on device.
 
-    ``ragged_paged_attention`` declares ``donate_argnames``, but it is called
-    here from inside an outer ``jax.jit``, where the donation degrades to an
-    intra-module aliasing hint — the outer function donates nothing, so q/k/v
-    survive and can be reused. The returned ``kv_cache`` is still threaded back
-    in so XLA can honour the in-place alias instead of copying ~2 GiB per call.
+    Two things keep the number honest at a target of a few hundred microseconds
+    per call:
 
-    Nothing is transferred host->device inside the timed region; at ~259 us per
-    call a single 100 KiB transfer would be a visible fraction of the result.
+    * Nothing is transferred host->device inside the timed region. A single
+      100 KiB transfer would be a visible fraction of the result.
+    * Each sample dispatches ``batch`` calls back to back and blocks once at
+      the end, so per-call host dispatch overhead is amortized instead of being
+      serialized with the device work. JAX dispatch is asynchronous, so the
+      calls queue up and the device stays fed.
+
+    The cache is threaded from call to call because ``run`` donates it.
     """
     kv_cache = inputs["kv_cache"]
     q = inputs["queries"]
@@ -237,27 +267,34 @@ def _latencies(run, inputs: dict[str, jax.Array], *, warmups: int,
     static = (inputs["kv_lens"], inputs["page_indices"], inputs["cu_q_lens"],
               inputs["distribution"])
 
-    def _one(cache):
-        out, new_cache = run(q, k, v, cache, *static)
+    def _chain(cache, n: int):
+        out = None
+        for _ in range(n):
+            out, cache = run(q, k, v, cache, *static)
         out.block_until_ready()
-        new_cache.block_until_ready()
-        return out, new_cache
+        cache.block_until_ready()
+        return out, cache
 
     start = time.perf_counter()
-    out, kv_cache = _one(kv_cache)
+    out, kv_cache = _chain(kv_cache, 1)
     first_ms = (time.perf_counter() - start) * 1e3
-    # Captured before the loop: the kernel writes new_k/new_v into the cache,
-    # which is idempotent across repeats, so any call's output would do.
+    # Writing new_k/new_v into the cache is idempotent across repeats, so any
+    # call's output would do; taking the first avoids holding a second copy.
     first_out = jax.device_get(out)
 
-    for _ in range(max(0, warmups - 1)):
-        out, kv_cache = _one(kv_cache)
+    if warmups > 1:
+        _, kv_cache = _chain(kv_cache, warmups - 1)
 
     samples: list[float] = []
     for _ in range(iterations):
         start = time.perf_counter()
-        out, kv_cache = _one(kv_cache)
-        samples.append((time.perf_counter() - start) * 1e3)
+        _, kv_cache = _chain(kv_cache, batch)
+        samples.append((time.perf_counter() - start) * 1e3 / batch)
+
+    if profile_dir is not None:
+        with jax.profiler.trace(str(profile_dir)):
+            _, kv_cache = _chain(kv_cache, batch)
+
     return first_ms, samples, first_out
 
 
@@ -301,6 +338,16 @@ def main() -> None:
     parser.add_argument("--total-slots", type=int, default=DEFAULT_TOTAL_SLOTS)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--batch",
+                        type=int,
+                        default=8,
+                        help="calls dispatched per timed sample; blocks once "
+                        "at the end so host dispatch is amortized")
+    parser.add_argument("--profile-dir",
+                        type=Path,
+                        default=None,
+                        help="if set, capture one xprof trace per page size "
+                        "into <dir>/p<page_size>/ after the timed loop")
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument("--skip-correctness", action="store_true")
     args = parser.parse_args()
@@ -329,6 +376,7 @@ def main() -> None:
             "page_sizes": page_sizes,
             "iterations": args.iterations,
             "warmups": args.warmups,
+            "batch": args.batch,
         },
     )
 
@@ -342,10 +390,20 @@ def main() -> None:
 
     run = _make_runner(kernel_mod, args.head_dim)
 
-    # Bytes of fp8 KV streamed per call: kv_len tokens x 2 (K and V) x
-    # num_kv_heads x head_dim x 1 byte, per sequence.
-    bytes_per_call = (args.num_seqs * args.kv_len * 2 * args.num_kv_heads *
-                      args.head_dim)
+    # Two byte counts, because at this config they differ by 2x and quoting
+    # only one is misleading.
+    #   payload: the K/V values the kernel actually needs.
+    #   physical: what it has to DMA, including the head-slot padding the fp8
+    #             cache layout forces (align_to(num_kv_heads*2, kv_packing)).
+    probe_shape = kernel_mod.get_kv_cache_shape(1, 1, args.num_kv_heads,
+                                                args.head_dim,
+                                                jnp.float8_e4m3fn)
+    _, _, x2_per_packing, kv_packing, padded_head_dim = probe_shape
+    physical_bytes_per_token = x2_per_packing * kv_packing * padded_head_dim
+    payload_bytes_per_call = (args.num_seqs * args.kv_len * 2 *
+                              args.num_kv_heads * args.head_dim)
+    physical_bytes_per_call = (args.num_seqs * args.kv_len *
+                               physical_bytes_per_token)
 
     reference_out = None
     results: dict[int, dict] = {}
@@ -365,21 +423,28 @@ def main() -> None:
             logical_v=logical_v,
             seed=args.seed,
         )
+        profile_dir = (None if args.profile_dir is None else args.profile_dir /
+                       f"p{page_size}")
         first_ms, samples, out = _latencies(run,
                                             inputs,
                                             warmups=args.warmups,
-                                            iterations=args.iterations)
+                                            iterations=args.iterations,
+                                            batch=args.batch,
+                                            profile_dir=profile_dir)
         stats = _stats(samples)
+        seconds = stats["median_ms"] * 1e-3
         record = {
             "event": "result",
             "page_size": page_size,
             "pages_per_seq": pages_per_seq,
             "dmas_per_call": args.num_seqs * cdiv(args.kv_len, page_size),
-            "page_bytes": page_size * 2 * args.num_kv_heads * args.head_dim,
+            "page_bytes": page_size * physical_bytes_per_token,
             "compile_and_first_call_ms": first_ms,
             "us_per_call": stats["median_ms"] * 1e3,
-            "achieved_gb_s": bytes_per_call / (stats["median_ms"] * 1e-3) /
-            1e9,
+            "achieved_gb_s": physical_bytes_per_call / seconds / 1e9,
+            "payload_gb_s": payload_bytes_per_call / seconds / 1e9,
+            "physical_bytes_per_call": physical_bytes_per_call,
+            "payload_bytes_per_call": payload_bytes_per_call,
             **stats,
         }
 
