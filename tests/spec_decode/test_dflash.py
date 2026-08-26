@@ -355,11 +355,9 @@ def test_update_draft_kv_cache_from_target_unit(device):
                         device=device,
                         query_start_loc_np=np.array([0, 3]),
                         position_ids=torch.zeros(3),
-                        aux_hidden_states=[
-                            torch.zeros((3, 32),
-                                        dtype=torch.float32,
-                                        device=device)
-                        ])
+                        aux_hidden_states=torch.zeros((3, 32),
+                                                      dtype=torch.float32,
+                                                      device=device))
 
     proposer._update_draft_kv_cache_from_target(chunk)
 
