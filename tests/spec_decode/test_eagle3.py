@@ -1315,12 +1315,16 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     )
     proposer.speculative_config.draft_model_config = SimpleNamespace(runner_type=None)
     loaded = {}
+    # A real nn.Module, not a bare object: _load_draft_model runs
+    # force_process_weights_after_loading over the loaded draft, which walks
+    # named_modules().
+    draft_model = torch.nn.Module()
 
     class _Loader:
         def load_model(self, *, vllm_config, model_config):
             loaded["vllm_config"] = vllm_config
             loaded["model_config"] = model_config
-            return object()
+            return draft_model
 
     wrapper_configs = []
 
@@ -1340,6 +1344,7 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
 
     proposer._load_draft_model()
 
+    assert proposer.draft_model is draft_model
     assert proposer.draft_vllm_config is loaded["vllm_config"]
     assert wrapper_configs == [proposer.draft_vllm_config]
 
