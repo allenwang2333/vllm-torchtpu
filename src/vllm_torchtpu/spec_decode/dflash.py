@@ -462,7 +462,7 @@ class DFlashProposer:
             self._dp_dummy_kv_update()
 
         # 2. Process each chunk
-        draft_tokens_per_chunk = []
+        draft_logits_per_chunk = []
         for i, chunk in enumerate(chunks):
             next_tokens_device = next_tokens_per_chunk[
                 i] if next_tokens_per_chunk else None
@@ -494,25 +494,28 @@ class DFlashProposer:
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size)
 
-            draft_tokens_per_chunk.append(draft_tokens_chunk)
+            draft_logits_per_chunk.append(draft_tokens_chunk)
         for _ in range(extra_chunks):
             self._dp_dummy_forward()
 
-        # 3. Drop each chunk's padding rows; [total_num_reqs, K].
+        # 3. Extract K tokens from logits
         if return_device:
-            draft_tokens = [
-                tokens[:chunk.num_reqs]
-                for tokens, chunk in zip(draft_tokens_per_chunk, chunks)
+            if len(draft_logits_per_chunk) == 1:
+                return draft_logits_per_chunk[0][:chunks[0].num_reqs]
+            sliced_chunks = [
+                logits if logits.shape[0] == chunk.num_reqs else
+                logits[:chunk.num_reqs]
+                for logits, chunk in zip(draft_logits_per_chunk, chunks)
             ]
-            if len(draft_tokens) == 1:
-                return draft_tokens[0]
-            return torch.cat(draft_tokens, dim=0)
+            return torch.cat(sliced_chunks, dim=0)
 
-        # Sync path: transfer each chunk's ENTIRE padded tensor and slice on
-        # the host, so the D2H keeps a static shape per bucket.
+        # Single synchronization and transfer to the host (return_device=False)
+        # We transfer the ENTIRE padded tensor to CPU to avoid dynamic-shape recompilations
         draft_tokens_list = []
-        for tokens, chunk in zip(draft_tokens_per_chunk, chunks):
-            draft_tokens_list.extend(tokens.cpu().tolist()[:chunk.num_reqs])
+        for logits, chunk in zip(draft_logits_per_chunk, chunks):
+            logits_host = logits.cpu().tolist()
+            draft_tokens_list.extend(logits_host[:chunk.num_reqs])
+
         return draft_tokens_list
 
     @torch.no_grad()
