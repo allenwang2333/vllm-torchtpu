@@ -83,7 +83,7 @@ def _write_jsonl(path: Path, record: dict) -> None:
         stream.write(line + "\n")
 
 
-def _tp_parity() -> dict[str, float | bool]:
+def _tp_parity(onehot_threshold: int) -> dict[str, float | bool]:
     """Check that two MXFP4 width shards reconstruct a flat MoE output."""
     num_tokens = 4
     hidden_size = 512
@@ -136,7 +136,7 @@ def _tp_parity() -> dict[str, float | bool]:
             activation="silu",
             use_ep=True,
             use_sparse_core=True,
-            onehot_moe_permute_threshold=0,
+            onehot_moe_permute_threshold=onehot_threshold,
         )
 
     flat = run(w1, w2, w1_scale, w2_scale)
@@ -245,7 +245,7 @@ def _routing_inputs(*, layout: Layout, route_count: int, num_tokens: int,
 def _benchmark_layout(layout: Layout, *, route_counts: list[int],
                       hidden_size: int, block_size: int, topk: int,
                       num_tokens: int, warmups: int, iterations: int,
-                      seed: int) -> list[dict]:
+                      onehot_threshold: int, seed: int) -> list[dict]:
     w1, w2, w1_scale, w2_scale = _production_weights(
         layout, hidden_size=hidden_size, block_size=block_size, seed=seed)
     records = []
@@ -275,7 +275,7 @@ def _benchmark_layout(layout: Layout, *, route_counts: list[int],
                 activation="silu",
                 use_ep=True,
                 use_sparse_core=True,
-                onehot_moe_permute_threshold=0,
+                onehot_moe_permute_threshold=onehot_threshold,
                 skip_padded_tokens=True,
             )
 
@@ -297,6 +297,7 @@ def _benchmark_layout(layout: Layout, *, route_counts: list[int],
             "event": "kernel_result",
             "layout": asdict(layout),
             "route_count": route_count,
+            "onehot_threshold": onehot_threshold,
             "compile_and_first_ms": compile_and_first_ms,
             "finite": bool(np.isfinite(result_np).all()),
             "padded_rows_zero": bool(np.count_nonzero(result_np[1:]) == 0),
@@ -313,6 +314,7 @@ def main() -> None:
     parser.add_argument("--num-tokens", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=3584)
     parser.add_argument("--mxfp4-block-size", type=int, default=32)
+    parser.add_argument("--onehot-threshold", type=int, default=0)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=20260826)
@@ -323,6 +325,8 @@ def main() -> None:
         raise ValueError("every route count must be <= --topk")
     if args.num_tokens < 1:
         raise ValueError("--num-tokens must be positive")
+    if args.onehot_threshold < 0:
+        raise ValueError("--onehot-threshold must be non-negative")
     if args.hidden_size % args.mxfp4_block_size:
         raise ValueError("hidden size must be divisible by MXFP4 block size")
     for layout in (FLAT, HIERARCHICAL):
@@ -345,12 +349,12 @@ def main() -> None:
             "valid_tokens": 1,
             "hidden_size": args.hidden_size,
             "mxfp4_block_size": args.mxfp4_block_size,
-            "onehot_threshold": 0,
+            "onehot_threshold": args.onehot_threshold,
             "ragged_gather_reduce_version": "v2",
         },
     )
 
-    parity = _tp_parity()
+    parity = _tp_parity(args.onehot_threshold)
     _write_jsonl(args.output, {"event": "tp_parity", **parity})
     if not parity["finite"] or not parity["allclose"]:
         raise RuntimeError(f"TP=2 parity failed: {parity}")
@@ -365,6 +369,7 @@ def main() -> None:
             num_tokens=args.num_tokens,
             warmups=args.warmups,
             iterations=args.iterations,
+            onehot_threshold=args.onehot_threshold,
             seed=args.seed + layout_index * 1000,
         )
         for record in records:
