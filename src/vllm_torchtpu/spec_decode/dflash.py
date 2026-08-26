@@ -102,7 +102,6 @@ class DFlashProposer:
         self._dummy_kv_input_cache: dict[tuple,
                                          tuple[list[torch.Tensor],
                                                "AttentionMetadata"]] = {}
-        self._dummy_kv_hidden_spec: tuple[list[int], torch.dtype] | None = None
         # Keyed by num_tokens; constant inputs of one dummy draft forward,
         # see `_dummy_forward_inputs`.
         self._dummy_forward_input_cache: dict[int, tuple] = {}
@@ -571,17 +570,12 @@ class DFlashProposer:
         tagged target layer, which the compiled program concatenates; the
         dummies must have the same list length and widths or they trace a
         different program and the real one compiles live on the first step.
-        Model-static, so resolved once.
         """
-        if self._dummy_kv_hidden_spec is None:
-            # `load_model` tags exactly `target_layer_ids` target layers, and
-            # each yields one [num_tokens, target_hidden] tensor.
-            target_hidden = self.vllm_config.model_config.get_hidden_size()
-            self._dummy_kv_hidden_spec = (
-                [target_hidden] * len(self._target_layer_ids),
-                self.draft_model.model.embed_tokens.weight.dtype,
-            )
-        return self._dummy_kv_hidden_spec
+        # `load_model` tags exactly `target_layer_ids` target layers, and
+        # each yields one [num_tokens, target_hidden] tensor.
+        target_hidden = self.vllm_config.model_config.get_hidden_size()
+        return ([target_hidden] * len(self._target_layer_ids),
+                self.draft_model.model.embed_tokens.weight.dtype)
 
     def _dummy_kv_update_inputs(
         self,
