@@ -283,7 +283,7 @@ class DFlashProposer:
         total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
-        if self.runner._dp_lockstep_enabled():
+        if self._dp_lockstep_sharded():
             # EP-DP lockstep: every rank must emit identical collective
             # shapes, and num_reqs is rank-local. Pad to the step's DP-wide
             # max per-chunk request count, coordinated by the same
@@ -446,7 +446,7 @@ class DFlashProposer:
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
         extra_chunks = 0
-        if runner._dp_lockstep_enabled():
+        if self._dp_lockstep_sharded():
             extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
@@ -727,13 +727,27 @@ class DFlashProposer:
                                   use_max_model_len=True,
                                   sync=False)
 
+    def _dp_lockstep_sharded(self) -> bool:
+        """True when the draft emits cross-DP collectives under EP-DP
+        lockstep: it is TP-sharded, or it carries expert-parallel MoE
+        layers. A replicated, MoE-free draft is entirely rank-local and
+        takes no part in the lockstep pairing (as in Eagle3Proposer)."""
+        if not self.runner._dp_lockstep_enabled():
+            return False
+        if not self._draft_replicated:
+            return True
+        from vllm.model_executor.models.interfaces import \
+            is_mixture_of_experts
+        return self.draft_model is not None and bool(
+            is_mixture_of_experts(self.draft_model))
+
     @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's draft collectives on an idle/padding rank
         for `num_chunks` padding chunks (EP-DP lockstep)."""
         if num_chunks <= 0 or self.draft_model is None:
             return
-        if not self.runner._dp_lockstep_enabled():
+        if not self._dp_lockstep_sharded():
             return
         # Collectives pair across ranks by emission order, and propose()
         # emits ALL KV-updates before ALL draft forwards, so the replay

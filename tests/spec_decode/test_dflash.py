@@ -453,7 +453,7 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
 
 
 def test_dp_lockstep_run_dummy_draft():
-    proposer = _make_proposer(draft_tp=1)
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(
         _dp_lockstep_enabled=lambda: True,
@@ -471,7 +471,7 @@ def test_dp_lockstep_run_dummy_draft():
 
 
 def test_prepare_dflash_inputs_dp_lockstep(device):
-    proposer = _make_proposer(draft_tp=1)
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
     proposer.runner = SimpleNamespace(
