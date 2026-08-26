@@ -29,9 +29,36 @@ import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, TPU_8I_MULTIHOST_TOPOLOGY_MAP,
-    TpuPlatform, _validate_phased_profiling_config, get_tpu_multihost_topology)
+    TpuPlatform, _validate_phased_profiling_config,
+    _validate_sequence_parallel_config, get_tpu_multihost_topology)
 from vllm_torchtpu.worker.tpu_worker import (DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
                                              _debug_tpu_local_rank_offset)
+
+
+def _sequence_parallel_config(architecture: str):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(),
+        additional_config={"sequence_parallel_size": 4},
+        model_config=SimpleNamespace(
+            architecture=architecture,
+            hf_config=SimpleNamespace(architectures=[architecture]),
+        ),
+    )
+
+
+@pytest.mark.parametrize("architecture", [
+    "KimiLinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
+])
+def test_sequence_parallel_validation_accepts_adapted_models(architecture):
+    assert _validate_sequence_parallel_config(
+        _sequence_parallel_config(architecture)) == 4
+
+
+def test_sequence_parallel_validation_rejects_unadapted_models():
+    with pytest.raises(ValueError, match="model-specific TPU adapter"):
+        _validate_sequence_parallel_config(
+            _sequence_parallel_config("DeepseekV4ForCausalLM"))
 
 
 def test_pcp_v2_validation_skips_gpu_only_checks(monkeypatch):
