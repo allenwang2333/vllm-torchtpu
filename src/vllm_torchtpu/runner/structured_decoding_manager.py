@@ -33,6 +33,12 @@ class StructuredDecodingManager:
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
         self.device = getattr(runner, "device", "cpu")
+        self.device_all_true_require = torch.ones((runner.max_num_reqs, 1),
+                                                  dtype=torch.bool,
+                                                  device=self.device)
+        self.device_all_false_require = torch.zeros((runner.max_num_reqs, 1),
+                                                    dtype=torch.bool,
+                                                    device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -78,10 +84,6 @@ class StructuredDecodingManager:
         padded_num_reqs = logits.shape[0]
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
-        # Reset only the rows this chunk will read.
-        self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
-        self.require_structured_out_cpu[:padded_num_reqs].zero_()
-
         bitmask = grammar_output.grammar_bitmask
         local_indices = []
         mask_rows = []
@@ -93,10 +95,39 @@ class StructuredDecodingManager:
                 local_indices.append(batch_index - cur_start_idx)
                 mask_rows.append(mask_row)
 
-        if local_indices:
+        # Fast path 1: No structured requests in this chunk.
+        if not local_indices:
+            return (
+                self.device_all_false_require[:padded_num_reqs],
+                self.grammar_bitmask_cpu[:padded_num_reqs].to(
+                    logits.device, non_blocking=True),
+            )
+
+        num_local = len(local_indices)
+
+        # Fast path 2: Entire batch is contiguous structured requests (0..padded_num_reqs-1).
+        # Direct contiguous slice copy to pinned host buffer ensures true asynchronous PCIe DMA transfer.
+        if (num_local == padded_num_reqs and local_indices[0] == 0
+                and local_indices[-1] == padded_num_reqs - 1):
+            self.grammar_bitmask_cpu[:padded_num_reqs].copy_(
+                torch.from_numpy(bitmask[:padded_num_reqs]))
+            return (
+                self.device_all_true_require[:padded_num_reqs],
+                self.grammar_bitmask_cpu[:padded_num_reqs].to(
+                    logits.device, non_blocking=True),
+            )
+
+        # Standard path: Mixed batch (some structured, some non-structured).
+        self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
+        self.require_structured_out_cpu[:padded_num_reqs].zero_()
+
+        if num_local == 1:
+            self.grammar_bitmask_cpu[local_indices[0]].copy_(
+                torch.from_numpy(bitmask[mask_rows[0]]))
+        else:
             self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
                 bitmask[mask_rows])
-            self.require_structured_out_cpu[local_indices] = True
+        self.require_structured_out_cpu[local_indices] = True
 
         return (
             self.require_structured_out_cpu[:padded_num_reqs].to(
