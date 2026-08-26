@@ -119,6 +119,7 @@ def _mla_ragged_paged_attention_kernel(
     mask_value: float,
     bkv_p: int,
     bq_sz: int,
+    analytic_mask: bool,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -149,10 +150,29 @@ def _mla_ragged_paged_attention_kernel(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
 
+    def causal_mask(bq_idx, bkv_idx):
+        """Analytic replacement for the CSA mask. True where masked out.
+
+        Valid only when every token has at most `topk` causal candidates: the
+        indexer scores non-causal and past-`kv_len` positions as -inf, takes an
+        exact top-k, and maps -inf back to -1, so with `pos + 1 <= topk` its
+        selection is exactly `[0, pos]` and the CSA bitmap degenerates to the
+        causal mask. The caller guarantees that with `max_kv_len <= topk`.
+        """
+        shape = (bq_sz, 1, bkv_sz)
+        # Absolute position of the query token in row `t` of this bq block:
+        # the sequence's KV minus this step's chunk, plus the row's offset.
+        q_pos = (kv_len - q_len + bq_idx * bq_sz +
+                 lax.broadcasted_iota(jnp.int32, shape, 0))
+        k_pos = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, shape, 2)
+        return k_pos > q_pos
+
     def flash_attention(
         q,  # [bq_sz * num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_x2_ref
         *,
+        bq_idx,
+        bkv_idx,
         bq_mask_in,
     ):
         assert len(q.shape) == 2
@@ -170,8 +190,11 @@ def _mla_ragged_paged_attention_kernel(
         if k_scale != 1.0:
             s *= k_scale
 
-        mask = ~(bq_mask_in[:, None, :].astype(jnp.bool_)
-                 )  # (bq_sz, 1, bkv_sz)
+        if analytic_mask:
+            mask = causal_mask(bq_idx, bkv_idx)  # (bq_sz, 1, bkv_sz)
+        else:
+            mask = ~(bq_mask_in[:, None, :].astype(jnp.bool_)
+                     )  # (bq_sz, 1, bkv_sz)
         s_3d = s.reshape(bq_sz, num_q_heads, bkv_sz)
         s_3d = jnp.where(mask, mask_value, s_3d)
         s = s_3d.reshape(s.shape)
@@ -304,6 +327,8 @@ def _mla_ragged_paged_attention_kernel(
         )
 
     def _fetch_mask(seq_idx, bq_idx, bkv_idx, mask_sem_idx, *, wait=False):
+        if analytic_mask:
+            return
         sem = sems.at[3, mask_sem_idx]
         vmem_ref = mask_hbm_x2_ref.at[mask_sem_idx]
 
@@ -455,7 +480,8 @@ def _mla_ragged_paged_attention_kernel(
 
                 # Wait for cur bkv
                 wait_fetch_bkv(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
-                bq_mask_in = mask_hbm_x2_ref[bkv_sem_idx, ...][:bq_sz, 0, :]
+                bq_mask_in = (None if analytic_mask else
+                              mask_hbm_x2_ref[bkv_sem_idx, ...][:bq_sz, 0, :])
 
                 # `load_bkv` zeroes rows past `kv_len` so that bytes belonging
                 # to another cache overlaid on the same tensor cannot decode to
@@ -467,6 +493,8 @@ def _mla_ragged_paged_attention_kernel(
                 flash_attention(
                     bq,
                     bkv,
+                    bq_idx=bq_idx,
+                    bkv_idx=bkv_idx,
                     bq_mask_in=bq_mask_in,
                 )
 
@@ -553,6 +581,7 @@ def prepare_outputs(
         "sm_scale",
         "k_scale",
         "mask_value",
+        "max_kv_len",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -573,6 +602,7 @@ def masked_dense_ragged_paged_attention(
     k_scale: float = 1.0,
     mask_value: float | None = None,
     # Kernel optimization params.
+    max_kv_len: int | None = None,
     chunk_prefill_size: int | None = None,
     # Kernel tuning params for decode, prefill, and mixed cases.
     # If passed in as int, all cases are the same.
@@ -612,7 +642,15 @@ def masked_dense_ragged_paged_attention(
       sm_scale: softmax scale applied to Q@K^T.
       k_scale: per-tensor dequantization scale for the fp8 caches, applied to
         both the QK and the PV product.
-      mask_value: score written where the CSA mask is 0.
+      mask_value: score written where the mask excludes a KV position.
+      max_kv_len: upper bound on every sequence's `kv_len` in this call.
+        Defaults to the full page-table stride. When it is at most
+        `topk_indices.shape[-1]`, the indexer necessarily selected every
+        causal position, so the CSA mask degenerates to the causal mask: the
+        kernel then computes it from `lax.broadcasted_iota` and neither
+        builds nor reads the materialized bitmap. The caller must guarantee
+        the bound -- a longer sequence would silently attend to KV rows the
+        indexer did not select.
       chunk_prefill_size: static query length for the prefill-only segment. If
         None that segment is not run, which is correct only when
         `distribution[0] == distribution[1]`.
@@ -662,11 +700,23 @@ def masked_dense_ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-    max_kv_len = pages_per_seq * page_size
+    page_table_span = pages_per_seq * page_size
+    if max_kv_len is None:
+        max_kv_len = page_table_span
+    assert 0 < max_kv_len <= page_table_span, (
+        f"max_kv_len={max_kv_len} must be within the page-table stride "
+        f"{page_table_span}")
 
     assert topk_indices is not None, (
         "topk_indices must be provided for masked dense CSA")
-    mask_hbm = csa_mask.generate_mask_sc(topk_indices, max_kv_len)[:, None, :]
+    analytic_mask = max_kv_len <= topk_indices.shape[-1]
+    if analytic_mask:
+        # Nothing reads it; a minimal operand keeps the pallas_call's operand
+        # layout identical in both modes.
+        mask_hbm = jnp.zeros((1, 1, 1), jnp.int32)
+    else:
+        mask_hbm = csa_mask.generate_mask_sc(topk_indices, max_kv_len)[:,
+                                                                       None, :]
 
     _, num_q_heads, _ = q.shape
 
@@ -687,11 +737,14 @@ def masked_dense_ragged_paged_attention(
     ):
         bkv_p = num_kv_pages_per_block
         bkv_sz = bkv_p * page_size
-        assert mask_hbm.shape[-1] % bkv_sz == 0, (
-            f"mask width {mask_hbm.shape[-1]} must be a multiple of the "
-            f"streamed block size {bkv_sz}")
-        mask_hbm_reshaped = mask_hbm.reshape(
-            (mask_hbm.shape[0], mask_hbm.shape[-1] // bkv_sz, bkv_sz))
+        if analytic_mask:
+            mask_hbm_reshaped = mask_hbm
+        else:
+            assert mask_hbm.shape[-1] % bkv_sz == 0, (
+                f"mask width {mask_hbm.shape[-1]} must be a multiple of the "
+                f"streamed block size {bkv_sz}")
+            mask_hbm_reshaped = mask_hbm.reshape(
+                (mask_hbm.shape[0], mask_hbm.shape[-1] // bkv_sz, bkv_sz))
         if static_q_len is not None:
             bq_sz = min(num_queries_per_block, static_q_len)
         else:
@@ -722,8 +775,11 @@ def masked_dense_ragged_paged_attention(
 
         bo_double_buf = bq_double_buf
 
+        # In analytic mode the mask lives in registers, so the double buffer
+        # shrinks to a placeholder -- at 64 heads the int32 buffer is 256 KiB
+        # of VMEM, which is what caps `num_queries_per_block` at 32.
         mask_hbm_double_buf = pltpu.VMEM(
-            (2, bq_sz, 1, bkv_sz),
+            (2, 1, 1, 128) if analytic_mask else (2, bq_sz, 1, bkv_sz),
             mask_hbm_reshaped.dtype,
         )
 
@@ -775,6 +831,7 @@ def masked_dense_ragged_paged_attention(
                     mask_value=mask_value,
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
+                    analytic_mask=analytic_mask,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),

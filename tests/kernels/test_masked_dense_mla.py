@@ -72,7 +72,8 @@ def _dequantize(x: jax.Array, k_scale: float) -> np.ndarray:
     return np.asarray(x.astype(jnp.float32)) * k_scale
 
 
-class MaskedDenseMlaTest(parameterized.TestCase):
+class MaskedDenseTestBase(parameterized.TestCase):
+    """Cache construction, reference attention, and the kernel call."""
 
     def setUp(self):
         super().setUp()
@@ -184,7 +185,8 @@ class MaskedDenseMlaTest(parameterized.TestCase):
              distribution,
              k_scale,
              bkv_p=1,
-             bq_sz=8):
+             bq_sz=8,
+             max_kv_len=None):
         return masked_dense.masked_dense_ragged_paged_attention(
             q,
             caches[0],
@@ -196,6 +198,7 @@ class MaskedDenseMlaTest(parameterized.TestCase):
             jnp.asarray(distribution, jnp.int32),
             sm_scale=self.sm_scale,
             k_scale=k_scale,
+            max_kv_len=max_kv_len,
             num_kv_pages_per_block=bkv_p,
             num_queries_per_block=bq_sz,
         )
@@ -206,7 +209,9 @@ class MaskedDenseMlaTest(parameterized.TestCase):
         # the sparse kernel's own functional test.
         np.testing.assert_allclose(got, expected[valid], rtol=2e-2, atol=2e-2)
 
-    # ---------------------------------------------------------------- cases
+
+class MaskedDenseMlaTest(MaskedDenseTestBase):
+    """Correctness of the kernel against a float32 numpy reference."""
 
     @parameterized.named_parameters(
         # topk = 64. `kv_len` below / at / above topk, and on / off a
@@ -400,6 +405,104 @@ class MaskedDenseMlaTest(parameterized.TestCase):
         # Different summation orders over fp32 accumulators; the two are the
         # same quantity, not the same bits.
         np.testing.assert_allclose(dense, sparse, rtol=2e-2, atol=2e-2)
+
+
+class AnalyticCausalMaskTest(MaskedDenseTestBase):
+    """`max_kv_len <= topk`: the CSA mask degenerates to the causal mask.
+
+    `streamindex_topk` scores every non-causal or past-`kv_len` position as
+    `-inf`, takes an exact top-k, and maps `-inf` back to `-1`. So a token
+    with at most `topk` causal candidates has all of them selected, and the
+    kernel can compute the mask from `lax.broadcasted_iota` instead of
+    reading a materialized bitmap -- skipping `generate_mask_sc` entirely.
+
+    These tests build genuinely causal `topk_indices`, which is what the
+    indexer emits in that regime, and check the analytic kernel against both
+    a numpy reference and the bitmap path on identical inputs.
+    """
+
+    def _causal_topk(self, num_tokens, seq_of_token, seq_lens, q_lens,
+                     cu_q_lens, topk):
+        """What the indexer emits when every token has <= topk candidates."""
+        rows = np.full((num_tokens, topk), -1, np.int32)
+        for s, q_len in enumerate(q_lens):
+            base = seq_lens[s] - q_len
+            for local in range(q_len):
+                pos = base + local
+                assert pos + 1 <= topk
+                rows[cu_q_lens[s] + local, :pos + 1] = np.arange(pos + 1)
+        return rows
+
+    @parameterized.named_parameters(
+        dict(testcase_name="prefill", q_lens=[48], seq_lens=[48],
+             num_decode=0),
+        dict(testcase_name="chunked_prefill",
+             q_lens=[24],
+             seq_lens=[100],
+             num_decode=0),
+        dict(testcase_name="decode",
+             q_lens=[1, 1],
+             seq_lens=[97, 128],
+             num_decode=2),
+        dict(testcase_name="mixed",
+             q_lens=[1, 1, 30],
+             seq_lens=[64, 90, 120],
+             num_decode=2),
+    )
+    def test_analytic_matches_materialized_mask(self, q_lens, seq_lens,
+                                                num_decode):
+        num_seqs = len(q_lens)
+        total = sum(q_lens)
+        num_tokens = math.ceil(total / TOKEN_PAD) * TOKEN_PAD
+        cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        topk = MAX_KV_LEN  # >= every sequence's kv_len, so analytic applies
+
+        block_tables = self._block_tables(num_seqs)
+        caches, kv_c_deq, k_pe_deq = self._fill_cache(seq_lens, block_tables,
+                                                      1.0)
+        seq_of_token = np.full(num_tokens, -1, np.int32)
+        for s, q_len in enumerate(q_lens):
+            seq_of_token[cu_q_lens[s]:cu_q_lens[s] + q_len] = s
+        topk_rows = self._causal_topk(num_tokens, seq_of_token, seq_lens,
+                                      q_lens, cu_q_lens, topk)
+
+        q = self._random_queries(num_tokens)
+        args = (q, caches, seq_lens, topk_rows, block_tables, cu_q_lens,
+                [num_decode, num_decode, num_seqs], 1.0)
+        # max_kv_len == MAX_KV_LEN <= topk -> analytic; the default
+        # (page-table stride) is also MAX_KV_LEN here, so force the bitmap
+        # path with a topk narrower than the stride instead.
+        analytic = self._run(*args, max_kv_len=MAX_KV_LEN)
+
+        expected, valid = self._reference(q, topk_rows, seq_of_token, kv_c_deq,
+                                          k_pe_deq, 1.0)
+        self._check(analytic, expected, valid)
+
+        # Same batch through the materialized CSA mask: pad topk_indices to a
+        # width above max_kv_len so `analytic_mask` is False.
+        wide = np.full((num_tokens, MAX_KV_LEN // 2), -1, np.int32)
+        wide[:, :topk_rows.shape[1]] = topk_rows[:, :MAX_KV_LEN // 2]
+        bitmap = self._run(q, caches, seq_lens, wide, block_tables, cu_q_lens,
+                           [num_decode, num_decode, num_seqs], 1.0)
+        np.testing.assert_allclose(np.asarray(analytic.astype(jnp.float32)),
+                                   np.asarray(bitmap.astype(jnp.float32)),
+                                   rtol=1e-6,
+                                   atol=1e-6)
+
+    def test_max_kv_len_beyond_page_table_is_rejected(self):
+        q_lens, seq_lens = [8], [32]
+        block_tables = self._block_tables(1)
+        caches, _, _ = self._fill_cache(seq_lens, block_tables, 1.0)
+        topk_rows = np.zeros((TOKEN_PAD, 64), np.int32)
+        q = self._random_queries(TOKEN_PAD)
+        with self.assertRaises(AssertionError):
+            self._run(q,
+                      caches,
+                      seq_lens,
+                      topk_rows,
+                      block_tables, [0, q_lens[0]], [0, 0, 1],
+                      1.0,
+                      max_kv_len=MAX_KV_LEN * 2)
 
 
 if __name__ == "__main__":
