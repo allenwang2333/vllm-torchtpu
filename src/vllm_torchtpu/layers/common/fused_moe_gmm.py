@@ -170,14 +170,9 @@ def prepare_routed_gmm_inputs(
     group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
-            # Use one-hot matmul for permutation, which can be faster
-            # for small batch size
-            onehot = jax.nn.one_hot(token_indices_sorted,
-                                    num_tokens_local,
-                                    dtype=hidden_states_local.dtype)
-            x = onehot @ hidden_states_local
-        else:
+        # A/B: one-hot permute branch (introduced by #313) removed; the
+        # SparseCore gather path below is the pre-#313 behavior.
+        if True:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
@@ -251,25 +246,8 @@ def moe_gmm(
                            preferred_element_type=x.dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
-            # Use onehot + matmul for unpermutation, which can be faster
-            # for small batch size.
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(revert_indices,
-                                    argsort_revert_indices.size,
-                                    dtype=gmm2_res.dtype)
-            combine = (onehot * topk_weights[..., None] *
-                       valid_mask[..., None]).sum(axis=1)
-            return (combine @ gmm2_res).astype(x.dtype)
+        # A/B: one-hot combine branch (introduced by #313) removed;
+        # the SparseCore reduce path below is the pre-#313 behavior.
         return ragged_gather_reduce_v2(
             gmm2_res,
             argsort_revert_indices,
