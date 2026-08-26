@@ -1,0 +1,342 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Numerical correctness of RPA v3 at the KV page sizes `get_page_size` picks.
+
+Why this exists. `PallasAttentionBackend.get_page_size` used to hard-return 16
+for any `max_model_len > 8192`; removing that guard moves the serving config
+for Qwen3-Coder-30B-A3B-Instruct-FP8 (max_model_len 9216) from page size 16 to
+256, which the operator sweep in `benchmark_rpa_decode_page_size.py` measures at
+1.87x faster. A speedup is not a result until the kernel is shown to still be
+correct at the new page size, and `tests/kernels/test_rpa_skip_kv_update.py`
+hardcodes `page_size = 16` everywhere -- nothing in the tree exercises RPA v3 at
+256.
+
+What it checks, per page size, against `ref_ragged_paged_attention` (the pure
+JAX reference that ships beside the Pallas kernel):
+
+  1. Attention output matches the reference.
+  2. The KV cache *after* the call matches the reference's, which is the check
+     that the kernel's KV writer puts the new tokens at the right page and
+     offset -- the part of the paging path a same-page-size output comparison
+     cannot see.
+  3. A negative control per case: perturbing one input must move the output by
+     much more than the tolerance, so a silently-zeroed kernel cannot pass.
+
+Cases cover the three `distribution` regimes the serving path produces: pure
+decode, chunked prefill with history, and a batch mixing both.
+
+Only the JAX kernel is imported, not the vLLM serving stack, so this runs on a
+bare TPU pod. The `get_page_size` mapping itself is covered by
+`tests/platforms/test_tpu_platform.py`; this file covers the kernel underneath
+it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+# The serving shape: 32 q heads / TP8, and vLLM's get_num_kv_heads gives
+# max(1, 4 // 8) == 1 kv head per rank.
+NUM_Q_HEADS = 4
+NUM_KV_HEADS = 1
+HEAD_DIM = 128
+MAX_MODEL_LEN = 9216  # what makes the old code return 16 and the new one 256
+
+# bf16 output of a length-8192 softmax-weighted sum: the reference accumulates
+# in a different order than the kernel's blocked flash pass, so exact equality
+# is not the bar. 5e-2 is ~4x bf16's 2^-8 relative step at these magnitudes and
+# is still 20x below what the negative control moves the output by.
+ATOL = 5e-2
+CONTROL_MIN_DIFF = 1.0
+
+
+def _load_kernel(repo_root: Path):
+    """Import the v3 RPA kernel without pulling in the vLLM serving stack."""
+    src = repo_root / "src"
+    rpa_dir = src / "vllm_torchtpu" / "kernels" / "ragged_paged_attention" / "v3"
+    package_paths = {
+        "vllm_torchtpu": src / "vllm_torchtpu",
+        "vllm_torchtpu.kernels": src / "vllm_torchtpu" / "kernels",
+        "vllm_torchtpu.kernels.ragged_paged_attention":
+        src / "vllm_torchtpu" / "kernels" / "ragged_paged_attention",
+        "vllm_torchtpu.kernels.ragged_paged_attention.v3": rpa_dir,
+    }
+    for name, path in package_paths.items():
+        module = types.ModuleType(name)
+        module.__path__ = [str(path)]
+        sys.modules[name] = module
+
+    def _load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load {name} from {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    _load("vllm_torchtpu.kernels.ragged_paged_attention.v3.util",
+          rpa_dir / "util.py")
+    _load(
+        "vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes",
+        rpa_dir / "tuned_block_sizes.py",
+    )
+    return _load("vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel",
+                 rpa_dir / "kernel.py")
+
+
+def cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+# (name, per-sequence (q_len, kv_len), distribution). Sequences must be ordered
+# decode-only, then chunked-prefill-only, then mixed -- `distribution` is read
+# as index boundaries into the batch, not as counts of a sorted list.
+CASES = [
+    ("decode", [(1, 8192)] * 8, (8, 8, 8)),
+    ("prefill_fresh", [(1024, 1024)] * 4, (0, 0, 4)),
+    ("prefill_with_history", [(512, 8192)] * 4, (0, 0, 4)),
+    ("mixed_batch", [(1, 8192)] * 4 + [(256, 4096)] * 2, (4, 4, 6)),
+]
+
+
+def _logical_kv(seq_shapes, seed: int):
+    """Per-sequence K/V for every position, page-size independent and float32.
+
+    float32 so both page sizes quantize from bit-identical source values; if
+    each arm rounded its own way the cross-arm comparison would measure the
+    rounding, not the paging.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    for _, kv_len in seq_shapes:
+        shape = (kv_len, NUM_KV_HEADS, HEAD_DIM)
+        out.append((
+            (rng.standard_normal(shape) * 0.5).astype(np.float32),
+            (rng.standard_normal(shape) * 0.5).astype(np.float32),
+        ))
+    return out
+
+
+def _build(kernel_mod, *, page_size, seq_shapes, logical, kv_dtype, seed):
+    """Lay the same logical K/V into a cache paged at ``page_size``."""
+    num_seqs = len(seq_shapes)
+    pages_per_seq = cdiv(MAX_MODEL_LEN, page_size)
+    total_num_pages = num_seqs * pages_per_seq + 1
+
+    cache_shape = kernel_mod.get_kv_cache_shape(total_num_pages, page_size,
+                                                NUM_KV_HEADS, HEAD_DIM,
+                                                kv_dtype)
+    _, _, x2_per_packing, kv_packing, padded_head_dim = cache_shape
+    merged_heads = x2_per_packing * kv_packing
+
+    rng = np.random.default_rng(seed)
+    # Scattered, not compact: a real block allocator hands out whatever pages
+    # are free, and a bug in the page-table indexing hides under an identity
+    # mapping.
+    page_indices = rng.permutation(total_num_pages)[:num_seqs *
+                                                    pages_per_seq].astype(
+                                                        np.int32)
+
+    cache = np.zeros(cache_shape, dtype=np.float32)
+    queries, new_k, new_v, cu = [], [], [], [0]
+    q_rng = np.random.default_rng(seed + 1)
+    for seq, (q_len, kv_len) in enumerate(seq_shapes):
+        k_all, v_all = logical[seq]
+        # Positions [0, kv_len - q_len) are already in the cache; the last
+        # q_len are handed to the kernel and must be written by it.
+        span = kv_len - q_len
+        merged = np.zeros((pages_per_seq * page_size, merged_heads,
+                           padded_head_dim),
+                          dtype=np.float32)
+        for head in range(NUM_KV_HEADS):
+            merged[:span, 2 * head, :HEAD_DIM] = k_all[:span, head]
+            merged[:span, 2 * head + 1, :HEAD_DIM] = v_all[:span, head]
+        paged = merged.reshape(pages_per_seq, page_size, x2_per_packing,
+                               kv_packing, padded_head_dim)
+        cache[page_indices[seq * pages_per_seq:(seq + 1) *
+                           pages_per_seq]] = paged
+
+        queries.append((q_rng.standard_normal(
+            (q_len, NUM_Q_HEADS, HEAD_DIM)) * 0.5).astype(np.float32))
+        new_k.append(k_all[span:kv_len])
+        new_v.append(v_all[span:kv_len])
+        cu.append(cu[-1] + q_len)
+
+    return {
+        "queries": np.concatenate(queries, axis=0),
+        "keys": np.concatenate(new_k, axis=0),
+        "values": np.concatenate(new_v, axis=0),
+        "kv_cache": cache,
+        "kv_lens": np.asarray([kv for _, kv in seq_shapes], np.int32),
+        "page_indices": page_indices,
+        "cu_q_lens": np.asarray(cu, np.int32),
+    }
+
+
+def _call(fn, built, distribution, *, q_dtype, kv_dtype, perturb=False):
+    """Run one implementation on fresh device copies of ``built``.
+
+    Fresh every time: the kernel donates its cache, so a second call would see
+    a buffer the first one already mutated.
+    """
+    queries = built["queries"]
+    if perturb:
+        queries = queries.copy()
+        queries[0, 0, 0] += 50.0
+    out, cache = fn(
+        jnp.asarray(queries, q_dtype),
+        jnp.asarray(built["keys"], kv_dtype),
+        jnp.asarray(built["values"], kv_dtype),
+        jnp.asarray(built["kv_cache"], kv_dtype),
+        jnp.asarray(built["kv_lens"]),
+        jnp.asarray(built["page_indices"]),
+        jnp.asarray(built["cu_q_lens"]),
+        jnp.asarray(distribution, jnp.int32),
+        sm_scale=HEAD_DIM**-0.5,
+    )
+    return (np.asarray(out.astype(jnp.float32)),
+            np.asarray(cache.astype(jnp.float32)))
+
+
+def _diff(a: np.ndarray, b: np.ndarray) -> dict:
+    delta = np.abs(a - b)
+    return {
+        "max_abs_diff": float(delta.max(initial=0.0)),
+        "mean_abs_diff": float(delta.mean()),
+        "finite": bool(np.isfinite(a).all()),
+    }
+
+
+def _emit(path: Path, record: dict) -> None:
+    line = json.dumps(record, sort_keys=True)
+    print(line, flush=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--page-sizes", type=str, default="16,256")
+    parser.add_argument("--kv-cache-dtype",
+                        choices=["fp8", "bf16"],
+                        default="fp8")
+    parser.add_argument("--seed", type=int, default=20260826)
+    args = parser.parse_args()
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.unlink(missing_ok=True)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    kernel_mod = _load_kernel(repo_root)
+    kv_dtype = (jnp.float8_e4m3fn
+                if args.kv_cache_dtype == "fp8" else jnp.bfloat16)
+    page_sizes = [int(x) for x in args.page_sizes.split(",") if x.strip()]
+
+    _emit(
+        args.output, {
+            "event": "environment",
+            "jax_version": jax.__version__,
+            "devices": [str(d) for d in jax.devices()],
+            "check": "rpa_v3_page_size_correctness",
+            "page_sizes": page_sizes,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "num_q_heads": NUM_Q_HEADS,
+            "num_kv_heads": NUM_KV_HEADS,
+            "head_dim": HEAD_DIM,
+            "max_model_len": MAX_MODEL_LEN,
+            "atol": ATOL,
+        })
+
+    failures = 0
+    for name, seq_shapes, distribution in CASES:
+        logical = _logical_kv(seq_shapes, args.seed)
+        ref_outputs: dict[int, np.ndarray] = {}
+        for page_size in page_sizes:
+            built = _build(kernel_mod,
+                           page_size=page_size,
+                           seq_shapes=seq_shapes,
+                           logical=logical,
+                           kv_dtype=kv_dtype,
+                           seed=args.seed)
+            record = {
+                "event": "check",
+                "case": name,
+                "page_size": page_size,
+                "pages_per_seq": cdiv(MAX_MODEL_LEN, page_size),
+                "distribution": list(distribution),
+            }
+            try:
+                pal_out, pal_cache = _call(kernel_mod.ragged_paged_attention,
+                                           built,
+                                           distribution,
+                                           q_dtype=jnp.bfloat16,
+                                           kv_dtype=kv_dtype)
+                ref_out, ref_cache = _call(kernel_mod.ref_ragged_paged_attention,
+                                           built,
+                                           distribution,
+                                           q_dtype=jnp.bfloat16,
+                                           kv_dtype=kv_dtype)
+                ctrl_out, _ = _call(kernel_mod.ragged_paged_attention,
+                                    built,
+                                    distribution,
+                                    q_dtype=jnp.bfloat16,
+                                    kv_dtype=kv_dtype,
+                                    perturb=True)
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                record["passed"] = False
+                failures += 1
+                _emit(args.output, record)
+                continue
+
+            record["output_vs_ref"] = _diff(pal_out, ref_out)
+            record["cache_vs_ref"] = _diff(pal_cache, ref_cache)
+            record["control_diff"] = float(
+                np.abs(ctrl_out - pal_out).max(initial=0.0))
+            record["passed"] = bool(
+                record["output_vs_ref"]["finite"]
+                and record["output_vs_ref"]["max_abs_diff"] <= ATOL
+                and record["cache_vs_ref"]["max_abs_diff"] <= ATOL
+                and record["control_diff"] >= CONTROL_MIN_DIFF)
+            ref_outputs[page_size] = pal_out
+            if not record["passed"]:
+                failures += 1
+            _emit(args.output, record)
+
+        # Same logical content, different paging: the outputs must agree.
+        base = page_sizes[0]
+        for page_size in page_sizes[1:]:
+            if base not in ref_outputs or page_size not in ref_outputs:
+                continue
+            cross = _diff(ref_outputs[page_size], ref_outputs[base])
+            cross_passed = bool(cross["finite"]
+                                and cross["max_abs_diff"] <= ATOL)
+            if not cross_passed:
+                failures += 1
+            _emit(
+                args.output, {
+                    "event": "cross_page_size",
+                    "case": name,
+                    "page_size": page_size,
+                    "vs_page_size": base,
+                    "passed": cross_passed,
+                    **cross,
+                })
+
+    _emit(args.output, {"event": "done", "failures": failures})
+    if failures:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
