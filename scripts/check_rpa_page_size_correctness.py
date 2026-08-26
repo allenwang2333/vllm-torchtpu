@@ -59,9 +59,18 @@ CONTROL_MIN_DIFF = 1.0
 
 
 def _load_kernel(repo_root: Path):
-    """Import the v3 RPA kernel without pulling in the vLLM serving stack."""
+    """Import the v3 RPA kernel without pulling in the vLLM serving stack.
+
+    Falls back to the installed wheel when ``repo_root`` has no ``src`` tree,
+    so the file can be dropped anywhere on a pod that has vllm_torchtpu
+    installed rather than only run from inside a checkout.
+    """
     src = repo_root / "src"
     rpa_dir = src / "vllm_torchtpu" / "kernels" / "ragged_paged_attention" / "v3"
+    if not rpa_dir.is_dir():
+        import importlib
+        return importlib.import_module(
+            "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel")
     package_paths = {
         "vllm_torchtpu": src / "vllm_torchtpu",
         "vllm_torchtpu.kernels": src / "vllm_torchtpu" / "kernels",
@@ -231,14 +240,19 @@ def main() -> None:
                         choices=["fp8", "bf16"],
                         default="fp8")
     parser.add_argument("--seed", type=int, default=20260826)
+    parser.add_argument("--repo-root",
+                        type=Path,
+                        default=None,
+                        help="checkout to import the kernel from; defaults to "
+                        "this file's repo, then to the installed wheel")
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.unlink(missing_ok=True)
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = args.repo_root or Path(__file__).resolve().parents[1]
     kernel_mod = _load_kernel(repo_root)
-    kv_dtype = (jnp.float8_e4m3fn
+    kv_dtype =(jnp.float8_e4m3fn
                 if args.kv_cache_dtype == "fp8" else jnp.bfloat16)
     page_sizes = [int(x) for x in args.page_sizes.split(",") if x.strip()]
 
