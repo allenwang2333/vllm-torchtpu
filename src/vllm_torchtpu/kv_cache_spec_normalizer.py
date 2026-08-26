@@ -1,4 +1,6 @@
+from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
@@ -8,16 +10,28 @@ from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
                                                  PallasMLAttentionBackend,
                                                  _resolve_kv_cache_dtype)
 
+# Maps a (layer_name, spec) to the attention backend class serving that layer,
+# e.g. TPUModelRunner._resolve_tpu_group_backend. Custom backends (such as
+# PallasBatchedRPAAttentionBackend) can have a different physical page layout
+# than the default Pallas backend, so page sizes must come from the backend
+# that will actually materialize the cache.
+BackendResolver = Callable[[str, KVCacheSpec], Any]
+
 
 def normalize_kv_cache_specs_for_tpu(
     kv_cache_specs: dict[str, KVCacheSpec],
     kv_cache_dtype: str | torch.dtype,
     *,
     enable_unified_kv_layout: bool = False,
+    backend_resolver: BackendResolver | None = None,
 ) -> dict[str, KVCacheSpec]:
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
-        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype)
+        backend_cls = (backend_resolver(layer_name, spec)
+                       if backend_resolver is not None
+                       and isinstance(spec, AttentionSpec) else None)
+        normalized[layer_name] = _normalize_one_spec(spec, kv_cache_dtype,
+                                                     backend_cls)
     if (enable_unified_kv_layout
             and _has_hybrid_attention_and_mamba(normalized)):
         page_size = max(spec.page_size_bytes for spec in normalized.values())
@@ -31,24 +45,20 @@ def normalize_kv_cache_specs_for_tpu(
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
+    backend_cls: Any | None = None,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
 
-    if isinstance(spec, MLAAttentionSpec):
-        page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
-    else:
-        page_size = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
+    if backend_cls is None:
+        backend_cls = (PallasMLAttentionBackend if isinstance(
+            spec, MLAAttentionSpec) else PallasAttentionBackend)
+    page_size = backend_cls.get_kv_cache_page_size_bytes(
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        kv_cache_dtype,
+    )
     padded_page_size = spec.page_size_padded or 0
     page_size = max(page_size, spec.real_page_size_bytes, padded_page_size)
     target_dtype = (_resolve_kv_cache_dtype(kv_cache_dtype)

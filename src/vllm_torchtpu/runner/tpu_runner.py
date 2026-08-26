@@ -953,6 +953,13 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
+            # Page sizes must come from each layer's actual backend: custom
+            # backends (e.g. PallasBatchedRPAAttentionBackend) lay out pages
+            # differently than the default PallasAttentionBackend, and an
+            # inflated normalizer page would desync the unified pool page from
+            # the tensors the materializer actually allocates.
+            backend_resolver=lambda layer_name, spec:
+            self._resolve_tpu_group_backend([layer_name], spec),
         )
 
     @staticmethod
