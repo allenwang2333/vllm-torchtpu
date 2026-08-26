@@ -275,9 +275,22 @@ class StructuredDecodingManager:
         grammar_bitmask: torch.Tensor,
         logits: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.where(require_struct_decoding,
-                           self.apply_grammar_bitmask(logits, grammar_bitmask),
-                           logits)
+        assert logits.shape[0] == grammar_bitmask.shape[0]
+        arange = torch.arange(0, 32, dtype=torch.int32, device=logits.device)
+        # Unpack the bitmask for the entire batch at once.
+        # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
+        # arange: (32,)
+        # (B, N, 1) and (1, 1, 32) broadcast to (B, N, 32)
+        unpacked_bitmask = (torch.bitwise_right_shift(
+            grammar_bitmask[:, :, None], arange[None, None, :])
+                            & 1) == 0
+        # Reshape to (B, vocab_size) and apply to logits.
+        # (B, N * 32) -> (B, vocab_size)
+        unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0],
+                                                    -1)[:, :self.vocab_size]
+        # Fused mask: only mask logits if request requires structured decoding
+        effective_mask = require_struct_decoding & unpacked_bitmask
+        return torch.where(effective_mask, float("-inf"), logits)
 
     def apply_grammar_bitmask(self, logits: torch.Tensor,
                               grammar_bitmask: torch.Tensor) -> torch.Tensor:
