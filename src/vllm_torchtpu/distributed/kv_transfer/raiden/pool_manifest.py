@@ -918,6 +918,26 @@ def _dsv4_row_region(*, row_bytes: int,
     ), )
 
 
+def _dsv4_layer_spec(group_spec: Any, layer_name: str) -> Any:
+    """The per-layer spec behind a DSv4 cache group.
+
+    DSv4 groups its layers under a `UniformTypeKVCacheSpecs` wrapper, whose
+    `block_size` is the uncompressed page and which carries no
+    `compress_ratio` at all. Reading role geometry off the wrapper reports
+    every layer as an uncompressed HCA page. `TPUModelRunner`'s
+    `_per_layer_spec` unwraps the same way before allocating.
+    """
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs is None:
+        return group_spec
+    try:
+        return specs[layer_name]
+    except KeyError:
+        raise ManifestError(
+            f"DSv4 layer {layer_name} is not in its own cache group's "
+            f"spec map (has {sorted(specs)})") from None
+
+
 def _dsv4_storage_block_size(spec: Any, layer_name: str) -> int:
     """Compressed tokens per page (`T` in the runner's allocation table)."""
     tokens = getattr(spec, "storage_block_size", None)
@@ -955,17 +975,16 @@ def _dsv4_classify(
     """
     kv_tag_by_layer: dict[str, str] = {}
     for group in kv_cache_groups:
-        spec = group.kv_cache_spec
         for layer_name in group.layer_names:
             if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
                 continue
             if "swa_cache" in layer_name:
                 continue
-            kv_tag_by_layer[layer_name] = _dsv4_kv_tag(layer_name, spec)
+            kv_tag_by_layer[layer_name] = _dsv4_kv_tag(
+                layer_name, _dsv4_layer_spec(group.kv_cache_spec, layer_name))
 
     entries: list[tuple[str, str, int, Any]] = []
     for ordinal, group in enumerate(kv_cache_groups):
-        spec = group.kv_cache_spec
         for layer_name in group.layer_names:
             cache = named_kv_caches.get(layer_name)
             if cache is None:
@@ -1004,7 +1023,9 @@ def _dsv4_classify(
                             f"DSv4 layer {layer_name} ({kv_tag}) must bind a "
                             f"single array; got {len(arrays)}")
                     entries.append((kv_tag, layer_name, ordinal, arrays[0]))
-                _dsv4_check_role_rows(kv_tag, layer_name, spec, arrays)
+                _dsv4_check_role_rows(
+                    kv_tag, layer_name,
+                    _dsv4_layer_spec(group.kv_cache_spec, layer_name), arrays)
     return entries
 
 

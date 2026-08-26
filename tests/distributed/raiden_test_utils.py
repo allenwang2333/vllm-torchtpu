@@ -96,6 +96,28 @@ class FakeDsv4Spec:
         self.block_size = self.storage_block_size * self.compress_ratio
 
 
+class FakeUniformTypeSpecs:
+    """Duck-typed `UniformTypeKVCacheSpecs`, how vLLM hands DSv4 its groups.
+
+    The wrapper reports the uncompressed `block_size` and carries no
+    `compress_ratio`, so anything reading role geometry off it sees every
+    layer as an uncompressed page. Callers have to unwrap per layer.
+    """
+
+    def __init__(self, specs):
+        self.kv_cache_specs = dict(specs)
+        self.block_size = max(
+            spec.block_size for spec in self.kv_cache_specs.values())
+
+
+def _dsv4_group(layer_names, spec):
+    """A DSv4 cache group: per-layer specs under a uniform-type wrapper."""
+    return FakeKVCacheGroup(
+        layer_names,
+        FakeUniformTypeSpecs({name: spec
+                              for name in layer_names}))
+
+
 def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     """A DSv4 materialization with the runner's overlay plan applied.
 
@@ -155,12 +177,12 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     swa_spec = FakeDsv4Spec(storage_block_size=tokens // 2, compress_ratio=1)
     # Each state role has its own window, so vLLM puts it in its own group.
     groups = [
-        FakeKVCacheGroup(csa_names, csa_spec),
-        FakeKVCacheGroup(idx_names, idx_spec),
-        FakeKVCacheGroup([hca_name], hca_spec),
-        FakeKVCacheGroup(swa_names, swa_spec),
-        FakeKVCacheGroup(csa_state, csa_spec),
-        FakeKVCacheGroup(idx_state, idx_spec),
-        FakeKVCacheGroup([hca_state], hca_spec),
+        _dsv4_group(csa_names, csa_spec),
+        _dsv4_group(idx_names, idx_spec),
+        _dsv4_group([hca_name], hca_spec),
+        _dsv4_group(swa_names, swa_spec),
+        _dsv4_group(csa_state, csa_spec),
+        _dsv4_group(idx_state, idx_spec),
+        _dsv4_group([hca_state], hca_spec),
     ]
     return named, groups
