@@ -649,11 +649,7 @@ class DFlashProposer:
                 dummy_hidden, dummy_positions,
                 tuple([dummy_attn_metadata] *
                       len(self.draft_model.model.layers)))
-            # The result is never consumed, so materialize it here or the
-            # deferred program is never enqueued. torch-tpu syncs one
-            # tensor per call; all handles come from the one program.
-            for attn_out in out:
-                synchronize_tensors(attn_out, wait=sync)
+            synchronize_tensors(out, wait=sync)
 
     def _dummy_forward_inputs(
         self,
@@ -776,7 +772,7 @@ class DFlashProposer:
         | torch.Tensor,
         positions: torch.Tensor,
         draft_md_tuple: tuple["AttentionMetadata", ...],
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor:
         """
         Projects target model hidden states directly into the draft model's KV space.
 
@@ -844,29 +840,23 @@ class DFlashProposer:
         roped_k_all = roped_k_flat.view(L, num_ctx, nkv, hd)
         roped_q_all = dummy_q_roped_flat.view(L, num_ctx, nq, hd)
 
-        # Update the kv cache in the compiled graph so XLA can fuse the
-        # mutations. The attention outputs read the updated cache, so they
-        # are returned as handles: synchronizing them materializes every
-        # layer's write (the dummies rely on this; the real path lets the
-        # next draft forward consume the writes).
-        attn_outputs = []
+        # 2. update kv cache in the compiled graph so XLA can fuse the mutations
         for i, layer in enumerate(self.draft_model.model.layers):
             attn_obj = layer.self_attn.attn
             kv_cache = attn_obj.kv_cache
             attn_impl = attn_obj.impl
 
             # Use normal forward pass to run RPA v3 and update KV cache
-            attn_outputs.append(
-                attn_impl.forward(
-                    layer=attn_obj,
-                    query=roped_q_all[i],
-                    key=roped_k_all[i],
-                    value=all_v[i],
-                    kv_cache=kv_cache,
-                    attn_metadata=draft_md_tuple[i],
-                ))
+            attn_impl.forward(
+                layer=attn_obj,
+                query=roped_q_all[i],
+                key=roped_k_all[i],
+                value=all_v[i],
+                kv_cache=kv_cache,
+                attn_metadata=draft_md_tuple[i],
+            )
 
-        return tuple(attn_outputs)
+        return hidden_states
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
