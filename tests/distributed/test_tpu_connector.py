@@ -104,6 +104,7 @@ def test_select_committed_mamba_blocks(num_speculative_blocks, expected):
 def _make_vllm_config(*,
                       is_producer: bool = True,
                       block_size: int = 16,
+                      enable_prefix_caching: bool = False,
                       dp_rank: int = 0,
                       dp_size: int = 1,
                       tp_size: int = 1,
@@ -113,7 +114,7 @@ def _make_vllm_config(*,
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
-    cfg.cache_config.enable_prefix_caching = False
+    cfg.cache_config.enable_prefix_caching = enable_prefix_caching
     cfg.model_config.max_model_len = 64
     cfg.model_config.hf_config = SimpleNamespace(
         num_key_value_heads=2,
@@ -149,6 +150,7 @@ def _make_scheduler(*,
 def _make_raiden_scheduler(*,
                            is_producer: bool = False,
                            block_size: int = 16,
+                           enable_prefix_caching: bool = False,
                            dp_rank: int = 0,
                            tp_size: int = 1,
                            pcp_size: int = 1,
@@ -157,6 +159,7 @@ def _make_raiden_scheduler(*,
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
     cfg = _make_vllm_config(is_producer=is_producer,
                             block_size=block_size,
+                            enable_prefix_caching=enable_prefix_caching,
                             dp_rank=dp_rank,
                             tp_size=tp_size,
                             pcp_size=pcp_size)
@@ -1110,7 +1113,6 @@ class TestTPURaidenConnectorScheduler:
         assert load.mamba_state_block_ids == [11]
 
     def test_stage3_consumer_prefix_hit_pulls_suffix_pages_only(self):
-        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
         req = MagicMock()
         req.request_id = "suffix-load"
         req.num_computed_tokens = 0
@@ -1134,8 +1136,13 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    True,
                    create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=True), \
              patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
                    return_value=False):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
             matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
             consumer.update_state_after_alloc(req, blocks, matched)
 
@@ -1146,6 +1153,52 @@ class TestTPURaidenConnectorScheduler:
         assert load.local_block_ids == [52, 53]
         assert load.num_tokens == 4095
         assert not load.release_only
+
+    @pytest.mark.parametrize(("requested", "supported"),
+                             ((False, True), (True, False)))
+    def test_stage3_consumer_partial_hit_falls_back_to_local_compute(
+            self, requested, supported):
+        req = MagicMock()
+        req.request_id = "local-suffix-fallback"
+        # vLLM assigns the admitted local hit only after the connector update;
+        # zero here makes the unused producer registration release promptly.
+        req.num_computed_tokens = 0
+        req.prompt_token_ids = [0] * 4096
+        req.kv_transfer_params = {
+            "req_id": "local-suffix-fallback-src",
+            "uuid": 994,
+            "num_tokens": 4095,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+        }
+        blocks = MagicMock()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
+                   requested,
+                   create=True), \
+             patch(f"{_MOD}._prefix_aware_load_supported",
+                   return_value=supported), \
+             patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
+                   return_value=False):
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=1024,
+                                              enable_prefix_caching=True)
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 2048)
+            consumer.update_state_after_alloc(req, blocks, matched)
+
+        assert matched == 0
+        assert not is_async
+        blocks.get_block_ids.assert_not_called()
+        release = consumer.reqs_to_load[req.request_id]
+        assert release.release_only
+        assert release.source_req_id == "local-suffix-fallback-src"
+        assert release.local_block_ids == []
 
     def test_stage3_consumer_full_hit_enqueues_release_only(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
@@ -1201,23 +1254,6 @@ class TestTPURaidenConnectorScheduler:
             consumer.update_state_after_alloc(req, blocks, 0)
 
         assert consumer.reqs_to_load == {}
-
-    def test_stage3_consumer_init_refuses_prefix_caching_without_flag(self):
-        cfg = _make_vllm_config(is_producer=False, block_size=1024)
-        cfg.cache_config.enable_prefix_caching = True
-        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
-                   "raiden",
-                   create=True), \
-             patch(f"{_MOD}.dist_utils.get_kv_ips",
-                   return_value="127.0.0.1"), \
-             patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100):
-            with pytest.raises(ValueError,
-                               match="TPU_RAIDEN_PREFIX_AWARE_LOAD"):
-                TPURaidenConnectorScheduler(cfg)
-            with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
-                       True,
-                       create=True):
-                TPURaidenConnectorScheduler(cfg)
 
     def test_stage3_consumer_preserves_distinct_source_request_id(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)

@@ -21,6 +21,7 @@ import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
@@ -261,11 +262,31 @@ def _use_raiden_glm_admission() -> bool:
                 and tpu_envs.TPU_RAIDEN_GLM_ADMISSION)
 
 
-def _prefix_aware_load_enabled() -> bool:
-    """Consumer subtracts local prefix-cache hits and pulls only the FA
-    suffix. Off = the pre-feature contract: full payload, prefix caching
-    refused on the reshard consumer."""
+def _prefix_aware_load_requested() -> bool:
     return bool(tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD)
+
+
+@lru_cache(maxsize=1)
+def _prefix_aware_load_supported() -> bool:
+    """Whether the installed reshard client can encode suffix clips.
+
+    Capability/version skew is a performance concern, not a serving-fatal
+    condition: callers fall back to decode-local computation on partial hits.
+    """
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        return bool(getattr(_reshard_client, "SUPPORTS_DST_SKIP_BYTES", False))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Could not probe tpu-sync dst_skip_bytes support; prefix-aware "
+            "loads will fall back to decode-local computation: %s", exc)
+        return False
+
+
+def _prefix_aware_load_enabled() -> bool:
+    """Whether suffix-only Stage-3 loads are requested and supported."""
+    return (_prefix_aware_load_requested() and _prefix_aware_load_supported())
 
 
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
@@ -816,17 +837,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def __init__(self, vllm_config: "VllmConfig"):
         super().__init__(vllm_config)
-        if (not self.is_producer and _use_raiden_stage3_transport()
-                and bool(vllm_config.cache_config.enable_prefix_caching)):
-            # Fail closed: without the prefix-aware suffix pull, a partial
-            # local hit would submit the full-payload transfer into the
-            # complete block table — an H2D write into adopted, shared
-            # prefix-cache pages other requests may be reading.
-            if not _prefix_aware_load_enabled():
-                raise ValueError(
-                    "Prefix caching on the reshard consumer requires "
-                    "TPU_RAIDEN_PREFIX_AWARE_LOAD=1: the full-payload path "
-                    "would overwrite adopted shared prefix-cache blocks")
+        stage3_consumer = (not self.is_producer
+                           and _use_raiden_stage3_transport())
+        self._stage3_prefix_aware_load_enabled = (stage3_consumer and
+                                                  _prefix_aware_load_enabled())
+        if (stage3_consumer
+                and bool(vllm_config.cache_config.enable_prefix_caching)
+                and not self._stage3_prefix_aware_load_enabled):
+            log = (logger.warning
+                   if _prefix_aware_load_requested() else logger.info)
+            log("Prefix-aware Stage-3 loads are unavailable; partial "
+                "decode-local prefix hits will skip the remote transfer and "
+                "compute the missing suffix locally")
         # req_id -> (uuid, global block ids, exact token count, wire params).
         # This survives build_connector_meta() so a duplicate request_finished
         # callback cannot mint a conflicting UUID or enqueue a second D5
@@ -873,6 +895,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 raise ValueError(
                     "Stage-3 metadata requires a positive num_tokens")
             count = max(transfer_tokens - num_computed_tokens, 0)
+            if (num_computed_tokens > 0 and count > 0
+                    and not self._stage3_prefix_aware_load_enabled):
+                # A full transfer would overwrite the adopted prefix pages.
+                # Preserve the local hit, decline the external load, and let
+                # the scheduler allocate/compute the missing suffix locally.
+                # update_state_after_alloc() then emits the existing
+                # release-only metadata for the unused producer registration.
+                logger.info(
+                    "Stage-3 partial prefix hit falls back to decode-local "
+                    "suffix computation req_id=%s local_tokens=%d "
+                    "missing_tokens=%d", request.request_id,
+                    num_computed_tokens, count)
+                return 0, False
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
@@ -1045,12 +1080,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if skip_tokens:
             # Partial local prefix hit: pull only the suffix, and only into
             # the trailing (newly allocated) pages — the leading adopted
-            # cache pages are shared and must never be transfer targets.
-            if not _prefix_aware_load_enabled():
-                raise ValueError(
-                    "The reshard consumer observed a partial prefix hit with "
-                    "TPU_RAIDEN_PREFIX_AWARE_LOAD disabled; refusing the "
-                    "full-payload overwrite of adopted cache blocks")
+            # cache pages are shared and must never be transfer targets. The
+            # earlier matched-token decision emits a positive external suffix
+            # only when the prefix-aware capability is enabled.
             if skip_tokens % self.block_size != 0:
                 raise ValueError(
                     "Prefix hits must be destination-page aligned: "
@@ -1416,22 +1448,6 @@ class TPURaidenConnectorWorker:
         self._failed_block_ids: set[int] = set()
         self.transfer_stats = TpuKVConnectorStats()
         dist_utils.configure_raiden_telemetry()
-        if (not self.is_producer and _use_raiden_stage3_transport()
-                and _prefix_aware_load_enabled()):
-            # Version-skew probe: the installed reshard client must be able
-            # to encode dst_skip_bytes, or a partial hit would fail only at
-            # submit time. The pair preflight's package-fingerprint gate
-            # forces both hosts onto the same tpu-sync build, so this also
-            # attests the source store's planner capability.
-            from tpu_sync.api.torch import reshard_client as _reshard_client
-
-            if not bool(
-                    getattr(_reshard_client, "SUPPORTS_DST_SKIP_BYTES",
-                            False)):
-                raise RuntimeError(
-                    "TPU_RAIDEN_PREFIX_AWARE_LOAD=1 requires a tpu-sync "
-                    "reshard client with dst_skip_bytes support; the "
-                    "installed package predates the prefix-clip wire field")
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
