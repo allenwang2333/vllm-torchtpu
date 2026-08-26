@@ -8,8 +8,8 @@
 # it fits a single host: same sharding on both sides, transfer parallelism 1,
 # every attention and compressor-state group admitted into Raiden.
 #
-# Untested. There is no DSv4 checkpoint on the box this was written on, so set
-# MODEL_PATH before running.
+# MODEL_PATH defaults to the DeepSeek-V4-Flash snapshot under /mnt/disk on the
+# dev box; override it anywhere else. Set PYTHON to your venv interpreter.
 #
 # Modelled on launch_qwen35_pcp4_dp4.sh; the port management, controller
 # sidecars, health poll and smoke probe are the same.
@@ -70,10 +70,21 @@ require_free_ports() {
 }
 
 
+# The servers are started through `bash -lc`, whose PATH may not carry the
+# venv, so resolve the interpreter here and pass an absolute path down. Point
+# PYTHONPATH at this checkout so the run exercises the tree the script lives
+# in rather than whatever vllm_torchtpu happens to be installed.
+PYTHON="${PYTHON:-python}"
+if ! PYTHON="$(command -v "${PYTHON}")"; then
+  echo "No usable python: set PYTHON to your venv interpreter" >&2
+  exit 1
+fi
+TORCHTPU_SRC="${TORCHTPU_SRC:-$(cd "${script_dir}/../../src" && pwd)}"
+
 RUN_ROOT="${RUN_ROOT:-${HOME}/pd_disagg_runs}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/dsv4_pd_dp4_dp4_$(date +%Y%m%d_%H%M%S)}"
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL_PATH}}"
+MODEL_PATH="${MODEL_PATH:-/mnt/disk/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
 
 SERVE_HOST="${DSV4_BIND_HOST:-127.0.0.1}"
 PREFILL_PORT="${PREFILL_PORT:-8400}"
@@ -101,8 +112,8 @@ NUM_GPU_BLOCKS_OVERRIDE_PREFILL="${NUM_GPU_BLOCKS_OVERRIDE_PREFILL:-}"
 NUM_GPU_BLOCKS_OVERRIDE_DECODE="${NUM_GPU_BLOCKS_OVERRIDE_DECODE:-}"
 
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-9216}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
@@ -119,6 +130,16 @@ for offset in 0 1 2 3; do
 done
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
+  # A crashed attempt leaves VLLM:: workers alive still holding the chips, and
+  # they do not listen on any port so the sweep above misses them. The next
+  # launch then dies with "PjRtClient is not initialized". Own user only.
+  if pgrep -u "$(id -u)" -f "VLLM::" >/dev/null 2>&1; then
+    echo "Clearing leftover VLLM workers from a previous attempt"
+    pkill -9 -u "$(id -u)" -f "VLLM::" 2>/dev/null || true
+    sleep 10
+    rm -f /tmp/libtpu_lockfile 2>/dev/null || true
+    sleep 5
+  fi
 else
   require_free_ports "${managed_ports[@]}"
 fi
@@ -136,6 +157,7 @@ common_args=(
   --enable-expert-parallel
   --disable-custom-all-reduce
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+  --kv-cache-dtype fp8_e4m3
   --language-model-only
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --max-num-seqs "${MAX_NUM_SEQS}"
@@ -182,11 +204,31 @@ printf '%q ' "${common_args[@]}" >"${RUN_DIR}/vllm_args.quoted"
 common_env=$(cat <<EOF
 export JAX_PLATFORMS=tpu,cpu PJRT_DEVICE=TPU TPU_BACKEND_TYPE=jax;
 export VLLM_XLA_CHECK_RECOMPILATION=0;
-export USE_MOE_SPARSE_CORE=1;
 export TPUMISC_HMA_CHECKSUM_TRACE=0;
+
+# DSv4 model-side settings, taken from the known-good single-replica serve.
+# Sparse core is off for this model, the MoE weights are requantized to fp4 at
+# load, and the fp4 cache is shared so the second replica does not redo it.
+export USE_MOE_SPARSE_CORE=0;
+# Both plugins are required: the platform plugin selects TPU, and the general
+# plugin is what registers this repo's DeepseekV4ForCausalLM. Leave the latter
+# out and vLLM silently loads its CUDA DSv4 model, which dies on
+# torch.cuda.Stream. Names must match the entry points in pyproject.toml.
+export VLLM_PLUGINS=torchtpu,torchtpu_layers;
+export MOE_REQUANTIZE_WEIGHT_DTYPE=fp4 MOE_REQUANTIZE_BLOCK_SIZE=512;
+# The blockwise linear requantization path is off for DSv4. It reshapes the
+# linear weight scales to [n_in_blocks, 1, n_out] and the fused o-projection
+# kernel needs the per-channel [n_out] form, but fp8.py rejects the kernel
+# without a block size, so the pair can only be off together. The MoE knobs
+# above are separate and stay on.
+export ENABLE_QUANTIZED_MATMUL_KERNEL=0;
+unset REQUANTIZE_BLOCK_SIZE;
+export HF_HUB_OFFLINE=1 TRANSFORMERS_VERBOSITY=error VLLM_NO_USAGE_STATS=1;
+export PYTHONPATH="${TORCHTPU_SRC}\${PYTHONPATH:+:\${PYTHONPATH}}";
+export TORCH_DIST_TIMEOUT=1200 VLLM_RPC_TIMEOUT=1200000;
 export XLA_PYTHON_CLIENT_PREALLOCATE=false VLLM_ALLOW_LONG_MAX_MODEL_LEN=1;
 unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR;
-export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536";
+export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1000000000 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1000000000";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
@@ -197,7 +239,12 @@ export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
 # admission path is what plans a pool per attention and compressor-state
 # group; without it the multi-group manifest is rejected. DP-attn with TP=1
 # leaves nothing to split across transfer ranks, hence parallelism 1.
-export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
+# The unified block pool is off, unlike the Qwen setups. It gives the pools an
+# aliased_raw binding and DSv4 admission requires private typed tensors, so it
+# would be rejected in build_dsv4_pool_manifest. It also crashes earlier:
+# update_tpu_block_size_and_slot_config asks the DSv4 SWA backend for
+# get_kv_cache_page_size_bytes, which that backend does not implement.
+export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
 export TPU_RAIDEN_DSV4_ADMISSION=1
 export TPU_KV_RESHARD_TRANSPORT=raiden
@@ -221,13 +268,13 @@ if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE_DECODE}" ]]; then
   decode_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE_DECODE}")
 fi
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; "${PYTHON}" -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; "${PYTHON}" -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
-prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 27000"
+prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"${PYTHON} ${script_dir}/run_raiden_controller.py --port 27000"
 
-decode_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 28000"
+decode_ctrl_cmd="${ctrl_common_env}"$'\n'"${PYTHON} ${script_dir}/run_raiden_controller.py --port 28000"
 
 printf '%s\n' "${prefill_ctrl_cmd}" >"${RUN_DIR}/prefill_ctrl_cmd.sh"
 printf '%s\n' "${decode_ctrl_cmd}" >"${RUN_DIR}/decode_ctrl_cmd.sh"
@@ -285,7 +332,7 @@ if [[ "${p_code}" != "200" || "${d_code}" != "200" ]]; then
 fi
 
 proxy_cmd=$(cat <<EOF
-python ${script_dir}/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
+${PYTHON} ${script_dir}/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
 EOF
 )
 printf '%s\n' "${proxy_cmd}" >"${RUN_DIR}/proxy_cmd.sh"
@@ -293,7 +340,7 @@ setsid bash -lc "${proxy_cmd}" >"${RUN_DIR}/logs/proxy.log" 2>&1 &
 echo $! >"${RUN_DIR}/proxy.pid"
 
 sleep 2
-python "${script_dir}/../../scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
+"${PYTHON}" "${script_dir}/../../scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
   --host "${SERVE_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
