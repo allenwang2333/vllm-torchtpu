@@ -18,6 +18,8 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.sequence_parallel import \
+    resolve_sequence_parallel_size
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -40,6 +42,11 @@ else:
     SamplingType = None
 
 logger = init_logger(__name__)
+
+_SEQUENCE_PARALLEL_ARCHITECTURES = frozenset({
+    "KimiLinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
+})
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -416,6 +423,29 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
             model_name).lower():
         return True
     return False
+
+
+def _validate_sequence_parallel_config(vllm_config: "VllmConfig") -> int:
+    """Fail early when a model has no TPU sequence-layout adapter."""
+    sp_size = resolve_sequence_parallel_size(vllm_config)
+    if sp_size == 1:
+        return sp_size
+
+    model_config = vllm_config.model_config
+    architecture = getattr(model_config, "architecture", None)
+    architectures = {architecture} if isinstance(architecture, str) else set()
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures.update(
+        str(item)
+        for item in (getattr(hf_config, "architectures", None) or []))
+    if not architectures.intersection(_SEQUENCE_PARALLEL_ARCHITECTURES):
+        rendered = ", ".join(sorted(architectures)) or "unknown"
+        supported = ", ".join(sorted(_SEQUENCE_PARALLEL_ARCHITECTURES))
+        raise ValueError(
+            "sequence_parallel_size > 1 requires a model-specific TPU "
+            f"adapter; architecture {rendered!r} is not supported. "
+            f"Supported architectures: {supported}")
+    return sp_size
 
 
 def _apply_model_specific_patches(
@@ -845,6 +875,7 @@ class TpuPlatform(Platform):
         assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
+        _validate_sequence_parallel_config(vllm_config)
         _validate_phased_profiling_config(vllm_config)
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)

@@ -48,6 +48,7 @@ nav:
     - Quickstart: getting_started/quickstart.md
     - 'Out-of-Tree Usage': getting_started/out-of-tree.md
   - 'Recommended Models and Features': recommended_models_features.md
+  - 'Sequence Parallelism': sequence_parallel.md
   - Developer Guides:
     - 'JAX Model Development': developer_guides/jax_model_development.md
     - 'Torch Model Development': developer_guides/torchax_model_development.md

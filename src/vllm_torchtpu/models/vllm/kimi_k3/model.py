@@ -52,6 +52,7 @@ from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+from .sequence_parallel import KimiSequenceParallel
 
 
 class KimiDecoderLayer(nn.Module):
@@ -61,8 +62,11 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        sequence_parallel: KimiSequenceParallel | None = None,
     ) -> None:
         super().__init__()
+        self.sequence_parallel = (sequence_parallel
+                                  or KimiSequenceParallel.disabled())
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         if config.is_kda_layer(self.layer_idx):
             self.self_attn = KimiDeltaAttention(
@@ -76,6 +80,10 @@ class KimiDecoderLayer(nn.Module):
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
             )
+        # SP owns the projection reduction, so the default TP reduction would
+        # reduce the same partials twice.
+        if self.sequence_parallel.enabled:
+            self.self_attn.o_proj.reduce_results = False
 
         is_moe = (config.num_experts is not None
                   and self.layer_idx >= config.first_k_dense_replace
@@ -155,6 +163,59 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
         return prefix_sum + hidden_states, block_residuals
 
+    def forward_sequence_parallel(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        block_residuals: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.attn_res_block_size is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            attention_input = self.sequence_parallel.gather_attention_input(
+                hidden_states)
+            hidden_states = self.self_attn(positions, attention_input)
+            hidden_states = self.sequence_parallel.reduce_attention_output(
+                hidden_states)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        else:
+            assert block_residuals is not None
+            prefix_sum = hidden_states
+            if block_residuals.shape[-2] > 0:
+                hidden_states = self.self_attention_res(
+                    prefix_sum, block_residuals)
+            if self.layer_idx % self.attn_res_block_size == 0:
+                block_residuals = torch.cat(
+                    (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2)
+                prefix_sum = None
+            hidden_states = self.input_layernorm(hidden_states)
+
+            attention_input = self.sequence_parallel.gather_attention_input(
+                hidden_states)
+            hidden_states = self.self_attn(positions, attention_input)
+            hidden_states = self.sequence_parallel.reduce_attention_output(
+                hidden_states)
+            prefix_sum = (hidden_states if prefix_sum is None else prefix_sum +
+                          hidden_states)
+            hidden_states = self.mlp_res(prefix_sum, block_residuals)
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # Existing feed-forward kernels require a replicated token layout.
+        hidden_states = self.sequence_parallel.gather_feed_forward_input(
+            hidden_states)
+        if self.is_moe:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.sequence_parallel.shard_feed_forward_output(
+            hidden_states)
+
+        if self.attn_res_block_size is None:
+            return residual + hidden_states, None
+        return prefix_sum + hidden_states, block_residuals
+
 
 @support_torch_compile(dynamic_arg_dims={
     "input_ids": 0,
@@ -167,6 +228,8 @@ class KimiModel(nn.Module):
         super().__init__()
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
+        self.sequence_parallel = KimiSequenceParallel.from_vllm_config(
+            vllm_config)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -179,6 +242,7 @@ class KimiModel(nn.Module):
                 config,
                 vllm_config,
                 prefix=f"{prefix}.layers.{layer_idx}",
+                sequence_parallel=self.sequence_parallel,
             ) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -200,12 +264,31 @@ class KimiModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
+        assert hidden_states is not None
+        # Per-bucket layout switches move TPU subgraph boundaries between traces.
+        if self.sequence_parallel.enabled:
+            hidden_states = self.sequence_parallel.shard_model_input(
+                hidden_states)
+            # A zero-length view avoids exporting a symbolic SymIntArrayRef.
+            block_residuals = (hidden_states.unsqueeze(-2).narrow(-2, 0, 0) if
+                               self.attn_res_block_size is not None else None)
+            for layer in self.layers:
+                hidden_states, block_residuals = layer.forward_sequence_parallel(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                )
+            if block_residuals is not None:
+                hidden_states = self.output_attn_res(hidden_states,
+                                                     block_residuals)
+            hidden_states = self.norm(hidden_states)
+            return self.sequence_parallel.gather_model_output(hidden_states)
+
         block_residuals = (hidden_states.new_empty(
             hidden_states.shape[0],
             0,
             hidden_states.shape[1],
         ) if self.attn_res_block_size is not None else None)
-        assert hidden_states is not None
 
         for layer in self.layers:
             hidden_states, block_residuals = layer(
