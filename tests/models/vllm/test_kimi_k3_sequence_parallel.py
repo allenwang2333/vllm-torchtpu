@@ -102,6 +102,18 @@ def test_model_adapter_rejects_unsupported_layouts() -> None:
             ))
 
 
+def test_disabled_model_adapter_preserves_layout() -> None:
+    adapter = KimiSequenceParallel.disabled()
+    hidden_states = torch.empty(4, 8)
+
+    assert adapter.shard_model_input(hidden_states) is hidden_states
+    assert adapter.gather_attention_input(hidden_states) is hidden_states
+    assert adapter.reduce_attention_output(hidden_states) is hidden_states
+    assert adapter.gather_feed_forward_input(hidden_states) is hidden_states
+    assert adapter.shard_feed_forward_output(hidden_states) is hidden_states
+    assert adapter.gather_model_output(hidden_states) is hidden_states
+
+
 class _FakeSPLayout:
 
     enabled = True
@@ -181,8 +193,7 @@ def test_decoder_sequence_parallel_contract_keeps_residuals_local(
         layer.mlp = feed_forward
 
     hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
-    output, block_residuals = layer.forward_sequence_parallel(
-        torch.arange(8), hidden_states, None)
+    output, block_residuals = layer(torch.arange(8), hidden_states, None)
 
     assert tuple(output.shape) == (2, 4)
     assert block_residuals is None
@@ -215,8 +226,8 @@ def test_attnres_stack_and_prefix_sum_remain_local() -> None:
 
     hidden_states = torch.ones(2, 4)
     block_residuals = torch.zeros(2, 1, 4)
-    output, updated_residuals = layer.forward_sequence_parallel(
-        torch.arange(8), hidden_states, block_residuals)
+    output, updated_residuals = layer(torch.arange(8), hidden_states,
+                                      block_residuals)
 
     assert tuple(output.shape) == (2, 4)
     assert updated_residuals is not None
@@ -250,19 +261,15 @@ class _Embedding(nn.Module):
         return torch.stack([input_ids.float()] * 4, dim=-1)
 
 
-class _SPDecoder(nn.Module):
+class _Decoder(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
         self.sp_shapes: list[tuple[int, ...]] = []
         self.block_residual_shapes: list[tuple[int, ...] | None] = []
 
-    def forward(self, *args, **kwargs):
-        raise AssertionError("SP bucket must not use the standard layer path")
-
-    def forward_sequence_parallel(self, positions: torch.Tensor,
-                                  hidden_states: torch.Tensor,
-                                  block_residuals: torch.Tensor | None):
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor,
+                block_residuals: torch.Tensor | None):
         assert tuple(positions.shape) == (8, )
         self.sp_shapes.append(tuple(hidden_states.shape))
         self.block_residual_shapes.append(
@@ -274,7 +281,7 @@ def test_embedding_first_layer_and_final_norm_boundaries() -> None:
     model = KimiModel.__new__(KimiModel)
     nn.Module.__init__(model)
     layout = _ModelSPLayout()
-    decoder = _SPDecoder()
+    decoder = _Decoder()
     final_norm = _ShapeRecorder()
     model.sequence_parallel = layout
     model.attn_res_block_size = None
@@ -299,7 +306,7 @@ def test_sp_attnres_empty_stack_uses_local_token_shape() -> None:
     model = KimiModel.__new__(KimiModel)
     nn.Module.__init__(model)
     layout = _ModelSPLayout()
-    decoder = _SPDecoder()
+    decoder = _Decoder()
     output_attn_res = _ResidualRecorder()
     model.sequence_parallel = layout
     model.attn_res_block_size = 2
