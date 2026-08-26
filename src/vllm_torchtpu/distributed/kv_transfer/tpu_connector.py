@@ -161,6 +161,22 @@ def _stage3_transfer_groups(
     return groups
 
 
+@dataclass(frozen=True)
+class _Stage3Dsv4Pool:
+    """One admitted DSv4 pool tag and everything its lowering needs.
+
+    `plan_position` is the tag's index into the Stage-3 transfer-group plan
+    (not the kv-cache-group ordinal), because that is the order the per-group
+    block tables travel in.
+    """
+
+    tag: str
+    plan_position: int
+    page_tokens: int
+    live_bytes_per_block: int
+    row_bytes: int
+
+
 @dataclass
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
@@ -184,6 +200,9 @@ class _Stage3LoadMeta:
     # request (state follows each group's block table; None for FA-only
     # models).
     mamba_state_block_ids: Optional[list[int]] = None
+    # One destination block table per transferred kv-cache group, in the
+    # Stage-3 transfer-group plan's order. See SendMeta.group_block_ids.
+    group_block_ids: list[list[int]] | None = None
 
 
 @dataclass(frozen=True)
@@ -412,16 +431,21 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                         "Stage-3 FA KV cache group is absent from request "
                         f"block tables: index={transfer_group.index}, "
                         f"groups={len(block_ids)}")
+            group_block_ids = None
             if len(self._stage3_transfer_groups) > 1:
-                # The plan is built and validated above, but the wire arrays
-                # below still carry one page range per request. Fail here
-                # rather than silently transferring only the first group.
-                raise NotImplementedError(
-                    "Stage-3 transfers a single KV cache group's pages per "
-                    "request; this model has "
-                    f"{len(self._stage3_transfer_groups)} "
-                    f"({[g.index for g in self._stage3_transfer_groups]}) "
-                    "and needs per-group block lists on the wire")
+                if not _use_raiden_dsv4_admission():
+                    # Only DSv4 admission lowers per-group spans; anything
+                    # else would silently transfer the first group alone.
+                    raise NotImplementedError(
+                        "Stage-3 transfers a single KV cache group's pages "
+                        "per request; this model has "
+                        f"{len(self._stage3_transfer_groups)} "
+                        f"({[g.index for g in self._stage3_transfer_groups]}) "
+                        "and needs TPU_RAIDEN_DSV4_ADMISSION=1")
+                group_block_ids = [
+                    list(block_ids[group.index])
+                    for group in self._stage3_transfer_groups
+                ]
             mamba_block_ids = None
             if self._stage3_mamba_group_indices:
                 mamba_block_ids = []
@@ -439,7 +463,8 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
-                mamba_block_ids=mamba_block_ids)  # type: ignore
+                mamba_block_ids=mamba_block_ids,
+                group_block_ids=group_block_ids)  # type: ignore
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
@@ -1056,14 +1081,27 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     f"allocation: index={transfer_group.index}, "
                     f"groups={len(grouped_block_ids)}")
         local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
-        expected_pages = ((num_tokens + self.block_size - 1) //
-                          self.block_size)
-        if len(local_block_ids) != expected_pages:
-            raise ValueError(
-                "Stage-3 FA resharding requires the complete destination "
-                "page set (prefix-suffix pulls are unsupported): "
-                f"blocks={len(local_block_ids)}, expected={expected_pages}, "
-                f"num_tokens={num_tokens}, page_tokens={self.block_size}")
+        multi_group = len(self._stage3_transfer_groups) > 1
+        primary_page_tokens = (self._stage3_transfer_groups[0].block_size
+                               if multi_group else self.block_size)
+
+        def _require_complete_pages(ids: list[int], page_tokens: int) -> None:
+            expected_pages = (num_tokens + page_tokens - 1) // page_tokens
+            if len(ids) != expected_pages:
+                raise ValueError(
+                    "Stage-3 FA resharding requires the complete destination "
+                    "page set (prefix-suffix pulls are unsupported): "
+                    f"blocks={len(ids)}, expected={expected_pages}, "
+                    f"num_tokens={num_tokens}, page_tokens={page_tokens}")
+
+        _require_complete_pages(local_block_ids, primary_page_tokens)
+        group_block_ids: list[list[int]] | None = None
+        if multi_group:
+            group_block_ids = []
+            for group in self._stage3_transfer_groups:
+                ids = list(grouped_block_ids[group.index])
+                _require_complete_pages(ids, group.block_size)
+                group_block_ids.append(ids)
         mamba_state_block_ids: Optional[list[int]] = None
         if self._stage3_mamba_group_indices:
             mamba_block_ids: list[list[int]] = []
@@ -1087,6 +1125,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_data_replica_idx=src_data_replica_idx,
             src_parallelism=src_parallelism,
             mamba_state_block_ids=mamba_state_block_ids,
+            group_block_ids=group_block_ids,
         )
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
@@ -1114,11 +1153,42 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         default_job = "prefill" if self.is_producer else "decode"
         return f"{default_job}-engine"
 
+    @staticmethod
+    def _stage3_normalize_producer_blocks(
+        block_ids: Sequence[int],
+        *,
+        num_tokens: int,
+        page_tokens: int,
+        pcp_size: int,
+    ) -> tuple[int, ...]:
+        """Trims one producer block table to the transfer prefix.
+
+        The producer may allocate trailing blocks for its excluded final
+        prompt token or locally generated tokens. They are outside the
+        transfer prefix; too few blocks remains an error.
+        """
+        scheduler_block_tokens = page_tokens * pcp_size
+        expected = ((num_tokens + scheduler_block_tokens - 1) //
+                    scheduler_block_tokens)
+        normalized = tuple(int(block_id) for block_id in block_ids)
+        if len(normalized) > expected:
+            normalized = normalized[:expected]
+        if len(normalized) != expected:
+            raise ValueError(
+                "Stage-3 producer block IDs must cover every PCP scheduler "
+                "block, including the partial tail: "
+                f"blocks={len(tuple(block_ids))}, transfer_blocks="
+                f"{len(normalized)}, expected={expected}, "
+                f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
+                f"pcp_size={pcp_size}")
+        return normalized
+
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
         mamba_block_ids: Optional[list[list[int]]] = None,
+        group_block_ids: Optional[list[list[int]]] = None,
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
@@ -1145,7 +1215,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        if not _use_raiden_glm_admission():
+        if not (_use_raiden_glm_admission() or _use_raiden_dsv4_admission()):
             # The interleave minimum applies to PCP sources only.
             interleave_size = int(
                 getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
@@ -1154,25 +1224,32 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if (num_tokens < min_transfer_tokens):
                 return False, {}
 
-        scheduler_block_tokens = self.block_size * pcp_size
-        expected_scheduler_blocks = (
-            (num_tokens + scheduler_block_tokens - 1) //
-            scheduler_block_tokens)
-        normalized_block_ids = tuple(int(block_id) for block_id in block_ids)
-        # The producer may allocate trailing blocks for its excluded final
-        # prompt token or locally generated tokens. They are outside the
-        # transfer prefix; too few blocks remains an error.
-        if len(normalized_block_ids) > expected_scheduler_blocks:
-            normalized_block_ids = (
-                normalized_block_ids[:expected_scheduler_blocks])
-        if len(normalized_block_ids) != expected_scheduler_blocks:
-            raise ValueError(
-                "Stage-3 producer block IDs must cover every PCP scheduler "
-                "block, including the partial tail: "
-                f"blocks={len(block_ids)}, transfer_blocks="
-                f"{len(normalized_block_ids)}, expected="
-                f"{expected_scheduler_blocks}, num_tokens={num_tokens}, "
-                f"page_tokens={self.block_size}, pcp_size={pcp_size}")
+        # Multi-group models page each group at its own size, so the primary
+        # block table is trimmed against group 0's page rather than the
+        # cache-config default.
+        primary_page_tokens = (self._stage3_transfer_groups[0].block_size
+                               if group_block_ids else self.block_size)
+        normalized_block_ids = self._stage3_normalize_producer_blocks(
+            block_ids,
+            num_tokens=num_tokens,
+            page_tokens=primary_page_tokens,
+            pcp_size=pcp_size)
+        normalized_group_block_ids: list[list[int]] | None = None
+        if group_block_ids is not None:
+            if len(group_block_ids) != len(self._stage3_transfer_groups):
+                raise ValueError(
+                    "Stage-3 producer per-group block tables do not match the "
+                    f"transfer plan: tables={len(group_block_ids)}, "
+                    f"groups={len(self._stage3_transfer_groups)}")
+            normalized_group_block_ids = [
+                list(
+                    self._stage3_normalize_producer_blocks(
+                        ids,
+                        num_tokens=num_tokens,
+                        page_tokens=group.block_size,
+                        pcp_size=pcp_size)) for group, ids in zip(
+                            self._stage3_transfer_groups, group_block_ids)
+            ]
 
         producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
                             if self.vllm_config.parallel_config else 0)
@@ -1192,7 +1269,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if src_parallelism <= 0:
             raise ValueError(
                 "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
-        if _use_raiden_glm_admission():
+        if _use_raiden_dsv4_admission():
+            if src_parallelism != 1:
+                raise ValueError(
+                    "Stage-3 DSv4 producer transfer parallelism must be 1 "
+                    f"under DP attention; got {src_parallelism}")
+        elif _use_raiden_glm_admission():
             tp_size = int(parallel_config.tensor_parallel_size or 1)
             if src_parallelism != tp_size:
                 raise ValueError(
@@ -1242,6 +1324,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             expiration_time=expiration_time,
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
+            group_block_ids=normalized_group_block_ids,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -1336,6 +1419,10 @@ class TPURaidenConnectorWorker:
         # admission/metadata directory.
         self._stage3_source_facades: dict[str, Any] = {}
         self._stage3_state_group_count = 0
+        # DSv4: the admitted pool tags in wire order, each with the kv-cache
+        # group whose block table addresses it and its page geometry.
+        self._stage3_dsv4_plan: tuple[_Stage3Dsv4Pool, ...] = ()
+        self._stage3_dsv4_group_count = 0
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
         # completions parked until every state class lands.
@@ -1426,23 +1513,31 @@ class TPURaidenConnectorWorker:
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         self.runner = runner
-        if (self._raiden_stage3_enabled()
-                and not (self._raiden_qwen35_admission_enabled()
-                         or _use_raiden_glm_admission())):
+        selected = [
+            name for name, enabled in (
+                ("TPU_RAIDEN_QWEN35_ADMISSION",
+                 self._raiden_qwen35_admission_enabled()),
+                ("TPU_RAIDEN_GLM_ADMISSION", _use_raiden_glm_admission()),
+                ("TPU_RAIDEN_DSV4_ADMISSION", _use_raiden_dsv4_admission()),
+            ) if enabled
+        ]
+        if self._raiden_stage3_enabled() and not selected:
             raise RuntimeError(
                 "TPU_KV_RESHARD_TRANSPORT=raiden requires explicit pool "
                 "admission (TPU_USE_RAIDEN_KV_CACHE_MANAGER=1 and one of "
-                "TPU_RAIDEN_QWEN35_ADMISSION=1 or TPU_RAIDEN_GLM_ADMISSION=1)")
-        if (self._raiden_qwen35_admission_enabled()
-                and _use_raiden_glm_admission()):
+                "TPU_RAIDEN_QWEN35_ADMISSION=1, TPU_RAIDEN_GLM_ADMISSION=1 "
+                "or TPU_RAIDEN_DSV4_ADMISSION=1)")
+        if len(selected) > 1:
             raise RuntimeError(
-                "TPU_RAIDEN_QWEN35_ADMISSION and TPU_RAIDEN_GLM_ADMISSION "
-                "are mutually exclusive")
+                f"{' and '.join(selected)} are mutually exclusive")
         if self._raiden_qwen35_admission_enabled():
             self._admit_raiden_qwen35_kv_cache(runner)
             return
         if _use_raiden_glm_admission():
             self._admit_raiden_glm_kv_cache(runner)
+            return
+        if _use_raiden_dsv4_admission():
+            self._admit_raiden_dsv4_kv_cache(runner)
             return
         self._ensure_raiden_transfer_engine()
 
@@ -1703,6 +1798,174 @@ class TPURaidenConnectorWorker:
                              f"data_parallel_size={dp_size}")
         return f"dp{dp_size}_decode"
 
+    def _admit_raiden_dsv4_kv_cache(self, runner: TPUModelRunner) -> None:
+        """Constructs the Raiden engine over DeepSeek-V4's cache classes.
+
+        DSv4 is the first admitted model with more than one attention KV cache
+        group, and the first whose caches alias one array at the same byte
+        offset (SWA on a CSA NoPE array, compressor states on their own
+        compressed-KV array). Every pool tag therefore names its cache group,
+        and every transfer carries that group's own block table.
+        """
+        if self._raiden_transfer_engine is not None:
+            return
+        if not self._raiden_stage3_enabled():
+            raise RuntimeError("TPU_RAIDEN_DSV4_ADMISSION requires "
+                               "TPU_KV_RESHARD_TRANSPORT=raiden")
+        self._maybe_host_reshard_store()
+        controller_address = _resolved_reshard_controller_address(self.dp_rank)
+        if not controller_address:
+            raise ValueError("TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
+                             "TPU_KV_RESHARD_TRANSPORT=raiden")
+
+        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+        topology = self._raiden_dsv4_admission_topology()
+        role = "kv_producer" if self.is_producer else "kv_consumer"
+        named_kv_caches = self.named_kv_caches
+        if not named_kv_caches:
+            raise ValueError("Raiden pool admission requires "
+                             "register_kv_caches() before register_runner()")
+        kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
+        raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
+
+        manifest = rpm.build_dsv4_pool_manifest(
+            named_kv_caches=named_kv_caches,
+            kv_cache_groups=kv_cache_groups,
+            raw_tensors=raw_tensors,
+        )
+        rpm.verify_storage_binding(
+            manifest=manifest,
+            named_kv_caches=named_kv_caches,
+            raw_tensors=raw_tensors,
+        )
+        rpm.materialize_storages(manifest)
+
+        storages = list(manifest.storages)
+        engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
+        summary = dict(engine.register_pools(manifest.pool_dicts()))
+
+        registration = self._register_raiden_stage3_work_unit(
+            engine=engine,
+            manifest=manifest,
+            controller_address=controller_address,
+        )
+        summary["stage3_registration"] = registration
+
+        self._raiden_transfer_engine = engine
+        self._raiden_manifest = manifest
+        self._stage3_dsv4_plan = self._measure_dsv4_pool_plan(
+            manifest, kv_cache_groups)
+
+        counts = manifest.tag_counts()
+        geometry = manifest.geometry_by_tag()
+        summary.update({
+            "topology": topology,
+            "model_server_role": role,
+            "binding": manifest.binding,
+            "tag_counts": dict(counts),
+            "geometry": {
+                tag: dict(geo)
+                for tag, geo in geometry.items()
+            },
+        })
+        self._raiden_admission_summary = dict(summary)
+        logger.info(
+            "Raiden DSv4 pool admission complete topology=%s role=%s "
+            "binding=%s pools=%d storages=%d tags=%d",
+            topology,
+            role,
+            manifest.binding,
+            len(manifest.pools),
+            len(manifest.storages),
+            len(counts),
+        )
+        for pool in self._stage3_dsv4_plan:
+            logger.info(
+                "Raiden DSv4 pool tag=%s plan_position=%d page_tokens=%d "
+                "live_bytes_per_block=%d row_bytes=%d pools=%d",
+                pool.tag,
+                pool.plan_position,
+                pool.page_tokens,
+                pool.live_bytes_per_block,
+                pool.row_bytes,
+                counts[pool.tag],
+            )
+
+    def _measure_dsv4_pool_plan(
+            self, manifest: Any,
+            kv_cache_groups: Sequence[Any]) -> tuple[_Stage3Dsv4Pool, ...]:
+        """Binds every admitted DSv4 tag to its group's pages and geometry.
+
+        Tag order follows the manifest's pool order, which both peers build
+        from the same model, and which fixes the executor-side H2D order.
+
+        The transfer-group plan is recomputed here from the runner's cache
+        config: the worker has no scheduler to inherit it from, and it must be
+        the same plan, since `plan_position` indexes the per-group block
+        tables the scheduler puts on the wire.
+        """
+        transfer_groups = _stage3_transfer_groups(kv_cache_groups,
+                                                  allow_multiple=True)
+        plan_position_by_group = {
+            group.index: position
+            for position, group in enumerate(transfer_groups)
+        }
+        geometry = manifest.geometry_by_tag()
+        pools: list[_Stage3Dsv4Pool] = []
+        seen: set[str] = set()
+        for pool in manifest.pools:
+            tag = str(pool.tag)
+            if tag in seen:
+                continue
+            seen.add(tag)
+            ordinal = int(tag.rsplit(".g", 1)[1])
+            position = plan_position_by_group.get(ordinal)
+            if position is None:
+                raise RuntimeError(
+                    f"DSv4 pool tag {tag!r} names kv cache group {ordinal}, "
+                    "which is not in the Stage-3 transfer plan "
+                    f"{[g.index for g in transfer_groups]}")
+            (region, ) = pool.regions
+            pools.append(
+                _Stage3Dsv4Pool(
+                    tag=tag,
+                    plan_position=position,
+                    page_tokens=int(
+                        kv_cache_groups[ordinal].kv_cache_spec.block_size),
+                    live_bytes_per_block=int(
+                        geometry[tag]["live_bytes_per_block"]),
+                    row_bytes=int(region.unit_bytes),
+                ))
+        if not pools:
+            raise RuntimeError("DSv4 admission produced no transfer pools")
+        self._stage3_dsv4_group_count = len(transfer_groups)
+        return tuple(pools)
+
+    def _raiden_dsv4_admission_topology(self) -> str:
+        """Step 1: P and D run the same DP-attention sharding, so each rank
+        owns whole requests and there is nothing to stripe."""
+        parallel_config = self.vllm_config.parallel_config
+        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        tp_size = int(self.tp_size)
+        dp_size = int(parallel_config.data_parallel_size or 1)
+        if pcp_size != 1 or tp_size != 1:
+            raise ValueError(
+                "Raiden DSv4 admission supports DP attention only "
+                f"(tp1/pcp1); got tensor_parallel_size={tp_size}, "
+                f"prefill_context_parallel_size={pcp_size}")
+        return (f"dp{dp_size}_prefill"
+                if self.is_producer else f"dp{dp_size}_decode")
+
+    @staticmethod
+    def _measure_raiden_dsv4_layout(
+        manifest: Any, ) -> tuple[str, dict[str, Any]]:
+        from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
+            measured_dsv4_layout_fingerprint,
+        )
+
+        return measured_dsv4_layout_fingerprint(manifest)
+
     @staticmethod
     def _measure_raiden_fa_layout(
         manifest: Any, ) -> tuple[str, dict[str, Any]]:
@@ -1723,6 +1986,14 @@ class TPURaidenConnectorWorker:
     def _measure_stage3_layout(
             self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
+        if _use_raiden_dsv4_admission():
+            fingerprint, payload = self._measure_raiden_dsv4_layout(manifest)
+            # DSv4's roles page at different sizes, so the single page_tokens
+            # the controller registers is only the nominal one; the real
+            # per-tag geometry travels in the fingerprint and in each span
+            # registration.
+            page_tokens = int(self.vllm_config.cache_config.block_size)
+            return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
@@ -1737,6 +2008,14 @@ class TPURaidenConnectorWorker:
             self, transfer_parallelism: int) -> None:
         """The producer must shard the transfer over exactly the rank set its
         byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise."""
+        if _use_raiden_dsv4_admission():
+            # DP attention: every rank owns whole requests, so there is one
+            # transfer rank and no page striping.
+            if transfer_parallelism != 1:
+                raise ValueError(
+                    "DSv4 producer transfer parallelism must be 1 under DP "
+                    f"attention; got {transfer_parallelism}")
+            return
         if _use_raiden_glm_admission():
             if transfer_parallelism != self.tp_size:
                 raise ValueError(
@@ -1787,6 +2066,9 @@ class TPURaidenConnectorWorker:
             return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
+        if _use_raiden_dsv4_admission():
+            # DP attention: one transfer rank per engine.
+            return 0
         from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
 
         return int(get_pcp_cache_rank())
@@ -2055,7 +2337,9 @@ class TPURaidenConnectorWorker:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             if self._raiden_stage3_enabled():
-                if _use_raiden_glm_admission():
+                if _use_raiden_dsv4_admission():
+                    self._register_stage3_request_blocks_dsv4(metadata)
+                elif _use_raiden_glm_admission():
                     self._register_stage3_request_blocks_glm(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
@@ -2481,6 +2765,156 @@ class TPURaidenConnectorWorker:
             }
             logger.info("%s", json.dumps(event, sort_keys=True))
 
+    def _stage3_dsv4_group_blocks(self, req_meta: Any) -> list[list[int]]:
+        """The request's per-cache-group block tables, in plan order."""
+        group_block_ids = getattr(req_meta, "group_block_ids", None)
+        if not group_block_ids:
+            raise RuntimeError(
+                "DSv4 Stage-3 transfers require one block table per KV cache "
+                "group; the scheduler supplied none")
+        if len(group_block_ids) != self._stage3_dsv4_group_count:
+            raise RuntimeError(
+                "DSv4 Stage-3 block tables do not match the admitted transfer "
+                f"plan: tables={len(group_block_ids)}, "
+                f"groups={self._stage3_dsv4_group_count}")
+        return [[int(block_id) for block_id in ids] for ids in group_block_ids]
+
+    def _register_stage3_request_blocks_dsv4(
+            self, metadata: TPUConnectorMetadata) -> None:
+        """Registers this producer's span set, one registration per pool tag.
+
+        Under DP attention this rank owns every page of every request it
+        prefilled, so the striping degenerates to `parallelism=1`. What DSv4
+        adds over GLM is that the tags no longer share a block table: each
+        one is lowered against its own cache group's pages.
+        """
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_dsv4_row_spans,
+        )
+
+        facade, _ = self._require_stage3_controller()
+        if self._raiden_work_unit is None:
+            raise RuntimeError("Stage-3 producer work unit is not registered")
+        if not self._stage3_dsv4_plan:
+            raise RuntimeError("DSv4 pool plan is missing; admission did not "
+                               "complete")
+        parallelism = self._raiden_transfer_parallelism()
+        transfer_rank = self._local_raiden_transfer_rank()
+
+        now = time.perf_counter()
+        for req_id in [
+                req_id for req_id, registration in
+                self._stage3_terminal_sends.items()
+                if registration.expiration_time <= now
+        ]:
+            self._stage3_terminal_sends.pop(req_id, None)
+            self._stage3_reported_sends.discard(req_id)
+            self._stage3_prune_state_send_tracking(req_id)
+
+        for req_id, req_meta in metadata.reqs_to_send.items():
+            uuid = int(req_meta.uuid)
+            num_tokens = int(req_meta.num_tokens or 0)
+            expiration_time = float(req_meta.expiration_time)
+            if num_tokens <= 0:
+                raise ValueError(
+                    "Stage-3 producer send metadata requires num_tokens")
+            if expiration_time <= 0:
+                raise ValueError(
+                    "Stage-3 producer send metadata requires a positive "
+                    "expiration_time")
+            group_blocks = self._stage3_dsv4_group_blocks(req_meta)
+            pool_spans = [
+                lower_dsv4_row_spans(
+                    tag=pool.tag,
+                    num_tokens=num_tokens,
+                    transfer_rank=transfer_rank,
+                    parallelism=parallelism,
+                    page_tokens=pool.page_tokens,
+                    live_bytes_per_block=pool.live_bytes_per_block,
+                    row_bytes=pool.row_bytes,
+                    block_ids=group_blocks[pool.plan_position],
+                ) for pool in self._stage3_dsv4_plan
+            ]
+            owned_spans = sum(len(reg.spans) for reg in pool_spans)
+            # The controller keys D5 on one block list per request, so the
+            # per-tag pages ride in the span registrations and this list is
+            # the primary group's.
+            registered_ids = tuple(group_blocks[0]) if owned_spans else ()
+            if not owned_spans:
+                pool_spans = []
+            terminal = self._stage3_terminal_sends.get(req_id)
+            if terminal is not None:
+                if (terminal.uuid != uuid
+                        or terminal.local_block_ids != registered_ids
+                        or terminal.num_tokens != num_tokens):
+                    raise ValueError(
+                        "Conflicting replay after terminal Stage-3 producer "
+                        f"registration for req_id={req_id}")
+                continue
+            existing = self._stage3_registered_sends.get(req_id)
+            if existing is not None:
+                if (existing.uuid != uuid
+                        or existing.local_block_ids != registered_ids
+                        or existing.num_tokens != num_tokens):
+                    raise ValueError(
+                        "Conflicting duplicate Stage-3 producer registration "
+                        f"for req_id={req_id}")
+                continue
+            try:
+                facade.register_request_blocks(
+                    req_id=req_id,
+                    uuid=uuid,
+                    unit=self._raiden_work_unit,
+                    block_ids=list(registered_ids),
+                    pool_spans=pool_spans,
+                )
+            except (RuntimeError, ValueError) as exc:
+                if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
+                    raise
+                tombstone_deadline = (
+                    time.perf_counter() +
+                    float(dist_utils.get_p2p_wait_pull_timeout()))
+                self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
+                    uuid=uuid,
+                    local_block_ids=registered_ids,
+                    num_tokens=num_tokens,
+                    expiration_time=tombstone_deadline,
+                )
+                self._done_sending.add(req_id)
+                logger.warning(
+                    "TPURaidenConnectorWorker rank%d --> Stage-3 DSv4 "
+                    "registration was already cancelled req_id=%s uuid=%d",
+                    self.tp_rank, req_id, uuid)
+                continue
+            self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
+                uuid=uuid,
+                local_block_ids=registered_ids,
+                num_tokens=num_tokens,
+                expiration_time=expiration_time,
+            )
+            if not owned_spans:
+                self._stage3_send_outcomes.setdefault(req_id, "done")
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event":
+                        "raiden_stage3_dsv4_request_blocks_registered",
+                        "req_id": req_id,
+                        "uuid": uuid,
+                        "num_tokens": num_tokens,
+                        "transfer_rank": transfer_rank,
+                        "parallelism": parallelism,
+                        "group_pages": [len(ids) for ids in group_blocks],
+                        "declared_bytes": {
+                            reg.tag: reg.declared_bytes
+                            for reg in pool_spans
+                        },
+                    },
+                    sort_keys=True,
+                ),
+            )
+
     @staticmethod
     def _raiden_hbm_memory_type() -> Any:
         from tpu_sync.rpc.raiden_controller import RaidenMemoryType
@@ -2818,11 +3252,26 @@ class TPURaidenConnectorWorker:
                 # order fixes the H2D order ranks executor-side (the first
                 # tag = group 0 uploads first). Each tag replays over the
                 # same destination pages.
-                transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS
-                                     if _use_raiden_glm_admission(
-                                     ) else _STAGE3_TRANSFER_POOL_TAGS)
-                dst_blocks = list(local_blocks) * len(transfer_tags)
-                dst_counts = [len(local_blocks)] * len(transfer_tags)
+                if _use_raiden_dsv4_admission():
+                    # Each DSv4 tag replays over its own cache group's pages,
+                    # not one shared page list: the groups' block IDs are
+                    # disjoint, and that disjointness is the only thing
+                    # separating the caches that alias one array.
+                    group_blocks = self._stage3_dsv4_group_blocks(req_meta)
+                    transfer_tags = []
+                    dst_blocks = []
+                    dst_counts = []
+                    for pool in self._stage3_dsv4_plan:
+                        pages = group_blocks[pool.plan_position]
+                        transfer_tags.append(pool.tag)
+                        dst_blocks.extend(pages)
+                        dst_counts.append(len(pages))
+                else:
+                    transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS
+                                         if _use_raiden_glm_admission(
+                                         ) else _STAGE3_TRANSFER_POOL_TAGS)
+                    dst_blocks = list(local_blocks) * len(transfer_tags)
+                    dst_counts = [len(local_blocks)] * len(transfer_tags)
                 mamba_state_block_ids = getattr(req_meta,
                                                 "mamba_state_block_ids", None)
                 if self._stage3_state_group_count:
