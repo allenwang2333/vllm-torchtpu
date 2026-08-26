@@ -50,11 +50,18 @@ NUM_KV_HEADS = 1
 HEAD_DIM = 128
 MAX_MODEL_LEN = 9216  # what makes the old code return 16 and the new one 256
 
-# bf16 output of a length-8192 softmax-weighted sum: the reference accumulates
-# in a different order than the kernel's blocked flash pass, so exact equality
-# is not the bar. 5e-2 is ~4x bf16's 2^-8 relative step at these magnitudes and
-# is still 20x below what the negative control moves the output by.
-ATOL = 5e-2
+# bf16 output of a long softmax-weighted sum: the reference accumulates in a
+# different order than the kernel's blocked flash pass, so exact equality is not
+# the bar. Job j-c82635ab measured the worst pallas-vs-ref gap at 0.0703 on
+# `prefill_fresh` (mean 0.0054 over 2M elements, ~18 bf16 ulps) -- and measured
+# it *identically at page 16 and page 256*, so it is a property of the reference
+# comparison, not of paging. 0.1 covers it with margin. The page-size claim
+# itself does not rest on this number: it rests on `cross_page_size`, which is
+# an exact equality.
+ATOL = 1e-1
+# The control perturbs a query vector and requires the output to move. Sized off
+# measurement, not guesswork: a single-element bump moved it 0.15, and the
+# whole-vector bump below moves it much further. 10x ATOL leaves room for both.
 CONTROL_MIN_DIFF = 1.0
 
 
@@ -196,11 +203,22 @@ def _call(fn, built, distribution, *, q_dtype, kv_dtype, perturb=False):
 
     Fresh every time: the kernel donates its cache, so a second call would see
     a buffer the first one already mutated.
+
+    ``perturb`` drives the negative control. It moves the **last** query token
+    of every sequence, and moves the whole 128-wide vector rather than one
+    element. Both details are load-bearing, and job j-c82635ab is why: the first
+    version bumped `queries[0, 0, 0]`, and on a fresh prefill (q_len == kv_len)
+    the causal mask leaves token 0 attending to exactly one key, so its softmax
+    is 1.0 whatever the logit and the output provably cannot move. That arm read
+    `control_diff: 0.0` -- a correct kernel making the control vacuous. The last
+    token of a sequence always attends to its full context, so no masking regime
+    can silence it.
     """
     queries = built["queries"]
     if perturb:
         queries = queries.copy()
-        queries[0, 0, 0] += 50.0
+        for end in built["cu_q_lens"][1:]:
+            queries[int(end) - 1, :, :] += 50.0
     out, cache = fn(
         jnp.asarray(queries, q_dtype),
         jnp.asarray(built["keys"], kv_dtype),
@@ -217,10 +235,19 @@ def _call(fn, built, distribution, *, q_dtype, kv_dtype, perturb=False):
 
 
 def _diff(a: np.ndarray, b: np.ndarray) -> dict:
+    """``b`` is the baseline, so the scale columns describe ``b``.
+
+    An absolute tolerance says nothing without the magnitude it applies to, and
+    the first version of this file shipped an atol chosen before anyone had seen
+    one. Reporting the baseline's scale means the next reader can judge the
+    tolerance from the record instead of re-deriving it.
+    """
     delta = np.abs(a - b)
     return {
         "max_abs_diff": float(delta.max(initial=0.0)),
         "mean_abs_diff": float(delta.mean()),
+        "baseline_abs_max": float(np.abs(b).max(initial=0.0)),
+        "baseline_rms": float(np.sqrt(np.mean(np.square(b, dtype=np.float64)))),
         "finite": bool(np.isfinite(a).all()),
     }
 
