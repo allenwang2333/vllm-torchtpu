@@ -80,35 +80,38 @@ class KimiSequenceParallel:
         return cls(mesh=mesh, token_sizes=ordered_compile_sizes)
 
     def shard_model_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
+        return self._shard_tokens(hidden_states)
+
+    def _shard_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.mesh is None:
+            return hidden_states
         return self.mesh.shard_tokens(
             hidden_states,
             full_token_sizes=self.token_sizes,
         )
 
+    def _all_gather_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.mesh is None:
+            return hidden_states
+        return self.mesh.all_gather_tokens(hidden_states)
+
     def gather_attention_input(self,
                                hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
-        return self.mesh.all_gather_tokens(hidden_states)
+        return self._all_gather_tokens(hidden_states)
 
     def reduce_attention_output(self,
                                 hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
+        if self.mesh is None:
+            return hidden_states
         return self.mesh.reduce_attention_output(hidden_states)
 
     def gather_feed_forward_input(self,
                                   hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
-        return self.mesh.all_gather_tokens(hidden_states)
+        return self._all_gather_tokens(hidden_states)
 
     def shard_feed_forward_output(self,
                                   hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
-        return self.mesh.shard_tokens(
-            hidden_states,
-            full_token_sizes=self.token_sizes,
-        )
+        return self._shard_tokens(hidden_states)
 
     def gather_model_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.mesh is not None
-        return self.mesh.all_gather_tokens(hidden_states)
+        return self._all_gather_tokens(hidden_states)
