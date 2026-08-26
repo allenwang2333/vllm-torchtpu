@@ -650,8 +650,10 @@ class DFlashProposer:
                 tuple([dummy_attn_metadata] *
                       len(self.draft_model.model.layers)))
             # The result is never consumed, so materialize it here or the
-            # deferred program is never enqueued.
-            synchronize_tensors(out, wait=sync)
+            # deferred program is never enqueued. torch-tpu syncs one
+            # tensor per call; all handles come from the one program.
+            for attn_out in out:
+                synchronize_tensors(attn_out, wait=sync)
 
     def _dummy_forward_inputs(
         self,
