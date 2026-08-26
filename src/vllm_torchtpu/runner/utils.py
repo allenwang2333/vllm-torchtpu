@@ -176,6 +176,9 @@ class PhaseBasedProfiler:
         self.world_size = world_size
         self.profile_context: Optional[Any] = None
         self._canonical_dst_ts: Optional[str] = None
+        # (path, payload) pairs buffered during a capture; see
+        # _write_batch_composition_stats_to_file_helper.
+        self._pending_batch_composition_stats: list[tuple[str, str]] = []
 
         logger.info(
             "Phase-based profiler enabled. Traces will be saved to: %s",
@@ -194,7 +197,17 @@ class PhaseBasedProfiler:
 
     def _write_batch_composition_stats_to_file_helper(
             self, batch_composition_stats: dict) -> None:
-        """Writes the batch composition stats to a file."""
+        """Buffers the batch composition stats for the end of the phase.
+
+        This runs inside ``execute_model``, before ``_dp_coordinated_step``.
+        Doing the ``open()``+``write()`` here costs 140-160 ms of host time per
+        step on a network filesystem -- and because it lands ahead of the DP
+        barrier, that cost desynchronizes the ranks by up to a full step, which
+        is precisely the quantity a phased capture exists to measure. Only the
+        filename timestamp has to be sampled per step; the I/O does not, so it
+        is deferred to :meth:`_flush_batch_composition_stats` at phase end.
+        The files produced are the same, with the same names and contents.
+        """
         if not self.profile_dir_with_phase_suffix:
             return
         now = datetime.datetime.now()
@@ -204,11 +217,19 @@ class PhaseBasedProfiler:
             self.profile_dir_with_phase_suffix,
             f"batch_composition_stats_{date_string_in_profiler_format}.json",
         )
-        try:
-            with open(stats_file, "w") as f:
-                f.write(json.dumps(batch_composition_stats) + "\n")
-        except Exception as e:
-            logger.warning("Failed to write batch composition stats: %s", e)
+        self._pending_batch_composition_stats.append(
+            (stats_file, json.dumps(batch_composition_stats) + "\n"))
+
+    def _flush_batch_composition_stats(self) -> None:
+        """Writes the stats buffered during the phase, then clears it."""
+        pending = self._pending_batch_composition_stats
+        self._pending_batch_composition_stats = []
+        for stats_file, payload in pending:
+            try:
+                with open(stats_file, "w") as f:
+                    f.write(payload)
+            except Exception as e:
+                logger.warning("Failed to write batch composition stats: %s", e)
 
     def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
         """Resolve the canonical destination timestamp for this phase."""
@@ -308,6 +329,9 @@ class PhaseBasedProfiler:
                 logger.error("Failed to stop PyTorch profiler: %s", e)
             self.profile_context = None
 
+        # Must precede the merge: the stats files belong to the rank capture
+        # sandbox that _merge_profile_directories consolidates.
+        self._flush_batch_composition_stats()
         self._merge_profile_directories()
         logger.info(f"Profiling for {self.current_phase} phase finished")
         self.current_phase = ""
