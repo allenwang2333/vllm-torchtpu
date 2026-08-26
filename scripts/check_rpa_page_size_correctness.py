@@ -20,6 +20,10 @@ JAX reference that ships beside the Pallas kernel):
      cannot see.
   3. A negative control per case: perturbing one input must move the output by
      much more than the tolerance, so a silently-zeroed kernel cannot pass.
+  4. That the reference itself has signal, because at long context with an fp8
+     cache it does not -- see REF_MIN_RMS. Run the reference comparison with
+     `--kv-cache-dtype bf16`; the fp8 arm still carries checks 1-3 and the
+     cross-page-size comparison, which do not involve the reference.
 
 Cases cover the three `distribution` regimes the serving path produces: pure
 decode, chunked prefill with history, and a batch mixing both.
@@ -63,6 +67,25 @@ ATOL = 1e-1
 # measurement, not guesswork: a single-element bump moved it 0.15, and the
 # whole-vector bump below moves it much further. 10x ATOL leaves room for both.
 CONTROL_MIN_DIFF = 1.0
+
+# The reference must itself have signal, or agreeing with it proves nothing.
+#
+# This is not hypothetical. `ref_ragged_paged_attention` does
+# `jax.nn.softmax(attn, axis=-1).astype(v.dtype)` (v3/kernel.py:200), casting the
+# attention weights to the KV dtype. With an fp8 cache that is float8_e4m3fn,
+# whose smallest subnormal is 2^-9 = 0.001953125 -- so a decode over 8192 keys,
+# whose near-uniform weights are ~1/8192 = 1.2e-4, underflows *every* weight to
+# zero and the reference returns an exactly-zero tensor. Job j-9037b4cc read
+# `baseline_abs_max: 0.0` on decode and prefill_with_history, and exactly one
+# fp8 subnormal (0.001953125) on mixed_batch, for precisely this reason. The
+# Pallas kernel does not round its weights that way and returned the correct
+# ~0.02 magnitude, so those three cases were scoring the kernel against zeros
+# and calling the agreement a pass.
+#
+# Run with --kv-cache-dtype bf16 to get a reference that means something at long
+# context; the fp8 arm remains meaningful for cross_page_size, which compares
+# the kernel against itself.
+REF_MIN_RMS = 1e-3
 
 
 def _load_kernel(repo_root: Path):
@@ -344,8 +367,13 @@ def main() -> None:
             record["cache_vs_ref"] = _diff(pal_cache, ref_cache)
             record["control_diff"] = float(
                 np.abs(ctrl_out - pal_out).max(initial=0.0))
+            # A reference that returned zeros agrees with anything small. Fail
+            # loudly instead of banking the agreement -- see REF_MIN_RMS.
+            record["ref_degenerate"] = bool(
+                record["output_vs_ref"]["baseline_rms"] < REF_MIN_RMS)
             record["passed"] = bool(
                 record["output_vs_ref"]["finite"]
+                and not record["ref_degenerate"]
                 and record["output_vs_ref"]["max_abs_diff"] <= ATOL
                 and record["cache_vs_ref"]["max_abs_diff"] <= ATOL
                 and record["control_diff"] >= CONTROL_MIN_DIFF)
