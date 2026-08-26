@@ -21,7 +21,8 @@ import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, MambaSpec)
+                                        KVCacheGroupSpec, MambaSpec,
+                                        MLAAttentionSpec, SlidingWindowMLASpec)
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -32,7 +33,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
     _Stage3RegisteredSend, _select_committed_mamba_blocks,
-    stage3_fa_raiden_id_fields)
+    _stage3_transfer_groups, stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -90,6 +91,89 @@ def _make_stage3_hybrid_kv_cache_config(
     return KVCacheConfig(num_blocks=0,
                          kv_cache_tensors=[],
                          kv_cache_groups=groups)
+
+
+def _make_stage3_dsv4_kv_cache_config() -> KVCacheConfig:
+    """A DeepSeek-V4-shaped config: several attention groups, no Mamba.
+
+    Page sizes differ per group by design. The SWA group's block covers an
+    eighth of the CSA group's tokens at the same byte size, so no single
+    connector-wide page size can validate both.
+    """
+    return KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn"],
+                kv_cache_spec=MLAAttentionSpec(
+                    block_size=1024,
+                    num_kv_heads=1,
+                    head_size=1024,
+                    dtype=torch.uint8,
+                    compress_ratio=4,
+                    model_version="deepseek_v4",
+                ),
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.self_attn.indexer"],
+                kv_cache_spec=MLAAttentionSpec(
+                    block_size=1024,
+                    num_kv_heads=1,
+                    head_size=256,
+                    dtype=torch.uint8,
+                    compress_ratio=4,
+                    model_version="deepseek_v4",
+                ),
+            ),
+            KVCacheGroupSpec(
+                layer_names=["model.layers.1.self_attn"],
+                kv_cache_spec=SlidingWindowMLASpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=1024,
+                    dtype=torch.uint8,
+                    sliding_window=512,
+                    model_version="deepseek_v4",
+                ),
+            ),
+        ],
+    )
+
+
+def test_stage3_transfer_groups_skips_mamba_state_groups():
+    """Mamba state rides the state-class tags, not the page transfer."""
+    config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
+    groups = _stage3_transfer_groups(config.kv_cache_groups,
+                                     allow_multiple=False)
+    assert [(group.index, group.block_size) for group in groups] == [(2, 16)]
+
+
+def test_stage3_transfer_groups_rejects_several_groups_by_default():
+    with pytest.raises(ValueError, match="exactly one"):
+        _stage3_transfer_groups(
+            _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
+            allow_multiple=False)
+
+
+def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
+    hybrid = _make_stage3_hybrid_kv_cache_config(fa_group_index=0)
+    mamba_only = [
+        group for group in hybrid.kv_cache_groups
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    with pytest.raises(ValueError, match="at least one non-Mamba"):
+        _stage3_transfer_groups(mamba_only, allow_multiple=True)
+
+
+def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
+    """Group order is preserved and each group carries its own page size."""
+    groups = _stage3_transfer_groups(
+        _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
+        allow_multiple=True)
+    assert [(group.index, group.block_size) for group in groups] == [(0, 1024),
+                                                                     (1, 1024),
+                                                                     (2, 128)]
 
 
 @pytest.mark.parametrize(("num_speculative_blocks", "expected"),
@@ -385,6 +469,42 @@ class TestTPUConnector:
             request, [30, 31], mamba_block_ids=[[10], [20], [40]])
         assert (mock_raiden_sched_cls.return_value.
                 _stage3_mamba_num_speculative_blocks == 3)
+        mock_raiden_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    def test_stage3_dsv4_admission_plans_every_attention_group(
+            self, mock_raiden_sched_cls, mock_raiden_worker_cls):
+        cfg = _make_vllm_config(is_producer=True)
+        cache_config = _make_stage3_dsv4_kv_cache_config()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                       True,
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                           True,
+                           create=True):
+            connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                                     cache_config)
+
+            assert [
+                group.index for group in connector._stage3_transfer_groups
+            ] == [0, 1, 2]
+            assert connector.get_block_ids_with_load_errors_group_index() == 0
+            assert (mock_raiden_sched_cls.return_value._stage3_transfer_groups
+                    is connector._stage3_transfer_groups)
+
+            # Until the wire arrays carry one block list per group, a
+            # multi-group model must fail rather than ship group 0 alone.
+            with pytest.raises(NotImplementedError,
+                               match="per-group block lists"):
+                connector.request_finished_all_groups(MagicMock(),
+                                                      ([1], [2], [3, 4]))
+
+        mock_raiden_sched_cls.return_value.request_finished.assert_not_called()
         mock_raiden_worker_cls.assert_not_called()
 
     @patch(f"{_MOD}.TPURaidenConnectorWorker")
