@@ -7,7 +7,11 @@ ISL 8192 / OSL 1024 / concurrency 256. Baseline commit `78cd999d`.
 
 **1.819x total and output token throughput**, from a scheduler change plus three environment
 variables. Arithmetic is unchanged: a greedy (`temperature=0`) probe is bit-identical to the
-baseline across every job in the campaign.
+baseline in every job that ran this configuration, across two images and two nodes.
+
+(The one job that broke bit-identity was the rejected mnbt=4096 variant — see below. Changing
+`--max-num-batched-tokens` alters the compiled bucket ladder and *can* perturb arithmetic, so treat
+bit-identity as a property to re-verify per configuration rather than an assumption.)
 
 | Metric | Baseline `78cd999d` | With `TPU_DP_PREFILL_*` | Ratio |
 | --- | ---: | ---: | ---: |
@@ -101,6 +105,7 @@ independently-measured quantities. `W` controls burstiness only.
 | `TPU_MOE_COLLECTION_CHUNK_SIZE=8192` | Null (-0.36%, sub-noise) | Sized against inflated steps, which the scheduler fix already made rare. Bit-identical output, as predicted. |
 | Counting sort for the MoE routing permute | Dead | 0.45-0.76x slower at every shape on real hardware, *and* wrong (parity MISMATCH at 4096 tokens). The `O(n log n) -> O(n)` argument does not survive contact with a TPU: the `[N, experts+1]` prefix sum costs more than the comparison sort. |
 | Eliminate per-layer padding-mask all-gathers | Dead | XLA already CSE'd 60 into 1; total cost <=0.18% of a step. |
+| `--max-num-batched-tokens` 2048 -> 4096 | **-18.5% throughput** | The mirror image of the 1024 experiment: TTFT improved (P99 50.5 -> 40.0 s) and decode got worse (mean ITL 62.4 -> 80.9 ms). `f` did **not** fall as predicted — it stayed pinned at 1/8 — so the bucket doubled in cost while staying only 46% full of real prefill tokens. Also **broke bit-identity**. |
 
 ## Budget model for future work
 
@@ -112,18 +117,61 @@ This predicts measured req/s to within ~5% and is the arithmetic to run before p
 that trades prefill against decode. Decode latency is not privileged: at OSL 1024 a 1 ms/step ITL
 win is worth ~1 s, while TTFT regressions run to tens of seconds.
 
-**Top candidate:** `--max-num-batched-tokens=4096`. The whole step scales *sublinearly* (1.80x for
-2x the tokens, 162 -> 292 ms), so cost per prefill token *falls* with a larger bucket (0.158 ms at
-mnbt 1024 vs 0.143 ms at 2048). If that continues, `f` falls to ~6%, mean ITL improves ~7%, and TTFT
-improves because an 8k prompt chunks 2 ways instead of 4 — the only idea here that moves both terms
-of the budget the same direction. Pair it with `TPU_DP_PREFILL_DRAIN_STEPS=1` to hold prefill supply
-at the shipped `W * mnbt / interval = 512` tokens/step, and raise the startup timeout: it adds a
-12th compiled bucket to a warmup that already takes ~7000 s.
+Validated three times, most sharply on the mnbt=4096 run, where `TTFT + OSL * ITL` predicts mean E2EL
+to **+0.10%** on both passes.
 
-A microbench gated this (chained `all_gather` -> `psum_scatter`, 8 real cores, bf16, hidden 4096):
-predicted 4096-token step **549 ms, ratio 1.878x**, cost/prefill-token 0.1428 -> 0.1340 ms. The same
-composition applied to the *measured* 1024 -> 2048 transition predicts 288.3 ms against an actual
-292.4 ms, so the extrapolation is good to ~1.4% one octave down.
+## mnbt=2048 is an optimum, bracketed by measured losses on both sides
+
+| mnbt | total tok/s | vs 2048 | mean ITL | TTFT P99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 25,095.57 | **-21.2%** | 43.54 ms | 69,727.80 ms |
+| **2048** | **31,859.46** | — | 62.39 ms | 50,534.39 ms |
+| 4096 | 25,977.97 | **-18.5%** | 80.85 ms | 39,963.89 ms |
+
+The two failures are mirror images. Shrinking the bucket buys decode and pays for it in TTFT
+(chunk count rises); growing it buys TTFT and pays for it in decode. Since `OSL * ITL` is ~90% of
+E2EL at OSL 1024, the decode side dominates and both directions lose.
+
+## `f` is pinned by the prefill cadence, not by `mnbt` or `W`
+
+The slow-step fraction `f = (mean ITL - median ITL) / (P90 ITL - median ITL)` is the same in **every**
+run with the scheduler fix enabled, across a 4x range of `mnbt` and `W` in {1, 2, 4}:
+
+| run | mnbt | `W` | `f` |
+| --- | ---: | ---: | ---: |
+| baseline (fix off) | 2048 | — | 42.80% |
+| J1 / K1 / J5 | 2048 | 2 | 11.99 / 12.26 / 12.01% |
+| C1 | 1024 | 4 | 12.08% |
+| J7 | 4096 | 1 | 12.41% |
+
+All land within 4% of **1/8 = `1 / --prefill-schedule-interval`**. The mechanism is quantization: a
+step is inflated if *any* of the 8 ranks prefills, the scheduler synchronizes the ranks onto a shared
+cadence window, and each rank's per-period prefill demand fits inside **one** chunk — so exactly one
+step per period of 8 is inflated, whatever the bucket size.
+
+    f = ceil(prefill tokens per rank per period / mnbt) / prefill_schedule_interval
+
+That numerator is fixed by throughput and ISL, not by `mnbt`. So **doubling `mnbt` does not halve `f`
+— it just makes the same one inflated step per period twice as expensive while leaving it half
+empty.** At mnbt 2048 the inflated step is ~86% real prefill tokens; at 4096, ~46%. Cost per *real*
+prefill token accordingly went the wrong way, 0.165 -> 0.231 ms.
+
+**Untested consequence, and the best remaining candidate:** the ceiling is what wastes the bucket, so
+raise `--prefill-schedule-interval` **together with** `mnbt` to refill it. At mnbt 4096 and interval
+16, per-period demand roughly doubles to ~91% of the bucket, `ceil()` still returns 1, and
+`f` -> 1/16 = 6.25%. With the measured 431 ms cost of the 4096 step that gives mean ITL ~56 ms and
+~+15% throughput. `W=1` still suffices for supply. Two caveats before spending a job: the projection
+is self-referential (demand depends on the throughput it predicts), and it doubles the wait for an
+admission window, which the model charges nothing for.
+
+## A step-cost microbench is necessary but not sufficient
+
+A chained `all_gather` -> `psum_scatter` microbench correctly predicted that step cost keeps scaling
+sublinearly to bucket 4096 — it put the step at 549 ms against an actual ~431 ms, erring on the
+pessimistic side, and reproduced the measured 1024 -> 2048 step cost to 1.4%. It still led to a
+losing experiment, because the question it answered ("what does one inflated step cost?") was not the
+question that decides the outcome ("how often is a step inflated, and how full is it?"). Cost per
+prefill token is only a valid invariant when the bucket is full.
 
 ## Collectives are sublinear — do not size them off trace durations
 
