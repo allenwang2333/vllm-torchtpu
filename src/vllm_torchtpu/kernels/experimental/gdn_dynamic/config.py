@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
+DEFAULT_VMEM_LIMIT_FACTOR: float = 0.70
 
 
 class GDNMode(enum.StrEnum):
