@@ -58,9 +58,6 @@ class DFlashProposer:
         assert self.mask_token_id is not None, (
             "DFlash requires `mask_token_id` to be defined in the draft model's config.json "
             "under the `dflash_config` dictionary.")
-        # Without tagged target layers no aux hidden states flow to the
-        # draft; the failure would otherwise surface much later as a width
-        # mismatch inside the compiled KV update.
         self._target_layer_ids: list[int] = list(
             self.dflash_config.get("target_layer_ids") or [])
         if not self._target_layer_ids:
