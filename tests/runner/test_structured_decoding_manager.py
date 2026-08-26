@@ -133,6 +133,31 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[0].tolist() == [0, 0]
         assert bitmask[1].tolist() == [BLOCK_ALL, BLOCK_ALL]
 
+    def test_prefetch_inputs_fast_path(self):
+        manager = make_manager(max_num_reqs=2,
+                               req_id_to_index={
+                                   "req0": 0,
+                                   "req1": 1
+                               })
+        manager.runner.input_batch.num_reqs = 2
+        manager.runner.num_reqs_paddings = [2, 4]
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            [[ALLOW_ALL, BLOCK_ALL], [BLOCK_ALL, ALLOW_ALL]],
+        )
+        # Prefetch inputs
+        manager.prefetch_inputs(grammar_output)
+        assert manager._prefetched_input is not None
+
+        # Prepare inputs uses prefetched tensors
+        logits = torch.zeros(2, VOCAB_SIZE)
+        require, bitmask = manager.prepare_structured_decoding_input(
+            logits, grammar_output, 0, 2)
+        assert require[:, 0].tolist() == [True, True]
+        assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
+        assert bitmask[1].tolist() == [BLOCK_ALL, ALLOW_ALL]
+        assert manager._prefetched_input is None
+
 
 class TestStructuredDecode:
 

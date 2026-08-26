@@ -3341,6 +3341,9 @@ class TPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
         # Update cached state
         self._update_states(scheduler_output)
+        if getattr(scheduler_output, "grammar_output", None) is not None:
+            self.structured_decoding_manager.prefetch_inputs(
+                scheduler_output.grammar_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:

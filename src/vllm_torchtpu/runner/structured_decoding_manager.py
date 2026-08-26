@@ -39,6 +39,8 @@ class StructuredDecodingManager:
         self.device_all_false_require = torch.zeros((runner.max_num_reqs, 1),
                                                     dtype=torch.bool,
                                                     device=self.device)
+        self._prefetched_input: tuple[torch.Tensor, torch.Tensor, int, int,
+                                      int] | None = None
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -66,6 +68,40 @@ class StructuredDecodingManager:
                 device="cpu",
                 pin_memory=PIN_MEMORY)
 
+    def prefetch_inputs(self, grammar_output: GrammarOutput | None) -> None:
+        """Asynchronously prefetches and issues DMA for bitmasks during model forward."""
+        if grammar_output is None:
+            self._prefetched_input = None
+            return
+        bitmask = grammar_output.grammar_bitmask
+        if bitmask is None:
+            self._prefetched_input = None
+            return
+        num_reqs = getattr(self.runner.input_batch, "num_reqs", None)
+        if num_reqs is None or num_reqs <= 0:
+            self._prefetched_input = None
+            return
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+        paddings = getattr(self.runner, "num_reqs_paddings",
+                           [8, 16, 32, 64, 128, 256])
+        padded_num_reqs = _get_padded_token_len(paddings, num_reqs)
+        req_ids = grammar_output.structured_output_request_ids
+        if len(req_ids) == num_reqs == padded_num_reqs:
+            bitmask_slice = bitmask[:padded_num_reqs]
+            bitmask_tensor = (bitmask_slice if isinstance(
+                bitmask_slice, torch.Tensor) else
+                              torch.from_numpy(bitmask_slice))
+            bitmask_dev = bitmask_tensor.to(self.device, non_blocking=True)
+            self._prefetched_input = (
+                self.device_all_true_require[:padded_num_reqs],
+                bitmask_dev,
+                0,
+                num_reqs,
+                padded_num_reqs,
+            )
+        else:
+            self._prefetched_input = None
+
     def prepare_structured_decoding_input(
         self,
         logits: torch.Tensor,
@@ -82,6 +118,13 @@ class StructuredDecodingManager:
         chunk are skipped.
         """
         padded_num_reqs = logits.shape[0]
+        if self._prefetched_input is not None:
+            req_dev, bit_dev, c_start, c_end, c_padded = self._prefetched_input
+            if (c_start == cur_start_idx and c_end == cur_end_idx
+                    and c_padded == padded_num_reqs
+                    and bit_dev.device == logits.device):
+                self._prefetched_input = None
+                return req_dev, bit_dev
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
         bitmask = grammar_output.grammar_bitmask
