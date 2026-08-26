@@ -33,8 +33,11 @@ class StructuredDecodingManager:
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
         self.device = getattr(runner, "device", "cpu")
-        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
-        self.structured_decode_arange = torch.arange(0, 32, device=self.device)
+        # Pre-allocate directly on device as int32 to avoid repeated host-to-device transfers and dtype promotion
+        self.structured_decode_arange = torch.arange(0,
+                                                     32,
+                                                     dtype=torch.int32,
+                                                     device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -96,10 +99,19 @@ class StructuredDecodingManager:
                 mask_rows.append(mask_row)
 
         if local_indices:
-            if len(local_indices) == 1:
+            num_local = len(local_indices)
+            if num_local == 1:
                 self.grammar_bitmask_cpu[local_indices[0]].copy_(
                     torch.from_numpy(bitmask[mask_rows[0]]))
                 self.require_structured_out_cpu[local_indices[0]] = True
+            elif (num_local == padded_num_reqs and local_indices[0] == 0
+                  and local_indices[-1] == padded_num_reqs - 1
+                  and mask_rows[0] == 0
+                  and mask_rows[-1] == padded_num_reqs - 1):
+                # Fast path: contiguous full-batch structured output (no indexing copy)
+                self.grammar_bitmask_cpu[:padded_num_reqs].copy_(
+                    torch.from_numpy(bitmask[:padded_num_reqs]))
+                self.require_structured_out_cpu[:padded_num_reqs] = True
             else:
                 self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
                     bitmask[mask_rows])
@@ -294,14 +306,6 @@ class StructuredDecodingManager:
         logits: torch.Tensor,
         arange: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.where(
-            require_struct_decoding,
-            self.apply_grammar_bitmask(logits, grammar_bitmask, arange),
-            logits)
-
-    def apply_grammar_bitmask(self, logits: torch.Tensor,
-                              grammar_bitmask: torch.Tensor,
-                              arange: torch.Tensor) -> torch.Tensor:
         assert logits.shape[0] == grammar_bitmask.shape[0]
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
@@ -312,6 +316,19 @@ class StructuredDecodingManager:
                             & 1) == 0
         # Reshape to (B, vocab_size) and apply to logits.
         # (B, N * 32) -> (B, vocab_size)
+        unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0],
+                                                    -1)[:, :self.vocab_size]
+        # Fused mask: only mask logits if request requires structured decoding
+        effective_mask = require_struct_decoding & unpacked_bitmask
+        return torch.where(effective_mask, float("-inf"), logits)
+
+    def apply_grammar_bitmask(self, logits: torch.Tensor,
+                              grammar_bitmask: torch.Tensor,
+                              arange: torch.Tensor) -> torch.Tensor:
+        assert logits.shape[0] == grammar_bitmask.shape[0]
+        unpacked_bitmask = (torch.bitwise_right_shift(
+            grammar_bitmask[:, :, None], arange[None, None, :])
+                            & 1) == 0
         unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0],
                                                     -1)[:, :self.vocab_size]
         return torch.where(unpacked_bitmask, float("-inf"), logits)
