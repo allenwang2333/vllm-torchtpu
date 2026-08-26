@@ -28,6 +28,12 @@ class SendMeta:
     # ordinal (the block holding the final recurrent state); None for FA-only
     # Stage-3 models and all legacy paths.
     mamba_state_block_ids: list[int] | None = None
+    # One block table per transferred kv-cache group, in the order of the
+    # connector's Stage-3 transfer-group plan. Multi-group hybrid attention
+    # (DeepSeek-V4) needs it because its groups page at different sizes and
+    # their block IDs must stay disjoint; single-group models leave it None
+    # and `local_block_ids` is the whole story.
+    group_block_ids: list[list[int]] | None = None
 
 
 @dataclass

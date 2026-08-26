@@ -24,6 +24,7 @@ EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_EXPECTED_MINOR_TO_MAJOR = (3, 2, 1, 0)
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
+DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -142,12 +143,14 @@ def measured_fa_layout_fingerprint(
 
 
 __all__ = [
+    "DSV4_LAYOUT_FINGERPRINT_SCHEMA",
     "EXPECTED_FA_MINOR_TO_MAJOR",
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "fa_page_tokens",
+    "measured_dsv4_layout_fingerprint",
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
 ]
@@ -229,6 +232,76 @@ def measured_glm_layout_fingerprint(
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
         "page_tokens": int(page_tokens),
+        "layouts": per_tag,
+    }
+    return canonical_layout_fingerprint(payload), payload
+
+
+def measured_dsv4_layout_fingerprint(
+    manifest: PoolManifest,
+    *,
+    layout_getter: Callable[[Any], Any] | None = None,
+    package_version: Callable[[str], str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fingerprint of the admitted DeepSeek-V4 cache layout.
+
+    Same row-prefix requirement as GLM: the transfer copies raw bytes, so a
+    prefix of rows must be a byte prefix of the page, which only holds for the
+    natural [blocks, rows, packing, width] order. DSv4 differs in that each
+    role has its own page geometry (CSA NoPE one row per token, RoPE and the
+    indexer one per four, HCA two), so rows are recorded per tag rather than
+    checked against a single page_tokens.
+    """
+    if not isinstance(manifest, PoolManifest):
+        raise TypeError("manifest must be a PoolManifest")
+    getter = layout_getter or _default_layout_getter
+    version = package_version or importlib.metadata.version
+
+    per_tag: dict[str, Any] = {}
+    shape_by_tag: dict[str, tuple[int, ...]] = {}
+    for pool in manifest.pools:
+        tensor = manifest.storages[pool.storage_index]
+        shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+        if len(shape) != 4:
+            raise RuntimeError(
+                f"admitted {pool.tag} storage must be rank-4: shape={shape}")
+        known = shape_by_tag.setdefault(pool.tag, shape)
+        if known != shape:
+            raise RuntimeError(
+                f"admitted {pool.tag} storages disagree on shape: "
+                f"{known} vs {shape}")
+        layout = getter(tensor)
+        if layout is None:
+            raise RuntimeError(
+                f"admitted {pool.tag} storage has no materialized TPU layout")
+        raw_minor_to_major, raw_tiles, _ = layout
+        minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
+        tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
+        element_bits = 8 * int(tensor.element_size())
+        _, rows, packing, width = shape
+        if minor_to_major != GLM_EXPECTED_MINOR_TO_MAJOR:
+            raise RuntimeError(
+                "DSv4 row transfers require the natural physical order: "
+                f"tag={pool.tag}, layer={pool.layer_name}, "
+                f"minor_to_major={minor_to_major}")
+        if tiles != ((packing, 128), (packing, 1)):
+            raise RuntimeError(
+                "DSv4 row transfers require the packed tile shape "
+                f"(({packing},128),({packing},1)): tag={pool.tag}, "
+                f"layer={pool.layer_name}, tiles={tiles}")
+        per_tag.setdefault(
+            pool.tag, {
+                "page_shape": [rows, packing, width],
+                "row_bytes": packing * width * element_bits // 8,
+                "minor_to_major": list(minor_to_major),
+                "tiles": [list(tile) for tile in tiles],
+                "element_size_in_bits": element_bits,
+            })
+
+    payload = {
+        "schema": DSV4_LAYOUT_FINGERPRINT_SCHEMA,
+        "torch_tpu": version("torch_tpu"),
+        "libtpu": version("libtpu"),
         "layouts": per_tag,
     }
     return canonical_layout_fingerprint(payload), payload

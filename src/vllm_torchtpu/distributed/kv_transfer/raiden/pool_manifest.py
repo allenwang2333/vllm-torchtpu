@@ -29,7 +29,7 @@ constructed.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
@@ -39,7 +39,10 @@ from vllm_torchtpu.gdn_pool_layout import (POOLED_GDN_CONV_STATE_DTYPE,
                                            pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes)
 
-from .tags import TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import (TAG_DSA_IDX, TAG_DSV4_CSA_NOPE, TAG_DSV4_CSA_ROPE,
+                   TAG_DSV4_HCA, TAG_DSV4_IDX, TAG_DSV4_STATE_CSA,
+                   TAG_DSV4_STATE_HCA, TAG_DSV4_STATE_IDX, TAG_DSV4_SWA,
+                   TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, dsv4_group_tag)
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -859,6 +862,304 @@ def build_glm_mla_pool_manifest(
                 regions=_glm_row_region(tag,
                                         row_bytes=row_bytes,
                                         num_rows=rows),
+                dtype_tag=dtype_tag,
+            ))
+
+    manifest = PoolManifest(binding=binding,
+                            storages=storages.storages,
+                            pools=pools)
+    block_counts = {pool.num_blocks for pool in manifest.pools}
+    if len(block_counts) != 1:
+        raise ManifestError(
+            f"pools disagree on num_blocks: {sorted(block_counts)}")
+    manifest.geometry_by_tag()  # raises on per-tag geometry divergence
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4.
+# ---------------------------------------------------------------------------
+
+# Layer-name conventions, mirroring TPUModelRunner's DSv4 constants. They are
+# duplicated rather than imported because this module must stay deviceless.
+DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
+DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+DSV4_CSA_COMPRESS_RATIO = 4
+
+_DSV4_STATE_TAG_BY_KV_TAG = {
+    TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
+    TAG_DSV4_IDX: TAG_DSV4_STATE_IDX,
+    TAG_DSV4_HCA: TAG_DSV4_STATE_HCA,
+}
+
+
+def dsv4_compressed_kv_layer_name(state_cache_name: str) -> str:
+    """`<...>.attn.compressor.state_cache` -> `<...>.attn`, and the indexer's
+    -> `<...>.indexer.k_cache`. Mirrors `DeepseekCompressor.k_cache_prefix`."""
+    if not state_cache_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+        raise ManifestError(
+            f"DSv4 compressor state cache {state_cache_name!r} does not end "
+            f"with {DSV4_STATE_CACHE_SUFFIX!r}, so its compressed-KV layer "
+            "cannot be derived")
+    base = state_cache_name[:-len(DSV4_STATE_CACHE_SUFFIX)]
+    return base + ".k_cache" if base.endswith(".indexer") else base
+
+
+def _dsv4_row_region(*, row_bytes: int,
+                     num_rows: int) -> tuple[RegionSpec, ...]:
+    """One dense region of whole packed rows covering the full page."""
+    return (RegionSpec(
+        name="dsv4_rows",
+        offset_bytes=0,
+        stride_bytes=row_bytes,
+        unit_bytes=row_bytes,
+        num_units=num_rows,
+        units_per_stride=1,
+    ), )
+
+
+def _dsv4_storage_block_size(spec: Any, layer_name: str) -> int:
+    """Compressed tokens per page (`T` in the runner's allocation table)."""
+    tokens = getattr(spec, "storage_block_size", None)
+    if tokens is None:
+        block_size = getattr(spec, "block_size", None)
+        ratio = getattr(spec, "compress_ratio", 1) or 1
+        if block_size is None:
+            raise ManifestError(
+                f"DSv4 layer {layer_name} has a spec with neither "
+                "storage_block_size nor block_size")
+        tokens = int(block_size) // int(ratio)
+    return int(tokens)
+
+
+def _dsv4_kv_tag(layer_name: str, spec: Any) -> str:
+    """The compressed-KV role of an MLA layer (CSA reports its NoPE tag)."""
+    if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+        return TAG_DSV4_IDX
+    if int(getattr(spec, "compress_ratio", 1)) == DSV4_CSA_COMPRESS_RATIO:
+        return TAG_DSV4_CSA_NOPE
+    return TAG_DSV4_HCA
+
+
+class Dsv4LayerEntry(NamedTuple):
+    """One layer's claim on one array: the unit a pool is built from.
+
+    A DSv4 layer does not map one-to-one onto an array. A CSA layer binds a
+    `(nope, rope)` pair and so yields two entries, while an SWA or
+    compressor-state layer owns no memory at all and yields one entry naming
+    the array it was overlaid onto. `group_ordinal` is what makes an entry
+    addressable: it says which cache group's block table the array's pages
+    will be drawn from, and two entries on the same array with different
+    ordinals are the aliasing case this whole module exists to describe.
+    """
+
+    # Role tag without the `.g{ordinal}` suffix, e.g. `dsv4.csa.nope`.
+    tag_base: str
+    layer_name: str
+    group_ordinal: int
+    array: Any
+
+
+def _dsv4_classify(
+    kv_cache_groups: Sequence[Any],
+    named_kv_caches: Mapping[str, Any],
+) -> list[Dsv4LayerEntry]:
+    """Split DSv4's layers into one `Dsv4LayerEntry` per (layer, array).
+
+    Mirrors `TPUModelRunner._classify_ds_v4_layers` and the overlay plan it
+    feeds. Iteration is in cache-group order, then declared layer order, so
+    both transfer peers build the same pool list.
+    """
+    kv_tag_by_layer: dict[str, str] = {}
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        for layer_name in group.layer_names:
+            if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+                continue
+            if "swa_cache" in layer_name:
+                continue
+            kv_tag_by_layer[layer_name] = _dsv4_kv_tag(layer_name, spec)
+
+    entries: list[Dsv4LayerEntry] = []
+    for ordinal, group in enumerate(kv_cache_groups):
+        spec = group.kv_cache_spec
+        for layer_name in group.layer_names:
+            cache = named_kv_caches.get(layer_name)
+            if cache is None:
+                raise ManifestError(
+                    f"DSv4 layer {layer_name} has no allocated KV cache")
+            arrays = tuple(cache) if isinstance(cache, tuple) else (cache, )
+            if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+                kv_layer = dsv4_compressed_kv_layer_name(layer_name)
+                kv_tag = kv_tag_by_layer.get(kv_layer)
+                if kv_tag is None:
+                    raise ManifestError(
+                        f"DSv4 state cache {layer_name} names a compressed-KV "
+                        f"layer {kv_layer} that is not an MLA cache")
+                # CSA states are overlaid on the `(nope, rope)` pair but the
+                # compressor only ever writes state rows through NoPE (it runs
+                # in overlap mode, with no separate state view), so the RoPE
+                # array holds no state and must not be transferred as one.
+                entries.append(
+                    Dsv4LayerEntry(_DSV4_STATE_TAG_BY_KV_TAG[kv_tag],
+                                   layer_name, ordinal, arrays[0]))
+            elif "swa_cache" in layer_name:
+                entries.append(
+                    Dsv4LayerEntry(TAG_DSV4_SWA, layer_name, ordinal,
+                                   arrays[0]))
+            else:
+                kv_tag = kv_tag_by_layer[layer_name]
+                if kv_tag == TAG_DSV4_CSA_NOPE:
+                    if len(arrays) != 2:
+                        raise ManifestError(
+                            f"DSv4 CSA layer {layer_name} must bind a "
+                            f"(nope, rope) pair; got {len(arrays)} array(s)")
+                    entries.append(
+                        Dsv4LayerEntry(TAG_DSV4_CSA_NOPE, layer_name, ordinal,
+                                       arrays[0]))
+                    entries.append(
+                        Dsv4LayerEntry(TAG_DSV4_CSA_ROPE, layer_name, ordinal,
+                                       arrays[1]))
+                else:
+                    if len(arrays) != 1:
+                        raise ManifestError(
+                            f"DSv4 layer {layer_name} ({kv_tag}) must bind a "
+                            f"single array; got {len(arrays)}")
+                    entries.append(
+                        Dsv4LayerEntry(kv_tag, layer_name, ordinal,
+                                       arrays[0]))
+                _dsv4_check_role_rows(kv_tag, layer_name, spec, arrays)
+    return entries
+
+
+def _dsv4_check_role_rows(kv_tag: str, layer_name: str, spec: Any,
+                          arrays: Sequence[Any]) -> None:
+    """Row counts must match the runner's per-role allocation table."""
+    tokens = _dsv4_storage_block_size(spec, layer_name)
+    if kv_tag == TAG_DSV4_CSA_NOPE:
+        expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
+    elif kv_tag == TAG_DSV4_IDX:
+        expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+    else:
+        expected = {"latents": tokens * 2}
+    for (role, rows), array in zip(expected.items(), arrays):
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if len(shape) == 4 and shape[1] != rows:
+            raise ManifestError(
+                f"DSv4 {kv_tag} layer {layer_name} array {role} has "
+                f"{shape[1]} rows; the {tokens}-token page needs {rows}")
+
+
+def build_dsv4_pool_manifest(
+    *,
+    named_kv_caches: Mapping[str, Any],
+    kv_cache_groups: Sequence[Any],
+    raw_tensors: Sequence[Any],
+) -> PoolManifest:
+    """Builds the Pool Manifest for DeepSeek-V4.
+
+    Five nouns, and they do not nest the way the names suggest:
+
+    - A **layer** is a model layer with KV to cache. It binds one array, or
+      two for CSA, or none of its own if the runner overlaid it.
+    - An **array** is the physical `[blocks, rows, packing, width]` tensor.
+      Fewer arrays than layers, because the overlaid layers get no memory.
+    - A **cache group** is the set of layers that share one block table, so
+      it is a unit of *page allocation*, not of memory. Layers land in one
+      group when the allocator can page them identically: same page size,
+      same eviction window.
+    - A **pool** is what this function emits, one per (layer, array). It is
+      a named block-strided window into one storage, not the storage itself.
+    - A **tag** names a pool, and pools sharing a tag transfer together.
+      There is one tag per (role, cache group); CSA is the only role needing
+      two, since its NoPE and RoPE arrays have different row geometry.
+
+    A DeepSeek-V4-Flash-shaped materialization with 12 layers therefore
+    yields 7 arrays, 7 cache groups, 14 pools and 8 tags.
+
+    DSv4 is the first admitted model whose logical caches alias one array at
+    the same byte offset: an SWA cache sits on a CSA NoPE array, and a
+    compressor state sits on its own compressed-KV array. They are kept apart
+    only by the allocator never handing the same block ID to two cache groups,
+    a temporal invariant Raiden cannot see. Every pool therefore names its
+    kv-cache-group in its tag, so a byte-span registration always addresses
+    the pages of one block table.
+
+    What can be checked here is the spatial half of that invariant: two layers
+    of the *same* group must never land on one array, because they share a
+    block table.
+    """
+    if not named_kv_caches:
+        raise ManifestError("named_kv_caches is empty")
+    if not kv_cache_groups:
+        raise ManifestError("DSv4 admission needs at least one KV cache group")
+
+    entries = _dsv4_classify(kv_cache_groups, named_kv_caches)
+
+    binding, _ = _binding_for([(entry.layer_name, entry.array)
+                               for entry in entries], raw_tensors)
+    if binding != BINDING_PRIVATE_TYPED:
+        raise ManifestError(
+            "DSv4 admission requires private typed cache tensors; got "
+            f"binding {binding!r}")
+
+    storages = _StorageTable()
+    pools: list[PoolEntry] = []
+    # storage index -> (group ordinal, layer name) of the pool that claimed it.
+    claimed_by_group: dict[tuple[int, int], str] = {}
+    for tag_base, layer_name, ordinal, array in entries:
+        dtype_tag = _dtype_tag(array)
+        if dtype_tag != "uint8":
+            raise ManifestError(
+                f"DSv4 cache {layer_name} ({tag_base}) must be uint8; got "
+                f"{dtype_tag}")
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if len(shape) != 4:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} ({tag_base}) must be "
+                f"[blocks, rows, packing, width]: got shape {shape}")
+        num_blocks, rows, packing, width = shape
+        itemsize = _element_size(array)
+        nbytes = _nbytes(array)
+        if num_blocks <= 0 or nbytes % num_blocks != 0:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} nbytes {nbytes} is not divisible by "
+                f"num_blocks {num_blocks}")
+        block_stride = nbytes // num_blocks
+        # The packing axis must fill one 32-bit word (see the layout
+        # fingerprint's tile assertion).
+        if packing * itemsize != 4:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} packing {packing} does not fill one "
+                f"32-bit word at itemsize {itemsize}")
+        if width % 128:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} width {width} is not lane-aligned")
+        row_bytes = packing * width * itemsize
+        if block_stride != rows * row_bytes:
+            raise ManifestError(
+                f"DSv4 cache {layer_name} block stride {block_stride} does "
+                f"not match {rows} rows of {row_bytes} bytes")
+
+        storage_index = storages.index_for(array)
+        claim = (ordinal, storage_index)
+        if claim in claimed_by_group:
+            raise ManifestError(
+                f"DSv4 layers {claimed_by_group[claim]} and {layer_name} "
+                f"share an array inside kv cache group {ordinal}; layers of "
+                "one group share a block table, so they would overwrite each "
+                "other's pages")
+        claimed_by_group[claim] = layer_name
+
+        pools.append(
+            PoolEntry(
+                tag=dsv4_group_tag(tag_base, ordinal),
+                layer_name=layer_name,
+                storage_index=storage_index,
+                base_offset_bytes=0,
+                block_stride_bytes=block_stride,
+                num_blocks=num_blocks,
+                regions=_dsv4_row_region(row_bytes=row_bytes, num_rows=rows),
                 dtype_tag=dtype_tag,
             ))
 
