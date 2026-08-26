@@ -4662,8 +4662,6 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decoding_manager.structured_decode_arange.to(
-                self.device)
             for num_reqs in self.num_reqs_paddings:
                 out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.
@@ -4671,7 +4669,6 @@ class TPUModelRunner(GPUModelRunner):
                     self.structured_decoding_manager.
                     grammar_bitmask_cpu[:num_reqs].to(self.device),
                     self._dummy_logits(num_reqs),
-                    arange,
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -4692,7 +4689,6 @@ class TPUModelRunner(GPUModelRunner):
                     self.structured_decoding_manager.
                     target_grammar_bitmask_cpu[:num_tokens].to(self.device),
                     self._dummy_logits(num_tokens),
-                    arange,
                 )
                 synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)

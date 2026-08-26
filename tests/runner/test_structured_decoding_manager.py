@@ -68,7 +68,7 @@ class TestPrepareStructuredDecodingInput:
         )
         logits = torch.zeros(4, VOCAB_SIZE)  # Padded to 4 rows.
 
-        require, bitmask, arange = manager.prepare_structured_decoding_input(
+        require, bitmask = manager.prepare_structured_decoding_input(
             logits, grammar_output, cur_start_idx=0, cur_end_idx=3)
 
         assert require.shape == (4, 1)
@@ -77,7 +77,6 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [0, 0]
         assert bitmask[2].tolist() == [BLOCK_ALL, ALLOW_ALL]
-        assert arange.tolist() == list(range(32))
 
     def test_second_chunk_uses_local_rows(self):
         # Chunk 2 covers batch rows [2, 4): its structured request (global
@@ -95,7 +94,7 @@ class TestPrepareStructuredDecodingInput:
         )
         logits = torch.zeros(2, VOCAB_SIZE)
 
-        require, bitmask, _ = manager.prepare_structured_decoding_input(
+        require, bitmask = manager.prepare_structured_decoding_input(
             logits, grammar_output, cur_start_idx=2, cur_end_idx=4)
 
         assert require[:, 0].tolist() == [False, True]
@@ -112,7 +111,7 @@ class TestPrepareStructuredDecodingInput:
         )
         logits = torch.zeros(1, VOCAB_SIZE)
 
-        require, bitmask, _ = manager.prepare_structured_decoding_input(
+        require, bitmask = manager.prepare_structured_decoding_input(
             logits, grammar_output, cur_start_idx=0, cur_end_idx=1)
 
         assert require[0, 0].item() is True
@@ -127,7 +126,7 @@ class TestPrepareStructuredDecodingInput:
         manager.prepare_structured_decoding_input(logits, first, 0, 2)
 
         second = make_grammar_output(["req1"], [[BLOCK_ALL, BLOCK_ALL]])
-        require, bitmask, _ = manager.prepare_structured_decoding_input(
+        require, bitmask = manager.prepare_structured_decoding_input(
             logits, second, 0, 2)
 
         assert require[:, 0].tolist() == [False, True]
@@ -150,9 +149,8 @@ class TestStructuredDecode:
                                 torch.iinfo(torch.int32).max,
                                 (num_reqs, num_words),
                                 dtype=torch.int32)
-        arange = torch.arange(32)
 
-        out = manager.apply_grammar_bitmask(logits, bitmask, arange)
+        out = manager.apply_grammar_bitmask(logits, bitmask)
 
         expected = reference_apply_bitmask(logits, bitmask, vocab_size)
         assert torch.equal(out, expected)
@@ -165,9 +163,8 @@ class TestStructuredDecode:
         bitmask = torch.tensor([[ALLOW_ALL, BLOCK_ALL], [0, 0], [0, 0]],
                                dtype=torch.int32)
         require = torch.tensor([[True], [False], [False]])
-        arange = torch.arange(32)
 
-        out = manager._structured_decode(require, bitmask, logits, arange)
+        out = manager._structured_decode(require, bitmask, logits)
 
         assert torch.equal(out[0, :32], logits[0, :32])
         assert torch.isinf(out[0, 32:]).all()
@@ -219,8 +216,8 @@ class TestPrepareSpecStructuredDecodingInput:
         target_logits = torch.zeros(8, VOCAB_SIZE)
         bonus_logits = torch.zeros(4, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         arange) = manager.prepare_spec_structured_decoding_input(
+        (require_target, target_bitmask, require_bonus,
+         bonus_bitmask) = manager.prepare_spec_structured_decoding_input(
              target_logits, bonus_logits, grammar_output, scheduled,
              draft_lengths, 0, 3)
 
@@ -240,7 +237,6 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == row(12)
         assert bonus_bitmask[1].tolist() == [0, 0]
         assert bonus_bitmask[2].tolist() == row(20)
-        assert arange.tolist() == list(range(32))
 
     def test_second_chunk_uses_local_rows(self):
         # Chunk 2 covers batch rows [2, 4). req0 (chunk 1) has 1 draft;
@@ -264,8 +260,8 @@ class TestPrepareSpecStructuredDecodingInput:
         target_logits = torch.zeros(4, VOCAB_SIZE)
         bonus_logits = torch.zeros(2, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
+        (require_target, target_bitmask, require_bonus,
+         bonus_bitmask) = manager.prepare_spec_structured_decoding_input(
              target_logits, bonus_logits, grammar_output, scheduled,
              draft_lengths, 2, 4)
 
@@ -297,8 +293,8 @@ class TestPrepareSpecStructuredDecodingInput:
         scheduled = {"req0": [5, 6]}
         logits = torch.zeros(2, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
+        (require_target, target_bitmask, require_bonus,
+         bonus_bitmask) = manager.prepare_spec_structured_decoding_input(
              None, logits, grammar_output, scheduled, None, 1, 2)
 
         assert require_target is None
@@ -323,8 +319,8 @@ class TestPrepareSpecStructuredDecodingInput:
         target_logits = torch.zeros(2, VOCAB_SIZE)
         bonus_logits = torch.zeros(1, VOCAB_SIZE)
 
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
+        (require_target, target_bitmask, require_bonus,
+         bonus_bitmask) = manager.prepare_spec_structured_decoding_input(
              target_logits, bonus_logits, grammar_output, scheduled,
              draft_lengths, 0, 1)
 
@@ -356,8 +352,8 @@ class TestPrepareSpecStructuredDecodingInput:
         second = make_grammar_output(["req1"], [row(30), row(31)])
         scheduled = {"req1": [3]}
         draft_lengths = np.array([0, 1], dtype=np.int32)
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         _) = manager.prepare_spec_structured_decoding_input(
+        (require_target, target_bitmask, require_bonus,
+         bonus_bitmask) = manager.prepare_spec_structured_decoding_input(
              target_logits, bonus_logits, second, scheduled, draft_lengths, 0,
              2)
 
