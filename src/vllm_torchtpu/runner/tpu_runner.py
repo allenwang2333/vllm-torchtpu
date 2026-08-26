@@ -3576,8 +3576,8 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_selected_local_logits(
                         hidden_states, logits_indices[:sampling_num_reqs])
                 else:
-                    logits = self.compute_selected_logits(hidden_states,
-                                                          logits_indices)
+                    logits = self.compute_selected_logits(
+                        hidden_states, logits_indices)
             else:
                 assert sampling_num_reqs is None
                 logits = self.compute_logits_from_hidden_states(
@@ -4064,11 +4064,10 @@ class TPUModelRunner(GPUModelRunner):
                     else:
                         rng_num_reqs = _get_padded_num_reqs_with_upper_limit(
                             num_reqs, self.max_num_reqs)
-                        padded_u = torch.rand(
-                            (rng_num_reqs, self.vocab_size),
-                            dtype=logits.dtype,
-                            device=logits.device,
-                            generator=sampling_generator)
+                        padded_u = torch.rand((rng_num_reqs, self.vocab_size),
+                                              dtype=logits.dtype,
+                                              device=logits.device,
+                                              generator=sampling_generator)
                         u = padded_u[:logits.shape[0]]
                     selected_token_ids = self.sharded_sample_from_local_logits(
                         logits, temperatures_tpu, u, top_k_tpu, top_p_tpu)
@@ -4434,9 +4433,9 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.layers.vllm.custom_ops.sharded_sampling_op import \
             build_sharded_sampling_op
 
-        self._sharded_sample_op = cast(Callable[..., torch.Tensor],
-                                       build_sharded_sampling_op(
-                                           self.vocab_size))
+        self._sharded_sample_op = cast(
+            Callable[..., torch.Tensor],
+            build_sharded_sampling_op(self.vocab_size))
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.vllm.linear_common import (
@@ -4707,8 +4706,7 @@ class TPUModelRunner(GPUModelRunner):
                         local_logits, temperatures,
                         torch.rand((num_reqs, self.vocab_size),
                                    dtype=self._hidden_states_dtype,
-                                   device=self.device),
-                        top_k, top_p)
+                                   device=self.device), top_k, top_p)
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break

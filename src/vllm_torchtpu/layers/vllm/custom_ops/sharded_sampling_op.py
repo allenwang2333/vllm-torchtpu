@@ -29,21 +29,16 @@ def _sample(logits: jax.Array, temperatures: jax.Array, u: jax.Array,
     safe_temperatures = jnp.where(temperatures == 0.0, 1.0, temperatures)
     scaled_logits = logits / safe_temperatures
     masked_logits = lax.cond(
-        jnp.any(top_k > 0),
-        lambda logits_: jnp.where(
+        jnp.any(top_k > 0), lambda logits_: jnp.where(
             top_k > 0,
             topk_mask(logits_, jnp.squeeze(top_k, -1), _MASKED_LOGIT_VALUE),
-            logits_), lambda logits_: logits_,
-        scaled_logits)
+            logits_), lambda logits_: logits_, scaled_logits)
     masked_logits = lax.cond(
-        jnp.any(top_p < 1.0),
-        lambda logits_: jnp.where(
+        jnp.any(top_p < 1.0), lambda logits_: jnp.where(
             top_p < 1.0,
             topp_mask(logits_, jnp.squeeze(top_p, -1), _MASKED_LOGIT_VALUE),
-            logits_), lambda logits_: logits_,
-        masked_logits)
-    u = jnp.clip(u, jnp.finfo(u.dtype).tiny,
-                 1.0 - jnp.finfo(u.dtype).eps)
+            logits_), lambda logits_: logits_, masked_logits)
+    u = jnp.clip(u, jnp.finfo(u.dtype).tiny, 1.0 - jnp.finfo(u.dtype).eps)
     noisy_logits = masked_logits - jnp.log(-jnp.log(u))
     return jnp.argmax(jnp.where(temperatures <= 1e-5, logits, noisy_logits),
                       axis=-1).astype(jnp.int32)
@@ -55,11 +50,9 @@ def _gather_owned_logits(local_logits: jax.Array, tp_size: int,
     slots = (batch_size + tp_size - 1) // tp_size
     payload = math.gcd(local_vocab_size, 128)
     local_tiles = local_vocab_size // payload
-    padded = jnp.pad(local_logits,
-                     ((0, slots * tp_size - batch_size), (0, 0)))
-    operand = padded.reshape(slots, tp_size, local_tiles,
-                             payload).transpose(1, 0, 2, 3).reshape(
-                                 tp_size * slots * local_tiles, payload)
+    padded = jnp.pad(local_logits, ((0, slots * tp_size - batch_size), (0, 0)))
+    operand = padded.reshape(slots, tp_size, local_tiles, payload).transpose(
+        1, 0, 2, 3).reshape(tp_size * slots * local_tiles, payload)
 
     owners = jnp.arange(tp_size, dtype=jnp.int32)
     rows_per_owner = jnp.maximum(
@@ -109,7 +102,8 @@ def _run_sharded_sample(local_logits: jax.Array, temperatures: jax.Array,
     def per_device(local_logits_, temperatures_, u_, top_k_, top_p_):
         rank = _tp_rank(tp_size)
         owner_logits, row_ids, valid = _gather_owned_logits(
-            local_logits_, tp_size, rank, jnp.asarray(vocab_ranks)[rank])
+            local_logits_, tp_size, rank,
+            jnp.asarray(vocab_ranks)[rank])
 
         def owned_rows(tensor):
             return tensor[jnp.minimum(row_ids, tensor.shape[0] - 1)]
@@ -121,17 +115,17 @@ def _run_sharded_sample(local_logits: jax.Array, temperatures: jax.Array,
             all_greedy = jnp.all(
                 jnp.where(valid[:, None], values[1] <= 1e-5, True))
             return lax.cond(
-                all_greedy,
-                lambda tensors: jnp.argmax(tensors[0], axis=-1).astype(
-                    jnp.int32), lambda tensors: _sample(*tensors), values)
+                all_greedy, lambda tensors: jnp.argmax(tensors[0], axis=-1).
+                astype(jnp.int32), lambda tensors: _sample(*tensors), values)
 
         owner_tokens = lax.cond(
-            jnp.any(valid), sample_owned,
-            lambda values: jnp.zeros((values[0].shape[0], ), dtype=jnp.int32),
-            operands)
+            jnp.any(valid), sample_owned, lambda values: jnp.zeros(
+                (values[0].shape[0], ), dtype=jnp.int32), operands)
         output_rows = jnp.where(valid, row_ids, batch_size)
-        local_tokens = jnp.zeros((batch_size, ), dtype=jnp.int32).at[
-            output_rows].add(jnp.where(valid, owner_tokens, 0), mode="drop")
+        local_tokens = jnp.zeros(
+            (batch_size, ), dtype=jnp.int32).at[output_rows].add(jnp.where(
+                valid, owner_tokens, 0),
+                                                                 mode="drop")
         return lax.psum(local_tokens, TP_AXIS_NAME)
 
     return jax.shard_map(
