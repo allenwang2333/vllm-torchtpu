@@ -40,6 +40,18 @@ def _tpu7x_single_host() -> list[_FakeDevice]:
     ]
 
 
+def _tpu7x_full_slice() -> list[_FakeDevice]:
+    """The K3 target layout: 16 physical chips x 2 cores = 32 ranks."""
+    devices = []
+    for chip in range(16):
+        coords = (chip % 4, chip // 4, 0)
+        devices.extend([
+            _FakeDevice(2 * chip, coords, 0),
+            _FakeDevice(2 * chip + 1, coords, 1),
+        ])
+    return devices
+
+
 def _topology_from(devices) -> ChipTopology:
     import collections
     grouped = collections.defaultdict(list)
@@ -123,6 +135,19 @@ def test_hierarchical_split_is_ep_between_chips_tp_within() -> None:
     assert topology.chip_of(0)[0] != topology.chip_of(2)[0]
 
 
+def test_k3_v7x32_topology_yields_ep16_tp2() -> None:
+    """Pin the exact topology and split required by the K3 C=1 experiment."""
+    topology = _topology_from(_tpu7x_full_slice())
+    assert topology.num_chips == 16
+    assert topology.cores_per_chip == 2
+    assert len(topology.device_ids) == 32
+
+    slots = [topology.chip_of(rank) for rank in range(32)]
+    assert len(set(slots)) == 32
+    assert {chip for chip, _ in slots} == set(range(16))
+    assert {core for _, core in slots} == {0, 1}
+
+
 def test_expert_blocks_tile_the_expert_space_exactly() -> None:
     """Chip blocks must partition [0, num_experts) with no gap or overlap.
 
@@ -130,7 +155,7 @@ def test_expert_blocks_tile_the_expert_space_exactly() -> None:
     missing experts are never computed by anyone and their contribution is
     silently zero.
     """
-    num_experts, ep_size = 224, 4
+    num_experts, ep_size = 896, 16
     base, remainder = divmod(num_experts, ep_size)
     covered: list[int] = []
     for ep_rank in range(ep_size):
@@ -151,9 +176,9 @@ def test_intermediate_split_is_exact_and_mxfp4_aligned() -> None:
     assert intermediate % tp_size == 0
     per_partition = intermediate // tp_size
     assert per_partition % mxfp4_group == 0
-    # And the per-device weight footprint is unchanged vs flat EP8:
+    # And the per-device weight footprint is unchanged vs flat EP32:
     # 56 experts x 1536 == 28 experts x 3072.
-    assert (224 // 4) * per_partition == (224 // 8) * intermediate
+    assert (896 // 16) * per_partition == (896 // 32) * intermediate
 
 
 def test_context_manager_is_a_noop_when_the_flag_is_off(monkeypatch) -> None:
@@ -277,10 +302,10 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
     from vllm_torchtpu.layers.vllm import moe_hierarchical
 
     monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
-    # Rank 1 under flat EP8 would be ep_rank=1 of 8; under the chip split it is
-    # core 1 of chip 0, so ep_rank=0 of 4.
+    # Rank 1 under flat EP32 would be ep_rank=1 of 32; under the chip split it
+    # is core 1 of chip 0, so ep_rank=0 of 16.
     monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none", lambda:
-                        (4, 0, 2, 1))
+                        (16, 0, 2, 1))
     # The pristine function, not whatever a previous test left bound: the
     # context manager patches the loader's namespace permanently (it is a
     # one-time init in production), so `default_loader.compute_local_expert_ids`
@@ -289,9 +314,9 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
     pristine = ep_weight_filter.compute_local_expert_ids
     monkeypatch.setattr(default_loader, "compute_local_expert_ids", pristine)
 
-    flat = pristine(224, 8, 1)  # what the loader would have computed
+    flat = pristine(896, 32, 1)  # what the loader would have computed
     moe_hierarchical.align_ep_weight_filter()
-    chip = default_loader.compute_local_expert_ids(224, 8, 1)
+    chip = default_loader.compute_local_expert_ids(896, 32, 1)
 
     assert flat == set(range(28, 56))
     assert chip == set(range(0, 56)), "must cover the whole chip block"
@@ -299,6 +324,6 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
     # Both chiplets of a chip must request the same experts.
     monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
     monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none", lambda:
-                        (4, 0, 2, 0))
+                        (16, 0, 2, 0))
     moe_hierarchical.align_ep_weight_filter()
-    assert default_loader.compute_local_expert_ids(224, 8, 0) == chip
+    assert default_loader.compute_local_expert_ids(896, 32, 0) == chip

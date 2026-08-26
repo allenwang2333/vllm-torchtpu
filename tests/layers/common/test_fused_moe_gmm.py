@@ -216,6 +216,75 @@ def test_fused_moe_local_routing_matches_reference():
                                rtol=1e-1)
 
 
+def test_two_tp_width_shards_reconstruct_flat_moe_output():
+    """Two intermediate-width shards must sum to the flat routed output.
+
+    This is the kernel-level numerical contract used by K3 hierarchical MoE:
+    both cores on a chip own the same experts, W13 is split into matching
+    gate/up slices, W2 is split on its contracting dimension, and the two
+    partial hidden vectors are reduced.
+    """
+    _require_tpu()
+    num_tokens = 4
+    hidden_size = 512
+    intermediate_size = 256
+    num_experts = 4
+    topk = 2
+    key = jax.random.key(20260826)
+    hidden_key, w1_key, w2_key = jax.random.split(key, 3)
+
+    hidden_states = (jax.random.normal(
+        hidden_key, (num_tokens, hidden_size), dtype=jnp.float32) /
+                     10).astype(jnp.bfloat16)
+    w1 = (jax.random.normal(
+        w1_key,
+        (num_experts, hidden_size, intermediate_size * 2),
+        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    w2 = (jax.random.normal(
+        w2_key, (num_experts, intermediate_size, hidden_size),
+        dtype=jnp.float32) / 10).astype(jnp.bfloat16)
+    topk_ids = jnp.asarray([[0, 1], [2, 3], [1, 3], [0, 2]],
+                           dtype=jnp.int32)
+    topk_weights = jnp.asarray([[0.7, 0.3], [0.6, 0.4], [0.55, 0.45],
+                                [0.8, 0.2]],
+                               dtype=jnp.float32)
+
+    def run(local_w1, local_w2):
+        return fused_moe_func(
+            hidden_states=hidden_states,
+            w1=local_w1,
+            w2=local_w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk=topk,
+            activation="silu",
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=0,
+        )
+
+    flat = run(w1, w2)
+    gate, up = jnp.split(w1, 2, axis=-1)
+    partials = []
+    for tp_rank in range(2):
+        start = tp_rank * (intermediate_size // 2)
+        stop = start + intermediate_size // 2
+        shard_w1 = jnp.concatenate((gate[..., start:stop], up[..., start:stop]),
+                                   axis=-1)
+        shard_w2 = w2[:, start:stop, :]
+        partials.append(run(shard_w1, shard_w2))
+    hierarchical = partials[0] + partials[1]
+
+    np.testing.assert_allclose(np.asarray(hierarchical, dtype=np.float32),
+                               np.asarray(flat, dtype=np.float32),
+                               atol=2e-1,
+                               rtol=2e-1)
+
+
 def _make_ep_inputs(num_local_experts, seed=0):
     """Synthesize one local shard's weights + per-token local topk_ids.
 
