@@ -697,12 +697,6 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
-        # Use independent request buckets starting at one for the local head.
-        max_num_seqs = self.scheduler_config.max_num_seqs
-        self.sharded_sampling_num_reqs_paddings = sorted(
-            {1, max_num_seqs}
-            | {size for size in self.num_tokens_paddings
-               if size <= max_num_seqs})
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (min(
@@ -3571,7 +3565,7 @@ class TPUModelRunner(GPUModelRunner):
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
             sampling_num_reqs = (_get_padded_token_len(
-                self.sharded_sampling_num_reqs_paddings, num_reqs)
+                self.num_tokens_paddings, num_reqs)
                                  if use_sharded_sampling else None)
             if sample_hidden_states is None:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
@@ -4701,7 +4695,7 @@ class TPUModelRunner(GPUModelRunner):
 
                 if self._sharded_sample_op is None:
                     continue
-                for num_reqs in self.sharded_sampling_num_reqs_paddings:
+                for num_reqs in self.num_tokens_paddings:
                     indices = torch.zeros(num_reqs,
                                           dtype=torch.int32,
                                           device=self.device)
