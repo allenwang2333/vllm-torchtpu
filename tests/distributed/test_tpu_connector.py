@@ -25,8 +25,11 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         MLAAttentionSpec, SlidingWindowMLASpec)
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
+
+from .raiden_test_utils import dsv4_materialization
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
@@ -466,7 +469,9 @@ class TestTPUConnector:
                 connector.get_block_ids_with_load_errors_group_index() == 2)
 
         mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
-            request, [30, 31], mamba_block_ids=[[10], [20], [40]])
+            request, [30, 31],
+            mamba_block_ids=[[10], [20], [40]],
+            group_block_ids=None)
         assert (mock_raiden_sched_cls.return_value.
                 _stage3_mamba_num_speculative_blocks == 3)
         mock_raiden_worker_cls.assert_not_called()
@@ -498,12 +503,51 @@ class TestTPUConnector:
             assert (mock_raiden_sched_cls.return_value._stage3_transfer_groups
                     is connector._stage3_transfer_groups)
 
-            # Until the wire arrays carry one block list per group, a
-            # multi-group model must fail rather than ship group 0 alone.
-            with pytest.raises(NotImplementedError,
-                               match="per-group block lists"):
-                connector.request_finished_all_groups(MagicMock(),
-                                                      ([1], [2], [3, 4]))
+            # Every attention group's pages reach the scheduler, in the
+            # transfer plan's order.
+            expected = (True, {"uuid": 11})
+            mock_raiden_sched_cls.return_value.request_finished.return_value = (
+                expected)
+            request = MagicMock()
+            assert connector.request_finished_all_groups(
+                request, ([1], [2], [3, 4])) == expected
+
+        mock_raiden_sched_cls.return_value.request_finished.assert_called_once_with(
+            request, [1],
+            mamba_block_ids=None,
+            group_block_ids=[[1], [2], [3, 4]])
+        mock_raiden_worker_cls.assert_not_called()
+
+    @patch(f"{_MOD}.TPURaidenConnectorWorker")
+    @patch(f"{_MOD}.TPURaidenConnectorScheduler")
+    def test_stage3_multi_group_without_dsv4_admission_is_rejected(
+            self, mock_raiden_sched_cls, mock_raiden_worker_cls):
+        """Only DSv4 admission lowers per-group spans. Any other multi-group
+        model must fail rather than ship group 0's pages alone."""
+        cfg = _make_vllm_config(is_producer=True)
+        cache_config = _make_stage3_dsv4_kv_cache_config()
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                       True,
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                           True,
+                           create=True):
+            connector = TPUConnector(cfg, KVConnectorRole.SCHEDULER,
+                                     cache_config)
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                       False,
+                       create=True), pytest.raises(NotImplementedError,
+                           match="TPU_RAIDEN_DSV4_ADMISSION"):
+            connector.request_finished_all_groups(MagicMock(),
+                                                  ([1], [2], [3, 4]))
 
         mock_raiden_sched_cls.return_value.request_finished.assert_not_called()
         mock_raiden_worker_cls.assert_not_called()
@@ -3556,3 +3600,129 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 worker plan and per-group span registration
+# ---------------------------------------------------------------------------
+
+
+def _dsv4_worker_plan(worker):
+    named, groups = dsv4_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(named_kv_caches=named,
+                                            kv_cache_groups=groups,
+                                            raw_tensors=())
+    return worker._measure_dsv4_pool_plan(manifest, groups), groups
+
+
+def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=True,
+                                 dp_size=8)
+    plan, _ = _dsv4_worker_plan(worker)
+
+    assert [(pool.tag, pool.plan_position, pool.page_tokens,
+             pool.live_bytes_per_block, pool.row_bytes) for pool in plan] == [
+                 ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
+                 ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
+                 ("dsv4.idx.g1", 1, 1024, 65536, 1024),
+                 ("dsv4.hca.g2", 2, 256, 262144, 512),
+                 ("dsv4.swa.g3", 3, 128, 131072, 512),
+                 ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
+                 ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
+                 ("dsv4.state.hca.g6", 6, 256, 131072, 512),
+             ]
+    assert worker._stage3_dsv4_group_count == 7
+
+
+def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    named, groups = dsv4_materialization()
+    manifest = rpm.build_dsv4_pool_manifest(named_kv_caches=named,
+                                            kv_cache_groups=groups,
+                                            raw_tensors=())
+    with pytest.raises(RuntimeError, match="not in the Stage-3 transfer plan"):
+        worker._measure_dsv4_pool_plan(manifest, groups[:3])
+
+
+def test_dsv4_group_blocks_must_match_the_admitted_plan():
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    _dsv4_worker_plan(worker)
+
+    with pytest.raises(RuntimeError, match="the scheduler supplied none"):
+        worker._stage3_dsv4_group_blocks(SimpleNamespace(group_block_ids=None))
+    with pytest.raises(RuntimeError, match="do not match the admitted"):
+        worker._stage3_dsv4_group_blocks(
+            SimpleNamespace(group_block_ids=[[1], [2]]))
+
+
+def test_dsv4_producer_registers_one_span_set_per_cache_group():
+    """Every tag replays over its own group's pages, and no page is shared."""
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=True,
+                                 dp_size=8,
+                                 block_size=1024)
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    facade = _FakeRaidenControllerFacade()
+    unit = SimpleNamespace(job_name="dsv4-prefill",
+                           job_replica_id="producer-engine-rank0",
+                           data_name="kv.dsv4",
+                           data_replica_idx=0)
+    worker._raiden_transfer_engine = _FakeRaidenEngine()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "prefill-controller.test:27000"
+    worker._raiden_work_unit = unit
+
+    # 1024 tokens: one page for the 1024-token groups, four for HCA's
+    # 256-token pages, eight for SWA's 128-token pages. The tables are
+    # disjoint, which is the only thing keeping the aliased arrays apart.
+    group_block_ids = [
+        [10],
+        [20],
+        [30, 31, 32, 33],
+        [40, 41, 42, 43, 44, 45, 46, 47],
+        [50],
+        [60],
+        [70, 71, 72, 73],
+    ]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["dsv4-req"] = MagicMock(uuid=99,
+                                              local_block_ids=[10],
+                                              group_block_ids=group_block_ids,
+                                              num_tokens=1024,
+                                              expiration_time=1e20)
+
+    with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+               "raiden",
+               create=True), patch(
+                   f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                   True,
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                       True,
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                           1,
+                           create=True):
+        worker.process_send_load(meta)
+
+    assert len(facade.register_request_blocks_calls) == 1
+    call = facade.register_request_blocks_calls[0]
+    assert call["req_id"] == "dsv4-req"
+    assert call["uuid"] == 99
+    assert call["unit"] is unit
+    # D5 keys on one list per request; the per-tag pages ride in the spans.
+    assert call["block_ids"] == [10]
+    assert [(reg.tag, list(reg.block_ids)) for reg in call["pool_spans"]] == [
+        (pool.tag, group_block_ids[pool.plan_position]) for pool in plan
+    ]
+    assert all(reg.dst_space_version == 1 for reg in call["pool_spans"])
+    # Each pool declares its whole request: full pages everywhere, because
+    # 1024 tokens divides every group's page size.
+    declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
+    assert declared["dsv4.csa.nope.g0"] == 131072
+    assert declared["dsv4.hca.g2"] == 4 * 262144
+    assert declared["dsv4.swa.g3"] == 8 * 131072
