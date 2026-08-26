@@ -271,7 +271,7 @@ class DFlashProposer:
 
         The base token is the last verified token from the target model.
         """
-        # 1. Calculate static padded shapes
+        # Static padded shapes
         num_reqs = chunk.num_reqs
         block_size = self.block_size
         total_draft_tokens = num_reqs * block_size
@@ -512,9 +512,7 @@ class DFlashProposer:
 
     @torch.no_grad()
     def precompile(self) -> None:
-        """Warm up the DFlash draft model across all padding buckets.
-        Called by tpu_runner.py during _dummy_run.
-        """
+        """Warm up the DFlash draft model across all padding buckets."""
         if self.draft_model is None:
             return
 
@@ -529,7 +527,14 @@ class DFlashProposer:
         # first such step compiles XLA mid-serving.
         max_chunk_reqs = max(runner.num_reqs_max_model_len,
                              runner.num_reqs_most_model_len or 0)
-        max_draft_tokens = max_chunk_reqs * block_size
+        max_draft_tokens = self._get_padded_len(max_chunk_reqs * block_size)
+        # A draft-token count past the largest bucket would compile live.
+        if max_draft_tokens > runner.num_tokens_paddings[-1]:
+            logger.warning(
+                "DFlash draft forward for %d requests needs %d tokens, past "
+                "the largest token bucket (%d); those steps will compile "
+                "at runtime.", max_chunk_reqs, max_draft_tokens,
+                runner.num_tokens_paddings[-1])
 
         with runner._precompile_timed("drafter first pass"):
             for num_tokens in runner.num_tokens_paddings:
@@ -753,9 +758,12 @@ class DFlashProposer:
             synchronize_tensors(draft_tokens_chunk, wait=sync)
 
     def _dp_lockstep_sharded(self) -> bool:
-        """True when the draft emits cross-DP collectives under EP-DP
-        lockstep. A DFlash draft always runs TP-sharded (draft_tp must equal
-        the target's TP), so this is simply whether lockstep is on.
+        """Whether this drafter takes part in EP-DP lockstep pairing.
+
+        Kept as "lockstep is on", including for a TP-replicated (draft_tp=1)
+        draft: replaying its padding forwards is redundant but harmless,
+        and keeps busy and idle ranks on one rule. Eagle3Proposer skips the
+        replicated MoE-free case instead.
         """
         return self.runner._dp_lockstep_enabled()
 
@@ -816,7 +824,7 @@ class DFlashProposer:
         | torch.Tensor,
         positions: torch.Tensor,
         draft_md_tuple: tuple["AttentionMetadata", ...],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Projects target model hidden states directly into the draft model's KV space.
 
@@ -884,23 +892,29 @@ class DFlashProposer:
         roped_k_all = roped_k_flat.view(L, num_ctx, nkv, hd)
         roped_q_all = dummy_q_roped_flat.view(L, num_ctx, nq, hd)
 
-        # 2. update kv cache in the compiled graph so XLA can fuse the mutations
+        # Update the kv cache in the compiled graph so XLA can fuse the
+        # mutations. The attention outputs read the updated cache, so they
+        # are returned as handles: synchronizing them materializes every
+        # layer's write (the dummies rely on this; the real path lets the
+        # next draft forward consume the writes).
+        attn_outputs = []
         for i, layer in enumerate(self.draft_model.model.layers):
             attn_obj = layer.self_attn.attn
             kv_cache = attn_obj.kv_cache
             attn_impl = attn_obj.impl
 
             # Use normal forward pass to run RPA v3 and update KV cache
-            attn_impl.forward(
-                layer=attn_obj,
-                query=roped_q_all[i],
-                key=roped_k_all[i],
-                value=all_v[i],
-                kv_cache=kv_cache,
-                attn_metadata=draft_md_tuple[i],
-            )
+            attn_outputs.append(
+                attn_impl.forward(
+                    layer=attn_obj,
+                    query=roped_q_all[i],
+                    key=roped_k_all[i],
+                    value=all_v[i],
+                    kv_cache=kv_cache,
+                    attn_metadata=draft_md_tuple[i],
+                ))
 
-        return hidden_states
+        return tuple(attn_outputs)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
