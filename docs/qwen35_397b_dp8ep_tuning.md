@@ -112,13 +112,37 @@ This predicts measured req/s to within ~5% and is the arithmetic to run before p
 that trades prefill against decode. Decode latency is not privileged: at OSL 1024 a 1 ms/step ITL
 win is worth ~1 s, while TTFT regressions run to tens of seconds.
 
-**Top untested candidate:** `--max-num-batched-tokens=4096`. The whole step scales *sublinearly*
-(1.80x for 2x the tokens, 162 -> 292 ms), even though reduce-scatter alone is superlinear over the
-same range — so cost per prefill token *falls* with a larger bucket (0.158 ms at mnbt 1024 vs
-0.143 ms at 2048). If that continues, `f` falls to ~6%, mean ITL improves ~5%, and TTFT improves
-because an 8k prompt chunks 2 ways instead of 4 — the only idea so far that moves both terms of the
-budget the same direction. It needs a step-cost microbench first: it extrapolates past the measured
-range, and it enlarges the worst-case bucket that the DP lockstep can drag a decode-only rank into.
+**Top candidate:** `--max-num-batched-tokens=4096`. The whole step scales *sublinearly* (1.80x for
+2x the tokens, 162 -> 292 ms), so cost per prefill token *falls* with a larger bucket (0.158 ms at
+mnbt 1024 vs 0.143 ms at 2048). If that continues, `f` falls to ~6%, mean ITL improves ~7%, and TTFT
+improves because an 8k prompt chunks 2 ways instead of 4 — the only idea here that moves both terms
+of the budget the same direction. Pair it with `TPU_DP_PREFILL_DRAIN_STEPS=1` to hold prefill supply
+at the shipped `W * mnbt / interval = 512` tokens/step, and raise the startup timeout: it adds a
+12th compiled bucket to a warmup that already takes ~7000 s.
+
+A microbench gated this (chained `all_gather` -> `psum_scatter`, 8 real cores, bf16, hidden 4096):
+predicted 4096-token step **549 ms, ratio 1.878x**, cost/prefill-token 0.1428 -> 0.1340 ms. The same
+composition applied to the *measured* 1024 -> 2048 transition predicts 288.3 ms against an actual
+292.4 ms, so the extrapolation is good to ~1.4% one octave down.
+
+## Collectives are sublinear — do not size them off trace durations
+
+An earlier round of this campaign read reduce-scatter as **superlinear** (368 us @1024 -> ~960 us
+@2048, ~2.6x) from `hlo_stats`, and used that to argue for *shrinking* the bucket. Measured directly
+— chained 20 deep so nothing can be overlapped or reordered away — it is not:
+
+| per-rank tokens | AG->RS round trip | vs 2x prev | all-reduce | vs 2x prev |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 363.14 us | — | 70.07 us | — |
+| 1024 | 699.68 us | 0.963x | 117.43 us | 0.838x |
+| 2048 | 1358.35 us | 0.971x | 207.42 us | 0.883x |
+| 4096 | 2672.48 us | **0.984x** | 389.19 us | **0.938x** |
+
+The true 1024 -> 2048 ratio is **1.94x**, not 2.6x. Under DP lockstep every rank blocks until the
+last one arrives, so a collective's *trace* duration measures arrival skew, not transfer. The real
+per-step collective cost is ~94 ms of the 292 ms bucket-2048 step (32%), for 60 EP round trips plus
+61 all-reduces. **Never size a collective optimization off trace durations on a lockstep workload** —
+the microbench that settled this cost 6 minutes of pod time.
 
 ## Profiling caveat
 
