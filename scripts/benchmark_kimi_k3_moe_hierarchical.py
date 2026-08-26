@@ -181,7 +181,11 @@ def _native_fp4(key: jax.Array, shape: tuple[int, int,
         raise ValueError(f"native fp4 output dimension must be even: {shape}")
     packed = jax.random.bits(key, (experts, size_k, size_n // 2),
                              dtype=jnp.uint8)
-    return jax.lax.bitcast_convert_type(packed, jnp.float4_e2m1fn)
+    # A uint8 -> float4 bitcast exposes the two packed nibbles as a new
+    # trailing dimension.  Fold that dimension back into N so gmm_v2 sees
+    # its required three-dimensional K-major [E, K, N] tensor.
+    return jax.lax.bitcast_convert_type(packed, jnp.float4_e2m1fn).reshape(
+        experts, size_k, size_n)
 
 
 def _production_weights(layout: Layout, *, hidden_size: int,
