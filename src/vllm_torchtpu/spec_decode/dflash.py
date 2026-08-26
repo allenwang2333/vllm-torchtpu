@@ -86,6 +86,7 @@ class DFlashProposer:
 
         self._max_model_len = vllm_config.model_config.max_model_len
         self.draft_model = None
+        self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[int, tuple[torch.Tensor,
@@ -736,10 +737,15 @@ class DFlashProposer:
             return False
         if not self._draft_replicated:
             return True
-        from vllm.model_executor.models.interfaces import \
-            is_mixture_of_experts
-        return self.draft_model is not None and bool(
-            is_mixture_of_experts(self.draft_model))
+        # Model-static: resolve once, not on every decode step.
+        if self._draft_has_moe_cache is None:
+            if self.draft_model is None:
+                return False
+            from vllm.model_executor.models.interfaces import \
+                is_mixture_of_experts
+            self._draft_has_moe_cache = bool(
+                is_mixture_of_experts(self.draft_model))
+        return self._draft_has_moe_cache
 
     @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
