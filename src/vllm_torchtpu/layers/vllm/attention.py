@@ -427,14 +427,24 @@ class PallasAttentionBackend(AttentionBackend):
     # can spill SREGs easily which leads to bad performance. The strategy we
     # apply here is trying to split max-model-len to 16 pages which make the
     # spill less likely. Meanwhile we make sure the page size is in [16, 256].
+    #
+    # This used to be preceded by `if max_model_len > 8192: return 16`, added
+    # as a temporary fix for a VMEM OOM. It inverted the strategy above exactly
+    # where the strategy matters most: at max_model_len 9216 it collapsed the
+    # page size 16x versus the 256 that 8192 would have produced, so a 1024
+    # token increase in max_model_len cost more than it bought. Measured on
+    # tpu7x at the Qwen3-Coder-30B-A3B-Instruct-FP8 decode shape (64 seqs,
+    # kv_len 8192, 1 kv head/rank, head_dim 128, fp8 cache), the v3 RPA decode
+    # kernel runs at 304.06 us/call at page size 16 and 163.03 us/call at 256 —
+    # a 1.87x difference on a kernel that is 47.6% of serving device time. The
+    # kernel is DMA-count bound: 32768 descriptors per call at page 16 versus
+    # 2048 at page 256, and bandwidth climbs monotonically from 883 GB/s to
+    # 1647 GB/s across the sweep. Outputs are bit-identical across page sizes.
+    #
+    # If a VMEM OOM resurfaces on some long-context model, cap it for that
+    # case rather than restoring a blanket floor of 16.
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
-        # TODO: This is a temporary fix for vmem OOM.
-        # For long model length, we use 16 page-size to avoid too much
-        # VMEM spill. A more robust solution should be implemented to
-        # handle VREG spills.
-        if vllm_config.model_config.max_model_len > 8192:
-            return 16
         page_size = next_power_of_2(
             vllm_config.model_config.max_model_len) // 16
         if page_size <= 16:
