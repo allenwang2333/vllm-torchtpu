@@ -444,9 +444,11 @@ class TestMaskLogitsWithTrace:
             for name in events), f"SD:MaskSpecLogits not found in {events}"
 
         # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
+        grammar_output_none = make_grammar_output(["req0"],
+                                                  [[ALLOW_ALL, BLOCK_ALL]])
         with capture_trace() as prof_none:
-            manager.mask_spec_logits(None, bonus_logits, grammar_output,
-                                     scheduled, draft_lengths, 0, 1)
+            manager.mask_spec_logits(None, bonus_logits, grammar_output_none,
+                                     {}, None, 0, 1)
         events_none = [evt.name for evt in prof_none.events()]
         assert any(
             "SD:PrepareSpecInput#num_reqs=1,num_target_rows=0,num_bonus_rows=1,cur_start_idx=0,cur_end_idx=1#"
