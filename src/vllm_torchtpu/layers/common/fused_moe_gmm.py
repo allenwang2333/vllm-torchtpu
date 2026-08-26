@@ -254,15 +254,16 @@ def moe_gmm(
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            # Zero out every GMM output row beyond the computed groups
+            # (padded tokens when skip_padded_tokens is on, and rows routed
+            # to non-local experts under EP, which gmm never writes because
+            # zero_initialize=False). Uninitialized rows can hold NaN, and
+            # the one-hot combine matmul contracts over ALL rows, so
+            # 0 * NaN = NaN spreads to every token in the batch.
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
