@@ -218,20 +218,9 @@ class DFlashProposer:
         position_ids_override: torch.Tensor | None,
         padded_num_reqs: int,
     ) -> dict:
-        """Build the draft layers' attention metadata from explicit inputs.
-
-        The real path and the precompile / lockstep dummies both come
-        through here, so they dispatch the identical program sequence:
-        torch-tpu fuses programs by dispatch sequence, and a dummy that
-        built its metadata differently would leave the real one to compile
-        live.
-
-        No mamba fields: DFlash drafters are attention-only, so the build
-        visits no mamba group and nothing would read them. A drafter with
-        recurrent layers needs more than a slot tensor here anyway —
-        `unified_mamba_state_indices`, the read-offset scatter, and the
-        state seed copies are all target-path only.
-        """
+        """Build the draft layers' attention metadata. The real path and
+        the dummies share this so they dispatch the identical programs.
+        No mamba fields: DFlash drafters are attention-only."""
         runner = self.runner
         assert self._draft_attn_layer_names is not None, (
             "load_model() must run before draft attention metadata is built")
@@ -362,13 +351,8 @@ class DFlashProposer:
         return input_ids, positions, seq_lens
 
     def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
-        """All-zero `draft_lengths` for a chunk without spec metadata.
-
-        Padded exactly like the real tensor (`get_spec_decode_metadata`
-        pads to the chunk's padded request count) so both steps share one
-        compiled input-builder program, and cached so a non-spec step
-        allocates nothing.
-        """
+        """Cached all-zero `draft_lengths` for a chunk without spec
+        metadata, padded like the real tensor so both share one program."""
         from vllm_torchtpu.runner.tpu_runner import \
             _get_padded_num_reqs_with_upper_limit
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
@@ -386,14 +370,8 @@ class DFlashProposer:
         attn_metadata: dict[str, "AttentionMetadata"],
     ) -> tuple["AttentionMetadata", ...]:
         """Per-layer metadata for the draft's KV write, in layer order.
-
-        `attn_metadata` is the *target's* full per-layer dict, so a draft layer
-        that fails to resolve must raise rather than fall back to an arbitrary
-        entry: the first entry is whichever layer hashed first — plausibly a
-        mamba group, whose block table indexes a different block size. Writing
-        the draft's KV through it would corrupt the cache silently instead of
-        failing.
-        """
+        A draft layer that fails to resolve must raise: falling back to an
+        arbitrary entry (e.g. a mamba group) would corrupt the cache."""
         draft_md_list = []
         for layer in self.draft_model.model.layers:
             layer_name = getattr(layer.self_attn.attn, "layer_name", None)
@@ -595,33 +573,14 @@ class DFlashProposer:
                                               use_max_model_len=False,
                                               sync=True)
 
-    def _kv_update_hidden_spec(self) -> tuple[list[int], torch.dtype]:
-        """`(per-aux-tensor widths, dtype)` of the KV update's hidden input.
-
-        The runner hands `_update_draft_kv_cache_from_target` one tensor per
-        tagged target layer, which the compiled program concatenates; the
-        dummies must have the same list length and widths or they trace a
-        different program and the real one compiles live on the first step.
-        """
-        # `load_model` tags exactly `target_layer_ids` target layers, and
-        # each yields one [num_tokens, target_hidden] tensor.
-        target_hidden = self.vllm_config.model_config.get_hidden_size()
-        return ([target_hidden] * len(self._target_layer_ids),
-                self.draft_model.model.embed_tokens.weight.dtype)
-
     def _dummy_kv_update_inputs(
         self,
         num_tokens: int,
         num_reqs: int,
         num_blocks: int,
     ) -> tuple[list[torch.Tensor], "AttentionMetadata"]:
-        """Reusable `(aux hidden list, metadata)` for one KV-update shape.
-
-        Under lockstep this runs once per padding chunk per step, so build
-        the constant dummies once per bucket instead of reallocating them
-        and re-issuing scalar H2D writes every idle step. `(num_reqs,
-        num_blocks)` is the block-table geometry of the target chunk whose
-        metadata the real call reuses.
+        """Cached `(aux hidden list, metadata)` for one KV-update shape;
+        `(num_reqs, num_blocks)` is the target chunk's block-table geometry.
         """
         key = (num_tokens, num_reqs, num_blocks)
         entry = self._dummy_kv_input_cache.get(key)
@@ -629,10 +588,15 @@ class DFlashProposer:
             return entry
 
         runner = self.runner
-        aux_widths, dtype = self._kv_update_hidden_spec()
+        # One [num_tokens, target_hidden] tensor per tagged target layer,
+        # matching what the runner hands the real update.
+        target_hidden = self.vllm_config.model_config.get_hidden_size()
+        dtype = self.draft_model.model.embed_tokens.weight.dtype
         dummy_hidden = [
-            torch.zeros((num_tokens, width), dtype=dtype, device=runner.device)
-            for width in aux_widths
+            torch.zeros((num_tokens, target_hidden),
+                        dtype=dtype,
+                        device=runner.device)
+            for _ in self._target_layer_ids
         ]
         dummy_positions = torch.zeros(num_tokens,
                                       dtype=torch.int32,
@@ -673,15 +637,8 @@ class DFlashProposer:
         num_blocks: int,
         sync: bool,
     ) -> None:
-        """One KV-update pass on constant dummies.
-
-        The dummy's result is never consumed, so the deferred program is
-        always materialized and enqueued here (in emission order, which the
-        cross-rank collective pairing relies on). `sync` additionally waits
-        on the host — what `precompile` wants, and what the per-step
-        lockstep replays must NOT do: they run inside `propose` on the
-        decode path, where a host wait per padding chunk stalls every step.
-        """
+        """One KV-update pass on constant dummies; `sync` waits on the host
+        (precompile), otherwise the program is only enqueued (lockstep)."""
         runner = self.runner
         dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
             num_tokens, num_reqs, num_blocks)
@@ -692,6 +649,8 @@ class DFlashProposer:
                 dummy_hidden, dummy_positions,
                 tuple([dummy_attn_metadata] *
                       len(self.draft_model.model.layers)))
+            # The result is never consumed, so materialize it here or the
+            # deferred program is never enqueued.
             synchronize_tensors(out, wait=sync)
 
     def _dummy_forward_inputs(
@@ -699,12 +658,7 @@ class DFlashProposer:
         num_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, int]:
-        """Constant inputs of one dummy draft forward at `num_tokens`.
-
-        Under lockstep `_dp_dummy_forward` runs once per padding chunk per
-        step, so build the dummies once per bucket instead of allocating and
-        uploading five tensors every idle step.
-        """
+        """Cached constant inputs of one dummy draft forward."""
         entry = self._dummy_forward_input_cache.get(num_tokens)
         if entry is not None:
             return entry
@@ -739,15 +693,12 @@ class DFlashProposer:
         use_max_model_len: bool,
         sync: bool,
     ) -> None:
-        """One draft forward on constant dummies; see
-        `_dummy_precompute_and_update_kv_cache` for `sync`."""
+        """One draft forward on constant dummies; `sync` as in
+        `_dummy_precompute_and_update_kv_cache`."""
         runner = self.runner
         (input_ids, positions, query_start_loc, seq_lens, request_distribution,
          actual_num_reqs) = self._dummy_forward_inputs(num_tokens)
 
-        # A fresh context per call (the staging walk caches its uploads on
-        # the context, and the real path stages once per chunk), through
-        # the same builder as the real path.
         per_layer_attn_metadata = self._build_attn_metadata_for_draft(
             num_reqs=actual_num_reqs,
             start_index=0,
@@ -774,27 +725,15 @@ class DFlashProposer:
                 input_ids, positions, self.block_size)
             synchronize_tensors(draft_tokens_chunk, wait=sync)
 
-    def _dp_lockstep_sharded(self) -> bool:
-        """Whether this drafter takes part in EP-DP lockstep pairing.
-
-        Kept as "lockstep is on", including for a TP-replicated (draft_tp=1)
-        draft: replaying its padding forwards is redundant but harmless,
-        and keeps busy and idle ranks on one rule. Eagle3Proposer skips the
-        replicated MoE-free case instead.
-        """
-        return self.runner._dp_lockstep_enabled()
-
     def _dp_draft_bucket(self) -> int:
-        """Draft-forward token bucket every lockstep rank runs this step,
-        from the DP-wide max per-chunk request count."""
+        """Draft-forward token bucket every lockstep rank runs this step."""
         coordinated_reqs = max(1, self.runner._dp_step_max_reqs)
         return self._get_padded_len(coordinated_reqs * self.block_size)
 
     @torch.no_grad()
     def _dp_dummy_kv_update(self) -> None:
-        """One padding KV-update pass at the DP-coordinated target bucket —
-        the same program a busy rank's `_update_draft_kv_cache_from_target`
-        dispatches."""
+        """One padding KV-update pass at the DP-coordinated target bucket.
+        Runs on the decode path, so it must not wait on the host."""
         runner = self.runner
         bucket = runner._dp_target_bucket
         assert bucket is not None, "_dp_target_bucket unset in lockstep step"
@@ -807,28 +746,22 @@ class DFlashProposer:
 
     @torch.no_grad()
     def _dp_dummy_forward(self) -> None:
-        """One padding draft forward at the step's coordinated draft bucket —
-        the shape `_prepare_dflash_inputs` pins every rank to under
-        lockstep, derived from the same `_dp_coordinated_step` all-reduce."""
+        """One padding draft forward at the step's coordinated draft bucket."""
         self._dummy_draft_forward(num_tokens=self._dp_draft_bucket(),
                                   use_max_model_len=True,
                                   sync=False)
 
     @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
-        """Replay a busy rank's DRAFT collective trace on an idle/padding
-        rank, for `num_chunks` padding chunks (EP-DP lockstep).
-
-        Collectives pair across ranks by emission order, and a busy
-        propose() emits ALL context KV-updates before ALL draft forwards
-        (the hoist at the top of propose), so the replay keeps the same
-        phase structure: KV-updates x num_chunks, then forwards x
-        num_chunks — never interleaved per chunk.
-        """
+        """Replay a busy rank's draft collectives on an idle/padding rank
+        for `num_chunks` padding chunks (EP-DP lockstep)."""
         if num_chunks <= 0 or self.draft_model is None:
             return
-        if not self._dp_lockstep_sharded():
+        if not self.runner._dp_lockstep_enabled():
             return
+        # Collectives pair across ranks by emission order, and propose()
+        # emits ALL KV-updates before ALL draft forwards, so the replay
+        # keeps that phase structure -- never interleaved per chunk.
         for _ in range(num_chunks):
             self._dp_dummy_kv_update()
         for _ in range(num_chunks):
@@ -860,7 +793,7 @@ class DFlashProposer:
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what
         # drafters that predate it expose. The concatenated width is one
-        # target hidden size per tagged layer -- see `_kv_update_hidden_spec`.
+        # target hidden size per tagged layer.
         if hasattr(self.draft_model, "combine_hidden_states"):
             target_hidden = self.draft_model.combine_hidden_states(
                 target_hidden)
