@@ -20,6 +20,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 import json
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
@@ -119,6 +120,53 @@ def _select_committed_mamba_blocks(
             f"blocks={len(block_ids)}, required={required_blocks}")
         committed_blocks.append(int(block_ids[-required_blocks]))
     return committed_blocks
+
+
+@dataclass(frozen=True)
+class _Stage3TransferGroup:
+    """One paged KV cache group Stage 3 moves, and the size of its pages.
+
+    A cache group is the set of layers the scheduler pages together: one
+    request gets one block table per group, and every layer in the group
+    reads the same page numbers. That is why a block ID means nothing until
+    you know its group, and why `page_tokens` travels alongside the ordinal
+    rather than being read from a connector-wide `block_size`.
+    """
+
+    cache_group_ordinal: int
+    page_tokens: int
+
+
+def _stage3_transfer_groups(
+    kv_cache_groups: Sequence[Any],
+    *,
+    allow_multiple: bool,
+) -> tuple[_Stage3TransferGroup, ...]:
+    """The KV cache groups whose pages Stage 3 transfers, in group order.
+
+    Mamba groups are excluded: their state rides the state-class tags and is
+    addressed one committed checkpoint at a time, not as a page range.
+
+    ``page_tokens`` travels with the ordinal because DeepSeek-V4's groups page
+    at different sizes -- its SWA group's block is an eighth of the CSA
+    group's -- so a single connector-wide page size cannot validate them all.
+    Every other model here has exactly one such group, which
+    ``allow_multiple=False`` keeps enforced.
+    """
+    groups = tuple(
+        _Stage3TransferGroup(cache_group_ordinal=index,
+                             page_tokens=int(group.kv_cache_spec.block_size))
+        for index, group in enumerate(kv_cache_groups)
+        if not isinstance(group.kv_cache_spec, MambaSpec))
+    if not groups:
+        raise ValueError(
+            "Stage-3 resharding requires at least one non-Mamba KV cache "
+            f"group, got {len(tuple(kv_cache_groups))} group(s)")
+    if not allow_multiple and len(groups) != 1:
+        raise ValueError("Stage-3 Qwen3.5 resharding requires exactly one "
+                         f"full-attention KV cache group, got "
+                         f"{[group.cache_group_ordinal for group in groups]}")
+    return groups
 
 
 @dataclass
@@ -253,6 +301,11 @@ def _use_raiden_glm_admission() -> bool:
                 and tpu_envs.TPU_RAIDEN_GLM_ADMISSION)
 
 
+def _use_raiden_dsv4_admission() -> bool:
+    return bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                and tpu_envs.TPU_RAIDEN_DSV4_ADMISSION)
+
+
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -274,17 +327,13 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config)
         self.use_raiden = use_raiden
         self._stage3_fa_group_index = 0
+        self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
         if use_raiden and _use_raiden_stage3_transport():
-            fa_groups = [
-                index
-                for index, group in enumerate(kv_cache_config.kv_cache_groups)
-                if not isinstance(group.kv_cache_spec, MambaSpec)
-            ]
-            if len(fa_groups) != 1:
-                raise ValueError(
-                    "Stage-3 Qwen3.5 resharding requires exactly one "
-                    f"full-attention KV cache group, got {fa_groups}")
-            self._stage3_fa_group_index = fa_groups[0]
+            self._stage3_transfer_groups = _stage3_transfer_groups(
+                kv_cache_config.kv_cache_groups,
+                allow_multiple=_use_raiden_dsv4_admission())
+            self._stage3_fa_group_index = (
+                self._stage3_transfer_groups[0].cache_group_ordinal)
         self._stage3_mamba_group_indices: list[int] = []
         stage3_mamba_num_speculative_blocks = 0
         if use_raiden and _use_raiden_stage3_transport():
@@ -317,6 +366,8 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             if use_raiden and _use_raiden_stage3_transport():
                 self.connector_scheduler._stage3_fa_group_index = (
                     self._stage3_fa_group_index)
+                self.connector_scheduler._stage3_transfer_groups = (
+                    self._stage3_transfer_groups)
                 self.connector_scheduler._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices)
                 self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
@@ -364,11 +415,23 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
 
         if self.use_raiden and _use_raiden_stage3_transport():
-            if self._stage3_fa_group_index >= len(block_ids):
-                raise ValueError(
-                    "Stage-3 FA KV cache group is absent from request block "
-                    f"tables: index={self._stage3_fa_group_index}, "
-                    f"groups={len(block_ids)}")
+            for transfer_group in self._stage3_transfer_groups:
+                if transfer_group.cache_group_ordinal >= len(block_ids):
+                    raise ValueError(
+                        "Stage-3 FA KV cache group is absent from request "
+                        f"block tables: group="
+                        f"{transfer_group.cache_group_ordinal}, "
+                        f"groups={len(block_ids)}")
+            if len(self._stage3_transfer_groups) > 1:
+                # The plan is built and validated above, but the wire arrays
+                # below still carry one page range per request. Fail here
+                # rather than silently transferring only the first group.
+                raise NotImplementedError(
+                    "Stage-3 transfers a single KV cache group's pages per "
+                    "request; this model has "
+                    f"{len(self._stage3_transfer_groups)} "
+                    f"({[g.cache_group_ordinal for g in self._stage3_transfer_groups]}) "
+                    "and needs per-group block lists on the wire")
             mamba_block_ids = None
             if self._stage3_mamba_group_indices:
                 mamba_block_ids = []
@@ -808,6 +871,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_fa_group_index = 0
+        self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
@@ -989,11 +1053,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 source transfer parallelism must be positive")
 
         grouped_block_ids = blocks.get_block_ids()
-        if self._stage3_fa_group_index >= len(grouped_block_ids):
-            raise ValueError(
-                "Stage-3 FA KV cache group is absent from decode allocation: "
-                f"index={self._stage3_fa_group_index}, "
-                f"groups={len(grouped_block_ids)}")
+        # Every planned group must be present before any of them is read; a
+        # missing one means the decode allocation and the admitted manifest
+        # disagree about the group layout.
+        for transfer_group in (self._stage3_transfer_groups
+                               or (_Stage3TransferGroup(
+                                   cache_group_ordinal=self.
+                                   _stage3_fa_group_index,
+                                   page_tokens=self.block_size), )):
+            if transfer_group.cache_group_ordinal >= len(grouped_block_ids):
+                raise ValueError(
+                    "Stage-3 FA KV cache group is absent from decode "
+                    f"allocation: group={transfer_group.cache_group_ordinal}, "
+                    f"groups={len(grouped_block_ids)}")
         local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
         expected_pages = ((num_tokens + self.block_size - 1) //
                           self.block_size)
