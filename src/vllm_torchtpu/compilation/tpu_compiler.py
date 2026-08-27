@@ -28,6 +28,8 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.stablehlo_dump import \
+    install_stablehlo_dump_hook
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -40,7 +42,12 @@ class TpuCompilationHandle:
     executable: Any | None = None
 
 
-_tpu_backend = TpuBackend()
+_stablehlo_dump_active = install_stablehlo_dump_hook()
+# AOTAutograd cache hits skip TorchTPU's FX-to-MLIR boundary, so an explicit
+# dump run disables that cache layer. Native TorchTPU compilation caches may
+# still serve the executable; MLIR construction and serialization happen
+# before that lookup and are therefore still captured.
+_tpu_backend = TpuBackend(enable_serialization=not _stablehlo_dump_active)
 
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
