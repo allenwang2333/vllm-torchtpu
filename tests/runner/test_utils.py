@@ -344,6 +344,78 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
+def test_phased_profiler_min_num_reqs_defaults_off(profiler_fixture):
+    """Unset `min_num_reqs` must not suppress a capture that happens today."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    assert profiler.min_num_reqs == -1
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+    profiler.step({
+        "num_reqs": 1,
+        "total_num_scheduled_tokens": 1,
+        "min_kv_len": 0
+    })
+
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+
+
+@pytest.mark.parametrize("phase", [
+    InferencePhase.DECODE_ONLY,
+    InferencePhase.DECODE_HEAVY,
+    InferencePhase.BALANCED,
+])
+def test_phased_profiler_skips_decode_bearing_steps_below_min_num_reqs(
+        profiler_fixture, phase):
+    """The warmup ramp must not consume a decode-bearing phase latch.
+
+    Each phase fires once per process, so a capture at num_reqs 1-2 is not just
+    unrepresentative -- it permanently costs the steady-state trace.
+    """
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.min_num_reqs = 16
+    # DECODE_HEAVY is separately rate-limited by num_decode_steps_to_skip;
+    # keep that gate open so this test measures only the num_reqs gate.
+    profiler.num_decode_steps_to_skip = 0
+    mock_determine_phase.return_value = phase
+
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100, "min_kv_len": 0}
+    profiler.step(stats)
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[phase]
+
+    stats["num_reqs"] = 16
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[phase]
+    assert profiler.current_phase == phase.name.lower()
+
+
+def test_phased_profiler_min_num_reqs_does_not_gate_prefill_only(
+        profiler_fixture):
+    """PREFILL_ONLY shape is set by the chunk size, not by how full the batch is."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.min_num_reqs = 16
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    profiler.step({
+        "num_reqs": 1,
+        "total_num_scheduled_tokens": 2048,
+        "min_kv_len": 0
+    })
+
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+
 def _stage_rank_capture(rank_dir, ts_name, filename, content):
     """Helper: simulate writing one xplane file under rank_N/plugins/profile/<ts>/."""
     ts_dir = rank_dir / "plugins" / "profile" / ts_name

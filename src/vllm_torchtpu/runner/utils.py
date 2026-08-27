@@ -24,17 +24,22 @@ BALANCED_RATIO_THRESHOLD = (0.4, 0.6)
 PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR = 15
 PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+# Off by default (-1): a capture that would otherwise happen must not disappear
+# for models nobody has re-tuned. See `min_num_reqs` in `PhaseBasedProfiler`.
+PHASED_PROFILER_MIN_NUM_REQS = -1
 
-# Tuning knob with no `profiler_config` equivalent, so it stays in
+# Tuning knobs with no `profiler_config` equivalent, so they stay in
 # `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_decode_only_kv_len_threshold")
+PHASED_PROFILER_MIN_NUM_REQS_KEY = "phased_profiler_min_num_reqs"
 
-# Diagnostics-only knob: it steers profiling and never changes the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
+# Diagnostics-only knobs: they steer profiling and never change the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
 # TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset({
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    PHASED_PROFILER_MIN_NUM_REQS_KEY,
 })
 
 
@@ -45,6 +50,16 @@ class InferencePhase(Enum):
     AMBIGUOUS = 3
     PREFILL_ONLY = 4
     DECODE_ONLY = 5
+
+
+# Phases whose cost depends on how full the decode batch is, and which are
+# therefore worthless when captured off the warmup ramp. `PREFILL_ONLY` is
+# excluded: its shape is set by the prefill chunk, not by `num_reqs`.
+_MIN_NUM_REQS_GATED_PHASES = frozenset({
+    InferencePhase.DECODE_ONLY,
+    InferencePhase.DECODE_HEAVY,
+    InferencePhase.BALANCED,
+})
 
 
 def determine_phase_from_batch_composition_stats(
@@ -149,6 +164,7 @@ class PhaseBasedProfiler:
         int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold:
         int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
+        min_num_reqs: int = PHASED_PROFILER_MIN_NUM_REQS,
         standard_opts: Optional[dict[str, Any]] = None,
         advanced_opts: Optional[dict[str, Any]] = None,
     ):
@@ -161,6 +177,13 @@ class PhaseBasedProfiler:
         # Wait for KV cache to reach a certain length before profiling decode-only phase
         # to ensure we capture traces of longer, steady-state context lengths.
         self.decode_kv_len_threshold: int = decode_kv_len_threshold
+        # Wait for the batch to be reasonably full before profiling a
+        # decode-bearing phase. `decode_kv_len_threshold` alone is not enough:
+        # during warmup a single long request already satisfies it, so the
+        # phase is consumed at num_reqs 1-2 and the steady-state program --
+        # the one that actually runs in production -- is never traced. The
+        # phase latch fires once per process, so there is no second chance.
+        self.min_num_reqs: int = min_num_reqs
         self.standard_opts = standard_opts or {}
         self.advanced_opts = advanced_opts or {}
         self.profile_dir: str = profile_dir
@@ -193,6 +216,11 @@ class PhaseBasedProfiler:
             logger.info(
                 "Will skip decode-only steps until min KV len >= %d.",
                 self.decode_kv_len_threshold,
+            )
+        if self.min_num_reqs >= 0:
+            logger.info(
+                "Will skip decode-bearing steps until num_reqs >= %d.",
+                self.min_num_reqs,
             )
 
     def _write_batch_composition_stats_to_file_helper(
@@ -229,7 +257,8 @@ class PhaseBasedProfiler:
                 with open(stats_file, "w") as f:
                     f.write(payload)
             except Exception as e:
-                logger.warning("Failed to write batch composition stats: %s", e)
+                logger.warning("Failed to write batch composition stats: %s",
+                               e)
 
     def _resolve_canonical_dst_ts(self, phase_dir: str) -> str:
         """Resolve the canonical destination timestamp for this phase."""
@@ -262,6 +291,21 @@ class PhaseBasedProfiler:
                         "Skipping decode-only step as min KV len %d < threshold %d.",
                         min_kv_len,
                         self.decode_kv_len_threshold,
+                    )
+                    break
+
+            # Every decode-bearing phase, not just DECODE_ONLY: the warmup ramp
+            # walks through DECODE_HEAVY and BALANCED at a near-empty batch too,
+            # and each latch it trips is a phase that can never be recaptured.
+            if (phase in _MIN_NUM_REQS_GATED_PHASES
+                    and self.min_num_reqs >= 0):
+                num_reqs = batch_composition_stats.get("num_reqs", 0)
+                if num_reqs < self.min_num_reqs:
+                    logger.debug(
+                        "Skipping %s step as num_reqs %d < threshold %d.",
+                        phase.name,
+                        num_reqs,
+                        self.min_num_reqs,
                     )
                     break
 
