@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek-V4 KV cache: logical caches and physical allocation</title>
+<style>
+  :root { color-scheme: light dark; }
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --rule: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --csa-nope: #2a78d6;   /* categorical slot 1 */
+    --csa-rope: #eb6834;   /* slot 2 */
+    --indexer:  #1baf7a;   /* slot 3 */
+    --hca:      #eda100;   /* slot 4 */
+    --overflow: #898781;   /* chrome, not a series */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --rule: #383835;
+      --border: rgba(255,255,255,0.10);
+      --csa-nope: #3987e5;
+      --csa-rope: #d95926;
+      --indexer:  #199e70;
+      --hca:      #c98500;
+      --overflow: #898781;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+    --grid: #2c2c2a; --rule: #383835; --border: rgba(255,255,255,0.10);
+    --csa-nope: #3987e5; --csa-rope: #d95926; --indexer: #199e70; --hca: #c98500;
+    --overflow: #898781;
+  }
+
+  body { margin: 0; background: var(--page); }
+  .viz-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--text-primary);
+    padding: 32px 28px 64px;
+    max-width: 1180px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 22px; margin: 0 0 6px; font-weight: 650; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 40px 0 4px; font-weight: 620; }
+  h2 .num { color: var(--text-muted); font-weight: 500; margin-right: 8px; }
+  .sub { color: var(--text-secondary); font-size: 13px; line-height: 1.55; margin: 0 0 4px; max-width: 74ch; }
+  .note { color: var(--text-muted); font-size: 12px; line-height: 1.55; margin: 8px 0 0; max-width: 78ch; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: inherit; }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 14px 0 0; }
+  button {
+    font: inherit; font-size: 12px; padding: 5px 11px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-secondary); cursor: pointer;
+  }
+  button:hover { color: var(--text-primary); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 0; font-size: 12px; color: var(--text-secondary); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+  .swatch.ghost { background: transparent; border: 1.5px dashed var(--rule); }
+
+  .panel {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; margin-top: 14px;
+  }
+
+  /* Panel 1: per-layer logical inventory */
+  .layers { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .layer-card { border: 1px solid var(--border); border-radius: 10px; padding: 13px 14px; }
+  .layer-card h3 { margin: 0 0 3px; font-size: 13px; font-weight: 620; }
+  .layer-card .kind { font-size: 11px; color: var(--text-muted); margin: 0 0 10px; }
+  .chip {
+    display: flex; align-items: center; gap: 8px; padding: 5px 0;
+    font-size: 12px; border-top: 1px solid var(--grid);
+  }
+  .chip:first-of-type { border-top: none; }
+  .dot { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .dot.ghost { background: transparent; border: 1.5px dashed var(--rule); }
+  .chip .name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+  .chip .tail { margin-left: auto; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+
+  /* Panel 2: physical arrays */
+  .arrays { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
+  .array-card { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .array-head { padding: 11px 13px 10px; border-bottom: 1px solid var(--grid); }
+  .array-title { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 620; }
+  .array-shape { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text-secondary); margin-top: 5px; }
+  .array-bytes { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
+  .residents { padding: 4px 13px 11px; }
+  .residents .hdr { font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); padding: 9px 0 5px; }
+  .res { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: baseline; padding: 5px 0; border-top: 1px solid var(--grid); font-size: 11.5px; }
+  .res .nm { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .res .grp { color: var(--text-muted); font-size: 10.5px; white-space: nowrap; }
+  .res .why { grid-column: 2 / -1; color: var(--text-muted); font-size: 10.5px; margin-top: 2px; }
+  .badge-owner, .badge-alias {
+    display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-top: 3px;
+  }
+  .badge-alias { background: transparent !important; border: 1.5px dashed var(--rule); }
+  .alias-count { margin-left: auto; font-size: 10.5px; color: var(--text-muted); }
+
+  /* Panel 3: block strip */
+  .strip-wrap { overflow-x: auto; }
+  svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 6px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-muted); font-weight: 550; font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td .mono { font-size: 11.5px; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+
+  #tip {
+    position: fixed; pointer-events: none; opacity: 0; transition: opacity .08s;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 11.5px; line-height: 1.5; max-width: 300px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.14); z-index: 50;
+  }
+  #tip .t { font-weight: 620; margin-bottom: 3px; }
+  #tip .d { color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<div class="viz-root">
+
+  <h1>DeepSeek-V4 KV cache: logical caches and physical allocation</h1>
+  <p class="sub">
+    DSv4 declares far more logical caches than it allocates arrays. Sliding-window
+    caches and compressor state caches carry no memory of their own; they are bound
+    onto an array another layer already owns, at offset&nbsp;0. Nothing in the bytes
+    separates them. The allocator keeps them apart by never handing one block ID to
+    two cache groups.
+  </p>
+  <p class="note">
+    Geometry from <code>src/vllm_torchtpu/runner/tpu_runner.py:5707-5891</code>
+    (<code>_initialize_ds_v4_kv_cache</code>, <code>_validate_ds_v4_overlay</code>);
+    byte figures from <code>tests/distributed/test_pool_byte_spans.py:419-434</code>
+    (DeepSeek-V4-Flash at <code>block_size=1024</code>, so <code>T=256</code> compressed
+    tokens per page, <code>uint8</code>, packing&nbsp;4). Pool tags from
+    <code>src/vllm_torchtpu/distributed/kv_transfer/raiden/tags.py</code>.
+  </p>
+
+  <div class="toolbar">
+    <button id="theme">Toggle dark mode</button>
+  </div>
+
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--csa-nope)"></i> CSA NoPE array</span>
+    <span><i class="swatch" style="background:var(--csa-rope)"></i> CSA RoPE array</span>
+    <span><i class="swatch" style="background:var(--indexer)"></i> Indexer array</span>
+    <span><i class="swatch" style="background:var(--hca)"></i> HCA array</span>
+    <span><i class="swatch ghost"></i> Overlay: no bytes of its own</span>
+  </div>
+
+  <h2><span class="num">1</span>What each layer declares</h2>
+  <p class="sub">
+    A three-layer slice: two CSA layers and one HCA layer. Filled marks allocate;
+    dashed marks are overlaid onto someone else's array. Real DeepSeek-V4-Flash has
+    21 CSA layers and 43 SWA layers (<code>tpu_runner.py:5797-5799</code>).
+  </p>
+  <div class="panel">
+    <div class="layers" id="layers"></div>
+  </div>
+
+  <h2><span class="num">2</span>Where those caches physically live</h2>
+  <p class="sub">
+    Seven arrays for eleven logical caches. The first card is the interesting one:
+    four caches from four different cache groups share it, at the same byte offset.
+  </p>
+  <div class="panel">
+    <div class="arrays" id="arrays"></div>
+  </div>
+  <p class="note">
+    <code>_validate_ds_v4_overlay</code> enforces the one thing checkable from
+    geometry alone: two layers of the <em>same</em> group may never land on one array,
+    because they share a block table. Cross-group sharing is legal and is what the
+    first card shows.
+  </p>
+  <p class="note">
+    The overlay depends on how vLLM groups the layers, which the runner logs for
+    exactly that reason (<code>tpu_runner.py:5833-5848</code>). Drawn here is the
+    grouping the Raiden fixture models
+    (<code>tests/distributed/raiden_test_utils.py:174-190</code>): all SWA layers in
+    one group, so they take hosts 0, 1, 2 in turn. If vLLM instead puts every SWA
+    layer in its own group, each is at position 0 and they all land on the first CSA
+    NoPE array. With more overlay consumers than CSA arrays, <code>_host_at</code>
+    allocates fresh <code>ds_v4_overflow.i</code> arrays rather than double-book a
+    same-group array.
+  </p>
+
+  <h2><span class="num">3</span>What keeps the four apart: block IDs</h2>
+  <p class="sub">
+    All groups draw pages from one shared <code>BlockPool</code>, and a block ID is
+    owned by at most one group at a time. That is a runtime invariant, not a property
+    of the layout, so Raiden cannot read it off the arrays.
+  </p>
+  <div class="panel">
+    <div class="strip-wrap"><svg id="strip" width="1040" height="150" role="img"
+      aria-label="Block ownership strip for the CSA layer 0 NoPE array: each block is owned by at most one cache group"></svg></div>
+    <p class="note" style="margin-top:14px">
+      This is why every DSv4 pool tag carries a <code>.g{ordinal}</code> suffix and why
+      every transfer registers spans against its own group's block table. A tag that
+      did not name the group would address the wrong cache's pages. The ordinal is
+      whatever vLLM's grouping produces; in the DeepSeek-V4-Flash run the SWA group
+      came out as group&nbsp;1, hence the tag <code>dsv4.swa.g1</code>.
+    </p>
+  </div>
+
+  <h2><span class="num">4</span>Page geometry per role</h2>
+  <p class="sub">
+    Every role disagrees about how many logical tokens sit on a page and how many rows
+    a token costs. That is why the layout fingerprint records geometry per tag rather
+    than one <code>page_tokens</code>, and why <code>lower_dsv4_row_spans</code> rounds
+    a partial tail page up in rows rather than tokens.
+  </p>
+  <div class="panel">
+    <table id="geo"></table>
+    <p class="note">
+      SWA's own page is 128 tokens x 1024&nbsp;B = 131072&nbsp;B, byte-for-byte the CSA
+      NoPE page, which is what lets it be overlaid there. Compressor-state block sizes
+      are derived by the kernel layout model rather than a closed form
+      (<code>deepseek_v4_compressor.py:266-309</code>); at ratio&nbsp;4 / head_dim&nbsp;512 /
+      block&nbsp;1024 it comes out 16 (<code>tests/layers/vllm/test_dsv4_compressor_op.py:45-58</code>).
+    </p>
+  </div>
+
+  <details>
+    <summary>Table view: every logical cache, its host array, and its overlay rule</summary>
+    <div class="panel"><table id="allrows"></table></div>
+  </details>
+
+  <div id="tip" role="status" aria-live="polite"></div>
+</div>
+
+<script>
+/* ---- model of the slice, straight from _initialize_ds_v4_kv_cache ---- */
+const ARRAYS = [
+  { id:"csa0n", role:"csa-nope", color:"var(--csa-nope)", title:"CSA layer 0 - NoPE",
+    shape:"(N, 256, 4, 128)", bytes:131072, rows:256, rowB:512,
+    alloc:"model.layers.0.self_attn.attn" },
+  { id:"csa0r", role:"csa-rope", color:"var(--csa-rope)", title:"CSA layer 0 - RoPE",
+    shape:"(N, 64, 4, 128)", bytes:32768, rows:64, rowB:512,
+    alloc:"model.layers.0.self_attn.attn (companion)" },
+  { id:"idx0", role:"indexer", color:"var(--indexer)", title:"Indexer layer 0",
+    shape:"(N, 64, 4, 256)", bytes:65536, rows:64, rowB:1024,
+    alloc:"model.layers.0.self_attn.attn.indexer.k_cache" },
+  { id:"csa1n", role:"csa-nope", color:"var(--csa-nope)", title:"CSA layer 1 - NoPE",
+    shape:"(N, 256, 4, 128)", bytes:131072, rows:256, rowB:512,
+    alloc:"model.layers.1.self_attn.attn" },
+  { id:"csa1r", role:"csa-rope", color:"var(--csa-rope)", title:"CSA layer 1 - RoPE",
+    shape:"(N, 64, 4, 128)", bytes:32768, rows:64, rowB:512,
+    alloc:"model.layers.1.self_attn.attn (companion)" },
+  { id:"idx1", role:"indexer", color:"var(--indexer)", title:"Indexer layer 1",
+    shape:"(N, 64, 4, 256)", bytes:65536, rows:64, rowB:1024,
+    alloc:"model.layers.1.self_attn.attn.indexer.k_cache" },
+  { id:"hca2", role:"hca", color:"var(--hca)", title:"HCA layer 2 - latents",
+    shape:"(N, 512, 4, 128)", bytes:262144, rows:512, rowB:512,
+    alloc:"model.layers.2.self_attn.attn" },
+];
+
+// resident: {array, name, group, owner, why}
+const RESIDENTS = [
+  { a:"csa0n", name:"model.layers.0.self_attn.attn", group:"CSA", owner:true,
+    why:"allocates the array; the layer binds the (nope, rope) pair" },
+  { a:"csa0n", name:"model.layers.0.self_attn.attn.compressor.state_cache", group:"CSA state", owner:false,
+    why:"a compressor state maps onto its own compressed-KV layer's array; the kernel writes f32 state rows and compressed KV through one buffer" },
+  { a:"csa0n", name:"model.layers.0.self_attn.swa_cache", group:"SWA", owner:false,
+    why:"SWA maps onto the CSA NoPE array at its position within its own cache group (position 0)" },
+  { a:"csa0n", name:"model.layers.2.self_attn.attn.compressor.state_cache", group:"HCA state", owner:false,
+    why:"the i-th HCA state maps onto the i-th CSA NoPE array; the HCA page cannot host it" },
+
+  { a:"csa0r", name:"model.layers.0.self_attn.attn", group:"CSA", owner:true,
+    why:"the RoPE half of the pair" },
+  { a:"csa0r", name:"model.layers.0.self_attn.attn.compressor.state_cache", group:"CSA state", owner:false,
+    why:"bound to the whole pair, but the compressor runs in overlap mode and writes state rows through NoPE only, so Raiden registers arrays[0] alone" },
+
+  { a:"idx0", name:"model.layers.0.self_attn.attn.indexer.k_cache", group:"Indexer", owner:true,
+    why:"allocates the array" },
+  { a:"idx0", name:"model.layers.0.self_attn.attn.indexer.compressor.state_cache", group:"Indexer state", owner:false,
+    why:"maps onto its own compressed-KV array" },
+
+  { a:"csa1n", name:"model.layers.1.self_attn.attn", group:"CSA", owner:true, why:"allocates the array" },
+  { a:"csa1n", name:"model.layers.1.self_attn.attn.compressor.state_cache", group:"CSA state", owner:false,
+    why:"maps onto its own compressed-KV layer's array" },
+  { a:"csa1n", name:"model.layers.1.self_attn.swa_cache", group:"SWA", owner:false,
+    why:"position 1 within the SWA cache group, so it takes the second host" },
+  { a:"csa1r", name:"model.layers.1.self_attn.attn", group:"CSA", owner:true, why:"the RoPE half of the pair" },
+  { a:"csa1r", name:"model.layers.1.self_attn.attn.compressor.state_cache", group:"CSA state", owner:false,
+    why:"bound to the pair; carries no state rows" },
+
+  { a:"idx1", name:"model.layers.1.self_attn.attn.indexer.k_cache", group:"Indexer", owner:true, why:"allocates the array" },
+  { a:"idx1", name:"model.layers.1.self_attn.attn.indexer.compressor.state_cache", group:"Indexer state", owner:false,
+    why:"maps onto its own compressed-KV array" },
+
+  { a:"hca2", name:"model.layers.2.self_attn.attn", group:"HCA", owner:true,
+    why:"allocates the array; its state cache went to a CSA NoPE array instead" },
+];
+
+const LAYERS = [
+  { title:"model.layers.0", kind:"CSA layer (compress_ratio 4)", caches:[
+    { n:"self_attn.attn", role:"csa-nope", tail:"NoPE + RoPE", ghost:false },
+    { n:"self_attn.attn.indexer.k_cache", role:"indexer", tail:"own array", ghost:false },
+    { n:"self_attn.swa_cache", role:"csa-nope", tail:"-> CSA0 NoPE", ghost:true },
+    { n:"self_attn.attn.compressor.state_cache", role:"csa-nope", tail:"-> CSA0 pair", ghost:true },
+    { n:"self_attn.attn.indexer.compressor.state_cache", role:"indexer", tail:"-> indexer 0", ghost:true },
+  ]},
+  { title:"model.layers.1", kind:"CSA layer (compress_ratio 4)", caches:[
+    { n:"self_attn.attn", role:"csa-nope", tail:"NoPE + RoPE", ghost:false },
+    { n:"self_attn.attn.indexer.k_cache", role:"indexer", tail:"own array", ghost:false },
+    { n:"self_attn.swa_cache", role:"csa-nope", tail:"-> CSA1 NoPE", ghost:true },
+    { n:"self_attn.attn.compressor.state_cache", role:"csa-nope", tail:"-> CSA1 pair", ghost:true },
+    { n:"self_attn.attn.indexer.compressor.state_cache", role:"indexer", tail:"-> indexer 1", ghost:true },
+  ]},
+  { title:"model.layers.2", kind:"HCA layer (raw bf16 latents)", caches:[
+    { n:"self_attn.attn", role:"hca", tail:"own array", ghost:false },
+    { n:"self_attn.attn.compressor.state_cache", role:"hca", tail:"-> CSA0 NoPE", ghost:true },
+  ]},
+];
+
+const ROLE_COLOR = { "csa-nope":"var(--csa-nope)", "csa-rope":"var(--csa-rope)",
+                     "indexer":"var(--indexer)", "hca":"var(--hca)" };
+
+const GEO = [
+  ["CSA NoPE","dsv4.csa.nope.g*",1024,"T = 256","256 x 512 B","131 072","4 logical tokens on one row"],
+  ["CSA RoPE","dsv4.csa.rope.g*",1024,"T/4 = 64","64 x 512 B","32 768","16 logical tokens on one row"],
+  ["Indexer","dsv4.idx.g*",1024,"T/4 = 64","64 x 1024 B","65 536","16 logical tokens on one row"],
+  ["HCA","dsv4.hca.g*",256,"2T = 512","512 x 512 B","262 144","two rows per page token"],
+  ["SWA","dsv4.swa.g*",128,"overlay","256 x 512 B","131 072","overlaid on a CSA NoPE array"],
+  ["CSA state","dsv4.state.csa.g*","derived","overlay","-","-","overlaid on its own compressed-KV pair"],
+  ["Indexer state","dsv4.state.idx.g*","derived","overlay","-","-","overlaid on its own indexer array"],
+  ["HCA state","dsv4.state.hca.g*","derived","overlay","-","-","overlaid on a CSA NoPE array"],
+];
+
+/* ---- render ---- */
+const el = (t, c, h) => { const e = document.createElement(t); if (c) e.className = c; if (h != null) e.innerHTML = h; return e; };
+const esc = s => s.replace(/[&<>]/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[m]));
+
+const layersEl = document.getElementById("layers");
+for (const L of LAYERS) {
+  const card = el("div", "layer-card");
+  card.appendChild(el("h3", null, esc(L.title)));
+  card.appendChild(el("p", "kind", esc(L.kind)));
+  for (const c of L.caches) {
+    const row = el("div", "chip");
+    const dot = el("i", "dot" + (c.ghost ? " ghost" : ""));
+    if (!c.ghost) dot.style.background = ROLE_COLOR[c.role];
+    row.append(dot, el("span", "name", esc(c.n)), el("span", "tail", esc(c.tail)));
+    card.appendChild(row);
+  }
+  layersEl.appendChild(card);
+}
+
+const arraysEl = document.getElementById("arrays");
+for (const A of ARRAYS) {
+  const res = RESIDENTS.filter(r => r.a === A.id);
+  const aliases = res.filter(r => !r.owner).length;
+  const card = el("div", "array-card");
+
+  const head = el("div", "array-head");
+  const title = el("div", "array-title");
+  const sw = el("i", "swatch"); sw.style.background = A.color;
+  title.append(sw, el("span", null, esc(A.title)));
+  if (aliases) title.appendChild(el("span", "alias-count", aliases + " overlaid"));
+  head.appendChild(title);
+  head.appendChild(el("div", "array-shape", esc(A.shape)));
+  head.appendChild(el("div", "array-bytes",
+    A.rows + " rows x " + A.rowB + " B = " + A.bytes.toLocaleString("en-US") + " B per page"));
+  head.dataset.tip = JSON.stringify({
+    t: A.title,
+    d: "torch.zeros(" + A.shape + ", dtype=uint8) allocated by " + A.alloc +
+       ". " + res.length + " logical cache(s) resolve to it, " + aliases + " of them overlaid."
+  });
+  card.appendChild(head);
+
+  const body = el("div", "residents");
+  body.appendChild(el("div", "hdr", "Logical caches bound here"));
+  for (const r of res) {
+    const row = el("div", "res");
+    const badge = el("i", r.owner ? "badge-owner" : "badge-alias");
+    if (r.owner) badge.style.background = A.color;
+    row.append(badge, el("span", "nm", esc(r.name)), el("span", "grp", esc(r.group) + " group"));
+    row.appendChild(el("span", "why", esc(r.why)));
+    body.appendChild(row);
+  }
+  card.appendChild(body);
+  arraysEl.appendChild(card);
+}
+
+/* geometry table */
+const geo = document.getElementById("geo");
+geo.innerHTML = "<thead><tr><th>Role</th><th>Pool tag</th><th>Page tokens</th><th>Rows / page</th>" +
+  "<th>Live bytes</th><th>Bytes / page</th><th>Note</th></tr></thead>";
+const gb = el("tbody");
+for (const g of GEO) {
+  const tr = el("tr");
+  tr.innerHTML = "<td>" + esc(g[0]) + "</td><td class='mono'>" + esc(g[1]) + "</td>" +
+    "<td class='num'>" + esc(String(g[2])) + "</td><td class='num'>" + esc(g[3]) + "</td>" +
+    "<td class='num'>" + esc(g[4]) + "</td><td class='num'>" + esc(g[5]) + "</td>" +
+    "<td>" + esc(g[6]) + "</td>";
+  gb.appendChild(tr);
+}
+geo.appendChild(gb);
+
+/* full table view */
+const all = document.getElementById("allrows");
+all.innerHTML = "<thead><tr><th>Logical cache</th><th>Cache group</th><th>Host array</th>" +
+  "<th>Owns bytes</th><th>Rule</th></tr></thead>";
+const ab = el("tbody");
+for (const r of RESIDENTS) {
+  const A = ARRAYS.find(a => a.id === r.a);
+  const tr = el("tr");
+  tr.innerHTML = "<td class='mono'>" + esc(r.name) + "</td><td>" + esc(r.group) + "</td>" +
+    "<td>" + esc(A.title) + " <span class='mono'>" + esc(A.shape) + "</span></td>" +
+    "<td>" + (r.owner ? "yes" : "no, overlaid") + "</td><td>" + esc(r.why) + "</td>";
+  ab.appendChild(tr);
+}
+all.appendChild(ab);
+
+/* block ownership strip */
+(function () {
+  const svg = document.getElementById("strip");
+  const NS = "http://www.w3.org/2000/svg";
+  const owners = [
+    { g:"CSA group", c:"var(--csa-nope)", blocks:[0,1,2,3,7,8,12,13] },
+    { g:"SWA group", c:"var(--csa-rope)", blocks:[4,5,9,14,15] },
+    { g:"CSA state group", c:"var(--indexer)", blocks:[6,10,17] },
+    { g:"HCA state group", c:"var(--hca)", blocks:[11,16,18] },
+  ];
+  const NB = 24, x0 = 12, y0 = 44, w = 38, h = 40, gap = 2;
+  const own = {};
+  owners.forEach(o => o.blocks.forEach(b => own[b] = o));
+
+  const mk = (t, attrs, txt) => {
+    const e = document.createElementNS(NS, t);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (txt != null) e.textContent = txt;
+    return e;
+  };
+
+  svg.appendChild(mk("text", { x:x0, y:20, "font-size":12, "font-weight":600,
+    fill:"var(--text-primary)" }, "Shared BlockPool, as seen by the CSA layer 0 NoPE array"));
+  svg.appendChild(mk("text", { x:x0, y:36, "font-size":11, fill:"var(--text-muted)" },
+    "Each block ID is held by at most one cache group at a time. Four groups write this one array and never collide."));
+
+  for (let b = 0; b < NB; b++) {
+    const o = own[b];
+    const x = x0 + b * (w + gap);
+    const rect = mk("rect", { x, y:y0, width:w, height:h, rx:4,
+      fill: o ? o.c : "transparent",
+      stroke: o ? "var(--surface-1)" : "var(--rule)",
+      "stroke-width": o ? 2 : 1,
+      "stroke-dasharray": o ? "" : "3 3" });
+    rect.dataset.tip = JSON.stringify({
+      t: "block " + b,
+      d: o ? "owned by the " + o.g + ". No other group can be handed this ID while it is held."
+           : "free. Any group may take it next; the allocator will not hand it to two."
+    });
+    svg.appendChild(rect);
+    svg.appendChild(mk("text", { x:x + w/2, y:y0 + h/2 + 4, "font-size":10.5,
+      "text-anchor":"middle", fill: o ? "var(--surface-1)" : "var(--text-muted)" }, String(b)));
+  }
+
+  let lx = x0;
+  owners.concat([{ g:"free", c:null }]).forEach(o => {
+    const sw = mk("rect", { x:lx, y:y0 + h + 20, width:11, height:11, rx:3,
+      fill: o.c || "transparent", stroke: o.c ? "none" : "var(--rule)",
+      "stroke-dasharray": o.c ? "" : "3 3" });
+    svg.appendChild(sw);
+    const t = mk("text", { x:lx + 17, y:y0 + h + 30, "font-size":11,
+      fill:"var(--text-secondary)" }, o.g);
+    svg.appendChild(t);
+    lx += 26 + o.g.length * 6.6;
+  });
+})();
+
+/* tooltip */
+(function () {
+  const tip = document.getElementById("tip");
+  const show = (e, raw) => {
+    const d = JSON.parse(raw);
+    tip.innerHTML = "<div class='t'></div><div class='d'></div>";
+    tip.querySelector(".t").textContent = d.t;
+    tip.querySelector(".d").textContent = d.d;
+    tip.style.opacity = 1;
+    move(e);
+  };
+  const move = e => {
+    const pad = 14, r = tip.getBoundingClientRect();
+    let x = e.clientX + pad, y = e.clientY + pad;
+    if (x + r.width > innerWidth - 8) x = e.clientX - r.width - pad;
+    if (y + r.height > innerHeight - 8) y = e.clientY - r.height - pad;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  };
+  addEventListener("mousemove", e => {
+    const t = e.target.closest ? e.target.closest("[data-tip]") : null;
+    if (t) { if (tip.style.opacity != 1) show(e, t.dataset.tip); else move(e); }
+    else tip.style.opacity = 0;
+  });
+  addEventListener("mouseover", e => {
+    const t = e.target.closest ? e.target.closest("[data-tip]") : null;
+    if (t) show(e, t.dataset.tip);
+  });
+})();
+
+document.getElementById("theme").onclick = () => {
+  const r = document.documentElement;
+  const dark = r.dataset.theme === "dark" ||
+    (!r.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+  r.dataset.theme = dark ? "light" : "dark";
+};
+</script>
+</body>
+</html>
