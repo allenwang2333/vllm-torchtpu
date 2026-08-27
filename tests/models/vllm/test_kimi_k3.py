@@ -753,7 +753,6 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         "test_compile",
         lower_bound=None,
         eps=1e-5,
-        state_dim_first=True,
     )
 
     sconv_cache = torch.zeros(1, 12, 2)

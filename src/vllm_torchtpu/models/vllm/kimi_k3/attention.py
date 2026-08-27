@@ -17,8 +17,8 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator, is_conv_state_dim_first)
+from vllm.model_executor.layers.mamba.mamba_utils import \
+    MambaStateDtypeCalculator
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -470,14 +470,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
-        # The dispatched op owns the short convolution as well: the fused decode
-        # kernel it routes decode rows to does the convolution itself, so it
-        # cannot be fed by a separate convolution op.
+        # The op owns the short convolution as well: the fused kernel does the
+        # convolution itself, so it cannot be fed by a separate convolution op.
         self.dispatched_kda_op = build_kimi_dispatched_kda_op(
             prefix,
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
-            state_dim_first=is_conv_state_dim_first(),
         )
 
         context = vllm_config.compilation_config.static_forward_context
