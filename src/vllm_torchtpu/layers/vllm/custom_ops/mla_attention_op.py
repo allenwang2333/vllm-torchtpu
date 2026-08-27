@@ -117,6 +117,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 # results.
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
             )
             return cache_kv, topk_indices
 
