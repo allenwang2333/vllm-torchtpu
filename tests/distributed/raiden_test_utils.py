@@ -87,9 +87,14 @@ class FakeKVCacheGroup:
 class FakeDsv4Spec:
     """Duck-typed DSv4 KV cache spec: only the fields the manifest reads."""
 
-    def __init__(self, *, storage_block_size, compress_ratio=1):
+    def __init__(self,
+                 *,
+                 storage_block_size,
+                 compress_ratio=1,
+                 sliding_window=None):
         self.storage_block_size = int(storage_block_size)
         self.compress_ratio = int(compress_ratio)
+        self.sliding_window = sliding_window
         # Logical page size, what the scheduler pages this group at. The
         # compressed roles store one row per `compress_ratio` tokens, so their
         # storage block is that much smaller than their block_size.
@@ -106,16 +111,15 @@ class FakeUniformTypeSpecs:
 
     def __init__(self, specs):
         self.kv_cache_specs = dict(specs)
-        self.block_size = max(
-            spec.block_size for spec in self.kv_cache_specs.values())
+        self.block_size = max(spec.block_size
+                              for spec in self.kv_cache_specs.values())
 
 
 def _dsv4_group(layer_names, spec):
     """A DSv4 cache group: per-layer specs under a uniform-type wrapper."""
     return FakeKVCacheGroup(
-        layer_names,
-        FakeUniformTypeSpecs({name: spec
-                              for name in layer_names}))
+        layer_names, FakeUniformTypeSpecs({name: spec
+                                           for name in layer_names}))
 
 
 def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
@@ -174,7 +178,9 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     hca_spec = FakeDsv4Spec(storage_block_size=tokens, compress_ratio=1)
     # SWA keeps raw latents, so its page holds an eighth of the CSA group's
     # tokens at the same byte size, and it pages at that smaller size.
-    swa_spec = FakeDsv4Spec(storage_block_size=tokens // 2, compress_ratio=1)
+    swa_spec = FakeDsv4Spec(storage_block_size=tokens // 2,
+                            compress_ratio=1,
+                            sliding_window=tokens // 2)
     # Each state role has its own window, so vLLM puts it in its own group.
     groups = [
         _dsv4_group(csa_names, csa_spec),

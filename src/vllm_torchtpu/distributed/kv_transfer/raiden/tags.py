@@ -11,7 +11,7 @@ TAG_GDN_CONV = "gdn.conv"
 TAG_GDN_SSM = "gdn.ssm"
 TAG_DSA_IDX = "dsa.idx"
 
-# DeepSeek-V4. Every DSv4 tag carries a ``.g{ordinal}`` suffix naming its
+# DeepSeek-V4. Every DSv4 tag carries a ``.g{index}`` suffix naming its
 # kv-cache-group, because DSv4 is the first admitted model whose logical caches
 # alias one array at the same byte offset and are told apart only by block ID.
 # A tag that did not name the group would address the wrong caches' pages.
@@ -27,6 +27,6 @@ TAG_DSV4_STATE_IDX = "dsv4.state.idx"
 TAG_DSV4_STATE_HCA = "dsv4.state.hca"
 
 
-def dsv4_group_tag(base_tag: str, group_ordinal: int) -> str:
+def dsv4_group_tag(base_tag: str, group_index: int) -> str:
     """``dsv4.swa`` + group 3 -> ``dsv4.swa.g3``."""
-    return f"{base_tag}.g{int(group_ordinal)}"
+    return f"{base_tag}.g{int(group_index)}"

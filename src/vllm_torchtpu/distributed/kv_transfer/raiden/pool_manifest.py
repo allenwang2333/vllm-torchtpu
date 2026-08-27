@@ -967,16 +967,16 @@ class Dsv4LayerEntry(NamedTuple):
     A DSv4 layer does not map one-to-one onto an array. A CSA layer binds a
     `(nope, rope)` pair and so yields two entries, while an SWA or
     compressor-state layer owns no memory at all and yields one entry naming
-    the array it was overlaid onto. `group_ordinal` is what makes an entry
+    the array it was overlaid onto. `group_index` is what makes an entry
     addressable: it says which cache group's block table the array's pages
     will be drawn from, and two entries on the same array with different
-    ordinals are the aliasing case this whole module exists to describe.
+    indices are the aliasing case this whole module exists to describe.
     """
 
-    # Role tag without the `.g{ordinal}` suffix, e.g. `dsv4.csa.nope`.
+    # Role tag without the `.g{index}` suffix, e.g. `dsv4.csa.nope`.
     tag_base: str
     layer_name: str
-    group_ordinal: int
+    group_index: int
     array: Any
 
 
@@ -1001,7 +1001,7 @@ def _dsv4_classify(
                 layer_name, _dsv4_layer_spec(group.kv_cache_spec, layer_name))
 
     entries: list[Dsv4LayerEntry] = []
-    for ordinal, group in enumerate(kv_cache_groups):
+    for group_index, group in enumerate(kv_cache_groups):
         for layer_name in group.layer_names:
             cache = named_kv_caches.get(layer_name)
             if cache is None:
@@ -1021,10 +1021,10 @@ def _dsv4_classify(
                 # array holds no state and must not be transferred as one.
                 entries.append(
                     Dsv4LayerEntry(_DSV4_STATE_TAG_BY_KV_TAG[kv_tag],
-                                   layer_name, ordinal, arrays[0]))
+                                   layer_name, group_index, arrays[0]))
             elif "swa_cache" in layer_name:
                 entries.append(
-                    Dsv4LayerEntry(TAG_DSV4_SWA, layer_name, ordinal,
+                    Dsv4LayerEntry(TAG_DSV4_SWA, layer_name, group_index,
                                    arrays[0]))
             else:
                 kv_tag = kv_tag_by_layer[layer_name]
@@ -1034,18 +1034,18 @@ def _dsv4_classify(
                             f"DSv4 CSA layer {layer_name} must bind a "
                             f"(nope, rope) pair; got {len(arrays)} array(s)")
                     entries.append(
-                        Dsv4LayerEntry(TAG_DSV4_CSA_NOPE, layer_name, ordinal,
-                                       arrays[0]))
+                        Dsv4LayerEntry(TAG_DSV4_CSA_NOPE, layer_name,
+                                       group_index, arrays[0]))
                     entries.append(
-                        Dsv4LayerEntry(TAG_DSV4_CSA_ROPE, layer_name, ordinal,
-                                       arrays[1]))
+                        Dsv4LayerEntry(TAG_DSV4_CSA_ROPE, layer_name,
+                                       group_index, arrays[1]))
                 else:
                     if len(arrays) != 1:
                         raise ManifestError(
                             f"DSv4 layer {layer_name} ({kv_tag}) must bind a "
                             f"single array; got {len(arrays)}")
                     entries.append(
-                        Dsv4LayerEntry(kv_tag, layer_name, ordinal,
+                        Dsv4LayerEntry(kv_tag, layer_name, group_index,
                                        arrays[0]))
                 _dsv4_check_role_rows(
                     kv_tag, layer_name,
@@ -1091,24 +1091,15 @@ def build_dsv4_pool_manifest(
       same eviction window.
     - A **pool** is what this function emits, one per (layer, array). It is
       a named block-strided window into one storage, not the storage itself.
-    - A **tag** names a pool, and pools sharing a tag transfer together.
-      There is one tag per (role, cache group); CSA is the only role needing
-      two, since its NoPE and RoPE arrays have different row geometry.
+    - A **tag** names a pool, and pools sharing a tag transfer together. It
+      pairs a role, meaning the cache kind (`dsv4.swa`, `dsv4.csa.nope`, and
+      the rest of `tags.py`), with a cache group.
 
-    A DeepSeek-V4-Flash-shaped materialization with 12 layers therefore
-    yields 7 arrays, 7 cache groups, 14 pools and 8 tags.
-
-    DSv4 is the first admitted model whose logical caches alias one array at
-    the same byte offset: an SWA cache sits on a CSA NoPE array, and a
-    compressor state sits on its own compressed-KV array. They are kept apart
-    only by the allocator never handing the same block ID to two cache groups,
-    a temporal invariant Raiden cannot see. Every pool therefore names its
-    kv-cache-group in its tag, so a byte-span registration always addresses
-    the pages of one block table.
-
-    What can be checked here is the spatial half of that invariant: two layers
-    of the *same* group must never land on one array, because they share a
-    block table.
+    DSv4's caches alias: an SWA cache sits on a CSA NoPE array, a compressor
+    state on its own compressed-KV array, both at byte offset 0. Only the
+    allocator never giving one block ID to two groups keeps them apart, and
+    Raiden cannot see that. So a tag names its group, and a byte-span
+    registration always addresses the pages of one block table.
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
@@ -1126,9 +1117,9 @@ def build_dsv4_pool_manifest(
 
     storages = _StorageTable()
     pools: list[PoolEntry] = []
-    # storage index -> (group ordinal, layer name) of the pool that claimed it.
+    # storage index -> (group index, layer name) of the pool that claimed it.
     claimed_by_group: dict[tuple[int, int], str] = {}
-    for tag_base, layer_name, ordinal, array in entries:
+    for tag_base, layer_name, group_index, array in entries:
         dtype_tag = _dtype_tag(array)
         if dtype_tag != "uint8":
             raise ManifestError(
@@ -1163,18 +1154,18 @@ def build_dsv4_pool_manifest(
                 f"not match {rows} rows of {row_bytes} bytes")
 
         storage_index = storages.index_for(array)
-        claim = (ordinal, storage_index)
+        claim = (group_index, storage_index)
         if claim in claimed_by_group:
             raise ManifestError(
                 f"DSv4 layers {claimed_by_group[claim]} and {layer_name} "
-                f"share an array inside kv cache group {ordinal}; layers of "
+                f"share an array inside kv cache group {group_index}; layers of "
                 "one group share a block table, so they would overwrite each "
                 "other's pages")
         claimed_by_group[claim] = layer_name
 
         pools.append(
             PoolEntry(
-                tag=dsv4_group_tag(tag_base, ordinal),
+                tag=dsv4_group_tag(tag_base, group_index),
                 layer_name=layer_name,
                 storage_index=storage_index,
                 base_offset_bytes=0,
