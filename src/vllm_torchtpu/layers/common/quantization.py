@@ -33,9 +33,11 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
+import math
 from typing import Tuple
 
 import jax.numpy as jnp
+import numpy as np
 import torch
 
 # MXFP4 block size as stored in checkpoints
@@ -59,6 +61,17 @@ def dtype_max(dtype: jnp.dtype) -> float:
     info = (jnp.iinfo(dtype)
             if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype))
     return float(info.max)
+# Largest magnitude representable in FP4 e2m1.
+FP4_E2M1_MAX = 6.0
+
+# Midpoints between adjacent FP4 e2m1 magnitudes (0, .5, 1, 1.5, 2, 3, 4, 6),
+# each paired with the comparison that reproduces round-to-nearest-even on an
+# exact tie: ``True`` means a strict ``>`` because the lower neighbour has the
+# even significand, ``False`` means ``>=``. The even neighbour alternates, since
+# e2m1 magnitudes alternate mantissa bit 0 / 1. Counting how many midpoints a
+# magnitude is past gives its index 0-7; see `_quantize_to_fp4_packed`.
+_FP4_E2M1_MIDPOINTS = ((0.25, True), (0.75, False), (1.25, True),
+                       (1.75, False), (2.5, True), (3.5, False), (5.0, True))
 
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:
@@ -100,6 +113,210 @@ def quantize_kv(
         return key, None
     value = static_per_tensor_quantize_tensor(value, quant_dtype, v_scale)
     return key, value
+
+
+# Cache of normalized Hadamard rotation matrices keyed by (dim, device).
+_HADAMARD_MATRICES: dict[tuple[int, torch.device], torch.Tensor] = {}
+# Cache of unnormalized +-1 Hadamard matrices keyed by (dim, device, dtype).
+_HADAMARD_PM1_MATRICES: dict[tuple[int, torch.device, torch.dtype],
+                             torch.Tensor] = {}
+
+
+def _hadamard_pm1_np(dim: int) -> np.ndarray:
+    """Unnormalized +-1 Sylvester-Hadamard matrix as float32 numpy."""
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError(
+            "Hadamard rotation requires head_dim to be a power of two, got"
+            f" {dim}.")
+    h = np.array([[1.0]], dtype=np.float32)
+    while h.shape[0] < dim:
+        h = np.block([[h, h], [h, -h]])
+    return h
+
+
+def _hadamard_np(dim: int) -> np.ndarray:
+    """Normalized Sylvester-Hadamard matrix as float32 numpy.
+
+    Must stay bitwise identical to
+    `vllm_torchtpu.kernels.experimental.batched_rpa.hadamard.hadamard_matrix_np`:
+    the K/V rotation applied here at quantization time is undone by the
+    Q-rotation / output-unrotation the batched RPA wrapper performs with its
+    own copy of the matrix.
+    """
+    return (_hadamard_pm1_np(dim) *
+            np.float32(1.0 / math.sqrt(dim))).astype(np.float32)
+
+
+def _hadamard_pm1_torch(dim: int, device: torch.device,
+                        dtype: torch.dtype) -> torch.Tensor:
+    """Same +-1 Sylvester recursion as `_hadamard_pm1_np`, in torch ops.
+
+    `apply_hadamard_transform` runs inside the traced model forward, and
+    Dynamo has no rule for `np.block`, so building the matrix through numpy
+    there aborts the `fullgraph=True` capture. The recursion is pure
+    constants, so XLA folds it away at compile time. Entries are +-1 exactly,
+    which is representable in any float dtype, so this stays bitwise
+    identical to the numpy reference (and hence to the JAX-side
+    `hadamard_pm1_np` the batched RPA wrapper un-rotates with).
+    """
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError(
+            "Hadamard rotation requires head_dim to be a power of two, got"
+            f" {dim}.")
+    h = torch.ones((1, 1), device=device, dtype=dtype)
+    while h.shape[0] < dim:
+        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)),
+                      dim=0)
+    return h
+
+
+def hadamard_pm1_matrix(dim: int,
+                        device: torch.device | None = None,
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Unnormalized +-1 Hadamard matrix; exact in any float dtype.
+
+    The cache is read but never written while tracing: storing a traced
+    tensor into a module-level dict is a side effect a `fullgraph=True`
+    capture cannot replay. Under tracing the construction is inlined into the
+    graph instead, where XLA constant-folds it.
+    """
+    device = device if device is not None else torch.device("cpu")
+    key = (dim, device, dtype)
+    cached = _HADAMARD_PM1_MATRICES.get(key)
+    if cached is not None:
+        return cached
+    built = _hadamard_pm1_torch(dim, device, dtype)
+    if not torch.compiler.is_compiling():
+        _HADAMARD_PM1_MATRICES[key] = built
+    return built
+
+
+def hadamard_matrix(dim: int,
+                    device: torch.device | None = None) -> torch.Tensor:
+    """Normalized Sylvester-Hadamard matrix as a float32 torch tensor.
+
+    H is symmetric and orthonormal (H == H.T == inv(H)), so applying it twice
+    is the identity up to float rounding.
+    """
+    device = device if device is not None else torch.device("cpu")
+    key = (dim, device)
+    cached = _HADAMARD_MATRICES.get(key)
+    if cached is None:
+        cached = torch.from_numpy(_hadamard_np(dim)).to(device)
+        _HADAMARD_MATRICES[key] = cached
+    return cached
+
+
+def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Rotates `x` by the normalized Hadamard matrix along the last dim.
+
+    The +-1 matmul runs in `x`'s own floating dtype -- products with +-1
+    entries are exact, so a bf16 input stays on the fast native MXU matmul
+    path instead of paying for an fp32 matmul. The 1/sqrt(d) normalization is
+    applied in float32 and the result stays float32 so the following
+    quantization step sees full precision.
+    """
+    dim = x.shape[-1]
+    if not x.is_floating_point():
+        x = x.to(torch.float32)
+    h = hadamard_pm1_matrix(dim, x.device, x.dtype)
+    return (x @ h).to(torch.float32) * (1.0 / math.sqrt(dim))
+
+
+def _quantize_to_fp4_packed(
+        tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token FP4 quantization of the trailing axis.
+
+    Returns packed uint8 ``[..., head_dim // 2]`` (two fp4 per byte, even
+    element in the low nibble, matching `pack_fp4_indices`) plus the float32
+    per-token scale ``[..., 1]``.
+
+    The FP4 index table is sorted by magnitude then sign, so an index splits
+    into ``magnitude_index | (sign << 3)`` and, because the magnitudes are
+    monotonic, the magnitude index is just how many of the seven midpoints the
+    value is past. Summing seven comparisons against compile-time constants
+    replaces `quantize_tensor_to_fp4`'s 16-way nearest-value search, which
+    broadcasts every element against an ``f32[16]`` table and reduces over it
+    carrying an index stream (~270 FLOPs per element and three full-width
+    intermediates for a 4-bit result). Saturation comes for free: anything past
+    the last midpoint lands on +-6, so no clamp is needed.
+
+    Rounding is bit-identical to the hardware ``torch.float4_e2m1fn_x2`` cast,
+    and so to the ``jnp.float4_e2m1fn`` cast the batched RPA kernel reads back
+    with. It differs from the search-based path only on exact ties, where
+    round-to-nearest-even is the NVFP4-specified behaviour and the search
+    rounded to the lower index, and on negatives that round to zero, which keep
+    their sign as ``-0.0`` rather than collapsing to ``+0.0``. Neither changes a
+    dequantized value.
+
+    Casting to ``torch.float4_e2m1fn_x2`` here would round the same way, but the
+    packed bytes could only be recovered with ``view(torch.uint8)``, which
+    lowers to a bitcast-convert plus a strided copy in a separate program and
+    costs more than the search it replaces.
+    """
+    if tensor.shape[-1] % 2:
+        raise ValueError("FP4 packing needs an even head_dim, got "
+                         f"{tensor.shape[-1]}")
+    scale = tensor.abs().amax(dim=-1,
+                              keepdim=True).to(torch.float32) / FP4_E2M1_MAX
+    scaled = tensor * _safe_inverse_scale(scale)
+
+    # Unrolled at trace time into seven elementwise compares; no control flow.
+    magnitude = scaled.abs()
+    indices = torch.zeros_like(magnitude, dtype=torch.uint8)
+    for midpoint, strict in _FP4_E2M1_MIDPOINTS:
+        past = magnitude > midpoint if strict else magnitude >= midpoint
+        indices += past.to(torch.uint8)
+    indices |= (scaled < 0).to(torch.uint8) << 3
+
+    # Same packing as `pack_fp4_indices`: even element low nibble, odd high.
+    packed = indices[..., 0::2] | (indices[..., 1::2] << 4)
+    return packed, scale
+
+
+def quantize_kv_fp4_per_tensor(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale_dtype: torch.dtype = torch.bfloat16,
+    hadamard_mode: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dynamic per-token FP4 quantization for key and value tensors.
+
+    `hadamard_mode` selects Hadamard rotation along head_dim before
+    quantization (see TPU_KV_CACHE_QUANT_HADAMARD in envs.py):
+      * None: no rotation.
+      * "k": rotate K only. The batched RPA wrapper (called with
+        hadamard_mode="k") rotates Q to match, so QK^T is preserved while
+        K's per-channel RoPE outliers get spread across head_dim. V keeps
+        plain per-token scaling and the attention output needs no rotation.
+      * "kv": additionally rotate V; the wrapper then un-rotates the
+        attention output.
+    Either mode leaves attention results unchanged up to quantization error.
+
+    Returns:
+        k_packed: uint8 tensor with shape [..., head_dim // 2]
+        v_packed: uint8 tensor with shape [..., head_dim // 2]
+        k_scale: scale_dtype tensor with shape [..., 1]
+        v_scale: scale_dtype tensor with shape [..., 1]
+    """
+    if hadamard_mode is not None:
+        if hadamard_mode not in ("k", "kv"):
+            raise ValueError(
+                f"Unsupported hadamard_mode: {hadamard_mode!r} "
+                "(expected None, 'k' or 'kv').")
+        key = apply_hadamard_transform(key)
+        if hadamard_mode == "kv":
+            value = apply_hadamard_transform(value)
+
+    # Dynamic per-token scale, then round+pack in one native fp4 convert.
+    k_packed, k_scale = _quantize_to_fp4_packed(key)
+    v_packed, v_scale = _quantize_to_fp4_packed(value)
+
+    # Cast scale factors to target scale_dtype (e.g. torch.bfloat16)
+    k_scale = k_scale.to(scale_dtype)
+    v_scale = v_scale.to(scale_dtype)
+
+    return k_packed, v_packed, k_scale, v_scale
 
 
 def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:

@@ -54,10 +54,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheConfig, KVCacheSpec, MambaSpec,
-                                        MLAAttentionSpec, SlidingWindowMLASpec,
-                                        SlidingWindowSpec,
+from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheSpec, KVQuantMode, MambaSpec,
+                                        MLAAttentionSpec, SlidingWindowMLASpec, SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
@@ -1260,31 +1258,31 @@ class TPUModelRunner(GPUModelRunner):
                             "Using irope in Pallas is not supported yet, it "
                             "will fall back to global attention for long context."
                         )
-                    # The layout can pad a page past what its shape and dtype
-                    # imply, with no other signal that it did. Take the backend
-                    # off this layer so it always matches the dimensions below.
-                    _warn_if_kv_cache_is_padded(
-                        attn_module.get_attn_backend(),
-                        block_size,
-                        attn_module.num_kv_heads,
-                        attn_module.head_size,
-                        self.kv_cache_dtype,
-                    )
+                    # Make sure we use the custom batched RPA backend for computing page sizes
+                    attn_backend = self._resolve_tpu_group_backend([layer_name], attn_module)
                     page_size_padded = (
-                        self._hybrid_uniform_page_size_bytes
-                        if self._hybrid_uniform_page_size_bytes is not None
-                        else backend_cls.get_kv_cache_page_size_bytes(
+                        self._hybrid_uniform_page_size_bytes if
+                        self._hybrid_uniform_page_size_bytes is not None else
+                        attn_backend.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
                             self.kv_cache_dtype,
                         ))
+                    kv_quant_mode = KVQuantMode.NONE
+                    norm_cache_dtype = str(self.kv_cache_dtype).lower().strip()
+                    if norm_cache_dtype in ("nvfp4", "uint8", "torch.uint8") or self.kv_cache_dtype == torch.uint8:
+                        kv_quant_mode = KVQuantMode.NVFP4
+                    elif norm_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+                        kv_quant_mode = KVQuantMode.FP8_PER_TENSOR
+
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            kv_quant_mode=kv_quant_mode,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
                             indexes_kv_by_block_stride=True,
@@ -1295,6 +1293,7 @@ class TPUModelRunner(GPUModelRunner):
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            kv_quant_mode=kv_quant_mode,
                             page_size_padded=page_size_padded,
                             indexes_kv_by_block_stride=True,
                         )
@@ -1663,11 +1662,11 @@ class TPUModelRunner(GPUModelRunner):
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
-        for m in layers.values():
+        for layer_name, m in layers.items():
             if isinstance(m, Attention):
+                attn_backend = self._resolve_tpu_group_backend([layer_name], m)
                 attn_page_sizes.add(
-                    backend_cls.get_kv_cache_page_size_bytes(
+                    attn_backend.get_kv_cache_page_size_bytes(
                         block_size,
                         m.num_kv_heads,
                         m.head_size,
@@ -1737,17 +1736,22 @@ class TPUModelRunner(GPUModelRunner):
             layers: A dictionary mapping layer names to their corresponding
                 attention module instances (e.g., `MambaBase`, `Attention`).
         """
+        # Collect (name, module) tuples rather than just module instances so that we can pass
+        # `first_attn_name` into `_resolve_tpu_group_backend`. This ensures custom attention backends
+        # (such as PallasBatchedRPAAttentionBackend) calculate the correct page size (e.g. 72-byte padded
+        # head size and 98,304-byte page size for NVFP4) instead of defaulting to legacy PallasAttentionBackend.
         attn_modules = [
-            m for m in layers.values()
+            (name, m) for name, m in layers.items()
             if isinstance(m, (Attention, MLAAttention))
         ]
         if not attn_modules:
             return
 
-        first_attn_module = attn_modules[0]
+        first_attn_name, first_attn_module = attn_modules[0]
         num_kv_heads = first_attn_module.num_kv_heads if isinstance(
             first_attn_module, Attention) else 1
-        attention_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        attention_backend = (PallasMLAttentionBackend if isinstance(
+            first_attn_module, MLAAttention) else self._resolve_tpu_group_backend([first_attn_name], first_attn_module))
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.block_size, num_kv_heads, first_attn_module.head_size,
             self.kv_cache_dtype)
@@ -6093,7 +6097,8 @@ class TPUModelRunner(GPUModelRunner):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        attn_backend = self._resolve_tpu_group_backend([layer_name], spec)
+                        total_group_page_size += attn_backend.get_kv_cache_page_size_bytes(
                             spec.block_size,
                             spec.num_kv_heads,
                             spec.head_size,
@@ -6169,7 +6174,8 @@ class TPUModelRunner(GPUModelRunner):
                         assert num_kv_heads % tp_size == 0, (
                             f"num_kv_heads {num_kv_heads} must be divisible by "
                             f"tp_size {tp_size} under SPMD mode")
-                    kv_cache_shape = backend_cls.get_kv_cache_shape(
+                    attn_backend = self._resolve_tpu_group_backend([layer_name], kv_cache_spec)
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,

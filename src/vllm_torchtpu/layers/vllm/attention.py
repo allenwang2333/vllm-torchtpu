@@ -5,6 +5,7 @@ import functools
 from typing import Any, ClassVar
 
 import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
@@ -17,6 +18,9 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from vllm_torchtpu import envs
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
+    sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -28,6 +32,9 @@ from vllm_torchtpu.layers.common.attention_interface import (
     ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
+from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
+                                                      quantize_kv,
+                                                      quantize_kv_fp4_per_tensor)
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
@@ -58,12 +65,19 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    "nvfp4": torch.uint8, # FP4 gets packed to uint8
 }
 
-
-def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
+# Returns whether the kv cache dtype requires quantization
+def _is_quantized_kv_cache_dtype(cache_dtype_str: str) -> bool:
     return cache_dtype_str.lower().strip() in frozenset(
-        ("fp8", "fp8_e4m3", "fp8_e5m2"))
+        ("fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"))
+
+# Returns whether the kv cache dtype requires per-token quantization (only for fp4)
+def _is_per_token_quantized_kv_cache(cache_dtype_str: str | torch.dtype) -> bool:
+    if isinstance(cache_dtype_str, torch.dtype):
+        return cache_dtype_str == torch.uint8
+    return cache_dtype_str.lower().strip() in ("nvfp4", "uint8")
 
 
 def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
@@ -78,6 +92,90 @@ def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
     if dtype is None:
         raise ValueError(f"Unsupported KV cache dtype string: {cache_dtype}")
     return dtype
+
+# Get the per-token scale dtype (only for fp4 per-token quantization). The
+# scale dtype is set with the TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE env var.
+def _resolve_kv_cache_scale_dtype(
+    is_per_token_quant: bool = True,
+    scale_dtype: str | torch.dtype | None = None,
+) -> torch.dtype | None:
+    """Resolve scale dtype. Returns None if per-token quantization is disabled."""
+    if not is_per_token_quant:
+        return None
+
+    if scale_dtype is None:
+        scale_dtype = envs.TPU_KV_CACHE_PER_TOKEN_SCALE_DTYPE
+    if isinstance(scale_dtype, torch.dtype):
+        return scale_dtype
+
+    normalized = str(scale_dtype).lower().strip()
+    if normalized in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    elif normalized in ("float32", "fp32", "float"):
+        return torch.float32
+    else:
+        raise ValueError(f"Unsupported scale dtype: {scale_dtype}")
+
+
+def _resolve_hadamard_mode() -> str | None:
+    """Parse TPU_KV_CACHE_QUANT_HADAMARD into None / "k" / "kv"."""
+    value = str(envs.TPU_KV_CACHE_QUANT_HADAMARD).lower().strip()
+    if value in ("", "0", "false"):
+        return None
+    if value in ("1", "true", "k"):
+        return "k"
+    if value == "kv":
+        return "kv"
+    raise ValueError(
+        f"Unsupported TPU_KV_CACHE_QUANT_HADAMARD value: {value!r}")
+
+
+def _torch_to_jax_dtype(dtype: torch.dtype | str | jnp.dtype | None) -> jnp.dtype | None:
+    if dtype is None:
+        return None
+    if isinstance(dtype, jnp.dtype):
+        return dtype
+    if dtype == torch.bfloat16 or str(dtype).lower().strip() in ("bfloat16", "bf16", "torch.bfloat16"):
+        return jnp.bfloat16
+    if dtype == torch.float32 or str(dtype).lower().strip() in ("float32", "fp32", "float", "torch.float32"):
+        return jnp.float32
+    if dtype == torch.float8_e4m3fn or str(dtype).lower().strip() in ("fp8", "fp8_e4m3"):
+        return jnp.float8_e4m3fn
+    if dtype == torch.float8_e5m2 or str(dtype).lower().strip() in ("fp8_e5m2",):
+        return jnp.float8_e5m2
+    if dtype == torch.uint8 or str(dtype).lower().strip() in ("uint8", "nvfp4"):
+        return jnp.uint8
+    return jnp.dtype(dtype)
+
+# Get the number of additional channels to reserve for the per-token scale.
+def get_per_token_scale_channels(
+    is_per_token_quant: bool = True,
+    scale_dtype: str | torch.dtype | None = None,
+    container_dtype: str | torch.dtype = torch.uint8,
+) -> int:
+    """Dynamically calculate added container channels for per-token scale factors."""
+    resolved_scale_dtype = _resolve_kv_cache_scale_dtype(is_per_token_quant, scale_dtype)
+    if resolved_scale_dtype is None:
+        return 0
+
+    resolved_container_dtype = (
+        _resolve_kv_cache_dtype(container_dtype)
+        if isinstance(container_dtype, str)
+        else container_dtype
+    )
+
+    scale_bits = (
+        torch.finfo(resolved_scale_dtype).bits
+        if resolved_scale_dtype.is_floating_point
+        else torch.iinfo(resolved_scale_dtype).bits
+    )
+    container_bits = (
+        torch.finfo(resolved_container_dtype).bits
+        if resolved_container_dtype.is_floating_point
+        else torch.iinfo(resolved_container_dtype).bits
+    )
+    return max(1, scale_bits // container_bits)
+
 
 
 def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
@@ -109,10 +207,12 @@ def _pallas_rpa_kernel_impl(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
+    k_scale: jax.Array | None = None,
+    v_scale: jax.Array | None = None,
     *,
+    q_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     skip_kv_update: bool,
@@ -122,6 +222,9 @@ def _pallas_rpa_kernel_impl(
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -131,6 +234,7 @@ def _pallas_rpa_kernel_impl(
         query_start_loc=query_start_loc,
         request_distribution=request_distribution,
     )
+    jax_scale_dtype = _torch_to_jax_dtype(per_token_scale_dtype)
     new_kv_cache, outputs = attention(
         kv_cache,
         query,
@@ -139,8 +243,13 @@ def _pallas_rpa_kernel_impl(
         metadata,
         mesh,
         q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        k_scale_scalar=k_scale_scalar,
+        v_scale_scalar=v_scale_scalar,
+        k_scale_tensor=k_scale,
+        v_scale_tensor=v_scale,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=jax_scale_dtype,
+        hadamard_mode=hadamard_mode,
         sinks=sinks,
         attention_chunk_size=sliding_window,
         skip_kv_update=skip_kv_update,
@@ -164,16 +273,21 @@ def _pallas_rpa_kernel_default(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
+    k_scale: jax.Array | None,
+    v_scale: jax.Array | None,
     *,
+    q_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -190,9 +304,11 @@ def _pallas_rpa_kernel_default(
         query_start_loc,
         request_distribution,
         sinks,
-        q_scale,
         k_scale,
         v_scale,
+        q_scale=q_scale,
+        k_scale_scalar=k_scale_scalar,
+        v_scale_scalar=v_scale_scalar,
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
@@ -200,6 +316,9 @@ def _pallas_rpa_kernel_default(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -220,16 +339,21 @@ def _pallas_rpa_kernel_local(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
+    k_scale: jax.Array | None,
+    v_scale: jax.Array | None,
     *,
+    q_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -248,9 +372,11 @@ def _pallas_rpa_kernel_local(
         query_start_loc,
         request_distribution,
         sinks,
-        q_scale,
         k_scale,
         v_scale,
+        q_scale=q_scale,
+        k_scale_scalar=k_scale_scalar,
+        v_scale_scalar=v_scale_scalar,
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
@@ -260,6 +386,9 @@ def _pallas_rpa_kernel_local(
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
         use_causal_mask=use_causal_mask,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -273,16 +402,21 @@ def _pallas_rpa_kernel_batched(
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
     sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
+    k_scale: jax.Array | None,
+    v_scale: jax.Array | None,
     *,
+    q_scale: float | None = None,
+    k_scale_scalar: float | None = None,
+    v_scale_scalar: float | None = None,
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    use_per_token_scale: bool | None = None,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    hadamard_mode: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -295,9 +429,11 @@ def _pallas_rpa_kernel_batched(
         query_start_loc,
         request_distribution,
         sinks,
-        q_scale,
         k_scale,
         v_scale,
+        q_scale=q_scale,
+        k_scale_scalar=k_scale_scalar,
+        v_scale_scalar=v_scale_scalar,
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
@@ -305,6 +441,9 @@ def _pallas_rpa_kernel_batched(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
+        hadamard_mode=hadamard_mode,
     )
 
 
@@ -321,6 +460,7 @@ class PallasAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -339,8 +479,28 @@ class PallasAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
-        padded_head_size = (cdiv(head_size, TPU_HEAD_SIZE_ALIGNMENT) *
-                            TPU_HEAD_SIZE_ALIGNMENT)
+        # Halve head size for nvfp4 4-bit packing
+        is_nvfp4 = (
+            cache_dtype_str == torch.uint8 or (
+                isinstance(cache_dtype_str, str)
+                and cache_dtype_str.lower().strip() in ("nvfp4", "uint8")
+            )
+        )
+        if is_nvfp4:
+            data_head_size = head_size // 2
+            head_alignment = 8
+        else:
+            data_head_size = head_size
+            head_alignment = TPU_HEAD_SIZE_ALIGNMENT
+
+        # Check if per token quantization should be used
+        is_per_token_quant = _is_per_token_quantized_kv_cache(cache_dtype_str)
+        # get_per_token_scale_channels returns 0 if per-token quantization is disabled..
+        scale_channels = get_per_token_scale_channels(is_per_token_quant)
+        head_size_with_scales = data_head_size + scale_channels
+
+        padded_head_size = (cdiv(head_size_with_scales, head_alignment) *
+                            head_alignment)
         # Two different RPA kernels have different KV cache layouts:
         # - hd64 (head_dim=64): K/V packed along head_dim
         # - v3 (head_dim!=64): K/V packed along heads
@@ -372,22 +532,23 @@ class PallasAttentionBackend(AttentionBackend):
             padded_head_size,
         )
 
-    @staticmethod
+    @classmethod
     def get_kv_cache_page_size_bytes(
+        cls,
         block_size: int,
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> int:
         """Return one Pallas KV-cache page size including layout padding."""
-        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        shape = PallasAttentionBackend.get_kv_cache_shape(
+        shape = cls.get_kv_cache_shape(
             1,
             block_size,
             num_kv_heads,
             head_size,
-            dtype,
+            cache_dtype_str,
         )
+        dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
         return num_elements * torch.empty((), dtype=dtype).element_size()
 
@@ -476,6 +637,25 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
+        is_nvfp4 = cache_dtype_str == torch.uint8 or (
+            isinstance(cache_dtype_str, str)
+            and cache_dtype_str.lower().strip() in ("nvfp4", "uint8"))
+        if is_nvfp4 and not is_auto:
+            is_per_token_quant = _is_per_token_quantized_kv_cache(cache_dtype_str)
+            torch_scale_dtype = _resolve_kv_cache_scale_dtype(is_per_token_quant)
+            jax_scale_dtype = (jnp.bfloat16
+                               if torch_scale_dtype == torch.bfloat16 else
+                               (jnp.float32
+                                if torch_scale_dtype == torch.float32 else None))
+            return rpa_batched.get_storage_kv_cache_shape(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size // 2,
+                jnp.uint8,
+                use_per_token_scale=is_per_token_quant,
+                scale_dtype=jax_scale_dtype,
+            )
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -531,6 +711,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # as a method. Subclasses override this to select a different kernel.
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
+    # Only the batched RPA kernel implements the Q-rotation / output-unrotation
+    # needed for Hadamard-transform KV cache quantization.
+    _supports_hadamard: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -566,10 +749,34 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                       "PallasAttentionBackendImpl")
 
         self.kv_cache_quantized_dtype = None
-        # Only set kv_cache_quantized_dtype for fp8 KV cache
-        if _is_fp8_kv_cache_dtype(kv_cache_dtype):
+        # Only set kv_cache_quantized_dtype for quantized KV cache
+        if _is_quantized_kv_cache_dtype(kv_cache_dtype):
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 kv_cache_dtype.lower().strip()]
+
+        self.per_token_fp4_quantization = _is_per_token_quantized_kv_cache(kv_cache_dtype)
+        # None if per-token quantization is disabled.
+        self.per_token_scale_dtype = _resolve_kv_cache_scale_dtype(self.per_token_fp4_quantization)
+
+        # Hadamard-rotated KV cache quantization (TPU_KV_CACHE_QUANT_HADAMARD).
+        # Mode "k": K is rotated along head_dim before FP4 quantization and
+        # the batched RPA wrapper rotates Q to compensate. Mode "kv":
+        # additionally V is rotated and the wrapper un-rotates the output.
+        self.hadamard_mode = _resolve_hadamard_mode()
+        if self.hadamard_mode is not None:
+            if not self.per_token_fp4_quantization:
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires per-token FP4 KV "
+                    "cache quantization (--kv-cache-dtype nvfp4), got "
+                    f"kv_cache_dtype={kv_cache_dtype!r}.")
+            if not self._supports_hadamard:
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires the batched RPA "
+                    "attention backend (--attention-backend CUSTOM).")
+            if head_size & (head_size - 1):
+                raise NotImplementedError(
+                    "TPU_KV_CACHE_QUANT_HADAMARD requires head_size to be a "
+                    f"power of two, got {head_size}.")
 
         # Store sinks for attention sink optimization
         self.sinks = sinks
@@ -591,9 +798,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _build_rpa_kernel(
         self,
-        q_scale: float | None,
-        k_scale: float | None,
-        v_scale: float | None,
+        q_scale: float | torch.Tensor | None,
+        k_scale: float | torch.Tensor | None,
+        v_scale: float | torch.Tensor | None,
         skip_kv_update: bool = False,
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
@@ -603,9 +810,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         max_model_len = (vllm_config.model_config.max_model_len
                          if use_pcp_streaming and vllm_config is not None else
                          None)
+        k_scale_key = "tensor_scale" if isinstance(k_scale, torch.Tensor) else k_scale
+        v_scale_key = "tensor_scale" if isinstance(v_scale, torch.Tensor) else v_scale
+
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
-                      k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len)
+                      k_scale_key, v_scale_key, use_pcp_streaming,
+                      cp_kv_cache_interleave_size, max_model_len,
+                      self.per_token_fp4_quantization, self.per_token_scale_dtype,
+                      self.hadamard_mode)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -620,9 +832,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             ctx.mesh, use_pcp_streaming)
         registry_key = (self._kernel_op_prefix,
                         self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
+                        id(mesh), q_scale, k_scale_key, v_scale_key, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+                        max_model_len, self.use_causal_mask,
+                        self.per_token_fp4_quantization, self.per_token_scale_dtype,
+                        self.hadamard_mode)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -645,19 +859,40 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
-            # Prepare wrapper function with static arguments.
-            wrapped_fn = functools.partial(
-                self._kernel_entry,
-                mesh=mesh,
-                sliding_window=self.sliding_window,
-                sm_scale=self.scale,
-                soft_cap=self.logits_soft_cap,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                skip_kv_update=skip_kv_update,
-                use_causal_mask=self.use_causal_mask,
-            )
+            if not self.per_token_fp4_quantization and isinstance(k_scale, (int, float)) and isinstance(v_scale, (int, float)):
+                k_scale_val = float(k_scale)
+                v_scale_val = float(v_scale)
+                wrapped_fn = functools.partial(
+                    self._kernel_entry,
+                    mesh=mesh,
+                    sliding_window=self.sliding_window,
+                    sm_scale=self.scale,
+                    soft_cap=self.logits_soft_cap,
+                    q_scale=q_scale,
+                    k_scale_scalar=k_scale_val,
+                    v_scale_scalar=v_scale_val,
+                    skip_kv_update=skip_kv_update,
+                    use_causal_mask=self.use_causal_mask,
+                    use_per_token_scale=False,
+                    per_token_scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=None,
+                )
+            else:
+                wrapped_fn = functools.partial(
+                    self._kernel_entry,
+                    mesh=mesh,
+                    sliding_window=self.sliding_window,
+                    sm_scale=self.scale,
+                    soft_cap=self.logits_soft_cap,
+                    q_scale=q_scale,
+                    k_scale_scalar=None,
+                    v_scale_scalar=None,
+                    skip_kv_update=skip_kv_update,
+                    use_causal_mask=self.use_causal_mask,
+                    use_per_token_scale=self.per_token_fp4_quantization,
+                    per_token_scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=self.hadamard_mode,
+                )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
@@ -741,6 +976,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             unsupported_features.append("logits soft cap")
         if skip_kv_update:
             unsupported_features.append("skip_kv_update")
+        if self.per_token_fp4_quantization:
+            unsupported_features.append("per-token FP4 quantization")
         if unsupported_features:
             raise NotImplementedError(
                 "PCP streaming attention does not support: "
@@ -762,7 +999,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         before forward().
         """
         q_scale = k_scale = v_scale = None
-        if self.kv_cache_quantized_dtype:
+        if self.per_token_fp4_quantization:
+            k_scale = v_scale = "tensor_scale"
+        elif self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
             if k_scale_value != 0.0 and v_scale_value != 0.0:
@@ -883,14 +1122,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
+        k_scale_scalar = v_scale_scalar = None
+        k_scale_tensor = v_scale_tensor = None
         if self.kv_cache_quantized_dtype:
-            k_scale_value = layer._k_scale_float
-            v_scale_value = layer._v_scale_float
-            if k_scale_value == 0.0 or v_scale_value == 0.0:
-                raise ValueError(
-                    "k_scale_float and v_scale_float must be non-zero")
-            key, value = quantize_kv(self.kv_cache_quantized_dtype, key, value,
-                                     k_scale_value, v_scale_value)
+            if self.per_token_fp4_quantization:
+                key, value, k_scale_tensor, v_scale_tensor = quantize_kv_fp4_per_tensor(
+                    key, value, scale_dtype=self.per_token_scale_dtype,
+                    hadamard_mode=self.hadamard_mode,
+                )
+            else:
+                k_scale_value = layer._k_scale_float
+                v_scale_value = layer._v_scale_float
+                if k_scale_value == 0.0 or v_scale_value == 0.0:
+                    raise ValueError(
+                        "k_scale_float and v_scale_float must be non-zero")
+                key, value = quantize_kv(self.kv_cache_quantized_dtype, key, value,
+                                         k_scale_value, v_scale_value)
+                k_scale_scalar = k_scale_value
+                v_scale_scalar = v_scale_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
@@ -910,14 +1159,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cp_kv_cache_interleave_size = (
             parallel_config.cp_kv_cache_interleave_size
             if use_pcp_streaming else 0)
-        rpa_kernel = self._build_rpa_kernel(
-            None,
-            layer._k_scale_float if self.kv_cache_quantized_dtype else None,
-            layer._v_scale_float if self.kv_cache_quantized_dtype else None,
-            skip_kv_update=skip_kv_update,
-            use_pcp_streaming=use_pcp_streaming,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-        )
+
+        if self.per_token_fp4_quantization:
+            k_scale_arg = k_scale_tensor
+            v_scale_arg = v_scale_tensor
+        else:
+            k_scale_arg = k_scale_scalar
+            v_scale_arg = v_scale_scalar
+
+        rpa_kernel = self.rpa_kernel
+        if rpa_kernel is None:
+            rpa_kernel = self._build_rpa_kernel(
+                None,
+                k_scale_arg,
+                v_scale_arg,
+                skip_kv_update=skip_kv_update,
+                use_pcp_streaming=use_pcp_streaming,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
 
         # TODO (geyuhao) the support of this API is pending discussion.
         # This line will only influence performance, not functionality
@@ -935,6 +1194,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             sink,
+            k_scale_tensor,
+            v_scale_tensor,
         )
 
         # Drop the padding added above so callers see the layer's own width.
@@ -956,6 +1217,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+    _supports_hadamard = True
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
@@ -969,6 +1231,7 @@ class PallasMLAttentionBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "fp8_ds_mla",
+        "nvfp4",
     ]
 
     # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
