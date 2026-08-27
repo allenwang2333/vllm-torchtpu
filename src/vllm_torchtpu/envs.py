@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
+    TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -281,6 +284,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_RAIDEN_RESHARD_PORT_BASE") or "27000"),
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE":
     lambda: int(os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"),
+    # Decode-side prefix-cache-aware reshard loads: when true, the consumer
+    # subtracts the local prefix-cache hit and transfers only the missing
+    # FA suffix (page-aligned dst_skip_bytes clip planned by the source
+    # store); GDN state always transfers whole. When false, or when the
+    # installed client lacks dst_skip_bytes support, partial local hits skip
+    # the remote transfer and compute their missing suffix on decode.
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD":
+    env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
@@ -351,6 +362,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
+    # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
+    # program, instead of bracketing the per-rank compute with vLLM's
+    # all-gather and reduce-scatter. The transport then overlaps the matmuls;
+    # the reduce-scatter it replaces is otherwise fully exposed.
+    "USE_MOE_FUSED_EP_KERNEL":
+    env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Largest node-wide token count, out of the scheduler's cap, at or above
+    # which the fused kernel is armed for the whole deployment. Decided once at
+    # weight load, not per step: a per-step choice would need the token count
+    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
+    # arming everything. Below the threshold the grouped-matmul path serves.
+    "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
