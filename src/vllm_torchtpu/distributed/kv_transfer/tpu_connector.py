@@ -129,6 +129,78 @@ class _Stage3TransferGroup:
     block_size: int
 
 
+def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
+                                 window_tokens: Optional[int]) -> int:
+    """Leading pages of a sliding-window block table that hold no live KV.
+
+    vLLM's `SlidingWindowManager` frees every page that falls out of the
+    window and writes the null block over its entry, so the table starts with
+    a run of one repeated ID. Transferring those pages would hand Raiden a
+    destination block list with duplicates, which it rejects, and would move
+    bytes the decode replica cannot read anyway.
+
+    Mirrors `SlidingWindowManager.get_num_skipped_tokens` and
+    `SingleTypeKVCacheManager.remove_skipped_blocks`. Both peers derive the
+    count from the same request length and page geometry, so they trim the
+    same pages and the surviving pages stay paired.
+    """
+    if not window_tokens:
+        return 0
+    skipped_tokens = max(0, int(num_tokens) - int(window_tokens) + 1)
+    return skipped_tokens // int(page_tokens)
+
+
+def _stage3_trim_window_pages(
+    block_ids: Sequence[int],
+    *,
+    num_tokens: int,
+    page_tokens: int,
+    window_tokens: Optional[int],
+    group_label: str,
+) -> list[int]:
+    """`block_ids` without the null-block prefix a sliding window leaves."""
+    ids = [int(block_id) for block_id in block_ids]
+    skipped = min(
+        _stage3_skipped_window_pages(num_tokens=num_tokens,
+                                     page_tokens=page_tokens,
+                                     window_tokens=window_tokens), len(ids))
+    if not skipped:
+        return ids
+    dropped, kept = ids[:skipped], ids[skipped:]
+    # Out-of-window pages hold nothing the consumer can attend to, so dropping
+    # them is right either way, but the allocator normally has already written
+    # the null block over all of them. A varied prefix means this arithmetic
+    # and vLLM's have drifted apart, which is worth seeing before it turns
+    # into a silent mis-transfer.
+    if len(set(dropped)) != 1:
+        logger.warning(
+            "Stage-3 sliding-window trim dropped pages that are not all the "
+            "null block: group=%s, dropped=%s, num_tokens=%d, page_tokens=%d, "
+            "window=%s", group_label, dropped, num_tokens, page_tokens,
+            window_tokens)
+    if len(set(kept)) != len(kept):
+        raise ValueError(
+            "Stage-3 sliding-window block table still repeats a page after "
+            f"trimming: group={group_label}, kept={kept}, "
+            f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
+            f"window={window_tokens}")
+    return kept
+
+
+def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
+    """The sliding window of a cache group, or None if it is full attention.
+
+    DSv4 hands its groups over as `UniformTypeKVCacheSpecs`, which carries no
+    `sliding_window` of its own; the layers under it are uniform by
+    construction, so any one of them answers for the group.
+    """
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs:
+        group_spec = next(iter(specs.values()))
+    window = getattr(group_spec, "sliding_window", None)
+    return int(window) if window else None
+
+
 def _stage3_transfer_groups(
     kv_cache_groups: Sequence[Any],
     *,
@@ -175,6 +247,29 @@ class _Stage3Dsv4Pool:
     page_tokens: int
     live_bytes_per_block: int
     row_bytes: int
+    window_tokens: Optional[int] = None
+
+
+def _stage3_dsv4_pool_pages(
+    pool: _Stage3Dsv4Pool,
+    block_ids: Sequence[int],
+    num_tokens: int,
+) -> tuple[list[int], int]:
+    """The pages one DSv4 pool actually transfers, and the tokens they hold.
+
+    A windowed group's block table opens with null blocks standing in for
+    pages the allocator already freed, so both the pages and the token count
+    they would account for come off the front together. Producer and consumer
+    call this with the same pool geometry and the same request length, which
+    is what keeps their page lists aligned index for index.
+    """
+    trimmed = _stage3_trim_window_pages(block_ids,
+                                        num_tokens=num_tokens,
+                                        page_tokens=pool.page_tokens,
+                                        window_tokens=pool.window_tokens,
+                                        group_label=pool.tag)
+    dropped_pages = len(block_ids) - len(trimmed)
+    return trimmed, int(num_tokens) - dropped_pages * int(pool.page_tokens)
 
 
 @dataclass
@@ -1936,6 +2031,8 @@ class TPURaidenConnectorWorker:
                     live_bytes_per_block=int(
                         geometry[tag]["live_bytes_per_block"]),
                     row_bytes=int(region.unit_bytes),
+                    window_tokens=_stage3_group_window_tokens(
+                        kv_cache_groups[ordinal].kv_cache_spec),
                 ))
         if not pools:
             raise RuntimeError("DSv4 admission produced no transfer pools")
@@ -2823,18 +2920,21 @@ class TPURaidenConnectorWorker:
                     "Stage-3 producer send metadata requires a positive "
                     "expiration_time")
             group_blocks = self._stage3_dsv4_group_blocks(req_meta)
-            pool_spans = [
-                lower_dsv4_row_spans(
-                    tag=pool.tag,
-                    num_tokens=num_tokens,
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
-                    page_tokens=pool.page_tokens,
-                    live_bytes_per_block=pool.live_bytes_per_block,
-                    row_bytes=pool.row_bytes,
-                    block_ids=group_blocks[pool.plan_position],
-                ) for pool in self._stage3_dsv4_plan
-            ]
+            pool_spans = []
+            for pool in self._stage3_dsv4_plan:
+                pool_blocks, pool_tokens = _stage3_dsv4_pool_pages(
+                    pool, group_blocks[pool.plan_position], num_tokens)
+                pool_spans.append(
+                    lower_dsv4_row_spans(
+                        tag=pool.tag,
+                        num_tokens=pool_tokens,
+                        transfer_rank=transfer_rank,
+                        parallelism=parallelism,
+                        page_tokens=pool.page_tokens,
+                        live_bytes_per_block=pool.live_bytes_per_block,
+                        row_bytes=pool.row_bytes,
+                        block_ids=pool_blocks,
+                    ))
             owned_spans = sum(len(reg.spans) for reg in pool_spans)
             # The controller keys D5 on one block list per request, so the
             # per-tag pages ride in the span registrations and this list is
@@ -3262,7 +3362,8 @@ class TPURaidenConnectorWorker:
                     dst_blocks = []
                     dst_counts = []
                     for pool in self._stage3_dsv4_plan:
-                        pages = group_blocks[pool.plan_position]
+                        pages, _ = _stage3_dsv4_pool_pages(
+                            pool, group_blocks[pool.plan_position], num_tokens)
                         transfer_tags.append(pool.tag)
                         dst_blocks.extend(pages)
                         dst_counts.append(len(pages))
