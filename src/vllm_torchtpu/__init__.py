@@ -1126,3 +1126,21 @@ def _patch_vllm_gemma4_mtp_attention() -> None:
     Gemma4MTPAttention._tpu_gemma4_mtp_zeros_patch = True
     init_logger(__name__).info("Applied TPU patch: Gemma4MTPAttention initialized kv_dummy with torch.zeros.")
 
+
+def _patch_vllm_sampling_params_seed() -> None:
+    """Ignore seed parameter in SamplingParams to avoid desynchronization/crashes
+    under speculative decoding on TPU.
+    """
+    try:
+        from vllm.sampling_params import SamplingParams
+    except ImportError:
+        return
+
+    if getattr(SamplingParams, "_tpu_sampling_params_seed_patch", False):
+        return
+
+    SamplingParams.seed = property(lambda self: None, lambda self, val: None)
+    SamplingParams._tpu_sampling_params_seed_patch = True
+    init_logger(__name__).info("Applied TPU patch: Ignore SamplingParams.seed.")
+
+

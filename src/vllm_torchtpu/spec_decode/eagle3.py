@@ -108,11 +108,11 @@ class Eagle3Proposer:
         self._draft_replicated = (draft_tp == 1)
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
-        logger.info(
-            "%s draft parallelism: %s (draft_tp=%s).",
-            self.speculative_config.method,
-            "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
-            draft_tp)
+        # logger.info(
+        #     "%s draft parallelism: %s (draft_tp=%s).",
+        #     self.speculative_config.method,
+        #     "REPLICATED (tp=1)" if self._draft_replicated else "SHARDED",
+        #     draft_tp)
         self.draft_model = None
         self.target_embed = None
         # Attention-layer names belonging to the draft model. Populated in
@@ -184,9 +184,9 @@ class Eagle3Proposer:
                 norm_layer = model_impl.norm
                 model_impl.norm = GemmaRMSNormPure(
                     norm_layer.weight, eps=norm_layer.variance_epsilon)
-                logger.info(
-                    "TPU Model Loader: Unconditionally patched draft model's final RMSNorm to GemmaRMSNormPure in Gemma4 MTP path."
-                )
+                # logger.info(
+                #     "TPU Model Loader: Unconditionally patched draft model's final RMSNorm to GemmaRMSNormPure in Gemma4 MTP path."
+                # )
         else:
             maybe_share_embeddings(self.draft_model, target_model,
                                    self._draft_replicated)
@@ -210,7 +210,7 @@ class Eagle3Proposer:
                                                self.speculative_config)
 
     def _load_draft_model(self) -> None:
-        logger.info(f"Loading {self.speculative_config.method} draft model...")
+        # logger.info(f"Loading {self.speculative_config.method} draft model...")
         model_loader = get_model_loader(self.vllm_config.load_config)
         # Tag the draft compile with "eagle_head" so its torch.compile cache
         # lives in a separate prefix from the target's "backbone" prefix.
@@ -287,22 +287,22 @@ class Eagle3Proposer:
                                 < len(draft_layer_types) else "full_attention")
             candidates = type_to_target_indices.get(draft_layer_type, [])
             if not candidates:
-                logger.warning(
-                    "No target layer of type '%s' for draft layer %d",
-                    draft_layer_type,
-                    draft_idx,
-                )
+                # logger.warning(
+                #     "No target layer of type '%s' for draft layer %d",
+                #     draft_layer_type,
+                #     draft_idx,
+                # )
                 continue
 
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
-            logger.info(
-                "Gemma4 MTP: draft layer %d (%s) -> %s",
-                draft_idx,
-                draft_layer_type,
-                target_layer_name,
-            )
+            # logger.info(
+            #     "Gemma4 MTP: draft layer %d (%s) -> %s",
+            #     draft_idx,
+            #     draft_layer_type,
+            #     target_layer_name,
+            # )
 
     def _bind_gemma4_shared_kv_caches(self) -> None:
         """Bind target KV cache tensors to draft layers at runtime."""
@@ -360,23 +360,23 @@ class Eagle3Proposer:
 
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
-            logger.info(
-                "Gemma4 MTP: Binding draft layer %d to %s. Target layers in dict: %s",
-                draft_idx, target_layer_name, list(target_layers.keys()))
+            # logger.info(
+            #     "Gemma4 MTP: Binding draft layer %d to %s. Target layers in dict: %s",
+            #     draft_idx, target_layer_name, list(target_layers.keys()))
             if target_layer_name in target_layers:
                 target_layer = target_layers[target_layer_name]
                 attn.kv_cache = getattr(target_layer, "kv_cache", None)
-                logger.info(
-                    "Gemma4 MTP: Successfully bound draft layer %d to target %s KV cache. kv_cache: %s",
-                    draft_idx, target_layer_name, attn.kv_cache is not None)
+                # logger.info(
+                #     "Gemma4 MTP: Successfully bound draft layer %d to target %s KV cache. kv_cache: %s",
+                #     draft_idx, target_layer_name, attn.kv_cache is not None)
 
                 # Directly reference and share the target layers' allocated KV cache and implementation objects
                 if hasattr(target_layer, "impl") and hasattr(attn, "impl"):
                     attn.impl = target_layer.impl
                     attn.impl.kv_sharing_target_layer_name = target_layer_name
-                    logger.info(
-                        "Gemma4 MTP: Successfully shared target layer %s's backend implementation object with draft layer %d.",
-                        target_layer_name, draft_idx)
+                    # logger.info(
+                    #     "Gemma4 MTP: Successfully shared target layer %s's backend implementation object with draft layer %d.",
+                    #     target_layer_name, draft_idx)
 
                 # Copy dynamic scales and log their values
                 for scale_attr in [
@@ -388,10 +388,10 @@ class Eagle3Proposer:
                     if hasattr(target_layer, scale_attr):
                         val = getattr(target_layer, scale_attr)
                         setattr(attn, scale_attr, val)
-                        if "scale_float" in scale_attr:
-                            logger.info(
-                                "Gemma4 MTP: Copied scale %s = %s from target to draft layer %d",
-                                scale_attr, val, draft_idx)
+                        # if "scale_float" in scale_attr:
+                        #     logger.info(
+                        #         "Gemma4 MTP: Copied scale %s = %s from target to draft layer %d",
+                        #         scale_attr, val, draft_idx)
             else:
                 logger.warning(
                     "Gemma4 MTP WARNING: Target layer %s NOT found in target_layers!",
@@ -442,13 +442,13 @@ class Eagle3Proposer:
             if lp is not None and hasattr(lp, "_gather_logits"):
                 logits = lp._gather_logits(logits)
 
-            if not torch.compiler.is_compiling():
-                k = min(5, logits[0].shape[-1])
-                top_vals, top_indices = logits[0].topk(k)
-                logger.info("DEBUG draft logits top%d: tokens=%s, values=%s",
-                            k,
-                            top_indices.cpu().tolist(),
-                            top_vals.cpu().tolist())
+            # if not torch.compiler.is_compiling():
+            #     k = min(5, logits[0].shape[-1])
+            #     top_vals, top_indices = logits[0].topk(k)
+            #     logger.info("DEBUG draft logits top%d: tokens=%s, values=%s",
+            #                 k,
+            #                 top_indices.cpu().tolist(),
+            #                 top_vals.cpu().tolist())
 
             return logits.argmax(dim=-1).to(torch.int32)
 
@@ -769,16 +769,16 @@ class Eagle3Proposer:
             dev_res = torch.cat(
                 [s[:c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)],
                 dim=0)
-            logger.info(
-                "Gemma4 MTP: propose() returning device draft proposed tokens: %s",
-                dev_res.tolist())
+            # logger.info(
+            #     "Gemma4 MTP: propose() returning device draft proposed tokens: %s",
+            #     dev_res.tolist())
             return dev_res
         result = []
         for s, c in zip(per_chunk_stacked, chunks):
             result.extend(s.cpu().tolist()[:c.num_reqs])
-        logger.info(
-            "Gemma4 MTP: propose() returning draft proposed tokens: %s",
-            result)
+        # logger.info(
+        #     "Gemma4 MTP: propose() returning draft proposed tokens: %s",
+        #     result)
         return result
 
     def _prepare_draft_inputs(
@@ -1169,16 +1169,9 @@ class Eagle3Proposer:
                                     target_name
                                 }
 
-        # Print debug diagnostics
-        print(f"[DEBUG BRCAST] speculator_layers={speculator_layers}",
-              flush=True)
-        print(
-            f"[DEBUG BRCAST] per_layer_attn_metadata keys={list(per_layer_attn_metadata.keys())[:10]} ... total={len(per_layer_attn_metadata)}",
-            flush=True)
-
         if is_gemma4_mtp:
             p = self._loop_bucket(num_reqs)
-            if p > 1:
+            if p > num_reqs:
                 for name, md in per_layer_attn_metadata.items():
                     if name in speculator_layers:
                         if md.block_tables is not None:
@@ -1186,9 +1179,9 @@ class Eagle3Proposer:
                             target_num_blocks = total_elements // kernel_num_reqs
                             bt_2d = md.block_tables.view(
                                 kernel_num_reqs, target_num_blocks)
-                            bt_2d[1:p] = bt_2d[0:1].expand(p - 1, -1)
+                            bt_2d[num_reqs:p] = bt_2d[0:1].expand(p - num_reqs, -1)
                         if md.seq_lens is not None:
-                            md.seq_lens[1:p] = md.seq_lens[0:1].expand(p - 1)
+                            md.seq_lens[num_reqs:p] = md.seq_lens[0:1].expand(p - num_reqs)
 
         result = {
             name: md
@@ -1211,23 +1204,7 @@ class Eagle3Proposer:
                                 f"draft_model.layers.{idx}.self_attn.attn")
                             if target_name is not None and target_name in result:
                                 result[draft_name] = result[target_name]
-                                print(
-                                    f"[DEBUG BRCAST] Aliased draft layer {draft_name} to target layer {target_name} metadata.",
-                                    flush=True)
 
-        # Print the resolved seq_lens and block_tables
-        for name in [
-                "draft_model.layers.0.self_attn.attn",
-                "language_model.model.layers.58.self_attn.attn"
-        ]:
-            if name in result:
-                md = result[name]
-                print(
-                    f"[DEBUG BRCAST] {name}: seq_lens={md.seq_lens.tolist() if md.seq_lens is not None else 'None'}",
-                    flush=True)
-                print(
-                    f"[DEBUG BRCAST] {name}: block_tables={md.block_tables.tolist() if md.block_tables is not None else 'None'}",
-                    flush=True)
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
         return result
@@ -1369,17 +1346,17 @@ class Eagle3Proposer:
             if inputs_embeds is not None:
                 kwargs["inputs_embeds"] = inputs_embeds
 
-        # Debug diagnostics print block
-        rank = torch.distributed.get_rank(
-        ) if torch.distributed.is_initialized() else 0
-        if self.speculative_config.method == "mtp":
-            print(
-                f"[DEBUG Rank {rank}] target_hidden_states: nan={torch.isnan(target_hidden_states).any()}, shape={target_hidden_states.shape}, sum={target_hidden_states.sum().item():.4f}",
-                flush=True)
-            if inputs_embeds is not None:
-                print(
-                    f"[DEBUG Rank {rank}] inputs_embeds: nan={torch.isnan(inputs_embeds).any()}, shape={inputs_embeds.shape}, sum={inputs_embeds.sum().item():.4f}",
-                    flush=True)
+        # # Debug diagnostics print block
+        # rank = torch.distributed.get_rank(
+        # ) if torch.distributed.is_initialized() else 0
+        # if self.speculative_config.method == "mtp":
+        #     print(
+        #         f"[DEBUG Rank {rank}] target_hidden_states: nan={torch.isnan(target_hidden_states).any()}, shape={target_hidden_states.shape}, sum={target_hidden_states.sum().item():.4f}",
+        #         flush=True)
+        #     if inputs_embeds is not None:
+        #         print(
+        #             f"[DEBUG Rank {rank}] inputs_embeds: nan={torch.isnan(inputs_embeds).any()}, shape={inputs_embeds.shape}, sum={inputs_embeds.sum().item():.4f}",
+        #             flush=True)
 
         draft_vllm_cfg = getattr(self.draft_model, "vllm_config",
                                  self.vllm_config)
@@ -1393,13 +1370,6 @@ class Eagle3Proposer:
             out = self.draft_model(**kwargs)
 
         last_hidden_out, carry_hidden_out = self._unwrap_model_out(out)
-        if self.speculative_config.method == "mtp":
-            print(
-                f"[DEBUG Rank {rank}] last_hidden_out: nan={torch.isnan(last_hidden_out).any()}, shape={last_hidden_out.shape}, sum={last_hidden_out.sum().item():.4f}",
-                flush=True)
-            print(
-                f"[DEBUG Rank {rank}] carry_hidden_out: nan={torch.isnan(carry_hidden_out).any()}, shape={carry_hidden_out.shape}, sum={carry_hidden_out.sum().item():.4f}",
-                flush=True)
         return last_hidden_out, carry_hidden_out
 
     def precompile(self) -> None:
@@ -1523,7 +1493,7 @@ class Eagle3Proposer:
                 ]
                 out = self._draft_combine_hidden_states(*aux)
                 sync.synchronize(out, wait=True)
-                logger.info("  -- drafter combine num_tokens: %d", num_tokens)
+                #logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -1583,7 +1553,7 @@ class Eagle3Proposer:
                 )
                 out = self._draft_propose_token(dummy_hidden)
                 sync.synchronize(out, wait=True)
-                logger.info("  -- drafter compute_logits n: %d", n)
+                # logger.info("  -- drafter compute_logits n: %d", n)
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's DRAFT collective trace on an idle/padding rank,

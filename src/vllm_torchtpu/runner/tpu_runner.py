@@ -3215,21 +3215,6 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                 )
 
-            logger.info(
-                "DEBUG _execute_model_chunk forward_model: num_reqs=%d, input_ids=%s, hidden_states stats: min=%s, max=%s, mean=%s, has_nan=%s, shape=%s",
-                num_reqs,
-                input_ids.cpu().tolist()[:10],
-                hidden_states.min().cpu().item() if hasattr(
-                    hidden_states, "min") else "None",
-                hidden_states.max().cpu().item() if hasattr(
-                    hidden_states, "max") else "None",
-                hidden_states.mean().cpu().item() if hasattr(
-                    hidden_states, "mean") else "None",
-                torch.isnan(hidden_states).any().cpu().item() if hasattr(
-                    hidden_states, "isnan") else "None",
-                list(hidden_states.shape)
-                if hasattr(hidden_states, "shape") else "None")
-
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
             layout_plan = self._last_sequence_layout_plan
