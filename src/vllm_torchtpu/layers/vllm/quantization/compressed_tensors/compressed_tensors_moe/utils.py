@@ -116,15 +116,6 @@ def release_memory_to_os() -> None:
         pass
 
 
-# FP4 E2M1 representable values: 0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
-# Representable values mapping to 4-bit nibbles (0..15)
-FP4_E2M1_VALUES = torch.tensor([
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0,
-    -4.0, -6.0
-],
-                               dtype=torch.float32)
-
-
 def quantize_to_fp4_e2m1_nibbles(tensor_scaled: torch.Tensor) -> torch.Tensor:
     """Vectorized projection of scaled float values into 4-bit FP4 E2M1 indices (0..15)."""
     abs_x = tensor_scaled.abs()
@@ -161,8 +152,6 @@ def requantize_int4_weights(
     in_block_size = size_k // num_in_blocks
 
     effective_requant_block = min(requant_block_size, size_k)
-    if effective_requant_block <= in_block_size:
-        return w_packed, scale_f
 
     groups_per_block = effective_requant_block // in_block_size
     num_out_blocks = size_k // effective_requant_block

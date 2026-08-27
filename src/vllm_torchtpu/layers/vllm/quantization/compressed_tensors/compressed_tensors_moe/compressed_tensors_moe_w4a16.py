@@ -47,10 +47,6 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         "w13_weight_packed",
         "w2_weight_packed",
     )
-    _SCALE_WEIGHT_NAMES = (
-        "w13_weight_scale",
-        "w2_weight_scale",
-    )
 
     _INT4_SIGN_XOR = ctypes.c_int32(0x88888888).value
 
@@ -61,16 +57,16 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         moe: FusedMoEConfig,
         layer_name: str | None = None,
     ):
+        # Bypass upstream CompressedTensorsWNA16MoEMethod to:
+        # Prevent upfront TPU HBM pre-allocation during weight creation,
+        # which leads to OOM during weight loading from GCS Streamer/HF without EP
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.symmetric = getattr(weight_quant, "symmetric", True)
         self.num_bits = int(getattr(weight_quant, "num_bits", 4))
         self.packed_factor = 32 // self.num_bits
         self.strategy = getattr(weight_quant, "strategy", "group")
         self.group_size = getattr(weight_quant, "group_size", None)
-        self.actorder = getattr(weight_quant, "actorder", None)
-        self.is_marlin = False
         self.is_transposed = True
 
     @property
@@ -152,10 +148,6 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         extra_weight_attrs["weight_loader"] = get_cpu_weight_loader_hook(
             layer, orig_loader, self.moe.tp_size, self.moe.tp_rank)
 
-        # Bypass upstream CompressedTensorsWNA16MoEMethod to:
-        # 1. Avoid GPU-only kernel selection (Marlin/FlashInfer) in parent class.
-        # 2. Prevent upfront ~30 GB TPU HBM pre-allocation during weight creation,
-        #    allowing weights to stream to CPU and transfer layer-by-layer on TPU.
         extra_weight_attrs.update({
             "is_transposed": self.is_transposed,
             "quant_method": self.strategy
