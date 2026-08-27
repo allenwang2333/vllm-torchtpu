@@ -17,8 +17,7 @@ x-unit-test-defaults: &unit_test_defaults
     - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
 
 x-tests-plugin-defaults: &tests_plugin_defaults
-  # Resolved relative to the org running the build, so this has to track the
-  # Buildkite org: tpu-commons/tests -> vllm/tpu-ci.
+  # Resolved relative to the Buildkite org running the build.
   suite-slug: tpu-ci
   test-runner: pytest
   install-client: false
