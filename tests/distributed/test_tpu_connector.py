@@ -35,8 +35,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3RegisteredSend, _select_committed_mamba_blocks,
-    _stage3_transfer_groups, stage3_fa_raiden_id_fields)
+    _Stage3Dsv4Pool, _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    _stage3_dsv4_pool_pages, _stage3_transfer_groups,
+    stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -149,7 +150,7 @@ def test_stage3_transfer_groups_skips_mamba_state_groups():
     config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
     groups = _stage3_transfer_groups(config.kv_cache_groups,
                                      allow_multiple=False)
-    assert [(group.cache_group_ordinal, group.page_tokens)
+    assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(2, 16)]
 
 
@@ -175,7 +176,7 @@ def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
     groups = _stage3_transfer_groups(
         _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
         allow_multiple=True)
-    assert [(group.cache_group_ordinal, group.page_tokens)
+    assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(0, 1024), (1, 1024), (2, 128)]
 
 
@@ -496,7 +497,7 @@ class TestTPUConnector:
                                      cache_config)
 
             assert [
-                group.cache_group_ordinal
+                group.cache_group_index
                 for group in connector._stage3_transfer_groups
             ] == [0, 1, 2]
             assert connector.get_block_ids_with_load_errors_group_index() == 0
@@ -544,7 +545,8 @@ class TestTPUConnector:
                    create=True), patch(
                        f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
                        False,
-                       create=True), pytest.raises(NotImplementedError,
+                       create=True), pytest.raises(
+                           NotImplementedError,
                            match="TPU_RAIDEN_DSV4_ADMISSION"):
             connector.request_finished_all_groups(MagicMock(),
                                                   ([1], [2], [3, 4]))
@@ -3636,6 +3638,66 @@ def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
     assert worker._stage3_dsv4_group_count == 7
 
 
+def test_dsv4_pool_plan_carries_the_sliding_window_of_its_group():
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=True,
+                                 dp_size=8)
+    plan, _ = _dsv4_worker_plan(worker)
+
+    windows = {pool.tag: pool.window_tokens for pool in plan}
+    assert windows["dsv4.swa.g3"] == 128
+    assert all(window is None for tag, window in windows.items()
+               if tag != "dsv4.swa.g3")
+
+
+def test_dsv4_window_trim_drops_the_null_prefix_and_its_tokens():
+    """A windowed group transfers only the pages still inside its window.
+
+    The out-of-window entries are all the same null block, and Raiden rejects
+    a destination page list that repeats an ID, so leaving them in fails the
+    whole transfer.
+    """
+    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
+                           plan_position=1,
+                           page_tokens=128,
+                           live_bytes_per_block=131072,
+                           row_bytes=512,
+                           window_tokens=128)
+    # 1534 tokens over 128-token pages is 12 pages; the window keeps the last
+    # two, matching SlidingWindowManager's (1534 - 128 + 1) // 128 == 10 skip.
+    table = [0] * 10 + [41, 42]
+
+    pages, tokens = _stage3_dsv4_pool_pages(pool, table, 1534)
+
+    assert pages == [41, 42]
+    assert tokens == 1534 - 10 * 128
+
+
+def test_dsv4_window_trim_leaves_a_full_attention_group_alone():
+    pool = _Stage3Dsv4Pool(tag="dsv4.csa.nope.g0",
+                           plan_position=0,
+                           page_tokens=1024,
+                           live_bytes_per_block=131072,
+                           row_bytes=512)
+
+    pages, tokens = _stage3_dsv4_pool_pages(pool, [7, 8], 1534)
+
+    assert (pages, tokens) == ([7, 8], 1534)
+
+
+def test_dsv4_window_trim_rejects_a_table_that_still_repeats_a_page():
+    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
+                           plan_position=1,
+                           page_tokens=128,
+                           live_bytes_per_block=131072,
+                           row_bytes=512,
+                           window_tokens=128)
+
+    with pytest.raises(ValueError, match="still repeats a page"):
+        _stage3_dsv4_pool_pages(pool, [0] * 10 + [41, 41], 1534)
+
+
 def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():
     worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
     named, groups = dsv4_materialization()
@@ -3679,15 +3741,18 @@ def test_dsv4_producer_registers_one_span_set_per_cache_group():
     # 1024 tokens: one page for the 1024-token groups, four for HCA's
     # 256-token pages, eight for SWA's 128-token pages. The tables are
     # disjoint, which is the only thing keeping the aliased arrays apart.
+    # SWA's window is one page wide, so vLLM has already replaced its first
+    # seven entries with the null block.
     group_block_ids = [
         [10],
         [20],
         [30, 31, 32, 33],
-        [40, 41, 42, 43, 44, 45, 46, 47],
+        [0, 0, 0, 0, 0, 0, 0, 47],
         [50],
         [60],
         [70, 71, 72, 73],
     ]
+    swa_live_pages = [47]
     meta = TPUConnectorMetadata()
     meta.reqs_to_send["dsv4-req"] = MagicMock(uuid=99,
                                               local_block_ids=[10],
@@ -3717,12 +3782,15 @@ def test_dsv4_producer_registers_one_span_set_per_cache_group():
     # D5 keys on one list per request; the per-tag pages ride in the spans.
     assert call["block_ids"] == [10]
     assert [(reg.tag, list(reg.block_ids)) for reg in call["pool_spans"]] == [
-        (pool.tag, group_block_ids[pool.plan_position]) for pool in plan
+        (pool.tag, swa_live_pages
+         if pool.tag == "dsv4.swa.g3" else group_block_ids[pool.plan_position])
+        for pool in plan
     ]
     assert all(reg.dst_space_version == 1 for reg in call["pool_spans"])
     # Each pool declares its whole request: full pages everywhere, because
-    # 1024 tokens divides every group's page size.
+    # 1024 tokens divides every group's page size. SWA declares only the one
+    # page still inside its window.
     declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
     assert declared["dsv4.csa.nope.g0"] == 131072
     assert declared["dsv4.hca.g2"] == 4 * 262144
-    assert declared["dsv4.swa.g3"] == 8 * 131072
+    assert declared["dsv4.swa.g3"] == 131072

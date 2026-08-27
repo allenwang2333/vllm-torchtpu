@@ -128,13 +128,88 @@ class _Stage3TransferGroup:
 
     A cache group is the set of layers the scheduler pages together: one
     request gets one block table per group, and every layer in the group
-    reads the same page numbers. That is why a block ID means nothing until
-    you know its group, and why `page_tokens` travels alongside the ordinal
-    rather than being read from a connector-wide `block_size`.
+    reads the same page numbers.
     """
 
-    cache_group_ordinal: int
+    cache_group_index: int
     page_tokens: int
+
+
+def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
+                                 window_tokens: Optional[int]) -> int:
+    """Leading pages of a sliding-window block table that hold no live KV.
+
+    vLLM's `SlidingWindowManager` frees every page that falls out of the
+    window and writes the null block over its entry, so the table starts with
+    a run of one repeated ID. Transferring those pages would hand Raiden a
+    destination block list with duplicates, which it rejects, and would move
+    bytes the decode replica cannot read anyway.
+
+    Mirrors `SlidingWindowManager.get_num_skipped_tokens` and
+    `SingleTypeKVCacheManager.remove_skipped_blocks`. Both peers derive the
+    count from the same request length and page geometry, so they trim the
+    same pages and the surviving pages stay paired.
+    """
+    if not window_tokens:
+        return 0
+    skipped_tokens = max(0, int(num_tokens) - int(window_tokens) + 1)
+    return skipped_tokens // int(page_tokens)
+
+
+def _stage3_trim_window_pages(
+    block_ids: Sequence[int],
+    *,
+    num_tokens: int,
+    page_tokens: int,
+    window_tokens: Optional[int],
+    group_label: str,
+) -> list[int]:
+    """`block_ids` without the dead prefix a sliding window leaves.
+
+    A windowed group's block table still has one entry per page of the whole
+    request, but the allocator has already freed the pages that fell behind
+    the window and points them at the null block. Those entries are dropped here.
+    """
+    ids = [int(block_id) for block_id in block_ids]
+    skipped = min(
+        _stage3_skipped_window_pages(num_tokens=num_tokens,
+                                     page_tokens=page_tokens,
+                                     window_tokens=window_tokens), len(ids))
+    if not skipped:
+        return ids
+    dropped, kept = ids[:skipped], ids[skipped:]
+    # Out-of-window pages hold nothing the consumer can attend to, so dropping
+    # them is right either way, but the allocator normally has already written
+    # the null block over all of them. A varied prefix means this arithmetic
+    # and vLLM's have drifted apart, which is worth seeing before it turns
+    # into a silent mis-transfer.
+    if len(set(dropped)) != 1:
+        logger.warning(
+            "Stage-3 sliding-window trim dropped pages that are not all the "
+            "null block: group=%s, dropped=%s, num_tokens=%d, page_tokens=%d, "
+            "window=%s", group_label, dropped, num_tokens, page_tokens,
+            window_tokens)
+    if len(set(kept)) != len(kept):
+        raise ValueError(
+            "Stage-3 sliding-window block table still repeats a page after "
+            f"trimming: group={group_label}, kept={kept}, "
+            f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
+            f"window={window_tokens}")
+    return kept
+
+
+def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
+    """The sliding window of a cache group, or None if it is full attention.
+
+    DSv4 hands its groups over as `UniformTypeKVCacheSpecs`, which carries no
+    `sliding_window` of its own; the layers under it are uniform by
+    construction, so any one of them answers for the group.
+    """
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    if specs:
+        group_spec = next(iter(specs.values()))
+    window = getattr(group_spec, "sliding_window", None)
+    return int(window) if window else None
 
 
 def _stage3_transfer_groups(
@@ -147,14 +222,14 @@ def _stage3_transfer_groups(
     Mamba groups are excluded: their state rides the state-class tags and is
     addressed one committed checkpoint at a time, not as a page range.
 
-    ``page_tokens`` travels with the ordinal because DeepSeek-V4's groups page
-    at different sizes -- its SWA group's block is an eighth of the CSA
+    ``page_tokens`` travels with the group index because DeepSeek-V4's groups
+    page at different sizes -- its SWA group's block is an eighth of the CSA
     group's -- so a single connector-wide page size cannot validate them all.
     Every other model here has exactly one such group, which
     ``allow_multiple=False`` keeps enforced.
     """
     groups = tuple(
-        _Stage3TransferGroup(cache_group_ordinal=index,
+        _Stage3TransferGroup(cache_group_index=index,
                              page_tokens=int(group.kv_cache_spec.block_size))
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec))
@@ -165,33 +240,52 @@ def _stage3_transfer_groups(
     if not allow_multiple and len(groups) != 1:
         raise ValueError("Stage-3 Qwen3.5 resharding requires exactly one "
                          f"full-attention KV cache group, got "
-                         f"{[group.cache_group_ordinal for group in groups]}")
+                         f"{[group.cache_group_index for group in groups]}")
     return groups
 
 
 @dataclass(frozen=True)
 class _Stage3Dsv4Pool:
-    """One admitted DSv4 pool tag and everything its lowering needs.
+    """One tag in the DSv4 transfer plan, and the geometry to move it."""
 
-    A request holds one block table per cache group, so its allocation
-    crosses the wire as `SendMeta.group_block_ids`, a list of lists ordered
-    by the Stage-3 transfer plan. `plan_position` is this tag's index into
-    that outer list, which is why it is a plan position and not a
-    kv-cache-group ordinal: Mamba groups are skipped, so the two numbers
-    differ as soon as a model has one. Two tags may share a position, as
-    `dsv4.csa.nope.g0` and `dsv4.csa.rope.g0` do, because a CSA layer's two
-    arrays belong to one group and therefore one block table.
-
-    The remaining fields are the geometry `lower_dsv4_row_spans` needs:
-    `page_tokens` is logical tokens per page, and `live_bytes_per_block` and
-    `row_bytes` are bytes.
-    """
-
+    # Pool tag, e.g. `dsv4.csa.nope.g0`. The `.g0` suffix names the kv cache
+    # group whose block table addresses these bytes.
     tag: str
+    # Which block table to read, as an index into `SendMeta.group_block_ids`.
+    # That list skips Mamba groups, so this is not a kv-cache-group index.
+    # Tags of one group share a position: `dsv4.csa.nope.g0` and
+    # `dsv4.csa.rope.g0` do, because a CSA layer's two arrays page together.
     plan_position: int
     page_tokens: int
     live_bytes_per_block: int
+    # `live_bytes_per_block // row_bytes` is rows per page, which is not
+    # `page_tokens`: each DSv4 role packs a different number of tokens into a
+    # row, four for CSA NoPE and sixteen for RoPE.
     row_bytes: int
+    # None for full attention.
+    window_tokens: Optional[int] = None
+
+
+def _stage3_dsv4_pool_pages(
+    pool: _Stage3Dsv4Pool,
+    block_ids: Sequence[int],
+    num_tokens: int,
+) -> tuple[list[int], int]:
+    """The pages one DSv4 pool actually transfers, and the tokens they hold.
+
+    A windowed group's block table opens with null blocks standing in for
+    pages the allocator already freed, so both the pages and the token count
+    they would account for come off the front together. Producer and consumer
+    call this with the same pool geometry and the same request length, which
+    is what keeps their page lists aligned index for index.
+    """
+    trimmed = _stage3_trim_window_pages(block_ids,
+                                        num_tokens=num_tokens,
+                                        page_tokens=pool.page_tokens,
+                                        window_tokens=pool.window_tokens,
+                                        group_label=pool.tag)
+    dropped_pages = len(block_ids) - len(trimmed)
+    return trimmed, int(num_tokens) - dropped_pages * int(pool.page_tokens)
 
 
 @dataclass
@@ -361,7 +455,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config.kv_cache_groups,
                 allow_multiple=_use_raiden_dsv4_admission())
             self._stage3_fa_group_index = (
-                self._stage3_transfer_groups[0].cache_group_ordinal)
+                self._stage3_transfer_groups[0].cache_group_index)
         self._stage3_mamba_group_indices: list[int] = []
         stage3_mamba_num_speculative_blocks = 0
         if use_raiden and _use_raiden_stage3_transport():
@@ -444,11 +538,11 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
 
         if self.use_raiden and _use_raiden_stage3_transport():
             for transfer_group in self._stage3_transfer_groups:
-                if transfer_group.cache_group_ordinal >= len(block_ids):
+                if transfer_group.cache_group_index >= len(block_ids):
                     raise ValueError(
                         "Stage-3 FA KV cache group is absent from request "
                         f"block tables: group="
-                        f"{transfer_group.cache_group_ordinal}, "
+                        f"{transfer_group.cache_group_index}, "
                         f"groups={len(block_ids)}")
             group_block_ids = None
             if len(self._stage3_transfer_groups) > 1:
@@ -459,10 +553,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                         "Stage-3 transfers a single KV cache group's pages "
                         "per request; this model has "
                         f"{len(self._stage3_transfer_groups)} "
-                        f"({[g.cache_group_ordinal for g in self._stage3_transfer_groups]}) "
+                        f"({[g.cache_group_index for g in self._stage3_transfer_groups]}) "
                         "and needs TPU_RAIDEN_DSV4_ADMISSION=1")
                 group_block_ids = [
-                    list(block_ids[group.cache_group_ordinal])
+                    list(block_ids[group.cache_group_index])
                     for group in self._stage3_transfer_groups
                 ]
             mamba_block_ids = None
@@ -1090,15 +1184,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Every planned group must be present before any of them is read; a
         # missing one means the decode allocation and the admitted manifest
         # disagree about the group layout.
-        for transfer_group in (self._stage3_transfer_groups
-                               or (_Stage3TransferGroup(
-                                   cache_group_ordinal=self.
-                                   _stage3_fa_group_index,
-                                   page_tokens=self.block_size), )):
-            if transfer_group.cache_group_ordinal >= len(grouped_block_ids):
+        for transfer_group in (
+                self._stage3_transfer_groups or (_Stage3TransferGroup(
+                    cache_group_index=self._stage3_fa_group_index,
+                    page_tokens=self.block_size), )):
+            if transfer_group.cache_group_index >= len(grouped_block_ids):
                 raise ValueError(
                     "Stage-3 FA KV cache group is absent from decode "
-                    f"allocation: group={transfer_group.cache_group_ordinal}, "
+                    f"allocation: group={transfer_group.cache_group_index}, "
                     f"groups={len(grouped_block_ids)}")
         local_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
         multi_group = len(self._stage3_transfer_groups) > 1
@@ -1119,7 +1212,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if multi_group:
             group_block_ids = []
             for group in self._stage3_transfer_groups:
-                ids = list(grouped_block_ids[group.cache_group_ordinal])
+                ids = list(grouped_block_ids[group.cache_group_index])
                 _require_complete_pages(ids, group.page_tokens)
                 group_block_ids.append(ids)
         mamba_state_block_ids: Optional[list[int]] = None
@@ -1915,25 +2008,16 @@ class TPURaidenConnectorWorker:
     def _measure_dsv4_pool_plan(
             self, manifest: Any,
             kv_cache_groups: Sequence[Any]) -> tuple[_Stage3Dsv4Pool, ...]:
-        """Binds every admitted DSv4 tag to the block table it reads.
+        """Builds one `_Stage3Dsv4Pool` per DSv4 tag in the manifest.
 
-        The manifest says where a tag's bytes live; this says which pages of
-        them to move, by resolving each tag's `.g{ordinal}` suffix to a
-        position in the transfer plan. See `_Stage3Dsv4Pool` for what a plan
-        position is.
-
-        Tag order follows the manifest's pool order, which both peers build
-        from the same model, and which fixes the executor-side H2D order.
-
-        The transfer-group plan is recomputed here from the runner's cache
-        config: the worker has no scheduler to inherit it from, and it must be
-        the same plan, since `plan_position` indexes the per-group block
-        tables the scheduler puts on the wire.
+        The worker has no scheduler to inherit the transfer-group plan from,
+        so it recomputes one here. The two must agree: `plan_position`
+        indexes the block tables the scheduler sends.
         """
         transfer_groups = _stage3_transfer_groups(kv_cache_groups,
                                                   allow_multiple=True)
         plan_position_by_group = {
-            group.cache_group_ordinal: position
+            group.cache_group_index: position
             for position, group in enumerate(transfer_groups)
         }
         geometry = manifest.geometry_by_tag()
@@ -1944,23 +2028,25 @@ class TPURaidenConnectorWorker:
             if tag in seen:
                 continue
             seen.add(tag)
-            ordinal = int(tag.rsplit(".g", 1)[1])
-            position = plan_position_by_group.get(ordinal)
+            group_index = int(tag.rsplit(".g", 1)[1])
+            position = plan_position_by_group.get(group_index)
             if position is None:
                 raise RuntimeError(
-                    f"DSv4 pool tag {tag!r} names kv cache group {ordinal}, "
+                    f"DSv4 pool tag {tag!r} names kv cache group {group_index}, "
                     "which is not in the Stage-3 transfer plan "
-                    f"{[g.cache_group_ordinal for g in transfer_groups]}")
+                    f"{[g.cache_group_index for g in transfer_groups]}")
             (region, ) = pool.regions
             pools.append(
                 _Stage3Dsv4Pool(
                     tag=tag,
                     plan_position=position,
                     page_tokens=int(
-                        kv_cache_groups[ordinal].kv_cache_spec.block_size),
+                        kv_cache_groups[group_index].kv_cache_spec.block_size),
                     live_bytes_per_block=int(
                         geometry[tag]["live_bytes_per_block"]),
                     row_bytes=int(region.unit_bytes),
+                    window_tokens=_stage3_group_window_tokens(
+                        kv_cache_groups[group_index].kv_cache_spec),
                 ))
         if not pools:
             raise RuntimeError("DSv4 admission produced no transfer pools")
@@ -1986,8 +2072,7 @@ class TPURaidenConnectorWorker:
     def _measure_raiden_dsv4_layout(
         manifest: Any, ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
-            measured_dsv4_layout_fingerprint,
-        )
+            measured_dsv4_layout_fingerprint, )
 
         return measured_dsv4_layout_fingerprint(manifest)
 
@@ -2814,8 +2899,7 @@ class TPURaidenConnectorWorker:
         one is lowered against its own cache group's pages.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-            lower_dsv4_row_spans,
-        )
+            lower_dsv4_row_spans, )
 
         facade, _ = self._require_stage3_controller()
         if self._raiden_work_unit is None:
@@ -2848,18 +2932,21 @@ class TPURaidenConnectorWorker:
                     "Stage-3 producer send metadata requires a positive "
                     "expiration_time")
             group_blocks = self._stage3_dsv4_group_blocks(req_meta)
-            pool_spans = [
-                lower_dsv4_row_spans(
-                    tag=pool.tag,
-                    num_tokens=num_tokens,
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
-                    page_tokens=pool.page_tokens,
-                    live_bytes_per_block=pool.live_bytes_per_block,
-                    row_bytes=pool.row_bytes,
-                    block_ids=group_blocks[pool.plan_position],
-                ) for pool in self._stage3_dsv4_plan
-            ]
+            pool_spans = []
+            for pool in self._stage3_dsv4_plan:
+                pool_blocks, pool_tokens = _stage3_dsv4_pool_pages(
+                    pool, group_blocks[pool.plan_position], num_tokens)
+                pool_spans.append(
+                    lower_dsv4_row_spans(
+                        tag=pool.tag,
+                        num_tokens=pool_tokens,
+                        transfer_rank=transfer_rank,
+                        parallelism=parallelism,
+                        page_tokens=pool.page_tokens,
+                        live_bytes_per_block=pool.live_bytes_per_block,
+                        row_bytes=pool.row_bytes,
+                        block_ids=pool_blocks,
+                    ))
             owned_spans = sum(len(reg.spans) for reg in pool_spans)
             # The controller keys D5 on one block list per request, so the
             # per-tag pages ride in the span registrations and this list is
@@ -3287,7 +3374,8 @@ class TPURaidenConnectorWorker:
                     dst_blocks = []
                     dst_counts = []
                     for pool in self._stage3_dsv4_plan:
-                        pages = group_blocks[pool.plan_position]
+                        pages, _ = _stage3_dsv4_pool_pages(
+                            pool, group_blocks[pool.plan_position], num_tokens)
                         transfer_tags.append(pool.tag)
                         dst_blocks.extend(pages)
                         dst_counts.append(len(pages))
