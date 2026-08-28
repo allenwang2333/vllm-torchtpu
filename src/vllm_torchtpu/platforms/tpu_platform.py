@@ -1200,10 +1200,9 @@ class TpuPlatform(Platform):
 
         del processed_inputs
         if isinstance(params, SamplingParams):
-            if params.sampling_type == SamplingType.RANDOM_SEED:
-                raise ValueError("JAX does not support per-request seed.")
             if params.sampling_type not in (SamplingType.GREEDY,
-                                            SamplingType.RANDOM):
+                                            SamplingType.RANDOM,
+                                            SamplingType.RANDOM_SEED):
                 raise ValueError(
                     f"Sampling type {params.sampling_type} is not supported on TPU."
                 )
