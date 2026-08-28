@@ -60,6 +60,7 @@ from vllm.model_executor.parameter import ChannelQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.common import expert_load
 from vllm_torchtpu.layers.common.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
@@ -806,6 +807,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(
             layer, device=layer.w13_weight.device)
+        expert_load.register_expert_load_buffer(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -832,6 +834,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
                 topk_ids,
                 topk_weights,
                 is_local_tensor=enable_pipelined_collective_and_compute())
+
+        # Measurement tap, after the padding weights are zeroed so it can mask
+        # them out. Inert unless TPU_MOE_DUMP_EXPERT_LOAD=1; see
+        # layers/common/expert_load.py.
+        expert_load.maybe_tap(layer, topk_ids, topk_weights)
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).

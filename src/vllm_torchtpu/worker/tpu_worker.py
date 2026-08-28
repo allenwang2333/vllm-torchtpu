@@ -30,6 +30,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.distributed.pcp_rank_order import (
     pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
+from vllm_torchtpu.layers.common import expert_load
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -482,7 +483,12 @@ class TPUWorker(WorkerBase):
         return available
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        out = self.model_runner.execute_model(scheduler_output)
+        # Host-side read of the MoE routing counters, between steps rather
+        # than inside the traced forward. Inert unless
+        # TPU_MOE_DUMP_EXPERT_LOAD=1; see layers/common/expert_load.py.
+        expert_load.maybe_dump_after_step()
+        return out
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)

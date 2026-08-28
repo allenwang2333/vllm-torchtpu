@@ -1,66 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-side tap on the global MoE routing histogram.
+"""Per-layer MoE routing histogram, accumulated on device.
 
 Inert unless ``TPU_MOE_DUMP_EXPERT_LOAD=1``. It exists to measure the
-per-layer, per-expert load that a *static* expert permutation needs. The
-xprof profile only carries the load's **time image** -- the per-rank
-``gmm_v2`` spread -- and nothing in the job-output tree carries a 512-bin
-histogram, so the number has to come from a dedicated run.
+per-layer, per-expert load that a *static* expert permutation needs
+(``vllm_torchtpu/expert_permutation.py``). The xprof profile only carries the
+load's **time image** -- the per-rank ``gmm_v2`` spread, 8 numbers per layer --
+which is not enough to repartition 512 experts, and nothing in the job-output
+tree carries a 512-bin histogram. So the number has to come from a dedicated
+run.
 
-Placement: the tap sits on ``topk_ids`` in ``fused_moe_gmm`` *before* the
-``experts_start`` remap, where the ids are still global and already gathered
-across the EP group. Every rank therefore sees identical values and a single
-rank's dump is the whole picture. The tap is nonetheless emitted on **every**
-rank: gating the graph on rank identity would make ranks compile structurally
-different programs, which is the exact failure mode ``experts_start`` is a
-traced array to avoid (see ``fused_moe_gmm``'s docstring).
+**Why this is not a host callback.** The obvious implementation is
+``jax.debug.callback`` on ``topk_ids``. It cannot work: ``torch_tpu`` lowers
+every JAX region through ``jax.export`` (``pallas.py`` -> ``do_export`` ->
+``_check_lowering``), which raises ``NotImplementedError: serialization of
+host_callbacks is not yet implemented``. That is architectural, not a flag --
+job ``j-b7f40703-7881-4383-9178`` died at engine-core init on all 8 ranks
+proving it. Note ``pallas.jax_op.__call__`` does have an eager, non-exported
+branch for wrapper tensors, but the server takes the FX-export path.
 
-Layer identity is deliberately not plumbed through the JIT. Passing it as a
-static argument would force one compilation per layer; passing it as traced
-data would mean a signature change down the whole custom-op path. Instead the
-callback is ``ordered=True`` and the tap only fires on one static token shape,
-so every executed step contributes exactly ``num_layers`` firings in order and
-the Nth firing is layer ``N % num_layers``. The dump carries the raw firing
-index so that assumption is checkable offline: a correct phase shows the high
-cross-step rank correlation the profile already established, a wrong one shows
-none.
+So the histogram is accumulated the way this stack already accumulates the KV
+cache: the op returns the updated counter functionally, the caller writes it
+back with ``copy_``, and XLA aliases the output onto the donated input. See
+``layers/vllm/attention.py`` ("Plain donation + copy_ writeback: XLA lifts the
+copy_ input mutation and aliases the op output onto the donated pool").
 
-This is measurement scaffolding for a throwaway run, not a production path --
-the histogram is a scatter-add over ~160k ids and the callback is a host
-round trip per layer per step.
+Two details that decide whether the numbers mean anything:
+
+* **Layer identity is explicit**, taken from ``layer.layer_name``, not inferred
+  from call order. An earlier draft folded firing ``i`` into layer
+  ``i % num_layers``; that is only correct if every trace visits exactly
+  ``num_layers`` MoE layers in order, and a silent phase slip would produce a
+  plausible-looking histogram for the wrong layers.
+* **Padded tokens are excluded.** Under ``TPU_MOE_SKIP_PADDED_TOKENS`` the
+  padding rows keep their expert ids and only their routing weights are
+  zeroed, so counting ids alone would attribute phantom load to whichever
+  experts the padding happened to select. The mask is on ``topk_weights > 0``,
+  which is what the kernel itself honours.
+
+This is measurement scaffolding for a throwaway run, not a production path.
 """
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import threading
 
 import jax
 import jax.numpy as jnp
-import numpy as np
+import torch
+from torch_tpu._internal import pallas
 
-_STATE_LOCK = threading.Lock()
-_STATE: dict = {
-    "started": False,
-    "firings": 0,
-    "num_layers": 0,
-    "num_experts": 0,
-    # layer -> np.int64[num_experts]
-    "counts": None,
-    # layer -> number of steps accumulated
-    "steps": None,
-    # Raw per-firing histograms for the first few steps. The accumulator
-    # above already folds firings into layers via ``i % num_layers``; these
-    # let that phase be *checked* offline rather than assumed, by correlating
-    # firing i against firing i + num_layers. A correct phase reproduces the
-    # high cross-step per-layer correlation the profile measured; a wrong one
-    # shows none. Bounded to AUDIT_STEPS steps so it cannot grow.
-    "audit_raw": [],
-}
-
-AUDIT_STEPS = 3
+_LOCK = threading.Lock()
+# layer_name -> the int32[global_num_experts] device counter for that layer.
+_BUFFERS: dict[str, torch.Tensor] = {}
+_OP = None
+_DUMPS = 0
 
 
 def enabled() -> bool:
@@ -68,27 +63,23 @@ def enabled() -> bool:
                                                               "False")
 
 
-def _num_layers() -> int:
-    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_LAYERS") or "0")
-
-
-def _num_experts() -> int:
-    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_EXPERTS") or "0")
-
-
 def _min_tokens() -> int:
-    """Gathered token count at which the tap arms.
+    """Local token count at which the tap arms.
 
-    Default 16384 = the full-fill prefill step (2048 local x 8 EP ranks),
-    which is the step the re-placement prize is measured on. Restricting to a
-    single shape also keeps steps from interleaving across compiled programs,
-    which is what the ``N % num_layers`` phase relies on.
+    Default 2048 = ``--max-num-batched-tokens``, i.e. the full-fill prefill
+    step, which is the step the re-placement prize is measured on. Arming on
+    one shape only also keeps the counters from mixing prefill and decode
+    routing, which have different expert distributions.
+
+    Note this is the *local* count: ``topk_ids`` here is pre-all-gather, so
+    each rank counts its own tokens and the global histogram is the sum over
+    the 8 ranks (all of which print).
     """
-    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_MIN_TOKENS") or "16384")
+    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_MIN_TOKENS") or "2048")
 
 
-def _period_s() -> float:
-    return float(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_PERIOD_S") or "60")
+def _dump_every() -> int:
+    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_EVERY") or "500")
 
 
 def _rank() -> int:
@@ -98,107 +89,115 @@ def _rank() -> int:
         return -1
 
 
-def _snapshot() -> dict | None:
-    with _STATE_LOCK:
-        if _STATE["counts"] is None:
-            return None
-        return {
-            "kind": "expert_load",
-            "rank": _rank(),
-            "firings": _STATE["firings"],
-            "num_layers": _STATE["num_layers"],
-            "num_experts": _STATE["num_experts"],
-            "steps": _STATE["steps"].tolist(),
-            "audit_raw": [[i, c.tolist()] for i, c in _STATE["audit_raw"]],
-            "counts": _STATE["counts"].tolist(),
-        }
+def _accumulate(counts: jax.Array, topk_ids: jax.Array,
+                topk_weights: jax.Array) -> jax.Array:
+    """``counts + histogram(topk_ids)``, ignoring padding and out-of-range."""
+    num_experts = counts.shape[0]
+    ids = topk_ids.reshape(-1).astype(jnp.int32)
+    weights = topk_weights.reshape(-1)
+    valid = (ids >= 0) & (ids < num_experts) & (weights > 0)
+    safe = jnp.where(valid, ids, 0)
+    ones = jnp.where(valid, 1, 0).astype(counts.dtype)
+    hist = jax.ops.segment_sum(ones,
+                               safe,
+                               num_segments=num_experts,
+                               indices_are_sorted=False)
+    return counts + hist.astype(counts.dtype)
 
 
-def _emit() -> None:
-    snap = _snapshot()
-    if snap is None:
+def _get_op():
+    global _OP
+    if _OP is None:
+        op = pallas.jax_op("pallas::expert_load_accum",
+                           _accumulate,
+                           donate_argnums=(0, ))
+
+        def _fake(counts, topk_ids, topk_weights):
+            return torch.empty_like(counts)
+
+        op.register_fake(_fake)
+        _OP = op
+    return _OP
+
+
+def register_expert_load_buffer(layer) -> None:
+    """Allocate this layer's counter. Call where ``experts_start`` is set up."""
+    if not enabled():
         return
-    # One line, so it survives log interleaving from the other EP ranks.
-    print("EXPERTLOAD_JSON " + json.dumps(snap, separators=(",", ":")),
+    name = getattr(layer, "layer_name", "") or ""
+    if not name:
+        print("EXPERTLOAD_ERROR layer has no layer_name; tap disabled for it",
+              flush=True)
+        return
+    buf = torch.zeros(layer.global_num_experts,
+                      dtype=torch.int32,
+                      device=layer.w13_weight.device)
+    layer.register_buffer("_expert_load_counts", buf, persistent=False)
+    with _LOCK:
+        _BUFFERS[name] = buf
+    print(f"EXPERTLOAD_REGISTER rank={_rank()} layer={name} "
+          f"experts={layer.global_num_experts}",
           flush=True)
 
 
-def _printer_loop() -> None:
-    import time
-    period = _period_s()
-    while True:
-        time.sleep(period)
-        try:
-            _emit()
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"EXPERTLOAD_ERROR printer: {exc!r}", flush=True)
+def maybe_tap(layer, topk_ids: torch.Tensor,
+              topk_weights: torch.Tensor) -> None:
+    """Fold this call's routing into the layer's counter. In-graph, no-op off.
 
-
-def _ensure_started(num_layers: int, num_experts: int) -> None:
-    if _STATE["started"]:
-        return
-    _STATE["started"] = True
-    _STATE["num_layers"] = num_layers
-    _STATE["num_experts"] = num_experts
-    _STATE["counts"] = np.zeros((num_layers, num_experts), dtype=np.int64)
-    _STATE["steps"] = np.zeros((num_layers, ), dtype=np.int64)
-    threading.Thread(target=_printer_loop, daemon=True,
-                     name="expert-load-dump").start()
-    atexit.register(_emit)
-    print(
-        f"EXPERTLOAD_START rank={_rank()} num_layers={num_layers} "
-        f"num_experts={num_experts} min_tokens={_min_tokens()}",
-        flush=True)
-
-
-def _record(counts, num_layers: int) -> None:
-    """Host callback. Must never raise -- it runs inside the model step."""
-    try:
-        counts = np.asarray(counts, dtype=np.int64).reshape(-1)
-        with _STATE_LOCK:
-            _ensure_started(num_layers, int(counts.shape[0]))
-            i = _STATE["firings"]
-            _STATE["firings"] = i + 1
-            layer = i % num_layers
-            _STATE["counts"][layer] += counts
-            _STATE["steps"][layer] += 1
-            if i < AUDIT_STEPS * num_layers:
-                _STATE["audit_raw"].append((i, counts.copy()))
-    except Exception as exc:  # pragma: no cover - defensive
-        print(f"EXPERTLOAD_ERROR record: {exc!r}", flush=True)
-
-
-def maybe_tap_global_topk_ids(topk_ids: jax.Array) -> None:
-    """Accumulate a global expert histogram for this MoE call.
-
-    ``topk_ids`` must be the gathered, still-global ids -- call this before
-    the ``experts_start`` remap. No-op unless the dump is enabled and this
-    graph is the armed token shape. Returns nothing and creates no data
-    dependency; ``jax.debug.callback`` is side-effecting so XLA keeps it.
-
-    The layer count and expert count come from the environment rather than
-    the call site so that no signature on the custom-op path has to change
-    for a one-off measurement run.
+    Must be called *after* padding weights are zeroed, so the mask sees them.
     """
     if not enabled():
         return
-    num_layers = _num_layers()
-    global_num_experts = _num_experts()
-    if num_layers <= 0 or global_num_experts <= 0:
-        # Nothing sane to attribute the firings to; say so once rather than
-        # silently recording an unusable dump.
-        print(
-            "EXPERTLOAD_ERROR TPU_MOE_DUMP_EXPERT_LOAD=1 but "
-            "TPU_MOE_DUMP_EXPERT_LOAD_LAYERS / _EXPERTS unset; tap disabled",
-            flush=True)
+    buf = getattr(layer, "_expert_load_counts", None)
+    if buf is None:
         return
-    num_tokens = topk_ids.shape[0]
-    if num_tokens < _min_tokens():
+    # Static shape check: arms one compiled program only.
+    if topk_ids.shape[0] < _min_tokens():
         return
+    new_counts = _get_op()(buf, topk_ids, topk_weights)
+    buf.copy_(new_counts)
 
-    flat = topk_ids.reshape(-1).astype(jnp.int32)
-    counts = jax.ops.segment_sum(jnp.ones_like(flat),
-                                 flat,
-                                 num_segments=global_num_experts,
-                                 indices_are_sorted=False)
-    jax.debug.callback(lambda c: _record(c, num_layers), counts, ordered=True)
+
+def dump() -> None:
+    """Print every layer's counter as one JSON line. Host side, off-graph.
+
+    Called from the worker between steps -- never from inside the traced
+    forward, where ``.cpu()`` would be a graph break.
+    """
+    global _DUMPS
+    if not enabled():
+        return
+    with _LOCK:
+        items = sorted(_BUFFERS.items())
+    if not items:
+        return
+    try:
+        counts = {name: buf.cpu().numpy().tolist() for name, buf in items}
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"EXPERTLOAD_ERROR dump: {exc!r}", flush=True)
+        return
+    _DUMPS += 1
+    # One line, so it survives interleaving with the other 7 ranks' output.
+    print("EXPERTLOAD_JSON " + json.dumps(
+        {
+            "kind": "expert_load",
+            "rank": _rank(),
+            "dump": _DUMPS,
+            "min_tokens": _min_tokens(),
+            "counts": counts,
+        },
+        separators=(",", ":")),
+          flush=True)
+
+
+_STEPS = 0
+
+
+def maybe_dump_after_step() -> None:
+    """Periodic host-side dump, driven by the worker's step counter."""
+    global _STEPS
+    if not enabled():
+        return
+    _STEPS += 1
+    if _STEPS % _dump_every() == 0:
+        dump()
