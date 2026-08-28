@@ -70,17 +70,6 @@ class KVLayout(enum.StrEnum):
         return "snh"
 
 
-class KVLayout(enum.StrEnum):
-    """Represents the different layouts for KV cache.
-
-    - HEAD_ALONG_SUBLANE: Number of heads on sublane, head_dim on lane.
-    - SEQ_ALONG_LANE: Sequence is packed along the lane, head_dim on sublane.
-    """
-
-    HEAD_ALONG_SUBLANE = enum.auto()
-    SEQ_ALONG_LANE = enum.auto()
-
-
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
   """Serving config that can change depending on use cases."""
