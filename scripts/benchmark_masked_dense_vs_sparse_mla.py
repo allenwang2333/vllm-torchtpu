@@ -11,11 +11,11 @@ Both kernels compute GLM-5.2's DSA attention over the same paged
   and the gather hot-spots when many tokens select overlapping rows, which is
   exactly what happens while a sequence is short.
 
-The production dispatcher considers masked-dense only for prefill-only
-batches. This script measures the crossover at GLM-5.2's serving geometry and
-also times the complete enabled-dispatch wrapper against direct sparse for
-prefill, decode, and mixed steps. Decode-sized token buckets bypass dispatch
-statically; larger mixed buckets exercise the runtime sparse fallback.
+The production dispatcher can combine a sparse prefix with a masked-dense
+suffix after the runner groups requests by length. This script measures the
+crossover at GLM-5.2's serving geometry and also times the complete enabled
+wrapper against direct sparse for prefill, decode, and mixed steps.
+Decode-sized token buckets bypass dispatch statically.
 
     prefill step:  1 sequence  x 1024 query tokens
     decode step:  64 sequences x    1 query token
@@ -262,21 +262,60 @@ def _build_wrapper(enable_dispatch: bool):
         else:
 
             def dense(max_kv_len, _):
-                return masked_dense.masked_dense_ragged_paged_attention(
-                    q,
-                    nope,
-                    rope,
-                    seq_lens,
-                    topk,
-                    pages,
-                    starts,
-                    distribution,
-                    sm_scale=sm_scale,
-                    k_scale=1.0,
-                    max_kv_len=max_kv_len,
-                    num_kv_pages_per_block=(1, 1, 1),
-                    num_queries_per_block=(1, 32, 32),
-                )
+                seq_ids = jnp.arange(seq_lens.shape[0])
+                active = seq_ids < distribution[2]
+                prefix = active & ((seq_ids < distribution[0]) |
+                                   (seq_lens > max_kv_len))
+                split_seq = jnp.sum(prefix).astype(jnp.int32)
+
+                def whole(_):
+                    return masked_dense.masked_dense_ragged_paged_attention(
+                        q,
+                        nope,
+                        rope,
+                        seq_lens,
+                        topk,
+                        pages,
+                        starts,
+                        distribution,
+                        sm_scale=sm_scale,
+                        k_scale=1.0,
+                        max_kv_len=max_kv_len,
+                        num_kv_pages_per_block=(1, 1, 1),
+                        num_queries_per_block=(1, 32, 32),
+                    )
+
+                def split(_):
+                    output = sparse._sparse_prefix_ragged_paged_attention(
+                        q,
+                        nope,
+                        rope,
+                        topk,
+                        pages,
+                        starts,
+                        distribution,
+                        starts[split_seq],
+                        sm_scale=sm_scale,
+                        k_scale=1.0,
+                    )
+                    return masked_dense._masked_dense_suffix_ragged_paged_attention(
+                        output,
+                        nope,
+                        rope,
+                        seq_lens,
+                        topk,
+                        pages,
+                        starts,
+                        distribution,
+                        split_seq,
+                        sm_scale=sm_scale,
+                        k_scale=1.0,
+                        max_kv_len=max_kv_len,
+                        num_kv_pages_per_block=(1, 1, 1),
+                        num_queries_per_block=(1, 32, 32),
+                    )
+
+                return jax.lax.cond(split_seq > 0, split, whole, None)
 
             tier = mla_dispatch.masked_dense_prefill_mla_tier(
                 seq_lens, distribution, starts, limits)
