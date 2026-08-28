@@ -476,6 +476,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
+        assert not (is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE), (
+            "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'.")
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -735,6 +737,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -877,7 +881,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        pool_head_dim = kv_cache.shape[-1]
+        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
+            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
+        else:
+            pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
