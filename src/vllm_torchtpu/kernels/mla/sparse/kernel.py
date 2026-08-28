@@ -125,7 +125,7 @@ def gather_page_ids(
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
-    start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
+    start_end_seq_idx_ref,  # [3] (grid_start, grid_end, valid_end)
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     # Input
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -162,6 +162,7 @@ def _attention_kernel(
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
+    valid_end_seq_idx = start_end_seq_idx_ref[2]
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
@@ -348,6 +349,7 @@ def _attention_kernel(
 
         prev_p = None
         prev_bkv = None
+        prev_bq = None
         prev_l_sum = None
         prev_out = None
 
@@ -374,8 +376,14 @@ def _attention_kernel(
 
             if prev_p is not None:
                 assert prev_bkv is not None
+                assert prev_bq is not None
                 assert prev_l_sum is not None
                 out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                # A dynamic segment end is rounded up to `batch_size` for the
+                # static Pallas grid. Preserve aliased query rows outside the
+                # exact segment for the following masked-dense launch.
+                prev_idx = batch_start_seq_idx + batch_idx - 1
+                out = jnp.where(prev_idx < valid_end_seq_idx, out, prev_bq)
 
                 # Store output from acc to bo.
                 bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
@@ -383,10 +391,14 @@ def _attention_kernel(
 
             prev_p = p
             prev_bkv = bkv
+            prev_bq = bq
             prev_l_sum = l_sum
 
         # end of pipelining loop
+        assert prev_bq is not None
         out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+        final_idx = batch_start_seq_idx + batch_size - 1
+        out = jnp.where(final_idx < valid_end_seq_idx, out, prev_bq)
         bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
 
@@ -453,7 +465,7 @@ def prepare_outputs(
         "vmem_limit_bytes",
     ),
 )
-def sparse_ragged_paged_attention(
+def _sparse_ragged_paged_attention(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
     cache_kv_nope: jax.Array,  # [total_num_pages, page_size, 4, 128]
     cache_kv_rope: jax.Array,  # [total_num_pages, page_size // 4, 4, 128]
@@ -461,6 +473,7 @@ def sparse_ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    token_end: jax.Array | None = None,
     *,
     sm_scale: float = 1.0,
     k_scale: float = 1.0,
@@ -483,6 +496,10 @@ def sparse_ragged_paged_attention(
     distribution: (i, j, k) represents that sequences[0:i] are decode-only,
       sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
       k is also the total number of sequences.
+    token_end: optional dynamic exclusive query-token bound. Sparse gather and
+      attention are issued only for chunks intersecting ``[0, token_end)``;
+      rows at or after the bound retain their input value for a following
+      segmented kernel.
     sm_scale: the softmax scale which will be applied to the Q@K^T.
     k_scale: per-tensor dequantization scale for the fp8 nope cache.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
@@ -503,6 +520,10 @@ def sparse_ragged_paged_attention(
     q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
     head_dim = q.shape[-1]
 
+    segmented = token_end is not None
+    if not segmented:
+        token_end = cu_q_lens[distribution[2]]
+
     _, page_size, _, _ = cache_kv_nope.shape
 
     _, num_q_heads, _ = q.shape
@@ -518,6 +539,7 @@ def sparse_ragged_paged_attention(
         kv_lens: jax.Array,  # i32[max_num_tokens]
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
+        valid_end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
     ):
         batch_size = kernel_batch_size
@@ -559,7 +581,8 @@ def sparse_ragged_paged_attention(
 
         scalar_prefetches = (
             kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+            jnp.array([start_seq_idx, end_seq_idx, valid_end_seq_idx],
+                      jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2, ), jnp.int32),
         )
@@ -649,44 +672,117 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
-            cache_kv_nope,
-            cache_kv_rope,
-            indices,
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            chunk_size,
-            topk * kv_cache_utils.WORD_BYTES,
-            kv_cache_utils.TILE_LANE_BYTES,
-        )
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk, -1)
-        # We treat each query token as a one independent sequence, attend to their
-        # respective gathered kv tokens in the `gathered_kv_buffer`.
-        # -1 in topk_indices is padded elements at the end of each row.
-        # Batching
         kernel_batch_size = _largest_divisor(chunk_size,
                                              attention_kernel_batch_size)
         assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (cdiv(
-            jnp.minimum(
-                cu_q_lens[distribution[2]],
-                end_pos,
-            ) - start_pos,
-            kernel_batch_size,
-        ) * kernel_batch_size)
-        q = run_mla_kernel(
-            q,
-            gathered_nope_buffer,
-            gathered_rope_buffer,
-            kv_lens,
-            start_seq_idx=start_pos,
-            end_seq_idx=batch_end,
-            kernel_batch_size=kernel_batch_size,
-        )
+
+        def gather_and_attend(q_input,
+                              indices=indices,
+                              chunk_size=chunk_size,
+                              start_pos=start_pos,
+                              end_pos=end_pos,
+                              kernel_batch_size=kernel_batch_size):
+            gathered_nope_buffer, gathered_rope_buffer = (
+                dsa_gather.dsa_gather(cache_kv_nope, cache_kv_rope, indices))
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                chunk_size,
+                topk * kv_cache_utils.WORD_BYTES,
+                kv_cache_utils.TILE_LANE_BYTES,
+            )
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                chunk_size, topk, -1)
+            # We treat each query token as one independent sequence and attend
+            # to its gathered KV rows. Round only the attention grid; the
+            # kernel preserves aliased rows past `valid_end` exactly.
+            valid_end = jnp.maximum(start_pos, jnp.minimum(token_end, end_pos))
+            batch_end = start_pos + (cdiv(
+                valid_end - start_pos, kernel_batch_size) * kernel_batch_size)
+            return run_mla_kernel(
+                q_input,
+                gathered_nope_buffer,
+                gathered_rope_buffer,
+                kv_lens,
+                start_seq_idx=start_pos,
+                end_seq_idx=batch_end,
+                valid_end_seq_idx=valid_end,
+                kernel_batch_size=kernel_batch_size,
+            )
+
+        # `token_end` remains a device scalar, so every outer token bucket has
+        # one executable. Untaken SparseCore gathers are genuinely not issued;
+        # only the last intersecting chunk can contain rounded padding.
+        if segmented:
+            q = lax.cond(token_end > start_pos, gather_and_attend, lambda x: x,
+                         q)
+        else:
+            q = gather_and_attend(q)
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+
+
+def sparse_ragged_paged_attention(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    gather_and_attention_chunk_size: int = 64,
+    attention_kernel_batch_size: int = 16,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """Stable full-batch sparse MLA interface."""
+    return _sparse_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        None,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+        attention_kernel_batch_size=attention_kernel_batch_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
+def _sparse_prefix_ragged_paged_attention(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    token_end: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    gather_and_attention_chunk_size: int = 64,
+    attention_kernel_batch_size: int = 16,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """Private segmented sparse prefix used by the MLA dispatcher."""
+    return _sparse_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        token_end,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+        attention_kernel_batch_size=attention_kernel_batch_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )

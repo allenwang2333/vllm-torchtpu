@@ -588,7 +588,7 @@ def prepare_outputs(
         "vmem_limit_bytes",
     ),
 )
-def masked_dense_ragged_paged_attention(
+def _masked_dense_ragged_paged_attention(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
     cache_kv_nope: jax.Array,  # uint8[total_num_pages, page_size, 4, 128]
     cache_kv_rope: jax.Array,  # uint8[total_num_pages, page_size // 4, 4, 128]
@@ -597,6 +597,7 @@ def masked_dense_ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    sequence_start: jax.Array | None = None,
     *,
     sm_scale: float = 1.0,
     k_scale: float = 1.0,
@@ -641,6 +642,10 @@ def masked_dense_ragged_paged_attention(
         number of sequences. The decode segment's launch is compiled with
         `static_q_len=1`, so `sequences[0:i]` must be 1-token requests --
         speculative-verify windows belong in the mixed segment.
+      sequence_start: optional dynamic first sequence to process. When set,
+        the decode/prefill launches are skipped and the mixed launch covers
+        only ``[sequence_start, distribution[2])``. The untouched output
+        prefix is preserved through the existing input/output alias.
       sm_scale: softmax scale applied to Q@K^T.
       k_scale: per-tensor dequantization scale for the fp8 caches, applied to
         both the QK and the PV product.
@@ -864,7 +869,10 @@ def masked_dense_ragged_paged_attention(
             mask_hbm_reshaped,
         )
 
-    # Decode-only
+    # Decode-only. A segmented caller skips this launch by giving it an empty
+    # dynamic range, then starts the mixed launch at `sequence_start` below.
+    decode_end = (distribution[0] if sequence_start is None else jnp.array(
+        0, jnp.int32))
     q = run_mla_kernel(
         q,
         cache_kv_nope,
@@ -874,14 +882,16 @@ def masked_dense_ragged_paged_attention(
         page_indices,
         cu_q_lens,
         start_seq_idx=jnp.array(0, dtype=jnp.int32),
-        end_seq_idx=distribution[0],
+        end_seq_idx=decode_end,
         static_q_len=1,
         num_kv_pages_per_block=num_kv_pages_per_blocks[0],
         num_queries_per_block=num_queries_per_blocks[0],
         case=MlaCase.DECODE,
     )
 
-    if chunk_prefill_size is None:
+    if sequence_start is not None:
+        mixed_start = sequence_start
+    elif chunk_prefill_size is None:
         # Without a static prefill length there is no prefill-only launch, so
         # the mixed launch has to start where the decode segment ended.
         # Starting it at `distribution[1]` instead would silently skip every
@@ -925,3 +935,86 @@ def masked_dense_ragged_paged_attention(
     )
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     return prepare_outputs(q, actual_num_q_heads, actual_head_dim)
+
+
+def masked_dense_ragged_paged_attention(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    kv_lens: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    mask_value: float | None = None,
+    max_kv_len: int | None = None,
+    chunk_prefill_size: int | None = None,
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
+    num_queries_per_block: tuple[int, int, int] | int | None = None,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """Stable full-batch masked-dense MLA interface."""
+    return _masked_dense_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        kv_lens,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        None,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        mask_value=mask_value,
+        max_kv_len=max_kv_len,
+        chunk_prefill_size=chunk_prefill_size,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
+def _masked_dense_suffix_ragged_paged_attention(
+    q: jax.Array,
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    kv_lens: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    sequence_start: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    k_scale: float = 1.0,
+    mask_value: float | None = None,
+    max_kv_len: int | None = None,
+    chunk_prefill_size: int | None = None,
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
+    num_queries_per_block: tuple[int, int, int] | int | None = None,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """Private masked-dense suffix used by the MLA dispatcher."""
+    return _masked_dense_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        kv_lens,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sequence_start,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        mask_value=mask_value,
+        max_kv_len=max_kv_len,
+        chunk_prefill_size=chunk_prefill_size,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )

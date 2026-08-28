@@ -430,10 +430,22 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         self.assertEqual(self._tier([6144], [1024], [0, 0, 1]), 1)
         self.assertEqual(self._tier([7168], [1024], [0, 0, 1]), 2)
 
-    @parameterized.parameters(([1], [1, 1, 1]), ([1, 1024], [1, 1, 2]))
-    def test_any_decode_forces_sparse(self, q_lens, distribution):
+    def test_decode_only_uses_sparse(self):
+        self.assertEqual(self._tier([1024], [1], [1, 1, 1]), 2)
+
+    def test_decode_prefix_and_short_suffix_can_use_hybrid(self):
+        self.assertEqual(self._tier([9000, 1024], [1, 1024], [1, 1, 2]), 0)
+
+    def test_reordered_long_short_prefill_can_use_hybrid(self):
+        self.assertEqual(self._tier([8192, 1024], [512, 512], [0, 0, 2]), 0)
+
+    def test_noncontiguous_partition_falls_back_to_sparse(self):
+        self.assertEqual(self._tier([1024, 8192, 1024], [512] * 3, [0, 0, 3]),
+                         2)
+
+    def test_small_short_suffix_uses_sparse(self):
         self.assertEqual(
-            self._tier([1024] * len(q_lens), q_lens, distribution), 2)
+            self._tier([8192, 9216, 8192, 1536], [256] * 4, [0, 0, 4]), 2)
 
     def test_cost_sums_multiple_prefill_requests(self):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
@@ -738,7 +750,7 @@ class MaskedDenseProfileTest(parameterized.TestCase):
                                 "sparse_ragged_paged_attention",
                                 return_value=sentinel) as sparse,
               mock.patch.object(mla_dispatch,
-                                "_masked_dense_prefill_cost_tier",
+                                "masked_dense_prefill_mla_tier",
                                 side_effect=AssertionError(
                                     "small buckets must not build dispatch"))):
             result = mla_dispatch.ragged_paged_attention(
