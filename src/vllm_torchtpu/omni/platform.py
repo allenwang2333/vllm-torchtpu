@@ -21,6 +21,21 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.OOT
+    device_control_env_var: str = "TPU_VISIBLE_DEVICES"
+
+    @classmethod
+    def set_device_control_env_var(cls, device_ids: str | list[str | int]) -> None:
+        if isinstance(device_ids, list):
+            device_str = ",".join(str(d) for d in device_ids)
+        else:
+            device_str = str(device_ids)
+        os.environ["TPU_VISIBLE_DEVICES"] = device_str
+        os.environ["TPU_VISIBLE_CHIPS"] = device_str
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+        os.environ.pop("TPU_VISIBLE_CHIPS", None)
 
     @property
     def dist_backend(self) -> str:
