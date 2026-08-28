@@ -67,7 +67,7 @@ def test_noise_resolution_and_dense_block():
 def test_bonus_anchor_keeps_dflash_layout():
     p = _make_proposer({
         "mask_token_id": 5,
-        "dspark_bonus_anchor": True,
+        "sample_from_anchor": False,
         **_LAYER_IDS,
     })
     assert not p.sample_from_anchor

@@ -9,9 +9,11 @@ on the previously sampled token. Upstream implements DSparkSpeculator as a
 small DFlashSpeculator subclass; this proposer mirrors that on top of the
 TPU DFlashProposer.
 
-Dense-checkpoint layout (``dspark_bonus_anchor`` unset): the query block is
-K tokens — the anchor is the FIRST prediction position and every slot
-predicts the NEXT token — versus DFlash's 1 + K (anchor is bonus only).
+Dense-checkpoint layout (``sample_from_anchor`` absent or true, as in
+upstream DSparkSpeculator): the query block is K tokens — the anchor is the
+FIRST prediction position and every slot predicts the NEXT token — versus
+DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
+``sample_from_anchor=False`` and keep the DFlash layout.
 
 PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
 Gumbel-coupled sampling is not implemented.
@@ -23,12 +25,8 @@ from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
-from vllm_torchtpu.spec_decode.utils import normalize_draft_config
 
 logger = init_logger(__name__)
-
-# Alias for backwards compatibility
-normalize_dspark_draft_config = normalize_draft_config
 
 
 class DSparkProposer(DFlashProposer):
@@ -46,7 +44,9 @@ class DSparkProposer(DFlashProposer):
                 "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
                 "target_layer_ids, or dflash_config.target_layer_ids).")
 
-        self.sample_from_anchor = not hf_dict.get("dspark_bonus_anchor", False)
+        # Same key/default as upstream DSparkSpeculator: dense checkpoints
+        # omit it (-> True); the speculators converter writes it explicitly.
+        self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
         if block is not None and K < int(block):
