@@ -63,21 +63,6 @@ def enabled() -> bool:
                                                               "False")
 
 
-def _min_tokens() -> int:
-    """Local token count at which the tap arms.
-
-    Default 2048 = ``--max-num-batched-tokens``, i.e. the full-fill prefill
-    step, which is the step the re-placement prize is measured on. Arming on
-    one shape only also keeps the counters from mixing prefill and decode
-    routing, which have different expert distributions.
-
-    Note this is the *local* count: ``topk_ids`` here is pre-all-gather, so
-    each rank counts its own tokens and the global histogram is the sum over
-    the 8 ranks (all of which print).
-    """
-    return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_MIN_TOKENS") or "2048")
-
-
 def _dump_every() -> int:
     return int(os.getenv("TPU_MOE_DUMP_EXPERT_LOAD_EVERY") or "500")
 
@@ -171,14 +156,34 @@ def maybe_tap(layer, topk_ids: torch.Tensor,
     """Fold this call's routing into the layer's counter. In-graph, no-op off.
 
     Must be called *after* padding weights are zeroed, so the mask sees them.
+
+    **Unconditional on purpose.** An earlier version armed only on the
+    full-fill prefill shape (``topk_ids.shape[0] >= 2048``) so the histogram
+    would not mix prefill and decode routing. That branch reads a *symbolic*
+    dimension: Dynamo turns it into a guard, a compile range whose token
+    dimension straddles the threshold gets specialised into two traces, and
+    the two disagree about whether this layer's counter is a graph input.
+    vLLM's artifact cache rejects the second one:
+
+        RuntimeError: artifact_compile_range_4_4_subgraph_0 was compiled by
+        another trace of this model whose inputs differ
+
+    Job j-f4752055-9b99-4402-9b07 died that way. Every trace-visible branch
+    here has to be trace-invariant, so the only conditions left are the env
+    flag and two ``is None`` checks that are fixed for the process.
+
+    The cost is that the counters are a prefill+decode mixture. At
+    ``--prefill-schedule-interval=8`` a full prefill step routes 2048 rows
+    against ~32 per decode step, so prefill is ~89% of the rows -- and the
+    two distributions correlate at Pearson 0.982-0.996 anyway, which is the
+    measurement that made a *static* permutation worth trying in the first
+    place. The mixture is arguably the better target: the permutation has to
+    serve both step types.
     """
     if not enabled():
         return
     buf = getattr(layer, "_expert_load_counts", None)
     if buf is None:
-        return
-    # Static shape check: arms one compiled program only.
-    if topk_ids.shape[0] < _min_tokens():
         return
     # Read the already-built op rather than calling `_get_op()`: constructing
     # it here would put op registration inside the traced graph. See
@@ -190,7 +195,15 @@ def maybe_tap(layer, topk_ids: torch.Tensor,
     buf.copy_(new_counts)
 
 
-def dump() -> None:
+def reset() -> None:
+    """Zero every counter. Host side, between steps."""
+    with _LOCK:
+        items = list(_BUFFERS.values())
+    for buf in items:
+        buf.zero_()
+
+
+def dump(tag: str = "") -> None:
     """Print every layer's counter as one JSON line. Host side, off-graph.
 
     Called from the worker between steps -- never from inside the traced
@@ -215,7 +228,9 @@ def dump() -> None:
             "kind": "expert_load",
             "rank": _rank(),
             "dump": _DUMPS,
-            "min_tokens": _min_tokens(),
+            "tag": tag,
+            "steps": _STEPS,
+            "gate": "unconditional",
             "counts": counts,
         },
         separators=(",", ":")),
@@ -226,10 +241,23 @@ _STEPS = 0
 
 
 def maybe_dump_after_step() -> None:
-    """Periodic host-side dump, driven by the worker's step counter."""
+    """Periodic host-side dump, driven by the worker's step counter.
+
+    The first call also clears the counters. Now that the tap is
+    unconditional it also fires during ``capture_model``'s dummy runs, whose
+    routing comes from whatever junk the dummy inputs produce -- counting it
+    would be counting noise. ``capture_model`` does not go through
+    ``TPUWorker.execute_model``, so ``_STEPS == 1`` is the first *real*
+    forward. The pre-reset counters are dumped first, tagged ``warmup``, so
+    the discarded amount is visible rather than merely asserted.
+    """
     global _STEPS
     if not enabled():
         return
     _STEPS += 1
+    if _STEPS == 1:
+        dump(tag="warmup")
+        reset()
+        return
     if _STEPS % _dump_every() == 0:
-        dump()
+        dump(tag="serving")
