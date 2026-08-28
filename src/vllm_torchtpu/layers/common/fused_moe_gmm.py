@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.layers.common.expert_load import maybe_tap_global_topk_ids
 
 
 def _select_ragged_gather_reduce(version: str):
@@ -408,6 +409,10 @@ def fused_moe_func(
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
+
+    # Measurement tap on the still-global, already-gathered ids. Inert
+    # unless TPU_MOE_DUMP_EXPERT_LOAD=1; see layers/common/expert_load.py.
+    maybe_tap_global_topk_ids(topk_ids)
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start

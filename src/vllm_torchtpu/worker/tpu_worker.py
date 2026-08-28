@@ -621,6 +621,10 @@ class TPUWorker(WorkerBase):
             _apply_model_specific_patches
         _apply_model_specific_patches(self.model_config)
         self.model_runner.load_model()
+        # Router gate rows must follow the permuted expert placement that
+        # expert_permutation installed on the expert maps before load.
+        from vllm_torchtpu import expert_permutation
+        expert_permutation.permute_router_gates(self.model_runner.get_model())
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()

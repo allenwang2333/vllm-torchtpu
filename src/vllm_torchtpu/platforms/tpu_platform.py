@@ -355,6 +355,7 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
     from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
+    from vllm_torchtpu import expert_permutation  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_pcp_v2_validation()
     tpu_plugin._patch_vllm_aot_compile_cache_key()
@@ -368,6 +369,7 @@ def apply_tpu_patches() -> None:
     _patch_moe_no_ep_tp_scope()
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
+    expert_permutation.patch_routed_experts()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_offloading_config_build()
     _patch_vllm_offloading_connector_spec()

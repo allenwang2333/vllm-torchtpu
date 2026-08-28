@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_PACK_ROUTING_AG: bool = False
+    TPU_MOE_EXPERT_PERM_URI: str = ""
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
 
@@ -400,6 +401,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-chunked path only (TPU_MOE_COLLECTION_CHUNK_SIZE=0, the default).
     "TPU_MOE_PACK_ROUTING_AG":
     env_bool("TPU_MOE_PACK_ROUTING_AG"),
+    # Path or gs:// URI of a per-layer expert permutation, applied at weight
+    # load so the contiguous EP blocks the fused-MoE kernel requires carry
+    # equal expert load. Empty (the default) leaves placement untouched. See
+    # expert_permutation.py -- the model computes the identical function, so
+    # this is a placement change, not a numerics change.
+    "TPU_MOE_EXPERT_PERM_URI":
+    lambda: (os.getenv("TPU_MOE_EXPERT_PERM_URI") or "").strip(),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
