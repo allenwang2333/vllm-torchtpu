@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_PACK_ROUTING_AG: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
 
@@ -390,6 +391,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # All-gather the MoE routing pair (topk_ids, topk_weights) as one packed
+    # f32 tensor instead of two separate collectives. Purely a shape change to
+    # the DP all-gather: same values, same kernel path. It exists to stop XLA
+    # sinking the top-k below the gather and gathering the much larger router
+    # logits instead -- see `_all_gather_routing` in
+    # layers/vllm/pipelined_fused_moe.py for the trace evidence. Applies to the
+    # non-chunked path only (TPU_MOE_COLLECTION_CHUNK_SIZE=0, the default).
+    "TPU_MOE_PACK_ROUTING_AG":
+    env_bool("TPU_MOE_PACK_ROUTING_AG"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
