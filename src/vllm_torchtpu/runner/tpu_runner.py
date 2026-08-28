@@ -665,6 +665,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Pallas attention bookkeeping.
         self._attention_kernels_initialized = False
+        self._has_groupable_sparse_mla = False
 
         # CPU staging tensors (TPU prepares inputs on CPU then transfers).
         self.input_ids_cpu = torch.zeros(self.max_num_tokens,
@@ -1156,8 +1157,11 @@ class TPUModelRunner(GPUModelRunner):
             self, scheduler_output: "SchedulerOutput") -> tuple[int, int]:
         """Reorder active requests into an RPA-friendly decode-first layout.
 
-        decode-only requests come first and all remaining requests stay in the
-        mixed bucket. We do not create a dedicated prefill-only bucket here.
+        decode-only requests come first. When the masked-dense MLA experiment
+        is enabled for a model with sparse MLA, the remaining non-speculative
+        requests are also grouped by KV length. The runner only establishes
+        that ordering; the MLA kernel derives and validates any execution
+        split from the existing device tensors.
 
         With speculative decoding the order is three segments:
         [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
@@ -1176,6 +1180,24 @@ class TPUModelRunner(GPUModelRunner):
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
+        grouped_bounds: tuple[int, ...] = ()
+        if (not spec_decode_tokens and self._has_groupable_sparse_mla
+                and envs.TPU_MLA_MASKED_DENSE_ENABLED):
+            # Keep MLA policy in the kernel package. Import lazily so the
+            # generic runner has no dependency on these optional kernels when
+            # the experiment is disabled.
+            from vllm_torchtpu.kernels.mla.dispatch import \
+                grouped_partition_limits
+            grouped_bounds = grouped_partition_limits()
+
+        kv_lens_by_req: dict[str, int] = {}
+        if grouped_bounds:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                assert req_id is not None
+                kv_lens_by_req[req_id] = (
+                    int(self.input_batch.num_computed_tokens_cpu[i]) +
+                    int(scheduler_output.num_scheduled_tokens[req_id]))
+
         def segment(req_id: str) -> int:
             # 0: 1-token decode, 1: speculative verify window,
             # 2: prefill/mixed.
@@ -1183,7 +1205,13 @@ class TPUModelRunner(GPUModelRunner):
                 return 0
             if req_id in spec_decode_tokens:
                 return 1
-            return 2
+            category = 2
+            if grouped_bounds:
+                kv_len = kv_lens_by_req[req_id]
+                for bound in grouped_bounds:
+                    if kv_len <= bound:
+                        category += 1
+            return category
 
         def partition(start: int, end: int, bound: int) -> int:
             """Two-pointer partition of [start, end]: requests with
@@ -1213,6 +1241,15 @@ class TPUModelRunner(GPUModelRunner):
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
+
+        # For non-speculative sparse MLA steps, group non-decode requests as
+        # [long][...][short] using only kernel-published length boundaries.
+        # No selected tier or split point is added to attention metadata.
+        group_start = num_windowed
+        for category_bound in range(2, 2 + len(grouped_bounds)):
+            if group_start >= num_reqs:
+                break
+            group_start = partition(group_start, num_reqs - 1, category_bound)
         return num_decode, num_windowed
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -6366,6 +6403,27 @@ class TPUModelRunner(GPUModelRunner):
                     attn_module = (self.vllm_config.compilation_config.
                                    static_forward_context.get(layer_name))
                     if getattr(attn_module, "use_sparse", False):
+                        from vllm_torchtpu.kernels.mla.dispatch import \
+                            matches_glm52_tpu7x_dimensions
+                        indexer = getattr(attn_module, "indexer", None)
+                        topk = getattr(indexer, "topk_tokens",
+                                       getattr(attn_module, "topk_tokens", -1))
+                        self._has_groupable_sparse_mla |= (
+                            matches_glm52_tpu7x_dimensions(
+                                num_heads=getattr(attn_module, "num_heads",
+                                                  -1),
+                                nope_dim=getattr(attn_module,
+                                                 "qk_nope_head_dim", -1),
+                                rope_dim=getattr(attn_module,
+                                                 "qk_rope_head_dim", -1),
+                                kv_dim=getattr(attn_module, "kv_lora_rank",
+                                               -1),
+                                k_pe_dim=getattr(attn_module,
+                                                 "qk_rope_head_dim", -1),
+                                topk=topk,
+                                page_size=kv_cache_spec.block_size,
+                                rope_page_size=kv_cache_spec.block_size,
+                            ))
                         # Split (nope, rope) cache; each half's shape and dtype
                         # come from its own layout spec.
                         specs = (
