@@ -37,6 +37,12 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         os.environ.pop("TPU_VISIBLE_DEVICES", None)
         os.environ.pop("TPU_VISIBLE_CHIPS", None)
 
+    @classmethod
+    def validate_request(cls, processed_inputs, params) -> None:
+        """TorchTPU supports RANDOM_SEED, RANDOM, and GREEDY."""
+        pass
+
+
     @property
     def dist_backend(self) -> str:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
