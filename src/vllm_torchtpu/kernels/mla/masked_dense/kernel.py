@@ -638,7 +638,9 @@ def masked_dense_ragged_paged_attention(
         num_seqs+1 values are valid.
       distribution: (i, j, k): sequences[0:i] are decode-only, sequences[i:j]
         are chunked-prefill-only, sequences[j:k] are mixed. k is the total
-        number of sequences.
+        number of sequences. The decode segment's launch is compiled with
+        `static_q_len=1`, so `sequences[0:i]` must be 1-token requests --
+        speculative-verify windows belong in the mixed segment.
       sm_scale: softmax scale applied to Q@K^T.
       k_scale: per-tensor dequantization scale for the fp8 caches, applied to
         both the QK and the PV product.
