@@ -151,6 +151,16 @@ def register_expert_load_buffer(layer) -> None:
     layer.register_buffer("_expert_load_counts", buf, persistent=False)
     with _LOCK:
         _BUFFERS[name] = buf
+    # Build the op HERE, eagerly. `maybe_tap` runs inside the compiled MoE
+    # forward, so if the op were still unbuilt at the first tap Dynamo would
+    # try to symbolically execute `inspect.signature`, `pallas.jax_op` and
+    # `torch.library.custom_op` as part of the graph -- which fails with
+    # `TypeError: 'getset_descriptor' object is not iterable` from somewhere
+    # inside torch's schema inference, reported against qwen3_next.py. Job
+    # j-75b2b2a8-3cec-41ac-8258 died that way with all 480 buffers registered
+    # and every standalone eager and fullgraph check passing, because the
+    # standalone checks happened to build the op before compiling.
+    _get_op()
     print(f"EXPERTLOAD_REGISTER rank={_rank()} layer={name} "
           f"experts={layer.global_num_experts}",
           flush=True)
@@ -170,7 +180,13 @@ def maybe_tap(layer, topk_ids: torch.Tensor,
     # Static shape check: arms one compiled program only.
     if topk_ids.shape[0] < _min_tokens():
         return
-    new_counts = _get_op()(buf, topk_ids, topk_weights)
+    # Read the already-built op rather than calling `_get_op()`: constructing
+    # it here would put op registration inside the traced graph. See
+    # `register_expert_load_buffer`.
+    op = _OP
+    if op is None:
+        return
+    new_counts = op(buf, topk_ids, topk_weights)
     buf.copy_(new_counts)
 
 
