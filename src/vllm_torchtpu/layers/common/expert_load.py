@@ -40,8 +40,7 @@ Two details that decide whether the numbers mean anything:
 This is measurement scaffolding for a throwaway run, not a production path.
 """
 
-from __future__ import annotations
-
+import inspect
 import json
 import os
 import threading
@@ -50,6 +49,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
+from torch_tpu._internal.pallas.pallas import _infer_static_argnums
 
 _LOCK = threading.Lock()
 # layer_name -> the int32[global_num_experts] device counter for that layer.
@@ -108,6 +108,22 @@ def _accumulate(counts: jax.Array, topk_ids: jax.Array,
 def _get_op():
     global _OP
     if _OP is None:
+        # `_infer_static_argnums` classifies an argument as *static* unless its
+        # annotation `is jax.Array` -- an identity check against the class. A
+        # `from __future__ import annotations` anywhere in this module turns
+        # every annotation into a string, all three tensors become static, and
+        # the op dies at engine-core init with
+        # `TypeError: 'getset_descriptor' object is not iterable`, from inside
+        # the compiled MoE forward where it looks like a Dynamo bug rather than
+        # an annotation bug. Job j-ba60be15-fc34-4868-bdc9 lost a slot to it.
+        # This module therefore must not use postponed annotations, and this
+        # asserts it rather than trusting the next edit.
+        static = _infer_static_argnums(inspect.signature(_accumulate))
+        if static:
+            raise RuntimeError(
+                "expert_load: _accumulate's tensor args were inferred static "
+                f"{static}; annotations are probably strings. Remove any "
+                "`from __future__ import annotations` from this module.")
         op = pallas.jax_op("pallas::expert_load_accum",
                            _accumulate,
                            donate_argnums=(0, ))
