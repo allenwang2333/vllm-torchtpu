@@ -200,10 +200,33 @@ docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
 if [ "$BACKEND" = "ray" ]; then
   sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true
 fi
+# Sweeping the workers' containers leaves their images behind, and
+# cleanup_docker.sh runs on the head only, so every build strands another
+# multi-GB per-commit image on each worker's boot disk -- these agents have no
+# data disk. Once a worker fills, its `docker run` fails to pull and the head,
+# which pulls fine because it is the node that gets cleaned, waits out the full
+# cluster-formation timeout on a node that was never going to start.
+#
+# `image prune -a` rather than the head's cleanup_docker.sh: a worker only ever
+# runs the CI image, so there is nothing to preserve, and it never builds, so
+# that script's `builder prune` would reclaim nothing while adding a command
+# that can block on the daemon. The tag is per-commit, so every build re-pulls
+# regardless and dropping the cache costs nothing. Containers are gone by the
+# line above, so no image is still in use.
+WORKER_CLEANUP="docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true"
+if [ "$BACKEND" = "ray" ]; then
+  WORKER_CLEANUP="${WORKER_CLEANUP}; sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true"
+fi
+# Reclaimed total and resulting free space, so a worker that is still short on
+# disk says so here instead of only surfacing as a pull failure later.
+WORKER_CLEANUP="${WORKER_CLEANUP}; docker image prune -af 2>/dev/null | tail -1 || true; df -h /var/lib/docker 2>/dev/null || true"
+
 for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
+  echo "Reclaiming disk on ${worker_ip}"
+  # Bounded because ssh keepalives notice a dead connection but not a remote
+  # command that is alive and wedged; a worker stuck here would stall the slice.
   # shellcheck disable=SC2029
-  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-    "docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true$( [ "$BACKEND" = "ray" ] && echo "; sudo -n pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || pkill -9 -f 'gcs_server|raylet|ray::' 2>/dev/null || true" )" || true
+  timeout 300 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" "${WORKER_CLEANUP}" || true
 done
 
 if [ "$BACKEND" = "ray" ]; then

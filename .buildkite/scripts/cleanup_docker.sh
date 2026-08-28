@@ -26,6 +26,28 @@ set -euo pipefail
 # A resource that is already being removed is the outcome we wanted.
 TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm-local")
 
+# Report free space either side of the cleanup. A job that dies with "No space
+# left on device" reports a path inside the container, not the host filesystem
+# that actually filled, so without this there is nothing in the log to tell the
+# candidate disks apart. The docker root is wherever the daemon is configured to
+# live, not necessarily /var/lib/docker, and /mnt/disks/persist only exists on
+# agents with a data disk attached.
+report_disk() {
+  local when="$1" docker_root
+  echo "=== Disk usage (${when} cleanup) ==="
+  docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+  df -h "${docker_root:-/var/lib/docker}" 2>/dev/null || true
+  if [[ -d /mnt/disks/persist ]]; then
+    df -h /mnt/disks/persist 2>/dev/null || true
+    # The HF cache is append-only across builds, so its size is the number
+    # worth watching on the agents that have it. Bounded because it can hold
+    # enough files for the walk itself to be slow.
+    timeout 60 du -sh /mnt/disks/persist/models 2>/dev/null || true
+  fi
+}
+
+report_disk before
+
 echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"
 
@@ -60,6 +82,12 @@ done
 
 echo "----------------------------------------"
 echo "Pruning old Docker build cache..."
-docker builder prune -f || true
+# Bounded: a prune blocks while an earlier one is still in flight, so a job
+# killed mid-prune leaves the next one waiting on the daemon indefinitely.
+# Hanging the job outright is a worse failure than the disk pressure this is
+# here to relieve, and a partial prune still reclaims what it got through.
+timeout 300 docker builder prune -f || true
+
+report_disk after
 
 echo "=== Cleanup complete ==="
