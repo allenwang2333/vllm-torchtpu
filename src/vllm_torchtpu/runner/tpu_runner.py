@@ -54,8 +54,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheSpec, KVQuantMode, MambaSpec,
-                                        MLAAttentionSpec, SlidingWindowMLASpec, SlidingWindowSpec,
+from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
+                                        KVCacheConfig, KVCacheSpec,
+                                        KVQuantMode, MambaSpec,
+                                        MLAAttentionSpec, SlidingWindowMLASpec,
+                                        SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
                              LogprobsLists, LogprobsTensors, ModelRunnerOutput)
