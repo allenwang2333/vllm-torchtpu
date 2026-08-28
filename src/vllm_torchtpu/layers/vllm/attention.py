@@ -476,8 +476,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        assert not (is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE), (
-            "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'.")
+        if is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            raise ValueError(
+                "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'."
+            )
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
