@@ -492,25 +492,34 @@ def build_kimi_dispatched_kda_op(
         # kernel, whose ABI intentionally uses one index for both read/write.
         decode_indices = _null_out_non_decode(state_indices, decode_end)
         if num_spec_tokens > 0:
-            seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
-            is_decode = seq_ids < decode_end
-            decode_read_indices = state_indices + slot_read_offsets[
-                state_indices]
-            decode_conv_seed = jnp.where(
-                is_decode.reshape((num_seqs, ) + (1, ) *
-                                  (conv_state.ndim - 1)),
-                conv_in[decode_read_indices],
-                conv_in[0],
-            )
-            decode_rec_seed = jnp.where(
-                is_decode.reshape((num_seqs, ) + (1, ) *
-                                  (recurrent_state.ndim - 1)),
-                recurrent_state[decode_read_indices],
-                recurrent_state[0],
-            )
-            conv_in = conv_in.at[decode_indices].set(decode_conv_seed)
-            recurrent_state = recurrent_state.at[decode_indices].set(
-                decode_rec_seed)
+            def seed_decode_state():
+                seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
+                is_decode = seq_ids < decode_end
+                decode_read_indices = state_indices + slot_read_offsets[
+                    state_indices]
+                decode_conv_seed = jnp.where(
+                    is_decode.reshape((num_seqs, ) + (1, ) *
+                                      (conv_state.ndim - 1)),
+                    conv_in[decode_read_indices],
+                    conv_in[0],
+                )
+                decode_rec_seed = jnp.where(
+                    is_decode.reshape((num_seqs, ) + (1, ) *
+                                      (recurrent_state.ndim - 1)),
+                    recurrent_state[decode_read_indices],
+                    recurrent_state[0],
+                )
+                return (conv_in.at[decode_indices].set(decode_conv_seed),
+                        recurrent_state.at[decode_indices].set(
+                            decode_rec_seed))
+
+            # ``num_spec_tokens`` is static and is also nonzero on the initial
+            # pure-prefill step. Keep the checkpoint gather/scatter out of that
+            # graph: even null-slot-only writes perturb Target prefill logits on
+            # TPU, while no checkpoint exists to restore until decode begins.
+            conv_in, recurrent_state = jax.lax.cond(
+                decode_end > 0, seed_decode_state,
+                lambda: (conv_in, recurrent_state))
 
         # --- decode segment: fused convolution + recurrence ---------------
         decode_out, conv_after_decode, pool_after_decode = decode_kda(
