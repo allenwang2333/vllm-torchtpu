@@ -1090,8 +1090,14 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
             if len(multimodal_embeddings) == 0:
                 return inputs_embeds
 
-            mm_embeds_flat = vllm_utils._flatten_embeddings(
-                multimodal_embeddings)
+            filtered = [
+                e for e in multimodal_embeddings
+                if e.shape[-1] == inputs_embeds.shape[-1]
+            ]
+            if len(filtered) == 0:
+                return inputs_embeds
+
+            mm_embeds_flat = vllm_utils._flatten_embeddings(filtered)
             if mm_embeds_flat.numel() == 0:
                 return inputs_embeds
 
