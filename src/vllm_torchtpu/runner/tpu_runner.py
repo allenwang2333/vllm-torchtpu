@@ -5128,7 +5128,6 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
-            arange = self.structured_decoding_manager.structured_decode_arange
             for num_reqs in self.num_reqs_paddings:
                 req_sd = (self.structured_decoding_manager.
                           require_structured_out_cpu[:num_reqs].to(
@@ -5137,11 +5136,11 @@ class TPUModelRunner(GPUModelRunner):
                            grammar_bitmask_cpu[:num_reqs].to(self.device))
                 dummy = self._dummy_logits(num_reqs)
                 out = self.structured_decoding_manager.structured_decode(
-                    req_sd, bitmask, dummy, arange)
+                    req_sd, bitmask, dummy)
                 synchronize_tensors(out)
                 out_greedy = (
                     self.structured_decoding_manager.structured_greedy_sample(
-                        req_sd, bitmask, dummy, arange))
+                        req_sd, bitmask, dummy))
                 synchronize_tensors(out_greedy)
                 logger.info("  -- num_seqs: %d", num_reqs)
             # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
@@ -5161,7 +5160,6 @@ class TPUModelRunner(GPUModelRunner):
                     self.structured_decoding_manager.
                     target_grammar_bitmask_cpu[:num_tokens].to(self.device),
                     self._dummy_logits(num_tokens),
-                    arange,
                 )
                 synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)

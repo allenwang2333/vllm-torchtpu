@@ -33,11 +33,6 @@ class StructuredDecodingManager:
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
         self.device = runner.device
-        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
-        self.structured_decode_arange = torch.arange(0,
-                                                     32,
-                                                     dtype=torch.int32,
-                                                     device=self.device)
         self.device_all_true_require = torch.ones((runner.max_num_reqs, 1),
                                                   dtype=torch.bool,
                                                   device=self.device)
@@ -81,7 +76,7 @@ class StructuredDecodingManager:
         grammar_output: GrammarOutput,
         cur_start_idx: int,
         cur_end_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Builds the device inputs for `structured_decode` for one chunk.
 
         Bitmask rows follow the order of `structured_output_request_ids`
@@ -113,7 +108,6 @@ class StructuredDecodingManager:
             return (
                 self.device_all_false_require[:padded_num_reqs],
                 self.device_dummy_bitmask[:padded_num_reqs],
-                self.structured_decode_arange,
             )
 
         num_local = len(local_indices)
@@ -140,7 +134,6 @@ class StructuredDecodingManager:
             return (
                 require_tensor,
                 self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-                self.structured_decode_arange,
             )
 
         # Standard path: Mixed batch (some structured, some non-structured).
@@ -159,7 +152,6 @@ class StructuredDecodingManager:
             self.require_structured_out_cpu[:padded_num_reqs].to(
                 logits.device),
             self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-            self.structured_decode_arange,
         )
 
     def prepare_spec_structured_decoding_input(
@@ -172,7 +164,7 @@ class StructuredDecodingManager:
         cur_start_idx: int,
         cur_end_idx: int,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
+               torch.Tensor]:
         """Builds the `structured_decode` inputs for one spec decoding chunk.
 
         On spec decoding path, the scheduler emits `1 + s_r` consecutive
@@ -180,7 +172,7 @@ class StructuredDecodingManager:
         scheduled for this step.
 
         Returns `(require_target, target_bitmask, require_bonus,
-        bonus_bitmask, arange)`; the first two are None when `target_logits`
+        bonus_bitmask)`; the first two are None when `target_logits`
         is None.
         """
         padded_bonus_rows = bonus_logits.shape[0]
@@ -243,7 +235,6 @@ class StructuredDecodingManager:
                 bonus_logits.device),
             self.grammar_bitmask_cpu[:padded_bonus_rows].to(
                 bonus_logits.device),
-            self.structured_decode_arange,
         )
 
     def mask_logits(
@@ -261,14 +252,14 @@ class StructuredDecodingManager:
                              padded_num_reqs=padded_num_reqs,
                              cur_start_idx=cur_start_idx,
                              cur_end_idx=cur_end_idx):
-            require_sd, bitmask, arange = self.prepare_structured_decoding_input(
+            require_sd, bitmask = self.prepare_structured_decoding_input(
                 logits, grammar_output, cur_start_idx, cur_end_idx)
         with TraceAnnotation("SD:MaskLogits",
                              num_reqs=num_reqs,
                              padded_num_reqs=padded_num_reqs,
                              cur_start_idx=cur_start_idx,
                              cur_end_idx=cur_end_idx):
-            return self.structured_decode(require_sd, bitmask, logits, arange)
+            return self.structured_decode(require_sd, bitmask, logits)
 
     def mask_and_greedy_sample(
         self,
@@ -285,15 +276,14 @@ class StructuredDecodingManager:
                              padded_num_reqs=padded_num_reqs,
                              cur_start_idx=cur_start_idx,
                              cur_end_idx=cur_end_idx):
-            require_sd, bitmask, arange = self.prepare_structured_decoding_input(
+            require_sd, bitmask = self.prepare_structured_decoding_input(
                 logits, grammar_output, cur_start_idx, cur_end_idx)
         with TraceAnnotation("SD:MaskLogits",
                              num_reqs=num_reqs,
                              padded_num_reqs=padded_num_reqs,
                              cur_start_idx=cur_start_idx,
                              cur_end_idx=cur_end_idx):
-            return self.structured_greedy_sample(require_sd, bitmask, logits,
-                                                 arange)
+            return self.structured_greedy_sample(require_sd, bitmask, logits)
 
     def mask_spec_logits(
         self,
@@ -320,8 +310,8 @@ class StructuredDecodingManager:
                              num_bonus_rows=num_bonus_rows,
                              cur_start_idx=cur_start_idx,
                              cur_end_idx=cur_end_idx):
-            (require_target, target_bitmask, require_bonus, bonus_bitmask,
-             arange) = self.prepare_spec_structured_decoding_input(
+            (require_target, target_bitmask, require_bonus,
+             bonus_bitmask) = self.prepare_spec_structured_decoding_input(
                  target_logits, bonus_logits, grammar_output,
                  scheduled_spec_decode_tokens, draft_lengths_cpu,
                  cur_start_idx, cur_end_idx)
@@ -334,9 +324,9 @@ class StructuredDecodingManager:
             if target_logits is not None:
                 target_logits = self.structured_decode(require_target,
                                                        target_bitmask,
-                                                       target_logits, arange)
+                                                       target_logits)
             bonus_logits = self.structured_decode(require_bonus, bonus_bitmask,
-                                                  bonus_logits, arange)
+                                                  bonus_logits)
             return target_logits, bonus_logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -345,10 +335,9 @@ class StructuredDecodingManager:
         require_struct_decoding: torch.Tensor,
         grammar_bitmask: torch.Tensor,
         logits: torch.Tensor,
-        arange: torch.Tensor,
     ) -> torch.Tensor:
         return self._structured_decode(require_struct_decoding,
-                                       grammar_bitmask, logits, arange)
+                                       grammar_bitmask, logits)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_greedy_sample(
@@ -356,11 +345,9 @@ class StructuredDecodingManager:
         require_struct_decoding: torch.Tensor,
         grammar_bitmask: torch.Tensor,
         logits: torch.Tensor,
-        arange: torch.Tensor,
     ) -> torch.Tensor:
         masked_logits = self._structured_decode(require_struct_decoding,
-                                                grammar_bitmask, logits,
-                                                arange)
+                                                grammar_bitmask, logits)
         return torch.argmax(masked_logits, dim=-1, keepdim=True)
 
     def _structured_decode(
@@ -368,17 +355,16 @@ class StructuredDecodingManager:
         require_struct_decoding: torch.Tensor,
         grammar_bitmask: torch.Tensor,
         logits: torch.Tensor,
-        arange: torch.Tensor,
     ) -> torch.Tensor:
         return torch.where(
             require_struct_decoding,
-            self.apply_grammar_bitmask(logits, grammar_bitmask, arange),
+            self.apply_grammar_bitmask(logits, grammar_bitmask),
             logits)
 
     def apply_grammar_bitmask(self, logits: torch.Tensor,
-                              grammar_bitmask: torch.Tensor,
-                              arange: torch.Tensor) -> torch.Tensor:
+                              grammar_bitmask: torch.Tensor) -> torch.Tensor:
         assert logits.shape[0] == grammar_bitmask.shape[0]
+        arange = torch.arange(0, 32, dtype=torch.int32, device=logits.device)
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
         # arange: (32,)
