@@ -3457,7 +3457,15 @@ class TPUModelRunner(GPUModelRunner):
             mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
                 scheduler_output)
             if mm_embeds_list:
-                mm_embeds_flat = torch.cat(mm_embeds_list)
+                first_dim = mm_embeds_list[0].shape[-1]
+                if all(e.shape[-1] == first_dim for e in mm_embeds_list):
+                    mm_embeds_flat = torch.cat(mm_embeds_list)
+                else:
+                    target_dim = getattr(getattr(self.model_config, "hf_config", None), "hidden_size", first_dim)
+                    filtered_list = [e for e in mm_embeds_list if e.shape[-1] == target_dim]
+                    if not filtered_list:
+                        filtered_list = [e for e in mm_embeds_list if e.shape[-1] == first_dim]
+                    mm_embeds_flat = torch.cat(filtered_list) if filtered_list else None
             req_tok = np.array([
                 scheduler_output.num_scheduled_tokens[r]
                 for r in self.input_batch.req_ids
