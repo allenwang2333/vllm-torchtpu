@@ -4,6 +4,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import vllm.envs as vllm_envs
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import \
@@ -36,9 +37,9 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
 #
-if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not envs.USE_BATCHED_RPA_LONGCTX:
+if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND" and not envs.USE_BATCHED_RPA_LONGCTX:
     raise ValueError(
-        "USE_BATCHED_RPA_SEQ_ON_LANE requires USE_BATCHED_RPA_LONGCTX=1.")
+        "VLLM_KV_CACHE_LAYOUT=HND requires USE_BATCHED_RPA_LONGCTX=1.")
 
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
 if envs.USE_BATCHED_RPA_LONGCTX:
@@ -324,7 +325,7 @@ def sharded_ragged_paged_attention(
 
     qkv_spec = P(None, "model", None)
     use_hd64 = q.shape[-1] == 64
-    if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not use_hd64:
+    if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND" and not use_hd64:
         kv_cache_spec = P(None, "model", None, None, None)
     else:
         kv_cache_spec = P(None, None, "model", None, None)

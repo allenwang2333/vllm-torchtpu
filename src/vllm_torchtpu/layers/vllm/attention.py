@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 import jax
 import torch
+import vllm.envs as vllm_envs
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -454,8 +455,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     which plumbs through `_pallas_rpa_kernel` → `attention()` →
     `sharded_ragged_paged_attention()` to pick the batched kernel function.
     Any multiple of 128 is a valid page size for this kernel (with or without
-    `USE_BATCHED_RPA_SEQ_ON_LANE`); `get_preferred_block_size` is overridden
-    so the auto-selected default (no `--block-size` given) stays at 256.
+    `VLLM_KV_CACHE_LAYOUT=HND`).
     """
 
     @staticmethod
@@ -476,8 +476,8 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
-        assert not (is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE), (
-            "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'.")
+        assert not (is_auto and vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"), (
+            "VLLM_KV_CACHE_LAYOUT=HND does not support cache_dtype='auto'.")
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -737,8 +737,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
-            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND":
+            unsupported_features.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -882,7 +882,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
         if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
+                and vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"):
             pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
         else:
             pool_head_dim = kv_cache.shape[-1]

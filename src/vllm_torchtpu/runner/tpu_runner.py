@@ -2050,8 +2050,8 @@ class TPUModelRunner(GPUModelRunner):
         for raw in raw_tensors:
             if raw.dim() > 1:
                 kernel_block_size = (raw.shape[-1]
-                                     if envs.USE_BATCHED_RPA_SEQ_ON_LANE else
-                                     raw.shape[1])
+                                     if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"
+                                     else raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
                                           kernel_block_size)
                 break

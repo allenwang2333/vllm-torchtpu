@@ -18,6 +18,7 @@ import math
 
 import jax
 import torch
+import vllm.envs as vllm_envs
 from einops import rearrange
 from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
@@ -30,7 +31,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import \
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (get_or_create_pcp_mesh,
                                            get_pcp_rank, get_pcp_world_size)
 from vllm_torchtpu.gdn_pool_layout import (
@@ -55,7 +55,7 @@ def _pooled_gdn_state_view(recurrent_state: jax.Array) -> jax.Array:
     into GDN's expected standard 5D layout:
       (num_blocks, gdn_kernel_block_size, packed_num_heads, kv_packing, padded_head_size)
     """
-    if not envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+    if vllm_envs.VLLM_KV_CACHE_LAYOUT != "HND":
         return recurrent_state
     if recurrent_state.ndim != 5:
         raise ValueError("SEQ_ALONG_LANE unified pool must be rank 5, got "
@@ -106,7 +106,7 @@ def _pooled_gdn_block_tokens(vllm_config: VllmConfig,
     with the GDN rows per page (pooled_state.shape[1]).
     """
     manager_block_tokens = vllm_config.cache_config.block_size
-    if not envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+    if vllm_envs.VLLM_KV_CACHE_LAYOUT != "HND":
         return manager_block_tokens
     kernel_block_size = recurrent_state.shape[-1]
     if manager_block_tokens % kernel_block_size != 0:
@@ -676,10 +676,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"local GDN V heads {local_num_v_heads} must be divisible "
                 f"by pcp_size={pcp_size}.")
 
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND":
             raise NotImplementedError(
                 "GDN pooled PCP prefill is not supported with "
-                "USE_BATCHED_RPA_SEQ_ON_LANE=1.")
+                "VLLM_KV_CACHE_LAYOUT=HND.")
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim

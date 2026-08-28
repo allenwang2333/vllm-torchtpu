@@ -32,10 +32,10 @@ Note: batched_rpa is build on top / derived from RPA3.
 
 import jax
 import jax.numpy as jnp
+import vllm.envs as vllm_envs
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     kernel,
                                                                     schedule,
@@ -153,7 +153,7 @@ def get_kv_cache_shape(
     kv_layout: configs.KVLayout | None = None,
 ):
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND":
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
@@ -475,7 +475,7 @@ def ragged_paged_attention(
     """
 
     if kv_layout is None:
-        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+        if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND":
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
         else:
             kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
