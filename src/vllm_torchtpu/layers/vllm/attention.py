@@ -19,8 +19,6 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 
 from vllm_torchtpu import envs
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
-from vllm_torchtpu.kernels.deepseek_v4.compress_norm_rope import \
-    sparse_packed_width
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -656,12 +654,23 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
                 use_per_token_scale=is_per_token_quant,
                 scale_dtype=jax_scale_dtype,
             )
-        if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
+        if head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
                 cache_dtype_str)
         torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         kv_packing = get_dtype_packing(torch_dtype)
+        if not envs.USE_BATCHED_RPA_LONGCTX:
+            # The batched-RPA kernel validates against the SEQ_ALONG_LANE
+            # layout unconditionally, so fp8/bf16 must use it too -- not just
+            # nvfp4. Byte count is identical to the FLASH_ATTN layout.
+            return rpa_batched.get_kv_cache_shape(
+                total_num_pages=num_blocks,
+                page_size=block_size,
+                actual_num_kv_heads=num_kv_heads,
+                actual_head_dim=head_size,
+                kv_dtype=_torch_to_jax_dtype(torch_dtype),
+            )
         return rpa_batched_wrapper.get_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
@@ -684,9 +693,6 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> int:
-        if not envs.USE_BATCHED_RPA_LONGCTX:
-            return PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                block_size, num_kv_heads, head_size, cache_dtype_str)
         dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
             1,
