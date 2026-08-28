@@ -38,6 +38,20 @@ TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm-local")
 # evicts from it, so it holds the union of every model ever run here -- the
 # useful question is which snapshots are still worth their space, and that
 # needs the list, not the sum.
+
+# du only stats, it does not read file contents, and model repos are a handful
+# of large shards rather than many small files -- so this is cheap despite the
+# size of the tree. Bounded anyway: a cold or unusually fragmented cache should
+# slow the report down, not the build. Missing directory is not a failure: the
+# layouts below are populated by different pipelines, so any one of them can be
+# absent on an agent that has only ever run the others.
+report_dir_entries() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  echo "--- Largest entries in ${dir} ---"
+  timeout 120 du -sh "${dir}"/* 2>/dev/null | sort -rh | head -15 || true
+}
+
 report_disk() {
   local when="$1" docker_root
   echo "=== Disk usage (${when} cleanup) ==="
@@ -45,12 +59,13 @@ report_disk() {
   df -h "${docker_root:-/var/lib/docker}" 2>/dev/null || true
   if [[ -d /mnt/disks/persist ]]; then
     df -h /mnt/disks/persist 2>/dev/null || true
-    # du only stats, it does not read file contents, and model repos are a
-    # handful of large shards rather than many small files -- so this is cheap
-    # despite the size of the tree. Bounded anyway: a cold or unusually
-    # fragmented cache should slow the report down, not the build.
-    echo "--- Largest entries in /mnt/disks/persist/models ---"
-    timeout 120 du -sh /mnt/disks/persist/models/* 2>/dev/null | sort -rh | head -15 || true
+    # Two layouts share this disk. stage_model_snapshot.sh copies repos
+    # straight into models/, while anything pulled through huggingface_hub
+    # lands a level down in models/hub/. Reporting only the top level
+    # collapses everything HF fetched into a single `hub` line, which is
+    # where the bulk of the space actually is.
+    report_dir_entries /mnt/disks/persist/models
+    report_dir_entries /mnt/disks/persist/models/hub
     timeout 60 du -sh /mnt/disks/persist/models 2>/dev/null || true
   fi
 }
