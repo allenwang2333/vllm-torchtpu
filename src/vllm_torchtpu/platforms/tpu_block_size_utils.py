@@ -43,6 +43,7 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    "nvfp4": torch.uint8,  # FP4 gets packed to uint8
 }
 
 _SLOT_ALIGNMENT_BYTES = 16

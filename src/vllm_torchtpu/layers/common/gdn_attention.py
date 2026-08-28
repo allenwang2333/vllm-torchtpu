@@ -745,6 +745,10 @@ def _build_v3_pool_state_plan(
         conv_bytes=pooled_gdn_conv_state_bytes(kernel_size=kernel_size,
                                                conv_dim=conv_dim),
         token_bytes=tok_bytes,
+        # v3_state_source tiles the SSM region by the kernel block height and
+        # starts the conv region at ssm_tokens; an unaligned start both fails
+        # its `ssm_ntok % block_size` assertion and straddles kernel blocks.
+        row_alignment=pool.shape[1],
     )
     if state_layout.required_tokens > pool_block_tokens:
         raise ValueError("GDN state does not fit in the unified pool manager "

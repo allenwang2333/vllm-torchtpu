@@ -104,16 +104,29 @@ def derive_pooled_gdn_state_layout(
     ssm_bytes: int,
     conv_bytes: int,
     token_bytes: int,
+    row_alignment: int = 1,
 ) -> PooledGDNStateLayout:
     """Derive the physical token extent of pooled GDN state regions.
 
     If ssm_bytes cannot be evenly divided into FA token rows, its last row
     is padded.
+
+    ``row_alignment`` is the kernel block height in pool token rows. The SSM
+    region is padded up to a multiple of it so that the conv region, which
+    starts at ``ssm_tokens``, lands on a kernel block boundary. Callers that
+    only size the page (rather than address it from a kernel) can leave it
+    at 1. Whole token rows are cheap: the page is ``block_size`` rows tall
+    regardless, so the padding consumes reserved space rather than adding
+    any.
     """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
+    if row_alignment <= 0:
+        raise ValueError("row_alignment must be positive")
 
     ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
+    ssm_tokens = ((ssm_tokens + row_alignment - 1) // row_alignment *
+                  row_alignment)
     conv_tokens = 1
     while conv_tokens * token_bytes < conv_bytes:
         conv_tokens *= 2
