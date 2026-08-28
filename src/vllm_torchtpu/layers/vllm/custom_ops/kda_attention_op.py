@@ -44,9 +44,10 @@ def _use_fused_kda() -> bool:
     """Whether to route KDA through the fused conv1d + GDN v3 kernel.
 
     Read per build rather than at import so it can be flipped between builds.
-    ``VLLM_TORCHTPU_KDA_FUSED=0`` gets the manual path back, and is the only
-    way to reach ``VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=mega``, since the fused
-    core replaces the whole op instead of composing with the prefill choice.
+    ``VLLM_TORCHTPU_KDA_FUSED=0`` keeps the manual decode/prefill dispatcher
+    and is the only way to reach ``VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL=mega``.
+    Its speculative verify segment still uses GDN-v3's fused window kernel;
+    the flag only controls whether the whole op, including prefill, is fused.
     """
     return os.environ.get("VLLM_TORCHTPU_KDA_FUSED", "1") == "1"
 
@@ -312,15 +313,15 @@ def _check_kda_abi(
 # Device-dispatched KDA: the fused decode kernel plus the chunked kernel
 # ===========================================================================
 # The batch is ordered [decode][prefill/mixed] and `request_distribution[0]` is
-# the boundary. Each recurrence is device-dispatched when its segment is
-# non-empty, and their outputs are selected per token.
+# the boundary. Both recurrences run every step, each restricted to its own side
+# of it, and their outputs are selected per token.
 #
 # Nothing branches on the host. vLLM's `TorchCompileWithNoGuardsWrapper` drops
 # every Dynamo guard and traces the model once, and the dummy run driving that
 # trace is decode-only, so a host-side branch on batch composition freezes the
 # decode path into the graph for every later step. That failure is silent -- it
-# produced garbage output while every unit test passed -- so segment guards
-# branch on device values inside the traced graph.
+# produced garbage output while every unit test passed -- so the boundary stays a
+# device value and both kernels are emitted unconditionally.
 #
 # `decode_kda` fuses the short convolution into the recurrence, so it owns the
 # convolution for its own rows; the scan covers the rest. The two touch disjoint
@@ -366,7 +367,8 @@ def _get_kda_prefill_kernel() -> str:
     return kernel
 
 
-def _build_fused_core(lower_bound: float | None, eps: float):
+def _build_fused_core(lower_bound: float | None, eps: float,
+                      num_spec_tokens: int):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     One Pallas call replaces the four-stage manual pipeline: the fused kernel
@@ -394,11 +396,14 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        window_distribution: jax.Array,  # [3]: [decode+verify end, _, mixed]
+        slot_read_offsets: jax.Array,  # pool-sized checkpoint read offsets
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         num_tokens, _, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
         kernel_size = conv_weight.shape[0]
+        del distribution
 
         # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
         # out as (3, H, D) in row-major order, which is exactly the flat
@@ -406,6 +411,8 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         # kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+        read_offsets = (slot_read_offsets[state_indices]
+                        if num_spec_tokens > 0 else None)
 
         (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
             qkv=mixed_qkv,
@@ -423,8 +430,12 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             dt_bias=dt_bias.reshape(num_heads, head_dim),
             query_start_loc=query_start_loc,
             state_indices=state_indices,
-            distribution=distribution,
+            # The batched segment contains both ordinary one-token decodes and
+            # K+1 target-verify windows.  Ragged query lengths distinguish the
+            # two while the recurrent kernel uses one static window shape.
+            distribution=window_distribution,
             seq_lens=seq_lens,
+            read_offsets=read_offsets,
             n_kq=num_heads,
             n_v=num_heads,
             d_k=head_dim,
@@ -432,6 +443,7 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             kernel_size=kernel_size,
             attention_mode=gdn_config.AttentionMode.KDA,
             gate_lower_bound=lower_bound,
+            num_spec_tokens=num_spec_tokens,
         )
 
         output = out.reshape(num_tokens, num_heads, head_dim)
@@ -450,11 +462,11 @@ def build_kimi_dispatched_kda_op(
     state_dim_first: bool,
     num_spec_tokens: int = 0,
 ):
-    """Build the KDA op that sends decode rows to the fused decode kernel.
+    """Build the KDA op and its decode/verify/prefill dispatcher.
 
-    Takes the *pre-convolution* projection output and owns both caches, because
-    ``decode_kda`` fuses the convolution into the recurrence and so cannot be fed
-    by a separate convolution op the way the chunked kernel is.
+    Takes the pre-convolution projection output and owns both caches.  With
+    speculative decoding, the whole verify window runs through one GDN-v3
+    Pallas call even when manual/mega prefill is selected.
     """
     prefill_kernel = _get_kda_prefill_kernel()
     use_mega_prefill = prefill_kernel == "mega"
@@ -498,136 +510,93 @@ def build_kimi_dispatched_kda_op(
         first_prefill_token = jnp.minimum(query_start_loc[window_end],
                                           total_tokens)
 
-        # A speculative request owns ``num_spec_tokens + 1`` consecutive KDA
-        # slots.  The previous rejection result selects the checkpoint to
-        # resume from; a plain one-token decode then writes the new state back
-        # to checkpoint zero, because the runner resets its read offset after
-        # sampling.  Seed that destination before invoking the fused decode
-        # kernel, whose ABI intentionally uses one index for both read/write.
-        decode_indices = _null_out_non_decode(state_indices, decode_end)
         if num_spec_tokens > 0:
+            # Keep the production manual/mega prefill path, but replace the
+            # ordinary-decode + target-verify prefix with one GDN-v3 Pallas
+            # invocation.  This makes VLLM_TORCHTPU_KDA_FUSED=0 useful for
+            # DSpark as well: only its windowed segment is fused, while the
+            # explicitly selected mega prefill kernel remains in force.
+            #
+            # All three boundaries are window_end so the wrapper emits only
+            # its BATCHED program.  PER_SEQ prefill remains below.
+            def run_verify_window():
+                fused_conv_weight = conv_weight.reshape(
+                    conv_weight.shape[0], -1)
+                fused_conv_weight = jnp.transpose(fused_conv_weight,
+                                                  (1, 0))[:, None]
+                window_only_distribution = jnp.full_like(
+                    window_distribution, window_end)
+                ((new_conv_state, new_recurrent_state),
+                 fused_output) = gdn_wrapper.fused_conv1d_gdn(
+                     qkv=mixed_qkv,
+                     b=beta,
+                     a=raw_gate,
+                     conv_state=conv_state,
+                     recurrent_state=recurrent_state,
+                     conv_weight=fused_conv_weight,
+                     conv_bias=None,
+                     a_log=a_log,
+                     dt_bias=dt_bias.reshape(num_heads, head_dim),
+                     query_start_loc=query_start_loc,
+                     state_indices=state_indices,
+                     distribution=window_only_distribution,
+                     seq_lens=seq_lens,
+                     read_offsets=slot_read_offsets[state_indices],
+                     n_kq=num_heads,
+                     n_v=num_heads,
+                     d_k=head_dim,
+                     d_v=head_dim,
+                     kernel_size=conv_weight.shape[0],
+                     attention_mode=gdn_config.AttentionMode.KDA,
+                     gate_lower_bound=lower_bound,
+                     num_spec_tokens=num_spec_tokens,
+                     batched_only=True,
+                 )
+                return (new_conv_state, new_recurrent_state,
+                        fused_output.reshape(num_tokens, num_heads, head_dim))
 
-            def seed_decode_state():
-                seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
-                is_decode = seq_ids < decode_end
-                decode_read_indices = state_indices + slot_read_offsets[
-                    state_indices]
-                decode_conv_seed = jnp.where(
-                    is_decode.reshape((num_seqs, ) + (1, ) *
-                                      (conv_state.ndim - 1)),
-                    conv_in[decode_read_indices],
-                    conv_in[0],
-                )
-                decode_rec_seed = jnp.where(
-                    is_decode.reshape((num_seqs, ) + (1, ) *
-                                      (recurrent_state.ndim - 1)),
-                    recurrent_state[decode_read_indices],
-                    recurrent_state[0],
-                )
-                return (
-                    conv_in.at[decode_indices].set(decode_conv_seed),
-                    recurrent_state.at[decode_indices].set(decode_rec_seed))
+            def skip_verify_window():
+                return (conv_state, recurrent_state,
+                        jnp.zeros((num_tokens, num_heads, head_dim),
+                                  activation_dtype))
 
-            # ``num_spec_tokens`` is static and is also nonzero on the initial
-            # pure-prefill step. Keep the checkpoint gather/scatter out of that
-            # graph: even null-slot-only writes perturb Target prefill logits on
-            # TPU, while no checkpoint exists to restore until decode begins.
-            conv_in, recurrent_state = jax.lax.cond(
-                decode_end > 0, seed_decode_state, lambda:
-                (conv_in, recurrent_state))
+            conv_after_verify, pool_after_verify, fused_window_out = (
+                _guard_kda_verify_window(window_end, run_verify_window,
+                                         skip_verify_window))
+            decode_out = _match_rows(fused_window_out, num_seqs)
+            verify_out = fused_window_out
+        else:
+            # --- ordinary one-token decode -------------------------------
+            decode_indices = _null_out_non_decode(state_indices, decode_end)
 
-        # --- decode segment: fused convolution + recurrence ---------------
-        def run_decode():
-            return decode_kda(
-                _match_rows(mixed_qkv, num_seqs),
-                _match_rows(raw_gate,
-                            num_seqs).reshape(num_seqs, num_heads, head_dim),
-                _activate_beta(_match_rows(beta, num_seqs)),
-                conv_in,
-                conv_weight,
-                recurrent_state,
-                a_log,
-                dt_bias.reshape(num_heads, head_dim),
-                decode_indices,
-                has_initial_state,
-                lower_bound=lower_bound,
-                # The pool is [slots, H, K, V], which is the layout the
-                # recurrence indexes as state[k, v]; no in-kernel swap.
-                state_transposed=False,
-            )
-
-        def skip_decode():
-            return (jnp.zeros((num_seqs, num_heads, head_dim),
-                              activation_dtype), conv_in, recurrent_state)
-
-        # A verify-only batch has no ordinary one-token decode segment. Avoid
-        # launching a null-slot KDA kernel before its K+1 verification calls.
-        decode_out, conv_after_decode, pool_after_decode = jax.lax.cond(
-            decode_end > 0, run_decode, skip_decode)
-
-        # --- verify segment: fixed K+1 window with one state checkpoint ---
-        # K3 DSpark verifies [anchor, d1, ..., dK].  Process the window with
-        # the already tuned one-token KDA kernel and chain the donated pools;
-        # checkpoint t is written to base+t.  This is deliberately the first,
-        # correctness-oriented implementation.  A fused single-Pallas-call
-        # version can replace it without changing the state ABI.
-        def run_verify():
-            verify_output = jnp.zeros((num_tokens, num_heads, head_dim),
-                                      activation_dtype)
-            verify_conv = conv_after_decode
-            verify_pool = pool_after_decode
-            seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
-            is_verify_seq = ((seq_ids >= decode_end) & (seq_ids < window_end))
-            read_indices = state_indices + slot_read_offsets[state_indices]
-
-            for t in range(num_spec_tokens + 1):
-                token_rows = query_start_loc[:-1] + t
-                active = (is_verify_seq & (t < query_lens)
-                          & (token_rows < total_tokens))
-                safe_rows = jnp.clip(token_rows, 0, num_tokens - 1)
-                write_indices = jnp.where(active, state_indices + t, 0)
-                source_indices = jnp.where(t == 0, read_indices,
-                                           state_indices + t - 1)
-
-                active_conv = active.reshape((num_seqs, ) + (1, ) *
-                                             (verify_conv.ndim - 1))
-                active_rec = active.reshape((num_seqs, ) + (1, ) *
-                                            (verify_pool.ndim - 1))
-                conv_seed = jnp.where(active_conv, verify_conv[source_indices],
-                                      verify_conv[0])
-                rec_seed = jnp.where(active_rec, verify_pool[source_indices],
-                                     verify_pool[0])
-                verify_conv = verify_conv.at[write_indices].set(conv_seed)
-                verify_pool = verify_pool.at[write_indices].set(rec_seed)
-
-                step_out, verify_conv, verify_pool = decode_kda(
-                    mixed_qkv[safe_rows],
-                    raw_gate[safe_rows].reshape(num_seqs, num_heads, head_dim),
-                    _activate_beta(beta[safe_rows]),
-                    verify_conv,
+            def run_decode():
+                return decode_kda(
+                    _match_rows(mixed_qkv, num_seqs),
+                    _match_rows(raw_gate,
+                                num_seqs).reshape(num_seqs, num_heads,
+                                                  head_dim),
+                    _activate_beta(_match_rows(beta, num_seqs)),
+                    conv_in,
                     conv_weight,
-                    verify_pool,
+                    recurrent_state,
                     a_log,
                     dt_bias.reshape(num_heads, head_dim),
-                    write_indices,
-                    active & (has_initial_state | (t > 0)),
+                    decode_indices,
+                    has_initial_state,
                     lower_bound=lower_bound,
                     state_transposed=False,
                 )
-                scatter_rows = jnp.where(active, token_rows, num_tokens)
-                verify_output = verify_output.at[scatter_rows].set(
-                    step_out.astype(activation_dtype), mode="drop")
 
-            return verify_output, verify_conv, verify_pool
+            # Pure prefill has no ordinary decode rows.  Avoid launching a
+            # null-slot-only KDA kernel in that case.
+            def skip_decode():
+                return (jnp.zeros((num_seqs, num_heads, head_dim),
+                                  activation_dtype), conv_in, recurrent_state)
 
-        def skip_verify():
-            return (jnp.zeros(
-                (num_tokens, num_heads, head_dim),
-                activation_dtype), conv_after_decode, pool_after_decode)
-
-        verify_out, conv_after_verify, pool_after_verify = \
-            _guard_kda_verify_window(window_end - decode_end, run_verify,
-                                     skip_verify)
+            decode_out, conv_after_verify, pool_after_verify = jax.lax.cond(
+                decode_end > 0, run_decode, skip_decode)
+            verify_out = jnp.zeros((num_tokens, num_heads, head_dim),
+                                   activation_dtype)
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
         # Guarded, because a decode-only step pays dearly for it otherwise.
@@ -782,8 +751,8 @@ def build_kimi_dispatched_kda_op(
     # the chunked/mega selection rather than composing with it.
     use_fused = _use_fused_kda()
     variant = "fused" if use_fused else prefill_kernel
-    core = _build_fused_core(lower_bound,
-                             eps) if use_fused else dispatched_core
+    core = (_build_fused_core(lower_bound, eps, num_spec_tokens)
+            if use_fused else dispatched_core)
 
     if use_fused and prefill_kernel != "chunked":
         logger.warning(
