@@ -99,8 +99,9 @@ class DFlashProposer:
 
     @property
     def block_size(self) -> int:
-        """Tokens per request in a draft forward: 1 base + K mask slots."""
-        return self.speculative_config.num_speculative_tokens + 1
+        """Tokens per request in a draft forward (see _query_block_size)."""
+        return self._query_block_size(
+            self.speculative_config.num_speculative_tokens)
 
     def _get_static_attn_tensors(
             self, padded_num_reqs: int) -> tuple[torch.Tensor, torch.Tensor]:

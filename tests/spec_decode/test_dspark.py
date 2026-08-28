@@ -59,6 +59,9 @@ def test_noise_resolution_and_dense_block():
     assert p.mask_token_id == 7
     assert p.sample_from_anchor
     assert p._query_block_size(4) == 4
+    # propose() sizes the query block via this property, so the dense
+    # override must reach it (K slots, not DFlash's 1 + K).
+    assert p.block_size == 4
 
 
 def test_bonus_anchor_keeps_dflash_layout():
@@ -69,6 +72,7 @@ def test_bonus_anchor_keeps_dflash_layout():
     })
     assert not p.sample_from_anchor
     assert p._query_block_size(4) == 5
+    assert p.block_size == 5
 
 
 def test_block_size_guard():
