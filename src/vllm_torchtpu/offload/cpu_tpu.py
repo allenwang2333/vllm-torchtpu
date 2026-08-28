@@ -1262,7 +1262,7 @@ class CpuTpuOffloadingHandlers:
     ):
         """
         Args:
-          gpu_block_size: scheduler block size (vllm config block_size).
+          gpu_block_size: rank-local physical pool block size.
           cpu_block_size: offloaded block size (gpu_block_size * factor).
           num_cpu_blocks: number of CPU-side scheduler blocks.
           kv_caches: vllm 0.19 CanonicalKVCaches — each .tensor is a 2D int8
@@ -1488,6 +1488,18 @@ class TPUCPUOffloadingWorker(OffloadingWorker):
 # ---------------------------------------------------------------------------
 
 
+def _get_uniform_physical_block_size(kv_cache_config: KVCacheConfig) -> int:
+    """Return the rank-local token span addressed by one pool row."""
+    block_sizes = {
+        group.kv_cache_spec.block_size
+        for group in kv_cache_config.kv_cache_groups
+    }
+    assert len(block_sizes) == 1, (
+        "TPU offloading requires uniform physical block sizes across KV "
+        f"cache groups, got {sorted(block_sizes)}")
+    return block_sizes.pop()
+
+
 class TPUCPUOffloadingSpec(CPUOffloadingSpec):
     """CPU offloading spec for TPU.
 
@@ -1520,11 +1532,6 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
         super().__init__(offloading_config)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        # The normalized config's tokens_per_block already spans all CP
-        # ranks (DCP upstream, PCP via _patch_vllm_offloading_config_build);
-        # get_worker consumes these under the legacy attribute names.
-        self.gpu_block_size = tuple(group.tokens_per_block
-                                    for group in offloading_config.groups)
         self.block_size_factor = offloading_config.cache.blocks_per_chunk
         self._tpu_worker: TPUCPUOffloadingWorker | None = None
         # Hybrid without the unified block pool is rejected at config time
@@ -1626,27 +1633,13 @@ class TPUCPUOffloadingSpec(CPUOffloadingSpec):
 
             from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-            gpu_block_sizes = set(self.gpu_block_size)
-            assert len(gpu_block_sizes) == 1, (
-                "TPU offloading requires a uniform block size across KV "
-                "cache groups (hybrid models: run with "
-                "--enable-prefix-caching and mamba_cache_mode='align'); "
-                f"got {self.gpu_block_size}")
-            gpu_block_size = gpu_block_sizes.pop()
-
-            # Under context parallelism the scheduler block spans cp_world
-            # ranks (OffloadingSpec.gpu_block_size multiplies by pcp*dcp),
-            # but each rank physically owns only 1/cp_world of its tokens
-            # as local pool rows, and the handlers move per-rank bytes.
-            # Work in per-rank token units so scheduler block b maps to
-            # this rank's pool rows [b*f, (b+1)*f).
-            parallel_config = self.vllm_config.parallel_config
-            cp_world = (parallel_config.prefill_context_parallel_size *
-                        parallel_config.decode_context_parallel_size)
-            assert gpu_block_size % cp_world == 0, (
-                "scheduler block tokens must divide evenly across CP ranks: "
-                f"gpu_block_size={gpu_block_size}, cp_world={cp_world}")
-            gpu_block_size //= cp_world
+            # OffloadingConfig group spans may be heterogeneous under PCP:
+            # attention uses a logical all-rank block while Mamba keeps its
+            # physical recurrent-state cadence. Transfer handlers address
+            # rank-local unified-pool rows, whose geometry comes directly
+            # from the physical KV cache specs.
+            gpu_block_size = _get_uniform_physical_block_size(
+                self.kv_cache_config)
             offloaded_block_size = gpu_block_size * self.block_size_factor
 
             # All kv_cache_groups must share the same attention spec so the

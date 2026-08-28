@@ -12,12 +12,13 @@ from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 def _config(*,
             pcp: int,
             enable_prefix_caching: bool = False,
-            connector_enabled: bool = False):
+            connector_enabled: bool = False,
+            prefix_match_unit: int | None = None):
     return SimpleNamespace(
         cache_config=SimpleNamespace(
             block_size=512,
             enable_prefix_caching=enable_prefix_caching,
-            prefix_match_unit=None,
+            prefix_match_unit=prefix_match_unit,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
@@ -69,10 +70,45 @@ def test_hybrid_full_attention_mamba_pcp_resolves_effective_block_size():
     )
 
     assert resolve_kv_cache_block_sizes(kv_cache_config,
-                                        _config(pcp=8)) == (32768, 32768)
+                                        _config(pcp=8)) == (4096, 4096)
     assert resolve_kv_cache_block_sizes(
         kv_cache_config, _config(pcp=8,
-                                 enable_prefix_caching=True)) == (32768, 4096)
+                                 connector_enabled=True)) == (4096, 4096)
+    assert resolve_kv_cache_block_sizes(
+        kv_cache_config, _config(pcp=8,
+                                 enable_prefix_caching=True)) == (4096, 512)
+
+
+def test_hybrid_pcp_prefix_match_unit_uses_physical_block_multiples():
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec()),
+            KVCacheGroupSpec(["gdn"], _mamba_spec()),
+        ],
+    )
+
+    explicit = _config(pcp=8,
+                       enable_prefix_caching=True,
+                       prefix_match_unit=1024)
+    assert resolve_kv_cache_block_sizes(kv_cache_config,
+                                        explicit) == (4096, 1024)
+
+    sub_block = _config(pcp=8,
+                        enable_prefix_caching=True,
+                        prefix_match_unit=256)
+    with pytest.raises(ValueError, match="multiple of physical block_size"):
+        resolve_kv_cache_block_sizes(kv_cache_config, sub_block)
+
+    not_group_aligned = _config(pcp=8,
+                                enable_prefix_caching=True,
+                                prefix_match_unit=1536)
+    with pytest.raises(ValueError, match="PCP KV cache coordinator group"):
+        resolve_kv_cache_block_sizes(kv_cache_config, not_group_aligned)
 
 
 def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
@@ -95,7 +131,7 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
     scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config)
 
-    assert (scheduler_block_size, hash_block_size) == (32768, 32768)
+    assert (scheduler_block_size, hash_block_size) == (32768, 512)
     coordinator = get_kv_cache_coordinator(
         kv_cache_config=kv_cache_config,
         max_model_len=65536,
@@ -110,17 +146,18 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
     )
 
     assert isinstance(coordinator, HybridKVCacheCoordinator)
+    assert coordinator.enable_partial_hash_hits is True
+    assert coordinator._cache_hit_alignment_tokens == 512
     assert [
         group.kv_cache_spec.block_size
         for group in coordinator.kv_cache_config.kv_cache_groups
-    ] == [32768, 32768]
+    ] == [32768, 4096]
     assert [
         manager.block_size for manager in coordinator.single_type_managers
-    ] == [32768, 32768]
-    # PCP is folded into the group specs, so the coordinator runs unaware of
-    # it (it asserts pcp_world_size == 1) and never multiplies the block
-    # sizes a second time. The caller's config is left untouched, i.e. still
-    # holds the physical, rank-local page sizes.
+    ] == [32768, 4096]
+    # PCP is folded into attention group specs only. Mamba recurrent state is
+    # not token-sharded across PCP ranks, so its manager keeps the physical
+    # block size. The caller's config remains untouched and rank-local.
     assert [
         group.kv_cache_spec.block_size
         for group in kv_cache_config.kv_cache_groups
@@ -152,12 +189,12 @@ def test_hybrid_pcp_coordinator_recovers_pcp_folded_by_vllm_scheduler():
         # This is intentionally 1: vLLM 0.26's Scheduler hard-codes it.
         pcp_world_size=1,
         scheduler_block_size=9216,
-        hash_block_size=9216,
+        hash_block_size=2304,
     )
 
     assert [
         manager.block_size for manager in coordinator.single_type_managers
-    ] == [9216, 9216]
+    ] == [9216, 2304]
 
 
 def test_hybrid_pcp_patch_keeps_non_mamba_scope():

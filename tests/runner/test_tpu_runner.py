@@ -1653,8 +1653,8 @@ class TestAttentionMetadataBuilder:
         assert torch.equal(meta.mamba_state_indices,
                            torch.tensor([0, 6, 0, 0], dtype=torch.int32))
 
-    def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
-        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+    def test_unified_mamba_state_indices_keep_physical_block_size(self):
+        runner = self._make_runner_mock(max_num_blocks_per_req=8)
         runner._unified_kv_layout = True
         mamba_spec = MambaSpec(
             block_size=16,
@@ -1662,14 +1662,7 @@ class TestAttentionMetadataBuilder:
             dtypes=[torch.bfloat16],
             page_size_padded=256,
         )
-        with patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_dcp_group"
-        ) as mock_dcp, patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_pcp_group"
-        ) as mock_pcp:
-            mock_dcp.return_value.world_size = 4
-            mock_pcp.return_value.world_size = 1
-            builder = self._make_builder(runner, spec=mamba_spec)
+        builder = self._make_builder(runner, spec=mamba_spec)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=2,
@@ -1683,9 +1676,9 @@ class TestAttentionMetadataBuilder:
         meta = builder.build(common_prefix_len=0,
                              common_attn_metadata=self._make_cm(4))
 
-        assert builder.target_block_size == 64
+        assert builder.target_block_size == 16
         assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 5, 0, 0], dtype=torch.int32))
+                           torch.tensor([3, 12, 0, 0], dtype=torch.int32))
 
 
 class TestCompactMambaSlotPool:

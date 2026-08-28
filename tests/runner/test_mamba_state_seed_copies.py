@@ -55,8 +55,8 @@ def _make_self(req_ids,
     rows; each group gets its own block table and its own raw pool buffer.
     ``state_block_size`` is the mamba groups' spec block size
     (``_mamba_state_block_size``, captured from the kv-cache config when the
-    copy plan is built); the collector strides columns by it times the CP
-    world size, never by the attention ``block_size``.
+    copy plan is built); the collector strides columns by this physical block
+    size, independent of CP and of the attention ``block_size``.
     """
     input_batch = SimpleNamespace(
         req_id_to_index={
@@ -143,99 +143,47 @@ def test_chunk_advance_copies_state():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
 
 
-def test_pcp_uses_rank_local_state_block_size(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
-    # A PCP rank's two table columns cover 16 logical manager blocks. The
-    # third global chunk is still in local column 0 and must not index column 2.
-    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6]]])
+def test_cp_keeps_physical_state_block_stride(monkeypatch):
+    monkeypatch.setattr(runner_mod,
+                        "get_dcp_group",
+                        lambda: SimpleNamespace(world_size=8),
+                        raising=False)
+    monkeypatch.setattr(runner_mod,
+                        "get_pcp_group",
+                        lambda: SimpleNamespace(world_size=1),
+                        raising=False)
+    fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6, 7, 8]]],
+                         state_pos={"a": 1})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
-    assert fake._mamba_state_pos["a"] == 0
-    assert fake._pending_mamba_state_copies == []
+    assert fake._mamba_state_pos["a"] == 2
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
 
 
-def test_pcp_local_state_block_crossing_copies(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
-    fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]],
-                         state_pos={"a": 0})
-    _collect(fake, _sched({"a": BLOCK_SIZE}))
-    assert fake._mamba_state_pos["a"] == 1
-    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(5, 6)]
-
-
-def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+def test_disagg_mamba_block_table_uses_physical_columns(monkeypatch):
+    monkeypatch.setattr(runner_mod,
+                        "get_dcp_group",
+                        lambda: SimpleNamespace(world_size=8),
+                        raising=False)
+    monkeypatch.setattr(runner_mod,
+                        "get_pcp_group",
+                        lambda: SimpleNamespace(world_size=1),
+                        raising=False)
     # Simulate disaggregated serving where Mamba physical block size is 2048
     # (rounded up power-of-two fit size for TP=2 decode).
     # With max_model_len = 4096 and mamba_block_size = 2048, the block table
     # is allocated with exactly 2 columns ([0, 1]).
-    # Under CP=8, each logical column spans 2048 * 8 = 16384 logical tokens.
     max_model_len = 4096
     mamba_block_size = 2048
     num_cols = max_model_len // mamba_block_size  # 2 columns
 
-    fake, _ = _make_self(["a"], [32], [[[5, 6]]],
+    fake, _ = _make_self(["a"], [mamba_block_size], [[[5, 6]]],
                          num_cols=num_cols,
-                         state_block_size=mamba_block_size)
+                         state_block_size=mamba_block_size,
+                         state_pos={"a": 0})
     _collect(fake, _sched({"a": 1}))
 
-    assert fake._mamba_state_pos["a"] == 0
-    assert fake._pending_mamba_state_copies == []
-
-
-def test_pcp_disagg_mamba_block_stride_comparison(monkeypatch):
-    """Documents the two historical wrong strides against the correct one.
-
-    The collector must stride mamba tables by the mamba groups' physical
-    block size times the CP world; the two bugs both strode by an
-    attention-derived size instead. Each wrong stride is simulated here by
-    installing it as ``_mamba_state_block_size``.
-    """
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
-    monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
-
-    # Wrong stride 1 (pre-PR172): attention block_size=16 with no cp factor,
-    # i.e. an effective stride of 16 logical tokens per column.
-    # At token 32, curr = 32 // 16 = 2 -> IndexError on a 2-column table.
-    fake_bug, _ = _make_self(["a"], [32], [[[5, 6]]],
-                             num_cols=2,
-                             state_block_size=16 // 8)
-    with pytest.raises(IndexError):
-        _collect(fake_bug, _sched({"a": 1}))
-
-    # Wrong stride 2 (PR 172): attention block_size * cp = 16 * 8 = 128.
-    # Survives token 32 (32 // 128 = 0) -- the CI's short prompts hid it...
-    fake_pr172, _ = _make_self(["a"], [32], [[[5, 6]]],
-                               num_cols=2,
-                               state_block_size=16)
-    _collect(fake_pr172, _sched({"a": 1}))
-    assert fake_pr172._mamba_state_pos["a"] == 0
-
-    # ...but any sequence past 2 columns * 128 tokens crashes again:
-    # curr = 256 // 128 = 2 -> IndexError.
-    fake_pr172_large, _ = _make_self(["a"], [256], [[[5, 6]]],
-                                     num_cols=2,
-                                     state_block_size=16)
-    with pytest.raises(IndexError):
-        _collect(fake_pr172_large, _sched({"a": 1}))
-
-    # Correct stride: the mamba groups' physical block size (2048), giving
-    # 2048 * 8 = 16384 logical tokens per column.
-    fake_mamba_true, _ = _make_self(["a"], [256], [[[5, 6]]],
-                                    num_cols=2,
-                                    state_block_size=2048)
-    _collect(fake_mamba_true, _sched({"a": 1}))
-    assert fake_mamba_true._mamba_state_pos["a"] == 0
+    assert fake._mamba_state_pos["a"] == 1
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(5, 6)]
 
 
 def test_cache_hit_resume_copies_from_checkpoint():

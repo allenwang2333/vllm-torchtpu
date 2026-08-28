@@ -13,9 +13,9 @@
 # limitations under the License.
 """Unit tests for _patch_vllm_offloading_config_build.
 
-The patch wraps vLLM's build_offloading_config so that offloading token
-quantities span all PCP ranks (upstream only scales by DCP) and
-tokens_per_hash matches the runtime (PCP-patched) resolve.
+The patch wraps vLLM's build_offloading_config so that attention token spans
+cover all PCP ranks, Mamba spans remain physical, and tokens_per_hash matches
+the runtime (PCP-patched) resolver.
 """
 
 from types import SimpleNamespace
@@ -91,7 +91,7 @@ def _patched_offloading_config_module():
     return offloading_config_module
 
 
-def test_pcp_scales_tokens_per_block_and_hash():
+def test_pcp_applies_group_token_spans_and_hash():
     module = _patched_offloading_config_module()
     resolve_before = module.resolve_kv_cache_block_sizes
 
@@ -99,9 +99,9 @@ def test_pcp_scales_tokens_per_block_and_hash():
     kv_cache_config = _kv_cache_config()
     config = module.build_offloading_config(vllm_config, kv_cache_config)
 
-    # Logical (all-PCP-rank) token spans: 4096 rank-local * pcp 8.
-    assert tuple(g.tokens_per_block for g in config.groups) == (32768, 32768)
-    assert config.cache.tokens_per_hash == 32768
+    # Attention spans all PCP ranks; Mamba recurrent state remains rank-local.
+    assert tuple(g.tokens_per_block for g in config.groups) == (32768, 4096)
+    assert config.cache.tokens_per_hash == 4096
     # Per-rank physical bytes are untouched by the PCP scaling.
     assert config.worker_kv_bytes_per_block == (256 * 1024) // 128
     # The temporary unpatched-resolve swap must be restored.

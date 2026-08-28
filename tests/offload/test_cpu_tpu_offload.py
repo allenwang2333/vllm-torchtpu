@@ -95,6 +95,25 @@ class TestGetKvCacheShapeProbe(unittest.TestCase):
         self.assertEqual(shape[1], 16)  # block_size
 
 
+class TestPhysicalOffloadBlockSize(unittest.TestCase):
+
+    def test_hybrid_uses_physical_cache_geometry(self):
+        from vllm_torchtpu.offload.cpu_tpu import \
+            _get_uniform_physical_block_size
+
+        kv_cache_config = MagicMock()
+        attn_group = MagicMock()
+        attn_group.kv_cache_spec.block_size = 4096
+        mamba_group = MagicMock()
+        mamba_group.kv_cache_spec.block_size = 4096
+        kv_cache_config.kv_cache_groups = [attn_group, mamba_group]
+
+        # OffloadingConfig may expose (32768, 4096) for PCP=8, but transfer
+        # handlers address rank-local pool rows and therefore use physical B.
+        self.assertEqual(_get_uniform_physical_block_size(kv_cache_config),
+                         4096)
+
+
 class TestEstimateHbmReserveBytes(unittest.TestCase):
     """TPUCPUOffloadingSpec.estimate_hbm_reserve_bytes scales linearly
     with both num_layers and KV_H2D_POOL_MAX_BLOCKS."""
