@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Donating slot-to-slot copy for Mamba recurrent state arrays."""
+"""Donating block copy within the unified KV pool.
+
+The same whole-page primitive seeds Mamba recurrent state blocks and applies
+prefix-cache copy-on-write pairs without materializing the full pool storage.
+"""
 
 import jax
 import torch

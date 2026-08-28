@@ -2107,6 +2107,30 @@ class TPUModelRunner(GPUModelRunner):
                                           raw.shape[1])
                 break
 
+    def _apply_kv_cache_block_copies(self, copies) -> None:
+        """Copy CoW blocks within each unified pool buffer page-locally.
+
+        Scheduler pairs name manager blocks. A manager block can span several
+        kernel-granular rows, so each pair fans out by ``_pool_block_split``.
+        """
+        assert copies, "page-local KV block copy requires at least one pair"
+        assert self.kv_cache_raw_tensors, (
+            "page-local KV block copy requires the unified KV pool")
+
+        split = self._pool_block_split
+        pairs = [(block_copy.src_block_id * split + j,
+                  block_copy.dst_block_id * split + j) for block_copy in copies
+                 for j in range(split)]
+        pairs = self._pad_to_bucket(pairs, pad=(0, 0))
+        src_t = torch.tensor([src for src, _ in pairs],
+                             dtype=torch.int32).to(self.device,
+                                                   non_blocking=True)
+        dst_t = torch.tensor([dst for _, dst in pairs],
+                             dtype=torch.int32).to(self.device,
+                                                   non_blocking=True)
+        for raw in self.kv_cache_raw_tensors:
+            copy_mamba_state_blocks(raw, src_t, dst_t)
+
     def _collect_mamba_state_seed_copies(self, scheduler_output,
                                          start_index: int,
                                          num_reqs: int) -> None:
@@ -2580,7 +2604,18 @@ class TPUModelRunner(GPUModelRunner):
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
-        return super()._update_states(scheduler_output)
+        copies = scheduler_output.kv_cache_block_copies
+        use_page_local_copy = bool(copies and self.kv_cache_raw_tensors)
+        # The base implementation uses an advanced-index assignment which
+        # TorchTPU functionalizes into a full raw-storage result. Hide only
+        # the copy field from it; block zeroing and state updates stay intact.
+        base_output = (dataclasses.replace(scheduler_output,
+                                           kv_cache_block_copies=None)
+                       if use_page_local_copy else scheduler_output)
+        result = super()._update_states(base_output)
+        if use_page_local_copy:
+            self._apply_kv_cache_block_copies(copies)
+        return result
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:
