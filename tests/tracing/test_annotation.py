@@ -4,20 +4,12 @@ from vllm_torchtpu.tracing.annotation import (TraceAnnotation,
                                               is_trace_annotation_enabled)
 
 
-@patch("torch.autograd._profiler_enabled", return_value=False)
-def test_trace_annotation_disabled(mock_profiler_enabled):
-    assert not is_trace_annotation_enabled()
-
-    with patch("torch.profiler.record_function") as mock_rf:
-        with TraceAnnotation("ModelForward"):
-            pass
-        mock_rf.assert_not_called()
-
-
 @patch("torch.autograd._profiler_enabled", return_value=True)
-def test_trace_annotation_enabled_no_kwargs(mock_profiler_enabled):
+def test_is_trace_annotation_enabled(mock_profiler_enabled):
     assert is_trace_annotation_enabled()
 
+
+def test_trace_annotation_no_kwargs():
     with patch("torch.profiler.record_function") as mock_rf:
         mock_context = MagicMock()
         mock_rf.return_value = mock_context
@@ -30,8 +22,7 @@ def test_trace_annotation_enabled_no_kwargs(mock_profiler_enabled):
         mock_context.__exit__.assert_called_once()
 
 
-@patch("torch.autograd._profiler_enabled", return_value=True)
-def test_trace_annotation_enabled_with_kwargs(mock_profiler_enabled):
+def test_trace_annotation_enabled_with_kwargs():
     with patch("torch.profiler.record_function") as mock_rf:
         mock_context = MagicMock()
         mock_rf.return_value = mock_context
@@ -46,8 +37,7 @@ def test_trace_annotation_enabled_with_kwargs(mock_profiler_enabled):
             "ModelForward#num_reqs=2,request_id1=cmpl-xyz#")
 
 
-@patch("torch.autograd._profiler_enabled", return_value=True)
-def test_trace_annotation_with_batch_composition(mock_profiler_enabled):
+def test_trace_annotation_with_batch_composition():
     with patch("torch.profiler.record_function") as mock_rf:
         mock_context = MagicMock()
         mock_rf.return_value = mock_context

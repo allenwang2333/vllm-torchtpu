@@ -12,27 +12,16 @@ def is_trace_annotation_enabled() -> bool:
 
 
 class TraceAnnotation(contextlib.ContextDecorator):
+    """PyTorch record_function wrapper supporting key-value metadata formatting."""
 
     def __init__(self, name: str, **kwargs: Any) -> None:
-        self.name = name
-        self.kwargs = kwargs
-        self._rf = None
-
-    @classmethod
-    def is_enabled(cls) -> bool:
-        return is_trace_annotation_enabled()
+        if kwargs:
+            args_str = ",".join(f"{k}={v}" for k, v in kwargs.items())
+            name = f"{name}#{args_str}#"
+        self._rf = torch.profiler.record_function(name)
 
     def __enter__(self):
-        if self.is_enabled():
-            name = self.name
-            if self.kwargs:
-                args_str = ",".join(f"{k}={v}" for k, v in self.kwargs.items())
-                name = f"{name}#{args_str}#"
-            self._rf = torch.profiler.record_function(name)
-            self._rf.__enter__()
-        return self
+        return self._rf.__enter__()
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if self._rf is not None:
-            self._rf.__exit__(exc_type, exc_val, exc_tb)
-            self._rf = None
+        return self._rf.__exit__(exc_type, exc_val, exc_tb)
