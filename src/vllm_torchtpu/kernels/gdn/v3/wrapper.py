@@ -316,6 +316,7 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
+        "batched_only",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -350,6 +351,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    batched_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -418,6 +420,9 @@ def fused_conv1d_gdn(
             Must be set iff `state_source` is set.
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
+        batched_only: Run only the leading decode/verify segment and omit the
+            PER_SEQ prefill call. Used by KDA's manual/mega dispatcher, which
+            owns prefill separately.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -453,13 +458,6 @@ def fused_conv1d_gdn(
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
-    if is_kda and num_spec_tokens > 0:
-        # The KDA compute path returns a single end-of-tile state, not one
-        # checkpoint per window position, so it cannot roll back rejected
-        # draft tokens.
-        raise NotImplementedError(
-            "KDA does not support speculative decoding yet "
-            f"(num_spec_tokens={num_spec_tokens}).")
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError("gate_lower_bound only applies to KDA; got "
@@ -685,8 +683,9 @@ def fused_conv1d_gdn(
     if pooled:
         out_act, out_source, _ = call_kernel(state_source, None, None,
                                              config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        if not batched_only:
+            out_act, out_source, _ = call_kernel(out_source, None, out_act,
+                                                 config.GDNMode.PER_SEQ)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -694,8 +693,10 @@ def fused_conv1d_gdn(
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    if not batched_only:
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
+            out_conv_state, out_recurrent_state, out_act,
+            config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
