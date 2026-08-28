@@ -1119,7 +1119,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     # models imported after the first call also have their bindings updated.
     patched_fn = vllm_utils._merge_multimodal_embeddings
     for mod_name, mod in list(sys.modules.items()):
-        if mod_name.startswith("vllm.model_executor.models") and hasattr(
+        if (mod_name.startswith("vllm.model_executor.models") or
+                mod_name.startswith("vllm_omni.model_executor.models")) and hasattr(
                 mod, "_merge_multimodal_embeddings"):
             if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
                 setattr(mod, "_merge_multimodal_embeddings", patched_fn)
