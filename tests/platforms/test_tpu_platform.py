@@ -625,3 +625,29 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
                  "TPURaidenOffloadingConnector"):
         cls = KVConnectorFactory.get_connector_class_by_name(name)
         assert cls.__name__ == name
+
+
+def test_mla_override_warns_when_it_contradicts_an_explicit_backend():
+    """A silently discarded --attention-backend is how a recipe's comment
+    ends up false: K3's config explains why CUSTOM matters, and MLA models
+    never get it."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    # vLLM's logger does not propagate, so caplog cannot see it; patch it.
+    with patch.object(tpu_platform.logger, "warning_once") as warn:
+        path = tpu_platform.TpuPlatform.get_attn_backend_cls(
+            AttentionBackendEnum.CUSTOM, SimpleNamespace(use_mla=True))
+    assert path == AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
+    warn.assert_called_once()
+    assert "CUSTOM" in warn.call_args.args[1]
+
+
+def test_mla_override_is_silent_when_nothing_was_asked_for():
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    for asked in (None, AttentionBackendEnum.FLASH_ATTN_MLA):
+        with patch.object(tpu_platform.logger, "warning_once") as warn:
+            path = tpu_platform.TpuPlatform.get_attn_backend_cls(
+                asked, SimpleNamespace(use_mla=True))
+        assert path == AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
+        warn.assert_not_called()

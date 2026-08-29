@@ -758,6 +758,13 @@ class TpuPlatform(Platform):
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         if getattr(attn_selector_config, "use_mla", False):
+            if (selected_backend is not None and selected_backend
+                    != AttentionBackendEnum.FLASH_ATTN_MLA):
+                # Say so: a recipe that passes --attention-backend and never
+                # gets it is how a config ends up carrying a false comment.
+                logger.warning_once(
+                    "Ignoring --attention-backend %s: MLA models always use "
+                    "FLASH_ATTN_MLA on TPU.", selected_backend.name)
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [

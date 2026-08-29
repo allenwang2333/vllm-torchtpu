@@ -11,7 +11,8 @@ import pytest
 import torch
 from torch import nn
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import (CompilationConfig, CompilationMode, VllmConfig,
+                         set_current_vllm_config)
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -22,7 +23,9 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
+import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from vllm_torchtpu import _patch_vllm_compile_prefix_isolation
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
@@ -445,6 +448,80 @@ def test_model_has_no_public_cache_or_pp_api() -> None:
 
 def test_model_is_registered_for_torch_compile() -> None:
     assert TorchCompileWithNoGuardsWrapper in KimiModel.__bases__
+
+
+def _build_kimi_model(monkeypatch: pytest.MonkeyPatch,
+                      prefix: str) -> KimiModel:
+    """A KimiModel with every child faked out, built the way vLLM builds it.
+
+    Only `hf_text_config`, `quant_config` and `compilation_config` are read, so
+    the config is a stand-in: a real `VllmConfig` needs a `tpu` torch device.
+    `mode` must compile, or `support_torch_compile` returns before it reaches
+    `TorchCompileWithNoGuardsWrapper.__init__` -- the call under test.
+    """
+
+    class FakeChild(nn.Module):
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            self.prefix = kwargs.get("prefix")
+
+    for name in ("VocabParallelEmbedding", "KimiDecoderLayer", "RMSNorm",
+                 "AttentionResidual"):
+        monkeypatch.setattr(kimi_model, name, FakeChild)
+
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        num_hidden_layers=3,
+        vocab_size=32,
+        attn_res_block_size=2,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=config),
+        quant_config=None,
+        compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
+    )
+    return KimiModel(vllm_config=vllm_config, prefix=prefix)
+
+
+@pytest.fixture
+def compile_prefixes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the compile_prefix `support_torch_compile` resolves per instance.
+
+    The real `TorchCompileWithNoGuardsWrapper.__init__` wants a live
+    `VllmConfig`, so it is replaced by the recorder the patch then wraps.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(
+        TorchCompileWithNoGuardsWrapper, "__init__",
+        lambda self, compile_prefix="", is_encoder=False: seen.append(
+            compile_prefix))
+    _patch_vllm_compile_prefix_isolation()
+    return seen
+
+
+def test_kimi_model_keeps_the_prefix_it_was_given(
+        monkeypatch: pytest.MonkeyPatch, compile_prefixes: list[str]) -> None:
+    model = _build_kimi_model(monkeypatch, "language_model.model")
+
+    assert model.prefix == "language_model.model"
+
+
+def test_kimi_model_compile_prefix_is_its_own_prefix(
+        monkeypatch: pytest.MonkeyPatch, compile_prefixes: list[str]) -> None:
+    """The on-disk compile cache is keyed on this; a fallback never persists."""
+    _build_kimi_model(monkeypatch, "language_model.model")
+
+    assert compile_prefixes == ["language_model.model"]
+
+
+def test_kimi_models_with_distinct_prefixes_do_not_share_a_cache_entry(
+        monkeypatch: pytest.MonkeyPatch, compile_prefixes: list[str]) -> None:
+    _build_kimi_model(monkeypatch, "language_model.model")
+    _build_kimi_model(monkeypatch, "draft_model.model")
+
+    assert compile_prefixes == ["language_model.model", "draft_model.model"]
 
 
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
