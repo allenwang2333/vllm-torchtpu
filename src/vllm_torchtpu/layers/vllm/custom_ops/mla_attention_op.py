@@ -57,6 +57,7 @@ def _streamidx_block_size(raw: str, default: int) -> int | tuple[int, int, int]:
     value -- so the env carries either form: `"8"` or `"8,16,8"`. Empty means
     "use the default", which reproduces the untuned constant exactly.
     """
+    raw = raw.strip()
     if not raw:
         return default
     parts = [p.strip() for p in raw.split(",")]

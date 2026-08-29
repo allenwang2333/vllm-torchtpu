@@ -278,6 +278,18 @@ def test_streamindex_topk_shape(
                 10, 17, 8, 15, 19, 12
             ]],
         ),
+        # 8-10. Small `bkv_p`. Every case above runs bkv_p >= 8, but a sweep on
+        # GLM-5.2 shapes found bkv_p=2 worth ~31% of the prefill indexer, so
+        # that is a value we want to ship and it had no ground-truth coverage.
+        # `bkv_sz = page_size * bkv_p` must be a multiple of 128, which is why
+        # these rows carry a larger page_size than the ones above rather than
+        # just lowering bkv_p.
+        # 8. bkv_p=2, chunked-prefill branch.
+        (1, [4], [100], 64, 4, 1, 16, 1024, 1, 8, 2, [[1, 0]]),
+        # 9. bkv_p=2, batched-decode branch (T=1 leads the batch).
+        (2, [1, 1], [64, 100], 64, 4, 1, 16, 1024, 1, 8, 2, [[1, 0], [2, 3]]),
+        # 10. bkv_p=1, the smallest legal block at page_size 128.
+        (1, [1], [200], 128, 4, 1, 16, 1024, 1, 8, 1, [[1, 0]]),
     ],
 )
 def test_streamindex_topk_numerical_correctness(
