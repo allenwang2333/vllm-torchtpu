@@ -1254,8 +1254,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 kv_cache,
                 metadata,
                 vllm_context.mesh,
-                layer.num_heads,
-                layer.qk_nope_head_dim,
                 sm_scale=layer.scale,
                 q_scale=q_scale,
                 k_scale=k_scale,

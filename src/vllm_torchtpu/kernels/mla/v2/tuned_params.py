@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -21,10 +22,21 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class TuningKey:
+    """Exact-equality lookup key: every field must match the row.
+
+    Each one is read off the arrays the kernel receives -- see
+    `layers/common/attention_interface.py`. Five of them
+    (`max_num_tokens`, `page_size_per_kv_packing`, `kv_packing`,
+    `max_num_seqs`, `pages_per_seq`) are serving-configuration values, so a
+    table tuned at one serving shape is inert at every other. The defaults
+    below are DeepSeekV3-on-v7-8's shape, not neutral values; prefer passing
+    every field. `report_missed_tuning_keys` is what makes a miss visible.
+    """
+
     case: str  # A string identifier for the case, support only: "batched_decode", "decode_only", "mixed"
     max_num_tokens: int  # Maximum number of tokens in the batch
-    actual_num_q_heads: int  # Actual number of Q heads, <= num_q_heads in the model config, fixed at 128 for now
-    actual_lkv_dim: int  # Actual NOPE head dimension, <= lkv_dim in the model config, fixed at 512 for now
+    actual_num_q_heads: int  # Q heads per shard, i.e. `ql_nope.shape[0]` inside the kernel
+    actual_lkv_dim: int  # Compressed latent dim (`ql_nope.shape[-1]` == kv_lora_rank; NOT qk_nope_head_dim)
     actual_r_dim: int  # Actual ROPE head dimension, <= r_dim in the model config, fixed at 64 for now
     kv_dtype: str = "float8_e4m3fn"  # KV cache and KV input data type, fixed at fp8 for now
     q_dtype: str = "float8_e4m3fn"  # Q activation dtype, fixed at fp8 for now
@@ -1181,24 +1193,72 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+class TuningKeyMissError(KeyError):
+    """A lookup missed the table and strict mode forbids the fallback."""
+
+
+# Distinct keys looked up, in first-seen order, with their lookup counts. The
+# lookup runs under jit tracing, once per layer per bucket, so the same key
+# recurs hundreds of times; only the end-of-warm-up summary is worth reading.
+_hit_keys: dict[TuningKey, int] = {}
+_missed_keys: dict[TuningKey, int] = {}
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
+        _hit_keys[tuning_key] = _hit_keys.get(tuning_key, 0) + 1
         return tuned_params_mapping[tuning_key]
-    else:
+    seen = _missed_keys.get(tuning_key, 0)
+    _missed_keys[tuning_key] = seen + 1
+    if envs.TPU_MLA_TUNING_STRICT:
+        raise TuningKeyMissError(
+            f"No tuned parameters for {tuning_key} and "
+            "TPU_MLA_TUNING_STRICT is set. Tune this shape (see "
+            "kernels/mla/v2/tuned_params.py) or unset the variable to fall "
+            "back to untuned defaults.")
+    if seen == 0:
         logger.warning(
-            f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
-        )
-        if tuning_key.case == "mixed":
-            return TunableParams(
-                num_kv_pages_per_block=1,
-                num_queries_per_block=16,
-                vmem_limit_bytes=62914560,
-            )
+            "No tuned parameters found for the given tuning key: %s, using "
+            "default parameters", tuning_key)
 
-        # decode, batched_decode
+    if tuning_key.case == "mixed":
         return TunableParams(
-            decode_batch_size=4,
-            num_kv_pages_per_block=3,
-            num_queries_per_block=1,
+            num_kv_pages_per_block=1,
+            num_queries_per_block=16,
             vmem_limit_bytes=62914560,
         )
+
+    # decode, batched_decode
+    return TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=3,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    )
+
+
+def missed_tuning_keys() -> dict[TuningKey, int]:
+    """Keys that fell back to untuned defaults, and how often each was asked for."""
+    return dict(_missed_keys)
+
+
+def report_missed_tuning_keys() -> int:
+    """Log one summary of MLA v2 tuning-table coverage; return the miss count.
+
+    Called once per worker after warm-up: by then every serving shape has been
+    traced, so a miss here means this recipe runs that shape untuned for the
+    life of the process. A per-lookup warning fires once per layer per bucket
+    and is read by nobody; this line names the distinct keys instead.
+    """
+    if not _missed_keys:
+        if _hit_keys:
+            logger.info("MLA v2 tuned params: all %d distinct keys hit.",
+                        len(_hit_keys))
+        return 0
+    logger.warning(
+        "MLA v2 tuned params: %d distinct keys MISSED, %d hit. The missed "
+        "shapes ran on default block sizes for this whole process:\n%s",
+        len(_missed_keys), len(_hit_keys),
+        "\n".join(f"  x{count:<5d} {key}"
+                  for key, count in _missed_keys.items()))
+    return len(_missed_keys)

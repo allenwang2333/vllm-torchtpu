@@ -630,10 +630,16 @@ class TPUWorker(WorkerBase):
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        from vllm_torchtpu.kernels.mla.v2.tuned_params import \
+            report_missed_tuning_keys
+
         start = time.perf_counter()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        # Every serving shape has now been traced, so this is the first moment
+        # the full set of MLA tuning misses is known.
+        report_missed_tuning_keys()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

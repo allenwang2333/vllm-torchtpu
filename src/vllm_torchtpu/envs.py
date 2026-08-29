@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    TPU_MLA_TUNING_STRICT: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -340,6 +341,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Refuse to fall back to default MLA v2 kernel block sizes: raise on a
+    # tuning-table miss instead. The table is keyed on serving-configuration
+    # fields, so a recipe that drifts off the tuned shape silently loses the
+    # tuning; turn this on in CI or when qualifying a new recipe.
+    "TPU_MLA_TUNING_STRICT":
+    env_bool("TPU_MLA_TUNING_STRICT"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
