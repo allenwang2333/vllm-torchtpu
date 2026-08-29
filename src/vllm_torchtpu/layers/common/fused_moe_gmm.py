@@ -45,6 +45,13 @@ ragged_gather_reduce = _select_ragged_gather_reduce(
 
 _ONEHOT_AUTO_CAP = 512
 
+# Runtime signature for the one-hot combine's NaN guard, which is no longer
+# gated on `skip_padded_tokens` -- see `moe_gmm`. The guard lives inside a
+# jitted branch and so cannot be probed directly; a job that depends on it
+# prints this constant to prove it is running mapped source and not the
+# image's copy.
+ONEHOT_NAN_GUARD_UNCONDITIONAL = True
+
 
 def resolve_onehot_permute_threshold() -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
@@ -302,15 +309,23 @@ def moe_gmm(
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            # Zero out the GMM output rows that skipped the GMM computation,
+            # otherwise those uninitialized values can be NaN and the one-hot
+            # matmul would spread them to every token in the batch.
+            #
+            # This used to be gated on `skip_padded_tokens`, but nothing in
+            # the condition depends on that flag: rows at or past
+            # `group_sizes.sum()` are skipped whenever `valid_mask` excluded
+            # anything, and under EP that includes the non-local rows, which
+            # carry a negative expert id and sort after the valid prefix.
+            # `gmm_wrapper` is called with `zero_initialize=False` just above,
+            # so this `where` is what initializes them. Gating it meant the
+            # only way to get the guard was to also pay for the flag, which
+            # measured +22.48 ms/prefill-step on GLM-5.2 at DP16 (arm #5b).
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,
