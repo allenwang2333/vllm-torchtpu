@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vllm_torchtpu.model_loader_patches import (
-    _sharded_runai_weights_iterator, _should_skip)
+    _sharded_runai_weights_iterator, _should_skip, _skip_reason, layer_index)
 
 # ---------------------------------------------------------------------------
 # _should_skip
@@ -56,6 +56,101 @@ def test_keeps_dense_shared_and_gate_weights():
             "language_model.model.embed_tokens.weight",
     ):
         assert not _should_skip(name, _LOCAL), name
+
+
+# ---------------------------------------------------------------------------
+# truncation filter (--hf-overrides num_hidden_layers below the checkpoint's)
+# ---------------------------------------------------------------------------
+
+# The real Kimi-K3 checkpoint's name shapes, in the proportions the index
+# json has them: 92 MoE layers x 896 experts x {w1,w2,w3} x
+# {weight_packed, weight_scale}, plus the per-layer dense tensors and the
+# non-layer ones. Generating them is cheaper than shipping a 59 MB index.
+_K3_LAYER_DENSE = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.g_proj.weight",
+    "mlp_res_norm.weight",
+    "mlp_res_proj.weight",
+    "self_attention_res_norm.weight",
+    "self_attention_res_proj.weight",
+)
+_K3_MOE_DENSE = (
+    "block_sparse_moe.gate.weight",
+    "block_sparse_moe.routed_expert_norm.weight",
+    "block_sparse_moe.routed_expert_up_proj.weight",
+    "block_sparse_moe.routed_expert_down_proj.weight",
+    "block_sparse_moe.shared_experts.up_proj.weight",
+)
+
+
+def _k3_names(num_layers: int = 93,
+              num_experts: int = 896,
+              first_k_dense: int = 1):
+    """Checkpoint tensor names for a K3-shaped model."""
+    yield "language_model.model.embed_tokens.weight"
+    yield "language_model.model.norm.weight"
+    yield "language_model.lm_head.weight"
+    for layer in range(num_layers):
+        prefix = f"language_model.model.layers.{layer}"
+        for suffix in _K3_LAYER_DENSE:
+            yield f"{prefix}.{suffix}"
+        if layer < first_k_dense:
+            yield f"{prefix}.mlp.up_proj.weight"
+            continue
+        for suffix in _K3_MOE_DENSE:
+            yield f"{prefix}.{suffix}"
+        for expert in range(num_experts):
+            for proj in ("w1", "w2", "w3"):
+                base = f"{prefix}.block_sparse_moe.experts.{expert}.{proj}"
+                yield f"{base}.weight_packed"
+                yield f"{base}.weight_scale"
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("language_model.model.layers.15.self_attn.o_proj.weight", 15),
+    ("model.layers.0.block_sparse_moe.experts.7.w2.weight_scale", 0),
+    ("language_model.model.embed_tokens.weight", None),
+    ("vision_tower.encoder.layers.4.attn.qkv.weight", 4),
+])
+def test_layer_index_parses_the_decoder_index(name, expected):
+    assert layer_index(name) == expected
+
+
+def test_no_truncation_filter_without_a_bound():
+    """num_layers=None must behave exactly like the pre-truncation filter."""
+    name = "language_model.model.layers.92.self_attn.o_proj.weight"
+    assert _skip_reason(name, _LOCAL, None) is None
+
+
+def test_full_model_skips_zero_tensors_for_truncation():
+    """The 93-layer path must be untouched: no tensor is dropped as truncated."""
+    reasons = [_skip_reason(n, _LOCAL, 93) for n in _k3_names()]
+    assert reasons.count("truncated_layer") == 0
+
+
+def test_truncated_model_skips_exactly_the_out_of_range_layers():
+    names = list(_k3_names())
+    reasons = [_skip_reason(n, _LOCAL, 12) for n in names]
+    # 81 dropped layers: 81 x (8 dense + 5 moe-dense + 896 x 6 expert).
+    expected = 81 * (len(_K3_LAYER_DENSE) + len(_K3_MOE_DENSE) + 896 * 6)
+    assert reasons.count("truncated_layer") == expected
+    # and nothing inside the kept range is dropped for truncation
+    kept = [n for n, r in zip(names, reasons) if r != "truncated_layer"]
+    assert all((layer_index(n) is None or layer_index(n) < 12) for n in kept)
+
+
+def test_truncation_and_expert_filter_compose():
+    """A foreign expert inside the kept range is still reported as such."""
+    kept_range = "language_model.model.layers.3.block_sparse_moe.experts.500"
+    gone = "language_model.model.layers.50.block_sparse_moe.experts.0"
+    assert _skip_reason(f"{kept_range}.w1.weight_packed", _LOCAL,
+                        12) == ("foreign_expert")
+    # Truncation wins for an out-of-range layer even when the expert is local.
+    assert _skip_reason(f"{gone}.w1.weight_packed", _LOCAL,
+                        12) == ("truncated_layer")
+    assert _should_skip(f"{gone}.w1.weight_packed", _LOCAL, 12)
 
 
 def test_keeps_expert_tensors_with_unknown_suffix():

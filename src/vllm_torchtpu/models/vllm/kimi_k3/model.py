@@ -45,6 +45,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import layer_index
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
@@ -52,6 +54,8 @@ from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+
+logger = init_logger(__name__)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -338,6 +342,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         mapper = self.hf_to_vllm_mapper
         if self.config.q_lora_rank is not None:
             mapper |= self.fused_mla_mapper
+        # A checkpoint may carry more decoder layers than this model was
+        # built with (`--hf-overrides '{"text_config":
+        # {"num_hidden_layers": N}}'` truncates K3 to N layers so it fits a
+        # small slice). Those tensors have no parameter to load into: one
+        # reaches params_dict[name] below, the other AutoWeightsLoader, and
+        # which arrives first depends on stream completion order -- so the
+        # guard sits ahead of both.
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        skipped_truncated = 0
 
         # Feed non-expert weights to AutoWeightsLoader as a GENERATOR, not a
         # list: with a streamed checkpoint the loop below drains the whole
@@ -347,7 +360,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # expert dispatch with AutoWeightsLoader consumption frees each host
         # tensor as soon as its parameter is loaded.
         def _ordinary_weights():
+            nonlocal skipped_truncated
             for name, loaded_weight in mapper.apply(weights):
+                layer = layer_index(name)
+                if (num_layers is not None and layer is not None
+                        and layer >= num_layers):
+                    skipped_truncated += 1
+                    continue
                 if name.startswith(("vision_tower.", "mm_projector.")):
                     continue
                 if experts_use_weight and name.endswith(".weight_packed"):
@@ -390,6 +409,20 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # load_weights fully consumes the generator before returning, so
         # loaded_experts is complete when the union is taken.
         ordinary_loaded = loader.load_weights(_ordinary_weights())
+        if skipped_truncated:
+            # Loud on purpose: a weight-name refactor that stops matching
+            # would show up here as a huge count rather than as an
+            # unexplained accuracy drop.
+            logger.info(
+                "Kimi-K3: skipped %d checkpoint tensors for decoder layers "
+                ">= %d (model truncated relative to the checkpoint)",
+                skipped_truncated, num_layers)
+            unloaded = sorted(
+                set(params_dict) - (loaded_experts | ordinary_loaded))
+            if unloaded:
+                logger.warning(
+                    "Kimi-K3: %d parameters got no checkpoint weight after "
+                    "truncation, e.g. %s", len(unloaded), unloaded[:5])
         return loaded_experts | ordinary_loaded
 
 

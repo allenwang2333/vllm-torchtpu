@@ -39,7 +39,9 @@ strictly per local expert (see ``compressed_tensors_moe/utils.py``), and at
 here like the packed weights.
 """
 
+import collections
 import os
+import re
 from collections.abc import Generator
 from typing import Optional
 
@@ -54,17 +56,57 @@ logger = init_logger(__name__)
 # every rank.
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
 
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
-def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
+
+def layer_index(name: str) -> Optional[int]:
+    match = _LAYER_INDEX_RE.search(name)
+    return int(match.group(1)) if match else None
+
+
+def num_decoder_layers() -> Optional[int]:
+    """Decoder layers the *built* model has, i.e. after ``--hf-overrides``.
+
+    None when it cannot be read, which keeps the truncation filter off
+    rather than guessing a bound.
+    """
+    from vllm.config import get_current_vllm_config
+
+    num = getattr(get_current_vllm_config().model_config.hf_text_config,
+                  "num_hidden_layers", None)
+    return num if isinstance(num, int) and num > 0 else None
+
+
+def _skip_reason(name: str,
+                 local_expert_ids: set[int],
+                 num_layers: Optional[int] = None) -> Optional[str]:
+    """Why this tensor is not fetched, or None to fetch it.
+
+    Two independent reasons, kept distinct because they are counted and
+    logged separately: a tensor can belong to another rank's expert, or to
+    a decoder layer this model does not have (``--hf-overrides``
+    ``num_hidden_layers`` below the checkpoint's).
+    """
     from vllm.model_executor.model_loader.ep_weight_filter import \
         parse_expert_id
 
+    if num_layers is not None:
+        layer = layer_index(name)
+        if layer is not None and layer >= num_layers:
+            return "truncated_layer"
+
     expert_id = parse_expert_id(name)
     if expert_id is None:
-        return False
+        return None
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
-        return False
-    return expert_id not in local_expert_ids
+        return None
+    return None if expert_id in local_expert_ids else "foreign_expert"
+
+
+def _should_skip(name: str,
+                 local_expert_ids: set[int],
+                 num_layers: Optional[int] = None) -> bool:
+    return _skip_reason(name, local_expert_ids, num_layers) is not None
 
 
 def _compute_local_expert_ids() -> Optional[set[int]]:
@@ -121,13 +163,15 @@ def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    num_layers: Optional[int] = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
     Reads each file's safetensors header (via the Run:AI streamer, so
     ``gs://`` and local paths both work), drops non-local expert tensors
-    from the request plan, and streams the surviving byte ranges as
-    contiguous runs. The skipped bytes are never requested from storage.
+    and (when ``num_layers`` is given) tensors for decoder layers past the
+    built model's, then streams the surviving byte ranges as contiguous
+    runs. The skipped bytes are never requested from storage.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -150,8 +194,12 @@ def _sharded_runai_weights_iterator(
         # (and a zero-byte group at the head of its queue aborts the whole
         # remaining stream). They are yielded directly as empty tensors.
         zero_size_tensors: list = []
-        kept = skipped = 0
-        kept_bytes = skipped_bytes = 0
+        kept = 0
+        kept_bytes = 0
+        # Keyed by _skip_reason so a filter that starts dropping the wrong
+        # thing shows up as a count, not as a silent accuracy loss.
+        skipped: collections.Counter = collections.Counter()
+        skipped_bytes: collections.Counter = collections.Counter()
 
         run_start: Optional[int] = None
         run_sizes: list[int] = []
@@ -169,9 +217,11 @@ def _sharded_runai_weights_iterator(
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata,
                                          meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
-                    skipped += 1
-                    skipped_bytes += size
+                reason = _skip_reason(tensor_meta.name, local_expert_ids,
+                                      num_layers)
+                if reason is not None:
+                    skipped[reason] += 1
+                    skipped_bytes[reason] += size
                     # A zero-byte skip leaves the byte stream contiguous, so
                     # the current run may continue through it.
                     if size:
@@ -191,9 +241,11 @@ def _sharded_runai_weights_iterator(
 
         logger.info(
             "[sharded-ep-load] fetching %d tensors (%.1f GB) in %d ranges; "
-            "skipping %d non-local expert tensors (%.1f GB) before fetch",
-            kept, kept_bytes / 1e9, len(requests), skipped,
-            skipped_bytes / 1e9)
+            "skipping %d non-local expert tensors (%.1f GB) and %d tensors "
+            "for layers >= %s (%.1f GB) before fetch", kept, kept_bytes / 1e9,
+            len(requests), skipped["foreign_expert"],
+            skipped_bytes["foreign_expert"] / 1e9, skipped["truncated_layer"],
+            num_layers, skipped_bytes["truncated_layer"] / 1e9)
 
         fs.stream_files(requests,
                         credentials=None,
@@ -286,7 +338,7 @@ def patch_runai_sharded_expert_streaming() -> None:
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
             hf_weights_files, local_expert_ids,
-            self.load_config.use_tqdm_on_load)
+            self.load_config.use_tqdm_on_load, num_decoder_layers())
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
