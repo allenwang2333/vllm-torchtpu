@@ -97,9 +97,32 @@ def _tpu_attention_slot_size_bytes(vllm_config: VllmConfig, backend_cls,
     return page_size
 
 
-def _tpu_attention_page_size_bytes(vllm_config: VllmConfig,
+# Bytes-per-token must be sampled on a block the layout can hold exactly. MLA
+# packs `kv_packing` tokens into one row -- `[pages, align(bs, packing) //
+# packing, packing, align(kv_dim, 128)]` -- so a 1-token page is rounded up to
+# a whole row and `page(1)` overstates the per-token cost by exactly
+# `kv_packing` (2x bf16, 4x fp8). Any power of two at least as large as any
+# packing factor is a valid sample; the token-linearity check in
+# `_derive_tpu_block_slot_config` is what proves the sample was representative.
+_BYTES_PER_TOKEN_PROBE_BLOCK = 128
+
+
+def _tpu_attention_bytes_per_token(vllm_config: VllmConfig,
                                    backend_cls) -> int:
-    return _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
+    probe = _BYTES_PER_TOKEN_PROBE_BLOCK
+    return _tpu_attention_slot_size_bytes(vllm_config, backend_cls,
+                                          probe) // probe
+
+
+def _tpu_attention_tokens_per_page_row(vllm_config: VllmConfig, backend_cls,
+                                       bytes_per_token: int) -> int:
+    """Token granularity of a page: `kv_packing` for MLA, 1 for everything else.
+
+    A page is token-linear only at multiples of this, so the block size the
+    unified pool settles on has to be one.
+    """
+    minimum_page = _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 1)
+    return max(1, minimum_page // bytes_per_token)
 
 
 def _hybrid_mamba_state_layout(
@@ -186,12 +209,16 @@ def _hybrid_mamba_state_layout(
     )
 
 
-def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
+def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig,
+                                               backend_cls) -> int:
     model_config = vllm_config.model_config
     dtype_size = torch.empty(
         (), dtype=_resolve_tpu_cache_dtype(vllm_config)).element_size()
-    return (model_config.get_num_kv_heads(vllm_config.parallel_config) * 2 *
-            model_config.get_head_size() * dtype_size)
+    # MLA caches one compressed latent per token, not a K and a V; counting
+    # both makes the reported layout padding negative.
+    entries_per_token = 1 if backend_cls.is_mla() else 2
+    return (model_config.get_num_kv_heads(vllm_config.parallel_config) *
+            entries_per_token * model_config.get_head_size() * dtype_size)
 
 
 def _derive_tpu_block_slot_config(
@@ -201,10 +228,10 @@ def _derive_tpu_block_slot_config(
     input_block_size: int,
 ) -> dict[str, int | str | Sequence[object] | None]:
     supported = backend_cls.get_supported_kernel_block_sizes()
-    fa_physical_bytes_per_token = _tpu_attention_page_size_bytes(
+    fa_physical_bytes_per_token = _tpu_attention_bytes_per_token(
         vllm_config, backend_cls)
     fa_raw_payload_bytes_per_token = (
-        _tpu_attention_raw_payload_bytes_per_token(vllm_config))
+        _tpu_attention_raw_payload_bytes_per_token(vllm_config, backend_cls))
     fa_layout_padding_bytes_per_token = (fa_physical_bytes_per_token -
                                          fa_raw_payload_bytes_per_token)
 
@@ -228,7 +255,11 @@ def _derive_tpu_block_slot_config(
             user_block_size_floor or 0,
             backend_min_page_size,
         )
-        final_block_size = _align_block_to_backend(block_size_floor, supported)
+        tokens_per_page_row = _tpu_attention_tokens_per_page_row(
+            vllm_config, backend_cls, fa_physical_bytes_per_token)
+        final_block_size = _align_block_to_backend(
+            _round_up_to_multiple(block_size_floor, tokens_per_page_row),
+            supported)
         if (user_block_size_floor is not None
                 and block_size_floor == user_block_size_floor):
             block_size_source = "user_block_size_floor"

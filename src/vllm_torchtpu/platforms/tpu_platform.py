@@ -974,10 +974,21 @@ class TpuPlatform(Platform):
                 # Seed copies live on the pooled path only, so the per-layer
                 # layout restores no Mamba state on a prefix-cache hit and
                 # would silently generate from an unrelated slot.
+                from vllm_torchtpu.gdn_pool_layout import \
+                    POOLED_GDN_ARCHITECTURES
+                architecture = vllm_config.model_config.architecture
+                # Off by an explicit env var, or off by default because the
+                # architecture has no pooled state path -- different fixes.
+                reason = (
+                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 is set; remove it"
+                    if envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL is not None else
+                    f"{architecture!r} is not in POOLED_GDN_ARCHITECTURES "
+                    f"({sorted(POOLED_GDN_ARCHITECTURES)}), so the pool is off "
+                    "by default; give the architecture a pooled GDN state "
+                    "path and add it there")
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires the "
-                    "unified KV pool; remove "
-                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0.")
+                    f"unified KV pool: {reason}.")
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = \

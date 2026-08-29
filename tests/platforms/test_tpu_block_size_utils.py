@@ -6,8 +6,9 @@ import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
-from vllm_torchtpu.platforms.tpu_block_size_utils import \
-    update_tpu_block_size_and_slot_config
+from vllm_torchtpu.layers.vllm.attention import PallasMLAttentionBackend
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    _derive_tpu_block_slot_config, update_tpu_block_size_and_slot_config)
 
 
 class FakeBatchedRPAAttentionBackend:
@@ -15,6 +16,10 @@ class FakeBatchedRPAAttentionBackend:
     @staticmethod
     def get_name():
         return "CUSTOM"
+
+    @staticmethod
+    def is_mla():
+        return False
 
     @staticmethod
     def get_min_page_size(_vllm_config):
@@ -114,24 +119,10 @@ class FakeKimiLinearModel:
         return (torch.bfloat16, torch.float32)
 
 
-class FakeKimiMLABackend(FakePlainAttentionBackend):
-    """MLA page geometry: packing=2 x 640 padded bf16 lanes = 2560 B/token.
-
-    The real PallasMLAttentionBackend inherits MultipleOf(1) kernel block
-    sizes, so the derivation's alignment step is a no-op ([] matches)."""
-
-    @staticmethod
-    def get_name():
-        return "PALLAS_MLA"
-
-    @staticmethod
-    def get_min_page_size(_vllm_config):
-        # Representative for max_model_len=32768, max_num_seqs=256.
-        return 64
-
-    @staticmethod
-    def get_kv_cache_page_size_bytes(block_size, *_args, **_kwargs):
-        return block_size * 2560
+# The MLA backend is deliberately NOT faked. A fake here used to return
+# `block_size * 2560`, i.e. token-linear by construction at the very number
+# that is wrong (2560 is `page(1)`, which covers `kv_packing`=2 tokens), and
+# that is what let the non-linear real page reach a pod.
 
 
 @pytest.fixture
@@ -142,6 +133,9 @@ def vllm_config():
     vllm_config.model_config.is_hybrid = False
     vllm_config.model_config.get_num_kv_heads.return_value = 1
     vllm_config.model_config.get_head_size.return_value = 256
+    vllm_config.model_config.max_model_len = 32768
+    vllm_config.scheduler_config = MagicMock()
+    vllm_config.scheduler_config.max_num_seqs = 256
     vllm_config.cache_config = MagicMock(spec=CacheConfig)
     vllm_config.cache_config.block_size = None
     vllm_config.cache_config.user_specified_block_size = False
@@ -221,28 +215,66 @@ def test_hybrid_fit_uses_configured_bf16_ssm_dtype(vllm_config):
     assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
-def test_kimi_linear_padded_ssm_fit(vllm_config):
-    """Kimi-Linear TP8: the f32 KDA state (2^18 B) does not divide the MLA
-    token row (2^9 * 5 B), so the derivation pads the SSM region up to whole
-    token rows instead of rejecting the geometry."""
+def _configure_kimi_mla(vllm_config, *, tp_size=8, cache_dtype="auto"):
     vllm_config.model_config.is_hybrid = True
     vllm_config.model_config.architecture = "KimiLinearForCausalLM"
+    # kv_lora_rank 512 + qk_rope_head_dim 64, one latent "head".
     vllm_config.model_config.get_head_size.return_value = 576
     vllm_config.cache_config.block_size = 16
     vllm_config.cache_config.mamba_block_size = 16
     vllm_config.cache_config.mamba_cache_mode = "align"
-    vllm_config.parallel_config.tensor_parallel_size = 8
+    vllm_config.cache_config.cache_dtype = cache_dtype
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+
+
+def test_kimi_linear_padded_ssm_fit(vllm_config):
+    """Kimi-Linear TP8: the f32 KDA state does not divide the MLA token row,
+    so the derivation pads the SSM region up to whole token rows instead of
+    rejecting the geometry."""
+    _configure_kimi_mla(vllm_config)
 
     _update(vllm_config,
-            backend_cls=FakeKimiMLABackend,
+            backend_cls=PallasMLAttentionBackend,
             model_cls=FakeKimiLinearModel)
 
-    # SSM: ceil(262144 / 2560) = 103 rows (1536 B of padding in the last
-    # row); conv: pow2(ceil(9216 / 2560)) = 4 rows; the fit floor 107 beats
-    # the backend minimum of 64 and the input block size of 16.
-    assert vllm_config.cache_config.block_size == 107
-    assert vllm_config.cache_config.mamba_block_size == 107
-    assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
+    # bf16 MLA is 1280 B/token. SSM: ceil(262144 / 1280) = 205 rows; conv:
+    # pow2(ceil(9216 / 1280)) = 8 rows; the fit floor 213 beats the backend
+    # minimum of 64, then rounds up to 214 for the 2-token packing row.
+    assert vllm_config.cache_config.block_size == 214
+    assert vllm_config.cache_config.mamba_block_size == 214
+    assert vllm_config.cache_config.mamba_page_size_padded == 214 * 1280
+
+
+@pytest.mark.parametrize("cache_dtype,bytes_per_token,kv_packing",
+                         [("auto", 1280, 2), ("fp8", 640, 4)])
+def test_mla_page_is_measured_per_token_not_per_minimum_page(
+        vllm_config, cache_dtype, bytes_per_token, kv_packing):
+    """The MLA page packs `kv_packing` tokens into one row.
+
+    Sampling it at `block_size=1` reports `kv_packing`x the true per-token
+    cost, which made the unified pool's token-linearity check unsatisfiable
+    for every MLA model: dev build #298 died with `block_size=324,
+    fa_physical_bytes_per_token=2560, expected 829440, actual 414720`.
+    """
+    _configure_kimi_mla(vllm_config, cache_dtype=cache_dtype)
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeKimiLinearModel, None)):
+        derivation = _derive_tpu_block_slot_config(vllm_config,
+                                                   PallasMLAttentionBackend,
+                                                   input_block_size=16)
+
+    assert derivation["fa_physical_bytes_per_token"] == bytes_per_token
+    # Layout padding is the align(576, 128) -> 640 lane padding, and MLA
+    # stores one latent per token rather than a K and a V.
+    assert derivation["fa_layout_padding_bytes_per_token"] == (
+        bytes_per_token - 576 * bytes_per_token // 640)
+    assert derivation["final_block_size"] % kv_packing == 0
+    # The invariant the pool needs, on the block size actually chosen.
+    assert derivation["fa_physical_slot_bytes"] == (
+        derivation["final_block_size"] * bytes_per_token)
+    assert (derivation["fa_physical_slot_bytes"]
+            >= derivation["mamba_required_state_bytes"])
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
