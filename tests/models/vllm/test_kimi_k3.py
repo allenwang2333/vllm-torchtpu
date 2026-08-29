@@ -480,7 +480,8 @@ def _build_kimi_model(monkeypatch: pytest.MonkeyPatch,
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=config),
         quant_config=None,
-        compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE),
     )
     return KimiModel(vllm_config=vllm_config, prefix=prefix)
 
@@ -493,10 +494,10 @@ def compile_prefixes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     `VllmConfig`, so it is replaced by the recorder the patch then wraps.
     """
     seen: list[str] = []
-    monkeypatch.setattr(
-        TorchCompileWithNoGuardsWrapper, "__init__",
-        lambda self, compile_prefix="", is_encoder=False: seen.append(
-            compile_prefix))
+    monkeypatch.setattr(TorchCompileWithNoGuardsWrapper,
+                        "__init__",
+                        lambda self, compile_prefix="", is_encoder=False: seen.
+                        append(compile_prefix))
     _patch_vllm_compile_prefix_isolation()
     return seen
 
