@@ -31,7 +31,7 @@ def test_platform_attributes():
 
 
 def test_device_control_env_var():
-    assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
+    assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_DEVICES"
 
 
 def test_memory_methods(monkeypatch):
