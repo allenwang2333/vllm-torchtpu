@@ -1304,17 +1304,20 @@ def _patch_vllm_structured_jump_decoding() -> None:
 
         def patched_compile_grammar(self, request_type, grammar_spec):
             if request_type == backend_xgrammar.StructuredOutputOptions.JSON:
-                ctx = self.compiler.compile_json_schema(grammar_spec, any_whitespace=False)
+                ctx = self.compiler.compile_json_schema(grammar_spec,
+                                                        any_whitespace=False)
+                max_rollback = max(self.num_speculative_tokens, 128)
                 grammar = backend_xgrammar.XgrammarGrammar(
                     matcher=backend_xgrammar.xgr.GrammarMatcher(
                         ctx,
-                        max_rollback_tokens=self.num_speculative_tokens,
+                        max_rollback_tokens=max_rollback,
                     ),
                     vocab_size=self.vocab_size,
                     ctx=ctx,
                 )
             else:
-                grammar = orig_compile_grammar(self, request_type, grammar_spec)
+                grammar = orig_compile_grammar(self, request_type,
+                                               grammar_spec)
             grammar.tokenizer = self.tokenizer
             return grammar
 
@@ -1328,7 +1331,8 @@ def _patch_vllm_structured_jump_decoding() -> None:
             if tokenizer is None:
                 return []
             matcher = getattr(self, "matcher", None)
-            if matcher is None or not hasattr(matcher, "find_jump_forward_string"):
+            if matcher is None or not hasattr(matcher,
+                                              "find_jump_forward_string"):
                 return []
             try:
                 jump_str = matcher.find_jump_forward_string()
@@ -1338,11 +1342,15 @@ def _patch_vllm_structured_jump_decoding() -> None:
                 return []
 
             try:
-                jump_tokens = tokenizer.encode(jump_str, add_special_tokens=False)
+                jump_tokens = tokenizer.encode(jump_str,
+                                               add_special_tokens=False)
             except Exception:
                 return []
             if not jump_tokens:
                 return []
+
+            # Enforce mathematical invariant: candidate jump tokens must not exceed max_rollback_tokens
+            jump_tokens = jump_tokens[:128]
 
             # Bidirectional validation: verify that the grammar matcher accepts each token in jump_tokens
             accepted_count = 0
@@ -1368,10 +1376,10 @@ def _patch_vllm_structured_jump_decoding() -> None:
 
         orig_update_from_output = Scheduler.update_from_output
 
-        def patched_update_from_output(self, scheduler_output, model_runner_output):
+        def patched_update_from_output(self, scheduler_output,
+                                       model_runner_output):
             engine_core_outputs = orig_update_from_output(
-                self, scheduler_output, model_runner_output
-            )
+                self, scheduler_output, model_runner_output)
 
             # Check for jump decoding on active structured output requests
             for req_id in scheduler_output.num_scheduled_tokens:
@@ -1397,7 +1405,8 @@ def _patch_vllm_structured_jump_decoding() -> None:
                         for output_token_id in jump_tokens:
                             request.append_output_token_ids(output_token_id)
                             valid_jump_tokens.append(output_token_id)
-                            jump_stopped = check_stop(request, self.max_model_len)
+                            jump_stopped = check_stop(request,
+                                                      self.max_model_len)
                             if jump_stopped:
                                 break
 
@@ -1412,8 +1421,7 @@ def _patch_vllm_structured_jump_decoding() -> None:
                                     out.new_token_ids.extend(valid_jump_tokens)
                                     if jump_stopped:
                                         out.finish_reason = (
-                                            request.get_finished_reason()
-                                        )
+                                            request.get_finished_reason())
                                     break
             return engine_core_outputs
 
