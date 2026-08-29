@@ -65,7 +65,7 @@ run_ray_multihost() {
     (
       for _attempt in 1 2 3; do
         ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1 ${PASSTHROUGH_ENV_STR}" \
           && break
         echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
         sleep 15

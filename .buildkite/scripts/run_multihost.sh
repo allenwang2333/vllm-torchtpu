@@ -173,18 +173,37 @@ BQ_EVAL_VARS=(
   -e TPU_NAME="${TPU_NAME:-}"
 )
 
+# Env vars forwarded into EVERY container, head and worker alike. Head and
+# worker used to carry separate hand-written lists, so a var added to one was
+# silently absent on the other three hosts -- and a knob read at import time
+# on rank 0 only is worse than a knob that is off everywhere. Add names here.
+# Unset names are skipped, so an entry costs nothing when it is not in use.
+PASSTHROUGH_ENV_NAMES=(
+  BENCHMARK_WARMUP_RUNS
+  TPU_ACCELERATOR_TYPE
+  TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+  USE_MOE_SPARSE_CORE
+  USE_PHASED_PROFILER
+  VLLM_ENGINE_READY_TIMEOUT_S
+  VLLM_XLA_CHECK_RECOMPILATION
+)
+PASSTHROUGH_ENV_ARGS=()
+for _name in "${PASSTHROUGH_ENV_NAMES[@]}"; do
+  if [ -n "${!_name:-}" ]; then
+    PASSTHROUGH_ENV_ARGS+=(-e "${_name}=${!_name}")
+  fi
+done
+export PASSTHROUGH_ENV_STR="${PASSTHROUGH_ENV_ARGS[*]}"
+
 CONTAINER_ENV_COMMON=(
   -e VLLM_DISABLE_COMPILE_CACHE=1
   -e HF_TOKEN="${HF_TOKEN:-}"
   -e TPU_MULTIHOST_BACKEND="${BACKEND}"
   -e TPU_SKIP_MDS_QUERY=1
-  -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0"
-  ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
-  ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"}
-  ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"}
+  "${PASSTHROUGH_ENV_ARGS[@]}"
 )
 
 CONTAINER_ENV_HEAD=(
