@@ -3619,7 +3619,11 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
-                if getattr(self.model, "model_stage", None) == "code2wav":
+                is_code2wav = (
+                    getattr(self.model_config, "model_stage", None) == "code2wav"
+                    or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "code2wav"
+                )
+                if is_code2wav:
                     self._omni_last_hidden_states = hidden_states
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
@@ -4368,7 +4372,11 @@ class TPUModelRunner(GPUModelRunner):
 
         # Omni multi-modal output propagation (strictly for Code2Wav vocoder stage)
         mm_outputs = None
-        if getattr(self.model, "model_stage", None) == "code2wav":
+        is_code2wav = (
+            getattr(self.model_config, "model_stage", None) == "code2wav"
+            or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "code2wav"
+        )
+        if is_code2wav:
             if hasattr(self, "_omni_last_hidden_states") and self._omni_last_hidden_states is not None:
                 raw_out = self._omni_last_hidden_states
                 self._omni_last_hidden_states = None
