@@ -146,10 +146,27 @@ def patch_routed_experts() -> None:
         perms = _perms()
         if not perms:
             return
-        idx = _layer_index(getattr(self, "layer_name", ""))
+        name = getattr(self, "layer_name", "")
+        idx = _layer_index(name)
         if idx is None or idx not in perms:
+            # Unlike `permute_router_gates`, this hook has no total to check
+            # `touched` against -- it fires once per layer construction and
+            # never sees the whole model. A silent skip here while the gates
+            # permute successfully would leave routing genuinely changed with
+            # nothing in the log to show it, so announce every skip. See the
+            # arm #1b write-up: `logger.info` from this module does not reach
+            # the job log, hence `print`.
+            print(
+                f"[expert_permutation] SKIPPED expert_map for layer_name="
+                f"{name!r} (parsed index {idx}); permutation file covers "
+                f"{len(perms)} layers",
+                flush=True)
             return
         if self._expert_map is None:
+            print(
+                f"[expert_permutation] SKIPPED expert_map for layer {idx}: "
+                f"_expert_map is None",
+                flush=True)
             return
         perm = perms[idx]
         if perm.shape[0] != self.global_num_experts:
@@ -161,6 +178,10 @@ def patch_routed_experts() -> None:
         new_map = new_map.to(self._expert_map.device)
         self.register_buffer("_expert_map", new_map, persistent=False)
         self.expert_map_manager._expert_map = new_map
+        print(
+            f"[expert_permutation] permuted expert_map for layer {idx} "
+            f"(ep_rank {ep_rank}, {self.local_num_experts} local experts)",
+            flush=True)
 
     RoutedExperts.update_expert_map_info = update_expert_map_info
     RoutedExperts._tpu_expert_perm_patch = True
