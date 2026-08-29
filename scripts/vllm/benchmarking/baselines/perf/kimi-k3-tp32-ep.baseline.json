@@ -1,0 +1,10 @@
+{
+  "isl8192_osl1024_c1": {
+    "completed": 20,
+    "median_tpot_ms": 35.862433822313,
+    "median_ttft_ms": 4639.8915947647765,
+    "num_prompts": 20,
+    "output_token_throughput": 24.777317318215246,
+    "total_token_throughput": 222.9958558639372
+  }
+}
