@@ -169,6 +169,9 @@ class KimiModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        # Keyed off by the compile-artifact cache; without it every restart
+        # gets a fresh `_tpu_instance_N` and nothing on disk is ever reused.
+        self.prefix = prefix
         config: KimiLinearConfig = vllm_config.model_config.hf_text_config
         self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
 
