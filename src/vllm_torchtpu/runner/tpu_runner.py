@@ -3619,6 +3619,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
+                self._omni_last_hidden_states = hidden_states
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -4363,6 +4364,53 @@ class TPUModelRunner(GPUModelRunner):
             pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
         )
+
+        # Omni multi-modal output propagation (e.g. Code2Wav audio output or make_omni_output)
+        mm_outputs = None
+        if hasattr(self, "_omni_last_hidden_states") and self._omni_last_hidden_states is not None:
+            raw_out = self._omni_last_hidden_states
+            self._omni_last_hidden_states = None
+            if hasattr(self.model, "make_omni_output"):
+                try:
+                    omni_out = self.model.make_omni_output(raw_out)
+                    if hasattr(omni_out, "multimodal_outputs") and omni_out.multimodal_outputs:
+                        raw_mm = omni_out.multimodal_outputs
+                        num_reqs = len(req_ids)
+                        per_req_payloads = []
+                        for i in range(num_reqs):
+                            mm_payload = {}
+                            for k, v in raw_mm.items():
+                                if isinstance(v, list) and len(v) == num_reqs:
+                                    val = v[i]
+                                    mm_payload[k] = val.detach().to("cpu") if hasattr(val, "detach") else val
+                                elif hasattr(v, "detach"):
+                                    mm_payload[k] = v.detach().to("cpu")
+                                else:
+                                    mm_payload[k] = v
+                            per_req_payloads.append(mm_payload)
+                        mm_outputs = per_req_payloads
+                except Exception as e:
+                    logger.debug("make_omni_output pass-through failed: %s", e)
+            elif getattr(self.model, "model_stage", None) == "code2wav":
+                num_reqs = len(req_ids)
+                per_req_payloads = []
+                for i in range(num_reqs):
+                    if isinstance(raw_out, list) and i < len(raw_out):
+                        t = raw_out[i]
+                    elif isinstance(raw_out, torch.Tensor):
+                        t = raw_out[i] if raw_out.dim() > 1 and i < raw_out.shape[0] else raw_out
+                    else:
+                        t = raw_out
+                    t_cpu = t.detach().to("cpu") if hasattr(t, "detach") else t
+                    per_req_payloads.append({
+                        "audio": t_cpu,
+                        "waveform": t_cpu,
+                        "audio_waveform": t_cpu,
+                        "model_outputs": t_cpu,
+                    })
+                mm_outputs = per_req_payloads
+        if mm_outputs is not None:
+            model_runner_output.multimodal_outputs = mm_outputs
 
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,
