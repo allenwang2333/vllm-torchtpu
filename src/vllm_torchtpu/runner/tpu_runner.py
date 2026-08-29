@@ -3619,12 +3619,8 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
-                is_code2wav = (
-                    getattr(self.model_config, "model_stage", None) == "code2wav"
-                    or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "code2wav"
-                )
-                if is_code2wav:
-                    self._omni_last_hidden_states = hidden_states
+                self._omni_last_hidden_states = hidden_states
+                self._omni_last_aux_hidden_states = aux_hidden_states
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -4370,13 +4366,82 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector_output=kv_connector_output,
         )
 
-        # Omni multi-modal output propagation (strictly for Code2Wav vocoder stage)
+        # Omni multi-modal and inter-stage output propagation
         mm_outputs = None
+        orig_model = getattr(self.model, "_orig_mod", self.model)
+        if hasattr(orig_model, "make_omni_output") or hasattr(self.model, "make_omni_output"):
+            raw_out = getattr(self, "_omni_last_hidden_states", None)
+            aux_out = getattr(self, "_omni_last_aux_hidden_states", None)
+            self._omni_last_hidden_states = None
+            self._omni_last_aux_hidden_states = None
+            if raw_out is not None or aux_out is not None:
+                make_fn = getattr(orig_model, "make_omni_output", getattr(self.model, "make_omni_output", None))
+                model_out = (raw_out, aux_out) if aux_out is not None else raw_out
+                try:
+                    omni_out = make_fn(model_out)
+                    if hasattr(omni_out, "multimodal_outputs") and omni_out.multimodal_outputs is not None:
+                        raw_mm = omni_out.multimodal_outputs
+                    elif isinstance(omni_out, dict):
+                        raw_mm = omni_out
+                    else:
+                        raw_mm = None
+                except Exception as e:
+                    logger.warning("[TPURunner] make_omni_output failed: %s", e)
+                    raw_mm = None
+
+                if raw_mm is not None:
+                    num_reqs = len(req_ids)
+                    per_req_payloads = []
+                    for i in range(num_reqs):
+                        req_payload = {}
+                        if isinstance(raw_mm, dict):
+                            for k, v in raw_mm.items():
+                                if k == "hidden_states" and isinstance(v, dict) and "layers" in v:
+                                    layers_dict = {}
+                                    for layer_k, layer_tensor in v["layers"].items():
+                                        if isinstance(layer_tensor, torch.Tensor):
+                                            if hasattr(self, "query_start_loc_np") and i + 1 < len(self.query_start_loc_np):
+                                                st = int(self.query_start_loc_np[i])
+                                                en = int(self.query_start_loc_np[i + 1])
+                                                layers_dict[layer_k] = layer_tensor[st:en].detach().to("cpu")
+                                            else:
+                                                layers_dict[layer_k] = layer_tensor.detach().to("cpu")
+                                        else:
+                                            layers_dict[layer_k] = layer_tensor
+                                    req_payload["hidden_states"] = {"layers": layers_dict}
+                                elif k == "embed" and isinstance(v, dict):
+                                    req_payload["embed"] = {
+                                        ek: [t.detach().to("cpu") if hasattr(t, "detach") else t for t in ev]
+                                        if isinstance(ev, list) else (ev.detach().to("cpu") if hasattr(ev, "detach") else ev)
+                                        for ek, ev in v.items()
+                                    }
+                                elif k in ("audio", "waveform", "audio_waveform", "model_outputs"):
+                                    if isinstance(v, list) and i < len(v):
+                                        item = v[i]
+                                    elif isinstance(v, torch.Tensor) and v.dim() > 1 and i < v.shape[0]:
+                                        item = v[i]
+                                    else:
+                                        item = v
+                                    req_payload[k] = item.detach().to("cpu") if hasattr(item, "detach") else item
+                                elif k == "codes" and isinstance(v, dict):
+                                    codes_dict = {}
+                                    for ck, cv in v.items():
+                                        if isinstance(cv, torch.Tensor) and cv.dim() > 1 and i < cv.shape[0]:
+                                            codes_dict[ck] = cv[i:i+1].detach().to("cpu")
+                                        else:
+                                            codes_dict[ck] = cv.detach().to("cpu") if hasattr(cv, "detach") else cv
+                                    req_payload["codes"] = codes_dict
+                                else:
+                                    req_payload[k] = v
+                        per_req_payloads.append(req_payload)
+                    mm_outputs = per_req_payloads
+
+        # Fallback for Code2Wav vocoder stage if make_omni_output did not produce outputs
         is_code2wav = (
             getattr(self.model_config, "model_stage", None) == "code2wav"
             or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "code2wav"
         )
-        if is_code2wav:
+        if is_code2wav and mm_outputs is None:
             if hasattr(self, "_omni_last_hidden_states") and self._omni_last_hidden_states is not None:
                 raw_out = self._omni_last_hidden_states
                 self._omni_last_hidden_states = None
@@ -4397,8 +4462,10 @@ class TPUModelRunner(GPUModelRunner):
                         "model_outputs": t_cpu,
                     })
                 mm_outputs = per_req_payloads
+
         if mm_outputs is not None:
             model_runner_output.multimodal_outputs = mm_outputs
+            model_runner_output.inter_stage_outputs = mm_outputs
 
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,
