@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -117,6 +118,15 @@ class FakeKimiLinearModel:
     @staticmethod
     def get_mamba_state_dtype_from_config(_):
         return (torch.bfloat16, torch.float32)
+
+
+class FakeKimiKdaModel(FakeKimiLinearModel):
+    """KDA declares fp32 conv on purpose (`kda_state_dtype`: v3's conv1d needs
+    the fp32 compact layout), while the pooled layout pins conv to bf16."""
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(_):
+        return (torch.float32, torch.float32)
 
 
 # The MLA backend is deliberately NOT faked. A fake here used to return
@@ -275,6 +285,31 @@ def test_mla_page_is_measured_per_token_not_per_minimum_page(
         derivation["final_block_size"] * bytes_per_token)
     assert (derivation["fa_physical_slot_bytes"]
             >= derivation["mamba_required_state_bytes"])
+
+
+def test_slot_covers_the_state_bytes_vllm_accounts_for(vllm_config):
+    """The pool page is vLLM's MambaSpec size, computed from the *declared*
+    dtypes; `kv_cache_materializer` asserts the FA page equals it. Sizing the
+    slot on the narrower pooled conv width made that unsatisfiable -- dev build
+    #301 died with `(829440, 1, 841728)`.
+    """
+    _configure_kimi_mla(vllm_config)
+
+    with patch("vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+               return_value=(FakeKimiKdaModel, None)):
+        derivation = _derive_tpu_block_slot_config(vllm_config,
+                                                   PallasMLAttentionBackend,
+                                                   input_block_size=16)
+
+    # `kv_cache_spec_normalizer._mamba_unpadded_page_size_bytes`, which is what
+    # the pool page is a max over.
+    declared = sum(
+        math.prod(shape) * dtype.itemsize for shape, dtype in zip(
+            FakeKimiKdaModel.get_mamba_state_shape_from_config(vllm_config),
+            FakeKimiKdaModel.get_mamba_state_dtype_from_config(vllm_config)))
+
+    assert derivation["mamba_raw_state_bytes"] == declared
+    assert derivation["fa_physical_slot_bytes"] >= declared
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):

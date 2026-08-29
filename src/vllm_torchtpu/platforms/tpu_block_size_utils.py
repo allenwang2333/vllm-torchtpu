@@ -181,9 +181,18 @@ def _hybrid_mamba_state_layout(
         raise ValueError(
             "TPU unified hybrid KV pool requires two GDN state dtypes "
             f"(conv, SSM), got dtypes={dtypes}")
+    # The slot must also cover what vLLM's MambaSpec accounts for, and that
+    # uses the dtypes the model *declares*. `pooled_gdn_state_dtypes` pins conv
+    # to bf16 for the pooled kernel, but KDA declares fp32 on purpose (see
+    # `kda_state_dtype`), so the pooled width alone under-budgets the slot and
+    # leaves the FA page smaller than the pool page -- which no block size can
+    # fix, because `kv_cache_materializer` asserts they are equal. Storing
+    # narrower inside a slot that is big enough is free; the reverse is not.
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
-    conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
-    ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+    conv_itemsize = max(pooled_gdn_state_itemsize(conv_dtype),
+                        pooled_gdn_state_itemsize(dtypes[0]))
+    ssm_itemsize = max(pooled_gdn_state_itemsize(ssm_dtype),
+                       pooled_gdn_state_itemsize(dtypes[1]))
     conv_bytes = math.prod(shapes[0]) * conv_itemsize
     ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
