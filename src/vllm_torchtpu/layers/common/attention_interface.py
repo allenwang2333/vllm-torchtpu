@@ -590,8 +590,7 @@ def mla_attention(
         kv_cache: jax.Array,
         md: AttentionMetadata,
         mesh: Mesh,
-        num_attention_heads: int,
-        qk_nope_head_dim: int,
+        *,
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
@@ -609,8 +608,6 @@ def mla_attention(
         kv_cache: Persistent paged latent KV cache tensor residing across devices.
         md: Attention metadata containing block tables, sequence lengths, and layout indices.
         mesh: JAX execution device mesh dictating parallel shard routing.
-        num_attention_heads: Total number of attention heads across the layer.
-        qk_nope_head_dim: Inner compressed projection dimension (`lkv_dim`).
         q_scale: Optional scalar activation quantization scale for queries.
         k_scale: Optional scalar parameter quantization scale for latent keys.
         v_scale: Optional scalar parameter quantization scale for latent values.
@@ -646,20 +643,13 @@ def mla_attention(
             x in str(cache.dtype).lower()
             for x in ("fp8", "e4m3")) else "bfloat16"
 
-        decode_key = TuningKey(
-            case="batched_decode",
-            max_num_tokens=max_num_tokens,
-            actual_num_q_heads=num_attention_heads,
-            actual_lkv_dim=qk_nope_head_dim,
-            actual_r_dim=actual_r_dim,
-            kv_dtype=kv_dtype_str,
-        )
-        decode_tuned = get_tuned_params(decode_key)
-
         _, page_size_per_kv_packing, kv_packing, _ = cache.shape
         max_num_seqs = seq_lens.shape[0]
-        mixed_key = TuningKey(
-            case="mixed",
+        # Both stages run one kernel invocation over these same arrays, so
+        # every field is read off the arrays and `case` is the only
+        # difference. `actual_lkv_dim` is the latent dim the kernel sees
+        # (`ql_nope.shape[-1]`, i.e. kv_lora_rank), not `qk_nope_head_dim`.
+        shape_fields = dict(
             max_num_tokens=max_num_tokens,
             actual_num_q_heads=q.shape[1],
             actual_lkv_dim=q.shape[-1],
@@ -671,7 +661,9 @@ def mla_attention(
             max_num_seqs=max_num_seqs,
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
-        mixed_tuned = get_tuned_params(mixed_key)
+        decode_tuned = get_tuned_params(
+            TuningKey(case="batched_decode", **shape_fields))
+        mixed_tuned = get_tuned_params(TuningKey(case="mixed", **shape_fields))
 
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
