@@ -3590,24 +3590,25 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            raw_input_ids = input_ids
             input_ids, inputs_embeds = self._get_model_inputs(
                 input_ids, chunk_mm_inputs)
+            preprocess_input_ids = input_ids if input_ids is not None else raw_input_ids
 
             orig_model = getattr(self.model, "_orig_mod", self.model)
             chunk_req_ids = self.input_batch.req_ids[start_index:start_index + num_reqs]
             if getattr(orig_model, "has_preprocess", False):
                 if not hasattr(self, "model_intermediate_buffer"):
                     self.model_intermediate_buffer = {}
-                req_start_idx = 0
                 for r_i, req_id in enumerate(chunk_req_ids):
-                    num_toks = int(scheduler_output.num_scheduled_tokens[req_id])
-                    req_end_idx = req_start_idx + num_toks
+                    s = int(self.query_start_loc_np[start_index + r_i])
+                    e = int(self.query_start_loc_np[start_index + r_i + 1])
                     req_info = self.model_intermediate_buffer.get(req_id, {})
                     num_computed = int(self.input_batch.num_computed_tokens_cpu[start_index + r_i])
                     req_info["_omni_num_computed_tokens"] = num_computed
                     req_info["_omni_is_prefill"] = (num_computed == 0)
-                    r_input_ids = input_ids[req_start_idx:req_end_idx] if input_ids is not None else None
-                    r_inputs_embeds = inputs_embeds[req_start_idx:req_end_idx] if inputs_embeds is not None else None
+                    r_input_ids = preprocess_input_ids[s:e] if preprocess_input_ids is not None else None
+                    r_inputs_embeds = inputs_embeds[s:e] if inputs_embeds is not None else None
                     try:
                         p_input_ids, p_inputs_embeds, update_dict = orig_model.preprocess(
                             input_ids=r_input_ids,
@@ -3616,24 +3617,23 @@ class TPUModelRunner(GPUModelRunner):
                         )
                         if inputs_embeds is None and p_inputs_embeds is not None:
                             inputs_embeds = torch.zeros(
-                                (input_ids.shape[0], p_inputs_embeds.shape[-1]),
+                                (preprocess_input_ids.shape[0], p_inputs_embeds.shape[-1]),
                                 device=self.device,
                                 dtype=p_inputs_embeds.dtype,
                             )
-                        if p_inputs_embeds is not None:
-                            p_len = min(p_inputs_embeds.shape[0], inputs_embeds.shape[0] - req_start_idx)
-                            inputs_embeds[req_start_idx:req_start_idx + p_len] = p_inputs_embeds[:p_len].to(
+                        if p_inputs_embeds is not None and inputs_embeds is not None:
+                            p_len = min(p_inputs_embeds.shape[0], inputs_embeds.shape[0] - s)
+                            inputs_embeds[s:s + p_len] = p_inputs_embeds[:p_len].to(
                                 device=self.device, dtype=inputs_embeds.dtype
                             )
-                        if p_input_ids is not None and input_ids is not None and p_input_ids.numel() == (req_end_idx - req_start_idx):
-                            input_ids[req_start_idx:req_end_idx] = p_input_ids.to(
+                        if p_input_ids is not None and input_ids is not None and p_input_ids.numel() == (e - s):
+                            input_ids[s:e] = p_input_ids.to(
                                 device=self.device, dtype=input_ids.dtype
                             )
                         req_info.update(update_dict)
                         self.model_intermediate_buffer[req_id] = req_info
                     except Exception as e:
                         logger.warning("[TPURunner] preprocess failed for req %s: %s", req_id, e)
-                    req_start_idx = req_end_idx
 
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
@@ -3685,16 +3685,15 @@ class TPUModelRunner(GPUModelRunner):
 
                 # Talker MTP code predictor residual token generation
                 if (getattr(orig_model, "has_talker_mtp", False) or hasattr(orig_model, "talker_mtp")) and getattr(orig_model, "talker", None) is not None:
-                    req_start_idx = 0
                     for r_i, req_id in enumerate(chunk_req_ids):
-                        num_toks = int(scheduler_output.num_scheduled_tokens[req_id])
-                        req_end_idx = req_start_idx + num_toks
+                        s = int(self.query_start_loc_np[start_index + r_i])
+                        e = int(self.query_start_loc_np[start_index + r_i + 1])
                         req_info = getattr(self, "model_intermediate_buffer", {}).get(req_id, {})
                         last_talker_hidden, text_step = req_info.get("mtp_inputs", (None, None))
                         if last_talker_hidden is not None and text_step is not None:
                             try:
-                                r_inp_ids = input_ids[req_start_idx:req_end_idx] if input_ids is not None else None
-                                r_inp_emb = inputs_embeds[req_start_idx:req_end_idx] if inputs_embeds is not None else None
+                                r_inp_ids = preprocess_input_ids[s:e] if preprocess_input_ids is not None else None
+                                r_inp_emb = inputs_embeds[s:e] if inputs_embeds is not None else None
                                 _, code_predictor_codes = orig_model.talker_mtp(
                                     r_inp_ids,
                                     r_inp_emb,
@@ -3709,7 +3708,6 @@ class TPUModelRunner(GPUModelRunner):
                                     req_codes["audio"] = audio_t
                             except Exception as e:
                                 logger.warning("[TPURunner] talker_mtp failed for req %s: %s", req_id, e)
-                        req_start_idx = req_end_idx
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
