@@ -1288,6 +1288,145 @@ def _patch_vllm_block_pool_lifo_free() -> None:
         "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_structured_jump_decoding() -> None:
+    """Patches vLLM V1 Scheduler/Grammar backend to support Jump-Forward deterministic decoding."""
+    from vllm_torchtpu import envs
+    if not envs.VLLM_TPU_ENABLE_JUMP_DECODING:
+        return
+
+    try:
+        from vllm.v1.structured_output import backend_xgrammar
+        if getattr(backend_xgrammar, "_tpu_jump_decoding_patched", False):
+            return
+
+        # 1. Patch XgrammarBackend.compile_grammar to attach tokenizer and compile deterministic grammar
+        orig_compile_grammar = backend_xgrammar.XgrammarBackend.compile_grammar
+
+        def patched_compile_grammar(self, request_type, grammar_spec):
+            if request_type == backend_xgrammar.StructuredOutputOptions.JSON:
+                ctx = self.compiler.compile_json_schema(grammar_spec, any_whitespace=False)
+                grammar = backend_xgrammar.XgrammarGrammar(
+                    matcher=backend_xgrammar.xgr.GrammarMatcher(
+                        ctx,
+                        max_rollback_tokens=self.num_speculative_tokens,
+                    ),
+                    vocab_size=self.vocab_size,
+                    ctx=ctx,
+                )
+            else:
+                grammar = orig_compile_grammar(self, request_type, grammar_spec)
+            grammar.tokenizer = self.tokenizer
+            return grammar
+
+        backend_xgrammar.XgrammarBackend.compile_grammar = patched_compile_grammar
+
+        # 2. Add try_jump_forward to XgrammarGrammar
+        def try_jump_forward(self) -> list[int]:
+            if getattr(self, "_is_terminated", False):
+                return []
+            tokenizer = getattr(self, "tokenizer", None)
+            if tokenizer is None:
+                return []
+            matcher = getattr(self, "matcher", None)
+            if matcher is None or not hasattr(matcher, "find_jump_forward_string"):
+                return []
+            try:
+                jump_str = matcher.find_jump_forward_string()
+            except Exception:
+                return []
+            if not jump_str:
+                return []
+
+            try:
+                jump_tokens = tokenizer.encode(jump_str, add_special_tokens=False)
+            except Exception:
+                return []
+            if not jump_tokens:
+                return []
+
+            # Bidirectional validation: verify that the grammar matcher accepts each token in jump_tokens
+            accepted_count = 0
+            for t in jump_tokens:
+                if matcher.accept_token(t):
+                    accepted_count += 1
+                    self.num_processed_tokens += 1
+                else:
+                    break
+
+            if accepted_count != len(jump_tokens):
+                if accepted_count > 0:
+                    self.rollback(accepted_count)
+                return []
+
+            self._is_terminated = matcher.is_terminated()
+            return jump_tokens
+
+        backend_xgrammar.XgrammarGrammar.try_jump_forward = try_jump_forward
+
+        # 3. Patch Scheduler.update_from_output to append jump tokens and propagate them
+        from vllm.v1.core.sched.scheduler import Scheduler, check_stop
+
+        orig_update_from_output = Scheduler.update_from_output
+
+        def patched_update_from_output(self, scheduler_output, model_runner_output):
+            engine_core_outputs = orig_update_from_output(
+                self, scheduler_output, model_runner_output
+            )
+
+            # Check for jump decoding on active structured output requests
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                struct_req = request.structured_output_request
+                if struct_req is None or struct_req.grammar is None:
+                    continue
+                grammar = struct_req.grammar
+                if hasattr(grammar, "try_jump_forward"):
+                    jump_tokens = grammar.try_jump_forward()
+                    if jump_tokens:
+                        logger.info(
+                            "⚡ [JumpDecoding SUCCESS] Fast-Forward Triggered! "
+                            "Request: %s -> Jumping %d Tokens: %s",
+                            req_id,
+                            len(jump_tokens),
+                            jump_tokens,
+                        )
+                        jump_stopped = False
+                        valid_jump_tokens = []
+                        for output_token_id in jump_tokens:
+                            request.append_output_token_ids(output_token_id)
+                            valid_jump_tokens.append(output_token_id)
+                            jump_stopped = check_stop(request, self.max_model_len)
+                            if jump_stopped:
+                                break
+
+                        if jump_stopped:
+                            finished = self._handle_stopped_request(request)
+                            if finished:
+                                self._free_request(request)
+
+                        for client_outs in engine_core_outputs.values():
+                            for out in client_outs.outputs:
+                                if out.request_id == req_id:
+                                    out.new_token_ids.extend(valid_jump_tokens)
+                                    if jump_stopped:
+                                        out.finish_reason = (
+                                            request.get_finished_reason()
+                                        )
+                                    break
+            return engine_core_outputs
+
+        Scheduler.update_from_output = patched_update_from_output
+
+        backend_xgrammar._tpu_jump_decoding_patched = True
+        logger.info(
+            "Applied TPU patch: structured jump decoding scheduler integration."
+        )
+    except Exception as e:
+        logger.warning("Failed to patch structured jump decoding: %s", e)
+
+
 def _patch_vllm_vocab_parallel_embedding() -> None:
     """Register shard index bounds as module buffers in VocabParallelEmbedding.
 

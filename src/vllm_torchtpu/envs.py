@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_ENABLE_JUMP_DECODING: bool = True
     MLA_XPOSE_N_TILE_SIZE: int = 160
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
@@ -448,6 +449,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Deterministic grammar jump-forward decoding for structured outputs.
+    "VLLM_TPU_ENABLE_JUMP_DECODING":
+    env_bool("VLLM_TPU_ENABLE_JUMP_DECODING", True),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

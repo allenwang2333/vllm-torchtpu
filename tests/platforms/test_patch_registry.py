@@ -200,6 +200,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
+        "_patch_vllm_structured_jump_decoding",
         "_patch_vllm_hybrid_producer_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
