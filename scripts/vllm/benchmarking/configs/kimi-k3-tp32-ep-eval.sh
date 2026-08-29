@@ -30,17 +30,27 @@ GPU_MEMORY_UTILIZATION=0.7
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
 
-# The Kimi-K3 checkpoint ships no chat_template (tokenizer_config.json has
-# tokenizer_class=TikTokenTokenizer and no template key), so the OpenAI
-# /v1/chat/completions route lm_eval drives has nothing to render with.
-# Supply the text-only template explicitly.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --chat-template scripts/kimi_k3_text_chat_template.jinja"
+# Do NOT add --chat-template. The checkpoint ships no Jinja template on
+# purpose: vLLM maps KimiK3ForConditionalGeneration to
+# tokenizer_mode="kimi_k3" (vllm/config/model.py), whose renderer builds chat
+# prompts with the checkpoint's own XTML encoder --
+# TikTokenTokenizer.apply_chat_template -> encoding_k3.build_chat_segments --
+# so structural markers keep their special-token ids. A Jinja override would
+# re-tokenize those markers as ordinary text. --trust-remote-code is what
+# makes that encoder importable.
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184}"
 
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }--trust-remote-code"
 
-# This template renders each turn as a closed <|open|>message ... <|end_of_msg|>
-# block, so lm_eval's default `continue_final_message` few-shot form has no
-# open assistant turn to continue. Take the single-turn path instead.
+# build_chat_segments takes **kwargs and ignores what it does not know, so
+# lm_eval's `continue_final_message` is dropped silently and the
+# few-shot-as-multiturn form renders with the final assistant turn CLOSED --
+# nothing for the model to continue. Take the single-turn path instead.
+#
+# thinking defaults to True with thinking_effort="max", so every eval request
+# would emit a reasoning block; run_eval_flow.sh / k3_accuracy.sh pass
+# chat_template_kwargs {"enable_thinking": false}, which the K3 renderer maps
+# onto thinking=False.
 MMLU_PRO_DISABLE_MULTITURN_ARGS="true"
 LM_EVAL_DISABLE_MULTITURN="true"
 
