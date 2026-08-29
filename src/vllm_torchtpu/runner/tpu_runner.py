@@ -3630,7 +3630,12 @@ class TPUModelRunner(GPUModelRunner):
                             input_ids[s:e] = p_input_ids.to(
                                 device=self.device, dtype=input_ids.dtype
                             )
-                        req_info.update(update_dict)
+                        if isinstance(update_dict, dict):
+                            for uk, uv in update_dict.items():
+                                if isinstance(uv, dict) and isinstance(req_info.get(uk), dict):
+                                    req_info[uk].update(uv)
+                                else:
+                                    req_info[uk] = uv
                         self.model_intermediate_buffer[req_id] = req_info
                     except Exception as e:
                         logger.warning("[TPURunner] preprocess failed for req %s: %s", req_id, e)
