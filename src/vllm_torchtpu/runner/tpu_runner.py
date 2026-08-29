@@ -2601,16 +2601,43 @@ class TPUModelRunner(GPUModelRunner):
         # Omni additional_information decoding and lifecycle management
         if not hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer = {}
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            add_info = getattr(new_req_data, "additional_information", None)
-            if add_info is not None:
-                try:
-                    from vllm_omni.utils.serialization import deserialize_additional_information
-                    info_dict = deserialize_additional_information(add_info)
-                    if info_dict:
-                        self.model_intermediate_buffer[new_req_data.req_id] = info_dict
-                except Exception as e:
-                    logger.debug("[TPURunner] deserialize_additional_information: %s", e)
+
+        def _merge_dict(target: dict, source: dict):
+            for k, v in source.items():
+                if isinstance(v, dict) and isinstance(target.get(k), dict):
+                    _merge_dict(target[k], v)
+                else:
+                    target[k] = v
+
+        def _deserialize(payload):
+            if payload is None:
+                return {}
+            if isinstance(payload, dict):
+                return payload
+            try:
+                from vllm_omni.engine.serialization import deserialize_additional_information
+                return deserialize_additional_information(payload)
+            except Exception as e:
+                logger.warning("[TPURunner] deserialize_additional_information error: %s", e)
+                return {}
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            payload_info = getattr(new_req, "additional_information", None)
+            decoded_info = _deserialize(payload_info)
+            if decoded_info:
+                existing = self.model_intermediate_buffer.setdefault(req_id, {})
+                _merge_dict(existing, decoded_info)
+
+        if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
+            cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
+            if isinstance(cached_infos, dict):
+                for req_id, req_infos in cached_infos.items():
+                    decoded_info = _deserialize(req_infos)
+                    if decoded_info:
+                        existing = self.model_intermediate_buffer.setdefault(req_id, {})
+                        _merge_dict(existing, decoded_info)
+
         for finished_req_id in scheduler_output.finished_req_ids:
             self.model_intermediate_buffer.pop(finished_req_id, None)
 
