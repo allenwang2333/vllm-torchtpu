@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_DSA_VMEM_LIMIT: int | None = None
     TPU_STREAMIDX_KV_PAGES_PER_BLOCK: str = ""
     TPU_STREAMIDX_QUERIES_PER_BLOCK: str = ""
+    TPU_STREAMIDX_TRIM_TOPK: bool = False
 
 
 def env_with_choices(
@@ -437,6 +438,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("TPU_STREAMIDX_KV_PAGES_PER_BLOCK") or "").strip(),
     "TPU_STREAMIDX_QUERIES_PER_BLOCK":
     lambda: (os.getenv("TPU_STREAMIDX_QUERIES_PER_BLOCK") or "").strip(),
+    # Run streamindex_topk's exact top-k over only the columns a sequence can
+    # actually span (pages_per_seq * page_size) instead of over the whole
+    # align_to()-padded scores buffer. Exact, not an approximation -- the
+    # dropped columns are pre-filled -inf and never written. Off by default so
+    # it is an A/B, not a silent change: see streamindex_topk.py.
+    "TPU_STREAMIDX_TRIM_TOPK":
+    env_bool("TPU_STREAMIDX_TRIM_TOPK"),
 }
 
 

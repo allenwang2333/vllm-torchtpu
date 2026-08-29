@@ -22,6 +22,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+import vllm_torchtpu.envs as envs
+
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -489,6 +491,7 @@ def prepare_outputs(out):
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "trim_topk",
     ),
 )
 def streamindex_topk(
@@ -507,6 +510,7 @@ def streamindex_topk(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    trim_topk: bool | None = None,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -528,6 +532,12 @@ def streamindex_topk(
     num_queries_per_block: number of queries to be processed in one block in the
       pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
+    decode_req_batch_size: number of decode sequences batched per kernel grid
+      step.
+    trim_topk: run the final exact top-k over only the columns a sequence can
+      span rather than over the whole align_to()-padded scores buffer. Exact
+      either way. None reads `TPU_STREAMIDX_TRIM_TOPK` at trace time; pass an
+      explicit bool to make it part of the jit cache key.
 
   Returns:
     Top-K indices (in compressed space).
@@ -770,6 +780,24 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
+
+    # `num_sublanes_total` is align_to()-sized so the kernel's per-block writes
+    # cannot overflow the buffer, and it takes the max over the whole
+    # (decode, prefill, mixed) triple. Neither has anything to do with how much
+    # of the buffer holds real scores: a sequence spans at most
+    # `pages_per_seq * page_size` tokens, everything past that was pre-filled
+    # -inf above and is never written with a finite value. Sorting it is pure
+    # padding cost -- at pages_per_seq=9, page_size=1024, bkv_p=8 the exact
+    # top-k below runs over 16384 columns for 9216 columns of data.
+    #
+    # Slicing is exact, not an approximation: the retained columns keep their
+    # indices, and every dropped column compares -inf.
+    if trim_topk is None:
+        trim_topk = envs.TPU_STREAMIDX_TRIM_TOPK
+    real_num_scores = pages_per_seq * page_size
+    if trim_topk and real_num_scores < scores.shape[1]:
+        scores = scores[:, :real_num_scores]
+
     if scores.shape[1] < k:
         scores = jnp.pad(
             scores,

@@ -79,6 +79,12 @@ STREAMIDX_NUM_KV_PAGES_PER_BLOCK = _streamidx_block_size(
 STREAMIDX_NUM_QUERIES_PER_BLOCK = _streamidx_block_size(
     envs.TPU_STREAMIDX_QUERIES_PER_BLOCK, 32)
 
+# Resolved here rather than left to the kernel's own fallback so the value is
+# part of the jit cache key on this path -- the kernel reads the env at trace
+# time, which is correct for a server that sets it once at start but stale for
+# anything that flips it inside one process.
+STREAMIDX_TRIM_TOPK = envs.TPU_STREAMIDX_TRIM_TOPK
+
 
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
@@ -139,6 +145,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
                 num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
+                trim_topk=STREAMIDX_TRIM_TOPK,
             )
             return cache_kv, topk_indices
 

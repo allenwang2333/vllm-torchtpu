@@ -292,6 +292,7 @@ def test_streamindex_topk_shape(
         (1, [1], [200], 128, 4, 1, 16, 1024, 1, 8, 1, [[1, 0]]),
     ],
 )
+@pytest.mark.parametrize("trim_topk", [False, True])
 def test_streamindex_topk_numerical_correctness(
     B,
     T_list,
@@ -305,6 +306,7 @@ def test_streamindex_topk_numerical_correctness(
     bq_sz,
     bkv_p,
     block_table_list,
+    trim_topk,
 ):
     """Executes randomized input data against a naive NumPy ground truth."""
     print(f"\n{'='*60}")
@@ -409,7 +411,19 @@ def test_streamindex_topk_numerical_correctness(
         compression_ratio=comp_ratio,
         num_kv_pages_per_block=bkv_p,
         num_queries_per_block=bq_sz,
+        trim_topk=trim_topk,
     )
+
+    # `trim_topk` drops the align_to() padding from the final exact top-k. It
+    # only engages where pages_per_seq is not a multiple of bkv_p, so say which
+    # rows actually cover it rather than letting an inert row look like
+    # evidence.
+    pages_per_seq = len(page_indices) // len(seq_lens)
+    padded = ((pages_per_seq + bkv_p - 1) // bkv_p) * bkv_p
+    print(f"trim_topk={trim_topk}: pages_per_seq={pages_per_seq} bkv_p={bkv_p}"
+          f" -> sorted columns {padded * page_size} vs"
+          f" {pages_per_seq * page_size}"
+          f" ({'ENGAGED' if padded > pages_per_seq else 'inert'})")
 
     actual_topk_np = np.array(actual_topk)
 

@@ -88,6 +88,43 @@ def _probe(env_overrides: dict[str, str]) -> str:
     return out.stdout.strip().splitlines()[-1]
 
 
+_TRIM_PROBE = (
+    "from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import "
+    "STREAMIDX_TRIM_TOPK as t; print(repr(t))")
+
+
+def _trim_probe(value: str | None) -> str:
+    env = {
+        k: v
+        for k, v in os.environ.items() if k != "TPU_STREAMIDX_TRIM_TOPK"
+    }
+    if value is not None:
+        env["TPU_STREAMIDX_TRIM_TOPK"] = value
+    out = subprocess.run([sys.executable, "-c", _TRIM_PROBE],
+                         capture_output=True,
+                         text=True,
+                         env=env,
+                         timeout=600)
+    assert out.returncode == 0, out.stderr[-4000:]
+    return out.stdout.strip().splitlines()[-1]
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, "False"),
+    ("0", "False"),
+    ("1", "True"),
+])
+def test_trim_topk_env_reaches_the_module_constant(value, expected):
+    """`TPU_STREAMIDX_TRIM_TOPK` must default off and be readable at import.
+
+    Off by default is the load-bearing half: the trim is an A/B against the
+    padded-sort baseline, and every other arm in flight shares this source
+    tree via --map-dir. An unset environment must reproduce the old behaviour
+    exactly or those arms stop being comparable to their baseline.
+    """
+    assert _trim_probe(value) == expected
+
+
 @pytest.mark.parametrize("overrides, expected", [
     ({}, f"({UNTUNED_KV_PAGES}, {UNTUNED_QUERIES})"),
     ({
