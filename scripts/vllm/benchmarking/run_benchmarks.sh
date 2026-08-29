@@ -138,6 +138,10 @@ EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 # so a config can tell "unset" from "forced by the operator".
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+# Drop lm_eval's few-shot-as-multiturn form for EVERY task, not just
+# mmlu_pro. Needed by chat templates that close each turn and so leave
+# no open assistant turn for `continue_final_message` to continue.
+LM_EVAL_DISABLE_MULTITURN=false
 EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
 # check_regression.py still apply). Raise per config for noisier layouts.
@@ -508,6 +512,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "lm_eval_disable_multiturn": $LM_EVAL_DISABLE_MULTITURN,
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }

@@ -122,7 +122,8 @@ run_lm_eval() {
                 --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
                 --apply_chat_template
             )
-            if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
+            if [ "$LM_EVAL_DISABLE_MULTITURN" = "true" ] || \
+               { [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; }; then
                 lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
             else
                 lm_eval_args+=(--fewshot_as_multiturn true)
@@ -232,6 +233,7 @@ BENCH_ARGS+=(--port "$PORT")
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
+LM_EVAL_DISABLE_MULTITURN=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("lm_eval_disable_multiturn", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("perf_tolerance", 0.05))' "$RESULTS_DIR/config.json")
 
