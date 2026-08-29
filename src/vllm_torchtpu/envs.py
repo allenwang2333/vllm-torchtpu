@@ -62,6 +62,11 @@ if TYPE_CHECKING:
     TPU_MOE_EXPERT_PERM_URI: str = ""
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
+    TPU_DSA_GATHER_CHUNK: int | None = None
+    TPU_DSA_ATTN_BATCH: int | None = None
+    TPU_DSA_VMEM_LIMIT: int | None = None
+    TPU_STREAMIDX_KV_PAGES_PER_BLOCK: str = ""
+    TPU_STREAMIDX_QUERIES_PER_BLOCK: str = ""
 
 
 def env_with_choices(
@@ -413,6 +418,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # GLM-5.2 DSA block-tuning knobs. These override the kernel defaults in
+    # kernels/mla/sparse/kernel.py and custom_ops/mla_attention_op.py, which
+    # are first-fit values rather than the result of a sweep. Unset means
+    # "use the kernel default", so every one of these is inert until set.
+    # They are `static_argnames` on the jitted kernels, so a change triggers a
+    # recompile -- set them once at server start, not per request.
+    "TPU_DSA_GATHER_CHUNK":
+    env_optional_int("TPU_DSA_GATHER_CHUNK"),
+    "TPU_DSA_ATTN_BATCH":
+    env_optional_int("TPU_DSA_ATTN_BATCH"),
+    "TPU_DSA_VMEM_LIMIT":
+    env_optional_int("TPU_DSA_VMEM_LIMIT"),
+    # streamindex_topk takes these either as one int or as a (decode, prefill,
+    # mixed) triple, and the three cases want different values -- so these are
+    # read as strings: "8" or "8,16,8". Parsed in mla_attention_op.py.
+    "TPU_STREAMIDX_KV_PAGES_PER_BLOCK":
+    lambda: (os.getenv("TPU_STREAMIDX_KV_PAGES_PER_BLOCK") or "").strip(),
+    "TPU_STREAMIDX_QUERIES_PER_BLOCK":
+    lambda: (os.getenv("TPU_STREAMIDX_QUERIES_PER_BLOCK") or "").strip(),
 }
 
 

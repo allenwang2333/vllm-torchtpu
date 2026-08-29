@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
@@ -48,11 +49,34 @@ from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.utils import synchronize_tensors
 
+def _streamidx_block_size(raw: str, default: int) -> int | tuple[int, int, int]:
+    """Parse a `TPU_STREAMIDX_*` override.
+
+    `streamindex_topk` takes these either as one int or as a
+    `(decode, prefill, mixed)` triple, and the three cases do not want the same
+    value -- so the env carries either form: `"8"` or `"8,16,8"`. Empty means
+    "use the default", which reproduces the untuned constant exactly.
+    """
+    if not raw:
+        return default
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) != 3:
+        raise ValueError(
+            f"expected 1 or 3 comma-separated ints (decode,prefill,mixed), "
+            f"got {raw!r}")
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+
 # streamindex_topk block-tuning knobs. NOT tuned: these are the first values
 # found to fit, not the result of a sweep -- benchmark before reading anything
-# into the kernel's throughput.
-STREAMIDX_NUM_KV_PAGES_PER_BLOCK = 8
-STREAMIDX_NUM_QUERIES_PER_BLOCK = 32
+# into the kernel's throughput. `TPU_STREAMIDX_*` override them so a sweep can
+# be run without a rebuild; unset reproduces the values below exactly.
+STREAMIDX_NUM_KV_PAGES_PER_BLOCK = _streamidx_block_size(
+    envs.TPU_STREAMIDX_KV_PAGES_PER_BLOCK, 8)
+STREAMIDX_NUM_QUERIES_PER_BLOCK = _streamidx_block_size(
+    envs.TPU_STREAMIDX_QUERIES_PER_BLOCK, 32)
 
 
 @SparseAttnIndexer.register_oot

@@ -14,7 +14,9 @@ per layer, and apply it at weight load:
 * physical (checkpoint) expert ``g`` is stored in slot ``pi[g] % local`` on
   rank ``pi[g] // local`` -- expressed as a permuted ``expert_map``, which is
   what the weight loader consults;
-* row ``pi[g]`` of the router gate gets physical expert ``g``'s row.
+* row ``pi[g]`` of the router gate gets physical expert ``g``'s row -- and so
+  does entry ``pi[g]`` of any per-expert routing bias, e.g. the
+  ``e_score_correction_bias`` that ``noaux_tc`` adds before top-k.
 
 The two moves cancel: for logit index ``n`` the kernel picks local slot
 ``n - local * ep_rank`` on rank ``n // local``, which holds physical expert
@@ -180,6 +182,7 @@ def permute_router_gates(model: torch.nn.Module) -> None:
     if not perms:
         return
     touched = 0
+    permuted_score_bias = 0
     for name, module in model.named_modules():
         if not name.endswith(".mlp.gate"):
             continue
@@ -201,7 +204,31 @@ def permute_router_gates(model: torch.nn.Module) -> None:
         if bias is not None and bias.shape[0] == perm.shape[0]:
             with torch.no_grad():
                 bias.data = bias.data.index_select(0, inverse).contiguous()
+        # `noaux_tc` routing (DeepSeek-V3/GLM-5.2) adds a per-expert
+        # `e_score_correction_bias` to the scores *before* top-k
+        # (`moe_routing.py`), so it is indexed by expert id exactly like the
+        # gate rows and must move with them -- otherwise the relabelling stops
+        # being a no-op and genuinely changes which experts are selected.
+        # It lives on the gate module but the experts layer captured the same
+        # Parameter object at construction, so mutate `.data` in place; a
+        # rebind would leave the experts layer on the unpermuted tensor.
+        score_bias = getattr(module, "e_score_correction_bias", None)
+        if score_bias is not None:
+            if score_bias.shape[0] != perm.shape[0]:
+                raise ValueError(
+                    f"{name}.e_score_correction_bias has {score_bias.shape[0]} "
+                    f"entries but perm[{idx}] has {perm.shape[0]}")
+            with torch.no_grad():
+                score_bias.data = score_bias.data.index_select(
+                    0, inverse).contiguous()
+            permuted_score_bias += 1
         touched += 1
+    # This module's `logger.info` does not reach the job log; print so the
+    # per-layer counts are actually observable in a benchmark run.
+    print(
+        f"[expert_permutation] permuted router gate rows on {touched} MoE "
+        f"layers ({permuted_score_bias} with e_score_correction_bias)",
+        flush=True)
     logger.info("Permuted router gate rows on %d MoE layers", touched)
     if touched != len(perms):
         raise ValueError(

@@ -53,6 +53,25 @@ mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
+def _sparse_mla_block_overrides() -> dict[str, int]:
+    """Env overrides for the DSA kernel's block-tuning `static_argnames`.
+
+    The kernel's defaults are first-fit values, not a sweep result. Each knob
+    is omitted unless explicitly set, so an unset environment reproduces the
+    kernel signature exactly and cannot perturb the compile cache key.
+    """
+    overrides: dict[str, int] = {}
+    for env_name, kwarg in (
+        ("TPU_DSA_GATHER_CHUNK", "gather_and_attention_chunk_size"),
+        ("TPU_DSA_ATTN_BATCH", "attention_kernel_batch_size"),
+        ("TPU_DSA_VMEM_LIMIT", "vmem_limit_bytes"),
+    ):
+        value = getattr(envs, env_name)
+        if value is not None:
+            overrides[kwarg] = value
+    return overrides
+
+
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
@@ -716,6 +735,7 @@ def sparse_mla_attention(
             request_distribution_,
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
+            **_sparse_mla_block_overrides(),
         )
 
         lkv_dim = ql_nope.shape[-1]
