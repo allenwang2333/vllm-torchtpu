@@ -3619,7 +3619,8 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
-                self._omni_last_hidden_states = hidden_states
+                if getattr(self.model, "model_stage", None) == "code2wav":
+                    self._omni_last_hidden_states = hidden_states
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -4365,33 +4366,12 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector_output=kv_connector_output,
         )
 
-        # Omni multi-modal output propagation (e.g. Code2Wav audio output or make_omni_output)
+        # Omni multi-modal output propagation (strictly for Code2Wav vocoder stage)
         mm_outputs = None
-        if hasattr(self, "_omni_last_hidden_states") and self._omni_last_hidden_states is not None:
-            raw_out = self._omni_last_hidden_states
-            self._omni_last_hidden_states = None
-            if hasattr(self.model, "make_omni_output"):
-                try:
-                    omni_out = self.model.make_omni_output(raw_out)
-                    if hasattr(omni_out, "multimodal_outputs") and omni_out.multimodal_outputs:
-                        raw_mm = omni_out.multimodal_outputs
-                        num_reqs = len(req_ids)
-                        per_req_payloads = []
-                        for i in range(num_reqs):
-                            mm_payload = {}
-                            for k, v in raw_mm.items():
-                                if isinstance(v, list) and len(v) == num_reqs:
-                                    val = v[i]
-                                    mm_payload[k] = val.detach().to("cpu") if hasattr(val, "detach") else val
-                                elif hasattr(v, "detach"):
-                                    mm_payload[k] = v.detach().to("cpu")
-                                else:
-                                    mm_payload[k] = v
-                            per_req_payloads.append(mm_payload)
-                        mm_outputs = per_req_payloads
-                except Exception as e:
-                    logger.debug("make_omni_output pass-through failed: %s", e)
-            elif getattr(self.model, "model_stage", None) == "code2wav":
+        if getattr(self.model, "model_stage", None) == "code2wav":
+            if hasattr(self, "_omni_last_hidden_states") and self._omni_last_hidden_states is not None:
+                raw_out = self._omni_last_hidden_states
+                self._omni_last_hidden_states = None
                 num_reqs = len(req_ids)
                 per_req_payloads = []
                 for i in range(num_reqs):
