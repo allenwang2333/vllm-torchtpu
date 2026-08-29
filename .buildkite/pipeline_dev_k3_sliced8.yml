@@ -1,0 +1,53 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 8-layer surrogate on ONE v7x-8 host. Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_sliced8.yml
+# Boots in ~6 min from GCS, so this is the fast "is the K3 model path alive on
+# this commit" check that does not need the single v7x-32 pod.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":microscope: K3-sliced8 bs=1 (TPU v7x-8)"
+    key: k3_sliced8
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/kimi-k3-sliced8-tp8-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":microscope: K3-sliced8 concurrency 1/4/16 (TPU v7x-8)"
+    key: k3_sliced8_conc
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-sliced8-tp8-ep-conc --results-dir /perf_eval_results/kimi-k3-sliced8-tp8-ep-conc"
+    artifact_paths:
+      - "perf_eval_results/**/*"

@@ -388,9 +388,6 @@ run_benchmark_once() {
     if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
         profile_arg="--profile"
     fi
-    local tokenizer_arg
-    tokenizer_arg=$(bench_tokenizer_args)
-
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
     # Otherwise vllm bench serve sends no temperature and the server's
     # generation_config decides sampling.
@@ -399,9 +396,10 @@ run_benchmark_once() {
         temperature_arg=(--temperature "$BENCHMARK_TEMPERATURE")
     fi
 
-    local tokenizer_arg=()
-    if [ -n "${TOKENIZER:-}" ]; then
-        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    local tokenizer_arg=() tokenizer_path
+    tokenizer_path=$(bench_tokenizer_path)
+    if [ -n "$tokenizer_path" ]; then
+        tokenizer_arg=(--tokenizer "$tokenizer_path")
     fi
 
     set +e
@@ -450,11 +448,14 @@ if [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
     PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
-bench_tokenizer_args() {
-    if [ -n "$BENCH_TOKENIZER" ]; then
-        echo "--tokenizer $BENCH_TOKENIZER"
+# Prints the path, or nothing to let the client resolve MODEL on the hub.
+bench_tokenizer_path() {
+    if [ -n "${TOKENIZER:-}" ]; then
+        echo "$TOKENIZER"
+    elif [ -n "$BENCH_TOKENIZER" ]; then
+        echo "$BENCH_TOKENIZER"
     elif [ -n "$PULLED_TOKENIZER_DIR" ] && [ -f "$PULLED_TOKENIZER_DIR/config.json" ]; then
-        echo "--tokenizer $PULLED_TOKENIZER_DIR"
+        echo "$PULLED_TOKENIZER_DIR"
     elif [ -n "$MODEL_URI" ]; then
         echo "WARNING: pulled dir $PULLED_TOKENIZER_DIR for $MODEL_URI has no config.json; bench client will resolve $MODEL on the hub" >&2
     fi
