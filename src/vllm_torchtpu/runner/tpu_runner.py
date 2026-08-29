@@ -2596,7 +2596,25 @@ class TPUModelRunner(GPUModelRunner):
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
-        return super()._update_states(scheduler_output)
+        ret = super()._update_states(scheduler_output)
+
+        # Omni additional_information decoding and lifecycle management
+        if not hasattr(self, "model_intermediate_buffer"):
+            self.model_intermediate_buffer = {}
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            add_info = getattr(new_req_data, "additional_information", None)
+            if add_info is not None:
+                try:
+                    from vllm_omni.utils.serialization import deserialize_additional_information
+                    info_dict = deserialize_additional_information(add_info)
+                    if info_dict:
+                        self.model_intermediate_buffer[new_req_data.req_id] = info_dict
+                except Exception as e:
+                    logger.debug("[TPURunner] deserialize_additional_information: %s", e)
+        for finished_req_id in scheduler_output.finished_req_ids:
+            self.model_intermediate_buffer.pop(finished_req_id, None)
+
+        return ret
 
     def _modify_prev_results(self):
         if self._pre_async_results is None:
@@ -3574,6 +3592,49 @@ class TPUModelRunner(GPUModelRunner):
 
             input_ids, inputs_embeds = self._get_model_inputs(
                 input_ids, chunk_mm_inputs)
+
+            orig_model = getattr(self.model, "_orig_mod", self.model)
+            chunk_req_ids = self.input_batch.req_ids[start_index:start_index + num_reqs]
+            if getattr(orig_model, "has_preprocess", False):
+                if not hasattr(self, "model_intermediate_buffer"):
+                    self.model_intermediate_buffer = {}
+                req_start_idx = 0
+                for r_i, req_id in enumerate(chunk_req_ids):
+                    num_toks = int(scheduler_output.num_scheduled_tokens[req_id])
+                    req_end_idx = req_start_idx + num_toks
+                    req_info = self.model_intermediate_buffer.get(req_id, {})
+                    num_computed = int(self.input_batch.num_computed_tokens_cpu[start_index + r_i])
+                    req_info["_omni_num_computed_tokens"] = num_computed
+                    req_info["_omni_is_prefill"] = (num_computed == 0)
+                    r_input_ids = input_ids[req_start_idx:req_end_idx] if input_ids is not None else None
+                    r_inputs_embeds = inputs_embeds[req_start_idx:req_end_idx] if inputs_embeds is not None else None
+                    try:
+                        p_input_ids, p_inputs_embeds, update_dict = orig_model.preprocess(
+                            input_ids=r_input_ids,
+                            input_embeds=r_inputs_embeds,
+                            **req_info,
+                        )
+                        if inputs_embeds is None and p_inputs_embeds is not None:
+                            inputs_embeds = torch.zeros(
+                                (input_ids.shape[0], p_inputs_embeds.shape[-1]),
+                                device=self.device,
+                                dtype=p_inputs_embeds.dtype,
+                            )
+                        if p_inputs_embeds is not None:
+                            p_len = min(p_inputs_embeds.shape[0], inputs_embeds.shape[0] - req_start_idx)
+                            inputs_embeds[req_start_idx:req_start_idx + p_len] = p_inputs_embeds[:p_len].to(
+                                device=self.device, dtype=inputs_embeds.dtype
+                            )
+                        if p_input_ids is not None and input_ids is not None and p_input_ids.numel() == (req_end_idx - req_start_idx):
+                            input_ids[req_start_idx:req_end_idx] = p_input_ids.to(
+                                device=self.device, dtype=input_ids.dtype
+                            )
+                        req_info.update(update_dict)
+                        self.model_intermediate_buffer[req_id] = req_info
+                    except Exception as e:
+                        logger.warning("[TPURunner] preprocess failed for req %s: %s", req_id, e)
+                    req_start_idx = req_end_idx
+
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -3621,6 +3682,34 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 self._omni_last_hidden_states = hidden_states
                 self._omni_last_aux_hidden_states = aux_hidden_states
+
+                # Talker MTP code predictor residual token generation
+                if (getattr(orig_model, "has_talker_mtp", False) or hasattr(orig_model, "talker_mtp")) and getattr(orig_model, "talker", None) is not None:
+                    req_start_idx = 0
+                    for r_i, req_id in enumerate(chunk_req_ids):
+                        num_toks = int(scheduler_output.num_scheduled_tokens[req_id])
+                        req_end_idx = req_start_idx + num_toks
+                        req_info = getattr(self, "model_intermediate_buffer", {}).get(req_id, {})
+                        last_talker_hidden, text_step = req_info.get("mtp_inputs", (None, None))
+                        if last_talker_hidden is not None and text_step is not None:
+                            try:
+                                r_inp_ids = input_ids[req_start_idx:req_end_idx] if input_ids is not None else None
+                                r_inp_emb = inputs_embeds[req_start_idx:req_end_idx] if inputs_embeds is not None else None
+                                _, code_predictor_codes = orig_model.talker_mtp(
+                                    r_inp_ids,
+                                    r_inp_emb,
+                                    last_talker_hidden,
+                                    text_step,
+                                )
+                                req_codes = req_info.setdefault("codes", {})
+                                audio_t = code_predictor_codes.detach().to("cpu")
+                                if "audio" in req_codes and isinstance(req_codes["audio"], torch.Tensor):
+                                    req_codes["audio"] = torch.cat([req_codes["audio"], audio_t], dim=0)
+                                else:
+                                    req_codes["audio"] = audio_t
+                            except Exception as e:
+                                logger.warning("[TPURunner] talker_mtp failed for req %s: %s", req_id, e)
+                        req_start_idx = req_end_idx
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -4377,8 +4466,9 @@ class TPUModelRunner(GPUModelRunner):
             if raw_out is not None or aux_out is not None:
                 make_fn = getattr(orig_model, "make_omni_output", getattr(self.model, "make_omni_output", None))
                 model_out = (raw_out, aux_out) if aux_out is not None else raw_out
+                req_infos = [getattr(self, "model_intermediate_buffer", {}).get(rid, {}) for rid in req_ids]
                 try:
-                    omni_out = make_fn(model_out)
+                    omni_out = make_fn(model_out, model_intermediate_buffer=req_infos)
                     if hasattr(omni_out, "multimodal_outputs") and omni_out.multimodal_outputs is not None:
                         raw_mm = omni_out.multimodal_outputs
                     elif isinstance(omni_out, dict):
@@ -4410,11 +4500,15 @@ class TPUModelRunner(GPUModelRunner):
                                             layers_dict[layer_k] = layer_tensor
                                     req_payload["hidden_states"] = {"layers": layers_dict}
                                 elif k == "embed" and isinstance(v, dict):
-                                    req_payload["embed"] = {
-                                        ek: [t.detach().to("cpu") if hasattr(t, "detach") else t for t in ev]
-                                        if isinstance(ev, list) else (ev.detach().to("cpu") if hasattr(ev, "detach") else ev)
-                                        for ek, ev in v.items()
-                                    }
+                                    embed_dict = {}
+                                    for ek, ev in v.items():
+                                        if isinstance(ev, list) and len(ev) > 0 and hasattr(ev[0], "detach"):
+                                            embed_dict[ek] = ev[0].detach().to("cpu")
+                                        elif hasattr(ev, "detach"):
+                                            embed_dict[ek] = ev.detach().to("cpu")
+                                        else:
+                                            embed_dict[ek] = ev
+                                    req_payload["embed"] = embed_dict
                                 elif k in ("audio", "waveform", "audio_waveform", "model_outputs"):
                                     if isinstance(v, list) and i < len(v):
                                         item = v[i]
@@ -4426,10 +4520,10 @@ class TPUModelRunner(GPUModelRunner):
                                 elif k == "codes" and isinstance(v, dict):
                                     codes_dict = {}
                                     for ck, cv in v.items():
-                                        if isinstance(cv, torch.Tensor) and cv.dim() > 1 and i < cv.shape[0]:
-                                            codes_dict[ck] = cv[i:i+1].detach().to("cpu")
+                                        if isinstance(cv, torch.Tensor):
+                                            codes_dict[ck] = cv.detach().to("cpu")
                                         else:
-                                            codes_dict[ck] = cv.detach().to("cpu") if hasattr(cv, "detach") else cv
+                                            codes_dict[ck] = cv
                                     req_payload["codes"] = codes_dict
                                 else:
                                     req_payload[k] = v
