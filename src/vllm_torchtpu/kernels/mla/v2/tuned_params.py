@@ -1214,7 +1214,10 @@ def _mixed_fallback_kv_pages(tuning_key: TuningKey) -> int:
     also gates the kernel's own fast paths, and 16 misses both.
 
     TPU_MLA_MIXED_FALLBACK_BKV_TOKENS sizes the block in tokens instead, so a
-    small page does not imply a small tile. 0 keeps the shipped behaviour.
+    small page does not imply a small tile: "at least this many tokens per KV
+    tile, when the page size allows". At `page >= tokens` one page already
+    clears the bar and this returns 1 -- a correct no-op, not a failure.
+    0 keeps the shipped behaviour.
     """
     tokens = envs.TPU_MLA_MIXED_FALLBACK_BKV_TOKENS
     if tokens <= 0:
