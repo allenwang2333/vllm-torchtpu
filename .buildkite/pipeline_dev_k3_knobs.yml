@@ -1,0 +1,85 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Noise band + cheap-knob matrix for the Kimi-K3 8-layer surrogate. Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_knobs.yml
+#
+# Every K3 A/B on record compares two numbers taken in different builds, and
+# nobody has ever measured what "the same number twice" costs. The two `noise`
+# steps answer that (identical config, 8 server restarts each, two hosts); the
+# two A/B steps run their arms A-B-B-A-A-B-B-A inside ONE job so drift cannot
+# alias onto the arm.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":bar_chart: noise band host A (8 restarts)"
+    key: noise_a
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/noise_a --reps 3 --probe --arms base,base,base,base,base,base,base,base"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":bar_chart: noise band host B (8 restarts)"
+    key: noise_b
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/noise_b --reps 3 --probe --arms base,base,base,base,base,base,base,base"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":gear: XLA flag SET A-B-B-A-A-B-B-A"
+    key: flagset
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/flagset --reps 3 --arms base,flagset,flagset,base,base,flagset,flagset,base"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":floppy_disk: fp8 KV A-B-B-A-A-B-B-A + gsm8k"
+    key: fp8kv
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/fp8kv --reps 3 --probe --gsm8k 100 --gsm8k-cells 1,2,3,4 --arms base,fp8kv,fp8kv,base,base,fp8kv,fp8kv,base"
+    artifact_paths:
+      - "perf_eval_results/**/*"
