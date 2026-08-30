@@ -15,7 +15,19 @@
 # server.log useful while the job is still running.
 set -uo pipefail
 
-WATCH_DIR="${1:-/mnt/disks/persist/perf_eval_results}"
+# The two harnesses do not agree on where the results bind-mount lives:
+# run_in_docker.sh uses /mnt/disks/persist, run_multihost.sh uses $HOME/persist
+# (`PERSIST_ROOT="${HOME}/persist"`). Watching one hard-coded path silently
+# uploads nothing on the other -- so watch every candidate that exists.
+WATCH_DIRS=()
+if [ "$#" -ge 1 ] && [ -n "${1:-}" ]; then
+  WATCH_DIRS=("$1")
+else
+  for _root in "/mnt/disks/persist" "${HOME}/persist" "/var/lib/buildkite-agent/persist"; do
+    [ -d "${_root}/perf_eval_results" ] && WATCH_DIRS+=("${_root}/perf_eval_results")
+  done
+fi
+WATCH_DIR="${WATCH_DIRS[0]:-/mnt/disks/persist/perf_eval_results}"
 DEST_DIR="${2:-perf_eval_results}"
 INTERVAL="${3:-60}"
 # The harness wipes the persistent results dir on the way in; wait past that so
@@ -30,8 +42,10 @@ command -v buildkite-agent >/dev/null || {
 }
 
 sleep "$START_DELAY"
+echo "incremental_artifact_upload: watching ${WATCH_DIRS[*]:-$WATCH_DIR}"
 while true; do
-  [ -d "$WATCH_DIR" ] || { sleep "$INTERVAL"; continue; }
+  for WATCH_DIR in "${WATCH_DIRS[@]:-$WATCH_DIR}"; do
+  [ -d "$WATCH_DIR" ] || continue
   while IFS= read -r -d '' src; do
     rel="${src#"$WATCH_DIR"/}"
     stamp=$(stat -c '%Y %s' "$src" 2>/dev/null) || continue
@@ -44,5 +58,6 @@ while true; do
       echo "incremental_artifact_upload: $rel"
     fi
   done < <(find "$WATCH_DIR" -type f -print0 2>/dev/null)
+  done
   sleep "$INTERVAL"
 done
