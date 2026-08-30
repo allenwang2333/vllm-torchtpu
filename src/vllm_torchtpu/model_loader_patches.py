@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""EP-sharded weight streaming for the Run:AI model-streamer load path.
+"""EP-sharded weight filtering for the Run:AI streamer and DefaultModelLoader.
 
 vLLM's ``--enable-ep-weight-filter`` skips non-local expert tensors during
 loading, but only in ``DefaultModelLoader`` (local files) and only for
@@ -328,8 +328,7 @@ def patch_default_loader_ep_weight_filter() -> None:
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
     """
-    from vllm.model_executor.model_loader import (ep_weight_filter,
-                                                  weight_utils)
+    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
 
     if getattr(weight_utils, "_tpu_ep_filter_patch", False):
         return
