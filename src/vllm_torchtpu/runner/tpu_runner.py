@@ -3716,7 +3716,14 @@ class TPUModelRunner(GPUModelRunner):
                 self._omni_last_aux_hidden_states = aux_hidden_states
 
                 # Talker MTP code predictor residual token generation
-                if (getattr(orig_model, "has_talker_mtp", False) or hasattr(orig_model, "talker_mtp")) and getattr(orig_model, "talker", None) is not None:
+                has_mtp = (
+                    getattr(orig_model, "has_talker_mtp", False)
+                    or hasattr(orig_model, "talker_mtp")
+                    or hasattr(getattr(orig_model, "talker", None), "talker_mtp")
+                )
+                if has_mtp:
+                    talker_obj = getattr(orig_model, "talker", orig_model)
+                    mtp_fn = getattr(orig_model, "talker_mtp", getattr(talker_obj, "talker_mtp", None))
                     for r_i, req_id in enumerate(chunk_req_ids):
                         s = int(self.query_start_loc_np[start_index + r_i])
                         e = int(self.query_start_loc_np[start_index + r_i + 1])
@@ -3726,7 +3733,7 @@ class TPUModelRunner(GPUModelRunner):
                             try:
                                 r_inp_ids = preprocess_input_ids[s:e] if preprocess_input_ids is not None else None
                                 r_inp_emb = inputs_embeds[s:e] if inputs_embeds is not None else None
-                                _, code_predictor_codes = orig_model.talker_mtp(
+                                _, code_predictor_codes = mtp_fn(
                                     r_inp_ids,
                                     r_inp_emb,
                                     last_talker_hidden,
