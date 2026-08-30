@@ -13,18 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Sweep: restart the server per concurrency.
-# Usage: bash sweep.sh
+# Unified Sweep Benchmark Runner
+# Supports:
+#   1. Standalone Single-Host VM mode (default): runs server in background and executes benchmarks locally.
+#   2. Dual-Pod / Cloud-Native mode:
+#      - Server Pod: bash sweep.sh --server [ISL] [OSL] [CONC]
+#      - Client Pod: bash sweep.sh --client
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8000}"
-READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
+HOST="${HOST:-0.0.0.0}"
+VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
+VLLM_URL="${VLLM_URL:-http://${VLLM_HOST}:${PORT}}"
+READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers cold compiles)
 
 # "ISL:OSL" pairs to sweep, and the concurrencies to run for each.
 # Both are overridable via env so per-point jobs can each own a slice.
 read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
-read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256}"
+read -r -a CONCS <<< "${CONCS:-${CLIENT_CONCURRENCIES:-4 8 16 32 64 128 256}}"
+
 # Sharding per swept point, keyed by "ISL,OSL,CONC" (every point listed).
 # Low concurrency runs TP8_EP, higher concurrency runs DP4TP2_EP.
 declare -A SHARDING_TABLE=(
@@ -37,6 +45,95 @@ declare -A SHARDING_TABLE=(
   [8192,1024,256]=DP4TP2_EP
 )
 
+ROLE="${1:-all}"
+
+# Query point configuration from sharding table
+if [ "$ROLE" = "--point-config" ]; then
+  key="${2:-8192},${3:-1024},${4:-64}"
+  echo "${SHARDING_TABLE[$key]:-}"
+  exit 0
+fi
+
+# =============================================================================
+# Role Mode 1: Server Pod (Dedicated TPU Pod in Dual-Pod Architecture)
+# =============================================================================
+if [ "$ROLE" = "--server" ]; then
+  # Determine point configuration parameters from CLI args or environment
+  if [ -z "${ISL:-}" ] || [ -z "${OSL:-}" ]; then
+    first_wl="${WORKLOADS[0]:-8192:1024}"
+    ISL="${first_wl%%:*}"
+    OSL="${first_wl#*:}"
+  fi
+  ISL="${2:-${ISL:-8192}}"
+  OSL="${3:-${OSL:-1024}}"
+  CONC="${4:-${CONC:-64}}"
+
+  # Automatically resolve sharding from SHARDING_TABLE if not explicitly set
+  if [ -z "${SHARDING:-}" ]; then
+    SHARDING="${SHARDING_TABLE[$ISL,$OSL,$CONC]:-TP8_EP}"
+  fi
+
+  echo "============================================================"
+  echo "=== Running in Server Mode (TPU Pod) ==="
+  echo "=== Workload: ISL=$ISL, OSL=$OSL, Target Max Concurrency: $CONC ==="
+  echo "=== Host: $HOST, Port: $PORT, Resolved Sharding: $SHARDING ==="
+  echo "============================================================"
+  export HOST="$HOST"
+  export PORT="$PORT"
+  export ISL="$ISL"
+  export OSL="$OSL"
+  export CONC="$CONC"
+  export SHARDING="$SHARDING"
+  exec bash "${SCRIPT_DIR}/server.sh"
+fi
+
+# =============================================================================
+# Role Mode 2: Client Pod (Dedicated CPU Benchmark Pod in Dual-Pod Architecture)
+# =============================================================================
+if [ "$ROLE" = "--client" ]; then
+  echo "============================================================"
+  echo "=== Running in Client Mode (CPU Benchmark Pod) ==="
+  echo "=== Target URL: $VLLM_URL ==="
+  echo "=== Workloads: ${WORKLOADS[*]} ==="
+  echo "=== Concurrencies: ${CONCS[*]} ==="
+  echo "============================================================"
+
+  # Wait for remote server to become healthy
+  echo "Waiting for vLLM server to become healthy at ${VLLM_URL}/health..."
+  waited=0
+  if [ "${DRY_RUN:-0}" != "1" ]; then
+  until curl -sf "${VLLM_URL}/health" >/dev/null 2>until curl -sf "${VLLM_URL}/health" >/dev/null 2>&1; do1; do
+    sleep 5
+    waited=$((waited + 5))
+    if [ "$waited" -ge "$READY_TIMEOUT" ]; then
+      echo "ERROR: vLLM server not ready at ${VLLM_URL} after ${READY_TIMEOUT}s" >&2
+      exit 1
+    fi
+  done
+  echo "--- vLLM server is healthy and ready! Starting client sweeps ---"
+fi
+
+  overall_client_exit=0
+  for wl in "${WORKLOADS[@]}"; do
+    export ISL="${wl%%:*}" OSL="${wl#*:}"
+    for CONC in "${CONCS[@]}"; do
+      export CONC
+      echo "########## Client Benchmark: ISL=$ISL OSL=$OSL CONC=$CONC ##########"
+      BENCH_LOG="/tmp/qwen3.5_sweep_bench_isl${ISL}_osl${OSL}_conc${CONC}_$(date +%m%d-%H%M).log"
+      echo "--- benchmark (log: $BENCH_LOG) ---"
+      if ! VLLM_URL="$VLLM_URL" bash "${SCRIPT_DIR}/bench.sh" 2>&1 | tee -a "$BENCH_LOG"; then
+        echo "ERROR: benchmark failed for ISL=$ISL OSL=$OSL CONC=$CONC" >&2
+        overall_client_exit=1
+      fi
+    done
+  done
+  echo "########## Client sweep complete (exit: $overall_client_exit) ##########"
+  exit "$overall_client_exit"
+fi
+
+# =============================================================================
+# Role Mode 3: Standalone Single-Host VM Mode (Default backward-compatible)
+# =============================================================================
 VLLM_PROCS='vllm serve|VLLM::'
 
 stop_server() {
@@ -65,7 +162,7 @@ stop_server() {
 start_server() {
   SERVER_LOG="/tmp/qwen3.5_sweep_server_isl${ISL}_osl${OSL}_conc${CONC}_$(date +%m%d-%H%M).log"
   echo "--- starting server SHARDING=$1 ISL=$ISL OSL=$OSL CONC=$CONC (log: $SERVER_LOG) ---"
-  SHARDING="$1" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
+  HOST="$HOST" PORT="$PORT" SHARDING="$1" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
   SERVER_PID=$!
   local waited=0
   until grep -q "Application startup complete" "$SERVER_LOG" 2>/dev/null; do

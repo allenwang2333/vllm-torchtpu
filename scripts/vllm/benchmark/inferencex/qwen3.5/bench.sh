@@ -15,8 +15,11 @@
 
 set -euo pipefail
 
-MODEL=Qwen/Qwen3.5-397B-A17B-FP8
+MODEL="${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
 PORT="${PORT:-8000}"
+VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
+VLLM_URL="${VLLM_URL:-http://${VLLM_HOST}:${PORT}}"
+
 # Matching InferenceX's Qwen3.5 benchmarks.
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
 if [ -z "${INFERENCEX_REPO:-}" ]; then
@@ -32,7 +35,8 @@ ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-64}"
 
-num_prompts=$((CONC * 10))
+num_prompts="${NUM_PROMPTS:-$((CONC * 10))}"
+num_warmups="${NUM_WARMUPS:-$((2 * CONC))}"
 STAMP="$(date +%m%d-%H%M)"   # month-day-hour-minute
 
 mkdir -p "$RESULT_DIR"
@@ -40,7 +44,7 @@ benchmark_cmd=(
   python3 "$BENCH_CLIENT"
   --model "$MODEL"
   --backend vllm
-  --base-url "http://0.0.0.0:${PORT}"
+  --base-url "${VLLM_URL}"
   --dataset-name random
   --random-input-len "$ISL"
   --random-output-len "$OSL"
@@ -50,13 +54,30 @@ benchmark_cmd=(
   --request-rate inf
   --ignore-eos
   --save-result
-  --num-warmups "$((2 * CONC))"
+  --num-warmups "$num_warmups"
   --percentile-metrics 'ttft,tpot,itl,e2el'
   --result-dir "$RESULT_DIR"
   --result-filename "qwen3.5_isl${ISL}_osl${OSL}_conc${CONC}_${STAMP}.json"
   --use-chat-template
 )
 
+# Start profiling if requested via environment
+if [ "${ENABLE_XPROF:-false}" = "true" ] || [ "${ENABLE_PERFETTO:-false}" = "true" ]; then
+  echo "--- Triggering profiler start at ${VLLM_URL}/start_profile ---"
+  curl -sf -X POST "${VLLM_URL}/start_profile" || true
+fi
+
+[ "${DRY_RUN:-0}" = "1" ] && { echo "=== DRY RUN ${benchmark_cmd[*]} ==="; exit 0; }
 set -x
 "${benchmark_cmd[@]}"
+bench_exit=$?
 set +x
+
+# Stop profiling if requested via environment
+if [ "${ENABLE_XPROF:-false}" = "true" ] || [ "${ENABLE_PERFETTO:-false}" = "true" ]; then
+  echo "--- Triggering profiler stop at ${VLLM_URL}/stop_profile ---"
+  curl -sf -X POST "${VLLM_URL}/stop_profile" || true
+  sleep 5
+fi
+
+exit $bench_exit
