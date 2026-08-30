@@ -68,6 +68,20 @@ arm_env() {
     # workload. tunehit selects the table row, tunemiss falls back.
     tunehit)  echo "MAX_MODEL_LEN=32768" ;;
     tunemiss) echo "MAX_MODEL_LEN=33024" ;;
+    # Rungs of kimi-k3-sliced8-tp8-ladder. L0 reproduces the shipped
+    # kimi-k3-sliced8-tp8-ep; each later rung adds one serve knob. Only L4
+    # presents a key that `tuned_params.py:1122` can match.
+    L0_ship)  ;;
+    L1_blk256)
+      printf '%s\n' "K3_BLOCK_SIZE=256" ;;
+    L2_tok4096)
+      printf '%s\n' "MAX_NUM_BATCHED_TOKENS=4096" "K3_COMPILE_SIZES=[16,4096]" ;;
+    L3_both)
+      printf '%s\n' "MAX_NUM_BATCHED_TOKENS=4096" "K3_COMPILE_SIZES=[16,4096]" \
+                     "K3_BLOCK_SIZE=256" ;;
+    L4_hit)
+      printf '%s\n' "MAX_NUM_BATCHED_TOKENS=4096" "K3_COMPILE_SIZES=[16,4096]" \
+                     "K3_BLOCK_SIZE=256" "MAX_NUM_SEQS=8" "MAX_MODEL_LEN=32768" ;;
     *) echo "__UNKNOWN_ARM__" ;;
   esac
 }
