@@ -43,13 +43,23 @@
 #     num_kv_pages_per_block=16) than the surrogate (:1122, q_split=1,
 #     num_kv_pages_per_block=4), so the size need not transfer -- hence a
 #     range, not a point.
-# P3  TPOT, hit vs miss: |delta| < 2%. No batched_decode row in the table has
-#     3 q-heads, so decode runs untuned in BOTH arms. A large TPOT delta would
-#     falsify the whole reading of the key.
-# P4  ABSOLUTE TTFT of `podhit` vs the calibrated nightly (BK #289, 4488.3 ms
-#     at mnbt 512 / block 16 / KV auto): 1200-2600 ms. This bundles the rig
-#     change (chunk 512->8192, block 16->256, fp8 KV) with the tuned row and
-#     is the number that decides whether the recipe is worth shipping.
+# P3  FALSIFIER, not a prediction of a null. No batched_decode row in the
+#     table has 3 q-heads, so decode runs untuned in BOTH arms and the arms
+#     should differ only in prefill. A TPOT delta ABOVE 3% (well outside the
+#     measured 2.05% one-cell resolution) therefore refutes the reading of the
+#     key that this whole config is built on -- something other than the mixed
+#     row changed. A small TPOT delta confirms nothing, because it is equally
+#     consistent with noise; only the large-delta branch carries information.
+# P4  ABSOLUTE TTFT, stated against the RIGHT control. Lane B (BK #311) has
+#     already measured `--block-size 256` alone on the real model: TTFT
+#     4488.3 -> 2577.3 ms (-42.6%), 4 distinct keys MISSED / 0 hit. This rig
+#     carries block 256 too, so quoting against the 4488.3 nightly would
+#     silently absorb B's win. The marginal prediction over B's result:
+#       podmiss (block 256 + 8192-tok chunks + fp8 KV, still fallback)
+#         1400-2200 ms, i.e. a further -15% to -45% beyond 2577.3
+#       podhit  (same, tuned row selected)  1000-1900 ms
+#     Lane D's own contribution is P2, the hit-vs-miss delta INSIDE this build,
+#     where both arms carry block 256 and differ in one flag.
 # P5  Completed 5/5 in every cell, and no NaN/garbage: `--kv-cache-dtype fp8`
 #     has never run on the real K3.
 #
@@ -58,11 +68,20 @@
 # resolves ~1.0%. Anything inside that is NOT SIGNIFICANT.
 # ---------------------------------------------------------------------------
 #
-# RISK, stated up front: `k3_knob_matrix.sh` restarts the server four times in
-# one job. That is proven on a single host (BK #305/#313/#315) and UNTESTED on
-# the Ray multihost path, where `cleanup_server.sh` only reaches the head
-# container. The arms are ordered hit-first so a teardown failure after cell 1
-# still answers P1 and P4.
+# DESIGNED FOR EARLY CANCELLATION. The pod is the team's only v7x-32 and this
+# job asks for ~2-2.5 h of it (lane B's single pod leg took 39 min end to end,
+# so 23 min/cell is optimistic).
+#   * Arms are hit-first, so cells 1-2 alone answer P1 and give a one-cell-per-
+#     arm P2 -- and a -20% effect is ten times the 2.05% one-cell resolution.
+#   * `run_with_incremental_upload.sh` uploads each file as it appears instead
+#     of only in the post-command artifact step, so a cancelled or wedged job
+#     still leaves every completed cell retrievable.
+# Cancel it at the 2 h mark if cell 3 has not started; the two-cell answer is
+# the answer.
+#
+# RISK: `k3_knob_matrix.sh` restarts the server four times in one job. That is
+# proven on a single host (BK #305/#313/#315) and UNTESTED on the Ray multihost
+# path, where `cleanup_server.sh` only reaches the head container.
 steps:
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
@@ -81,6 +100,6 @@ steps:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-ep-tunehit --results-dir /perf_eval_results/pod_tunehit --reps 3 --arms podhit,podmiss,podmiss,podhit"
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-ep-tunehit --results-dir /perf_eval_results/pod_tunehit --reps 3 --arms podhit,podmiss,podmiss,podhit"
     artifact_paths:
       - "perf_eval_results/**/*"
