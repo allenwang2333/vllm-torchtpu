@@ -3746,10 +3746,7 @@ class TPUModelRunner(GPUModelRunner):
                                 )
                                 req_codes = req_info.setdefault("codes", {})
                                 audio_t = code_predictor_codes.detach().to("cpu")
-                                if "audio" in req_codes and isinstance(req_codes["audio"], torch.Tensor):
-                                    req_codes["audio"] = torch.cat([req_codes["audio"].to("cpu"), audio_t], dim=0)
-                                else:
-                                    req_codes["audio"] = audio_t
+                                req_codes["audio"] = audio_t
                             except Exception as e:
                                 logger.warning("[TPURunner] talker_mtp failed for req %s: %s", req_id, e)
 
