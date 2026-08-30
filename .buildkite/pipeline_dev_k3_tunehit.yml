@@ -1,0 +1,47 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Can ANY Kimi-K3 serving config select a Kimi-K3 row from the MLA v2 tuning
+# table? Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_tunehit.yml
+#
+# Every K3 recipe on record runs the untuned fallback (BK #306: 6 distinct keys
+# MISSED, 0 hit, at four block sizes). `kimi-k3-sliced8-tp8-tunehit` is built
+# field-by-field to match the one row the table holds for K3 at TP8. The A/B
+# arm moves `pages_per_seq` by one page and nothing else, so a perf difference
+# between the arms is the tuned row and not the workload.
+#
+# Primary verdict is one grep, not a benchmark:
+#   grep 'MLA v2 tuned params:' server.log
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":key: MLA tuning-table reachability, hit vs miss (A-B-B-A-A-B-B-A)"
+    key: tunehit
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-tunehit --results-dir /perf_eval_results/tunehit --reps 3 --arms tunehit,tunemiss,tunemiss,tunehit,tunehit,tunemiss,tunemiss,tunehit"
+    artifact_paths:
+      - "perf_eval_results/**/*"

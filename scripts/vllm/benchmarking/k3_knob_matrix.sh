@@ -63,6 +63,11 @@ arm_env() {
     f_decomp) echo "LIBTPU_INIT_ARGS=$F_DECOMPOSE_AR" ;;
     f_overlap) echo "LIBTPU_INIT_ARGS=$F_MULTI_OVERLAP" ;;
     fp8kv)    echo "KV_CACHE_DTYPE=fp8" ;;
+    # Only for kimi-k3-sliced8-tp8-tunehit: moves pages_per_seq 128 -> 129,
+    # the one MLA tuning-key field that can be changed without changing the
+    # workload. tunehit selects the table row, tunemiss falls back.
+    tunehit)  echo "MAX_MODEL_LEN=32768" ;;
+    tunemiss) echo "MAX_MODEL_LEN=33024" ;;
     *) echo "__UNKNOWN_ARM__" ;;
   esac
 }
