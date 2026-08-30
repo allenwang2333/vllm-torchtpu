@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +7,7 @@ import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
+_MOCK_ASYNC_OUTPUT = bool(int(os.getenv("VLLM_TPU_MOCK_ASYNC_OUTPUT", "0")))
 
 
 @dataclass
@@ -41,7 +43,8 @@ class AsyncTPUCopyState:
     def wait(self) -> None:
         if self.completed:
             return
-        self.copy_ready_event.synchronize()
+        if not _MOCK_ASYNC_OUTPUT:
+            self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self.completed = True
 
@@ -53,13 +56,25 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [
-                t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
-            ]
-            if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
+            if _MOCK_ASYNC_OUTPUT:
+                total_len = sum(self.chunk_real_lens)
+                first_chunk = self.chunks_cpu[0]
+                if first_chunk.dim() > 1:
+                    shape = (total_len, first_chunk.shape[1])
+                else:
+                    shape = (total_len,)
+                # Use a safe, standard non-EOS token ID (e.g. 100)
+                self._sampled_token_ids_cpu = torch.full(
+                    shape, 100, dtype=first_chunk.dtype, device="cpu"
+                )
             else:
-                self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
+                trimmed = [
+                    t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+                ]
+                if len(trimmed) == 1:
+                    self._sampled_token_ids_cpu = trimmed[0]
+                else:
+                    self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
 
