@@ -102,6 +102,16 @@ for arm in "${arm_list[@]}"; do
     model=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' \
       "$cell_dir/config.json")
 
+    # Positive control. `run_in_docker.sh` forwards a hand-written allowlist of
+    # env vars and LIBTPU_INIT_ARGS is not on it, which is why this script sets
+    # the arm INSIDE the container -- but "I exported it" is not evidence that
+    # the server got it. Read it back out of the live worker processes.
+    for pid in $(pgrep -f 'VLLM::|vllm serve' 2>/dev/null | head -20); do
+      tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | sed -n "s/^LIBTPU_INIT_ARGS=/pid $pid: /p"
+    done > "$cell_dir/libtpu_readback.txt"
+    echo "readback: $(wc -l < "$cell_dir/libtpu_readback.txt") worker(s) report LIBTPU_INIT_ARGS"
+
     if [ "$PROBE" = "1" ]; then
       python3 "$SCRIPT_DIR/k3_completion_probe.py" --model "$model" \
         --base-url "http://localhost:$PORT" --out "$cell_dir/completions.json" \
@@ -125,7 +135,7 @@ for arm in "${arm_list[@]}"; do
   # Keep the artifact bundle small: the interesting parts of a 190 KB
   # server.log are the config echo, the KV sizing and any error.
   if [ -f "$cell_dir/server.log" ]; then
-    grep -nE 'KV cache|kv_cache|num_gpu_blocks|Maximum concurrency|init engine|ERROR|Traceback|tuned|TuningKey|fallback|page_size|kv_packing' \
+    grep -nE 'KV cache|kv_cache|num_gpu_blocks|Maximum concurrency|init engine|ERROR|Traceback|tuned|TuningKey|fallback|page_size|kv_packing|Using cache directory|Compiling FX graph|libtpu_init_args' \
       "$cell_dir/server.log" > "$cell_dir/server.grep.txt" 2>/dev/null
     gzip -f "$cell_dir/server.log"
   fi
