@@ -1544,6 +1544,68 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=512,
         vmem_limit_bytes=62914560,
     ),  # median 4.624 ms
+    # Same Kimi-K3 InferenceX geometry as the max_num_seqs=64 block above but
+    # at max_num_seqs=32, the value the fast COMPILE_SIZES=4,8192 recipe
+    # serves at. max_num_seqs is part of TuningKey, so the seqs=64 entries
+    # never match a seqs=32 server; only the two buckets that recipe compiles
+    # are tuned. Tuned with scripts/mla_mixed_prefill_tuner.py via
+    # scripts/k3/slurm_mla_tune_seqs32.sbatch, candidates seeded from the
+    # seqs=64 winners' neighbourhood rather than the full default sweep.
+    #
+    # The 8192 winner sits in the known CompileTimeScopedVmemOom neighbourhood
+    # (bq=512, bkvp=256): that family is at the 60 MiB scoped-vmem edge --
+    # (512, 256, q_split=2) OOMs even in the tuner -- and this bucket's
+    # seqs=64 winner OOMed under real weights only, which dummy-weight tuning
+    # cannot see. Fallback that does not need a re-tune: bq=512, bkvp=128,
+    # q_split=8, vmem 60 MiB, median 2.046 ms (+1.4%).
+    TuningKey(
+        case="mixed",
+        max_num_tokens=4,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=32,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=2,
+        num_queries_per_block=16,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.215 ms
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8192,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=32,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=8,
+        num_kv_pages_per_block=256,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+    ),  # median 2.018 ms
 }
 
 
