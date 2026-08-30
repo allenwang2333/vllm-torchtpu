@@ -21,6 +21,7 @@ if [ -n "${VENV:-}" ] && [ -f "$VENV/bin/activate" ]; then
   source "$VENV/bin/activate"
 fi
 
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 SHARDING="${SHARDING:-DP8_EP}"
 ISL="${ISL:-8192}"
@@ -112,6 +113,8 @@ export TPU_MOE_SKIP_PADDED_TOKENS=1
 args=(
   "$MODEL"
   --served-model-name="$SERVED_NAME"
+  --host="$HOST"
+  --port="$PORT"
   --max-model-len="$MAX_MODEL_LEN"
   --max-num-batched-tokens="$MAX_NUM_BATCHED_TOKENS"
   --max-num-seqs="$MAX_NUM_SEQS"
@@ -119,7 +122,6 @@ args=(
   --gpu-memory-utilization=0.92
   --block-size=256
   --async-scheduling
-  --port="$PORT"
   --language-model-only
   --limit-mm-per-prompt='{"image": 0, "video": 0}'
   --quantization=fp8
@@ -129,6 +131,21 @@ args=(
 )
 # Pass --load-format when streaming from GCS.
 [ -n "${LOAD_FORMAT:-}" ] && args+=(--load-format="$LOAD_FORMAT")
+
+# Support static KV cache sizing to eliminate memory profiling pass and lock block allocation.
+[ -n "${KV_CACHE_MEMORY_BYTES:-}" ] && args+=(--kv-cache-memory-bytes="$KV_CACHE_MEMORY_BYTES")
+
+# Support Torch Profiler hooks for XProf tracing.
+if [ -n "${TORCH_PROFILER_DIR:-}" ]; then
+  args+=(
+    --profiler-config.profiler=torch
+    --profiler-config.torch_profiler_dir="$TORCH_PROFILER_DIR"
+    --profiler-config.ignore_frontend=true
+  )
+fi
+
+# Support arbitrary extra vLLM arguments passed via environment.
+[ -n "${EXTRA_VLLM_ARGS:-}" ] && args+=(${EXTRA_VLLM_ARGS})
 
 set -x
 vllm serve "${args[@]}"
