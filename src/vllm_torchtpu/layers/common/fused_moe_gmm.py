@@ -190,6 +190,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    argsort_revert_scatter: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -215,7 +216,19 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    if argsort_revert_scatter is None:
+        argsort_revert_scatter = envs.TPU_MOE_ARGSORT_REVERT_SCATTER
+    if argsort_revert_scatter:
+        # `sorted_indices` is a permutation, so its argsort is exactly its
+        # inverse -- which a scatter computes directly instead of paying for a
+        # second sort. Identical output; the sort is O(n log n) and this is a
+        # single scatter over the same buffer.
+        argsort_revert_indices = jnp.zeros_like(
+            sorted_indices).at[sorted_indices].set(
+                jnp.arange(sorted_indices.shape[0],
+                           dtype=sorted_indices.dtype))
+    else:
+        argsort_revert_indices = jnp.argsort(sorted_indices)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)

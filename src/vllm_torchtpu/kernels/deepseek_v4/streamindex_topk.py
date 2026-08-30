@@ -492,6 +492,7 @@ def prepare_outputs(out):
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "trim_topk",
+        "recall_target",
     ),
 )
 def streamindex_topk(
@@ -511,6 +512,7 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     trim_topk: bool | None = None,
+    recall_target: float | None = None,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -538,6 +540,10 @@ def streamindex_topk(
       span rather than over the whole align_to()-padded scores buffer. Exact
       either way. None reads `TPU_STREAMIDX_TRIM_TOPK` at trace time; pass an
       explicit bool to make it part of the jit cache key.
+    recall_target: `recall_target` for the final `jax.lax.approx_max_k`. 1.0
+      (the default) is exact. Below 1.0 the returned set is approximate --
+      this changes which KV entries attention sees, so it is an accuracy
+      knob, not just a speed one. None reads `TPU_STREAMIDX_TOPK_RECALL`.
 
   Returns:
     Top-K indices (in compressed space).
@@ -811,10 +817,14 @@ def streamindex_topk(
     # direct VMEM streaming will allow SC to beat TensorCore performance.
 
     # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
-    # but faster.
+    # but faster. Below 1.0 it becomes a genuine approximation: XLA partitions
+    # the reduction dimension and may miss true top-k entries, so the recall
+    # is an accuracy setting and defaults to exact.
+    if recall_target is None:
+        recall_target = envs.TPU_STREAMIDX_TOPK_RECALL
     top_vals, top_idxs = jax.lax.approx_max_k(scores,
                                               k,
                                               reduction_dimension=-1,
-                                              recall_target=1.0)
+                                              recall_target=recall_target)
     topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
     return topk_idxs[:q.shape[0], :k]

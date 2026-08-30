@@ -308,7 +308,50 @@ def test_streamindex_topk_numerical_correctness(
     block_table_list,
     trim_topk,
 ):
-    """Executes randomized input data against a naive NumPy ground truth."""
+    """Exact top-k (`recall_target=1.0`) must match the ground truth."""
+    _check_streamindex_topk_case(
+        B,
+        T_list,
+        S_list,
+        page_size,
+        H_I,
+        H_KV,
+        D,
+        k,
+        comp_ratio,
+        bq_sz,
+        bkv_p,
+        block_table_list,
+        trim_topk,
+        recall_target=1.0,
+        min_recall=None,
+    )
+
+
+def _check_streamindex_topk_case(
+    B,
+    T_list,
+    S_list,
+    page_size,
+    H_I,
+    H_KV,
+    D,
+    k,
+    comp_ratio,
+    bq_sz,
+    bkv_p,
+    block_table_list,
+    trim_topk,
+    recall_target,
+    min_recall,
+):
+    """Executes randomized input data against a naive NumPy ground truth.
+
+    `min_recall=None` demands an exact match; a float instead asserts that at
+    least that fraction of the ground-truth top-k was recovered. An
+    approximate `recall_target` cannot be checked with array equality -- it is
+    allowed to miss entries, which is the whole point of it being cheaper.
+    """
     print(f"\n{'='*60}")
     print(f"BATCHED NUMERICAL TEST (B={B})")
     print(f"{'='*60}")
@@ -412,6 +455,7 @@ def test_streamindex_topk_numerical_correctness(
         num_kv_pages_per_block=bkv_p,
         num_queries_per_block=bq_sz,
         trim_topk=trim_topk,
+        recall_target=recall_target,
     )
 
     # `trim_topk` drops the align_to() padding from the final exact top-k. It
@@ -433,15 +477,82 @@ def test_streamindex_topk_numerical_correctness(
     # =====================================================================
     # 4. VERIFY
     # =====================================================================
-    print("\n[3/3] Verifying absolute correctness...")
-    np.testing.assert_array_equal(
-        np.sort(actual_topk_np, axis=-1),
-        np.sort(expected_topk, axis=-1),
-        err_msg="JAX Pallas Kernel Top-K math did not match Naive Ground Truth",
-    )
+    if min_recall is None:
+        print("\n[3/3] Verifying absolute correctness...")
+        np.testing.assert_array_equal(
+            np.sort(actual_topk_np, axis=-1),
+            np.sort(expected_topk, axis=-1),
+            err_msg=
+            "JAX Pallas Kernel Top-K math did not match Naive Ground Truth",
+        )
+        print("MATCH VERIFIED! JAX kernel handles batches, fragmentation, and"
+              " dummy padding.\n")
+        return
+
+    # Recall, per query row, of the ground-truth set. -1 is the kernel's
+    # "no such entry" marker and is excluded from both sides so a short
+    # sequence does not read as perfect recall of nothing.
+    print(f"\n[3/3] Verifying recall >= {min_recall} at"
+          f" recall_target={recall_target}...")
+    recalls = []
+    for got_row, want_row in zip(actual_topk_np, expected_topk):
+        want = set(int(v) for v in np.asarray(want_row).ravel() if v >= 0)
+        if not want:
+            continue
+        got = set(int(v) for v in np.asarray(got_row).ravel() if v >= 0)
+        recalls.append(len(want & got) / len(want))
+    assert recalls, "no query row had a non-empty ground-truth top-k"
+    worst = min(recalls)
+    mean = sum(recalls) / len(recalls)
     print(
-        "MATCH VERIFIED! JAX kernel handles batches, fragmentation, and dummy"
-        " padding.\n")
+        f"recall: worst={worst:.4f} mean={mean:.4f} over {len(recalls)} rows")
+    assert worst >= min_recall, (
+        f"worst-row recall {worst:.4f} < {min_recall} at "
+        f"recall_target={recall_target}")
+
+
+# Every row of the matrix above runs k >= the number of score columns, so the
+# top-k is the whole buffer and recall is trivially 1.0 whatever
+# `recall_target` says. This case is the opposite regime -- k=128 of 464
+# columns, k/n = 0.28, close to GLM-5.2's production k/n = 2048/9216 = 0.22 --
+# and it is the only one where an approximate `recall_target` can actually
+# drop an entry. pages_per_seq=29 is deliberately not a multiple of bkv_p=8,
+# so `trim_topk` engages here too.
+#
+# The floors are empirical margins below the requested target, not a
+# guarantee XLA makes: `recall_target` bounds the *expected* recall of the
+# approximation, and this asserts per-row. A run that comes back at exactly
+# 1.0 for every target is a real outcome, not a broken test -- it means XLA
+# declined to approximate at this k/n and the lever is inert.
+@pytest.mark.parametrize("trim_topk", [False, True])
+@pytest.mark.parametrize("recall_target,min_recall", [
+    (1.0, 1.0),
+    (0.99, 0.94),
+    (0.95, 0.90),
+    (0.9, 0.85),
+])
+def test_streamindex_topk_recall_target(trim_topk, recall_target, min_recall):
+    pages_per_seq = 29
+    page_size = 16
+    rng = np.random.RandomState(7)
+    block_table = rng.permutation(pages_per_seq).astype(np.int32).tolist()
+    _check_streamindex_topk_case(
+        B=1,
+        T_list=[4],
+        S_list=[pages_per_seq * page_size],
+        page_size=page_size,
+        H_I=4,
+        H_KV=1,
+        D=16,
+        k=128,
+        comp_ratio=1,
+        bq_sz=1,
+        bkv_p=8,
+        block_table_list=[block_table],
+        trim_topk=trim_topk,
+        recall_target=recall_target,
+        min_recall=min_recall,
+    )
 
 
 def test_streamindex_topk_quantized():

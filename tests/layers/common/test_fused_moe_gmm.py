@@ -585,6 +585,93 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("num_tokens,topk", [(4, 2), (64, 8)])
+def test_prepare_routed_argsort_revert_scatter_matches_argsort(
+        num_tokens, topk):
+    """The scatter must invert the permutation exactly, not approximately.
+
+    `argsort_revert_indices` is used to un-permute GMM outputs back to token
+    order, so a single wrong entry silently routes one token's expert output
+    to another token -- a correctness bug a throughput benchmark cannot see.
+    """
+    hidden = 8
+    key = jax.random.key(0)
+    k_h, k_i = jax.random.split(key)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden),
+                                      dtype=jnp.float32).astype(jnp.bfloat16)
+    local_num_experts = 4
+    # Include -1 (non-local expert under EP) so the invalid-row padding, which
+    # all sorts to the same key, is covered: ties are where two different
+    # permutations of equal-keyed rows could disagree.
+    topk_indices = jax.random.randint(k_i, (num_tokens, topk), -1,
+                                      local_num_experts).astype(jnp.int32)
+    topk_weights = jnp.full((num_tokens, topk), 0.5, dtype=jnp.float32)
+
+    common = dict(local_num_experts=local_num_experts,
+                  topk=topk,
+                  use_ep=True,
+                  use_sparse_core=False,
+                  onehot_moe_permute_threshold=0)
+    scatter_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        argsort_revert_scatter=True,
+        **common)
+    argsort_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        argsort_revert_scatter=False,
+        **common)
+
+    for got, want in zip(scatter_out, argsort_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    # And that it is genuinely the inverse permutation, independent of the
+    # argsort path being right.
+    revert = np.asarray(scatter_out[2])
+    assert sorted(revert.tolist()) == list(range(revert.shape[0]))
+
+
+@pytest.mark.parametrize("env_value, expected_argsorts", [
+    (False, 2),
+    (True, 1),
+])
+def test_argsort_revert_scatter_env_selects_the_branch(monkeypatch, env_value,
+                                                       expected_argsorts):
+    """The env must reach the branch, and must default to the second argsort.
+
+    Counting `jnp.argsort` calls is the evidence: both branches return the same
+    array, so an env that silently fails to arrive would look identical in the
+    output and only show up as a missing speedup on a 55-minute benchmark.
+    """
+    calls = []
+    real_argsort = fused_moe_gmm.jnp.argsort
+
+    def counting_argsort(*args, **kwargs):
+        calls.append(1)
+        return real_argsort(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm.jnp, "argsort", counting_argsort)
+    monkeypatch.setattr(envs,
+                        "TPU_MOE_ARGSORT_REVERT_SCATTER",
+                        env_value,
+                        raising=False)
+
+    fused_moe_gmm.prepare_routed_gmm_inputs(
+        jnp.zeros((4, 8), dtype=jnp.bfloat16),
+        jnp.array([[0, 1], [1, -1], [2, 0], [-1, 3]], dtype=jnp.int32),
+        jnp.full((4, 2), 0.5, dtype=jnp.float32),
+        local_num_experts=4,
+        topk=2,
+        use_ep=True,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+    )
+    assert len(calls) == expected_argsorts
+
+
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk

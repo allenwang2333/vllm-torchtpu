@@ -75,8 +75,7 @@ _PROBE = ("from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import ("
 def _probe(env_overrides: dict[str, str]) -> str:
     env = {
         k: v
-        for k, v in os.environ.items()
-        if not k.startswith("TPU_STREAMIDX_")
+        for k, v in os.environ.items() if not k.startswith("TPU_STREAMIDX_")
     }
     env.update(env_overrides)
     out = subprocess.run([sys.executable, "-c", _PROBE],
@@ -123,6 +122,51 @@ def test_trim_topk_env_reaches_the_module_constant(value, expected):
     exactly or those arms stop being comparable to their baseline.
     """
     assert _trim_probe(value) == expected
+
+
+_RECALL_PROBE = (
+    "from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import "
+    "STREAMIDX_TOPK_RECALL as r; print(repr(r))")
+
+
+def _recall_probe(value: str | None) -> subprocess.CompletedProcess:
+    env = {
+        k: v
+        for k, v in os.environ.items() if k != "TPU_STREAMIDX_TOPK_RECALL"
+    }
+    if value is not None:
+        env["TPU_STREAMIDX_TOPK_RECALL"] = value
+    return subprocess.run([sys.executable, "-c", _RECALL_PROBE],
+                          capture_output=True,
+                          text=True,
+                          env=env,
+                          timeout=600)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, "1.0"),
+    ("1.0", "1.0"),
+    ("0.95", "0.95"),
+    ("0.9", "0.9"),
+])
+def test_topk_recall_env_reaches_the_module_constant(value, expected):
+    """`TPU_STREAMIDX_TOPK_RECALL` must default to exact and be readable.
+
+    1.0 is the only value that is exact; anything lower changes which KV
+    entries attention sees. An unset environment must reproduce the exact
+    top-k, or every arm sharing this image stops being comparable.
+    """
+    out = _recall_probe(value)
+    assert out.returncode == 0, out.stderr[-4000:]
+    assert out.stdout.strip().splitlines()[-1] == expected
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "high"])
+def test_topk_recall_rejects_out_of_range(value):
+    """A typo must fail loudly, not silently benchmark a different accuracy."""
+    out = _recall_probe(value)
+    assert out.returncode != 0
+    assert "TPU_STREAMIDX_TOPK_RECALL" in out.stderr or "float" in out.stderr
 
 
 @pytest.mark.parametrize("overrides, expected", [

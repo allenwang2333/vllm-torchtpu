@@ -68,6 +68,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_KV_PAGES_PER_BLOCK: str = ""
     TPU_STREAMIDX_QUERIES_PER_BLOCK: str = ""
     TPU_STREAMIDX_TRIM_TOPK: bool = False
+    TPU_STREAMIDX_TOPK_RECALL: float = 1.0
+    TPU_MOE_ARGSORT_REVERT_SCATTER: bool = False
 
 
 def env_with_choices(
@@ -165,6 +167,30 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
         return int(value)
 
     return _get_optional_int_env
+
+
+def env_float(env_name: str,
+              default: float,
+              low: float | None = None,
+              high: float | None = None) -> Callable[[], float]:
+    """
+    Float parsing with an optional inclusive range check. Out-of-range raises
+    rather than clamping: these feed kernel accuracy knobs, where a silently
+    clamped value is a wrong answer nobody sees.
+    """
+
+    def _get_float_env() -> float:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return default
+        parsed = float(value)
+        if ((low is not None and parsed < low)
+                or (high is not None and parsed > high)):
+            raise ValueError(f"Invalid value {parsed} for {env_name}: "
+                             f"expected {low} <= value <= {high}.")
+        return parsed
+
+    return _get_float_env
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -445,6 +471,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it is an A/B, not a silent change: see streamindex_topk.py.
     "TPU_STREAMIDX_TRIM_TOPK":
     env_bool("TPU_STREAMIDX_TRIM_TOPK"),
+    # `recall_target` for streamindex_topk's jax.lax.approx_max_k. 1.0 is the
+    # default and is exact -- it lowers to a full sort. Below 1.0 XLA is
+    # allowed to return an approximate top-k, which is cheaper but changes
+    # which KV entries the model attends to: this is the one knob here that
+    # can alter output quality, so it is gated on an accuracy run, not on a
+    # throughput number.
+    "TPU_STREAMIDX_TOPK_RECALL":
+    env_float("TPU_STREAMIDX_TOPK_RECALL", 1.0, low=0.0, high=1.0),
+    # Build the argsort-revert permutation with a scatter
+    # (`zeros.at[sorted].set(arange)`) instead of a second `jnp.argsort` over
+    # the first argsort's output. Mathematically identical -- inverting a
+    # permutation -- but it is a scatter rather than a sort. Off by default so
+    # it is an A/B: see prepare_routed_gmm_inputs.
+    "TPU_MOE_ARGSORT_REVERT_SCATTER":
+    env_bool("TPU_MOE_ARGSORT_REVERT_SCATTER"),
 }
 
 

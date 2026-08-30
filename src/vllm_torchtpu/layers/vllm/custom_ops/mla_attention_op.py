@@ -49,7 +49,9 @@ from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.utils import synchronize_tensors
 
-def _streamidx_block_size(raw: str, default: int) -> int | tuple[int, int, int]:
+
+def _streamidx_block_size(raw: str,
+                          default: int) -> int | tuple[int, int, int]:
     """Parse a `TPU_STREAMIDX_*` override.
 
     `streamindex_topk` takes these either as one int or as a
@@ -84,6 +86,7 @@ STREAMIDX_NUM_QUERIES_PER_BLOCK = _streamidx_block_size(
 # time, which is correct for a server that sets it once at start but stale for
 # anything that flips it inside one process.
 STREAMIDX_TRIM_TOPK = envs.TPU_STREAMIDX_TRIM_TOPK
+STREAMIDX_TOPK_RECALL = envs.TPU_STREAMIDX_TOPK_RECALL
 
 
 @SparseAttnIndexer.register_oot
@@ -146,6 +149,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=STREAMIDX_NUM_KV_PAGES_PER_BLOCK,
                 num_queries_per_block=STREAMIDX_NUM_QUERIES_PER_BLOCK,
                 trim_topk=STREAMIDX_TRIM_TOPK,
+                recall_target=STREAMIDX_TOPK_RECALL,
             )
             return cache_kv, topk_indices
 
