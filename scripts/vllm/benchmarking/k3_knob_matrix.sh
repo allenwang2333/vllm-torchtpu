@@ -135,6 +135,13 @@ for arm in "${arm_list[@]}"; do
     done > "$cell_dir/libtpu_readback.txt"
     echo "readback: $(wc -l < "$cell_dir/libtpu_readback.txt") worker(s) report LIBTPU_INIT_ARGS"
 
+    # Echo the MLA tuning-table verdict to STDOUT. It is otherwise only in
+    # server.log, which reaches nobody until the post-command artifact upload
+    # -- so a cancelled job loses the one line that is the whole point of a
+    # reachability run. The job log survives cancellation; server.log does not.
+    grep -am1 'MLA v2 tuned params:' "$cell_dir/server.log" 2>/dev/null \
+      | sed 's/^/[tuning] /' || echo "[tuning] no MLA v2 coverage line (warm compile cache: no lookups traced)"
+
     if [ "$PROBE" = "1" ]; then
       python3 "$SCRIPT_DIR/k3_completion_probe.py" --model "$model" \
         --base-url "http://localhost:$PORT" --out "$cell_dir/completions.json" \
