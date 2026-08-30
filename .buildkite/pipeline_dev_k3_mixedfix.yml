@@ -1,0 +1,65 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Does sizing the MLA *mixed* fallback's KV block in tokens buy the block-256
+# prefill win without changing the block size? Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_mixedfix.yml
+#
+# Lane B's LLO model of the chunked-prefill kernel says the whole page-size
+# TTFT win is block size and ~none of it is page size: an 8192 prefill over
+# 2 MLA layers costs 163.7 ms at the shipped bkv_p=1 / page 16, 12.5 ms at
+# bkv_p=16 (bkv_sz 256), 7.1 ms at bkv_p=48, against 11.0 ms at page 256
+# ($AMPLIO_ARTIFACT_DIR/r2/b/KERNEL.md). It is a static AOT/LLO result with no
+# hardware measurement behind it, and lane B has no build budget left. This is
+# that measurement, on lane D's last v7x-8 build.
+#
+# REGISTERED PREDICTIONS (before the run):
+#  Q1  median TTFT, `mfix256` vs `mfix_off`, both at --block-size 16 and
+#      mnbt 512: 440-500 ms against the arm's own 642 ms, i.e. -22% to -31%.
+#      Lower bound = B's model (642 - (163.7 - 12.5) = 490.8); upper bound =
+#      lane D's measured --block-size 256 arm (439.8 ms, BK #315), which the
+#      model under-predicts by 50 ms.
+#  Q2  `mfix768` beats `mfix256` by 0-2%: the model puts 7.1 vs 12.5 ms of
+#      attention inside a ~450 ms TTFT, i.e. ~1.2%, which is INSIDE the 2.05%
+#      one-cell band and at the edge of the 1.0% A-B-B-A band. Reported as
+#      not significant unless it clears it.
+#  Q3  FALSIFIER: TPOT should barely move. These arms touch only `case=mixed`;
+#      decode keeps the batched_decode fallback. A TPOT delta above 3% means
+#      the knob is not doing what the model says.
+#  Q4  Positive control: three arms, three distinct AOT cache hashes
+#      (TPU_MLA_MIXED_FALLBACK_BKV_TOKENS is in envs.environment_variables and
+#      therefore in compute_tpu_compilation_hash).
+# A null on Q1 refutes B's static model on hardware, which is worth as much as
+# a confirmation and is why the arm is worth the slot.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":wrench: MLA mixed fallback sized in tokens (off/256/768, palindromic)"
+    key: mixedfix
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-sliced8-tp8-ladder --results-dir /perf_eval_results/mixedfix --reps 3 --arms mfix_off,mfix256,mfix768,mfix768,mfix256,mfix_off"
+    artifact_paths:
+      - "perf_eval_results/**/*"

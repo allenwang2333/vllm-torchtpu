@@ -86,6 +86,14 @@ arm_env() {
     # (fallback), identical workload either way.
     podhit)   echo "MAX_MODEL_LEN=10240" ;;
     podmiss)  echo "MAX_MODEL_LEN=10496" ;;
+    # Size the MLA v2 *mixed* fallback's KV block in tokens instead of one
+    # page. At the shipped --block-size 16 the fallback walks a 16-token KV
+    # tile per query tile; 256 and 768 are the two sizes lane B's LLO model
+    # prices at 12.5 ms and 7.1 ms per 8192 prefill against the shipped
+    # 163.7 ms ($AMPLIO_ARTIFACT_DIR/r2/b/KERNEL.md).
+    mfix_off) ;;
+    mfix256)  echo "TPU_MLA_MIXED_FALLBACK_BKV_TOKENS=256" ;;
+    mfix768)  echo "TPU_MLA_MIXED_FALLBACK_BKV_TOKENS=768" ;;
     *) echo "__UNKNOWN_ARM__" ;;
   esac
 }

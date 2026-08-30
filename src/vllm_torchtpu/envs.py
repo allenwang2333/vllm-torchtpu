@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     TPU_MLA_TUNING_STRICT: bool = False
+    TPU_MLA_MIXED_FALLBACK_BKV_TOKENS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -347,6 +348,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tuning; turn this on in CI or when qualifying a new recipe.
     "TPU_MLA_TUNING_STRICT":
     env_bool("TPU_MLA_TUNING_STRICT"),
+    # Size the MLA v2 *mixed* (chunked-prefill) fallback's KV block in TOKENS
+    # instead of leaving it at one page. 0 keeps the shipped behaviour. The
+    # fallback returns num_kv_pages_per_block=1 whatever the page size, so at
+    # --block-size 16 the kernel walks a 16-token KV tile and pays a
+    # near-constant 587 ns per (query tile x KV tile); bkv_sz also misses the
+    # kernel's own 256- and 128-byte fast paths, costing 14.4x the MXU work
+    # per KV token. Setting 256 here is the prefill twin of the decode-side
+    # token-sized fallback.
+    "TPU_MLA_MIXED_FALLBACK_BKV_TOKENS":
+    lambda: int(os.getenv("TPU_MLA_MIXED_FALLBACK_BKV_TOKENS", "0")),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

@@ -1204,6 +1204,25 @@ _hit_keys: dict[TuningKey, int] = {}
 _missed_keys: dict[TuningKey, int] = {}
 
 
+def _mixed_fallback_kv_pages(tuning_key: TuningKey) -> int:
+    """KV pages per block for an untuned chunked-prefill call.
+
+    One page is the shipped answer and it is page-blind: the kernel walks
+    `cdiv(kv_len, bkv_p * page)` KV tiles once per query tile with no causal
+    skip, at a near-constant cost per tile, so at `--block-size 16` a full 8192
+    prefill pays 16384 tiles per layer instead of 1024. `bkv_sz = bkv_p * page`
+    also gates the kernel's own fast paths, and 16 misses both.
+
+    TPU_MLA_MIXED_FALLBACK_BKV_TOKENS sizes the block in tokens instead, so a
+    small page does not imply a small tile. 0 keeps the shipped behaviour.
+    """
+    tokens = envs.TPU_MLA_MIXED_FALLBACK_BKV_TOKENS
+    if tokens <= 0:
+        return 1
+    page = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+    return max(1, tokens // page)
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         _hit_keys[tuning_key] = _hit_keys.get(tuning_key, 0) + 1
@@ -1223,7 +1242,7 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
 
     if tuning_key.case == "mixed":
         return TunableParams(
-            num_kv_pages_per_block=1,
+            num_kv_pages_per_block=_mixed_fallback_kv_pages(tuning_key),
             num_queries_per_block=16,
             vmem_limit_bytes=62914560,
         )
