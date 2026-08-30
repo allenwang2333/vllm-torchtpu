@@ -179,10 +179,19 @@ class DFlashProposer:
 
         with set_vllm_model_wrapper_context(mesh=self.runner.mesh):
             for i, layer in enumerate(self.draft_model.model.layers):
-                attn_impl = layer.self_attn.attn.impl
+                # Dense DFlash/DSpark layers expose ``self_attn.attn`` and
+                # need their RPA kernel initialized here.  K3 DSpark uses the
+                # MLA wrapper, whose custom op is initialized by
+                # process_weights_after_loading instead.
+                attn_obj = getattr(layer.self_attn, "attn", None)
+                if attn_obj is None:
+                    continue
+                attn_impl = attn_obj.impl
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
-                    attn_impl.use_causal_mask = layer_causal_list[i]
-                    attn_impl.initialize_kernel(layer.self_attn.attn)
+                    attn_impl.layer_idx = i
+                    use_causal = layer_causal_list[i]
+                    attn_impl.use_causal_mask = use_causal
+                    attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -379,9 +388,15 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
+        if hasattr(self.draft_model, "get_draft_kv_cache_layer_names"):
+            layer_names = self.draft_model.get_draft_kv_cache_layer_names()
+        else:
+            layer_names = [
+                getattr(layer.self_attn.attn, "layer_name", None)
+                for layer in self.draft_model.model.layers
+            ]
         draft_md_list = []
-        for layer in self.draft_model.model.layers:
-            layer_name = getattr(layer.self_attn.attn, "layer_name", None)
+        for layer_name in layer_names:
             md = attn_metadata.get(layer_name) if layer_name else None
             if md is None:
                 raise RuntimeError(
@@ -793,6 +808,13 @@ class DFlashProposer:
                 hidden_states) == 1 else torch.cat(hidden_states, dim=-1)
         else:
             target_hidden = hidden_states
+
+        # MLA-native K3 drafts own their latent-KV projection and cache
+        # insertion.  Keep the proposer generic: standard Qwen/Gemma drafts
+        # continue through the fused full-K/V path below.
+        if hasattr(self.draft_model, "precompute_and_store_context_kv"):
+            return self.draft_model.precompute_and_store_context_kv(
+                target_hidden, positions, draft_md_tuple)
 
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what

@@ -434,6 +434,7 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
+    num_spec_tokens: int = 0,
 ):
     """Build the KDA op that sends decode rows to the fused decode kernel.
 
@@ -459,12 +460,15 @@ def build_kimi_dispatched_kda_op(
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        window_distribution: jax.Array,  # [3]: [decode+verify end, _, mixed]
+        slot_read_offsets: jax.Array,  # per-slot accepted-state checkpoint
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
         activation_dtype = mixed_qkv.dtype
         decode_end = distribution[0].astype(jnp.int32)
+        window_end = window_distribution[0].astype(jnp.int32)
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         has_initial_state = seq_lens > query_lens
@@ -477,8 +481,36 @@ def build_kimi_dispatched_kda_op(
 
         token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
         total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-        first_prefill_token = jnp.minimum(query_start_loc[decode_end],
+        first_prefill_token = jnp.minimum(query_start_loc[window_end],
                                           total_tokens)
+
+        # A speculative request owns ``num_spec_tokens + 1`` consecutive KDA
+        # slots.  The previous rejection result selects the checkpoint to
+        # resume from; a plain one-token decode then writes the new state back
+        # to checkpoint zero, because the runner resets its read offset after
+        # sampling.  Seed that destination before invoking the fused decode
+        # kernel, whose ABI intentionally uses one index for both read/write.
+        decode_indices = _null_out_non_decode(state_indices, decode_end)
+        if num_spec_tokens > 0:
+            seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
+            is_decode = seq_ids < decode_end
+            decode_read_indices = state_indices + slot_read_offsets[
+                state_indices]
+            decode_conv_seed = jnp.where(
+                is_decode.reshape((num_seqs, ) + (1, ) *
+                                  (conv_state.ndim - 1)),
+                conv_in[decode_read_indices],
+                conv_in[0],
+            )
+            decode_rec_seed = jnp.where(
+                is_decode.reshape((num_seqs, ) + (1, ) *
+                                  (recurrent_state.ndim - 1)),
+                recurrent_state[decode_read_indices],
+                recurrent_state[0],
+            )
+            conv_in = conv_in.at[decode_indices].set(decode_conv_seed)
+            recurrent_state = recurrent_state.at[decode_indices].set(
+                decode_rec_seed)
 
         # --- decode segment: fused convolution + recurrence ---------------
         decode_out, conv_after_decode, pool_after_decode = decode_kda(
@@ -491,13 +523,80 @@ def build_kimi_dispatched_kda_op(
             recurrent_state,
             a_log,
             dt_bias.reshape(num_heads, head_dim),
-            _null_out_non_decode(state_indices, decode_end),
+            decode_indices,
             has_initial_state,
             lower_bound=lower_bound,
             # The pool is [slots, H, K, V], which is the layout the recurrence
             # indexes as state[k, v]; no in-kernel swap.
             state_transposed=False,
         )
+
+        # --- verify segment: fixed K+1 window with one state checkpoint ---
+        # K3 DSpark verifies [anchor, d1, ..., dK].  Process the window with
+        # the already tuned one-token KDA kernel and chain the donated pools;
+        # checkpoint t is written to base+t.  This is deliberately the first,
+        # correctness-oriented implementation.  A fused single-Pallas-call
+        # version can replace it without changing the state ABI.
+        def run_verify():
+            verify_output = jnp.zeros(
+                (num_tokens, num_heads, head_dim), activation_dtype)
+            verify_conv = conv_after_decode
+            verify_pool = pool_after_decode
+            seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
+            is_verify_seq = ((seq_ids >= decode_end)
+                             & (seq_ids < window_end))
+            read_indices = state_indices + slot_read_offsets[state_indices]
+
+            for t in range(num_spec_tokens + 1):
+                token_rows = query_start_loc[:-1] + t
+                active = (is_verify_seq & (t < query_lens)
+                          & (token_rows < total_tokens))
+                safe_rows = jnp.clip(token_rows, 0, num_tokens - 1)
+                write_indices = jnp.where(active, state_indices + t, 0)
+                source_indices = jnp.where(t == 0, read_indices,
+                                           state_indices + t - 1)
+
+                active_conv = active.reshape(
+                    (num_seqs, ) + (1, ) * (verify_conv.ndim - 1))
+                active_rec = active.reshape(
+                    (num_seqs, ) + (1, ) * (verify_pool.ndim - 1))
+                conv_seed = jnp.where(active_conv,
+                                      verify_conv[source_indices],
+                                      verify_conv[0])
+                rec_seed = jnp.where(active_rec,
+                                     verify_pool[source_indices],
+                                     verify_pool[0])
+                verify_conv = verify_conv.at[write_indices].set(conv_seed)
+                verify_pool = verify_pool.at[write_indices].set(rec_seed)
+
+                step_out, verify_conv, verify_pool = decode_kda(
+                    mixed_qkv[safe_rows],
+                    raw_gate[safe_rows].reshape(num_seqs, num_heads,
+                                                head_dim),
+                    _activate_beta(beta[safe_rows]),
+                    verify_conv,
+                    conv_weight,
+                    verify_pool,
+                    a_log,
+                    dt_bias.reshape(num_heads, head_dim),
+                    write_indices,
+                    active & (has_initial_state | (t > 0)),
+                    lower_bound=lower_bound,
+                    state_transposed=False,
+                )
+                scatter_rows = jnp.where(active, token_rows, num_tokens)
+                verify_output = verify_output.at[scatter_rows].set(
+                    step_out.astype(activation_dtype), mode="drop")
+
+            return verify_output, verify_conv, verify_pool
+
+        def skip_verify():
+            return (jnp.zeros(
+                (num_tokens, num_heads, head_dim), activation_dtype),
+                    conv_after_decode, pool_after_decode)
+
+        verify_out, conv_after_verify, pool_after_verify = jax.lax.cond(
+            decode_end < window_end, run_verify, skip_verify)
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
         # Guarded, because a decode-only step pays dearly for it otherwise.
@@ -522,13 +621,13 @@ def build_kimi_dispatched_kda_op(
         def run_prefill():
             conv_out, conv_after_prefill = kimi_short_conv_scan(
                 mixed_qkv,
-                conv_after_decode,
+                conv_after_verify,
                 # Free: contiguous buffer, same channels in the same order.
                 conv_weight.reshape(conv_weight.shape[0], -1),
                 query_start_loc,
                 state_indices,
                 seq_lens,
-                start_seq=decode_end,
+                start_seq=window_end,
             )
             conv_out = jax.nn.silu(conv_out)
 
@@ -543,7 +642,7 @@ def build_kimi_dispatched_kda_op(
                 return jnp.transpose(x, (1, 0, 2))[:, None]
 
             initial_state = jnp.where(has_initial_state[:, None, None, None],
-                                      pool_after_decode[state_indices], 0.0)
+                                      pool_after_verify[state_indices], 0.0)
             activated_beta = _activate_beta(beta)
             gate = raw_gate.reshape(num_tokens, num_heads, head_dim)
 
@@ -564,7 +663,7 @@ def build_kimi_dispatched_kda_op(
                     N_max=num_seqs,
                     initial_state=initial_state[None],
                     output_final_state=True,
-                    start_seq=decode_end,
+                    start_seq=window_end,
                 )
                 return (
                     jnp.transpose(chunk_out[:, 0], (1, 0, 2)),
@@ -601,7 +700,7 @@ def build_kimi_dispatched_kda_op(
                 mega_layout_supported = _mega_kda_layout_supported(
                     query_start_loc, num_tokens)
                 chunk_out, final_state = jax.lax.cond(
-                    (decode_end == 0) & mega_layout_supported,
+                    (window_end == 0) & mega_layout_supported,
                     run_mega_kda,
                     run_chunked_kda,
                 )
@@ -620,16 +719,16 @@ def build_kimi_dispatched_kda_op(
             # ever reaches the decode segment without carried state, where the
             # passthrough would be zero rather than the live state.
             sequence_ids_all = jnp.arange(num_seqs, dtype=jnp.int32)
-            keep = (query_lens > 0) & (sequence_ids_all >= decode_end)
+            keep = (query_lens > 0) & (sequence_ids_all >= window_end)
             write_indices = jnp.where(keep, state_indices, 0)
-            new_pool = pool_after_decode.at[write_indices].set(
+            new_pool = pool_after_verify.at[write_indices].set(
                 final_state[0].astype(recurrent_state.dtype))
             return chunk_out, conv_after_prefill, new_pool
 
         def skip_prefill():
             return (jnp.zeros(
                 (num_tokens, num_heads, head_dim),
-                activation_dtype), conv_after_decode, pool_after_decode)
+                activation_dtype), conv_after_verify, pool_after_verify)
 
         chunk_out, conv_after_prefill, new_pool = jax.lax.cond(
             first_prefill_token < total_tokens, run_prefill, skip_prefill)
@@ -637,11 +736,12 @@ def build_kimi_dispatched_kda_op(
         # --- select per token ---------------------------------------------
         # Each side left the other's rows zero, so this is a select rather than
         # a sum only to keep the intent legible.
+        decode_rows = _match_rows(decode_out,
+                                  num_tokens).astype(chunk_out.dtype)
         output = jnp.where(
-            (token_ids < decode_end)[:, None, None],
-            _match_rows(decode_out, num_tokens).astype(chunk_out.dtype),
-            chunk_out,
-        )
+            (token_ids < decode_end)[:, None, None], decode_rows,
+            jnp.where((token_ids < first_prefill_token)[:, None, None],
+                      verify_out.astype(chunk_out.dtype), chunk_out))
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                     activation_dtype)
 
@@ -697,6 +797,8 @@ def build_kimi_dispatched_kda_op(
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         distribution: torch.Tensor,
+        window_distribution: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
     ) -> torch.Tensor:
         output, new_conv_state, new_pool = dispatched_op(
             mixed_qkv,
@@ -713,6 +815,8 @@ def build_kimi_dispatched_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            window_distribution,
+            slot_read_offsets,
         )
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)
