@@ -52,6 +52,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vmem-mib", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--result-path", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--tokens", type=int, default=8192)
+    parser.add_argument("--kv-tokens",
+                        type=int,
+                        default=None,
+                        help="KV length of the profiled sequence; defaults to "
+                        "--tokens. Use a smaller value when the padded token "
+                        "bucket exceeds the page-table capacity (tokens > "
+                        "pages-per-seq * page-size), e.g. a 16384-token bucket "
+                        "with 10240-token pages.")
     parser.add_argument("--num-heads", type=int, default=3)
     parser.add_argument("--lkv-dim", type=int, default=512)
     parser.add_argument("--rope-dim", type=int, default=64)
@@ -105,7 +113,8 @@ def _run_child(args: argparse.Namespace) -> None:
         raise ValueError("--result-path is required in child mode")
     if args.page_size % args.kv_packing:
         raise ValueError("page size must be divisible by KV packing")
-    needed_pages = (args.tokens + args.page_size - 1) // args.page_size
+    kv_tokens = args.kv_tokens if args.kv_tokens is not None else args.tokens
+    needed_pages = (kv_tokens + args.page_size - 1) // args.page_size
     if needed_pages > args.pages_per_seq or needed_pages > args.total_pages:
         raise ValueError("page-table/cache capacity is too small")
 
@@ -118,7 +127,7 @@ def _run_child(args: argparse.Namespace) -> None:
                      (args.rope_dim + 127) // 128 * 128)
     cache_kv = jnp.zeros((args.total_pages, args.page_size // args.kv_packing,
                           args.kv_packing, padded_kv_dim), jnp.float8_e4m3fn)
-    kv_lens = jnp.asarray([args.tokens] + [0] * (args.max_num_seqs - 1),
+    kv_lens = jnp.asarray([kv_tokens] + [0] * (args.max_num_seqs - 1),
                           jnp.int32)
     page_row = list(
         range(needed_pages)) + [-1] * (args.pages_per_seq - needed_pages)
@@ -216,6 +225,8 @@ def _run_parent(args: argparse.Namespace) -> int:
         f"--warmups={args.warmups}",
         f"--iterations={args.iterations}",
     ]
+    if args.kv_tokens is not None:
+        common.append(f"--kv-tokens={args.kv_tokens}")
     results = []
     with tempfile.TemporaryDirectory(prefix="mla-mixed-tuner-") as temp_dir:
         for index, (bq, bkvp, q_split, vmem_mib) in enumerate(candidates):
