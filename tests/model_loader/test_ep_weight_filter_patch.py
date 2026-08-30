@@ -8,7 +8,6 @@ vLLM 0.27.0's ``should_skip_weight`` only matches names ending in
 widens the suffix allowlist. No TPU, no network.
 """
 
-import pytest
 import torch
 
 from vllm_torchtpu.model_loader_patches import (
@@ -28,10 +27,8 @@ def _expert_name(expert_id: int, suffix: str) -> str:
 
 
 def test_remote_expert_packed_and_scale_skipped():
-    assert _should_skip_weight_tpu(_expert_name(500, ".weight_packed"),
-                                   _LOCAL)
-    assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale"),
-                                   _LOCAL)
+    assert _should_skip_weight_tpu(_expert_name(500, ".weight_packed"), _LOCAL)
+    assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight"), _LOCAL)
 
 
@@ -73,15 +70,20 @@ def test_dense_and_fused_names_kept():
 
 
 def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
-    from vllm.model_executor.model_loader import ep_weight_filter
-    from vllm.model_executor.model_loader import weight_utils
+    from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
 
     # Register teardown restoration of the attributes the patch overwrites.
     monkeypatch.setattr(weight_utils, "should_skip_weight",
                         weight_utils.should_skip_weight)
     monkeypatch.setattr(ep_weight_filter, "should_skip_weight",
                         ep_weight_filter.should_skip_weight)
-    monkeypatch.delattr(weight_utils, "_tpu_ep_filter_patch", raising=False)
+    # delattr(raising=False) records nothing when the flag is absent, so it
+    # would not undo the stamp the patch sets. setattr registers a teardown
+    # that deletes (or restores) it.
+    monkeypatch.setattr(weight_utils,
+                        "_tpu_ep_filter_patch",
+                        False,
+                        raising=False)
 
     patch_default_loader_ep_weight_filter()
     assert weight_utils.should_skip_weight is _should_skip_weight_tpu
@@ -100,8 +102,7 @@ def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path,
-                                                       monkeypatch):
+def test_lazy_iterator_filters_remote_packed_and_scale(tmp_path, monkeypatch):
     from safetensors.torch import save_file
     from vllm.model_executor.model_loader import weight_utils
 
