@@ -3707,10 +3707,15 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens_padded),
             ), set_vllm_model_wrapper_context(mesh=self.mesh,
                                               vllm_config=self.vllm_config):
+                runtime_info = [
+                    getattr(self, "model_intermediate_buffer", {}).get(r_id, {})
+                    for r_id in chunk_req_ids
+                ] if hasattr(self, "model_intermediate_buffer") and self.model_intermediate_buffer else None
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
+                    runtime_additional_information=runtime_info,
                 )
                 self._omni_last_hidden_states = hidden_states
                 self._omni_last_aux_hidden_states = aux_hidden_states
@@ -6525,12 +6530,16 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def forward_model(self, input_ids, positions, inputs_embeds=None):
+    def forward_model(self, input_ids, positions, inputs_embeds=None, runtime_additional_information=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
+        extra_kwargs = {}
+        if runtime_additional_information is not None:
+            extra_kwargs["runtime_additional_information"] = runtime_additional_information
         out = self.model(input_ids=input_ids,
                          positions=positions,
-                         inputs_embeds=inputs_embeds)
+                         inputs_embeds=inputs_embeds,
+                         **extra_kwargs)
         # @support_torch_compile may wrap a single tensor in a 1-element
         # list/tuple; unwrap that first.
         if isinstance(out, (list, tuple)) and len(out) == 1:
