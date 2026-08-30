@@ -8,6 +8,11 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
 _MOCK_ASYNC_OUTPUT = bool(int(os.getenv("VLLM_TPU_MOCK_ASYNC_OUTPUT", "0")))
+_HAS_ASYNC_HOST_COPY = (
+    hasattr(torch, "tpu")
+    and hasattr(torch.tpu, "_start_async_host_copy")
+    and hasattr(torch.tpu, "_wait_async_host_copy")
+)
 
 
 @dataclass
@@ -21,7 +26,8 @@ class AsyncTPUCopyState:
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
-    copy_ready_event: Any
+    copy_ready_event: Any = None
+    copy_ids: list[int] | None = None
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
@@ -30,6 +36,27 @@ class AsyncTPUCopyState:
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+
+        # Solution 1: Use tracked async host copy into pinned CPU buffers.
+        # This uses copy-specific completion handles from TorchTPU, bypassing
+        # device-wide Event.synchronize() and eliminating the 1.27ms barrier-cores bubble.
+        if _HAS_ASYNC_HOST_COPY and not _MOCK_ASYNC_OUTPUT:
+            chunks_cpu = [
+                torch.empty(t.shape, dtype=t.dtype, device="cpu").pin_memory()
+                for t in chunks_tpu
+            ]
+            copy_ids = [
+                torch.tpu._start_async_host_copy(t, c)  # type: ignore[attr-defined]
+                for t, c in zip(chunks_tpu, chunks_cpu)
+            ]
+            return cls(
+                chunks_cpu=chunks_cpu,
+                chunk_real_lens=chunk_real_lens,
+                copy_ready_event=None,
+                copy_ids=copy_ids,
+                chunks_tpu=chunks_tpu,
+            )
+
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
@@ -37,13 +64,18 @@ class AsyncTPUCopyState:
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
+            copy_ids=None,
             chunks_tpu=chunks_tpu,
         )
 
     def wait(self) -> None:
         if self.completed:
             return
-        if not _MOCK_ASYNC_OUTPUT:
+        if self.copy_ids is not None:
+            for cid in self.copy_ids:
+                if cid != 0:
+                    torch.tpu._wait_async_host_copy(cid)  # type: ignore[attr-defined]
+        elif not _MOCK_ASYNC_OUTPUT and self.copy_ready_event is not None:
             self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self.completed = True
