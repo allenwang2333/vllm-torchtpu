@@ -1,0 +1,86 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# Does the MLA v2 tuning table do anything for the REAL Kimi-K3 on the pod?
+#
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_podtunehit.yml
+#   bk build create -p vllm-torchtpu-dev -b geyuhao/k3r2-knobs \
+#     -e DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_podtunehit.yml \
+#     -m "laneD: MLA tuned row on the real K3 (hit vs miss)" -y --no-input
+#
+# DO NOT FIRE without the pod owner's go-ahead: tpu_v7x_32_queue has one agent.
+# ============================================================================
+#
+# `kimi-k3-tp32-ep-tunehit` is the first K3 serving config that can select a
+# K3 row from `kernels/mla/v2/tuned_params.py` (row :1169). The two arms differ
+# only in `--max-model-len`: 10240 -> pages_per_seq 40 (row selected) vs
+# 10496 -> 41 (untuned fallback). Both cover 8192+1024, both run the same
+# requests, and pages_per_seq is only the width of `block_tables` -- the actual
+# context is 40 pages of 256 either way. So the arm difference IS the tuned row.
+#
+# ---------------------------------------------------------------------------
+# REGISTERED PREDICTIONS (written before the run; falsify freely)
+#
+# P1  REACHABILITY. `podhit` server.log shows `MLA v2 tuned params: 3 distinct
+#     keys MISSED, 1 hit`; `podmiss` shows `4 distinct keys MISSED, 0 hit`.
+#     (Buckets {16, 8192} x cases {batched_decode, mixed} = 4 keys; only
+#     mixed@8192 can match.) This is the primary result and it is binary.
+# P2  TTFT, hit vs miss, same rig: -10% to -40%, point estimate -20%.
+#     Basis: the same minimal pair at TP8 on the surrogate (BK #313) gave
+#     -19%. The pod hits a DIFFERENT row (:1169, q_split=8,
+#     num_kv_pages_per_block=16) than the surrogate (:1122, q_split=1,
+#     num_kv_pages_per_block=4), so the size need not transfer -- hence a
+#     range, not a point.
+# P3  TPOT, hit vs miss: |delta| < 2%. No batched_decode row in the table has
+#     3 q-heads, so decode runs untuned in BOTH arms. A large TPOT delta would
+#     falsify the whole reading of the key.
+# P4  ABSOLUTE TTFT of `podhit` vs the calibrated nightly (BK #289, 4488.3 ms
+#     at mnbt 512 / block 16 / KV auto): 1200-2600 ms. This bundles the rig
+#     change (chunk 512->8192, block 16->256, fp8 KV) with the tuned row and
+#     is the number that decides whether the recipe is worth shipping.
+# P5  Completed 5/5 in every cell, and no NaN/garbage: `--kv-cache-dtype fp8`
+#     has never run on the real K3.
+#
+# Judge every delta against lane D's measured band (BK #305, surrogate):
+# one cell per arm resolves 2.05% of TPOT; A-B-B-A with drift+rep controls
+# resolves ~1.0%. Anything inside that is NOT SIGNIFICANT.
+# ---------------------------------------------------------------------------
+#
+# RISK, stated up front: `k3_knob_matrix.sh` restarts the server four times in
+# one job. That is proven on a single host (BK #305/#313/#315) and UNTESTED on
+# the Ray multihost path, where `cleanup_server.sh` only reaches the head
+# container. The arms are ordered hit-first so a teardown failure after cell 1
+# still answers P1 and P4.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":key: Real K3: MLA tuned row hit vs miss (TPU v7x-32)"
+    key: pod_tunehit
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-ep-tunehit --results-dir /perf_eval_results/pod_tunehit --reps 3 --arms podhit,podmiss,podmiss,podhit"
+    artifact_paths:
+      - "perf_eval_results/**/*"

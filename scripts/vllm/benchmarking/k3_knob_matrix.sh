@@ -82,6 +82,10 @@ arm_env() {
     L4_hit)
       printf '%s\n' "MAX_NUM_BATCHED_TOKENS=4096" "K3_COMPILE_SIZES=[16,4096]" \
                      "K3_BLOCK_SIZE=256" "MAX_NUM_SEQS=8" "MAX_MODEL_LEN=32768" ;;
+    # kimi-k3-tp32-ep-tunehit: pages_per_seq 40 (row :1169 selected) vs 41
+    # (fallback), identical workload either way.
+    podhit)   echo "MAX_MODEL_LEN=10240" ;;
+    podmiss)  echo "MAX_MODEL_LEN=10496" ;;
     *) echo "__UNKNOWN_ARM__" ;;
   esac
 }
