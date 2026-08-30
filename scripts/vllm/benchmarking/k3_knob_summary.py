@@ -118,41 +118,59 @@ def report_case(case: str, cells: list[dict], out: list[str]) -> None:
                        f"t={fmt(delta / se, 2) if se else 'inf'}")
 
 
+def _pair_agreement(a: dict, b: dict) -> tuple[int, int, float]:
+    """(exact matches, comparable prompts, mean first-divergence index)."""
+    exact = tot = 0
+    first_div = []
+    for k in sorted(set(a) & set(b)):
+        ta, tb = a[k].get("tokens") or [], b[k].get("tokens") or []
+        if not ta or not tb:
+            continue
+        tot += 1
+        if ta == tb:
+            exact += 1
+            first_div.append(len(ta))
+        else:
+            first_div.append(next(
+                (i for i, (x, y) in enumerate(zip(ta, tb)) if x != y),
+                min(len(ta), len(tb))))
+    return exact, tot, st.fmean(first_div) if first_div else float("nan")
+
+
 def report_completions(root: str, cells: list[dict], out: list[str]) -> None:
-    caps = {}
+    caps, arm_of = {}, {}
     for c in cells:
         p = os.path.join(root, c["dir"], "completions.json")
-        if os.path.exists(p):
-            try:
-                with open(p) as fh:
-                    caps[c["dir"]] = json.load(fh)
-            except (OSError, ValueError):
-                pass
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as fh:
+                caps[c["dir"]] = json.load(fh)
+            arm_of[c["dir"]] = c["arm"]
+        except (OSError, ValueError):
+            pass
     if len(caps) < 2:
         return
-    out.append("\n### greedy-completion agreement (pairwise, vs cell01)")
-    names = list(caps)
-    ref_name = names[0]
-    for other in names[1:]:
-        a, b = caps[ref_name], caps[other]
-        exact = tot = 0
-        first_div = []
-        for k in sorted(set(a) & set(b)):
-            ta, tb = a[k].get("tokens") or [], b[k].get("tokens") or []
-            if not ta or not tb:
-                continue
-            tot += 1
-            if ta == tb:
-                exact += 1
-                first_div.append(len(ta))
-            else:
-                first_div.append(next(
-                    (i for i, (x, y) in enumerate(zip(ta, tb)) if x != y),
-                    min(len(ta), len(tb))))
-        if tot:
-            out.append(f"  {ref_name} vs {other}: exact={exact}/{tot} "
-                       f"mean_first_divergence={fmt(st.fmean(first_div), 1)} "
-                       f"tokens")
+    out.append("\n### greedy-completion agreement")
+    out.append("  A same-arm pair is the restart-to-restart floor; judge a "
+               "cross-arm pair against it.")
+    names = sorted(caps)
+    by_kind: dict[tuple[str, str], list[tuple[int, int, float]]] = {}
+    for i, n1 in enumerate(names):
+        for n2 in names[i + 1:]:
+            kind = tuple(sorted((arm_of[n1], arm_of[n2])))
+            res = _pair_agreement(caps[n1], caps[n2])
+            by_kind.setdefault(kind, []).append(res)
+            out.append(f"  {n1} vs {n2}: exact={res[0]}/{res[1]} "
+                       f"mean_first_divergence={fmt(res[2], 1)} tokens")
+    out.append("  -- aggregated by arm pair --")
+    for kind, rows in sorted(by_kind.items()):
+        ex = sum(r[0] for r in rows)
+        tot = sum(r[1] for r in rows)
+        div = st.fmean([r[2] for r in rows if r[2] == r[2]])
+        out.append(f"  {kind[0]} x {kind[1]}: {len(rows)} pairs, "
+                   f"exact={ex}/{tot} ({fmt(100 * ex / tot, 1)}%), "
+                   f"mean_first_divergence={fmt(div, 1)} tokens")
 
 
 def main() -> None:
