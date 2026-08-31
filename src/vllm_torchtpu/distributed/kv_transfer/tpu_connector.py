@@ -163,6 +163,8 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+    token_base: int = 0
+    is_final: bool = True
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
