@@ -22,7 +22,6 @@ RANDOM_RANGE_RATIO="0.0"
 
 export NEW_MODEL_DESIGN=1
 export MODEL_IMPL_TYPE="vllm"
-export VLLM_PLUGINS="torchtpu,torchtpu_layers"
 export MOE_REQUANTIZE_WEIGHT_DTYPE=fp4
 export MOE_REQUANTIZE_BLOCK_SIZE=512
 export TPU_ROPE_CACHE_ROW_MAJOR=1
@@ -30,17 +29,11 @@ export TPU_MOE_HASH_TABLE_ROW_MAJOR=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
 export VLLM_NO_USAGE_STATS=1
-export TORCH_DIST_TIMEOUT=1200
-export VLLM_RPC_TIMEOUT=1200000
-export VLLM_SHM_BROADCAST_TIMEOUT_S=1200
-export VLLM_ENFORCE_EAGER=0
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=1200
 
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 SERVER_READY_WAIT_MIN=120
 
-
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash\"}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash\"}"
 
 BENCHMARK_TEMPERATURE=0
 EVAL_TOLERANCE="0.02"
