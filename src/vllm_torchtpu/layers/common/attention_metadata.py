@@ -452,10 +452,16 @@ def stage_block_table_uploads(
                 builder._block_table_geometry(ctx))
             entries.append((gid, block_table_obj, target_num_blocks))
             entry_builders.append(builder)
-    if not entries:
+    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+
+    # Option 1 Zero-H2D Probe: Reuse persistent on-device block tables in steady-state decode
+    cache_geom_key = (total, num_reqs_padded, tuple((gid, tnb) for gid, _, tnb in entries))
+    if (getattr(runner, "_cached_block_table_geom_key", None) == cache_geom_key
+            and getattr(runner, "_cached_staged_block_tables", None) is not None):
+        ctx.staged_block_tables = runner._cached_staged_block_tables
+        ctx.staged_mamba_products = getattr(runner, "_cached_staged_mamba_products", None)
         return
 
-    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     scratch = runner._block_table_stage_cpu
     if scratch is None or scratch.numel() < total:
         scratch = torch.zeros((total, ),
@@ -537,3 +543,7 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+
+    runner._cached_block_table_geom_key = cache_geom_key
+    runner._cached_staged_block_tables = ctx.staged_block_tables
+    runner._cached_staged_mamba_products = getattr(ctx, "staged_mamba_products", None)
