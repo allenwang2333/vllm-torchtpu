@@ -580,6 +580,57 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
 done
 
 # =============================================================================
+# Sanity probe: did the model actually work?
+# =============================================================================
+# `vllm bench serve --save-result` keeps metrics and no text, and every recipe
+# here passes --ignore-eos, so a request completes whatever the model emits.
+# A run therefore cannot distinguish a working model from a broken one, and
+# that is not hypothetical: dev build 299 reported 20/20 completed and a median
+# TPOT for a Kimi-K3 whose routed experts were half `torch.empty`, because a
+# merged flag bypassed its own weight-filter realignment on the streaming
+# loader. Nothing in the bundle could have shown it.
+#
+# So take one greedy completion before teardown and say, on STDOUT (the job log
+# survives a cancel; server.log does not), whether the text is degenerate.
+# BENCHMARK_SANITY_PROBE=0 opts out.
+if [ "${BENCHMARK_SANITY_PROBE:-1}" = "1" ] && [ "$exit_code" -eq 0 ] \
+   && [ "${DRY_RUN:-0}" != "1" ]; then
+    echo "--- Sanity probe"
+    if python3 "$SCRIPT_DIR/k3_completion_probe.py" \
+            --model "$MODEL" --base-url "http://$HOST:$PORT" \
+            --num-prompts 2 --words-per-prompt 600 --max-tokens 32 \
+            --out "$RESULTS_DIR/sanity_completions.json" >/dev/null 2>&1; then
+        python3 - "$RESULTS_DIR/sanity_completions.json" <<'PYEOF'
+import json, sys
+
+# A model with uninitialised expert shards still emits *tokens*; what it stops
+# emitting is variety. distinct/total over a greedy continuation separates the
+# two without needing a reference output or a tokenizer.
+worst = None
+for key, cap in sorted(json.load(open(sys.argv[1])).items()):
+    if "error" in cap:                      # the probe failed, the model did not
+        print(f"K3SANITY prompt={key} error={cap['error'][:80]!r}")
+        continue
+    text = cap.get("text") or ""
+    toks = cap.get("tokens") or text.split()
+    ratio = len(set(toks)) / len(toks) if toks else 0.0
+    worst = ratio if worst is None else min(worst, ratio)
+    print(f"K3SANITY prompt={key} n_tokens={len(toks)} distinct_ratio={ratio:.3f} "
+          f"text={text[:70]!r}")
+if worst is None:
+    print("K3SANITY verdict=NO_DATA")
+else:
+    # 0.25 is well under any healthy continuation and well over a model stuck in
+    # a short cycle; calibrate it against a known-good run before tightening.
+    print(f"K3SANITY worst_distinct_ratio={worst:.3f} "
+          f"verdict={'OK' if worst >= 0.25 else 'DEGENERATE'}")
+PYEOF
+    else
+        echo "K3SANITY verdict=PROBE_FAILED (server did not answer /v1/completions)"
+    fi
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 {
