@@ -18,8 +18,16 @@ from vllm_torchtpu.layers.vllm.latent_proj_intra_chip import \
     make_latent_projection
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
+from vllm_torchtpu.logger import init_logger
 
 from .layers import KimiMLP
+
+logger = init_logger(__name__)
+
+# Not `logger.info_once`: that defaults to scope="local", i.e. local rank 0 only,
+# so on a 4-host pod it samples 4 of 32 ranks -- and a per-rank disagreement
+# about the expert split is precisely what this line exists to expose.
+_bank_logged = False
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -168,6 +176,24 @@ class KimiMoE(nn.Module):
             w2_weight.data.zero_()
             self.experts.moe_config.intermediate_size_per_partition_unpadded = (
                 config.moe_intermediate_size // moe_tp_size)
+
+        # The shape of the expert bank this rank will actually feed to the gmm
+        # kernel, which is the only statement about the MoE split that no later
+        # layer of indirection can contradict: an expert count that disagrees
+        # with `ep_size` means the loader and the layer disagree, and a width
+        # that disagrees with `tp_size` means the chip split did not take.
+        global _bank_logged
+        routed = getattr(self.experts, "routed_experts", None)
+        w13 = getattr(routed, "w13_weight", None)
+        if w13 is None:
+            w13 = getattr(routed, "w13_weight_packed", None)
+        if w13 is not None and not _bank_logged:
+            _bank_logged = True
+            logger.info(
+                "MoE expert bank on this rank: w13 %s (ep_size=%d, "
+                "moe_tp_size=%d of %d routed experts)", tuple(w13.shape),
+                self.experts.moe_config.ep_size, moe_tp_size,
+                config.num_experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
