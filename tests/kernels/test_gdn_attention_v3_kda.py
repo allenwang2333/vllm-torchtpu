@@ -443,7 +443,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             read_offsets=[2, 0, 7, 1, 4],
         ),
         dict(
-            testcase_name="tp8_large_recurrent_dma",
+            testcase_name="tp8_large_recurrent_window",
             num_heads=12,
             spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4],
             read_offsets=[0, 2, 4, 6, 0, 2, 4, 6],
@@ -454,9 +454,9 @@ class KdaAttentionV3Test(parameterized.TestCase):
         """An 8-token K3 verify window stays in one kernel invocation.
 
         This covers ragged windows, rollback reads from non-zero checkpoints,
-        and TP8's large FP32 recurrent-state DMAs. Every real token must write
-        its conv and recurrent state to ``base + t``; padded tail slots must
-        remain untouched.
+        and TP8's large FP32 recurrent-state window. Every real token must
+        write its conv and recurrent state to ``base + t``; padded tail slots
+        must remain untouched.
         """
         n_kq = n_v = num_heads
         d_k = d_v = 128
