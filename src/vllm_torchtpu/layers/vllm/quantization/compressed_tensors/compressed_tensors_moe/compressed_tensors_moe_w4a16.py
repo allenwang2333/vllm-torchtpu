@@ -57,9 +57,8 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         moe: FusedMoEConfig,
         layer_name: str | None = None,
     ):
-        # Bypass upstream CompressedTensorsWNA16MoEMethod to:
-        # Prevent upfront TPU HBM pre-allocation during weight creation,
-        # which leads to OOM during weight loading from GCS Streamer/HF without EP
+
+        # Skip CompressedTensorsWNA16MoEMethod.__init__ (GPU backend assertion)
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -123,6 +122,9 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Bypass upstream create weights method as well
+        # to prevent upfront TPU HBM pre-allocation during weight creation,
+        # which leads to OOM during weight loading from GCS Streamer/HF without EP
         self._validate_w4a16_scheme()
 
         if self.strategy == "channel":
