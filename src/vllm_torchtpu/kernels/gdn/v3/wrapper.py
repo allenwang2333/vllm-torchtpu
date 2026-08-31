@@ -137,8 +137,8 @@ def inner_kernel(
         # math. Preserve that numerical contract for a fused verify window;
         # otherwise its target logits can drift solely because the KDA window
         # keeps this intermediate in fp32.
-        qkv_out_compact = qkv_out_compact.astype(
-            cfg.dtypes.act_out).astype(jnp.float32)
+        qkv_out_compact = qkv_out_compact.astype(cfg.dtypes.act_out).astype(
+            jnp.float32)
 
     # Step 2: GDN.
 
@@ -522,18 +522,32 @@ def fused_conv1d_gdn(
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__[
             "num_buffers"].default
-        bytes_per_seq = window * (
+        recurrent_bytes_per_seq = window * n_v * d_k * d_v * 4
+        bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
-            n_v * d_k * d_v * 4
+            recurrent_bytes_per_seq
             # Conv checkpoints (fp32).
-            + (kernel_size - 1) * dim * 4
+            + window * (kernel_size - 1) * dim * 4
             # qkv (fp32), b/a (fp32), out (act_out).
-            + dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2))
         vmem_budget = int(config.GDNConfig.WINDOWED_VMEM_FRACTION *
                           pltpu.get_tpu_info().vmem_capacity_bytes)
         spec_tile_budget = (vmem_budget // 2) // num_buffers
         decode_tile_size = max(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq))
+
+        if is_kda:
+            # The general VMEM-capacity budget above is too loose for KDA's
+            # large FP32 checkpoint window. On v7, TP8 with two 12-head
+            # sequences per tile corrupts the leading recurrent checkpoint,
+            # while one sequence is stable; TP32 with four 3-head sequences
+            # is also stable. Cap TP8/TP16/TP32 at the same 12-head footprint,
+            # or 6 MiB of recurrent checkpoints in one buffer tile.
+            max_recurrent_bytes_per_tile = 6 * 1024 * 1024
+            recurrent_tile_budget = (max_recurrent_bytes_per_tile //
+                                     recurrent_bytes_per_seq)
+            decode_tile_size = max(
+                1, min(decode_tile_size, recurrent_tile_budget))
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
