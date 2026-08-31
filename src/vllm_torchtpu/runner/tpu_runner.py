@@ -2493,6 +2493,20 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
+        # Option 3: On-device token passing in steady-state decode:
+        # If all input tokens match previous step's next_tokens_tpu 1:1 on device,
+        # directly slice next_tokens_tpu on-device without H2D index uploads or scatter kernel.
+        if (len(token_in_tpu_cur_input_indices) == len(input_ids)
+                and np.array_equal(token_in_tpu_cur_input_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and np.array_equal(token_in_tpu_pre_next_tokens_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None):
+            next_tpu = self._pre_async_results.next_tokens_tpu.flatten()
+            if len(next_tpu) >= len(input_ids):
+                return next_tpu[:len(input_ids)]
+
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside
@@ -3015,28 +3029,50 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
-        if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[:, total_num_scheduled_tokens:
-                                         padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:,
-                                                         local_token_slice].to(
-                                                             self.device,
-                                                             non_blocking=True)
+        if (self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None
+                and total_num_scheduled_tokens == num_reqs):
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[local_token_slice]
         else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
                 self.device, non_blocking=True)
+
+        # Option 3: Double-buffered persistent tensor pools for positions and seq_lens
+        if not hasattr(self, "_h2d_double_buf"):
+            self._h2d_double_buf = {
+                "idx": 0,
+                "positions": [None, None],
+                "seq_lens": [None, None],
+            }
+        self._h2d_double_buf["idx"] = (self._h2d_double_buf["idx"] + 1) % 2
+        b_idx = self._h2d_double_buf["idx"]
+
+        pos_src = self.positions_cpu[local_token_slice]
+        pos_dev = self._h2d_double_buf["positions"][b_idx]
+        if pos_dev is None or pos_dev.shape != pos_src.shape:
+            pos_dev = torch.empty(pos_src.shape, dtype=pos_src.dtype, device=self.device)
+            self._h2d_double_buf["positions"][b_idx] = pos_dev
+        pos_dev.copy_(pos_src, non_blocking=True)
+        self.position_ids = pos_dev
+
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True)
+            target_slice = self.seq_lens_cpu[:self.num_reqs_max_model_len]
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True)
+            target_slice = self.seq_lens_cpu[:self.num_reqs_most_model_len]
             target_num_reqs = self.num_reqs_most_model_len
+
+        seq_dev = self._h2d_double_buf["seq_lens"][b_idx]
+        if seq_dev is None or seq_dev.shape != target_slice.shape:
+            seq_dev = torch.empty(target_slice.shape, dtype=target_slice.dtype, device=self.device)
+            self._h2d_double_buf["seq_lens"][b_idx] = seq_dev
+        seq_dev.copy_(target_slice, non_blocking=True)
+        seq_lens = seq_dev
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real

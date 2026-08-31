@@ -476,9 +476,17 @@ def stage_block_table_uploads(
             rows[:ctx.num_reqs] = source[ctx.start_index:ctx.start_index +
                                          ctx.num_reqs, :target_num_blocks]
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
-
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    # Option 3: Double-buffered persistent device staging pool
+    if not hasattr(runner, "_block_table_dev_pool"):
+        runner._block_table_dev_pool = [None, None]
+        runner._dev_buf_idx = 0
+    runner._dev_buf_idx = (runner._dev_buf_idx + 1) % 2
+    staged_buf = runner._block_table_dev_pool[runner._dev_buf_idx]
+    if staged_buf is None or staged_buf.numel() < total or staged_buf.dtype != flat.dtype:
+        staged_buf = torch.empty((total, ), dtype=flat.dtype, device=runner.device)
+        runner._block_table_dev_pool[runner._dev_buf_idx] = staged_buf
+    staged_dev = staged_buf[:total]
+    staged_dev.copy_(flat, non_blocking=True)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
