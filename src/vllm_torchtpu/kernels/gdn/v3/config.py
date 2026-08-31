@@ -119,6 +119,11 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # KDA speculative verify only: use the chunk/prefill-style triangular
+    # solve for the whole fixed window instead of the token-recurrent scan.
+    # Kept static so recurrent and mega-window variants have distinct Pallas
+    # programs and can be compared without changing the state ABI.
+    kda_verify_use_chunked: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -173,12 +178,9 @@ class GDNConfig:
 
     @property
     def use_recurrent(self) -> bool:
-        """Whether GDN runs the token-recurrent scan instead of the chunked one.
-
-        Keeping more than one state checkpoint mandates the recurrent scan,
-        since the chunked path only ever produces the final state.
-        """
-        return self.chunk_size == 1 or self.window_size > 1
+        """Whether GDN runs the token-recurrent scan instead of chunk solve."""
+        return (self.chunk_size == 1 or
+                (self.window_size > 1 and not self.kda_verify_use_chunked))
 
     @property
     def v_dim_size(self) -> int:
@@ -202,6 +204,8 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.is_kda and self.window_size > 1 and self.kda_verify_use_chunked:
+            suffix += "_mega"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         return (f"fused_conv1d_{self.attention_mode.value}"

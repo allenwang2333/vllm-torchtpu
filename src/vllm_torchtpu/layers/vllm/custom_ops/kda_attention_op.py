@@ -367,8 +367,19 @@ def _get_kda_prefill_kernel() -> str:
     return kernel
 
 
+def _get_kda_verify_kernel() -> str:
+    """Read the compile-time K3 speculative-verify KDA implementation."""
+    kernel = os.environ.get("VLLM_TORCHTPU_K3_KDA_VERIFY_KERNEL",
+                            "recurrent").strip().lower()
+    if kernel not in ("recurrent", "mega"):
+        raise ValueError(
+            "VLLM_TORCHTPU_K3_KDA_VERIFY_KERNEL must be 'recurrent' or "
+            f"'mega', got {kernel!r}.")
+    return kernel
+
+
 def _build_fused_core(lower_bound: float | None, eps: float,
-                      num_spec_tokens: int):
+                      num_spec_tokens: int, *, mega_verify: bool):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     One Pallas call replaces the four-stage manual pipeline: the fused kernel
@@ -444,6 +455,7 @@ def _build_fused_core(lower_bound: float | None, eps: float,
             attention_mode=gdn_config.AttentionMode.KDA,
             gate_lower_bound=lower_bound,
             num_spec_tokens=num_spec_tokens,
+            kda_verify_use_chunked=mega_verify,
         )
 
         output = out.reshape(num_tokens, num_heads, head_dim)
@@ -469,6 +481,8 @@ def build_kimi_dispatched_kda_op(
     Pallas call even when manual/mega prefill is selected.
     """
     prefill_kernel = _get_kda_prefill_kernel()
+    verify_kernel = _get_kda_verify_kernel()
+    mega_verify = verify_kernel == "mega"
     use_mega_prefill = prefill_kernel == "mega"
 
     def dispatched_core(
@@ -550,6 +564,7 @@ def build_kimi_dispatched_kda_op(
                      attention_mode=gdn_config.AttentionMode.KDA,
                      gate_lower_bound=lower_bound,
                      num_spec_tokens=num_spec_tokens,
+                     kda_verify_use_chunked=mega_verify,
                      batched_only=True,
                  )
                 return (new_conv_state, new_recurrent_state,
@@ -750,8 +765,10 @@ def build_kimi_dispatched_kda_op(
     # The fused core replaces the whole op, prefill included, so it overrides
     # the chunked/mega selection rather than composing with it.
     use_fused = _use_fused_kda()
-    variant = "fused" if use_fused else prefill_kernel
-    core = (_build_fused_core(lower_bound, eps, num_spec_tokens)
+    variant = (f"fused_{verify_kernel}_verify"
+               if use_fused else f"{prefill_kernel}_{verify_kernel}_verify")
+    core = (_build_fused_core(lower_bound, eps, num_spec_tokens,
+                              mega_verify=mega_verify)
             if use_fused else dispatched_core)
 
     if use_fused and prefill_kernel != "chunked":
@@ -764,8 +781,9 @@ def build_kimi_dispatched_kda_op(
     # var, so the variant goes in the op name. If this line disagrees with the
     # kernels in a profile, the run came from cache.
     logger.info(
-        "KDA op %s: using the %s path.", prefix, "fused conv1d + GDN v3"
-        if use_fused else f"manual with {prefill_kernel} prefill")
+        "KDA op %s: using the %s path with %s verify.", prefix,
+        "fused conv1d + GDN v3" if use_fused else
+        f"manual with {prefill_kernel} prefill", verify_kernel)
 
     op_name = (f"pallas::kimi_dispatched_kda_{variant}_"
                f"{prefix.replace('.', '_')}")

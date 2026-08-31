@@ -284,14 +284,42 @@ def chunked_kda_per_seq(
 
     g_last = g_cumsum[:, -1:, :]
     k_gating_last = k * jnp.exp(g_last - g_cumsum)
-    state_new = jax.lax.dot_general(
-        k_gating_last,
-        u_ws,
-        (((1, ), (1, )), ((0, ), (0, ))),
-        preferred_element_type=jnp.float32,
-    )
-    state_updated = state_prev * jnp.exp(g_last.swapaxes(1, 2))
-    state = state_updated + state_new
+    if cfg.window_size > 1:
+        # A speculative verify window needs the state after every token, not
+        # only the state at the end of the chunk.  The chunk solve has already
+        # produced the delta-rule updates ``u_ws`` for all positions.  Apply
+        # every causal prefix to the incoming state in one batched contraction:
+        #
+        #   H_t = exp(g_t) H_0
+        #       + sum_{j <= t} exp(g_t - g_j) k_j (u-ws)_j
+        #
+        # This is the prefill/mega formulation of the same recurrence.  It
+        # emits [token, head, k, v] checkpoints through the existing windowed
+        # state ABI, so rejection rollback is unchanged.
+        delta_g = (g_cumsum[:, :, None, :]
+                   - g_cumsum[:, None, :, :])
+        causal = (jnp.arange(cfg.chunk_size)[:, None]
+                  >= jnp.arange(cfg.chunk_size)[None, :])
+        prefix_k = (k[:, None, :, :] * jnp.exp(jnp.minimum(delta_g, 0.0))
+                    * causal[None, :, :, None])
+        state_new = jax.lax.dot_general(
+            prefix_k,
+            u_ws,
+            (((2, ), (1, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32,
+        )
+        state_updated = (state_prev[:, None] *
+                         jnp.exp(g_cumsum[:, :, :, None]))
+        state = state_updated + state_new
+    else:
+        state_new = jax.lax.dot_general(
+            k_gating_last,
+            u_ws,
+            (((1, ), (1, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32,
+        )
+        state_updated = state_prev * jnp.exp(g_last.swapaxes(1, 2))
+        state = state_updated + state_new
 
     out_new = jax.lax.dot(
         Aqk,
@@ -336,6 +364,9 @@ def chunked_kda(
     # (seqs, 1, chunk, num_v_heads)
     beta = jax.nn.sigmoid(b_large.astype(jnp.float32))
     beta = jnp.where(mask, beta, 0.0)
+    if cfg.window_size > 1:
+        # Match the one-token decode ABI used by the recurrent verifier.
+        beta = beta.astype(cfg.dtypes.act_out).astype(jnp.float32)
 
     a_log_kda = a_log.reshape(1, -1, 1, 1).astype(jnp.float32)
     dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1,
@@ -356,11 +387,14 @@ def chunked_kda(
             cfg,
         )
         out_list.append(out.swapaxes(0, 1))
-        state_list.append(state)
+        state_list.append(state.swapaxes(0, 1)
+                          if cfg.window_size > 1 else state)
     out = jnp.stack(out_list, axis=0)
-    # Chunked KDA is only selected for a one-checkpoint window; speculative
-    # verify uses the recurrent scan below.
-    state = jnp.stack(state_list, axis=0)[:, jnp.newaxis]
+    # Prefill keeps one end-of-sequence checkpoint.  The optional mega verify
+    # path keeps one checkpoint per window position.
+    state = jnp.stack(state_list, axis=0)
+    if cfg.window_size == 1:
+        state = state[:, jnp.newaxis]
     return out, state
 
 

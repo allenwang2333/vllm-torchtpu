@@ -322,6 +322,7 @@ def outer_kernel(
         "d_v",
         "kernel_size",
         "num_spec_tokens",
+        "kda_verify_use_chunked",
         "decode_tile_size",
         "mixed_tile_size",
         "batched_only",
@@ -359,6 +360,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    kda_verify_use_chunked: bool = False,
     batched_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
@@ -428,6 +430,9 @@ def fused_conv1d_gdn(
             Must be set iff `state_source` is set.
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
+        kda_verify_use_chunked: KDA-only experimental path that evaluates a
+            fixed speculative verify window with the prefill-style triangular
+            solve while retaining every rollback checkpoint.
         batched_only: Run only the leading decode/verify segment and omit the
             PER_SEQ prefill call. Used by KDA's manual/mega dispatcher, which
             owns prefill separately.
@@ -607,6 +612,8 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            kda_verify_use_chunked=(kda_verify_use_chunked
+                                    and is_kda and window_size > 1),
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,

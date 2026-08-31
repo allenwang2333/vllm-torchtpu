@@ -441,16 +441,33 @@ class KdaAttentionV3Test(parameterized.TestCase):
             num_heads=3,
             spec_lengths=[8, 3, 1, 7, 2],
             read_offsets=[2, 0, 7, 1, 4],
+            kda_verify_use_chunked=False,
+        ),
+        dict(
+            testcase_name="tp32_mega_verify",
+            num_heads=3,
+            spec_lengths=[8, 3, 1, 7, 2],
+            read_offsets=[2, 0, 7, 1, 4],
+            kda_verify_use_chunked=True,
         ),
         dict(
             testcase_name="tp8_large_recurrent_window",
             num_heads=12,
             spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4],
             read_offsets=[0, 2, 4, 6, 0, 2, 4, 6],
+            kda_verify_use_chunked=False,
+        ),
+        dict(
+            testcase_name="tp8_large_mega_window",
+            num_heads=12,
+            spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4],
+            read_offsets=[0, 2, 4, 6, 0, 2, 4, 6],
+            kda_verify_use_chunked=True,
         ),
     )
     def test_speculative_window_checkpoints(self, num_heads, spec_lengths,
-                                            read_offsets):
+                                            read_offsets,
+                                            kda_verify_use_chunked):
         """An 8-token K3 verify window stays in one kernel invocation.
 
         This covers ragged windows, rollback reads from non-zero checkpoints,
@@ -529,6 +546,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             **common_kwargs,
             read_offsets=read_offsets_arr,
             num_spec_tokens=num_spec_tokens,
+            kda_verify_use_chunked=kda_verify_use_chunked,
             batched_only=True,
             attention_mode=config.AttentionMode.KDA,
         )
