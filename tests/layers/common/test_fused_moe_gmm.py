@@ -197,6 +197,67 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
 
 
+def test_owner_output_combine_survives_the_unmaterialised_path():
+    """The fused path hands moe_gmm x=None, so no return may read x.dtype.
+
+    `use_fpg` and the one-hot owner-output branch are both small-M conditions and
+    hold together under the shipped defaults. Every other return was moved to
+    `out_dtype` when `materialize=False` was introduced; the blockwise combine
+    arrived later, from upstream, and kept `x.dtype` -- which is None here.
+    """
+    w1 = jnp.zeros((2, 2, 4), dtype=jnp.bfloat16)
+    w2 = jnp.zeros((2, 2, 2), dtype=jnp.bfloat16)
+    pool = jnp.zeros((2, 2), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([2, 2], dtype=jnp.int32)
+    argsort_revert_indices = jnp.array([2, 0, 1, 3], dtype=jnp.int32)
+    topk_weights_flat = jnp.array([0.1, 0.2, 0.3, 0.4], dtype=jnp.bfloat16)
+    valid_mask = jnp.ones((4, ), dtype=jnp.bool_)
+    token_indices_sorted = jnp.array([1, 2, 0, 3], dtype=jnp.int32) // 2
+    gmm1_res = jnp.zeros((4, 4), dtype=jnp.bfloat16)
+    gmm2_res = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    expected = jnp.ones((2, 2), dtype=jnp.bfloat16)
+
+    with patch.object(envs, "TPU_MOE_OWNER_OUTPUT_MODE",
+                      "on"), patch.object(
+                          fused_moe_gmm,
+                          "fused_permute_gmm",
+                          return_value=gmm1_res), patch.object(
+                              fused_moe_gmm,
+                              "gmm_wrapper",
+                              return_value=gmm2_res), patch.object(
+                                  fused_moe_gmm,
+                                  "can_use_blockwise_onehot_unpermute",
+                                  return_value=True), patch.object(
+                                      fused_moe_gmm,
+                                      "blockwise_onehot_unpermute",
+                                      return_value=expected):
+        actual = moe_gmm(
+            None,
+            w1,
+            None,
+            None,
+            w2,
+            None,
+            None,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            activation="silu",
+            num_tokens=2,
+            topk=2,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4,
+            lhs_pool=pool,
+            gather_indices=token_indices_sorted,
+        )
+
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == pool.dtype
+
+
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True),
                                                     ("off", False)])
 def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):

@@ -19,6 +19,8 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.fused_permute_gmm import (
+    fused_permute_gmm, smem_index_limit_bytes)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -147,6 +149,17 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     return packed, scale
 
 
+def _is_fp4_weight(rhs) -> bool:
+    """fp4 weights keep bf16 activations.
+
+    Quantizing activations to fp8 collapses fp4 accuracy (error compounds
+    across MoE layers) with no decode speedup, decode being weight-HBM-bound.
+    fp8/int4 weights keep the default fp8 activation.
+    """
+    return (jnp.issubdtype(rhs.dtype, jnp.floating)
+            and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -157,11 +170,7 @@ def gmm_wrapper(lhs,
                 fuse_act=None,
                 preferred_element_type=None,
                 rhs_quant_dtype=None):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -243,7 +252,9 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    materialize: bool = True,
+) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array,
+           jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -297,7 +308,11 @@ def prepare_routed_gmm_inputs(
                              valid_mask[:, None].astype(jnp.int32))
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if use_ep and use_sparse_core:
+    if not materialize:
+        # fused_permute_gmm reads the pool per-row inside the GMM1 kernel; the
+        # permuted activation never exists in HBM.
+        x = None
+    elif use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
@@ -323,7 +338,7 @@ def prepare_routed_gmm_inputs(
 
 
 def moe_gmm(
-    x: jax.Array,
+    x: jax.Array | None,
     w1: jax.Array,
     w1_scale: jax.Array | None,
     w1_bias: jax.Array | None,
@@ -344,6 +359,9 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    lhs_pool: jax.Array | None = None,
+    gather_indices: jax.Array | None = None,
+    ep_size: int = 1,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -353,20 +371,37 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    if gather_indices is not None:
+        # GMM1 reads row `gather_indices[i]` of the un-permuted pool per DMA.
+        gmm1_res = fused_permute_gmm(
+            lhs_pool,
+            w1,
+            group_sizes,
+            gather_indices,
+            w1_scale,
+            w1_bias,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            maybe_quantize_lhs=not _is_fp4_weight(w1),
+            ep_size=ep_size,
+        )
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
 
+    out_dtype = x.dtype if x is not None else lhs_pool.dtype
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
@@ -377,7 +412,7 @@ def moe_gmm(
                            group_sizes,
                            group_offset,
                            zero_initialize=False,
-                           preferred_element_type=x.dtype,
+                           preferred_element_type=out_dtype,
                            rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
@@ -404,7 +439,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
             if skip_padded_tokens:
                 # Zero out the GMM output rows of padded tokens that
                 # skipped the GMM computation, otherwise those
@@ -420,14 +455,14 @@ def moe_gmm(
                                     dtype=gmm2_res.dtype)
             combine = (onehot * topk_weights[..., None] *
                        valid_mask[..., None]).sum(axis=1)
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(out_dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(out_dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape(
@@ -436,7 +471,7 @@ def moe_gmm(
                                                             axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(out_dtype)
 
 
 @functools.partial(
@@ -449,6 +484,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "ep_size",
     ),
 )
 def fused_moe_func(
@@ -462,6 +498,7 @@ def fused_moe_func(
     topk_weights: jax.Array,
     topk_ids: jax.Array,
     experts_start: jax.Array | None = None,
+    hidden_states_blocked: jax.Array | None = None,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
@@ -469,6 +506,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    ep_size: int = 1,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -519,6 +557,15 @@ def fused_moe_func(
                                  jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
+    # fused_permute_gmm folds the dispatch permute into GMM1, reading the
+    # un-permuted pool per row. Scoped to the EP SparseCore dispatch it was
+    # measured against; outside its envelope the materialised path stands.
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    use_fpg = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
+               and num_tokens * topk * 4 <= smem_index_limit_bytes()
+               and padded_hidden_size % num_lanes == 0
+               and rhs_quant_dtype is None)  # no packed-carrier bitcast
+
     (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
      token_indices_sorted) = prepare_routed_gmm_inputs(
          hidden_states,
@@ -530,8 +577,23 @@ def fused_moe_func(
          use_sparse_core=use_sparse_core,
          onehot_moe_permute_threshold=onehot_moe_permute_threshold,
          skip_padded_tokens=skip_padded_tokens,
+         materialize=not use_fpg,
      )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    lhs_pool = gather_indices = None
+    if use_fpg:
+        # The pool the communicator blocked on the pre-gather shard; the same
+        # reshape here would be that conversion on dp times the bytes. It is a
+        # view, so it serves only when no hidden-size padding is needed.
+        if (hidden_states_blocked is not None
+                and hidden_states_blocked.ndim == 3
+                and padded_hidden_size == hidden_size):
+            lhs_pool = hidden_states_blocked
+        else:
+            lhs_pool = jnp.pad(hidden_states,
+                               ((0, 0), (0, padded_hidden_size - hidden_size)))
+        gather_indices = token_indices_sorted
+    else:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -553,5 +615,8 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        lhs_pool=lhs_pool,
+        gather_indices=gather_indices,
+        ep_size=ep_size,
     )
     return x[:num_tokens, :hidden_size]

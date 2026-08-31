@@ -259,6 +259,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            ep_size=layer.moe_config.moe_parallel_config.ep_size,
         )
 
     def get_fused_moe_quant_config(
@@ -311,9 +312,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)
 
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(
+            **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)
 
 
 REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
@@ -497,4 +500,5 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
+            ep_size=layer.moe_config.moe_parallel_config.ep_size,
         )

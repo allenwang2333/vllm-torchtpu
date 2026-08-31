@@ -13,11 +13,13 @@
 # limitations under the License.
 """Unit tests for vllm_torchtpu.layers.vllm.moe_routing helpers."""
 
+import types
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_torchtpu.layers.vllm import moe_routing
+from vllm_torchtpu.distributed import tpu_communicator
+from vllm_torchtpu.layers.vllm import fused_moe, moe_routing
 
 
 def _make_layer(*, use_ep, ep_size=1, ep_rank=0, global_num_experts=0):
@@ -181,3 +183,134 @@ def test_routing_path_compiles_fullgraph(monkeypatch, impl):
     got_w, got_i = compiled(hidden, logits)
     ref_w, ref_i = run(hidden, logits)
     assert torch.equal(got_w, ref_w) and torch.equal(got_i, ref_i)
+
+
+class _FakeDpGroup:
+    """A DP group whose all_gather concatenates `world_size` copies."""
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+
+    def all_gather(self, x, dim=0):
+        return torch.cat([x] * self.world_size, dim=dim)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+@pytest.mark.parametrize("dp_size,pcp_size,expected", [(1, 1, False),
+                                                       (2, 1, True),
+                                                       (2, 2, False),
+                                                       (1, 2, False)])
+@pytest.mark.parametrize("withheld", [False, True])
+@pytest.mark.parametrize("budget,expect_blocked", [(0, False), (7, False),
+                                                   (8, True)])
+def test_pre_gather_blocking_follows_the_fused_path(monkeypatch, budget,
+                                                    expect_blocked):
+    """A blockable SHAPE is not enough; the fused path has to be able to read it.
+
+    Blocking on the shard and un-blocking on the full pool costs a data-format
+    call per layer, which is strictly worse than gathering the pool plainly.
+    """
+    dp_size, num_tokens, hidden_size = 2, 4, 128
+    monkeypatch.setattr(tpu_communicator, "get_dp_group",
+                        lambda: _FakeDpGroup(dp_size))
+    monkeypatch.setattr(tpu_communicator, "router_logits_withheld",
+                        lambda: False)
+    monkeypatch.setattr(tpu_communicator,
+                        "_FPG_MAX_TOKENS", [budget],
+                        raising=False)
+    tpu_communicator.take_blocked_pool()
+
+    comm = tpu_communicator.TpuDeviceCommunicator.__new__(
+        tpu_communicator.TpuDeviceCommunicator)
+    out_hidden, _ = comm.dispatch_router_logits(
+        torch.zeros(num_tokens, hidden_size), torch.zeros(num_tokens, 8))
+
+    assert (tpu_communicator.take_blocked_pool() is not None) is expect_blocked
+    assert out_hidden.shape == (num_tokens * dp_size, hidden_size)
+
+
+def test_fpg_ceiling_is_zero_when_the_switch_is_off(monkeypatch):
+    """Blocking a pool nothing will read costs a SparseCore data-format call per
+    layer, so the switch has to reach the ceiling too, not just the dispatch."""
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(tpu_communicator,
+                        "_FPG_MAX_TOKENS", [None],
+                        raising=False)
+    monkeypatch.setattr(envs, "USE_FUSED_PERMUTE_GMM", False)
+    fused_moe._build_fused_moe_custom_op(
+        topk=8,
+        activation="silu",
+        use_ep=True,
+        skip_padded_tokens=False,
+    )
+    assert tpu_communicator.fpg_max_tokens() == 0
+
+
+def test_fpg_ceiling_takes_the_most_restrictive_layer(monkeypatch):
+    monkeypatch.setattr(tpu_communicator,
+                        "_FPG_MAX_TOKENS", [None],
+                        raising=False)
+    tpu_communicator.set_fpg_max_tokens(12000)
+    tpu_communicator.set_fpg_max_tokens(0)
+    tpu_communicator.set_fpg_max_tokens(12000)
+    assert tpu_communicator.fpg_max_tokens() == 0
+
+
+def test_lane_count_comes_from_the_hardware(monkeypatch):
+    """`resolve_hardware` reads the lane count off the device, once."""
+    monkeypatch.setattr(tpu_communicator, "_LANES", [0])
+    fake = types.SimpleNamespace(num_lanes=256)
+    monkeypatch.setattr("jax.experimental.pallas.tpu.get_tpu_info",
+                        lambda: fake)
+    tpu_communicator.resolve_hardware()
+    assert tpu_communicator._LANES[0] == 256
+
+
+def test_lane_count_survives_a_device_less_host(monkeypatch):
+    """Op construction can run before there is a device; the default must stand.
+
+    `get_tpu_info` raises for an unsupported device kind, which is what a CPU host looks
+    like. Upstream's own use of it at this same site catches that and falls back.
+    """
+    monkeypatch.setattr(tpu_communicator, "_LANES", [128])
+
+    def _boom():
+        raise ValueError("Unsupported TPU device kind: cpu")
+
+    monkeypatch.setattr("jax.experimental.pallas.tpu.get_tpu_info", _boom)
+    tpu_communicator.resolve_hardware()
+    assert tpu_communicator._LANES[0] == 128
+
+
+def test_dispatch_never_reads_the_hardware_while_tracing(monkeypatch):
+    """The traced path must read the cached int, never call into the accessor.
+
+    `dispatch_router_logits` runs inside the Dynamo-traced region, where the nanobind
+    `get_tpu_info` is untraceable -- an earlier revision called it here and took the whole
+    slice down. Making the accessor explode is what pins that it is not on this path.
+    """
+
+    def _boom():
+        raise AssertionError("get_tpu_info reached from the traced path")
+
+    monkeypatch.setattr("jax.experimental.pallas.tpu.get_tpu_info", _boom)
+    monkeypatch.setattr(tpu_communicator, "_LANES", [128])
+    monkeypatch.setattr(tpu_communicator, "_dp_initialized", lambda: True)
+    monkeypatch.setattr(tpu_communicator, "get_dp_group",
+                        lambda: _FakeDpGroup(2))
+    monkeypatch.setattr(tpu_communicator, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(tpu_communicator.envs, "TPU_MOE_COLLECTION_CHUNK_SIZE",
+                        0)
+    tpu_communicator.set_fpg_max_tokens(1 << 20)
+
+    comm = tpu_communicator.TpuDeviceCommunicator.__new__(
+        tpu_communicator.TpuDeviceCommunicator)
+    monkeypatch.setattr(comm, "_dp_gather", lambda t: t, raising=False)
+    hidden = torch.zeros((4, 256), dtype=torch.bfloat16)
+    logits = torch.zeros((4, 8), dtype=torch.bfloat16)
+    comm.dispatch_router_logits(hidden, logits)
+
+    # Not vacuous: the blocking branch -- the one that reads the lane count, twice -- has to
+    # have been taken, or an early return would make this pass without exercising anything.
+    assert tpu_communicator.take_blocked_pool() is not None

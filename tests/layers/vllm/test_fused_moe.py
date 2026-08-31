@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.layers.vllm import fused_moe
 from vllm_torchtpu.layers.vllm.fused_moe import get_fused_moe_activation
 
 
@@ -67,3 +68,23 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+def test_prebuild_and_forward_share_one_cache_entry(monkeypatch):
+    """A prebuilt op must be the one the forward finds.
+
+    The cache key is spelled at every call site, so a parameter added to the
+    forward and not to the prebuild silently misses -- correct results, but the
+    op gets built inside the traced forward, which is what prebuilding exists to
+    avoid.
+    """
+    monkeypatch.setattr(fused_moe, "_fused_moe_kernel_cache", {})
+    kwargs = dict(topk=4,
+                  activation="silu",
+                  use_ep=True,
+                  skip_padded_tokens=True,
+                  ep_size=8)
+    fused_moe.prebuild_fused_moe_kernel(**kwargs)
+    assert len(fused_moe._fused_moe_kernel_cache) == 1
+    fused_moe._get_fused_moe_custom_op(**kwargs)
+    assert len(fused_moe._fused_moe_kernel_cache) == 1

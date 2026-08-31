@@ -15,6 +15,7 @@ class FakeRoutedExperts(RoutedExperts):
         self.moe_config.experts_per_token = experts_per_token
         self.moe_config.moe_parallel_config = MagicMock()
         self.moe_config.moe_parallel_config.use_ep = False
+        self.moe_config.moe_parallel_config.ep_size = 1
         self.moe_config.norm_topk_prob = True
         self.moe_config.has_bias = False
         self.activation = "silu"
@@ -94,7 +95,8 @@ def test_mxfp4_create_weights_and_process():
     mock_prebuild.assert_called_once_with(topk=2,
                                           activation="silu",
                                           use_ep=False,
-                                          skip_padded_tokens=True)
+                                          skip_padded_tokens=True,
+                                          ep_size=1)
 
     # Validate output
     assert hasattr(layer, "w13_weight")

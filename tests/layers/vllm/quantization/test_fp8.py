@@ -537,6 +537,7 @@ class TestOnlineFp8Quantization:
         layer._tpu_activation_str = "silu"
         layer.moe_config.experts_per_token = 2
         layer.moe_config.moe_parallel_config.use_ep = False
+        layer.moe_config.moe_parallel_config.ep_size = 1
         layer.renormalize = True
 
         mock_routing = MagicMock(

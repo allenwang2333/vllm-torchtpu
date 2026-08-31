@@ -836,6 +836,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            ep_size=layer.moe_config.moe_parallel_config.ep_size,
         )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
@@ -899,9 +900,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
             "activation": activation_str,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)
 
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(
+            **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

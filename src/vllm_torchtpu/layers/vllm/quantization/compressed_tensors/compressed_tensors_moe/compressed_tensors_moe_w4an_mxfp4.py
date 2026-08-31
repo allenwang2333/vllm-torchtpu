@@ -223,6 +223,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             activation=activation_str,
             use_ep=use_ep,
             skip_padded_tokens=True,
+            ep_size=layer.moe_config.moe_parallel_config.ep_size,
         )
 
     def apply_monolithic(
@@ -265,7 +266,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "skip_padded_tokens": True,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)
 
         # Execute GMM Kernel with native fp4 weights and scales
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(
+            **kwargs, ep_size=layer.moe_config.moe_parallel_config.ep_size)

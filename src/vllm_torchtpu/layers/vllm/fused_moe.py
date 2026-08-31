@@ -21,6 +21,9 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed import tpu_communicator
+from vllm_torchtpu.kernels.megablox.fused_permute_gmm import \
+    smem_index_limit_bytes
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
     resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
@@ -113,6 +116,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    ep_size: int = 1,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -135,7 +139,18 @@ def _build_fused_moe_custom_op(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens)
+        skip_padded_tokens=skip_padded_tokens,
+        ep_size=ep_size)
+
+    # Read the hardware once, here: op construction is off the traced path.
+    tpu_communicator.resolve_hardware()
+
+    # The fused permute path's static eligibility, so the communicator can skip
+    # pre-gather blocking on a model that will never consume it.
+    tpu_communicator.set_fpg_max_tokens(
+        smem_index_limit_bytes() //
+        (topk * 4) if (envs.USE_FUSED_PERMUTE_GMM and use_ep
+                       and use_sparse_core and rhs_quant_dtype is None) else 0)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -146,7 +161,8 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
+                 ep_size)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -158,10 +174,12 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    ep_size: int = 1,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
+                 ep_size)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -171,6 +189,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        ep_size=ep_size,
     )
 
 
@@ -181,6 +200,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    ep_size: int = 1,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -189,6 +209,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        ep_size=ep_size,
     )
 
 
@@ -207,6 +228,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    ep_size: int = 1,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -227,6 +249,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        ep_size=ep_size,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -235,6 +258,12 @@ def fused_moe_gmm(
         experts_start = torch.zeros((),
                                     dtype=torch.int32,
                                     device=hidden_states.device)
+    # The pool the communicator blocked on the pre-gather shard, if any.
+    # `custom_op` rejects keyword-only Tensors and needs a fixed arity, so with
+    # no blocked pool hand it the (unread) 2-D pool.
+    blocked = tpu_communicator.take_blocked_pool()
+    if blocked is None:
+        blocked = hidden_states
     return fused_moe(
         hidden_states,
         w1,
@@ -246,4 +275,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        blocked,
     )

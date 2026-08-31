@@ -121,6 +121,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    ep_size: int = 1,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -179,6 +180,7 @@ def pipelined_fused_moe_gmm(
             ag_topk_ids = topk_ids
 
         out = fused_moe_gmm(
+            ep_size=ep_size,
             hidden_states=ag_hidden_states,
             w1=w1,
             w2=w2,
@@ -236,6 +238,7 @@ def pipelined_fused_moe_gmm(
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
+            ep_size=ep_size,
             hidden_states=ag_hs_curr,
             w1=w1,
             w2=w2,

@@ -19,6 +19,57 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
 
+# The blocked pool's minor dim. Resolved from the device once, at op-build time; the traced
+# path reads the int. `dispatch_router_logits` runs inside the Dynamo-traced region, where a
+# nanobind call is untraceable, so the accessor must never be reached from there.
+_LANES = [128]
+
+
+def resolve_hardware() -> None:
+    """Read the lane count off the device. Call at op-build time, never while tracing."""
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+        _LANES[0] = pltpu.get_tpu_info().num_lanes
+    except Exception:
+        pass  # no device yet, or an unsupported kind; the default stands
+
+
+# Side channel for the lane-blocked MoE pool, set by dispatch_router_logits and
+# consumed by the MoE quant method in the SAME traced forward.  A single slot is
+# enough because dispatch and apply strictly alternate, once per MoE layer.
+_BLOCKED_POOL = [None]
+
+
+def set_blocked_pool(t) -> None:
+    _BLOCKED_POOL[0] = t
+
+
+# Global token ceiling of the fused permute path, published by the MoE op builder.
+_FPG_MAX_TOKENS = [None]
+
+
+def set_fpg_max_tokens(n: int) -> None:
+    """Publish the fused permute path's global-token ceiling (0 = ineligible).
+
+    Blocking a pool that path cannot read is worse than not blocking it: the
+    full-pool un-blocking costs a SparseCore data-format call per layer, more
+    than the shard-side blocking saved.  The most restrictive layer wins, since
+    blocking is decided per step for the whole model while eligibility is a
+    per-layer property.
+    """
+    cur = _FPG_MAX_TOKENS[0]
+    _FPG_MAX_TOKENS[0] = n if cur is None else min(cur, n)
+
+
+def fpg_max_tokens() -> int:
+    return _FPG_MAX_TOKENS[0] or 0
+
+
+def take_blocked_pool():
+    """Return the pool stashed by the last dispatch and clear the slot."""
+    t, _BLOCKED_POOL[0] = _BLOCKED_POOL[0], None
+    return t
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -51,7 +102,28 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, router_logits
-        hidden_states = self._dp_gather(hidden_states)
+
+        # A blockable shape is not enough: the fused path has to be able to
+        # read it, or the full-pool un-blocking costs more than blocking saved.
+        budget = fpg_max_tokens()
+        if (budget and hidden_states.dim() == 2
+                and hidden_states.shape[-1] % _LANES[0] == 0
+                and hidden_states.shape[0] * dp.world_size <= budget):
+            # Block the pool on the pre-gather shard, the layout
+            # fused_permute_gmm reads rows in: the same SparseCore data-format
+            # conversion as after the gather, on 1/dp of the bytes.
+            n, k = hidden_states.shape
+            blocked = self._dp_gather(
+                hidden_states.view(n, k // _LANES[0], _LANES[0]))
+            # Side channel: `_maybe_dispatch` unpacks a 2-tuple. The gate above
+            # is what makes the returned view unread, so its reshape is dead
+            # code and the relayout is not paid.
+            set_blocked_pool(blocked)
+            hidden_states = blocked.view(blocked.shape[0], k)
+        else:
+            set_blocked_pool(None)
+            hidden_states = self._dp_gather(hidden_states)
+
         router_logits = self._dp_gather(router_logits)
         return hidden_states, router_logits
 

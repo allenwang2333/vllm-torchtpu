@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
+    USE_FUSED_PERMUTE_GMM: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -321,6 +322,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    # Selects the fused MoE dispatch permute: GMM1 reads the un-permuted pool
+    # per row, so the permuted activation never reaches HBM. When 0 the permute
+    # is materialised and the SparseCore ragged / one-hot paths stand.
+    "USE_FUSED_PERMUTE_GMM":
+    lambda: bool(int(os.getenv("USE_FUSED_PERMUTE_GMM") or "1")),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
