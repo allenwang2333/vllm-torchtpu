@@ -153,6 +153,38 @@ def _make_inputs(args, rng: np.random.Generator) -> Inputs:
                            replace=False).astype(np.int32)
     page_indices = jnp.asarray(pages)
 
+    # --poison-tail turns the KV tail into a real test of the tail mask.
+    #
+    # The kernel masks KV past `effective_kv_len` so the `pv` matmul never
+    # evaluates `0 * NaN`. With a constant, finite cache that mask is
+    # UNOBSERVABLE: deleting it entirely still yields a bit-identical output,
+    # so an output digest computed on this cache says nothing about whether
+    # the mask works. Filling the out-of-range region with NaN makes the mask
+    # load-bearing -- if it stops covering those slots, NaN reaches `pv` and
+    # propagates into the output.
+    #
+    # Off by default so perf numbers stay comparable with runs taken before
+    # this flag existed; turn it on for correctness runs.
+    if args.poison_tail:
+        full_pages = args.kv_len // page_size
+        tail_in_page = args.kv_len % page_size
+        pages_2d = np.asarray(pages).reshape(args.num_seqs, pages_per_seq)
+        nan = jnp.asarray(float("nan"), jnp.float32).astype(kv_dtype)
+        # Pages lying wholly past kv_len.
+        whole = pages_2d[:, full_pages + (1 if tail_in_page else 0):].ravel()
+        if whole.size:
+            cache = cache.at[jnp.asarray(whole)].set(nan)
+        # The partially-filled page, if kv_len is not page-aligned.
+        if tail_in_page:
+            partial = jnp.asarray(pages_2d[:, full_pages])
+            cache = cache.at[partial, tail_in_page:].set(nan)
+        logger.info(
+            "poison_tail: NaN past kv_len=%d -> %d whole pages/seq + "
+            "%s partial slot(s)", args.kv_len,
+            pages_per_seq - full_pages - (1 if tail_in_page else 0),
+            page_size - tail_in_page if tail_in_page else 0)
+
+
     cu_q_lens = jnp.asarray(np.arange(args.num_seqs + 1, dtype=np.int32))
     # DECODE covers seqs [0, distribution[0]); PREFILL and MIXED are empty.
     distribution = jnp.asarray([args.num_seqs] * 3, jnp.int32)
@@ -282,6 +314,10 @@ def _dedup(out):
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--poison-tail", action="store_true",
+                   help="Fill KV past kv_len with NaN so the tail "
+                        "mask is actually exercised. Without it a "
+                        "digest match proves nothing about the mask.")
     p.add_argument("--num-kv-heads", type=int, default=NUM_KV_HEADS,
                    help="KV heads per rank. 1 reproduces the padded "
                         "production layout; 2 fills all 4 fp8 slots.")
