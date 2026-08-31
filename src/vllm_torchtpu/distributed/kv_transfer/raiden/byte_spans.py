@@ -33,6 +33,10 @@ class PoolByteSpan:
     src_stride_bytes: int = 0
     dst_stride_bytes: int = 0
     count: int = 1
+    # Destination work-unit ordinal inside the transfer's ``dst_units``
+    # (tpu-sync #744 sharded destinations); ``None`` = every destination
+    # (replicated), which is the wire default.
+    dst_unit_ordinal: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
