@@ -1176,11 +1176,19 @@ def _patch_vllm_piecewise_backend() -> None:
 
     def patched_call(self, *args, **kwargs):
         if self.sym_shape_indices:
-            runtime_shape = args[self.sym_shape_indices[0]]
+            val = args[self.sym_shape_indices[0]]
+            if isinstance(val, torch.Tensor):
+                runtime_shape = val.shape[0] if val.ndim > 0 else int(
+                    val.item())
+            elif isinstance(val, (int, torch.SymInt)):
+                runtime_shape = int(val)
+            else:
+                runtime_shape = val
             range_entry = self._find_range_for_shape(runtime_shape)
             assert range_entry is not None, (
                 f"Shape: {runtime_shape} out of considered ranges: "
                 f"{self.compile_ranges}")
+
         elif len(self.range_entries) > 1 or (self.compile_sizes
                                              and len(self.compile_sizes) > 1):
             # Dynamic token count from tensor dimension 0
