@@ -3015,9 +3015,56 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
-        if self.uses_mrope:
+        if use_max_model_len:
+            seq_src = self.seq_lens_cpu[:self.num_reqs_max_model_len]
+            target_num_reqs = self.num_reqs_max_model_len
+        else:
+            assert self.num_reqs_most_model_len is not None
+            seq_src = self.seq_lens_cpu[:self.num_reqs_most_model_len]
+            target_num_reqs = self.num_reqs_most_model_len
+
+        if not self.uses_mrope:
+            # Scheme 1: Mega-H2D 1-shot transfer for (input_ids, positions, seq_lens).
+            # Packs 3 independent transfers into 1 pinned staging buffer, issuing a single
+            # non-blocking copy_ to TPU to eliminate 2 redundant PJRT DMA launch overheads.
+            if not hasattr(self, "_mega_h2d_double_buf"):
+                self._mega_h2d_double_buf = {
+                    "idx": 0,
+                    "cpu": [None, None],
+                    "dev": [None, None],
+                }
+            self._mega_h2d_double_buf["idx"] = (self._mega_h2d_double_buf["idx"] + 1) % 2
+            m_idx = self._mega_h2d_double_buf["idx"]
+
+            inp_src = self.input_ids_cpu[local_token_slice]
+            pos_src = self.positions_cpu[local_token_slice]
+
+            l1, l2, l3 = inp_src.numel(), pos_src.numel(), seq_src.numel()
+            total_elems = l1 + l2 + l3
+
+            buf_cpu = self._mega_h2d_double_buf["cpu"][m_idx]
+            if buf_cpu is None or buf_cpu.numel() < total_elems:
+                buf_cpu = torch.zeros(total_elems, dtype=torch.int32, device="cpu", pin_memory=True)
+                self._mega_h2d_double_buf["cpu"][m_idx] = buf_cpu
+
+            buf_cpu[:l1].copy_(inp_src)
+            buf_cpu[l1:l1 + l2].copy_(pos_src)
+            buf_cpu[l1 + l2:total_elems].copy_(seq_src)
+
+            buf_dev = self._mega_h2d_double_buf["dev"][m_idx]
+            if buf_dev is None or buf_dev.numel() < total_elems:
+                buf_dev = torch.empty(total_elems, dtype=torch.int32, device=self.device)
+                self._mega_h2d_double_buf["dev"][m_idx] = buf_dev
+
+            # Single unified H2D DMA copy
+            buf_dev[:total_elems].copy_(buf_cpu[:total_elems], non_blocking=True)
+
+            self.input_ids = buf_dev[:l1]
+            self.position_ids = buf_dev[l1:l1 + l2]
+            seq_lens = buf_dev[l1 + l2:total_elems]
+        else:
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True)
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[:, total_num_scheduled_tokens:
                                          padded_total_num_scheduled_tokens] = 0
@@ -3025,18 +3072,7 @@ class TPUModelRunner(GPUModelRunner):
                                                          local_token_slice].to(
                                                              self.device,
                                                              non_blocking=True)
-        else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True)
-        if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_most_model_len
+            seq_lens = seq_src.to(self.device, non_blocking=True)
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
