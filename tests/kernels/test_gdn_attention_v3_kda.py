@@ -262,7 +262,12 @@ def kda_attention_spec_ref(
             k_seq = np.repeat(k_seq, repeat_factor, axis=1)
         q_seq = _l2_normalize(q_seq) * float(d_k**-0.5)
         k_seq = _l2_normalize(k_seq)
-        beta_seq = 1.0 / (1.0 + np.exp(-np.asarray(b[start:end], np.float64)))
+        # Production activates beta in fp32, then stores it in the model
+        # activation dtype before the recurrent update.
+        beta_seq = np.asarray(
+            jax.nn.sigmoid(b[start:end].astype(jnp.float32)).astype(b.dtype),
+            np.float64,
+        )
         a_seq = np.asarray(a[start:end],
                            np.float64).reshape(query_len, n_v, d_k)
         if gate_lower_bound is None:
@@ -459,14 +464,25 @@ class KdaAttentionV3Test(parameterized.TestCase):
         dim_size = 2 * n_kq * d_k + n_v * d_v
 
         rngs = iter(jax.random.split(jax.random.key(11), 8))
-        qkv = jax.random.normal(next(rngs), (sum(spec_lengths), dim_size))
-        b = jax.random.normal(next(rngs), (sum(spec_lengths), n_v))
-        a = jax.random.normal(next(rngs), (sum(spec_lengths), n_v * d_k))
-        conv_state = jax.random.normal(next(rngs),
-                                       (num_blocks, kernel_size - 1, dim_size))
+        qkv = jax.random.normal(next(rngs),
+                                (sum(spec_lengths), dim_size),
+                                dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs),
+                              (sum(spec_lengths), n_v),
+                              dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs),
+                              (sum(spec_lengths), n_v * d_k),
+                              dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs),
+            (num_blocks, kernel_size - 1, dim_size),
+            dtype=jnp.bfloat16,
+        )
         recurrent_state = jax.random.normal(next(rngs),
                                             (num_blocks, n_v, d_k, d_v))
-        conv_weight = jax.random.normal(next(rngs), (dim_size, 1, kernel_size))
+        conv_weight = jax.random.normal(next(rngs),
+                                        (dim_size, 1, kernel_size),
+                                        dtype=jnp.bfloat16)
         a_log = jax.random.normal(next(rngs), (n_v, ))
         dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
 
@@ -492,47 +508,34 @@ class KdaAttentionV3Test(parameterized.TestCase):
             gate_lower_bound=-5.0,
         )
 
-        run_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
-            static_argnames=[
-                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "num_spec_tokens",
-                "gate_lower_bound"
-            ],
+        (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
+            **common_kwargs,
+            read_offsets=read_offsets_arr,
+            num_spec_seqs=num_seqs,
         )
-        (new_conv, new_rec), out = run_jitted(
+        # `fused_conv1d_gdn` already owns its jit/static-argument contract and
+        # donates both cache inputs. Build the reference first: reading either
+        # original cache after this call is invalid once JAX reuses it.
+        (new_conv, new_rec), out = wrapper.fused_conv1d_gdn(
             **common_kwargs,
             read_offsets=read_offsets_arr,
             num_spec_tokens=num_spec_tokens,
             batched_only=True,
             attention_mode=config.AttentionMode.KDA,
         )
-        (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
-            **common_kwargs,
-            read_offsets=read_offsets_arr,
-            num_spec_seqs=num_seqs,
-        )
 
         np.testing.assert_allclose(out, ref_out, rtol=2e-2, atol=5e-3)
-        touched = {
-            int(state_indices[i]) + t
-            for i, length in enumerate(spec_lengths)
-            for t in range(length)
-        }
         for slot in range(num_blocks):
-            expected_conv = ref_conv[slot] if slot in touched else conv_state[
-                slot]
-            expected_rec = ref_rec[slot] if slot in touched else (
-                recurrent_state[slot])
             np.testing.assert_allclose(
                 new_conv[slot],
-                expected_conv,
+                ref_conv[slot],
                 rtol=2e-2,
                 atol=5e-3,
                 err_msg=f"conv checkpoint mismatch at slot {slot}",
             )
             np.testing.assert_allclose(
                 new_rec[slot],
-                expected_rec,
+                ref_rec[slot],
                 rtol=2e-2,
                 atol=1e-2,
                 err_msg=f"recurrent checkpoint mismatch at slot {slot}",
