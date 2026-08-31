@@ -456,6 +456,30 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+
+    # Event-Driven H2D: Reuse persistent on-device block tables when batching/scheduling
+    # state is unchanged. Only perform H2D upload if:
+    # 1. Batch membership changed (requests joined/left)
+    # 2. A sequence reached a new block boundary (seq_len % block_size == 1)
+    # 3. Geometry/shape changed
+    cache_geom_key = (total, num_reqs_padded, tuple((gid, tnb) for gid, _, tnb in entries))
+    block_size = getattr(runner, "block_size", 256)
+    seq_lens_slice = getattr(runner, "seq_lens_cpu", None)
+    current_req_ids = tuple(runner.input_batch.req_ids[ctx.start_index:ctx.start_index + ctx.num_reqs])
+    is_state_changed = True
+    if (getattr(runner, "_cached_block_table_geom_key", None) == cache_geom_key
+            and getattr(runner, "_cached_staged_block_tables", None) is not None
+            and getattr(runner, "_cached_active_req_ids", None) == current_req_ids):
+        if seq_lens_slice is not None and ctx.num_reqs > 0:
+            cur_lens = seq_lens_slice[ctx.start_index:ctx.start_index + ctx.num_reqs]
+            if not bool(((cur_lens % block_size) == 1).any()):
+                is_state_changed = False
+
+    if not is_state_changed:
+        ctx.staged_block_tables = runner._cached_staged_block_tables
+        ctx.staged_mamba_products = getattr(runner, "_cached_staged_mamba_products", None)
+        return
+
     scratch = runner._block_table_stage_cpu
     if scratch is None or scratch.numel() < total:
         scratch = torch.zeros((total, ),
@@ -479,6 +503,10 @@ def stage_block_table_uploads(
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
     staged_dev = flat.to(runner.device, non_blocking=True)
+
+    # Record active state tracking for event-driven H2D
+    runner._cached_block_table_geom_key = cache_geom_key
+    runner._cached_active_req_ids = current_req_ids
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -537,3 +565,6 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+
+    runner._cached_staged_block_tables = ctx.staged_block_tables
+    runner._cached_staged_mamba_products = getattr(ctx, "staged_mamba_products", None)
