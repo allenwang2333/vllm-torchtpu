@@ -302,3 +302,56 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
                         (4, 0, 2, 0))
     moe_hierarchical.align_ep_weight_filter()
     assert default_loader.compute_local_expert_ids(224, 8, 0) == chip
+
+
+def _fake_vllm_config(num_experts: int, tp_size: int):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=True,
+                                     get_num_experts=lambda: num_experts),
+        parallel_config=SimpleNamespace(enable_expert_parallel=True,
+                                        enable_ep_weight_filter=True,
+                                        enable_eplb=False,
+                                        data_parallel_size=1,
+                                        tensor_parallel_size=tp_size,
+                                        prefill_context_parallel_size=1,
+                                        expert_placement_strategy="linear"))
+
+
+@pytest.mark.parametrize("tp_rank,chip", [(0, 0), (1, 0), (5, 2)])
+def test_runai_sharded_fetch_reads_the_chip_block(monkeypatch, tp_rank,
+                                                  chip) -> None:
+    """The Run:AI streaming filter must agree with the layer's chip split.
+
+    K3 loads with ``--load-format runai_streamer``, and that path does not go
+    through ``DefaultModelLoader``: it calls this module's own
+    ``_compute_local_expert_ids``, which imports ``compute_local_expert_ids``
+    straight from ``ep_weight_filter`` and so never sees
+    ``align_ep_weight_filter``'s patch of the ``default_loader`` namespace.
+    Before this was fixed, BK #299 logged both lines in the same server --
+    ``moe_hierarchical.py:69 ... ep_size=16`` and ``[sharded-ep-load]
+    ep_size=32 ... keeps 28/896`` -- i.e. every rank built 56 expert slots and
+    streamed the bytes for 28 of them.
+    """
+    import vllm.config as vllm_config_mod
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import model_loader_patches
+    from vllm_torchtpu.layers.vllm import moe_hierarchical
+
+    monkeypatch.setattr(vllm_config_mod, "get_current_vllm_config",
+                        lambda: _fake_vllm_config(896, 8))
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank",
+                        lambda: tp_rank)
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none",
+                        lambda: (4, chip, 2, tp_rank % 2))
+
+    got = model_loader_patches._compute_local_expert_ids()
+    assert got == set(range(chip * 224, (chip + 1) * 224))
+
+    # And with the flag off the flat rank-derived block is unchanged.
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none",
+                        lambda: None)
+    flat = model_loader_patches._compute_local_expert_ids()
+    assert flat == set(range(tp_rank * 112, (tp_rank + 1) * 112))
+    assert flat < got, "the flat block is the half of the chip block it fetched"
