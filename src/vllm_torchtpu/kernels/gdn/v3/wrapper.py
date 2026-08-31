@@ -537,17 +537,16 @@ def fused_conv1d_gdn(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq))
 
         if is_kda:
-            # The general VMEM-capacity budget above is too loose for KDA's
-            # large FP32 checkpoint window. On v7, TP8 with two 12-head
-            # sequences per tile corrupts the leading recurrent checkpoint,
-            # while one sequence is stable; TP32 with four 3-head sequences
-            # is also stable. Cap TP8/TP16/TP32 at the same 12-head footprint,
-            # or 6 MiB of recurrent checkpoints in one buffer tile.
-            max_recurrent_bytes_per_tile = 6 * 1024 * 1024
-            recurrent_tile_budget = (max_recurrent_bytes_per_tile //
-                                     recurrent_bytes_per_seq)
-            decode_tile_size = max(
-                1, min(decode_tile_size, recurrent_tile_budget))
+            # Keep exactly one KDA sequence in each window tile.  The state
+            # pipeline issues one async recurrent-state DMA per sequence but
+            # shares a semaphore and drains the tile with one aggregate wait.
+            # Bounding only the total bytes is insufficient: TP32's four
+            # 3-head sequences have the same 6 MiB footprint as one TP8
+            # 12-head sequence, but the former still has four independent DMA
+            # starts and corrupts recurrent checkpoints in long-running
+            # serving.  A one-sequence tile is the only schedule validated for
+            # repeated rollback and slot reuse on v7, independent of TP size.
+            decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
