@@ -106,10 +106,28 @@ All contributions during this pre-public phase must strictly follow this 4-step 
   ```
 
 - **UI Override (Temporary Pre-Public Option):** During this pre-public stage, repository collaborators can also manually click the DCO check details in the GitHub PR UI and click "Set DCO to PASS" to manually override and pass the check when necessary.
+1. **Find Your Reviewers:** GitHub does not auto-request CODEOWNERS on this private repo, so pick reviewers yourself. `scripts/find_owners.py` maps your changed files onto [.github/CODEOWNERS](https://github.com/vllm-project/vllm-torchtpu/blob/main/.github/CODEOWNERS) and prints the smallest set of owners covering every area you touched:
+
+   ```bash
+   scripts/find_owners.py             # owners of the current branch's changes
+   scripts/find_owners.py --pr 123    # owners of an existing PR
+   scripts/find_owners.py --handles   # just a comma-separated handle list
+   ```
+
+   Once the PR exists, `--request` requests review from those owners for you instead of you retyping the handles. It uses the current branch's PR unless you name one with `--pr`:
+
+   ```bash
+   scripts/find_owners.py --request
+   scripts/find_owners.py --pr 123 --request
+   ```
+
 1. **Push & Open PR with Assignees & Reviewers:** Because GitHub UI only allows assigning a pending PR to one reviewer for this private repo, you can assign multiple reviewers via `--assignee`, or add multiple reviewers using comma-separated handles:
 
    ```bash
    git push origin HEAD
+   gh pr create --fill --assignee "$(scripts/find_owners.py --handles)"
+
+   # Or name them yourself
    gh pr create --fill --assignee reviewer1,reviewer2
    gh pr edit --add-reviewer reviewer3,reviewer4
    ```
@@ -232,7 +250,9 @@ In urgent situations where you must unblock yourself immediately:
 
 | Objective | Command / Direct Link |
 | :--- | :--- |
-| **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee reviewer1,reviewer2` |
+| **Phase 1: Find Reviewers (CODEOWNERS)** | `scripts/find_owners.py` (or `--pr <PR_NUMBER>`) |
+| **Phase 1: Request Those Reviewers** | `scripts/find_owners.py --request` (or `--pr <PR_NUMBER> --request`) |
+| **Phase 1: Create PR & Assign** | `gh pr create --fill --assignee "$(scripts/find_owners.py --handles)"` |
 | **Phase 1: Add Multiple Reviewers** | `gh pr edit <PR_NUMBER> --add-reviewer reviewer3,reviewer4` |
 | **Phase 1: Start CI (`ready` label)** | `gh pr edit <PR_NUMBER> --add-label ready` |
 | **Phase 2: Check PR Approval** | `gh pr view <PR_NUMBER> --json latestReviews --jq 'if ([.latestReviews[] \| select(.state == "APPROVED")] \| length > 0) then "APPROVED ✅" else "NOT APPROVED ❌" end'` |
