@@ -2493,6 +2493,20 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
+        # Option 2: On-device token passing in steady-state decode:
+        # If all input tokens match previous step's next_tokens_tpu 1:1 on device,
+        # directly slice next_tokens_tpu on-device without H2D index uploads or scatter kernel.
+        if (len(token_in_tpu_cur_input_indices) == len(input_ids)
+                and np.array_equal(token_in_tpu_cur_input_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and np.array_equal(token_in_tpu_pre_next_tokens_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None):
+            next_tpu = self._pre_async_results.next_tokens_tpu.flatten()
+            if len(next_tpu) >= len(input_ids):
+                return next_tpu[:len(input_ids)]
+
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside
@@ -3015,8 +3029,17 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
+        if (self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None
+                and total_num_scheduled_tokens == num_reqs):
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[local_token_slice]
+        else:
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True)
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[:, total_num_scheduled_tokens:
@@ -3184,8 +3207,12 @@ class TPUModelRunner(GPUModelRunner):
             combined[2] = num_reqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
-            combined[5] = num_reqs
-            combined_device = combined.to(self.device, non_blocking=True)
+            chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
+            if (not hasattr(self, "_cached_comb_dev")
+                    or getattr(self, "_cached_comb_key", None) != chunk_comb_key):
+                self._cached_comb_dev = combined.to(self.device, non_blocking=True)
+                self._cached_comb_key = chunk_comb_key
+            combined_device = self._cached_comb_dev
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 

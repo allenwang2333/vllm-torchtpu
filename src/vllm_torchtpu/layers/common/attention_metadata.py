@@ -456,6 +456,27 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+
+    # Option 2: Incremental Block Table Cache with Boundary Check.
+    # In decode mode, a new block is allocated ONLY when a sequence crosses a block boundary:
+    # (seq_len % block_size == 1). For all other steps (255/256), the block table
+    # is guaranteed identical, completely eliminating PCIe upload and compilation walk.
+    cache_geom_key = (total, num_reqs_padded, tuple((gid, tnb) for gid, _, tnb in entries))
+    block_size = getattr(runner, "block_size", 256)
+    seq_lens_slice = getattr(runner, "seq_lens_cpu", None)
+    can_reuse_tables = False
+    if (seq_lens_slice is not None and ctx.num_reqs > 0
+            and getattr(runner, "_cached_block_table_geom_key", None) == cache_geom_key
+            and getattr(runner, "_cached_staged_block_tables", None) is not None):
+        cur_lens = seq_lens_slice[:ctx.num_reqs]
+        if not bool(((cur_lens % block_size) == 1).any()):
+            can_reuse_tables = True
+
+    if can_reuse_tables:
+        ctx.staged_block_tables = runner._cached_staged_block_tables
+        ctx.staged_mamba_products = getattr(runner, "_cached_staged_mamba_products", None)
+        return
+
     scratch = runner._block_table_stage_cpu
     if scratch is None or scratch.numel() < total:
         scratch = torch.zeros((total, ),
@@ -537,3 +558,7 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+
+    runner._cached_block_table_geom_key = cache_geom_key
+    runner._cached_staged_block_tables = ctx.staged_block_tables
+    runner._cached_staged_mamba_products = getattr(ctx, "staged_mamba_products", None)
