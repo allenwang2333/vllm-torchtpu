@@ -56,7 +56,6 @@ if TYPE_CHECKING:
     TPU_MOE_EXPERT_LOAD_DIR: str = ""
     TPU_MOE_EXPERT_LOAD_SLOTS: int = 128
     TPU_MOE_EXPERT_LOAD_BUCKET: int = 16
-    TPU_MOE_EXPERT_LOAD_MAX_TOKENS: int = 256
     TPU_MOE_EXPERT_LOAD_EVERY: int = 1024
     TPU_MOE_EXPERT_LOAD_RANKS: str = "0"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -385,10 +384,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_SLOTS") or "128"),
     "TPU_MOE_EXPERT_LOAD_BUCKET":
     lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_BUCKET") or "16"),
-    # Instrument only token buckets this small. The bucket is static per
-    # compiled graph, so a prefill graph is left completely untouched.
-    "TPU_MOE_EXPERT_LOAD_MAX_TOKENS":
-    lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_MAX_TOKENS") or "256"),
     "TPU_MOE_EXPERT_LOAD_EVERY":
     lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_EVERY") or "1024"),
     # Which ranks write a file. Routing is replicated, so rank 0 alone is the

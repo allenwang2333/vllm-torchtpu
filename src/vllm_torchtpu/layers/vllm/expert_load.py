@@ -56,10 +56,6 @@ logger = init_logger(__name__)
 _DIR = envs.TPU_MOE_EXPERT_LOAD_DIR
 _SLOTS = envs.TPU_MOE_EXPERT_LOAD_SLOTS
 _BUCKET = envs.TPU_MOE_EXPERT_LOAD_BUCKET
-# Only instrument the small token buckets. The bucket size is static per
-# compiled graph, so this is a trace-time branch: the prefill graph gets no
-# instrumentation at all, and a prefill step cannot swamp slot 0.
-_MAX_TOKENS = envs.TPU_MOE_EXPERT_LOAD_MAX_TOKENS
 _EVERY = envs.TPU_MOE_EXPERT_LOAD_EVERY
 _RANKS = frozenset(
     int(r) for r in envs.TPU_MOE_EXPERT_LOAD_RANKS.split(",") if r.strip())
@@ -108,15 +104,26 @@ def record(layer, topk_ids: torch.Tensor,
     rank's histogram is every rank's, and per-rank load is a partial sum of it.
     """
     hist_all = getattr(layer, "_eld_hist_all", None)
-    if hist_all is None or topk_ids.shape[0] > _MAX_TOKENS:
+    if hist_all is None:
         return
 
     slots, num_experts = hist_all.shape
-    onehot = torch.nn.functional.one_hot(topk_ids.reshape(-1).long(),
-                                         num_experts).to(torch.int32)
-    counts_all = onehot.sum(0)
+    # scatter_add, not one_hot: O(rows) instead of O(rows x experts), which is
+    # what lets this run unconditionally. It has to run unconditionally --
+    # skipping large token buckets to "leave the prefill graph untouched" is a
+    # branch on a SYMBOLIC dimension, which is a guard rather than a
+    # compile-time constant, and it made the module's placeholder list depend
+    # on the specialization: two traces of the same bucket, one reading these
+    # buffers and one not, and the hand-over between them refuses (BK #322).
+    ids = topk_ids.reshape(-1).long()
     is_real = _real_row_mask(topk_ids, topk_weights).to(torch.int32)
-    counts_real = (onehot * is_real.unsqueeze(1)).sum(0)
+
+    def counts(src):
+        return torch.zeros(num_experts, dtype=torch.int32,
+                           device=hist_all.device).scatter_add_(0, ids, src)
+
+    counts_all = counts(torch.ones_like(is_real))
+    counts_real = counts(is_real)
 
     step = layer._eld_step
     slot = torch.clamp(step // _BUCKET, max=slots - 1)

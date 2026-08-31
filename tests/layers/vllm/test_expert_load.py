@@ -174,21 +174,20 @@ def test_slot_advances_with_bucket_and_last_slot_absorbs_overflow(
     assert layer._eld_step.item() == 10
 
 
-def test_prefill_sized_batches_are_not_instrumented(monkeypatch, tmp_path):
-    """The token bucket is static per compiled graph, so this is a trace-time
-    branch: the prefill graph carries no instrumentation at all."""
-    el = _arm(monkeypatch, tmp_path, TPU_MOE_EXPERT_LOAD_MAX_TOKENS=16)
+def test_every_token_count_is_instrumented(monkeypatch, tmp_path):
+    """No branch on the token count. Skipping large buckets to leave the
+    prefill graph alone is a branch on a SYMBOLIC dimension -- a guard, not a
+    compile-time constant -- and it makes the module's placeholder list depend
+    on the specialization, which breaks the bucket hand-over (BK #322)."""
+    el = _arm(monkeypatch, tmp_path)
     layer = _Layer(global_num_experts=4)
     el.register_buffers(layer, device=torch.device("cpu"))
 
-    ids, weights = torch.zeros(17, 2, dtype=torch.long), torch.ones(17, 2)
-    with _OpCounter() as counter:
-        el.record(layer, ids, weights)
-    assert counter.ops == []
-    assert layer._eld_calls.sum().item() == 0
-
-    el.record(layer, torch.zeros(16, 2, dtype=torch.long), torch.ones(16, 2))
-    assert layer._eld_calls.sum().item() == 1
+    for tokens in (1, 16, 8192):
+        el.record(layer, torch.zeros(tokens, 2, dtype=torch.long),
+                  torch.ones(tokens, 2))
+    assert layer._eld_calls.sum().item() == 3
+    assert layer._eld_hist_all[:, 0].sum().item() == 2 * (1 + 16 + 8192)
 
 
 def test_reset_zeroes_everything(monkeypatch, tmp_path):
