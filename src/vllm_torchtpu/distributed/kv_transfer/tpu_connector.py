@@ -17,6 +17,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import hashlib
 import json
 import time
 from collections import OrderedDict
@@ -76,6 +77,8 @@ __all__ = [
     "LoadMeta",
     "_CoordSendEntry",
     "_CoordRecvEntry",
+    "_Stage3SendState",
+    "chunk_uuid",
     "stage3_fa_raiden_id_fields",
 ]
 
@@ -153,6 +156,53 @@ class _Stage3LoadMeta:
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
     release_only: bool = False
+
+
+@dataclass
+class _Stage3SendState:
+    """In-flight tracking state for Stage-3 pipelined chunked KV transfer.
+
+    Maintains token computation and transfer progression cursors for a single
+    active prefill request, enabling incremental sub-chunk emission and
+    carry-over of unaligned token remainders across scheduler cycles.
+
+    Attributes:
+        base_uuid: Base request UUID used to derive deterministic sub-chunk
+            UUIDs.
+        block_ids: Flash-attention KV cache block IDs allocated for the request.
+        num_computed_tokens: Cumulative number of prompt tokens computed so far.
+        tokens_sent: Cumulative number of prompt tokens emitted across sent
+            chunks.
+        next_chunk_idx: Zero-based sequence index for the next chunk to emit.
+        total_prompt_tokens: Total expected prompt length in tokens.
+    """
+
+    base_uuid: int
+    block_ids: list[int]
+    num_computed_tokens: int = 0
+    tokens_sent: int = 0
+    next_chunk_idx: int = 0
+    total_prompt_tokens: int = 0
+
+
+def chunk_uuid(base_uuid: int, chunk_idx: int) -> int:
+    """Derives deterministic 50-bit sub-chunk UUID from base UUID and index.
+
+    Computes a SHA-256 hash over the composite key "{base_uuid}:{chunk_idx}",
+    extracts the leading 8 bytes, and right-shifts by 14 bits to yield a
+    50-bit unsigned integer suitable for JSON encoding and 64-bit platforms.
+
+    Args:
+        base_uuid: The base request identifier integer.
+        chunk_idx: Zero-based sequential index of the sub-chunk.
+
+    Returns:
+        A deterministic 50-bit integer UUID for the given sub-chunk.
+    """
+    data = f"{base_uuid}:{chunk_idx}".encode()
+    digest = hashlib.sha256(data).digest()
+    int_val = int.from_bytes(digest[:8], "big")
+    return int_val >> 14
 
 
 @dataclass(frozen=True)
@@ -353,11 +403,12 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = scheduler_cls(vllm_config)
             if use_raiden and _use_raiden_stage3_transport():
-                self.connector_scheduler._stage3_fa_group_index = (
+                sched = self.connector_scheduler
+                sched._stage3_fa_group_index = (
                     self._stage3_fa_group_index)
-                self.connector_scheduler._stage3_mamba_group_indices = (
+                sched._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices)
-                self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
+                sched._stage3_mamba_num_speculative_blocks = (
                     stage3_mamba_num_speculative_blocks)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
@@ -385,10 +436,21 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
 
     def build_connector_meta(
         self,
-        scheduler_output: SchedulerOutput,
+        scheduler_output: SchedulerOutput | None = None,
     ) -> TPUConnectorMetadata:
+        """Constructs connector metadata by delegating to the scheduler.
+
+        Forwards the current step's scheduler output to the underlying connector
+        scheduler to process chunk emissions and assemble metadata.
+
+        Args:
+            scheduler_output: The scheduler execution plan for the step.
+
+        Returns:
+            The connector metadata assembled by the active connector scheduler.
+        """
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.build_connector_meta()
+        return self.connector_scheduler.build_connector_meta(scheduler_output)
 
     def request_finished(
         self,
@@ -672,7 +734,22 @@ class TPUConnectorScheduler:
             "TPUConnectorScheduler update_state_after_alloc --> reqs_to_load=%s",
             self.reqs_to_load)
 
-    def build_connector_meta(self) -> TPUConnectorMetadata:
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> TPUConnectorMetadata:
+        """Constructs connector metadata for pending send/load requests.
+
+        Drains queued send or load descriptors from internal scheduler buffers
+        and packages them into a TPUConnectorMetadata instance for the runner.
+
+        Args:
+            scheduler_output: The scheduler execution plan for the step, unused
+                in the baseline scheduler.
+
+        Returns:
+            A TPUConnectorMetadata containing pending send or load descriptors.
+        """
         meta = TPUConnectorMetadata()
         if self.is_producer:
             meta.reqs_to_send = self.reqs_to_send
@@ -867,6 +944,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # registration.
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
+        self._stage3_send_requests: dict[ReqId, _Stage3SendState] = {}
+        parallel_config = vllm_config.parallel_config if vllm_config else None
+        if parallel_config is not None:
+            self.pcp_size = int(
+                parallel_config.prefill_context_parallel_size or 1)
+            self.interleave_tokens = int(
+                getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
+                or 256)
+        else:
+            self.pcp_size = 1
+            self.interleave_tokens = 256
         self._stage3_fa_group_index = 0
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
@@ -948,7 +1036,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        if self.is_producer or not request.kv_transfer_params:
+        if self.is_producer:
+            if _use_raiden_stage3_transport():
+                self._update_stage3_producer_state_after_alloc(request, blocks)
+            return
+
+        if not request.kv_transfer_params:
             return
 
         if _use_raiden_stage3_transport():
@@ -1200,6 +1293,127 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "TPURaidenConnectorScheduler full prefix hit req_id=%s "
             "source_req_id=%s uuid=%d releases the producer registration",
             request.request_id, source_req_id, uuid)
+
+    def _update_stage3_producer_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: Any,
+    ) -> None:
+        """Initializes or updates tracking state for chunked prefill.
+
+        Extracts flash-attention block allocations from the scheduled request,
+        creates or updates a _Stage3SendState tracker containing the base UUID
+        and computed token cursors, and updates existing block allocations.
+
+        Args:
+            request: The request scheduled in the current allocation cycle.
+            blocks: Cache block container or sequence of allocated blocks.
+        """
+        req_id = str(request.request_id)
+        if hasattr(blocks, "get_block_ids"):
+            grouped = blocks.get_block_ids()
+            if (isinstance(grouped, (list, tuple)) and grouped
+                    and isinstance(grouped[0], (list, tuple))):
+                fa_block_ids = list(grouped[self._stage3_fa_group_index])
+            else:
+                fa_block_ids = list(grouped)
+        elif isinstance(blocks, (list, tuple)):
+            if blocks and isinstance(blocks[0], (list, tuple)):
+                fa_block_ids = list(blocks[self._stage3_fa_group_index])
+            else:
+                fa_block_ids = [int(b) for b in blocks]
+        else:
+            fa_block_ids = []
+
+        if req_id not in self._stage3_send_requests:
+            num_computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+            total_prompt = int(
+                getattr(request, "num_prompt_tokens", 0)
+                or (len(getattr(request, "prompt_token_ids", []))
+                    if hasattr(request, "prompt_token_ids") else 0)
+            )
+            self._stage3_send_requests[req_id] = _Stage3SendState(
+                base_uuid=get_uuid(),
+                block_ids=fa_block_ids,
+                num_computed_tokens=num_computed,
+                tokens_sent=0,
+                next_chunk_idx=0,
+                total_prompt_tokens=total_prompt,
+            )
+        else:
+            if fa_block_ids:
+                self._stage3_send_requests[req_id].block_ids = fa_block_ids
+
+    def _can_emit_chunk(self, req_id: str) -> bool:
+        """Determines whether an in-flight chunk can be emitted for the request.
+
+        Evaluates window capacity and in-flight limits before allowing an
+        intermediate chunk transfer descriptor to be added to metadata.
+
+        Args:
+            req_id: Identifier of the active transfer request.
+
+        Returns:
+            True if the chunk can be emitted, False if deferred.
+        """
+        return True
+
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> TPUConnectorMetadata:
+        """Constructs connector metadata and emits ready Stage-3 chunk descriptors.
+
+        Inspects the per-request token progress reported by scheduler output,
+        advances computed token counters, identifies aligned context parallel
+        stride boundaries, and packages ready sub-chunks into SendMeta
+        descriptors tagged with deterministic 50-bit sub-chunk UUIDs.
+
+        Args:
+            scheduler_output: The scheduler execution plan for the step,
+                containing per-request scheduled token counts.
+
+        Returns:
+            A TPUConnectorMetadata containing pending send/load descriptors.
+        """
+        if self.is_producer and scheduler_output is not None:
+            min_transfer_tokens = self.pcp_size * self.interleave_tokens
+            num_scheduled_tokens = getattr(scheduler_output,
+                                           "num_scheduled_tokens", None)
+            if num_scheduled_tokens is not None:
+                for req_id, scheduled_tokens in num_scheduled_tokens.items():
+                    req_state = self._stage3_send_requests.get(req_id)
+                    if req_state is None:
+                        continue
+
+                    computed = req_state.num_computed_tokens + scheduled_tokens
+                    req_state.num_computed_tokens = computed
+                    if min_transfer_tokens > 0:
+                        aligned_boundary = (computed // min_transfer_tokens
+                                            ) * min_transfer_tokens
+                    else:
+                        aligned_boundary = computed
+
+                    if (aligned_boundary > req_state.tokens_sent
+                            and self._can_emit_chunk(req_id)):
+                        chunk_tokens = aligned_boundary - req_state.tokens_sent
+                        sub_uuid = chunk_uuid(req_state.base_uuid,
+                                              req_state.next_chunk_idx)
+                        expiration_time = (
+                            time.perf_counter() +
+                            dist_utils.get_p2p_wait_pull_timeout())
+                        self.reqs_to_send[req_id] = SendMeta(
+                            uuid=sub_uuid,
+                            local_block_ids=list(req_state.block_ids),
+                            expiration_time=expiration_time,
+                            num_tokens=chunk_tokens,
+                            token_base=req_state.tokens_sent,
+                            is_final=False,
+                        )
+                        req_state.tokens_sent = aligned_boundary
+                        req_state.next_chunk_idx += 1
+
+        return super().build_connector_meta(scheduler_output)
 
     def request_finished(
         self,

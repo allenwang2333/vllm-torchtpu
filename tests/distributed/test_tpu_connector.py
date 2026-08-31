@@ -266,10 +266,9 @@ class TestTPUConnector:
         connector.update_state_after_alloc(req, blocks, 16)
         sched.update_state_after_alloc.assert_called_once_with(req, blocks, 16)
 
-        # build_connector_meta receives scheduler_output but strips it before
-        # delegating — verify the downstream call has no arguments.
+        # build_connector_meta receives scheduler_output and passes it down.
         connector.build_connector_meta(sched_out)
-        sched.build_connector_meta.assert_called_once_with()
+        sched.build_connector_meta.assert_called_once_with(sched_out)
 
         connector.request_finished(req, [1, 2])
         sched.request_finished.assert_called_once_with(req, [1, 2])
