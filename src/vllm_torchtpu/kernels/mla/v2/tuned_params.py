@@ -1606,6 +1606,70 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=512,
         vmem_limit_bytes=62914560,
     ),  # median 2.018 ms
+    # Kimi-K3 batched_decode on TPU v7x, TP32 fast recipe (COMPILE_SIZES=
+    # 4,8192): 3 local q heads per chip, lkv=512, rope=64, fp8 KV, bf16 q,
+    # 16-token pages (4 per kv_packing of 4), max_num_seqs=32, pages_per_seq=
+    # 640 (max_model_len 10240 / block 16). Until task 18 these keys missed
+    # every lookup (47 per server run in job 225) and fell back to the
+    # (dbs=4, nkvpb=3) defaults: the decode TuningKey was built from dataclass
+    # defaults + qk_nope_head_dim in attention_interface.py instead of the live
+    # operand shapes the mixed key uses (and that upstream tpu-inference uses).
+    # With the construction fixed, the decode key is the mixed key with
+    # case="batched_decode".
+    #
+    # Tuned with the UPSTREAM tpu-inference batched-decode tuner
+    # (tools/kernel/tuner/v1/mla_kernel_tuner.py, Bayesian/optuna, 50 trials
+    # per bucket over its own search space) driving this repo's vendored
+    # kernel, via scripts/k3/slurm_mla_decode_tune.sbatch (job 235). The
+    # tuner derives inputs from the key, so both buckets exercise the same
+    # 32-sequence decode batch (max_num_tokens does not enter the input
+    # geometry); the per-bucket winners agree to within noise. The default
+    # params measure ~1.93 ms; the winners ~0.50-0.52 ms (3.8x).
+    #
+    # VMEM/OOM neighbourhood: nkvpb=256 and 512 CompileTimeScopedVmemOom even
+    # in the dummy-weight tuner at dbs>=8/16, so the known (bq=512, bkvp=256)
+    # landmine family is unreachable here; winners sit at nkvpb=128.
+    # Runner-ups if a winner ever OOMs under real weights: bucket 4 ->
+    # (dbs=4, nkvpb=128, vmem 60 MiB) at 501 us; bucket 8192 ->
+    # (dbs=4, nkvpb=128, vmem 64 MiB) at 524 us.
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=4,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=32,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # 500 us vs 1929 us with the default (dbs=4, nkvpb=3) params
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=8192,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=32,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    ),  # 518 us vs 1952 us with the default (dbs=4, nkvpb=3) params
 }
 
 
