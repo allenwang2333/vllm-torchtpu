@@ -478,6 +478,34 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
+    # Scheme 3: Dirty-flag check on flat block tables.
+    # In steady-state decode, block table allocations only happen every block_size tokens.
+    # For all other steps, comparing the CPU flat buffer (~9 KB) takes <1 us and completely
+    # skips the 129 us device upload (staged_dev.to) and graph derivation.
+    geom_key = (total, num_reqs_padded, tuple((gid, tnb) for gid, _, tnb in entries))
+    can_reuse = False
+    cached_tables = getattr(runner, "_cached_staged_block_tables", None)
+    last_flat = getattr(runner, "_last_block_table_flat_cpu", None)
+    last_key = getattr(runner, "_cached_block_table_geom_key", None)
+
+    if (cached_tables is not None
+            and last_flat is not None
+            and last_flat.numel() == total
+            and last_key == geom_key):
+        if torch.equal(flat, last_flat):
+            can_reuse = True
+
+    if can_reuse:
+        ctx.staged_block_tables = cached_tables
+        ctx.staged_mamba_products = getattr(runner, "_cached_staged_mamba_products", None)
+        return
+
+    # Cache current CPU flat content for the next step's dirty check
+    if last_flat is None or last_flat.numel() < total:
+        runner._last_block_table_flat_cpu = flat.clone()
+    else:
+        runner._last_block_table_flat_cpu[:total].copy_(flat)
+
     staged_dev = flat.to(runner.device, non_blocking=True)
 
     # One compiled program splits the staged tensor into per-group tables
@@ -510,6 +538,9 @@ def stage_block_table_uploads(
         gid, _, target_num_blocks = entries[0]
         length = num_reqs_padded * target_num_blocks
         ctx.staged_block_tables = {gid: staged_dev[:length]}
+        runner._cached_block_table_geom_key = geom_key
+        runner._cached_staged_block_tables = ctx.staged_block_tables
+        runner._cached_staged_mamba_products = None
         return
 
     if staged_dev.device.type == "tpu":
@@ -537,3 +568,7 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+
+    runner._cached_block_table_geom_key = geom_key
+    runner._cached_staged_block_tables = ctx.staged_block_tables
+    runner._cached_staged_mamba_products = getattr(ctx, "staged_mamba_products", None)
