@@ -7,6 +7,7 @@ import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
+_ZERO_D2H = bool(int(os.getenv("VLLM_TPU_ZERO_D2H", "1")))
 _MOCK_ASYNC_OUTPUT = bool(int(os.getenv("VLLM_TPU_MOCK_ASYNC_OUTPUT", "0")))
 _HAS_ASYNC_HOST_COPY = (
     hasattr(torch, "tpu")
@@ -33,6 +34,8 @@ class AsyncTPUCopyState:
       across steps (preventing PJRT premature deallocation/recycle stalls).
     - Option 1: Unblocked async wait (skipping full synchronous stalls) controlled
       by VLLM_TPU_SKIP_COPY_SYNC.
+    - Zero-D2H Probe: Completely disables device-to-host copies to establish
+      the theoretical lower bound of barrier-cores under zero host readback.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
@@ -47,6 +50,19 @@ class AsyncTPUCopyState:
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
         global _PREV_COPY_STATE
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+
+        # P0 A/B Test: Zero D2H Probe.
+        # Completely skip all device-to-host transfers, bypass t.to("cpu"),
+        # bypass _start_async_host_copy, and bypass Event.record().
+        if _ZERO_D2H:
+            return cls(
+                chunks_cpu=[],
+                chunk_real_lens=chunk_real_lens,
+                copy_ready_event=None,
+                copy_ids=None,
+                chunks_tpu=None,
+                completed=True,
+            )
 
         # Retire prior step's tensor retention now that Step N+1 has started
         if _PREV_COPY_STATE is not None:
@@ -115,16 +131,11 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            if _MOCK_ASYNC_OUTPUT:
+            if _ZERO_D2H or _MOCK_ASYNC_OUTPUT:
                 total_len = sum(self.chunk_real_lens)
-                first_chunk = self.chunks_cpu[0]
-                if first_chunk.dim() > 1:
-                    shape = (total_len, first_chunk.shape[1])
-                else:
-                    shape = (total_len,)
-                # Use a safe, standard non-EOS token ID (e.g. 100)
+                # Use a safe, standard non-EOS token ID (100)
                 self._sampled_token_ids_cpu = torch.full(
-                    shape, 100, dtype=first_chunk.dtype, device="cpu"
+                    (total_len, 1), 100, dtype=torch.int32, device="cpu"
                 )
             else:
                 trimmed = [
