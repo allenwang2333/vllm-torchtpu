@@ -272,15 +272,6 @@ class StateBufferedRef(BaseBufferedRef):
         """Source rows one state occupies (checkpoints for the dense path)."""
         return 1
 
-    def _wait_slice(self, vmem_ref: jax.Ref, count):
-        """Never-executed self-copy ref carrying the bytes to wait on.
-
-        ``count`` is a number of participating SLOTS, not source rows: one
-        slot's copy is `_unit()` rows, and this ref must cover exactly the
-        bytes those copies moved.
-        """
-        return vmem_ref.at[0, pl.ds(0, count)]
-
     def _read_offset(self, s_idx):
         """Spec-decode checkpoint to resume from; 0 without a window."""
         return self.metadata_ref.s_idx_to_read_offset[s_idx]
@@ -320,20 +311,20 @@ class StateBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
-        dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
                 s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size += jnp.where(should_read, 1, 0)
+            dma_size = jnp.where(should_read, self._unit(), 0)
 
-        # NOTE: With bounds checks disabled, the self-copy descriptor may
-        # nominally exceed the window row; it is never executed, only used
-        # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            # A semaphore is shared by all slot DMAs. The TPU async-copy
+            # protocol requires waits to replay those transfers in issue
+            # order with matching byte counts; an aggregate descriptor does
+            # not preserve that per-transfer contract.
+            wait_ref = vmem_ref.at[idx, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -369,18 +360,18 @@ class StateBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
-        dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-        # NOTE: With bounds checks disabled, the self-copy descriptor may
-        # nominally exceed the window row; it is never executed, only used
-        # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            # Keep waits one-to-one with copy_out() starts. In particular, a
+            # windowed FP32 recurrent state can make each slot DMA several
+            # MiB, and one synthetic cross-row wait did not reliably drain
+            # every checkpoint transfer before the buffer was reused.
+            wait_ref = vmem_ref.at[idx, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -533,22 +524,16 @@ class ExternalStateBufferedRef(StateBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
-        dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
                 s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size += jnp.where(should_read, 1, 0)
+            nblocks = jnp.where(should_read, self.region.nblocks, 0)
 
-        # Each slot's copy covers one full region tile (all nblocks), read
-        # into window position 0; wait per slot along the window dim of one
-        # sequence row. NOTE: With bounds checks disabled, the descriptor
-        # may nominally exceed the window row; it is never executed, only
-        # used to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            wait_ref = vmem_ref.at[idx, 0, pl.ds(0, nblocks)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -558,18 +543,23 @@ class ExternalStateBufferedRef(StateBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
-        dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-        # Each checkpoint's copy covers one full region tile; wait for that
-        # many region tiles along the window dim of one sequence row (the
-        # descriptor may nominally exceed it, see wait_in's NOTE).
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            if self.compact_output_ref is not None:
+                nblocks = jnp.where(is_last_tile,
+                                    num_ckpts * self.region.nblocks, 0)
+                wait_ref = vmem_ref.at[idx, 0, pl.ds(0, nblocks)]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+                continue
+
+            for t in range(self.cfg.window_size):
+                should_wait = jnp.logical_and(is_last_tile, t < num_ckpts)
+                nblocks = jnp.where(should_wait, self.region.nblocks, 0)
+                wait_ref = vmem_ref.at[idx, t, pl.ds(0, nblocks)]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 def create_allocs(
