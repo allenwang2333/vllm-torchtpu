@@ -150,6 +150,7 @@ During this pre-public phase, GitHub does not automatically block merges or show
   You can also check the Buildkite dashboard from the UI: [Buildkite TPU Commons](https://screenshot.googleplex.com/36Qsd6vKhWSjEmb)
 - **Verify Reviewer Approval:** Ensure at least one reviewer has explicitly approved the PR before merging.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for approval verification command)
+  The **CODEOWNERS Approval** check reports whether every area you touched has an owner's approval — see [Approval Gate (Advisory)](#approval-gate-advisory) below.
 - **Check Unresolved Discussion Comments:** Verify that all review comment threads have been addressed and marked as resolved.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for GraphQL thread query)
 - **Update Outdated PR (Missing Web UI Button):** Because the "Update branch" web button is disabled/missing on outdated PRs in this repository setup, update your branch directly via GitHub CLI if main has moved ahead.
@@ -208,6 +209,18 @@ After the PR is merged into `main`:
 
 > [!NOTE] The Label Does Not Gate Merging
 > Because this repository has no branch rulesets (see Section 1), the `ready` label controls only whether CI **runs**. It does not block the merge button. The Pre-Merge Verification Checklist is still what protects `main`.
+
+### Approval Gate (Advisory)
+
+- **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](../.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
+- **Rationale:** GitHub applies CODEOWNERS automatically only on plans this repository is not on (see Section 1), so an approval from someone who happens to be available today does not mean the people who own the code have seen it. The gate makes that gap visible instead of leaving it to the reviewer's memory.
+- **It is advisory, not enforcing.** Like every other check here, a red gate does not disable the merge button. Treat it as a line item on the Pre-Merge Verification Checklist. Marking it required is a one-click change once branch rulesets become available.
+- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. A failure names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
+- **What counts:**
+  - Ownership is read from the **base branch's** CODEOWNERS, matching how GitHub evaluates it: a PR does not get to grant itself ownership of a directory until it merges. The resolver itself runs from the PR, so a change to `scripts/find_owners.py` is exercised by the gate before it lands.
+  - Self-approvals are ignored. If you are an area's **only** owner, any other reviewer's approval clears it, so the PR does not deadlock.
+  - A stale approval — one submitted against an older head commit — still counts, and is reported as a warning. This is deliberate: the DCO fix in Phase 1 (`git commit --amend --signoff` plus a force push) rewrites the head SHA, and dismissing approvals on that would be noise. Flip `STRICT_STALE_APPROVALS` in the workflow to change this.
+- **Override:** Add the `approval-gate-override` label to bypass the gate in an emergency (for example, reverting a broken `main` when the owner is unreachable). Every use is logged as a warning on the run; explain it in the PR.
 
 ### Addressing Existing Regression in main
 
