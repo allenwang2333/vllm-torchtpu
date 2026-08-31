@@ -173,9 +173,18 @@ cheaply; device ops are `pid=3, tid=3` ("XLA Ops") for `/device:TPU:0`.
 
 Four things that will mislead you:
 
-- **The profiler inflates step time ~50x** (875 ms/step vs 16.6 ms unprofiled).
-  Per-op *self times* are hardware counters and stay valid; *gaps between steps*
-  are profiler overhead. Within a step the device is ~95-99% busy.
+- **The profiler does NOT inflate step time ~50x.** This file used to claim it
+  did (875 ms/step vs 16.6 ms unprofiled). Refuted 2026-08-31: that 7 s window
+  was 6.3 s of one-time profiler *startup stall* plus 0.34 s of real steps, so
+  the per-step figure was startup amortised over too few steps. Per-op self
+  times are hardware counters and stay valid, and the device is ~98.6% busy in
+  steady state (one ~63 us gap per step).
+- **Never divide one run's device time by another run's wall time.** Doing that
+  produced a phantom "decode is only 17% device-bound" result. The two runs
+  differed in chip count (2 vs 4), step count, *and* context length (~100 tokens
+  profiled vs 8192 benchmarked) at the same time. Establish a device-busy
+  fraction from gaps within a single trace timeline, and remember TPOT is
+  context-length dependent: TPOT = 19.87 + 1.32*concurrency ms at 8k context.
 - **Measure a bubble to the next op that does real work**, not to the next
   event. Zero-duration `copy-start`s fragment one visible 1.3 us gap into a
   dozen 0.001 us gaps and it disappears from a naive per-pair histogram.
