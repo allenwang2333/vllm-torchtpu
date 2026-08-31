@@ -435,21 +435,34 @@ class KdaAttentionV3Test(parameterized.TestCase):
                                    rtol=2e-2,
                                    atol=1e-2)
 
-    def test_speculative_window_checkpoints(self):
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="tp32",
+            num_heads=3,
+            spec_lengths=[8, 3, 1, 7, 2],
+            read_offsets=[2, 0, 7, 1, 4],
+        ),
+        dict(
+            testcase_name="tp8_large_recurrent_dma",
+            num_heads=12,
+            spec_lengths=[1, 6, 3, 8, 5, 2, 7, 4],
+            read_offsets=[0, 2, 4, 6, 0, 2, 4, 6],
+        ),
+    )
+    def test_speculative_window_checkpoints(self, num_heads, spec_lengths,
+                                            read_offsets):
         """An 8-token K3 verify window stays in one kernel invocation.
 
-        This covers ragged windows, a batch larger than the K3 TP32 VMEM tile,
-        and rollback reads from non-zero checkpoints.  Every real token must
-        write its conv and recurrent state to ``base + t``; padded tail slots
-        must remain untouched.
+        This covers ragged windows, rollback reads from non-zero checkpoints,
+        and TP8's large FP32 recurrent-state DMAs. Every real token must write
+        its conv and recurrent state to ``base + t``; padded tail slots must
+        remain untouched.
         """
-        n_kq = n_v = 3  # K3 TP32: 96 global heads / 32 ranks.
+        n_kq = n_v = num_heads
         d_k = d_v = 128
         kernel_size = 4
         num_spec_tokens = 7
         window = num_spec_tokens + 1
-        spec_lengths = [8, 3, 1, 7, 2]
-        read_offsets = [2, 0, 7, 1, 4]
         num_seqs = len(spec_lengths)
         q_loc = jnp.array(np.concatenate([[0], np.cumsum(spec_lengths)]),
                           dtype=jnp.int32)
@@ -464,14 +477,11 @@ class KdaAttentionV3Test(parameterized.TestCase):
         dim_size = 2 * n_kq * d_k + n_v * d_v
 
         rngs = iter(jax.random.split(jax.random.key(11), 8))
-        qkv = jax.random.normal(next(rngs),
-                                (sum(spec_lengths), dim_size),
+        qkv = jax.random.normal(next(rngs), (sum(spec_lengths), dim_size),
                                 dtype=jnp.bfloat16)
-        b = jax.random.normal(next(rngs),
-                              (sum(spec_lengths), n_v),
+        b = jax.random.normal(next(rngs), (sum(spec_lengths), n_v),
                               dtype=jnp.bfloat16)
-        a = jax.random.normal(next(rngs),
-                              (sum(spec_lengths), n_v * d_k),
+        a = jax.random.normal(next(rngs), (sum(spec_lengths), n_v * d_k),
                               dtype=jnp.bfloat16)
         conv_state = jax.random.normal(
             next(rngs),
@@ -480,8 +490,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
         )
         recurrent_state = jax.random.normal(next(rngs),
                                             (num_blocks, n_v, d_k, d_v))
-        conv_weight = jax.random.normal(next(rngs),
-                                        (dim_size, 1, kernel_size),
+        conv_weight = jax.random.normal(next(rngs), (dim_size, 1, kernel_size),
                                         dtype=jnp.bfloat16)
         a_log = jax.random.normal(next(rngs), (n_v, ))
         dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
