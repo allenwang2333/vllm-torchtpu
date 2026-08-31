@@ -298,10 +298,12 @@ def chunked_kda_per_seq(
         # state ABI, so rejection rollback is unchanged.
         delta_g = (g_cumsum[:, :, None, :]
                    - g_cumsum[:, None, :, :])
-        causal = (jnp.arange(cfg.chunk_size)[:, None]
-                  >= jnp.arange(cfg.chunk_size)[None, :])
+        causal_shape = (1, cfg.chunk_size, cfg.chunk_size, 1)
+        causal_row = jax.lax.broadcasted_iota(jnp.int32, causal_shape, 1)
+        causal_col = jax.lax.broadcasted_iota(jnp.int32, causal_shape, 2)
+        causal = (causal_row >= causal_col).astype(k.dtype)
         prefix_k = (k[:, None, :, :] * jnp.exp(jnp.minimum(delta_g, 0.0))
-                    * causal[None, :, :, None])
+                    * causal)
         state_new = jax.lax.dot_general(
             prefix_k,
             u_ws,
