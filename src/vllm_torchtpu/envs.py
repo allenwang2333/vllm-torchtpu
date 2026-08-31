@@ -53,6 +53,12 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_EXPERT_LOAD_DIR: str = ""
+    TPU_MOE_EXPERT_LOAD_SLOTS: int = 128
+    TPU_MOE_EXPERT_LOAD_BUCKET: int = 16
+    TPU_MOE_EXPERT_LOAD_MAX_TOKENS: int = 256
+    TPU_MOE_EXPERT_LOAD_EVERY: int = 1024
+    TPU_MOE_EXPERT_LOAD_RANKS: str = "0"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -366,6 +372,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Directory for per-(layer, expert) router load histograms; empty = off,
+    # and off means no buffer is registered and the traced graph is unchanged.
+    # Diagnostic only: it adds HLO to the decode graph, so it must never be on
+    # during a capture whose op counts are being compared with another run's.
+    # See layers/vllm/expert_load.py.
+    "TPU_MOE_EXPERT_LOAD_DIR":
+    lambda: os.getenv("TPU_MOE_EXPERT_LOAD_DIR", ""),
+    # Time axis: slot = min(step // BUCKET, SLOTS - 1), so SLOTS x BUCKET steps
+    # are resolved individually and everything after piles into the last slot.
+    "TPU_MOE_EXPERT_LOAD_SLOTS":
+    lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_SLOTS") or "128"),
+    "TPU_MOE_EXPERT_LOAD_BUCKET":
+    lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_BUCKET") or "16"),
+    # Instrument only token buckets this small. The bucket is static per
+    # compiled graph, so a prefill graph is left completely untouched.
+    "TPU_MOE_EXPERT_LOAD_MAX_TOKENS":
+    lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_MAX_TOKENS") or "256"),
+    "TPU_MOE_EXPERT_LOAD_EVERY":
+    lambda: int(os.getenv("TPU_MOE_EXPERT_LOAD_EVERY") or "1024"),
+    # Which ranks write a file. Routing is replicated, so rank 0 alone is the
+    # whole answer; a second rank is a cheap check that it really is replicated.
+    "TPU_MOE_EXPERT_LOAD_RANKS":
+    lambda: os.getenv("TPU_MOE_EXPERT_LOAD_RANKS", "0"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

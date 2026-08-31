@@ -30,6 +30,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.distributed.pcp_rank_order import (
     pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
+from vllm_torchtpu.layers.vllm import expert_load
 from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -140,6 +141,11 @@ class TPUWorker(WorkerBase):
 
         # step_counter is used to calc uuid for intermediate tensor transfer.
         self.step_counter = 0
+
+        # Diagnostic, inert unless TPU_MOE_EXPERT_LOAD_DIR is set. Lives on the
+        # worker because the histograms must be read from OUTSIDE the compiled
+        # forward -- reading them inside it is a device sync per layer per step.
+        self.expert_load_driver = expert_load.DumpDriver(self.rank)
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -482,7 +488,9 @@ class TPUWorker(WorkerBase):
         return available
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        output = self.model_runner.execute_model(scheduler_output)
+        self.expert_load_driver.step(self.model_runner)
+        return output
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)

@@ -48,6 +48,19 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def get_local_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """Bool[num_tokens], True where the row is padding; None if not tracked.
+
+    Read-only view for callers that want to know which rows are padding
+    without altering them -- ``zero_routing_weights_for_padding`` is the
+    mutating path and runs after routing, so anything hooked into routing
+    itself cannot infer padding from a zero weight.
+    """
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
 def zero_routing_weights_for_padding(
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,

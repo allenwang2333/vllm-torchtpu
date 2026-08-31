@@ -17,6 +17,7 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.vllm import expert_load
 from vllm_torchtpu.layers.vllm.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
 
@@ -145,6 +146,20 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
+    topk_weights, topk_ids = _route(layer, hidden_states, router_logits,
+                                    input_ids)
+    # Diagnostic, and a no-op unless TPU_MOE_EXPERT_LOAD_DIR is set. Here, not
+    # in _route, so every routing branch is counted.
+    expert_load.record(layer, topk_ids, topk_weights)
+    return topk_weights, topk_ids
+
+
+def _route(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
@@ -336,6 +351,9 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     buffer = (torch.tensor(experts_start, dtype=torch.int32, device=device)
               if experts_start is not None else None)
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    # Piggy-backed here because this is the one place every TPU MoE quant
+    # method already calls exactly once per layer, with a device in hand.
+    expert_load.register_buffers(layer, device=device)
 
 
 def validate_linear_ep_placement(layer) -> None:
