@@ -544,18 +544,32 @@ def mla_attention(
             x in str(cache.dtype).lower()
             for x in ("fp8", "e4m3")) else "bfloat16"
 
+        # The decode key must be built from the live operand shapes, exactly
+        # like the mixed key below: get_tuned_params() does an exact-match
+        # dict lookup, and the upstream tpu-inference tuner derives both its
+        # search space and its input geometry from these fields.  Building it
+        # from TuningKey dataclass defaults (and from qk_nope_head_dim, the
+        # per-head NOPE dim, rather than the operand's lkv dim) produces a
+        # key no tuned entry can legitimately match.  This mirrors the live
+        # construction in upstream tpu_inference/layers/common/
+        # attention_interface.py.
+        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
+        max_num_seqs = seq_lens.shape[0]
         decode_key = TuningKey(
             case="batched_decode",
             max_num_tokens=max_num_tokens,
-            actual_num_q_heads=num_attention_heads,
-            actual_lkv_dim=qk_nope_head_dim,
+            actual_num_q_heads=q.shape[1],
+            actual_lkv_dim=q.shape[-1],
             actual_r_dim=actual_r_dim,
+            q_dtype=jnp.dtype(q.dtype).name,
             kv_dtype=kv_dtype_str,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
         decode_tuned = get_tuned_params(decode_key)
 
-        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
-        max_num_seqs = seq_lens.shape[0]
         mixed_key = TuningKey(
             case="mixed",
             max_num_tokens=max_num_tokens,
