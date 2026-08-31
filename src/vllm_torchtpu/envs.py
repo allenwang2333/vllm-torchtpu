@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -379,6 +380,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
+    # Shard Kimi K3's latent-MoE down/up projections across the cores of a
+    # chip instead of replicating them. They are unquantized [7168, 3584] and
+    # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
+    # time at TP=32; halving the bytes each core reads costs two on-package
+    # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
+    "TPU_LATENT_PROJ_INTRA_CHIP_TP":
+    env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
