@@ -2493,6 +2493,20 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
+        # Option A: On-device token passing in steady-state decode:
+        # If all input tokens match previous step's next_tokens_tpu 1:1 on device,
+        # directly slice next_tokens_tpu on-device without H2D index uploads or scatter kernel.
+        if (len(token_in_tpu_cur_input_indices) == len(input_ids)
+                and np.array_equal(token_in_tpu_cur_input_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and np.array_equal(token_in_tpu_pre_next_tokens_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None):
+            next_tpu = self._pre_async_results.next_tokens_tpu.flatten()
+            if len(next_tpu) >= len(input_ids):
+                return next_tpu[:len(input_ids)]
+
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside
@@ -2530,7 +2544,7 @@ class TPUModelRunner(GPUModelRunner):
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
         if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
-        self._modify_prev_results()
+        self._modify_prev_results(force=True)
         self._pre_async_results = None
 
     def _install_spec_token_room_guard(self) -> None:
@@ -2608,8 +2622,16 @@ class TPUModelRunner(GPUModelRunner):
         self._install_spec_token_room_guard()
         return super()._update_states(scheduler_output)
 
-    def _modify_prev_results(self):
+    def _modify_prev_results(self, force: bool = False):
         if self._pre_async_results is None:
+            return
+
+        # Option A: Decouple TPU execution thread from D2H completion.
+        # In steady-state non-speculative decode, TPU has already substituted
+        # next_tokens_tpu on device. Calling wait_for_copy() on the TPU execution
+        # thread stalls the forward pipeline. Skip on execution thread unless force=True.
+        defer_modify = bool(int(os.getenv("VLLM_TPU_DEFER_ASYNC_MODIFY", "1")))
+        if not force and defer_modify and self.speculative_config is None:
             return
 
         pre_req_ids = self._pre_async_results.req_ids
@@ -3015,8 +3037,17 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
+        if (self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+                and self._pre_async_results.next_tokens_tpu is not None
+                and total_num_scheduled_tokens == num_reqs):
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[local_token_slice]
+        else:
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True)
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[:, total_num_scheduled_tokens:

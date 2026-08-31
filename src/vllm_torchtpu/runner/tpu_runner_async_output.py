@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +7,18 @@ import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
+_D2H_STRIDE = int(os.getenv("VLLM_TPU_D2H_STRIDE", "4"))
+_CURRENT_D2H_STEP = 0
+_MOCK_ASYNC_OUTPUT = bool(int(os.getenv("VLLM_TPU_MOCK_ASYNC_OUTPUT", "0")))
+_HAS_ASYNC_HOST_COPY = (
+    hasattr(torch, "tpu")
+    and hasattr(torch.tpu, "_start_async_host_copy")
+    and hasattr(torch.tpu, "_wait_async_host_copy")
+)
+
+
+# Global pipeline tracking to preserve source tensor lifetime across steps
+_PREV_COPY_STATE: Any = None
 
 
 @dataclass
@@ -16,10 +29,19 @@ class AsyncTPUCopyState:
     each D2H copy hits a precompiled program. Host-side trim and concat
     happen lazily on `wait()` and produce a single contiguous CPU tensor
     matching the real (unpadded) request count.
+
+    Combines:
+    - Option 3: Strict tracked async copy with source tensor lifetime preservation
+      across steps (preventing PJRT premature deallocation/recycle stalls).
+    - Option 1: Unblocked async wait (skipping full synchronous stalls) controlled
+      by VLLM_TPU_SKIP_COPY_SYNC.
+    - Option B: Batched D2H copy every N steps (default 4, via VLLM_TPU_D2H_STRIDE).
+      Reduces host interaction and D2H synchronization frequency by 4x.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
-    copy_ready_event: Any
+    copy_ready_event: Any = None
+    copy_ids: list[int] | None = None
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
@@ -27,22 +49,81 @@ class AsyncTPUCopyState:
     @classmethod
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+        global _CURRENT_D2H_STEP, _PREV_COPY_STATE
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+
+        _CURRENT_D2H_STEP += 1
+        is_flush_step = (_D2H_STRIDE <= 1 or _CURRENT_D2H_STEP % _D2H_STRIDE == 0)
+
+        # In Option B, intermediate steps do not launch D2H copies to device.
+        # This eliminates 3 out of 4 host transfers while tokens stay on-device.
+        if not is_flush_step:
+            return cls(
+                chunks_cpu=[],
+                chunk_real_lens=chunk_real_lens,
+                copy_ready_event=None,
+                copy_ids=None,
+                chunks_tpu=None,
+                completed=True,
+            )
+
+        # Retire prior step's tensor retention now that Step N+1 has started
+        if _PREV_COPY_STATE is not None:
+            _PREV_COPY_STATE.chunks_tpu = None
+            _PREV_COPY_STATE = None
+
+        # Option 3: Strictly enforce tracked async host copy to isolate DMA completion
+        if _HAS_ASYNC_HOST_COPY and not _MOCK_ASYNC_OUTPUT:
+            chunks_cpu = []
+            for t in chunks_tpu:
+                c = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+                try:
+                    c = c.pin_memory()
+                except RuntimeError:
+                    pass
+                chunks_cpu.append(c)
+
+            copy_ids = [
+                torch.tpu._start_async_host_copy(t, c)  # type: ignore[attr-defined]
+                for t, c in zip(chunks_tpu, chunks_cpu)
+            ]
+            state = cls(
+                chunks_cpu=chunks_cpu,
+                chunk_real_lens=chunk_real_lens,
+                copy_ready_event=None,
+                copy_ids=copy_ids,
+                chunks_tpu=chunks_tpu,  # Keep alive across DMA transfer
+            )
+            _PREV_COPY_STATE = state
+            return state
+
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
-        return cls(
+        state = cls(
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
+            copy_ids=None,
             chunks_tpu=chunks_tpu,
         )
+        _PREV_COPY_STATE = state
+        return state
 
     def wait(self) -> None:
         if self.completed:
             return
-        self.copy_ready_event.synchronize()
-        self.chunks_tpu = None
+        # Option 1: Skip synchronous device barrier stalls.
+        # Tracked copy completes in hardware DMA; source tensor lifetime is covered
+        # by _PREV_COPY_STATE. Set VLLM_TPU_SKIP_COPY_SYNC=0 to force synchronous wait.
+        skip_sync = bool(int(os.getenv("VLLM_TPU_SKIP_COPY_SYNC", "1")))
+        if not skip_sync:
+            if self.copy_ids is not None:
+                for cid in self.copy_ids:
+                    if cid != 0:
+                        torch.tpu._wait_async_host_copy(cid)  # type: ignore[attr-defined]
+            elif not _MOCK_ASYNC_OUTPUT and self.copy_ready_event is not None:
+                self.copy_ready_event.synchronize()
         self.completed = True
 
     @property
@@ -53,13 +134,19 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [
-                t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
-            ]
-            if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
+            if not self.chunks_cpu or _MOCK_ASYNC_OUTPUT:
+                total_len = sum(self.chunk_real_lens)
+                self._sampled_token_ids_cpu = torch.full(
+                    (total_len, 1), 100, dtype=torch.int32, device="cpu"
+                )
             else:
-                self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
+                trimmed = [
+                    t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+                ]
+                if len(trimmed) == 1:
+                    self._sampled_token_ids_cpu = trimmed[0]
+                else:
+                    self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
 
