@@ -344,13 +344,19 @@ class StateBufferedRef(BaseBufferedRef):
             # many tokens but keep only the final state.
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                self._src_slice(dst_ref, state_idx, dma_size),
-                sem,
-            ).start()
+            # Keep each checkpoint as its own DMA. A TP8 K3 recurrent state
+            # is roughly 768 KiB, so coalescing an 8-token window produced a
+            # single ~6 MiB dynamic transfer that did not reliably write its
+            # leading checkpoint.
+            for t in range(self.cfg.window_size):
+                should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+                dma_size = jnp.where(should_write, self._unit(), 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, pl.ds(t, dma_size)],
+                    self._src_slice(dst_ref, state_idx + t, dma_size),
+                    sem,
+                ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -364,14 +370,13 @@ class StateBufferedRef(BaseBufferedRef):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-            # Keep waits one-to-one with copy_out() starts. In particular, a
-            # windowed FP32 recurrent state can make each slot DMA several
-            # MiB, and one synthetic cross-row wait did not reliably drain
-            # every checkpoint transfer before the buffer was reused.
-            wait_ref = vmem_ref.at[idx, pl.ds(0, dma_size)]
-            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            # Replay the per-checkpoint copy_out() descriptors in issue order.
+            for t in range(self.cfg.window_size):
+                should_wait = jnp.logical_and(is_last_tile, t < num_ckpts)
+                dma_size = jnp.where(should_wait, self._unit(), 0)
+                wait_ref = vmem_ref.at[idx, pl.ds(t, dma_size)]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
