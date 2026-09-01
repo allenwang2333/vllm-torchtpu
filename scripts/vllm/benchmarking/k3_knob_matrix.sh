@@ -317,9 +317,9 @@ for arm in "${arm_list[@]}"; do
     # How long the server took to answer /health, split from the benchmark.
     # Dummy-weight bring-up has never been timed anywhere; this is the number
     # that says how many more cells a dummy job can afford than a real one.
-    printf '[boot] arm=%s ready=%ss\n' "$arm" \
+    printf '[boot] arm=%s ready=%s\n' "$arm" \
       "$(grep -aoE 'Server ready on port [0-9]+ \(([0-9]+)s\)' "$cell_dir/server.log" 2>/dev/null \
-         | grep -oE '[0-9]+s\)' | tr -d 's)' | tail -1)"
+         | grep -oE '[0-9]+s\)' | tr -d ')' | tail -1 || true)"
 
     # WHICH MLA rows the server actually asked for, and whether it got them.
     # `get_tuned_params` is silent on a hit and warns on a miss, so a table
@@ -336,9 +336,10 @@ for arm in "${arm_list[@]}"; do
     printf '[keys] arm=%s tuning_misses=%s\n' "$arm" \
       "$(grep -ac 'No tuned parameters found' "$cell_dir/server.log" 2>/dev/null)"
     grep -ah 'No tuned parameters found' "$cell_dir/server.log" 2>/dev/null \
-      | grep -oE 'TuningKey\([^)]*\)' | sort -u | sed 's/^/[keys] MISS /' | head -12
+      | grep -oE 'TuningKey\([^)]*\)' | sort -u | sed 's/^/[keys] WARNED /' | head -12
     printf '[keys] arm=%s block_size=%s pages_per_seq=%s\n' "$arm" \
-      "$(grep -aom1 "block_size=[0-9]*" "$cell_dir/server.log" 2>/dev/null | sed 's/.*=//')" \
+      "$(grep -aom1 -E "'block_size': *[0-9]+|--block-size[= ][0-9]+" \
+           "$cell_dir/server.log" 2>/dev/null | grep -oE '[0-9]+$' || echo unknown)" \
       "$(grep -ah '\[mla-key\]' "$cell_dir/server.log" 2>/dev/null \
          | grep -oE 'pages_per_seq=[0-9]+' | sed 's/.*=//' | sort -un | tr '\n' ',')"
 
@@ -361,7 +362,11 @@ for arm in "${arm_list[@]}"; do
     # the way their own slurm wrapper does.
     hier_ranks() {
       local hits suppressed
-      hits=$(grep -Fc "$1" "$cell_dir/server.log" 2>/dev/null || echo 0)
+      # `|| true`, never `|| echo 0`: grep -c already prints 0 when it finds
+      # nothing AND exits 1, so `|| echo 0` yields the two-line value "0\n0"
+      # and the arithmetic below dies with a syntax error. Verified against a
+      # real server.log.
+      hits=$(grep -Fc "$1" "$cell_dir/server.log" 2>/dev/null || true)
       suppressed=$(grep -F "$1" "$cell_dir/server.log" 2>/dev/null | cut -c1-400 \
         | grep -oE 'repeated [0-9]+x' | grep -oE '[0-9]+' \
         | awk '{n+=$1} END {print n+0}')
