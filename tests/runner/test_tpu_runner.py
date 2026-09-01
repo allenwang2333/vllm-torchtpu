@@ -291,18 +291,22 @@ def _fake_phased_runner(additional_config=None,
                         max_iterations=0,
                         delay_iterations=0,
                         profiler_rank=2,
-                        profiler_world_size=4):
+                        profiler_world_size=4,
+                        max_num_seqs=32):
     """A stand-in for TPUModelRunner carrying only what phased profiling reads.
 
-    No parallel_config: the phased profiler must not reach for it.
+    No parallel_config: the phased profiler must not reach for it. It does read
+    scheduler_config.max_num_seqs, to default the steady-state num_reqs gate.
     """
     return SimpleNamespace(
-        vllm_config=SimpleNamespace(additional_config=additional_config
-                                    if additional_config is not None else {},
-                                    profiler_config=SimpleNamespace(
-                                        torch_profiler_dir=torch_profiler_dir,
-                                        max_iterations=max_iterations,
-                                        delay_iterations=delay_iterations)),
+        vllm_config=SimpleNamespace(
+            additional_config=additional_config
+            if additional_config is not None else {},
+            profiler_config=SimpleNamespace(
+                torch_profiler_dir=torch_profiler_dir,
+                max_iterations=max_iterations,
+                delay_iterations=delay_iterations),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs)),
         _profiler_rank=profiler_rank,
         _profiler_world_size=profiler_world_size,
     )
@@ -380,6 +384,7 @@ class TestStartStopPhasedProfiling:
             monkeypatch,
             additional_config={
                 "phased_profiler_decode_only_kv_len_threshold": 128,
+                "phased_profiler_min_num_reqs": 24,
             },
             max_iterations=20,
             delay_iterations=3,
@@ -396,6 +401,7 @@ class TestStartStopPhasedProfiling:
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
+            min_num_reqs=24,
             standard_opts={
                 'host_tracer_level': 2,
                 'device_tracer_level': 1,
@@ -408,6 +414,17 @@ class TestStartStopPhasedProfiling:
             },
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
+
+    def test_min_num_reqs_defaults_to_half_a_full_batch(self, monkeypatch):
+        """Unset, the gate tracks max_num_seqs -- so it stays meaningful for a
+        workload whose batch size nobody tuned this knob for."""
+        runner = _init_phased_runner(monkeypatch, max_num_seqs=32)
+        with patch(
+                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(runner)
+
+        assert mock_profiler_cls.call_args.kwargs["min_num_reqs"] == 16
 
     def test_profile_prefix_scopes_the_phase_dirs(self, monkeypatch):
         """Same scoping the standard profiler gives /start_profile's prefix:

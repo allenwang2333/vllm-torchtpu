@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -74,7 +75,10 @@ def test_phased_profiler_full_cycle(profiler_fixture):
             PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
     assert profiler.current_phase == "prefill_heavy"
     assert profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
-    assert mock_file().write.call_count == 1  # Wrote stats on start
+    # Stats are buffered, not written: the write is deferred out of
+    # execute_model so it cannot skew the capture it is describing.
+    assert mock_file().write.call_count == 0
+    assert len(profiler._pending_batch_composition_stats) == 1
 
     # 2. Step profiling (N-1 steps)
     for i in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1):
@@ -89,8 +93,11 @@ def test_phased_profiler_full_cycle(profiler_fixture):
     mock_context.__exit__.assert_called_once_with(None, None, None)
     assert profiler.profiling_n_steps_left == 0
     assert profiler.current_phase == ""
+    # All N+1 stats land at phase end, in one flush -- same files as before,
+    # just none of them written on the critical path.
     assert (mock_file().write.call_count ==
             PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1)
+    assert profiler._pending_batch_composition_stats == []
 
 
 def test_phased_profiler_finish_stops_a_phase_mid_capture(profiler_fixture):
@@ -337,6 +344,78 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
+def test_phased_profiler_min_num_reqs_defaults_off(profiler_fixture):
+    """Unset `min_num_reqs` must not suppress a capture that happens today."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    assert profiler.min_num_reqs == -1
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+    profiler.step({
+        "num_reqs": 1,
+        "total_num_scheduled_tokens": 1,
+        "min_kv_len": 0
+    })
+
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+
+
+@pytest.mark.parametrize("phase", [
+    InferencePhase.DECODE_ONLY,
+    InferencePhase.DECODE_HEAVY,
+    InferencePhase.BALANCED,
+])
+def test_phased_profiler_skips_decode_bearing_steps_below_min_num_reqs(
+        profiler_fixture, phase):
+    """The warmup ramp must not consume a decode-bearing phase latch.
+
+    Each phase fires once per process, so a capture at num_reqs 1-2 is not just
+    unrepresentative -- it permanently costs the steady-state trace.
+    """
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.min_num_reqs = 16
+    # DECODE_HEAVY is separately rate-limited by num_decode_steps_to_skip;
+    # keep that gate open so this test measures only the num_reqs gate.
+    profiler.num_decode_steps_to_skip = 0
+    mock_determine_phase.return_value = phase
+
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100, "min_kv_len": 0}
+    profiler.step(stats)
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[phase]
+
+    stats["num_reqs"] = 16
+    profiler.step(stats)
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[phase]
+    assert profiler.current_phase == phase.name.lower()
+
+
+def test_phased_profiler_min_num_reqs_does_not_gate_prefill_only(
+        profiler_fixture):
+    """PREFILL_ONLY shape is set by the chunk size, not by how full the batch is."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.min_num_reqs = 16
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    profiler.step({
+        "num_reqs": 1,
+        "total_num_scheduled_tokens": 2048,
+        "min_kv_len": 0
+    })
+
+    mock_profile.assert_called_once()
+    assert profiler.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+
 def _stage_rank_capture(rank_dir, ts_name, filename, content):
     """Helper: simulate writing one xplane file under rank_N/plugins/profile/<ts>/."""
     ts_dir = rank_dir / "plugins" / "profile" / ts_name
@@ -482,3 +561,72 @@ def test_merge_profile_directories_multiworker(tmp_path):
                 ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def test_batch_composition_stats_are_buffered_until_phase_end(tmp_path):
+    """Per-step stats must not touch the filesystem inside execute_model.
+
+    The write used to happen per step, ahead of the DP barrier, costing
+    140-160 ms of host time and desynchronizing ranks during the very capture
+    meant to measure them. Buffering keeps the resulting files identical.
+    """
+    profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
+    rank_dir = tmp_path / "balanced" / "rank_0"
+    rank_dir.mkdir(parents=True)
+    profiler.profile_dir_with_phase_suffix = str(rank_dir)
+
+    for batch_id in range(3):
+        profiler._write_batch_composition_stats_to_file_helper(
+            {"batch_id": batch_id})
+
+    # Nothing on disk yet, but all three are queued.
+    assert list(rank_dir.iterdir()) == []
+    assert len(profiler._pending_batch_composition_stats) == 3
+
+    profiler._flush_batch_composition_stats()
+
+    written = sorted(rank_dir.glob("batch_composition_stats_*.json"))
+    assert len(written) == 3
+    assert sorted(json.loads(p.read_text())["batch_id"]
+                  for p in written) == [0, 1, 2]
+    # Buffer is cleared, so the next phase cannot re-emit this phase's stats.
+    assert profiler._pending_batch_composition_stats == []
+
+
+def test_stats_flush_before_merge_lands_them_in_the_capture_dir(tmp_path):
+    """_finish_current_phase must flush before merging, not after.
+
+    _merge_profile_directories consolidates the rank capture sandbox; a flush
+    ordered after it would strand the stats outside the merged phase.
+    """
+    profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
+    phase_dir = tmp_path / "balanced"
+    rank_dir = phase_dir / "rank_0"
+    rank_dir.mkdir(parents=True)
+    profiler.profile_dir_with_phase_suffix = str(rank_dir)
+    profiler.current_phase = "balanced"
+
+    profiler._write_batch_composition_stats_to_file_helper({"batch_id": 7})
+
+    seen_at_merge = []
+    with patch.object(PhaseBasedProfiler,
+                      "_merge_profile_directories",
+                      side_effect=lambda: seen_at_merge.extend(
+                          rank_dir.glob("batch_composition_stats_*.json"))):
+        profiler._finish_current_phase()
+
+    assert len(seen_at_merge) == 1, "stats were not on disk when merge ran"
+    assert json.loads(seen_at_merge[0].read_text())["batch_id"] == 7
+
+
+def test_stats_helper_is_a_noop_before_a_phase_opens(tmp_path):
+    """No capture dir means no buffering -- otherwise the buffer would grow
+    unboundedly across every step of a run that never profiles."""
+    profiler = PhaseBasedProfiler(profile_dir=str(tmp_path), worker_rank=0)
+    assert profiler.profile_dir_with_phase_suffix is None
+
+    for batch_id in range(100):
+        profiler._write_batch_composition_stats_to_file_helper(
+            {"batch_id": batch_id})
+
+    assert profiler._pending_batch_composition_stats == []

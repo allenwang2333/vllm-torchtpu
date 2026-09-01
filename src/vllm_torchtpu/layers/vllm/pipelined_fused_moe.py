@@ -94,6 +94,58 @@ def _get_moe_collective_group():
     return dp_group, "DP"
 
 
+def _all_gather_routing(
+    collective_group,
+    topk_weights: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+    dim: int = 0,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """All-gather the routing pair as one packed tensor instead of two.
+
+    Written as two separate all-gathers of ``[S, topk]``, this moves 160 KiB per
+    rank per layer. XLA does not compile it that way. In the Qwen3.5-397B
+    prefill trace (j-4de2ed22, rank0 ``prefill_only``) there is no ``[*, topk]``
+    all-gather anywhere in the step. The compiler sank the top-k below the
+    gather -- legal, since top-k is row-wise and the gather is along dim 0 --
+    and gathers the router logits ``bf16[S, num_experts]`` instead. That is
+    13.1x more bytes, on the one collective in the step that runs synchronously
+    on TensorCore and is therefore 100% exposed (7.191 ms/step), and it also
+    forces every rank to redo top-k over the gathered ``[8S, num_experts]``
+    rather than its own ``[S, num_experts]`` (a further 1.501 ms/step).
+
+    Packing removes the reward the rewrite was chasing -- two collectives
+    collapsing into one. With a single collective either way, hoisting buys the
+    cost model nothing and costs 25x the bytes.
+
+    Packing in f32 is exact: f32 represents every integer below 2**24, so expert
+    ids round-trip bit-for-bit for any expert count a real model has. The
+    weights are already f32 or a narrower float on every path that reaches here,
+    and are cast back to their original dtype on the way out.
+    """
+    if topk_weights is None or topk_ids is None:
+        # Nothing to pack against; fall back to gathering whichever exists.
+        ag_w = (collective_group.all_gather(topk_weights, dim=dim)
+                if topk_weights is not None else None)
+        ag_i = (collective_group.all_gather(topk_ids, dim=dim)
+                if topk_ids is not None else None)
+        return ag_w, ag_i
+
+    if topk_weights.shape[:-1] != topk_ids.shape[:-1]:
+        raise ValueError(
+            "topk_weights and topk_ids must agree on every dimension but the "
+            f"last; got {list(topk_weights.shape)} and {list(topk_ids.shape)}.")
+
+    topk = topk_ids.shape[-1]
+    weights_dtype, ids_dtype = topk_weights.dtype, topk_ids.dtype
+    packed = torch.cat(
+        [topk_ids.to(torch.float32),
+         topk_weights.to(torch.float32)], dim=-1)
+    ag_packed = collective_group.all_gather(packed, dim=dim)
+    ag_ids = ag_packed[..., :topk].to(ids_dtype)
+    ag_weights = ag_packed[..., topk:].to(weights_dtype)
+    return ag_weights, ag_ids
+
+
 @torch.compiler.assume_constant_result
 def _log_active_chunk_pipeline() -> None:
     """Emit trace-time evidence without passing symbolic values to logging."""
@@ -169,10 +221,15 @@ def pipelined_fused_moe_gmm(
         if parallel_size > 1:
             ag_hidden_states = collective_group.all_gather(hidden_states,
                                                            dim=0)
-            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
-                               if topk_weights is not None else None)
-            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
-                           if topk_ids is not None else None)
+            if envs.TPU_MOE_PACK_ROUTING_AG:
+                ag_topk_weights, ag_topk_ids = _all_gather_routing(
+                    collective_group, topk_weights, topk_ids, dim=0)
+            else:
+                ag_topk_weights = (collective_group.all_gather(topk_weights,
+                                                               dim=0)
+                                   if topk_weights is not None else None)
+                ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
+                               if topk_ids is not None else None)
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights

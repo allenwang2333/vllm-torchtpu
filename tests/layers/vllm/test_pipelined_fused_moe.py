@@ -647,6 +647,114 @@ def test_pipelined_moe_single_chunk_dp_greater_than_one():
     assert len(rs_calls) == 1
 
 
+def test_pack_routing_ag_gathers_once_and_round_trips_exactly():
+    """TPU_MOE_PACK_ROUTING_AG: one routing collective, values unchanged.
+
+    The flag exists to stop XLA sinking the top-k below the all-gather and
+    gathering the much larger router logits instead. What it must not do is
+    change any value the kernel sees, so this asserts bit-exact round-tripping
+    of both routing tensors alongside the collective count.
+    """
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
+    seq_len = 1024
+    hidden_dim = 64
+    topk = 2
+    num_experts = 4
+
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    # Distinct, non-uniform values: a round trip that silently broadcast or
+    # truncated would still pass against the all-ones weights used elsewhere.
+    topk_weights = torch.rand(seq_len, topk).to(torch.bfloat16)
+    topk_ids = torch.randint(0, num_experts, (seq_len, topk),
+                             dtype=torch.int32)
+    w1 = torch.randn(num_experts, hidden_dim, hidden_dim * 2,
+                     dtype=torch.bfloat16)
+    w2 = torch.randn(num_experts, hidden_dim * 2, hidden_dim,
+                     dtype=torch.bfloat16)
+
+    seen = {}
+
+    def mock_kernel_fn(hidden_states, *args, **kwargs):
+        seen["topk_weights"] = kwargs["topk_weights"]
+        seen["topk_ids"] = kwargs["topk_ids"]
+        return hidden_states * 3.0
+
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+         patch.object(envs, "TPU_MOE_PACK_ROUTING_AG", True), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm", side_effect=mock_kernel_fn):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+
+    assert out.shape == (seq_len, hidden_dim)
+
+    ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
+    # Two, not three: hidden states, then the packed routing pair.
+    assert len(ag_calls) == 2, dp_group.call_log
+    assert ag_calls[0][1] == hidden_states.shape
+    assert ag_calls[1][1] == (seq_len, 2 * topk)
+
+    expected_weights = torch.cat([topk_weights] * dp_group.world_size, dim=0)
+    expected_ids = torch.cat([topk_ids] * dp_group.world_size, dim=0)
+    assert seen["topk_weights"].dtype == topk_weights.dtype
+    assert seen["topk_ids"].dtype == topk_ids.dtype
+    torch.testing.assert_close(seen["topk_weights"],
+                               expected_weights,
+                               rtol=0,
+                               atol=0)
+    assert torch.equal(seen["topk_ids"], expected_ids)
+
+
+def test_pack_routing_ag_ignored_when_routing_tensors_are_none():
+    """The flag must not fabricate a collective when there is nothing to pack."""
+    dp_group = _MockCollectiveGroup(world_size=4, rank=0)
+    seq_len = 512
+    hidden_dim = 64
+    num_experts = 4
+
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    w1 = torch.randn(num_experts, hidden_dim, hidden_dim * 2,
+                     dtype=torch.bfloat16)
+    w2 = torch.randn(num_experts, hidden_dim * 2, hidden_dim,
+                     dtype=torch.bfloat16)
+
+    with patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16384), \
+         patch.object(envs, "TPU_MOE_PACK_ROUTING_AG", True), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.get_dp_group", return_value=dp_group), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm",
+               side_effect=lambda hidden_states, *a, **k: hidden_states):
+        pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=None,
+            topk_ids=None,
+            experts_start=None,
+            topk=2,
+            activation="silu",
+        )
+
+    ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
+    assert len(ag_calls) == 1
+    assert ag_calls[0][1] == hidden_states.shape
+
+
 def test_pipelined_moe_dp_size_one_no_collectives():
     """Verify pipelined MoE bypasses collectives when DP == 1 or dp_group is None."""
     seq_len = 1024

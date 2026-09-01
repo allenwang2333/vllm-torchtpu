@@ -789,6 +789,14 @@ class TPUModelRunner(GPUModelRunner):
         decode_kv_len_threshold = additional_config.get(
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
             runner_utils.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+        # Default to half a full batch. The warmup ramp climbs from one request,
+        # so anything short of a real fraction of max_num_seqs lets the phase
+        # latch fire on a batch that never occurs in steady state; half is far
+        # enough up the ramp to be representative while still leaving headroom
+        # for a workload that does not quite saturate its slots.
+        min_num_reqs = additional_config.get(
+            runner_utils.PHASED_PROFILER_MIN_NUM_REQS_KEY,
+            self.vllm_config.scheduler_config.max_num_seqs // 2)
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
 
@@ -811,6 +819,7 @@ class TPUModelRunner(GPUModelRunner):
                 or runner_utils.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR),
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
+            min_num_reqs=min_num_reqs,
             standard_opts=standard_opts,
             advanced_opts=advanced_opts,
         )

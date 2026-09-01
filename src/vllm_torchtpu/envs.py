@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
+    TPU_DP_PREFILL_DEFER: bool = False
+    TPU_DP_PREFILL_HARD: bool = False
+    TPU_DP_PREFILL_DRAIN_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -57,6 +60,8 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_PACK_ROUTING_AG: bool = False
+    TPU_MOE_EXPERT_PERM_URI: str = ""
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
 
@@ -326,6 +331,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Let TpuDpScheduler forward the DP prefill cadence to upstream vLLM so
+    # that in-progress prefill *chunks* can also be deferred to
+    # cadence-aligned steps. Off by default, which keeps the historical
+    # behaviour of only gating brand-new requests.
+    "TPU_DP_PREFILL_DEFER":
+    env_bool("TPU_DP_PREFILL_DEFER"),
+    # With TPU_DP_PREFILL_DEFER, pin ``prefill_capacity_bound`` to False so a
+    # backlogged waiting queue cannot re-open prefill admission mid-window.
+    # Under a saturated benchmark the queue is never empty, so without this
+    # upstream disables deferral on every step.
+    "TPU_DP_PREFILL_HARD":
+    env_bool("TPU_DP_PREFILL_HARD"),
+    # With TPU_DP_PREFILL_DEFER, close the prefill drain window this many
+    # steps after it opened, even if requests are still queued. 0 keeps the
+    # historical behaviour of draining until the queue empties -- which under
+    # saturation means the window never closes. The counter is driven purely
+    # by the DP-identical prefill cadence, so it stays in lockstep across
+    # ranks with no extra collective.
+    "TPU_DP_PREFILL_DRAIN_STEPS":
+    lambda: int(os.getenv("TPU_DP_PREFILL_DRAIN_STEPS") or "0"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
@@ -376,6 +401,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # All-gather the MoE routing pair (topk_ids, topk_weights) as one packed
+    # f32 tensor instead of two separate collectives. Purely a shape change to
+    # the DP all-gather: same values, same kernel path. It exists to stop XLA
+    # sinking the top-k below the gather and gathering the much larger router
+    # logits instead -- see `_all_gather_routing` in
+    # layers/vllm/pipelined_fused_moe.py for the trace evidence. Applies to the
+    # non-chunked path only (TPU_MOE_COLLECTION_CHUNK_SIZE=0, the default).
+    "TPU_MOE_PACK_ROUTING_AG":
+    env_bool("TPU_MOE_PACK_ROUTING_AG"),
+    # Path or gs:// URI of a per-layer expert permutation, applied at weight
+    # load so the contiguous EP blocks the fused-MoE kernel requires carry
+    # equal expert load. Empty (the default) leaves placement untouched. See
+    # expert_permutation.py -- the model computes the identical function, so
+    # this is a placement change, not a numerics change.
+    "TPU_MOE_EXPERT_PERM_URI":
+    lambda: (os.getenv("TPU_MOE_EXPERT_PERM_URI") or "").strip(),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
