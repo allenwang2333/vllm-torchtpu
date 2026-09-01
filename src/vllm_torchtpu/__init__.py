@@ -1267,6 +1267,29 @@ def _patch_vllm_compile_prefix_isolation() -> None:
                       compile_prefix=compile_prefix,
                       is_encoder=is_encoder)
 
+        if hasattr(self, "vllm_config"):
+            try:
+                self._backend = self.vllm_config.compilation_config.init_backend(
+                    self.vllm_config,
+                    prefix=compile_prefix,
+                    is_encoder=is_encoder)
+            except Exception as e:
+                logger.debug("Could not initialize backend for stitching: %s",
+                             e)
+
+        # Transparently wrap _compiled_callable with FX layer template stitching if enabled
+        if hasattr(self, "_compiled_callable") and not is_encoder:
+            from vllm_torchtpu import envs
+            if envs.VLLM_TORCH_TPU_EXPERIMENTAL_ENABLE_LAYER_STITCHING:
+                try:
+                    from vllm_torchtpu.compilation.layer_stitcher import \
+                        wrap_callable_with_stitching
+                    self._compiled_callable = wrap_callable_with_stitching(
+                        self, self._compiled_callable)
+                except Exception as e:
+                    logger.debug(
+                        "Could not attach layer stitching wrapper: %s", e)
+
     patched_init._tpu_compile_prefix_isolation_patch = True
     TorchCompileWithNoGuardsWrapper.__init__ = patched_init
     logger.info(
