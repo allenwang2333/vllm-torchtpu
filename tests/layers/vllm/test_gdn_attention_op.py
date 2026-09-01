@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -94,10 +95,12 @@ class TestVllmGatedDeltaNetAttention:
 
         num_kv_heads_x2 = num_kv_heads * 2
         packed_head_dim = head_dim // kv_packing
-        recurrent_state = jnp.zeros(
-            (1, num_kv_heads_x2, packed_head_dim, kv_packing, page_size),
-            dtype=dtype,
-        )
+        shape = (1, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
+        total_elements = math.prod(shape)
+        # Use structured, distinct non-zero values fitting in FP8 / BF16 ranges
+        raw_values = (
+            np.arange(1, total_elements + 1, dtype=np.float32) % 120 + 1)
+        recurrent_state = jnp.array(raw_values.reshape(shape), dtype=dtype)
         pooled_state = _pooled_gdn_state_view(recurrent_state)
 
         packed_num_heads = cdiv(num_kv_heads_x2, kv_packing)
@@ -110,6 +113,18 @@ class TestVllmGatedDeltaNetAttention:
                            page_size) * expected_gdn_kernel_block_size
         assert _pooled_gdn_block_tokens(vllm_config, recurrent_state,
                                         pooled_state) == expected_tokens
+
+        # Assert values: verify that the underlying flattened memory buffer is
+        # bitwise-identical and that round-trip reshape restores exact values.
+        np.testing.assert_array_equal(
+            np.array(pooled_state).reshape(-1),
+            np.array(recurrent_state).reshape(-1),
+        )
+        restored = pooled_state.reshape(recurrent_state.shape)
+        np.testing.assert_array_equal(
+            np.array(restored),
+            np.array(recurrent_state),
+        )
 
     @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
            "run_jax_gdn_attention_pcp_tp_prefill")

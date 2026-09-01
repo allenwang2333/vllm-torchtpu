@@ -1191,6 +1191,7 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
+        backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1206,7 +1207,6 @@ class TPUModelRunner(GPUModelRunner):
             not self.scheduler_config.disable_hybrid_kv_cache_manager)
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
-        attention_backends: dict[str, type[Any]] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
@@ -1263,10 +1263,8 @@ class TPUModelRunner(GPUModelRunner):
                     # The layout can pad a page past what its shape and dtype
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
-                    attention_backend = attn_module.get_attn_backend()
-                    attention_backends[layer_name] = attention_backend
                     _warn_if_kv_cache_is_padded(
-                        attention_backend,
+                        backend_cls,
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
@@ -1275,7 +1273,7 @@ class TPUModelRunner(GPUModelRunner):
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes
                         if self._hybrid_uniform_page_size_bytes is not None
-                        else attention_backend.get_kv_cache_page_size_bytes(
+                        else backend_cls.get_kv_cache_page_size_bytes(
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
@@ -1350,7 +1348,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
-            attention_backends=attention_backends,
+            attention_backend=backend_cls,
         )
 
     def _build_attention_metadata(

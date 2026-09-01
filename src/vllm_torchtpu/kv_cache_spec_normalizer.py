@@ -1,8 +1,8 @@
 import math
 from dataclasses import replace
-from typing import Any, Mapping
 
 import torch
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec)
 
@@ -16,7 +16,7 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    attention_backends: Mapping[str, Any] | None = None,
+    attention_backend: type[AttentionBackend] | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
@@ -29,11 +29,11 @@ def normalize_kv_cache_specs_for_tpu(
         if layer_name in exempt:
             normalized[layer_name] = spec
             continue
-        backend = (None if attention_backends is None else
-                   attention_backends.get(layer_name))
-        normalized[layer_name] = _normalize_one_spec(spec,
-                                                     kv_cache_dtype,
-                                                     attention_backend=backend)
+        normalized[layer_name] = _normalize_one_spec(
+            spec,
+            kv_cache_dtype,
+            attention_backend=attention_backend,
+        )
     if enable_unified_kv_layout:
         non_exempt_specs = {
             k: v
@@ -55,7 +55,7 @@ def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: str | torch.dtype,
     *,
-    attention_backend: Any | None = None,
+    attention_backend: type[AttentionBackend] | None = None,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
