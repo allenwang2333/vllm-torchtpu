@@ -4,13 +4,22 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import (_layout_supported,
                                                     kda_forward_inference)
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
-    _get_kda_prefill_kernel
+    _get_kda_prefill_kernel, _guard_kda_verify_window
+
+
+@pytest.mark.parametrize(("num_window_reqs", "expected"), [(0, 2), (1, 1)])
+def test_kda_verify_window_guard(num_window_reqs: int, expected: int) -> None:
+    guarded = jax.jit(lambda count: _guard_kda_verify_window(
+        count, lambda: jnp.asarray(1), lambda: jnp.asarray(2)))
+
+    assert int(guarded(jnp.asarray(num_window_reqs))) == expected
 
 
 def test_kda_prefill_kernel_defaults_to_chunked(monkeypatch) -> None:
