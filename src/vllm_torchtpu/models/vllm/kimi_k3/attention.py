@@ -32,9 +32,27 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
     build_kimi_dispatched_kda_op
+from vllm_torchtpu.layers.vllm.low_latency_linear import \
+    LowLatencyRowParallelLinear
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _o_proj_cls():
+    """RowParallelLinear, or the low-latency-all-reduce variant when armed.
+
+    The low-latency out-proj layer routes its TP all-reduce through an opaque
+    custom op that picks the two-shot kernel or the stock ring reduction from
+    the concrete token count at execution time; see
+    layers/vllm/low_latency_linear.py. Read once at construction -- the flag
+    folds into the traced graph's structure either way.
+    """
+    from vllm_torchtpu import envs
+
+    if envs.TPU_LOW_LATENCY_ALLREDUCE:
+        return LowLatencyRowParallelLinear
+    return RowParallelLinear
 
 
 def kda_state_dtype(
@@ -274,7 +292,7 @@ class MultiHeadLatentAttention(nn.Module):
             prefix=f"{prefix}.g_proj",
         ) if (getattr(config, "mla_use_output_gate", False)
               and not self.mla_gate_is_fused) else None)
-        self.o_proj = RowParallelLinear(
+        self.o_proj = _o_proj_cls()(
             config.num_attention_heads * self.v_head_dim,
             config.hidden_size,
             bias=False,
@@ -462,7 +480,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         set_weight_attrs(self.dt_bias,
                          {"weight_loader": sharded_weight_loader(0)})
         self.o_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.o_proj = RowParallelLinear(
+        self.o_proj = _o_proj_cls()(
             self.projection_size,
             config.hidden_size,
             bias=False,

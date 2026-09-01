@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_LOW_LATENCY_ALLREDUCE: bool = False
+    TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE: str = ""
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -362,6 +364,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Route decode-sized out-projection TP all-reduces through the two-shot
+    # Pallas kernel (1.43x XLA at the c=4 payload, 32 devices) instead of
+    # XLA's ring. The choice is made inside one opaque custom op from the
+    # concrete token count, so every compile bucket keeps the same graph
+    # interface; payloads past the crossover reduce through the stock ring
+    # from inside the op. See distributed/low_latency_all_reduce.py.
+    #
+    # Both variables change the compiled graph -- the flag adds workspace
+    # tensors as graph inputs, the threshold sizes them -- so they live here,
+    # where `_tpu_compile_env_factors()` hashes them into the compile cache
+    # key. A flag read with a bare os.environ.get is invisible to the cache,
+    # and an A/B against it silently reuses the other arm's compiled graph.
+    "TPU_LOW_LATENCY_ALLREDUCE":
+    env_bool("TPU_LOW_LATENCY_ALLREDUCE"),
+    # Largest padded token count routed to the kernel; payloads past it take
+    # the XLA fallback inside the same op. A raw string: the reader
+    # (low_latency_all_reduce.max_batch_size) owns blank/garbage/non-positive
+    # handling. Default 8; 16 is the measured crossover tie and is not wired
+    # by default.
+    "TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE":
+    lambda: os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", ""),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":

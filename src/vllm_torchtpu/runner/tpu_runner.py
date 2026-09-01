@@ -4524,6 +4524,24 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
+
+                # Arm the low-latency all-reduce on the out-proj layers that
+                # opted in at construction (LowLatencyRowParallelLinear). The
+                # op registration, rank->device gather, and workspace
+                # allocation in initialize_llar() must all happen here --
+                # after the process groups and weights exist, before
+                # torch.compile traces a forward.
+                from vllm_torchtpu.layers.vllm.low_latency_linear import \
+                    LowLatencyRowParallelLinear
+                llar_layers = 0
+                for module in self.model.modules():
+                    if isinstance(module, LowLatencyRowParallelLinear):
+                        module.initialize_llar()
+                        llar_layers += 1
+                if llar_layers:
+                    logger.info(
+                        "Initialized the low-latency all-reduce op for %d "
+                        "out-proj layers.", llar_layers)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)
