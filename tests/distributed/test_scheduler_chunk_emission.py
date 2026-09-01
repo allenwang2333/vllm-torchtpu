@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for scheduler wrapper pass-through and stride chunk emission."""
 
+from collections.abc import Iterator
+import contextlib
 import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.request import RequestStatus
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
@@ -29,6 +32,7 @@ def _make_raiden_scheduler(
     pcp_size: int = 4,
     interleave_size: int = 256,
 ) -> TPURaidenConnectorScheduler:
+    """Creates a mock-configured TPURaidenConnectorScheduler for testing."""
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
@@ -41,11 +45,46 @@ def _make_raiden_scheduler(
     cfg.parallel_config.prefill_context_parallel_size = pcp_size
     cfg.parallel_config.cp_kv_cache_interleave_size = interleave_size
 
-    with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"), \
-         patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100), \
-         patch(f"{_MOD}.dist_utils.get_side_channel_port", return_value="9600"):
+    with (
+        patch(f"{_MOD}.dist_utils.get_kv_ips", return_value="127.0.0.1"),
+        patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=9100),
+        patch(f"{_MOD}.dist_utils.get_side_channel_port", return_value="9600"),
+    ):
         scheduler = TPURaidenConnectorScheduler(cfg)
     return scheduler
+
+
+@contextlib.contextmanager
+def _patch_raiden_stage3_env(
+    *,
+    base_uuid: int = 12345,
+    parallelism: int = 4,
+    timeout_s: float = 30.0,
+    controller_address: str = "127.0.0.1:27000",
+    job_name: str = "prefill",
+    engine_id: str = "producer-0",
+) -> Iterator[None]:
+    """Patches Stage-3 Raiden connector environment variables and utilities."""
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+            controller_address,
+        ),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", job_name),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", engine_id),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+            parallelism,
+        ),
+        patch(
+            f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+            return_value=timeout_s,
+        ),
+        patch(f"{_MOD}.get_uuid", return_value=base_uuid),
+    ):
+        yield
 
 
 def test_chunk_uuid_determinism_and_properties() -> None:
@@ -584,3 +623,429 @@ def test_raiden_connector_wrapper_pass_through() -> None:
 
     mock_sched.build_connector_meta.assert_called_once_with(sched_out)
     assert isinstance(result, TPUConnectorMetadata)
+
+
+# ===========================================================================
+# Step 2.3 — Short-Prompt Bypass & Terminal Remainder Emission Tests
+# ===========================================================================
+
+
+def test_short_prompt_bypass() -> None:
+    """Verifies 512-token prompt bypasses intermediate chunking.
+
+    Under PCP4 with stride 1024, a 512-token prompt is shorter than the minimum
+    transfer threshold. build_connector_meta() must emit zero intermediate
+    chunks, and request_finished() must emit a single terminal SendMeta
+    descriptor covering [0, 512) with is_final=True.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-short-512"
+    base_uuid = 555555
+    # PCP4 with block_size=16 -> scheduler block = 64 tokens.
+    # 512 tokens -> (512 + 63) // 64 = 8 scheduler blocks.
+    block_ids = list(range(100, 108))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 512
+    req.num_computed_tokens = 512
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # 1. build_connector_meta during execution step: emits 0 chunks
+        sched_out = MagicMock(spec=SchedulerOutput)
+        sched_out.num_scheduled_tokens = {req_id: 512}
+
+        meta_step = scheduler.build_connector_meta(sched_out)
+        assert req_id not in meta_step.reqs_to_send
+        assert len(meta_step.reqs_to_send) == 0
+
+        # Verify state cursor untouched
+        req_state = scheduler._stage3_send_requests[req_id]
+        assert req_state.tokens_sent == 0
+        assert req_state.next_chunk_idx == 0
+
+        # 2. request_finished emits single terminal chunk
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert req_id in meta_fin.reqs_to_send
+        send_meta = meta_fin.reqs_to_send[req_id]
+        assert send_meta.token_base == 0
+        assert send_meta.num_tokens == 512
+        assert send_meta.is_final is True
+        assert send_meta.uuid == chunk_uuid(base_uuid, 0)
+        assert send_meta.local_block_ids == block_ids
+
+        # 3. Verify cleanup of request tracking state
+        assert req_id not in scheduler._stage3_send_requests
+
+
+def test_terminal_remainder_emission() -> None:
+    """Verifies intermediate chunks and terminal remainder on 3500-token prompt.
+
+    Intermediate execution steps emit chunks for [0, 1024), [1024, 2048),
+    and [2048, 3072). Upon completion, request_finished() emits the terminal
+    remainder [3072, 3500) marked with is_final=True.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-long-3500"
+    base_uuid = 999111
+    # 3500 tokens on PCP4 (block_size=16): (3500 + 63) // 64 = 55 blocks.
+    block_ids = list(range(100, 155))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 3500
+    req.num_computed_tokens = 0
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # Step 1: 1024 tokens -> [0, 1024), chunk_idx 0
+        sched_out_1 = MagicMock(spec=SchedulerOutput)
+        sched_out_1.num_scheduled_tokens = {req_id: 1024}
+        meta_1 = scheduler.build_connector_meta(sched_out_1)
+        assert req_id in meta_1.reqs_to_send
+        s1 = meta_1.reqs_to_send[req_id]
+        assert s1.token_base == 0
+        assert s1.num_tokens == 1024
+        assert s1.is_final is False
+        assert s1.uuid == chunk_uuid(base_uuid, 0)
+
+        # Step 2: 1024 tokens -> [1024, 2048), chunk_idx 1
+        sched_out_2 = MagicMock(spec=SchedulerOutput)
+        sched_out_2.num_scheduled_tokens = {req_id: 1024}
+        meta_2 = scheduler.build_connector_meta(sched_out_2)
+        assert req_id in meta_2.reqs_to_send
+        s2 = meta_2.reqs_to_send[req_id]
+        assert s2.token_base == 1024
+        assert s2.num_tokens == 1024
+        assert s2.is_final is False
+        assert s2.uuid == chunk_uuid(base_uuid, 1)
+
+        # Step 3: 1024 tokens -> [2048, 3072), chunk_idx 2
+        sched_out_3 = MagicMock(spec=SchedulerOutput)
+        sched_out_3.num_scheduled_tokens = {req_id: 1024}
+        meta_3 = scheduler.build_connector_meta(sched_out_3)
+        assert req_id in meta_3.reqs_to_send
+        s3 = meta_3.reqs_to_send[req_id]
+        assert s3.token_base == 2048
+        assert s3.num_tokens == 1024
+        assert s3.is_final is False
+        assert s3.uuid == chunk_uuid(base_uuid, 2)
+
+        # Step 4: 428 tokens scheduled (3500 total) -> carries, no chunk emitted
+        sched_out_4 = MagicMock(spec=SchedulerOutput)
+        sched_out_4.num_scheduled_tokens = {req_id: 428}
+        meta_4 = scheduler.build_connector_meta(sched_out_4)
+        assert req_id not in meta_4.reqs_to_send
+
+        # Prefill finished: request_finished emits remainder [3072, 3500)
+        req.num_computed_tokens = 3500
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert req_id in meta_fin.reqs_to_send
+        s_fin = meta_fin.reqs_to_send[req_id]
+        assert s_fin.token_base == 3072
+        assert s_fin.num_tokens == 428
+        assert s_fin.is_final is True
+        assert s_fin.uuid == chunk_uuid(base_uuid, 3)
+        assert s_fin.local_block_ids == block_ids
+
+        # Verify cleanup of request tracking state
+        assert req_id not in scheduler._stage3_send_requests
+
+
+def test_fail_safe_fallback_degradation() -> None:
+    """Verifies monolithic fallback when scheduler emits no intermediate chunks.
+
+    If intermediate chunk emission is skipped (e.g. window capacity limit),
+    request_finished() must emit the full range [0, 3500) with is_final=True,
+    matching baseline monolithic behavior.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-fallback-3500"
+    base_uuid = 888222
+    block_ids = list(range(100, 155))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 3500
+    req.num_computed_tokens = 3500
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # Scheduler fails to emit intermediate chunks; tokens_sent remains 0.
+        req_state = scheduler._stage3_send_requests[req_id]
+        assert req_state.tokens_sent == 0
+        assert req_state.next_chunk_idx == 0
+
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert req_id in meta_fin.reqs_to_send
+        s_fin = meta_fin.reqs_to_send[req_id]
+        assert s_fin.token_base == 0
+        assert s_fin.num_tokens == 3500
+        assert s_fin.is_final is True
+        assert s_fin.uuid == chunk_uuid(base_uuid, 0)
+        assert s_fin.local_block_ids == block_ids
+
+        # Verify cleanup of request tracking state
+        assert req_id not in scheduler._stage3_send_requests
+
+
+def test_request_finished_duplicate_idempotency_after_chunking() -> None:
+    """Verifies duplicate request_finished calls return cached parameters."""
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-dedup-test"
+    base_uuid = 333444
+    block_ids = list(range(100, 108))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 512
+    req.num_computed_tokens = 512
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+        delay1, params1 = scheduler.request_finished(req, block_ids)
+        meta1 = scheduler.build_connector_meta()
+        delay2, params2 = scheduler.request_finished(req, block_ids)
+        meta2 = scheduler.build_connector_meta()
+
+        assert delay1 is True and delay2 is True
+        assert params1 == params2
+        assert req_id in meta1.reqs_to_send
+        assert len(meta2.reqs_to_send) == 0
+
+
+def test_terminal_emission_exact_stride_aligned_all_tokens_sent() -> None:
+    """Verifies request_finished() when all prompt tokens were already emitted.
+
+    For an exact stride multiple (e.g. 4096 tokens on PCP=4), all tokens are
+    emitted across intermediate steps. request_finished() must clean up
+    the send state, return (True, params), and NOT emit an empty remainder into
+    reqs_to_send.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-exact-4096"
+    base_uuid = 777111
+    block_ids = list(range(100, 164))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 4096
+    req.num_computed_tokens = 0
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # Emit 4 chunks covering all 4096 tokens
+        for step in range(4):
+            sched_out = MagicMock(spec=SchedulerOutput)
+            sched_out.num_scheduled_tokens = {req_id: 1024}
+            meta = scheduler.build_connector_meta(sched_out)
+            assert req_id in meta.reqs_to_send
+            assert meta.reqs_to_send[req_id].token_base == step * 1024
+            assert meta.reqs_to_send[req_id].num_tokens == 1024
+            assert meta.reqs_to_send[req_id].is_final is False
+            assert meta.reqs_to_send[req_id].uuid == chunk_uuid(
+                base_uuid, step
+            )
+
+        # Finish request: all 4096 tokens already sent
+        req.num_computed_tokens = 4096
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert params["req_id"] == req_id
+        assert params["uuid"] == chunk_uuid(base_uuid, 4)
+        assert params["num_tokens"] == 4096
+
+        # No redundant/zero-token SendMeta emitted in build_connector_meta
+        assert req_id not in meta_fin.reqs_to_send
+        assert len(meta_fin.reqs_to_send) == 0
+
+        # Verify state is cleaned up
+        assert req_id not in scheduler._stage3_send_requests
+
+
+def test_untracked_request_terminal_fallback() -> None:
+    """Verifies request_finished() fallback when request was not tracked.
+
+    If update_state_after_alloc was not called or request is not in
+    _stage3_send_requests (req_state is None), request_finished() must
+    gracefully emit a single monolithic SendMeta([0, num_tokens), is_final=True)
+    with a freshly generated UUID.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-untracked-2048"
+    base_uuid = 666777
+    block_ids = list(range(100, 132))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 2048
+    req.num_computed_tokens = 2048
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    # Ensure req_id is NOT in _stage3_send_requests
+    assert req_id not in scheduler._stage3_send_requests
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert params["req_id"] == req_id
+        assert params["uuid"] == base_uuid
+        assert params["num_tokens"] == 2048
+
+        assert req_id in meta_fin.reqs_to_send
+        s_fin = meta_fin.reqs_to_send[req_id]
+        assert s_fin.token_base == 0
+        assert s_fin.num_tokens == 2048
+        assert s_fin.is_final is True
+        assert s_fin.uuid == base_uuid
+        assert s_fin.local_block_ids == block_ids
+
+
+def test_short_prompt_multi_step_bypass() -> None:
+    """Verifies that multi-step execution for short prompts stays bypassed.
+
+    A 512-token prompt executed in two 256-token steps must emit zero
+    intermediate chunks on both steps, and emit a single terminal chunk on
+    request_finished().
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-short-multistep-512"
+    base_uuid = 444333
+    block_ids = list(range(100, 108))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 512
+    req.num_computed_tokens = 0
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # Step 1: 256 tokens scheduled -> bypassed, 0 chunks emitted
+        sched_out_1 = MagicMock(spec=SchedulerOutput)
+        sched_out_1.num_scheduled_tokens = {req_id: 256}
+        meta_1 = scheduler.build_connector_meta(sched_out_1)
+        assert len(meta_1.reqs_to_send) == 0
+
+        req_state = scheduler._stage3_send_requests[req_id]
+        assert req_state.tokens_sent == 0
+        assert req_state.next_chunk_idx == 0
+
+        # Step 2: another 256 tokens scheduled (512 total) -> still
+        # bypassed (< 1024 stride)
+        sched_out_2 = MagicMock(spec=SchedulerOutput)
+        sched_out_2.num_scheduled_tokens = {req_id: 256}
+        meta_2 = scheduler.build_connector_meta(sched_out_2)
+        assert len(meta_2.reqs_to_send) == 0
+        assert req_state.tokens_sent == 0
+
+        # Prefill completed: request_finished emits single terminal [0, 512)
+        req.num_computed_tokens = 512
+        delay, params = scheduler.request_finished(req, block_ids)
+        meta_fin = scheduler.build_connector_meta()
+
+        assert delay is True
+        assert req_id in meta_fin.reqs_to_send
+        s_fin = meta_fin.reqs_to_send[req_id]
+        assert s_fin.token_base == 0
+        assert s_fin.num_tokens == 512
+        assert s_fin.is_final is True
+        assert s_fin.uuid == chunk_uuid(base_uuid, 0)
+        assert s_fin.local_block_ids == block_ids
+
+        assert req_id not in scheduler._stage3_send_requests
+
+
+def test_request_finished_duplicate_idempotency_multi_chunk() -> None:
+    """Verifies duplicate request_finished calls on multi-chunk requests.
+
+    A multi-chunk request with intermediate emissions and a terminal remainder
+    must return identical cached parameters and avoid duplicate emissions on
+    subsequent request_finished() calls.
+    """
+    scheduler = _make_raiden_scheduler(
+        is_producer=True, pcp_size=4, interleave_size=256
+    )
+    req_id = "req-dedup-multichunk"
+    base_uuid = 123987
+    block_ids = list(range(100, 155))
+
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = 3500
+    req.num_computed_tokens = 0
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    req.kv_transfer_params = {"_p_side_truncated": True}
+
+    with _patch_raiden_stage3_env(base_uuid=base_uuid):
+        scheduler.update_state_after_alloc(req, block_ids, 0)
+
+        # Emit 3 chunks (3072 tokens)
+        for _ in range(3):
+            sched_out = MagicMock(spec=SchedulerOutput)
+            sched_out.num_scheduled_tokens = {req_id: 1024}
+            scheduler.build_connector_meta(sched_out)
+
+        req.num_computed_tokens = 3500
+
+        # First request_finished call
+        delay1, params1 = scheduler.request_finished(req, block_ids)
+        meta1 = scheduler.build_connector_meta()
+        assert delay1 is True
+        assert req_id in meta1.reqs_to_send
+        assert meta1.reqs_to_send[req_id].token_base == 3072
+        assert meta1.reqs_to_send[req_id].num_tokens == 428
+        assert meta1.reqs_to_send[req_id].is_final is True
+
+        # Second request_finished call (duplicate)
+        delay2, params2 = scheduler.request_finished(req, block_ids)
+        meta2 = scheduler.build_connector_meta()
+        assert delay2 is True
+        assert params1 == params2
+        assert len(meta2.reqs_to_send) == 0
+

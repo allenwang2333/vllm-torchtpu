@@ -8,7 +8,7 @@ pull-on-demand transport that moves torch tensors over the TPU host network.
 
 The default generic shm-staged ZMQ machinery lives in
 ``vllm_torchtpu.distributed.kv_transfer.zmq_shm_base.ZmqShmKvConnectorBase``;
-this file holds the TPU-specific transport hooks plus the scheduler half
+Defines the TPU-specific transport hooks and scheduler components
 of the connector. A Raiden C++ transfer backend is available as an opt-in
 alternative via ``kv_connector_extra_config.use_raiden_connector``.
 
@@ -147,7 +147,7 @@ class _Stage3LoadMeta:
     # group ordinal: the block holding the recurrent state for the resumed
     # request (state follows each group's block table; None for FA-only
     # models).
-    mamba_state_block_ids: Optional[list[int]] = None
+    mamba_state_block_ids: list[int] | None = None
     # Prefix-aware load: tokens satisfied by the decode-local prefix cache
     # and excluded from the transfer. local_block_ids then holds only the
     # suffix pages; the source store clips its plan at
@@ -1362,7 +1362,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         scheduler_output: SchedulerOutput | None = None,
     ) -> TPUConnectorMetadata:
-        """Constructs connector metadata and emits ready Stage-3 chunk descriptors.
+        """Emits ready Stage-3 chunk descriptors and builds connector metadata.
 
         Inspects the per-request token progress reported by scheduler output,
         advances computed token counters, identifies aligned context parallel
@@ -1384,6 +1384,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 for req_id, scheduled_tokens in num_scheduled_tokens.items():
                     req_state = self._stage3_send_requests.get(req_id)
                     if req_state is None:
+                        continue
+
+                    # Short-prompt bypass: skip intermediate chunk tracking
+                    if (min_transfer_tokens > 0 and
+                            0 < req_state.total_prompt_tokens <
+                            min_transfer_tokens):
                         continue
 
                     computed = req_state.num_computed_tokens + scheduled_tokens
@@ -1419,8 +1425,34 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         request: "Request",
         block_ids: list[int],
-        mamba_block_ids: Optional[list[list[int]]] = None,
-    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        mamba_block_ids: list[list[int]] | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Finalizes Stage-3 metadata and emits terminal transfer chunk.
+
+        Evaluates prefill completion for a finished prompt request, derives
+        the transferable prefix token count, validates block allocations,
+        and packages any unsent token remainder into a terminal SendMeta
+        descriptor marked with is_final=True. Cleans up per-request tracking
+        state and returns transfer connection parameters for the consumer.
+
+        Args:
+            request: The completed prefill request.
+            block_ids: Physical KV cache block IDs allocated for the request.
+            mamba_block_ids: Optional recurrent state block IDs for hybrid
+                models.
+
+        Returns:
+            A tuple of (delay_release, transfer_params) where delay_release
+            indicates whether block release should be deferred, and
+            transfer_params provides Raiden connection details for the
+            consumer.
+
+        Raises:
+            ValueError: If block allocations do not cover the expected tokens,
+                or if configuration parameters are missing or invalid.
+            RuntimeError: If the in-flight deduplication table limit is
+                exceeded.
+        """
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
         if not self.is_producer:
@@ -1446,14 +1478,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        if not _use_raiden_glm_admission():
-            # The interleave minimum applies to PCP sources only.
-            interleave_size = int(
-                getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
-                or 256)
-            min_transfer_tokens = pcp_size * interleave_size
-            if (num_tokens < min_transfer_tokens):
-                return False, {}
 
         max_transfer_tokens = tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS
         if max_transfer_tokens is not None and max_transfer_tokens > 0:
@@ -1544,19 +1568,36 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                  "mamba block tables were not provided")
             mamba_state_block_ids = _select_committed_mamba_blocks(
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks)
-        uuid = get_uuid()
+        req_state = (
+            self._stage3_send_requests.pop(request.request_id, None)
+            or self._stage3_send_requests.pop(str(request.request_id), None))
+        if req_state is not None:
+            tokens_sent = req_state.tokens_sent
+            base_uuid = req_state.base_uuid
+            next_chunk_idx = req_state.next_chunk_idx
+            sub_uuid = chunk_uuid(base_uuid, next_chunk_idx)
+        else:
+            tokens_sent = 0
+            base_uuid = get_uuid()
+            sub_uuid = base_uuid
+
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
-        self.reqs_to_send[request.request_id] = SendMeta(
-            uuid=uuid,
-            local_block_ids=list(normalized_ids),
-            expiration_time=expiration_time,
-            num_tokens=num_tokens,
-            mamba_state_block_ids=mamba_state_block_ids,
-        )
+        if tokens_sent < num_tokens:
+            remainder_tokens = num_tokens - tokens_sent
+            self.reqs_to_send[request.request_id] = SendMeta(
+                uuid=sub_uuid,
+                local_block_ids=list(normalized_ids),
+                expiration_time=expiration_time,
+                num_tokens=remainder_tokens,
+                mamba_state_block_ids=mamba_state_block_ids,
+                token_base=tokens_sent,
+                is_final=True,
+            )
+
         params: dict[str, Any] = {
             "req_id": request.request_id,
-            "uuid": uuid,
+            "uuid": sub_uuid,
             "num_tokens": num_tokens,
             "src_controller_address": controller_address,
             "src_job_name": src_job_name,
@@ -1565,7 +1606,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_parallelism": src_parallelism,
         }
         self._stage3_finished_sends[request.request_id] = (
-            uuid,
+            sub_uuid,
             normalized_ids,
             num_tokens,
             dict(params),
@@ -1574,7 +1615,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "TPURaidenConnectorScheduler Stage-3 send req_id=%s uuid=%d "
             "num_tokens=%d source_pages=%d source_controller=%s",
             request.request_id,
-            uuid,
+            sub_uuid,
             num_tokens,
             len(normalized_ids),
             controller_address,
