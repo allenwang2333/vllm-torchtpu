@@ -253,7 +253,7 @@ steps:
       K3_CONCURRENCY: "1 2 4 8 16 32"
       NUM_PROMPTS_BY_CONCURRENCY: "1:6 2:8 4:8 8:8 16:16 32:32"
     commands:
-      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe --gsm8k 100 --gsm8k-cells 2"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe --gsm8k 100 --gsm8k-cells 2"
       - "du -sh perf_eval_results/* || true"
     artifact_paths:
       - "perf_eval_results/**/*"
