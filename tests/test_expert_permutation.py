@@ -81,17 +81,43 @@ class _Gate(torch.nn.Module):
 
 
 class _Model(torch.nn.Module):
-    """Minimal stand-in exposing `model.layers.<i>.mlp.gate`."""
+    """Minimal stand-in yielding `model.layers.<i>.mlp.gate` from named_modules.
+
+    The nesting is not decoration. `expert_permutation._LAYER_RE` is
+    ``\\.layers\\.(\\d+)\\.`` -- it requires a **leading dot**, so a flat model
+    whose `named_modules()` emits ``layers.0.mlp.gate`` matches nothing,
+    `permute_router_gates` touches zero gates, and every test here would fail
+    for a reason that has nothing to do with the code under test. Real vLLM
+    models carry the `model.` prefix; this mirrors that.
+    """
 
     def __init__(self, num_layers, num_experts=NUM_EXPERTS):
         super().__init__()
-        self.layers = torch.nn.ModuleList()
+        inner = torch.nn.Module()
+        inner.layers = torch.nn.ModuleList()
         for _ in range(num_layers):
             layer = torch.nn.Module()
             mlp = torch.nn.Module()
             mlp.gate = _Gate(num_experts)
             layer.mlp = mlp
-            self.layers.append(layer)
+            inner.layers.append(layer)
+        self.model = inner
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+
+def test_the_fake_model_matches_the_layer_regex():
+    """Guard the fixture itself.
+
+    If this fails, every gate-reorder test below is testing the regex rather
+    than the permutation, and would go green only by never running.
+    """
+    model = _Model(num_layers=2)
+    names = [n for n, _ in model.named_modules() if n.endswith(".mlp.gate")]
+    assert names == ["model.layers.0.mlp.gate", "model.layers.1.mlp.gate"]
+    assert [expert_permutation._layer_index(n) for n in names] == [0, 1]
 
 
 def _gate_rows(model, layer_idx):
