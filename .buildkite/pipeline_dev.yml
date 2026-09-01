@@ -12,54 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dev pipeline for vllm-torchtpu-dev.
-# Demo/sample steps showing how to run one-off experiments on TPU.
-# Copy and adapt any step below for your own test.
-#
-# WHY THIS EXISTS
-# ───────────────
-# vllm-torchtpu-ci runs the full suite (~build + unit tests + integration +
-# perf) on every push, which is slow and shared. This pipeline uploads ONLY the
-# steps on YOUR branch, so a single test costs one image build + one job.
-#
-# HOW TO TRIGGER
-# ──────────────
-# Option A — Buildkite UI:
-#   https://buildkite.com/tpu-commons/vllm-torchtpu-dev → "New Build",
-#   set branch to your branch, "Create Build".
-#
-# Option B — Buildkite API (needs BUILDKITE_API_TOKEN in your env):
-#   curl -s -X POST \
-#     -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
-#     -H "Content-Type: application/json" \
-#     "https://api.buildkite.com/v2/organizations/tpu-commons/pipelines/vllm-torchtpu-dev/builds" \
-#     -d "{\"commit\": \"$(git rev-parse HEAD)\", \"branch\": \"$(git rev-parse --abbrev-ref HEAD)\", \"message\": \"my test\"}"
-#
-# HOW TO CUSTOMIZE
-# ────────────────
-# 1. On your branch, edit this file — start from whichever demo is closest.
-# 2. Delete the steps you don't need (each one costs a TPU slot).
-# 3. Trigger the pipeline — only your branch's copy of this file is used, so
-#    you can leave it modified indefinitely without affecting anyone else.
-#
-# NOTES
-# ─────
-# * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
-#   pulls that exact tag, so all steps must depend_on `build_docker`.
-# * run_in_docker.sh runs your command inside the image at
-#   /root/torchtpu-vllm — that is a COPY of the repo at this commit, not the
-#   agent's checkout. Reference paths like `examples/...` / `tests/...`
-#   relative to the repo root.
-# * Anything written to /perf_eval_results inside the container is copied back
-#   out and uploaded as a Buildkite artifact.
+# Coverage measurement run: unit tests on 2-chip and 8-chip queues with
+# pytest-cov, coverage data combined and reported in a final CPU step.
 
 steps:
 
-  # -----------------------------------------------------------------
-  # Build step (required by every demo below)
-  # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
-  # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -67,61 +24,55 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
-  # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  - label: "coverage: 2-chip (not multichip)"
+    key: cov_2chip
     depends_on: build_docker
     agents:
       queue: tpu_v7x_2_queue
+    timeout_in_minutes: 240
     commands:
       - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
         .buildkite/scripts/run_in_docker.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
+          COVERAGE_FILE=/perf_eval_results/.coverage.2chip \
+          python3 -m pytest -q --timeout=1800 -m "not nightly and not multichip" \
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
+          ls -la /perf_eval_results/'
+    artifact_paths:
+      - "perf_eval_results/.coverage.2chip"
 
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
+  - label: "coverage: 8-chip (multichip)"
+    key: cov_8chip
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: tpu_v7x_8_queue
+    timeout_in_minutes: 240
     commands:
       - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
         .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+          COVERAGE_FILE=/perf_eval_results/.coverage.8chip \
+          python3 -m pytest -q --timeout=3600 -m "not nightly and multichip" \
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
+          ls -la /perf_eval_results/'
+    artifact_paths:
+      - "perf_eval_results/.coverage.8chip"
 
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
+  - label: "coverage: combine + report"
+    key: cov_combine
+    depends_on:
+      - cov_2chip
+      - cov_8chip
     agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
+      queue: cpu
+    timeout_in_minutes: 30
     commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+      - buildkite-agent artifact download "perf_eval_results/.coverage.*" .
+      - python3 -m venv /tmp/covenv && /tmp/covenv/bin/pip install -q coverage
+      - cp perf_eval_results/.coverage.* .
+      - /tmp/covenv/bin/coverage combine .coverage.2chip .coverage.8chip
+      - /tmp/covenv/bin/coverage report | tee coverage_summary.txt
+      - /tmp/covenv/bin/coverage xml -o coverage.xml
+      - /tmp/covenv/bin/coverage html -d cov_html
+    artifact_paths:
+      - "coverage_summary.txt"
+      - "coverage.xml"
+      - "cov_html/**/*"
