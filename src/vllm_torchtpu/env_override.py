@@ -131,10 +131,10 @@ def _fetch_tpu_type_from_metadata() -> str | None:
 
 def _resolve_sc_offload_threshold_bytes() -> int | None:
     # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:
-    #   "auto" (default): look up per-family constant
+    #   "auto":           look up per-family constant
     #   "<integer>":      use that byte value
     #   "0":              disable the flag (fall through to libtpu default)
-    override = os.getenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", "auto")
+    override = os.getenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", "1099511627776")
     if override != "auto":
         try:
             value = int(override)
@@ -204,6 +204,8 @@ for _offload_flag in (
         "--xla_tpu_enable_sparse_core_collective_offload_all_reduce",
         "--xla_tpu_enable_sparse_core_collective_offload_all_gather",
         "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter",
+        "--xla_tpu_enable_offloading_reduce_to_sparsecore",
+        "--xla_tpu_offload_reduction_to_sparsecore",
 ):
     if not _user_has_flag(_offload_flag):
         _libtpu_extra_args.append(f"{_offload_flag}=false")

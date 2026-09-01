@@ -235,8 +235,8 @@ def _substitute_placeholder_token(
     new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
-    input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
-    return input_ids
+    new_input_ids = input_ids.scatter(0, token_in_tpu_cur_input_indices, update_values)
+    return new_input_ids
 
 
 logger = init_logger(__name__)
@@ -2772,7 +2772,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 # Mixed-batch non-spec chunk: pad the single sampled token to the
                 # uniform 1+K span (token at slot 0, rest INVALID).
-                token = nt_chunk[:num_reqs, 0]
+                token = nt_chunk[:num_reqs, 0].contiguous()
                 src = torch.full((num_reqs, 1 + K),
                                  INVALID_TOKEN_ID,
                                  dtype=token.dtype,
@@ -2813,7 +2813,7 @@ class TPUModelRunner(GPUModelRunner):
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
         for sel, n in zip(combined_selected_tokens, combined_real_lens):
-            bonus = sel.view(-1)[:n].unsqueeze(1)  # [n, 1]
+            bonus = sel.view(-1)[:n].unsqueeze(1).contiguous()  # [n, 1]
             drafts_chunk = drafts[req_offset:req_offset + n]  # [n, K]
             src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk],
                             dim=1)  # [n, 1+K] = [bonus, draft_1..K]
@@ -4039,7 +4039,7 @@ class TPUModelRunner(GPUModelRunner):
                         logits, md, grammar_output, scheduler_output,
                         cur_start_idx, cur_end_idx, all_greedy,
                         sampling_generator)
-                    combined_selected_tokens.append(next_tokens)
+                    combined_selected_tokens.append(next_tokens.contiguous())
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
                     self._update_mamba_slot_read_offsets(
@@ -4073,7 +4073,7 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=selected.dtype,
                         device=selected.device)
                     padded[:, 0] = selected.view(-1)
-                    combined_selected_tokens.append(padded)
+                    combined_selected_tokens.append(padded.contiguous())
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
                     # Non-verify chunk in a spec step: reset the read offsets
@@ -4122,7 +4122,7 @@ class TPUModelRunner(GPUModelRunner):
 
                 # Keep the bucketed (padded) tensor; trim happens on the host
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
-                combined_selected_tokens.append(selected_token_ids)
+                combined_selected_tokens.append(selected_token_ids.contiguous())
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
                     next_tokens_tpu_chunks.append(selected_token_ids.view(-1))

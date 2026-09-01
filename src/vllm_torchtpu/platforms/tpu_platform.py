@@ -876,6 +876,13 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
+        # Ensure we disable rms_norm and fused_add_rms_norm custom op compilation on TPU,
+        # so they remain inside the fused transformer block compiled by XLA and do not
+        # spill onto SparseCore as isolated elementwise MLIR graphs.
+        for op in ("-rms_norm", "-fused_add_rms_norm"):
+            if op not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append(op)
+
         # No graph splitting — TPU handles the full graph including
         compilation_config.splitting_ops = []
 

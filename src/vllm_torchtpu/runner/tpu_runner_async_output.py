@@ -28,7 +28,9 @@ class AsyncTPUCopyState:
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        chunks_cpu = [
+            t.contiguous().to("cpu", non_blocking=True) for t in chunks_tpu
+        ]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
