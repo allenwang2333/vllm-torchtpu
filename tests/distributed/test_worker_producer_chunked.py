@@ -36,6 +36,7 @@ class _FakeRaidenEngine:
     """Mock low-level Raiden transfer engine for worker testing."""
 
     def __init__(self) -> None:
+        """Initializes call tracking lists and queued completion results."""
         self.calls: list[Any] = []
         self.poll_results: list[tuple[list[str], list[str], list[str]]] = []
         self.complete_read_results: list[
@@ -45,6 +46,7 @@ class _FakeRaidenEngine:
     def register_read(
         self, req_id: str, uuid: int, block_ids: list[int]
     ) -> int:
+        """Records a register_read invocation."""
         self.calls.append(("register_read", req_id, uuid, block_ids))
         return 1
 
@@ -56,12 +58,14 @@ class _FakeRaidenEngine:
         remote_blocks: list[int],
         local_blocks: list[int],
     ) -> int:
+        """Records a start_read invocation."""
         self.calls.append(
             ("start_read", req_id, uuid, endpoint, remote_blocks, local_blocks)
         )
         return 2
 
     def complete_read(self) -> tuple[list[str], list[str], list[str]]:
+        """Returns queued complete_read completion triples."""
         self.calls.append(("complete_read",))
         if self.complete_read_results:
             return self.complete_read_results.pop(0)
@@ -70,6 +74,7 @@ class _FakeRaidenEngine:
         return [], [], []
 
     def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
+        """Returns queued poll_stats completion triples."""
         self.calls.append(("poll_stats",))
         if self.poll_results:
             return self.poll_results.pop(0)
@@ -82,6 +87,7 @@ class _FakeRaidenControllerFacade:
     """Mock controller client recording RPC invocations."""
 
     def __init__(self) -> None:
+        """Initializes lists to record controller RPC calls."""
         self.register_work_unit_calls: list[dict[str, Any]] = []
         self.register_request_blocks_calls: list[dict[str, Any]] = []
         self.complete_request_blocks_calls: list[dict[str, Any]] = []
@@ -89,15 +95,19 @@ class _FakeRaidenControllerFacade:
         self.cancel_request_blocks_result: bool = True
 
     def register_work_unit(self, **kwargs: Any) -> None:
+        """Records a register_work_unit RPC call."""
         self.register_work_unit_calls.append(kwargs)
 
     def register_request_blocks(self, **kwargs: Any) -> None:
+        """Records a register_request_blocks RPC call."""
         self.register_request_blocks_calls.append(kwargs)
 
     def complete_request_blocks(self, **kwargs: Any) -> None:
+        """Records a complete_request_blocks RPC call."""
         self.complete_request_blocks_calls.append(kwargs)
 
     def cancel_request_blocks_if_unclaimed(self, **kwargs: Any) -> bool:
+        """Records a cancel_request_blocks_if_unclaimed RPC call."""
         self.cancel_request_blocks_calls.append(kwargs)
         return self.cancel_request_blocks_result
 
@@ -967,7 +977,10 @@ def test_poll_finished_engine_interface_polymorphism() -> None:
 
     # Engine implementing only complete_read
     class EngineWithCompleteRead:
+        """Mock transfer engine supporting complete_read interface."""
+
         def complete_read(self) -> tuple[list[str], list[str], list[str]]:
+            """Returns completed read requests."""
             return [req_id_1], [], []
 
     with _patch_raiden_worker_env(parallelism=4):
@@ -991,7 +1004,10 @@ def test_poll_finished_engine_interface_polymorphism() -> None:
 
     # Engine implementing only poll_stats
     class EngineWithPollStats:
+        """Mock transfer engine supporting poll_stats interface."""
+
         def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
+            """Returns polled transfer completion stats."""
             return [req_id_2], [], []
 
     with _patch_raiden_worker_env(parallelism=4):
@@ -1000,7 +1016,7 @@ def test_poll_finished_engine_interface_polymorphism() -> None:
 
     # Engine implementing neither method
     class EngineWithoutPolling:
-        pass
+        """Mock transfer engine without completion query methods."""
 
     with _patch_raiden_worker_env(parallelism=4):
         worker._poll_finished(EngineWithoutPolling())
