@@ -92,8 +92,14 @@ printf 'FALCON_MULTIHOST rank=%s world=%s pod=%s master=%s variant=%s mode=%s\n'
   "$RANK" "$WORLD" "$POD_HOST" "$MASTER_ADDR" "$VARIANT" "$MODE"
 getent hosts "$MASTER_ADDR"
 
-test -s "$WHEEL_PATH"
-printf '%s  %s\n' "$TORCH_TPU_SHA256" "$WHEEL_PATH" | sha256sum -c -
+WHEEL_TO_INSTALL="$WHEEL_PATH"
+if test -s "$WHEEL_TO_INSTALL"; then
+  printf '%s  %s\n' "$TORCH_TPU_SHA256" "$WHEEL_TO_INSTALL" \
+    | sha256sum -c -
+else
+  WHEEL_TO_INSTALL=""
+  printf 'Mounted torch-tpu wheel unavailable; using verified registry fallback\n'
+fi
 test "$(git -C /workspace/vllm-torchtpu rev-parse HEAD)" = \
   "$EXPECTED_SOURCE_COMMIT"
 test "$(git -C /workspace/vllm rev-parse HEAD)" = "$VLLM_COMMIT"
@@ -138,7 +144,20 @@ python -m pip install \
   --index-url https://download.pytorch.org/whl/cpu \
   --extra-index-url https://pypi.org/simple \
   'torch==2.13.0+cpu' 'torchvision==0.28.0+cpu'
-python -m pip install "$WHEEL_PATH"
+if test -z "$WHEEL_TO_INSTALL"; then
+  readonly REGISTRY_WHEEL_DIR="$CACHE_ROOT/registry-wheel"
+  mkdir -p "$REGISTRY_WHEEL_DIR"
+  python -m pip install keyring keyrings.google-artifactregistry-auth
+  PIP_INDEX_URL='https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/' \
+    python -m pip download --no-deps --pre \
+      "torch-tpu==$TORCH_TPU_VERSION" -d "$REGISTRY_WHEEL_DIR"
+  WHEEL_TO_INSTALL=$(find "$REGISTRY_WHEEL_DIR" -maxdepth 1 -type f \
+    -name 'torch_tpu-*.whl' -print -quit)
+  test -n "$WHEEL_TO_INSTALL"
+  printf '%s  %s\n' "$TORCH_TPU_SHA256" "$WHEEL_TO_INSTALL" \
+    | sha256sum -c -
+fi
+python -m pip install "$WHEEL_TO_INSTALL"
 python -m pip install --pre 'runai-model-streamer[gcs]'
 
 python - /workspace/vllm-torchtpu/pyproject.toml <<'PY'
