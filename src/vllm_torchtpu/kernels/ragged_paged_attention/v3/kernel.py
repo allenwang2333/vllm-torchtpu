@@ -1534,10 +1534,17 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = min(min_bkv_sz_to_peak, max_kv)
             else:
-                bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(2048, max_kv)
-                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_csz = min(512, align_to(max_kv // 2, page_size))
+                # Restrict block sizes on Trillium (v7x) for head_dim >= 256 to avoid VMEM compile OOM
+                if head_dim >= 256:
+                    bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
+                    bkv_sz = min(1024, max_kv)
+                    bq_csz = min(512 // num_q_heads_per_kv_head, max_q)
+                    bkv_csz = min(512, align_to(max_kv // 2, page_size))
+                else:
+                    bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
+                    bkv_sz = min(2048, max_kv)
+                    bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
+                    bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
@@ -1875,7 +1882,7 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            res = get_default_block_sizes(
                 q.dtype,
                 kv_cache.dtype,
                 actual_num_q_heads,
@@ -1887,12 +1894,21 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
-        return {
-            "bq_sz": block_sizes[0],
-            "bkv_sz": block_sizes[1],
-            "bq_csz": block_sizes[2],
-            "bkv_csz": block_sizes[3],
-        }
+        else:
+            res = {
+                "bq_sz": block_sizes[0],
+                "bkv_sz": block_sizes[1],
+                "bq_csz": block_sizes[2],
+                "bkv_csz": block_sizes[3],
+            }
+
+        # Globally clamp block sizes for head_dim >= 256 to prevent VMEM OOMs
+        if head_dim >= 256 and case != RpaCase.DECODE:
+            res["bq_sz"] = min(res["bq_sz"], 512)
+            res["bkv_sz"] = min(res["bkv_sz"], 1024)
+            res["bq_csz"] = min(res["bq_csz"], 512)
+            res["bkv_csz"] = min(res["bkv_csz"], 512)
+        return res
 
     # Decode-only
     q, kv_cache = run_rpa_kernel(

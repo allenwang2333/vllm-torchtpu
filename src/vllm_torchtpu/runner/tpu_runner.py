@@ -6363,9 +6363,30 @@ class TPUModelRunner(GPUModelRunner):
         safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
         return logits / safe_temperatures
 
-    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
-    #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _sample_from_logits_compiled(self,
+                                     logits: torch.Tensor,
+                                     temperatures: torch.Tensor,
+                                     u: torch.Tensor,
+                                     top_k: torch.Tensor,
+                                     top_p: torch.Tensor,
+                                     all_greedy: bool = False) -> torch.Tensor:
+        """Statically compiled core sampler. Must only receive static-shaped bucket tensors."""
+        if all_greedy:
+            res = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            is_greedy = temperatures <= SAMPLING_EPS
+            scaled_logits = self._apply_temperature(logits, temperatures)
+            masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+            u_clamped = torch.clamp(u,
+                                    min=torch.finfo(u.dtype).tiny,
+                                    max=1.0 - torch.finfo(u.dtype).eps)
+            gumbel_noise = -torch.log(-torch.log(u_clamped))
+            noisy_logits = masked_logits + gumbel_noise
+            final_logits = torch.where(is_greedy, logits, noisy_logits)
+            res = torch.argmax(final_logits, dim=-1, keepdim=True)
+        return res
+
     def sample_from_logits(self,
                            logits: torch.Tensor,
                            temperatures: torch.Tensor,
@@ -6374,21 +6395,52 @@ class TPUModelRunner(GPUModelRunner):
                            top_p: torch.Tensor,
                            all_greedy: bool = False) -> torch.Tensor:
         """
-        Sample with xla-friendly function. This function is to be traced
-        separately from `forward` for lighter compilation overhead.
+        Wrapper to pad dynamic batch shapes to precompiled static buckets
+        before dispatching to the compiled sampler, avoiding runtime JIT compile.
         """
-        if all_greedy:
-            return torch.argmax(logits, dim=-1, keepdim=True)
-        is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
-        u_clamped = torch.clamp(u,
-                                min=torch.finfo(u.dtype).tiny,
-                                max=1.0 - torch.finfo(u.dtype).eps)
-        gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = masked_logits + gumbel_noise
-        final_logits = torch.where(is_greedy, logits, noisy_logits)
-        return torch.argmax(final_logits, dim=-1, keepdim=True)
+        batch_size = logits.shape[0]
+        padded_batch_size = next((p for p in self.num_reqs_paddings if p >= batch_size), batch_size)
+        
+        if padded_batch_size > batch_size:
+            pad_len = padded_batch_size - batch_size
+            logits = torch.cat([
+                logits,
+                torch.full((pad_len, logits.shape[1]), -float('inf'), dtype=logits.dtype, device=logits.device)
+            ], dim=0)
+            
+            temperatures = torch.cat([
+                temperatures,
+                torch.ones((pad_len, 1) if temperatures.dim() == 2 else (pad_len,), dtype=temperatures.dtype, device=temperatures.device)
+            ], dim=0)
+            
+            u = torch.cat([
+                u,
+                torch.full((pad_len, u.shape[1]) if u.dim() == 2 else (pad_len,), 0.5, dtype=u.dtype, device=u.device)
+            ], dim=0)
+            
+            top_k = torch.cat([
+                top_k,
+                torch.zeros((pad_len, 1) if top_k.dim() == 2 else (pad_len,), dtype=top_k.dtype, device=top_k.device)
+            ], dim=0)
+            
+            top_p = torch.cat([
+                top_p,
+                torch.ones((pad_len, 1) if top_p.dim() == 2 else (pad_len,), dtype=top_p.dtype, device=top_p.device)
+            ], dim=0)
+            
+        res = self._sample_from_logits_compiled(
+            logits,
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            all_greedy=all_greedy
+        )
+            
+        if padded_batch_size > batch_size:
+            res = res[:batch_size]
+            
+        return res
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(self, logits: torch.Tensor,

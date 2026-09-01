@@ -183,7 +183,7 @@ _libtpu_extra_args: list[str] = []
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
-# --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
+# --xla_tpu_sparse_core_{all_reduce,all_gather,reduce_scatter}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
 # offloaded to SparseCore. The chip family is detected from
@@ -194,9 +194,19 @@ if _sc_offload_bytes is not None:
     for _flag_name in (
             "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
             "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+            "--xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes",
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+
+# Natively disable SparseCore collective offloading to prevent cascading layernorm/as_strided halts on SC2
+for _offload_flag in (
+        "--xla_tpu_enable_sparse_core_collective_offload_all_reduce",
+        "--xla_tpu_enable_sparse_core_collective_offload_all_gather",
+        "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter",
+):
+    if not _user_has_flag(_offload_flag):
+        _libtpu_extra_args.append(f"{_offload_flag}=false")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
