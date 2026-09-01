@@ -2894,9 +2894,16 @@ class TPUModelRunner(GPUModelRunner):
         # We advance positions and seq_lens directly on TPU in-place and early-return the cached tuple,
         # completely bypassing ~440 lines of Python loops, layout planning, and object allocations.
         cur_req_ids = self.input_batch.req_ids[start_index:num_reqs]
+        # In steady decode, check if any request crosses a 256-token block boundary:
+        # A new block is allocated when seq_len % 256 == 1. If so, do full build to update block tables!
+        block_boundary_crossed = (
+            ((self.input_batch.num_computed_tokens_cpu[start_index:num_reqs] + 1) % 256 == 1).any()
+            if getattr(self.input_batch, "num_computed_tokens_cpu", None) is not None else True
+        )
         is_steady_step = (
             start_index == 0
             and scheduler_output.total_num_scheduled_tokens == num_reqs
+            and not block_boundary_crossed
             and getattr(self, "_cached_steady_inputs_tuple", None) is not None
             and getattr(self, "_steady_batch_req_ids", None) == cur_req_ids
             and hasattr(self, "_device_positions")
@@ -2911,7 +2918,9 @@ class TPUModelRunner(GPUModelRunner):
             if not hasattr(self, "_device_input_placeholder"):
                 self._device_input_placeholder = torch.zeros(
                     self.max_num_tokens, dtype=torch.int32, device=self.device)
-            self.input_ids = self._device_input_placeholder[:len(self._device_positions)]
+            # Use padded_num_reqs from cached tuple (element 2) for correct token dimension (e.g. M-RoPE has shape [3, N])
+            padded_tokens = self._cached_steady_inputs_tuple[2]
+            self.input_ids = self._device_input_placeholder[:padded_tokens]
             self._last_sequence_layout_plan = self._cached_steady_inputs_tuple[9]
             return self._cached_steady_inputs_tuple
 
