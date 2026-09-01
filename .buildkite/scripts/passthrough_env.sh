@@ -53,8 +53,31 @@
 # GPC correctness topology whose script sets its own knobs inside the
 # container. A pipeline env var will not reach that suite; that is its
 # contract, not an oversight, but do not assume otherwise.
+#
+# 2026-09-01 (r4 lane B): the serving-config overrides above stopped at the
+# ones round 3 happened to use. A reproduction of someone else's recipe needs
+# the rest of theirs -- LOAD_FORMAT (dummy vs real weights, the whole of Q3),
+# MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS, GPU_MEMORY_UTILIZATION, K3_BLOCK_SIZE,
+# ENABLE_PREFIX_CACHING, and the four env-only flags their sbatch pins
+# (VLLM_USE_BREAKABLE_CUDAGRAPH, VLLM_TORCHTPU_KDA_FUSED,
+# TPU_LATENT_PROJ_INTRA_CHIP_TP, RAY_memory_usage_threshold). Same failure
+# mode as the 2026-08-31 entry: absent from this list, a step asking for
+# max_num_seqs=32 silently serves 8 and reports a plausible number.
 # shellcheck disable=SC2034  # consumed by the sourcing driver
 PASSTHROUGH_ENV_NAMES=(
+  CAPTURE_PROFILE
+  ENABLE_PREFIX_CACHING
+  GPU_MEMORY_UTILIZATION
+  K3_BLOCK_SIZE
+  LOAD_FORMAT
+  MAX_NUM_BATCHED_TOKENS
+  MAX_NUM_SEQS
+  NUM_PROMPTS_BY_CONCURRENCY
+  PRUNE_RAY_LOGS
+  RAY_memory_usage_threshold
+  TPU_LATENT_PROJ_INTRA_CHIP_TP
+  VLLM_TORCHTPU_KDA_FUSED
+  VLLM_USE_BREAKABLE_CUDAGRAPH
   ASYNC_SCHEDULING
   BENCHMARK_WARMUP_RUNS
   K3_COMPILE_SIZES

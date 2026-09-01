@@ -223,6 +223,23 @@ if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
     mkdir -p "$PROFILE_DIR"
 fi
 
+# Local directory holding everything of the checkpoint EXCEPT the weights.
+# Echoes the path; caches across cells of one container (the copy is a few MB
+# but the arm loop would otherwise repeat it every restart).
+STAGED_METADATA_DIR="${STAGED_METADATA_DIR:-/root/k3-metadata}"
+stage_metadata_dir() {
+    if [ -f "$STAGED_METADATA_DIR/config.json" ]; then
+        echo "$STAGED_METADATA_DIR"; return 0
+    fi
+    if [ -z "$MODEL_URI" ]; then
+        echo "$MODEL"; return 0
+    fi
+    python3 "$REPO_DIR/.buildkite/scripts/stage_tokenizer.py" \
+        "$MODEL_URI" "$STAGED_METADATA_DIR" >&2 || {
+        echo "ERROR: could not stage $MODEL_URI metadata" >&2; return 1; }
+    echo "$STAGED_METADATA_DIR"
+}
+
 start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
@@ -266,7 +283,16 @@ start_vllm_server() {
     fi
     local kv_cache_dtype="$KV_CACHE_DTYPE"
     local serve_target="$MODEL"
-    if [ -n "$MODEL_URI" ]; then
+    if [ "${LOAD_FORMAT:-}" = "dummy" ]; then
+        # Random weights. The checkpoint's METADATA is still required (config,
+        # tokenizer, remote code) and is a few MB; the 96 safetensors shards
+        # are never opened. Serving the staged metadata directory rather than
+        # the gs:// URI is what keeps the two arms one variable apart: same
+        # config, same tokenizer, same remote code, same everything vLLM reads
+        # -- differing only in whether a weight byte is loaded.
+        serve_target="$(stage_metadata_dir)"
+        extra_args="$extra_args --load-format dummy --served-model-name $MODEL"
+    elif [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
     fi
@@ -444,7 +470,11 @@ run_benchmark_once() {
 # the client falls back to MODEL.
 BENCH_TOKENIZER="${BENCH_TOKENIZER:-}"
 PULLED_TOKENIZER_DIR=""
-if [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
+if [ -z "$BENCH_TOKENIZER" ] && [ "${LOAD_FORMAT:-}" = "dummy" ]; then
+    # No runai pull happens on this path, so point the client at the same
+    # staged copy the server was given.
+    PULLED_TOKENIZER_DIR="$STAGED_METADATA_DIR"
+elif [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
     PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
@@ -493,6 +523,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
 {
     "model": "$MODEL",
     "model_uri": $model_uri_json,
+    "weights": "$([ "${LOAD_FORMAT:-}" = dummy ] && echo dummy || echo real)",
     "tensor_parallelism": $TENSOR_PARALLELISM,
     "data_parallelism": $DATA_PARALLELISM,
     "enable_ep": $ENABLE_EP,

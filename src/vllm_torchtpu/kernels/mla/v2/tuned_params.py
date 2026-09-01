@@ -1828,7 +1828,19 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+# A hit is silent, so a table that is being used and a table with no matching
+# row look identical from outside the process. One line per distinct key makes
+# the lookup auditable at the cost of nothing: the set is Python-side and the
+# key is already hashed for the dict lookup below.
+_logged_tuning_keys: set[TuningKey] = set()
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
+    if tuning_key not in _logged_tuning_keys:
+        _logged_tuning_keys.add(tuning_key)
+        logger.info("[mla-key] %s %s",
+                    "HIT " if tuning_key in tuned_params_mapping else "MISS",
+                    tuning_key)
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
     else:

@@ -117,9 +117,54 @@ arm_env() {
     bucket8)  echo "K3_COMPILE_SIZES=[8,8192]" ;;
     hier8)    printf '%s\n' "K3_COMPILE_SIZES=[8,8192]" \
                              "TPU_MOE_HIERARCHICAL_EP=1" ;;
+    # ---- round 4 lane B: gnovack/k3-dev's recipe, dummy vs real weights ----
+    # Use with --config kimi-k3-tp32-theirs, which carries the rest of their
+    # config. THE ONLY DIFFERENCE BETWEEN dummy AND real IS LOAD_FORMAT: same
+    # branch, same flags, same server command, same client, same job, same
+    # host. Everything below `real` is what their compile_flag_sweep.sbatch
+    # exports, restated per arm so a cell's record is self-contained.
+    dummy|real|dummyprof|realprof)
+      printf '%s\n' \
+        "TPU_MOE_HIERARCHICAL_EP=1" \
+        "TPU_LATENT_PROJ_INTRA_CHIP_TP=1" \
+        "VLLM_USE_BREAKABLE_CUDAGRAPH=0" \
+        "VLLM_TORCHTPU_KDA_FUSED=1" \
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0" \
+        "ENABLE_PREFIX_CACHING=false" \
+        "RAY_memory_usage_threshold=0.99" \
+        "LIBTPU_INIT_ARGS=$K3_THEIRS_LIBTPU"
+      case "$1" in
+        dummy|dummyprof) echo "LOAD_FORMAT=dummy" ;;
+      esac
+      case "$1" in
+        # The profiled cells are deliberately NOT part of the A,B,B,A: the
+        # bench client's --profile costs ~+11% TTFT / -4% throughput, so a
+        # profiled cell's serving numbers are not comparable to an unprofiled
+        # one's. They are here for the per-category device diff, which both
+        # arms pay equally, and for the router histogram that tests the Q3
+        # mechanism directly instead of inferring it from a timing delta.
+        *prof) printf '%s\n' "CAPTURE_PROFILE=1" \
+                              "USE_PHASED_PROFILER=true" \
+                              "TPU_MOE_EXPERT_LOAD_EVERY=8" \
+                              "TPU_MOE_EXPERT_LOAD_DIR=$RESULTS_DIR/expert_load_$1" \
+                              "K3_CONCURRENCY=1" \
+                              "K3_ARM_REPS=1" ;;
+      esac
+      ;;
     *) echo "__UNKNOWN_ARM__" ;;
   esac
 }
+
+# The three SparseCore flags they credit for the TTFT win, on top of the same
+# diagnostics-off trio their launcher always sets. Their note: the 32 MiB
+# offload threshold is only a win WITH hierarchical all-reduce.
+K3_THEIRS_LIBTPU="${K3_THEIRS_LIBTPU:-\
+--xla_tpu_enable_diagnostic_coordinator=false \
+--tpu_hbm_report_enable=false \
+--enable_runtime_uptime_telemetry=false \
+--xla_tpu_enable_sparse_core_hierarchical_all_reduce=true \
+--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=33554432 \
+--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=33554432}"
 
 IFS=',' read -r -a arm_list <<< "$ARMS"
 for arm in "${arm_list[@]}"; do
@@ -138,7 +183,35 @@ trap 'echo "--- matrix cleanup"; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT 
 # the job mid-flight.
 disk() { printf '[disk] %s %s\n' "$1" \
     "$(df -P /perf_eval_results / 2>/dev/null | awk 'NR>1{printf "%s:%s free(%s used) ", $6, $4, $5}')"; }
+# WHERE the bytes go, which `df` cannot say. r3 left this as its one open disk
+# question: #336's five cells burned 10.6/8.1/7.6/10.3/>=14.4 GB from ~51 GB
+# and died, while #338's one-lifetime-per-container jobs burned 1.05 GB and
+# 7.2 MB streaming the same weights -- so the growth belongs to the CELL LOOP,
+# not to a server start or to the expert fetch, and "one du -sh between cells
+# settles what is left" (r3/W0.md). This is that du.
+du_breakdown() {
+  local d
+  for d in /perf_eval_results /tmp/ray /tmp/tpu_logs /root/.cache /var/lib/docker /root/k3-metadata; do
+    [ -e "$d" ] && printf '[du] %s %s\n' "$1" "$(du -sh "$d" 2>/dev/null | head -1)"
+  done
+}
+
+# Ray keeps one session directory per container and every restarted server
+# appends 32 more actor logs to it; nothing in the loop ever reclaims them.
+# copytruncate rather than unlink, because a live writer holds these fds.
+PRUNE_RAY_LOGS="${PRUNE_RAY_LOGS:-1}"
+prune_ray_logs() {
+  [ "$PRUNE_RAY_LOGS" = "1" ] || return 0
+  local n
+  n=$(find /tmp/ray -type f \( -name '*.out' -o -name '*.err' -o -name '*.log' \) \
+        -size +64M -print 2>/dev/null | wc -l)
+  find /tmp/ray -type f \( -name '*.out' -o -name '*.err' -o -name '*.log' \) \
+    -size +64M -exec truncate -s 0 {} + 2>/dev/null
+  echo "[prune] truncated $n ray log file(s) >64M"
+}
+
 disk start
+du_breakdown start
 
 fail=0
 cell=0
@@ -146,6 +219,7 @@ for arm in "${arm_list[@]}"; do
   cell=$((cell + 1))
   cell_id=$(printf 'cell%02d_%s' "$cell" "$arm")
   cell_dir="$RESULTS_DIR/$cell_id"
+  cell_t0=$(date +%s)
   mkdir -p "$cell_dir"
   echo "--- $cell_id ($cell/${#arm_list[@]}) : $(date -u +%H:%M:%S)"
 
@@ -156,7 +230,10 @@ for arm in "${arm_list[@]}"; do
     while IFS= read -r kv; do
       [ -n "$kv" ] && export "${kv?}"
     done < <(arm_env "$arm")
-    export BENCHMARK_WARMUP_RUNS=$((REPS - 1))
+    # An arm may buy fewer repeats than the matrix default (K3_ARM_REPS from
+    # arm_env): the profiled cells are not part of the drift-controlled ABBA,
+    # so a second repeat of them buys nothing but wall clock and disk.
+    export BENCHMARK_WARMUP_RUNS=$(( ${K3_ARM_REPS:-$REPS} - 1 ))
     # Ray prints one copy of a line the whole cluster emitted and appends
     # "[repeated Nx across cluster]". That is unusable as a per-rank control:
     # the batching window decides whether 32 ranks arrive as one message or
@@ -190,6 +267,34 @@ for arm in "${arm_list[@]}"; do
     grep -am1 'MLA v2 tuned params:' "$cell_dir/server.log" 2>/dev/null \
       | sed 's/^/[tuning] /' || echo "[tuning] no MLA v2 coverage line (warm compile cache: no lookups traced)"
 
+    # How long the server took to answer /health, split from the benchmark.
+    # Dummy-weight bring-up has never been timed anywhere; this is the number
+    # that says how many more cells a dummy job can afford than a real one.
+    printf '[boot] arm=%s ready=%ss\n' "$arm" \
+      "$(grep -aoE 'Server ready on port [0-9]+ \(([0-9]+)s\)' "$cell_dir/server.log" 2>/dev/null \
+         | grep -oE '[0-9]+s\)' | tr -d 's)' | tail -1)"
+
+    # WHICH MLA rows the server actually asked for, and whether it got them.
+    # `get_tuned_params` is silent on a hit and warns on a miss, so a table
+    # that is being used and a table that does not exist look identical from
+    # the outside; [mla-key] logs both, once per distinct key. pages_per_seq
+    # is the field that decides it: 10240/16 = 640 selects their rows,
+    # 10240/256 = 40 selects ours, and no key can select both.
+    grep -ah '\[mla-key\]' "$cell_dir/server.log" 2>/dev/null \
+      | sed -E 's/.*\[mla-key\]/[keys]/' | sort -u | head -20
+    # r4 SHARED, mandatory for every hardware lane: get_tuned_params NEVER
+    # returns None -- a miss silently falls back to kvpb 1 / qpb 16, which at
+    # 8192 tokens is 512x32 blocks instead of 16x2. An arm that lost a row and
+    # an arm that never had one look the same in the serving number.
+    printf '[keys] arm=%s tuning_misses=%s\n' "$arm" \
+      "$(grep -ac 'No tuned parameters found' "$cell_dir/server.log" 2>/dev/null)"
+    grep -ah 'No tuned parameters found' "$cell_dir/server.log" 2>/dev/null \
+      | grep -oE 'TuningKey\([^)]*\)' | sort -u | sed 's/^/[keys] MISS /' | head -12
+    printf '[keys] arm=%s block_size=%s pages_per_seq=%s\n' "$arm" \
+      "$(grep -aom1 "block_size=[0-9]*" "$cell_dir/server.log" 2>/dev/null | sed 's/.*=//')" \
+      "$(grep -ah '\[mla-key\]' "$cell_dir/server.log" 2>/dev/null \
+         | grep -oE 'pages_per_seq=[0-9]+' | sed 's/.*=//' | sort -un | tr '\n' ',')"
+
     # Hierarchical MoE verdict, per cell, to STDOUT (survives a cancel).
     # Three separate things have to be true and each fails silently on its own:
     #   reached  -- the env var got to the worker PROCESS, not just the driver
@@ -203,11 +308,19 @@ for arm in "${arm_list[@]}"; do
     # per-rank lines are the `logger.info` ones -- `moe_hierarchical.py:109`
     # uses `info_once`, which defaults to scope="local" and therefore samples
     # local rank 0 of each host (4 of 32 on the pod, 1 of 8 here) BY DESIGN.
+    # With Ray's log dedup left ON (r4 lane B: turning it off is the leading
+    # suspect for r3's ~9 GB/cell disk burn) the raw line count understates by
+    # the size of the batching window, so add back the `[repeated Nx]` suffixes
+    # the way their own slurm wrapper does.
     hier_ranks() {
-      local hits
+      local hits suppressed
       hits=$(grep -Fc "$1" "$cell_dir/server.log" 2>/dev/null || echo 0)
+      suppressed=$(grep -F "$1" "$cell_dir/server.log" 2>/dev/null | cut -c1-400 \
+        | grep -oE 'repeated [0-9]+x' | grep -oE '[0-9]+' \
+        | awk '{n+=$1} END {print n+0}')
       printf '%s/%s' "$(grep -F "$1" "$cell_dir/server.log" 2>/dev/null \
-        | grep -oE 'Worker_TP[0-9]+_EP[0-9]+' | sort -u | wc -l)" "$hits"
+        | grep -oE 'Worker_TP[0-9]+_EP[0-9]+' | sort -u | wc -l)" \
+        "$(( ${hits:-0} + ${suppressed:-0} ))"
     }
     printf '[hier] arm=%s split=%s filter=%s topology=%s fallback=%s loader=%s bank=%s (tagged_ranks/lines)\n' \
       "$arm" \
@@ -279,16 +392,20 @@ for fn in sorted(os.listdir(d)):
           f"TTFT {j.get('median_ttft_ms'):.1f} ITL {j.get('median_itl_ms'):.4f} "
           f"tok/s {j.get('total_token_throughput'):.2f} completed {j.get('completed')}")
 PYCELL
+  printf '[wall] %s %ss\n' "$cell_id" "$(( $(date +%s) - cell_t0 ))"
   disk "after $cell_id"
+  du_breakdown "after $cell_id"
 
   bash "$SCRIPT_DIR/cleanup_server.sh"
   # Keep the artifact bundle small: the interesting parts of a 190 KB
   # server.log are the config echo, the KV sizing and any error.
   if [ -f "$cell_dir/server.log" ]; then
-    grep -nE 'KV cache|kv_cache|num_gpu_blocks|Maximum concurrency|init engine|ERROR|Traceback|tuned|TuningKey|fallback|page_size|kv_packing|Using cache directory|Compiling FX graph|libtpu_init_args|moe_hierarchical|Chip topology|sharded-ep-load' \
+    grep -nE 'KV cache|kv_cache|num_gpu_blocks|Maximum concurrency|init engine|ERROR|Traceback|tuned|TuningKey|mla-key|fallback|page_size|kv_packing|Using cache directory|Compiling FX graph|libtpu_init_args|moe_hierarchical|Chip topology|sharded-ep-load|Loading weights|load_format' \
       "$cell_dir/server.log" > "$cell_dir/server.grep.txt" 2>/dev/null
     gzip -f "$cell_dir/server.log"
   fi
+  prune_ray_logs
+  disk "after prune $cell_id"
 done
 
 echo "--- summary"
