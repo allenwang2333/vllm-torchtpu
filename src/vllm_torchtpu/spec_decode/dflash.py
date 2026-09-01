@@ -576,7 +576,17 @@ class DFlashProposer:
 
                 # The draft model only runs speculation on decode steps, so it never processes
                 # more tokens than the max batch size * speculation block size.
-                if num_tokens > max_draft_tokens:
+                # It also never receives less than one complete query block.
+                # Compiling such a bucket would create zero requests in
+                # _dflash_forward_and_sample and eventually hand an empty
+                # leading dimension to the TP logits all-gather.  Keep the
+                # smaller bucket for the context-KV update above: that path
+                # legitimately processes short prompt/verify chunks.
+                if num_tokens < block_size or num_tokens > max_draft_tokens:
+                    if num_tokens < block_size:
+                        logger.info(
+                            "Skipping DFlash draft-forward bucket %d: "
+                            "query block size is %d.", num_tokens, block_size)
                     continue
 
                 self._dummy_draft_forward(num_tokens=num_tokens,
@@ -674,6 +684,11 @@ class DFlashProposer:
         `_dummy_precompute_and_update_kv_cache`."""
         runner = self.runner
         block_size = self.block_size
+
+        if num_tokens < block_size:
+            raise ValueError(
+                f"DFlash draft-forward bucket {num_tokens} is smaller than "
+                f"its query block size {block_size}")
 
         input_ids = torch.zeros((num_tokens),
                                 dtype=torch.int32).to(runner.device)
