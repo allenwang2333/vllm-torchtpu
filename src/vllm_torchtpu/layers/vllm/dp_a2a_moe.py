@@ -207,10 +207,16 @@ def _dispatch_local(hidden: jax.Array, topk_w: jax.Array, topk_ids: jax.Array,
             recv_counts[:, None])
 
 
-def _combine_local(gmm_out: jax.Array, tok_of_pair: jax.Array,
-                   send_off: jax.Array, send_sizes: jax.Array,
-                   recv_off: jax.Array, recv_sizes: jax.Array, *, mode: str,
-                   dp_size: int, axis: str) -> jax.Array:
+def _combine_local(gmm_out: jax.Array,
+                   tok_of_pair: jax.Array | None = None,
+                   send_off: jax.Array | None = None,
+                   send_sizes: jax.Array | None = None,
+                   recv_off: jax.Array | None = None,
+                   recv_sizes: jax.Array | None = None,
+                   *,
+                   mode: str,
+                   dp_size: int,
+                   axis: str) -> jax.Array:
     """Shard-map body: received-layout [P*T, H] partials -> local [T, H]."""
     dp = dp_size
     num_tokens = gmm_out.shape[0] // dp
