@@ -68,6 +68,11 @@ trap 'docker kill "${CONTAINER_NAME}" 2>/dev/null || true' EXIT INT TERM
 export BUILDKITE_PARALLEL_JOB="${BUILDKITE_PARALLEL_JOB:-0}"
 export BUILDKITE_PARALLEL_JOB_COUNT="${BUILDKITE_PARALLEL_JOB_COUNT:-1}"
 
+# Knobs a pipeline step may set for the server, shared with run_multihost.sh.
+# shellcheck source=.buildkite/scripts/passthrough_env.sh
+source "${SCRIPT_DIR}/passthrough_env.sh"
+build_passthrough_env_args
+
 TEST_SUITE_VARS=()
 while IFS='=' read -r key _; do
   if [[ "$key" == BUILDKITE_* ]]; then
@@ -114,6 +119,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"} \
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
+  "${PASSTHROUGH_ENV_ARGS[@]}" \
   "${IMAGE_TAG}" \
   bash -c '
     umask 000

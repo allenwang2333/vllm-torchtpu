@@ -65,7 +65,7 @@ run_ray_multihost() {
     (
       for _attempt in 1 2 3; do
         ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
-          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1" \
+          "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster.sh '${IMAGE_TAG}' '${HEAD_INTERNAL_IP}' --worker \"\$HOME/hf_home\" -e HF_TOKEN='${HF_TOKEN:-}' -e VLLM_DISABLE_COMPILE_CACHE=1 -e TPU_MULTIHOST_BACKEND=ray -e JAX_PLATFORMS='' -e RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1 -e TPU_SKIP_MDS_QUERY=1 ${PASSTHROUGH_ENV_STR}" \
           && break
         echo "worker run_cluster ssh dropped (attempt ${_attempt}/3); restarting in 15s"
         sleep 15
@@ -101,6 +101,28 @@ run_ray_multihost() {
   ' -- "$@"
   EXIT_CODE=$?
   set -e
+
+  # Only the head container has /perf_eval_results bind-mounted, so the ranks
+  # on worker hosts write their xprof capture inside a container `cleanup` is
+  # about to delete. Reduce it in place -- the raw traces are far too big to
+  # ship -- and pull the bundle back over the ssh we already have.
+  if [ "${COLLECT_WORKER_PROFILE:-0}" = "1" ]; then
+    echo "--- Reducing and collecting worker-host xprof captures"
+    base64 < "${SCRIPT_DIR}/xprof_reduce_in_container.sh" > /tmp/xpr_reduce.b64
+    widx=0
+    for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
+      widx=$((widx + 1))
+      tgz="perf_eval_results/xprof_worker${widx}.tgz"
+      ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/xpr_reduce.sh" \
+        < /tmp/xpr_reduce.b64 || continue
+      ssh "${SSH_OPTS[@]}" "${SSH_USER}@${worker_ip}" \
+        "docker cp ~/xpr_reduce.sh node:/tmp/xpr_reduce.sh >&2 &&
+         docker exec node bash /tmp/xpr_reduce.sh >&2 &&
+         docker exec node bash -c 'cd /tmp/xpr && tar czf - .'" \
+        > "$tgz" 2>/dev/null || true
+      echo "    worker${widx}: $(du -h "$tgz" 2>/dev/null | cut -f1)"
+    done
+  fi
 
   echo "--- Collecting Ray session logs"
   docker exec node bash -c 'cd /tmp/ray/session_latest/logs 2>/dev/null && tar czf - .' \

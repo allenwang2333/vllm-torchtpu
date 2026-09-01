@@ -1,0 +1,80 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# v7x-8 rehearsal for pipeline_dev_k3w0.yml, on the 8-layer surrogate.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0_val.yml
+#
+# tpu_v7x_8_queue has 18 agents, so the two arms run concurrently and the
+# rehearsal costs one boot of wall time. It must answer three questions before
+# the single v7x-32 agent is spent:
+#
+#   (a) does the phased profiler still classify DECODE_ONLY under
+#       --async-scheduling? Never run before. Evidence: every
+#       batch_composition_stats record in the window has
+#       num_prefill_tokens == 0 and phase == DECODE_ONLY.
+#   (b) does the expert-load dump cost anything? Evidence: ops/step/core and
+#       us/step/core, dump-ON arm minus dump-OFF arm, on two byte-identical
+#       configs. Run this pipeline at the parent commit as well for the
+#       dump-ABSENT control (no expert_load code in the image at all).
+#   (c) do --block-size 256 + fp8 KV + mnbt 8192 survive the profiler wiring?
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: W0 rehearsal A: dump OFF (v7x-8, sliced8)"
+    key: k3w0_val_off
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      USE_PHASED_PROFILER: "1"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-w0profile k3w0off"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":mag: W0 rehearsal B: dump ON (v7x-8, sliced8)"
+    key: k3w0_val_on
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      USE_PHASED_PROFILER: "1"
+      BENCHMARK_WARMUP_RUNS: "1"
+      # Match the pod's compilation regime: run_multihost.sh hard-codes
+      # VLLM_DISABLE_COMPILE_CACHE=1 and run_in_docker.sh does not, so without
+      # this the rehearsal serves from an AOT artifact compiled by a trace that
+      # predates the dump's buffers and dies with ShapeSpecializationError.
+      VLLM_DISABLE_COMPILE_CACHE: "1"
+      TPU_MOE_EXPERT_LOAD_DIR: "/perf_eval_results/kimi-k3-sliced8-tp8-w0load/expert_load"
+      TPU_MOE_EXPERT_LOAD_SLOTS: "8"
+      TPU_MOE_EXPERT_LOAD_BUCKET: "128"
+      TPU_MOE_EXPERT_LOAD_RANKS: "0,1"
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-w0load k3w0on"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"

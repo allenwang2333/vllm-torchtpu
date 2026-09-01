@@ -1,0 +1,45 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Rehearsal for pipeline_dev_k3_profile.yml on ONE v7x-8 host and the 8-layer
+# surrogate. Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r2a_val.yml
+#
+# The v7x-32 queue has a single agent, so the phased-profiler capture and the
+# xprof_reduce retrieval path get proven here first -- boot is ~6 min instead of
+# ~90, and nothing else queues behind it.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: Profile rehearsal: k3-sliced8 decode window (TPU v7x-8)"
+    key: k3_profile_val
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      USE_PHASED_PROFILER: "1"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-ep-profile k3sl8"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"

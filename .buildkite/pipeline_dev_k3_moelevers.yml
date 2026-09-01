@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The zero-code lever stack, on the real model. Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_moelevers.yml
+#
+# TPU_MOE_HIERARCHICAL_EP, TPU_MOE_SKIP_PADDED_TOKENS,
+# ONEHOT_MOE_PERMUTE_THRESHOLD and a compile_sizes floor of 8 are all merged
+# and all default-off. Together they are quoted once, in PR #405's body, at
+# 25.56 -> 20.99 ms (-17.9%) on the full model with real weights -- the largest
+# full-model delta in the whole record, never reproduced and never defaulted.
+#
+# Control is dev build 289 on the same commit and the identical recipe
+# (median TPOT 32.09 ms, 20/20), so this build only needs the treatment arm.
+# PR #539 calibrated run-to-run spread at <=0.3% on every gated metric, which
+# a -17.9% effect clears by two orders of magnitude.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":zap: kimi-k3-tp32-ep + MoE levers (TPU v7x-32)"
+    key: k3_moelevers
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+      TPU_MOE_HIERARCHICAL_EP: "1"
+      TPU_MOE_SKIP_PADDED_TOKENS: "1"
+      ONEHOT_MOE_PERMUTE_THRESHOLD: "8"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-moelevers --results-dir /perf_eval_results/kimi-k3-tp32-ep-moelevers"
+    artifact_paths:
+      - "perf_eval_results/**/*"

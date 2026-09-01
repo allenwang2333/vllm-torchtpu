@@ -128,7 +128,20 @@ BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
 # non-greedy: temp 0.7 / top_p 0.8 / top_k 20).
 # Set to 0 for deterministic greedy decoding.
 BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
+# Extra flags appended verbatim to every `vllm bench serve` invocation —
+# the client-side counterpart of EXTRA_SERVE_ARGS, same contract: env
+# passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
+# E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# Server async scheduling (--async-scheduling / --no-async-scheduling).
+# Resolution order: env > config > harness default (true). Left empty here
+# so a config can tell "unset" from "forced by the operator".
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+# Drop lm_eval's few-shot-as-multiturn form for EVERY task, not just
+# mmlu_pro. Needed by chat templates that close each turn and so leave
+# no open assistant turn for `continue_final_message` to continue.
+LM_EVAL_DISABLE_MULTITURN=false
 EVAL_TOLERANCE=""
 # Ratio tolerance for the perf regression gate (per-metric floors in
 # check_regression.py still apply). Raise per config for noisier layouts.
@@ -136,6 +149,13 @@ PERF_TOLERANCE="0.05"
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
+if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
+    echo "ERROR: ASYNC_SCHEDULING must be 'true' or 'false', got '$ASYNC_SCHEDULING'"
+    exit 1
+fi
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
@@ -240,13 +260,17 @@ start_vllm_server() {
     if [ "${ENABLE_PREFIX_CACHING:-false}" = "true" ]; then
         prefix_caching_flag="--enable-prefix-caching"
     fi
-    local kv_cache_dtype="${KV_CACHE_DTYPE:-fp8}"
+    local async_scheduling_flag="--async-scheduling"
+    if [ "$ASYNC_SCHEDULING" = "false" ]; then
+        async_scheduling_flag="--no-async-scheduling"
+    fi
+    local kv_cache_dtype="$KV_CACHE_DTYPE"
     local serve_target="$MODEL"
     if [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
     fi
-    local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT --async-scheduling $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
+    local server_cmd="vllm serve ${serve_target} --tensor-parallel-size=$TENSOR_PARALLELISM --data-parallel-size=$DATA_PARALLELISM --max-model-len=$max_model_len --max-num-batched-tokens=$max_num_batched_tokens --max-num-seqs=$max_num_seqs --port $PORT $async_scheduling_flag $prefix_caching_flag --gpu-memory-utilization=$gpu_mem_util --kv-cache-dtype=$kv_cache_dtype $extra_args"
 
     echo ""
     echo "================================================"
@@ -364,7 +388,6 @@ run_benchmark_once() {
     if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
         profile_arg="--profile"
     fi
-
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
     # Otherwise vllm bench serve sends no temperature and the server's
     # generation_config decides sampling.
@@ -373,9 +396,10 @@ run_benchmark_once() {
         temperature_arg=(--temperature "$BENCHMARK_TEMPERATURE")
     fi
 
-    local tokenizer_arg=()
-    if [ -n "${TOKENIZER:-}" ]; then
-        tokenizer_arg=(--tokenizer "$TOKENIZER")
+    local tokenizer_arg=() tokenizer_path
+    tokenizer_path=$(bench_tokenizer_path)
+    if [ -n "$tokenizer_path" ]; then
+        tokenizer_arg=(--tokenizer "$tokenizer_path")
     fi
 
     set +e
@@ -398,12 +422,43 @@ run_benchmark_once() {
         --ignore-eos \
         --result-filename "$result_file" \
         $profile_arg \
+        ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
     set -e
 
     return "$bench_exit"
+}
+
+# =============================================================================
+# Bench-client tokenizer
+# =============================================================================
+# With MODEL_URI the server pulls config/tokenizer/custom code from object
+# storage into ObjectStorageModel(MODEL_URI).dir in this container during
+# startup, so the client tokenizes from there instead of re-resolving MODEL
+# on the HF hub (a hub outage must not kill the bench after the serve
+# bring-up). BENCH_TOKENIZER overrides. The dir is only populated once the
+# server is up, so its presence is checked per bench run (see
+# bench_tokenizer_args); if absent (e.g. --host against a remote server)
+# the client falls back to MODEL.
+BENCH_TOKENIZER="${BENCH_TOKENIZER:-}"
+PULLED_TOKENIZER_DIR=""
+if [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
+    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
+fi
+
+# Prints the path, or nothing to let the client resolve MODEL on the hub.
+bench_tokenizer_path() {
+    if [ -n "${TOKENIZER:-}" ]; then
+        echo "$TOKENIZER"
+    elif [ -n "$BENCH_TOKENIZER" ]; then
+        echo "$BENCH_TOKENIZER"
+    elif [ -n "$PULLED_TOKENIZER_DIR" ] && [ -f "$PULLED_TOKENIZER_DIR/config.json" ]; then
+        echo "$PULLED_TOKENIZER_DIR"
+    elif [ -n "$MODEL_URI" ]; then
+        echo "WARNING: pulled dir $PULLED_TOKENIZER_DIR for $MODEL_URI has no config.json; bench client will resolve $MODEL on the hub" >&2
+    fi
 }
 
 # =============================================================================
@@ -452,10 +507,13 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,
+    "async_scheduling": $ASYNC_SCHEDULING,
+    "kv_cache_dtype": "$KV_CACHE_DTYPE",
     "capture_profile": $capture_profile_json,
     "profile_dir": $profile_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "lm_eval_disable_multiturn": $LM_EVAL_DISABLE_MULTITURN,
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE
 }
@@ -578,6 +636,57 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
         fi
     done
 done
+
+# =============================================================================
+# Sanity probe: did the model actually work?
+# =============================================================================
+# `vllm bench serve --save-result` keeps metrics and no text, and every recipe
+# here passes --ignore-eos, so a request completes whatever the model emits.
+# A run therefore cannot distinguish a working model from a broken one, and
+# that is not hypothetical: dev build 299 reported 20/20 completed and a median
+# TPOT for a Kimi-K3 whose routed experts were half `torch.empty`, because a
+# merged flag bypassed its own weight-filter realignment on the streaming
+# loader. Nothing in the bundle could have shown it.
+#
+# So take one greedy completion before teardown and say, on STDOUT (the job log
+# survives a cancel; server.log does not), whether the text is degenerate.
+# BENCHMARK_SANITY_PROBE=0 opts out.
+if [ "${BENCHMARK_SANITY_PROBE:-1}" = "1" ] && [ "$exit_code" -eq 0 ] \
+   && [ "${DRY_RUN:-0}" != "1" ]; then
+    echo "--- Sanity probe"
+    if python3 "$SCRIPT_DIR/k3_completion_probe.py" \
+            --model "$MODEL" --base-url "http://$HOST:$PORT" \
+            --num-prompts 2 --words-per-prompt 600 --max-tokens 32 \
+            --out "$RESULTS_DIR/sanity_completions.json" >/dev/null 2>&1; then
+        python3 - "$RESULTS_DIR/sanity_completions.json" <<'PYEOF'
+import json, sys
+
+# A model with uninitialised expert shards still emits *tokens*; what it stops
+# emitting is variety. distinct/total over a greedy continuation separates the
+# two without needing a reference output or a tokenizer.
+worst = None
+for key, cap in sorted(json.load(open(sys.argv[1])).items()):
+    if "error" in cap:                      # the probe failed, the model did not
+        print(f"K3SANITY prompt={key} error={cap['error'][:80]!r}")
+        continue
+    text = cap.get("text") or ""
+    toks = cap.get("tokens") or text.split()
+    ratio = len(set(toks)) / len(toks) if toks else 0.0
+    worst = ratio if worst is None else min(worst, ratio)
+    print(f"K3SANITY prompt={key} n_tokens={len(toks)} distinct_ratio={ratio:.3f} "
+          f"text={text[:70]!r}")
+if worst is None:
+    print("K3SANITY verdict=NO_DATA")
+else:
+    # 0.25 is well under any healthy continuation and well over a model stuck in
+    # a short cycle; calibrate it against a known-good run before tightening.
+    print(f"K3SANITY worst_distinct_ratio={worst:.3f} "
+          f"verdict={'OK' if worst >= 0.25 else 'DEGENERATE'}")
+PYEOF
+    else
+        echo "K3SANITY verdict=PROBE_FAILED (server did not answer /v1/completions)"
+    fi
+fi
 
 # =============================================================================
 # Summary

@@ -1,0 +1,48 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Re-ask the two prefix-caching probes after the R15 page-linearity fix.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_apc2.yml
+#
+# Dev build 298 showed prefix caching failing the unified pool's
+# token-linearity check with block_size=324, expected 829440 B, actual 414720 --
+# because bytes-per-token was sampled from a block_size=1 page, which the MLA
+# layout rounds up to kv_packing. The fix derives it from a packing-aligned
+# block; on paper K3 TP8 then lands on 648 tokens / 829440 B and clears both
+# that guard and the pooled-GDN-state guard behind it. This asks the engine.
+#
+# Still a probe, not a claim: getting past the derivation is not prefix caching
+# working. KDA state restoration on a cache hit is untouched by the fix.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":test_tube: K3 prefix-caching probe {{matrix}} (post-fix) (TPU v7x-8)"
+    key: k3_probes
+    depends_on: build_docker
+    timeout_in_minutes: 90
+    agents:
+      queue: tpu_v7x_8_queue
+    matrix: ["apcpool", "apc"]
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/k3_feature_probe.sh --config kimi-k3-sliced8-tp8-{{matrix}} --name {{matrix}} --results-dir /perf_eval_results/probe-{{matrix}}"
+    artifact_paths:
+      - "perf_eval_results/**/*"

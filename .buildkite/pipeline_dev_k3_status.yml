@@ -1,0 +1,78 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 status sweep. Select with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_status.yml
+#
+# Three legs, cheapest first:
+#   1. sliced8 surrogate on one v7x-8 host  -- does the K3 model path still
+#      work at all on this commit? 8 layers, both attention kinds, minutes.
+#   2. kimi-k3-tp32-ep on the v7x-32 pod    -- the full 1561 GB model against
+#      the baseline calibrated in dev builds 235/236 (PR #539).
+#   3. kimi-k3-tp32-ep-eval on the same pod -- first accuracy numbers for K3
+#      (mmlu_llama + mmlu_pro); no baseline exists yet, so nothing gates.
+#
+# 2 and 3 are chained on purpose: there is exactly one tpu_v7x_32 agent.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":microscope: K3-sliced8 surrogate (TPU v7x-8)"
+    key: k3_sliced8
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+    commands:
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-sliced8-tp8-ep --results-dir /perf_eval_results/kimi-k3-sliced8-tp8-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":rocket: Perf: kimi-k3-tp32-ep (TPU v7x-32)"
+    key: k3_perf
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --results-dir /perf_eval_results/kimi-k3-tp32-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":bar_chart: Eval: kimi-k3-tp32-ep-eval mmlu (TPU v7x-32)"
+    key: k3_eval
+    depends_on: k3_perf
+    allow_dependency_failure: true
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-eval --run-lm-eval --results-dir /perf_eval_results/kimi-k3-tp32-ep-eval"
+    artifact_paths:
+      - "perf_eval_results/**/*"

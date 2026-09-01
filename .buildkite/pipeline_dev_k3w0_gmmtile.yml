@@ -1,0 +1,77 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Is W6's m-bucket curve real in situ, or an artifact of the microbenchmark?
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0_gmmtile.yml
+#
+# W6 (BK #326/#328) measured, per non-empty local expert, at K3's exact
+# per-rank shapes: bucket_base 16 -> 10.00 us, 32 -> 12.37, 64 -> 12.55 (the
+# default), 128 -> 10.17, 256 -> 19.01. Buckets 32 and 64 sit ~25% above the
+# floor 16/128/256 share, reproduced across three routed-row counts, with no
+# mechanism -- and W6 says plainly that if that step is an artifact of
+# back-to-back identical calls in a microbenchmark, the whole lever is zero.
+#
+# Three profiled serving arms, one build, three of tpu_v7x_8_queue's 18
+# agents, free. The routed gmm's per-op self time comes straight out of the
+# trace, in situ, at pad 16 (m = 256) where the default bucket_base is 64.
+#
+# PRE-REGISTERED:
+#   Q1 if the microbenchmark transfers, per-op routed-gmm self time is ~19%
+#      lower at 128 than at 64, and ~20% lower at 16 than at 64.
+#   Q2 if instead the three arms agree within the per-op reproducibility of
+#      this rig (0.39% cross-cluster, lane A SS7), the +25% step is a
+#      microbenchmark artifact and W6's lever is refuted at the serving shape.
+#   Q3 NEGATIVE CONTROL: MoE latent projections and the MLA decode kernel must
+#      move <3% / <5% across all three arms. They have nothing to do with the
+#      gmm's m bucket; if they move, the arms are not a minimal pair.
+#   Q4 bit-identical outputs. W6 verified 78/78 cells with max|delta| = 0.0, so
+#      the three arms' completions must match token for token (--probe is not
+#      wired into this pipeline; the ITL/TTFT columns are the weak check).
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: gmm bucket_base 64 (today's default)"
+    key: gt64
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents: { queue: tpu_v7x_8_queue }
+    env: { TPU_ACCELERATOR_TYPE: "tpu7x", VLLM_ENGINE_READY_TIMEOUT_S: "5400", USE_PHASED_PROFILER: "1", BENCHMARK_WARMUP_RUNS: "1" }
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-gt64 k3gt64"
+    artifact_paths: ["perf_eval_results/**/*"]
+
+  - label: ":mag: gmm bucket_base 128 (W6's arm)"
+    key: gt128
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents: { queue: tpu_v7x_8_queue }
+    env: { TPU_ACCELERATOR_TYPE: "tpu7x", VLLM_ENGINE_READY_TIMEOUT_S: "5400", USE_PHASED_PROFILER: "1", BENCHMARK_WARMUP_RUNS: "1", TPU_GMM_DECODE_BUCKET_ROWS: "128" }
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-gt128 k3gt128"
+    artifact_paths: ["perf_eval_results/**/*"]
+
+  - label: ":mag: gmm bucket_base 16"
+    key: gt16
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents: { queue: tpu_v7x_8_queue }
+    env: { TPU_ACCELERATOR_TYPE: "tpu7x", VLLM_ENGINE_READY_TIMEOUT_S: "5400", USE_PHASED_PROFILER: "1", BENCHMARK_WARMUP_RUNS: "1", TPU_GMM_DECODE_BUCKET_ROWS: "16" }
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-gt16 k3gt16"
+    artifact_paths: ["perf_eval_results/**/*"]

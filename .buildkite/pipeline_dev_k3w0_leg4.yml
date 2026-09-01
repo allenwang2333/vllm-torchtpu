@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Round-3 pod leg 4. Two profiled server lifetimes, one agent, ~50-60 min.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0_leg4.yml
+#
+# CELL A -- WHERE DOES THE PADDING LEVER BOTTOM OUT?
+# Leg 3 (BK #336) measured compile_sizes [16,8192] -> [8,8192] at -13.68% TPOT
+# (22.5096 -> 19.4310 ms, +14.71% tok/s, TTFT flat to 0.01%, within-cell spread
+# 0.018%). This is the same config with a LADDER, [1,2,4,8,8192]: a c=1 decode
+# step pads to 1 instead of 8, and the same server still serves any batch up to
+# max_num_seqs 8. ONE extra bucket, not three: the recipe records ~2.8 min of
+# cold compile per bucket on the pod.
+#   P19 pad 8 -> 1 at c=1 buys **-3% to -11% TPOT, point -7%**. The dense ops
+#       (QKV, MLA projections, o_proj) put tokens on the sublane dimension and
+#       cannot go below 8 rows of hardware, so they should flatten; the MoE
+#       gmm's routed rows go 128 -> 16 and should keep scaling. TWO-SIDED
+#       FALSIFIERS: >= -13% means the dense ops DO scale below a sublane and
+#       the hardware model is wrong; <= -2% means everything is sublane-floored
+#       and the correct upstream fix is exactly `min_token_size=8`, one integer.
+#   P20 boot rises from ~939 s to **1050..1180 s**. Boot seconds and the
+#       compiled-variant count are first-class outputs: a config that is faster
+#       per token and minutes slower to start is not shippable, and which of
+#       those two it is IS the deliverable.
+#   P21 the per-category table at pad=1 against BK #327's at pad=16 puts the
+#       saving in routing/permute, AttentionResidual, the routed gmm and the
+#       collectives, and NOT in the MoE latent projections (<3%) or the MLA
+#       decode kernel (<5%) -- the negative control that held in BK #325. If
+#       those move, the arms are not a minimal pair and P19 is uninterpretable.
+#       Which rows flatten first is an out-of-sample test of W6's per-group and
+#       per-instruction floors, from a cell being run anyway.
+#
+# 8 STAYS IN THE LIST. `_get_padded_token_len` (tpu_runner.py:6445) is
+# `bisect_left` over the sorted list, so [1,8192] would pad a 2-token step to
+# 8192 -- legal and catastrophic. [1,8,8192] keeps every step size 1..8 on a
+# sane bucket. And 1 is reachable: BK #325 ran [1,8,8192] on the surrogate and
+# logged `padded_total_num_scheduled_tokens: 1`. Measured, not inferred.
+#
+# CELL B -- the MECHANISM capture for hierarchical EP, spec'd by lane W1.
+# One env var from BK #327, which is the control and is already taken.
+# compile_sizes stays [16,8192]: a bucket-8 capture would confound W0's
+# padding lever with the effect being explained, on the rows in dispute.
+#   W1's registered branches, against #327's own split (transfer 2310.5 us,
+#   barrier 3788.9 us): transfer -> 900..1400 us means hierEP is a cross-host
+#   COLLECTIVE saving and composes with the bucket lever; transfer flat
+#   2100..2400 with the gmm -12..-30% means it is a COMPUTE lever that
+#   competes with it; outside both means the mechanism is wrong.
+#
+# TWO `run_multihost.sh` INVOCATIONS, NOT TWO CELLS OF ONE. Ray's
+# `RayWorkerProc.initialize_worker` applies the driver env with
+# `os.environ.setdefault`, so a value baked into the worker containers at
+# `docker run` wins and would pin every cell of a shared container set to one
+# arm -- the ladder cell would silently get hierarchical EP. See
+# k3w0_leg4_run.sh.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":ladder: W0 leg 4: token-bucket ladder, then hier-EP mechanism (v7x-32)"
+    key: k3w0_leg4
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      USE_PHASED_PROFILER: "1"
+      BENCHMARK_WARMUP_RUNS: "1"
+      COLLECT_WORKER_PROFILE: "1"
+    commands:
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/k3w0_leg4_run.sh"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"

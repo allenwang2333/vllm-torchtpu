@@ -1,0 +1,127 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Round-3 W0 leg 3: does the decode token bucket convert?
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0_abba.yml
+#
+# `tpu_runner.py:632` sets `num_tokens_paddings = compile_sizes`, so the
+# smallest compiled size IS the decode batch. Every K3 config pins it at 16.
+# BK #325 measured `[8,8192]` on the v7x-8 surrogate at **-11.8% device busy**
+# with both negative controls held (MoE latent projections -0.9/-1.1%, MLA
+# decode kernel -1.6%), and the saving is the routed gmm (-35.3%), the MoE
+# all-reduce (-10.8%), AttentionResidual (-56.3%) and routing/permute (-14.7%).
+# The weight-stream-bound projections did not move at all: LM head +0.1%, KDA
+# q+k+v+beta -0.4%, dense MLP -0.2%.
+#
+# The device delta is not the open question -- it is measured to 0.39%-class
+# precision on a free rig. THE OPEN QUESTION IS WHETHER IT CONVERTS. On the
+# surrogate it did not: device/ITL falls 71.1% -> 59.6% as the device gets
+# faster, the surrogate becomes host-bound, and its client ITL went +5.9% at
+# bucket 8 (one cell per arm, three different agents, so unresolved rather
+# than refuted). The real model is ~90% device-bound and is the only rig that
+# can answer it.
+#
+# PRE-REGISTERED, before the build:
+# RESTATED 2026-08-31 01:22Z, BEFORE this build ran, and here is the reason.
+# The first version quoted percentages against BK #316's 24 547 us of device
+# busy. BK #327 has since measured the fixed config at **22 290.8 us** and at
+# **99.03% device-bound**, so the same absolute saving is now a larger
+# percentage of both, and the old interval would have scored as a spurious
+# beat. The ABSOLUTE number is the invariant; the percentage is derived.
+#
+#   P13 device busy -3072 us/step/core, accept [-2600, -3500].
+#       Built per category from BK #325's surrogate ratios on #327's absolute
+#       microseconds: gmm -1131, collectives -900, AttentionResidual -611,
+#       routing/permute -390, MLA fused_qkv_a_proj -40. Against 22 290.8 that
+#       is **-13.8%** (accept -11.7%..-15.7%). Not measured by this job; stated
+#       so leg 1's table and this job's TPOT can be reconciled.
+#       WHY THE ABSOLUTE SHOULD CARRY: the bucket attacks routing/permute
+#       (2035.1), AttentionResidual (1081.2), the gmm (3165.7) and the
+#       collectives (8390.4), and NONE of those moved between #316 and #327
+#       (-1.0%, -0.4%, +0.8%, +0.7%). The only category that collapsed is MLA
+#       attention, which the bucket does not touch. If the absolute deltas do
+#       not carry, that is a finding and not a miss.
+#   P14 median TPOT **-13.6%**, accept [-11.5%, -15.5%], i.e. inside
+#       [19.0, 19.9] ms if the bucket16 arm lands near #327's 22.514 ms.
+#       At 99.03% device-bound the device saving converts at ~1:1, which is
+#       itself a restatement: the first version assumed 88-93% and measured
+#       99.03%. ABBA at 3 reps resolves 1.0%, so this is an interval.
+#   P15 median TTFT unchanged within 2.05%. The bucket touches the decode
+#       padding; the 8192-token prefill bucket is untouched in both arms.
+#   P16 FALSIFIER OF THE MECHANISM, not of the size: if the delta is adverse
+#       while leg 1 + BK #325 say the device work fell, that is a CONVERSION
+#       FAILURE and must be reported in those words, not as noise.
+#
+#   P17 COMPOSITION, arm C = [8,8192] + TPU_MOE_HIERARCHICAL_EP=1. Registered
+#       from W1's P14, not mine: the two levers share a term (rows at the gmm),
+#       so the pair lands at 76..87% of the sum of the singles, with a 1020 us
+#       EP32 floor. W1's own leg (BK #329) supplies (bucket16, hier) and this
+#       arm supplies (bucket8, hier), so the interaction is a cross-JOB
+#       difference and carries the ~2.6% cross-build term on top of each
+#       contrast's own ~1.0%. Say so when reporting it.
+#   P18 arm C's TTFT is WORSE than arm B's. W1 measured hierarchical EP at
+#       +2.07% TTFT on the v7x-8 rehearsal [-0.97, +3.17]: at prefill every
+#       expert is non-empty, so balls-in-bins buys nothing while the rank walks
+#       twice as many half-width groups and pays the per-group boundary cost
+#       twice. The bucket lever also touches per-group boundaries, so the two
+#       may compound on the prefill side even as they compose on the decode
+#       side. A TTFT column in arm C is the point, not an afterthought.
+#   P19 POSITIVE CONTROL for arm C, and the reason to run it at all: the C
+#       cell's own log must show `w13 (56, 3072, ...)` with `ep_size=16
+#       moe_tp_size=2` and `[sharded-ep-load] ... keeps 56/896`. `(28, 6144)`
+#       or `keeps 28/896` means the loader fix did not take and arm C measured
+#       a model with half its routed-expert intermediates uninitialised (C3);
+#       report it as void rather than as a composition.
+#
+# Arms A,B,B,A,C -- bucket16,bucket8,bucket8,bucket16,hier8. NOT A,B,C,B,A.
+# BK #329 died in cell 4 of 4 with `No space left on device` after ~100 minutes
+# on this same agent, and left four 0-byte artifact tarballs. Cells therefore
+# fail LATE, so the primary contrast must finish FIRST: cells 1-4 are a
+# complete drift-controlled ABBA on the bucket, and the composition arm C is
+# cell 5, the only one that is lost if anything is. Centring C would have
+# bracketed it more prettily and put the result at risk to do it.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":straight_ruler: W0 leg 3: decode token bucket 16 vs 8 (+ hier EP), ABBCBA (v7x-32)"
+    key: k3w0_abba
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # Async on in every arm: it is not the variable, and main-agent wants the
+      # bucket8 cells' absolute TTFT/TPOT quotable as the round's best-known
+      # config against the #289 nightly baseline (4488.3 ms / 32.09 ms).
+      # NOTE for the cross-job 2x2: W1's leg (BK #329) runs async OFF, so the
+      # (bucket16, hier) row and this job's (bucket8, hier) row differ in async
+      # as well as in the bucket. The interaction estimate carries that too.
+      ASYNC_SCHEDULING: "true"
+      # c1 only. W1's config runs c1 and c8 in one lifetime; five cells of both
+      # does not fit the round's remaining pod budget, and c1 is where the
+      # padded batch is 16x the real one.
+      K3_CONCURRENCY: "1"
+      NUM_PROMPTS: "5"
+    commands:
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-ep-fixed --results-dir /perf_eval_results/k3w0abba --arms bucket16,bucket8,bucket8,bucket16,hier8 --reps 3 --probe --no-log-dedup"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"

@@ -1,0 +1,71 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The second occupancy, which collapses W6's TP32 interval.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0_gmmtile_c8.yml
+#
+# BK #330 measured `bucket_base` 64 vs 128 in situ at c=1 and found the routed
+# gmm pair falling 61.62 -> 40.01 us/layer, -35.1% -- 4.5x what the per-group
+# term alone predicts. So most of the saving must live in the GROUP-INDEPENDENT
+# term, and that term carries `local_num_experts` (112 at EP8 against 28 at
+# EP32) while the per-group term does not. One occupancy cannot separate them,
+# and the TP32 number is an interval of up to 1.8x because of it:
+#
+#   per-group rule (a floor)      c=1  -531 us   c=8  -1767 us
+#   relative-fraction (weak rule) c=1  -957 us   c=8  -3187 us
+#
+# c=8 changes mean non-empty groups per (rank, layer) from 2.0 to ~15 at
+# IDENTICAL m geometry -- 8 real tokens still pad to the 16 bucket, so
+# size_m = 256 in both. Two occupancies x two buckets solves
+# `pair(k) = A + B*k` for each bucket and splits the 35% into dA and dB.
+#
+# PRE-REGISTERED:
+#   R1 mean k per (rank, layer) at c=8 is 14..16 (128 routes -> ~120 distinct
+#      experts over 8 rank-bins). If the measured gmm scaling implies anything
+#      outside that, the occupancy model is wrong before the split is read.
+#   R2 dB (per-group) is 2..4 us/group -- W6's rig says 2.38 and W2's EP8 fit
+#      bounds it -- and dA (per-call) carries the remainder of the 21.6 us/layer
+#      that BK #330 measured at c=1, i.e. dA ~ 14..18 us/layer at g=112.
+#   R3 if instead dA ~ 0 and dB ~ 10.8, the per-group rule is right, the TP32
+#      number is the TOP of the interval, and W6's -1767 us at c=8 is a
+#      2x under-count.
+#   R4 NEGATIVE CONTROL, as in BK #330: MoE latent projections <3% and the MLA
+#      decode kernel <5% between the two arms.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: c=8, gmm bucket_base 64 (default)"
+    key: gt64c8
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents: { queue: tpu_v7x_8_queue }
+    env: { TPU_ACCELERATOR_TYPE: "tpu7x", VLLM_ENGINE_READY_TIMEOUT_S: "5400", USE_PHASED_PROFILER: "1", BENCHMARK_WARMUP_RUNS: "1" }
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-gt64c8 k3gt64c8"
+    artifact_paths: ["perf_eval_results/**/*"]
+
+  - label: ":mag: c=8, gmm bucket_base 128"
+    key: gt128c8
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents: { queue: tpu_v7x_8_queue }
+    env: { TPU_ACCELERATOR_TYPE: "tpu7x", VLLM_ENGINE_READY_TIMEOUT_S: "5400", USE_PHASED_PROFILER: "1", BENCHMARK_WARMUP_RUNS: "1", TPU_GMM_DECODE_BUCKET_ROWS: "128" }
+    commands:
+      - "bash .buildkite/scripts/k3_profile_run.sh run_in_docker.sh kimi-k3-sliced8-tp8-gt128c8 k3gt128c8"
+    artifact_paths: ["perf_eval_results/**/*"]

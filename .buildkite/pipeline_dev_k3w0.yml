@@ -1,0 +1,65 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Round-3 W0, pod leg 1 of 4. One v7x-32 agent, one server lifetime
+# (W0_LOAD_LIFETIME=1 adds a second; see k3w0_pod_run.sh for why it is off).
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3w0.yml
+#
+# PRE-REGISTERED PREDICTIONS -- written before the job was launched, so this
+# is a test and not a demonstration. Full text with mechanisms and falsifiers:
+# artifacts r3/w0/PREDICTION.md, committed at the same SHA this build runs.
+#
+#   P1 MLA attention (24 layers) 3362.5 -> 950..1400 us/step/core, i.e. 4.3..6.4%
+#      of device busy, down from 13.70%. Mechanism: pages_per_seq 576 -> 40.
+#   P2 MoE latent projections stay 4218.6 +-3%. They are replicated bf16 and
+#      nothing in the config touches them. This is the CONTROL row: if it moves
+#      more than 3%, something changed that I did not intend and the delta
+#      table against #316 is not trustworthy.
+#   P3 transfer-free wait stays 3400..4600 us absolute (routing, batch shape
+#      and message size are all unchanged) but RISES to 17..20% of device busy
+#      because the denominator shrinks. It becomes the largest single item.
+#   P4 device busy 21.5..23.5 ms/step/core, down from 24.547.
+#   P5 device busy / ITL = 86..97%, up from 76.7% -- and NOT comparable to it,
+#      because --async-scheduling shrinks the denominator by design.
+#   P6 ops/step/core is a constant across all 32 cores and all steady steps,
+#      as in #316 (17562 there). Its VALUE will differ from 17562 (page size
+#      and KV dtype change the attention subgraph); its INVARIANCE is the
+#      capture-integrity proof and a failure of it invalidates the run.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: W0: k3 TP32 decode capture @ fixed config + async"
+    key: k3w0
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      USE_PHASED_PROFILER: "1"
+      BENCHMARK_WARMUP_RUNS: "1"
+      COLLECT_WORKER_PROFILE: "1"
+    commands:
+      # Incremental upload, because Buildkite does not run artifact_paths after
+      # a cancel and a 32-rank bundle is not reproducible for free.
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/k3w0_pod_run.sh"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
