@@ -193,6 +193,60 @@ def test_dump_and_reset_are_noops_when_disabled(capsys):
         "the step counter advanced with the tap disabled")
 
 
+def test_disabled_tap_does_not_graph_break_the_compiled_forward():
+    """The inertness claim that actually costs money if it is wrong.
+
+    `maybe_tap` is called from `VllmFp8MoEMethodTPU.apply`, inside the
+    Dynamo-traced MoE forward -- the hot path. With the flag off it returns on
+    the first line, but Dynamo still has to *trace* that line, and
+    `expert_load.enabled()` is a raw `os.getenv` rather than the
+    `vllm_torchtpu.envs` module attribute the rest of this codebase uses (env
+    module attributes constant-fold; an arbitrary `os` call is not guaranteed
+    to). If it graph-breaks, the merge adds an unconditional graph break to the
+    MoE forward with every flag at its default, and every "the flags caused
+    this delta" attribution built on top of that is wrong.
+
+    `fullgraph=True` turns a graph break into an exception, so this test fails
+    loudly rather than silently costing throughput.
+    """
+    import torch
+
+    class _Layer:
+        pass
+
+    layer = _Layer()
+
+    def f(x, ids, weights):
+        expert_load.maybe_tap(layer, ids, weights)
+        return x * 2
+
+    compiled = torch.compile(f, fullgraph=True, backend="eager", dynamic=False)
+    x = torch.ones(4)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    weights = torch.ones(4, 2)
+    with _off():
+        out = compiled(x, ids, weights)
+    assert torch.equal(out, torch.full((4, ), 2.0))
+
+
+def test_fullgraph_really_rejects_a_graph_break():
+    """Negative control for the test above.
+
+    If `fullgraph=True` were not enforcing on this torch build, the previous
+    test would pass no matter what `maybe_tap` did. Compile a region with an
+    unambiguous graph break and require it to raise.
+    """
+    import torch
+
+    def g(x):
+        print("this print is a graph break")  # noqa: T201
+        return x * 2
+
+    compiled = torch.compile(g, fullgraph=True, backend="eager", dynamic=False)
+    with pytest.raises(Exception):
+        compiled(torch.ones(4))
+
+
 def test_layer_without_a_buffer_is_skipped_even_when_enabled():
     """A layer that never registered must not crash the forward."""
 
