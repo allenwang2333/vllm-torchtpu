@@ -189,6 +189,11 @@ class K3DSparkModel(nn.Module):
                 device=context.device,
             )
             _, k_pe = wrapper.rotary_emb(positions, dummy_q_pe, k_pe)
+            # RoPE is configured with fp32 frequencies and may promote its
+            # output even when the projected context is bf16.  The dense MLA
+            # cache-update kernel requires both latent cache components to
+            # have exactly the cache dtype.
+            k_pe = k_pe.to(dtype=core.kv_cache.dtype)
             ql_nope = torch.zeros(
                 (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
                 dtype=context.dtype,
