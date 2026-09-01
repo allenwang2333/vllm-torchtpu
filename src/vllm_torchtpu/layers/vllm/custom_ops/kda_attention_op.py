@@ -315,15 +315,15 @@ def _check_kda_abi(
 # Device-dispatched KDA: the fused decode kernel plus the chunked kernel
 # ===========================================================================
 # The batch is ordered [decode][prefill/mixed] and `request_distribution[0]` is
-# the boundary. Both recurrences run every step, each restricted to its own side
-# of it, and their outputs are selected per token.
+# the boundary. Each recurrence is device-dispatched when its segment is
+# non-empty, and their outputs are selected per token.
 #
 # Nothing branches on the host. vLLM's `TorchCompileWithNoGuardsWrapper` drops
 # every Dynamo guard and traces the model once, and the dummy run driving that
 # trace is decode-only, so a host-side branch on batch composition freezes the
 # decode path into the graph for every later step. That failure is silent -- it
-# produced garbage output while every unit test passed -- so the boundary stays a
-# device value and both kernels are emitted unconditionally.
+# produced garbage output while every unit test passed -- so segment guards
+# branch on device values inside the traced graph.
 #
 # `decode_kda` fuses the short convolution into the recurrence, so it owns the
 # convolution for its own rows; the scan covers the rest. The two touch disjoint
@@ -524,22 +524,33 @@ def _dispatched_kda_core(
             lambda: (conv_in, recurrent_state))
 
     # --- decode segment: fused convolution + recurrence ---------------
-    decode_out, conv_after_decode, pool_after_decode = decode_kda(
-        _match_rows(mixed_qkv, num_seqs),
-        _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads, head_dim),
-        _activate_beta(_match_rows(beta, num_seqs)),
-        conv_in,
-        conv_weight,
-        recurrent_state,
-        a_log,
-        dt_bias.reshape(num_heads, head_dim),
-        decode_indices,
-        has_initial_state,
-        lower_bound=lower_bound,
-        # The pool is [slots, H, K, V], which is the layout the recurrence
-        # indexes as state[k, v]; no in-kernel swap.
-        state_transposed=False,
-    )
+    def run_decode():
+        return decode_kda(
+            _match_rows(mixed_qkv, num_seqs),
+            _match_rows(raw_gate,
+                        num_seqs).reshape(num_seqs, num_heads, head_dim),
+            _activate_beta(_match_rows(beta, num_seqs)),
+            conv_in,
+            conv_weight,
+            recurrent_state,
+            a_log,
+            dt_bias.reshape(num_heads, head_dim),
+            decode_indices,
+            has_initial_state,
+            lower_bound=lower_bound,
+            # The pool is [slots, H, K, V], which is the layout the recurrence
+            # indexes as state[k, v]; no in-kernel swap.
+            state_transposed=False,
+        )
+
+    def skip_decode():
+        return (jnp.zeros((num_seqs, num_heads, head_dim), activation_dtype),
+                conv_in, recurrent_state)
+
+    # A verify-only batch has no ordinary one-token decode segment. Avoid
+    # launching a null-slot KDA kernel before its K+1 verification calls.
+    decode_out, conv_after_decode, pool_after_decode = jax.lax.cond(
+        decode_end > 0, run_decode, skip_decode)
 
     # --- verify segment: serial K+1 decode with per-position checkpoints ---
     def run_verify():
