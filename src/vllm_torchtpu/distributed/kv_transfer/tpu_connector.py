@@ -2526,6 +2526,7 @@ class TPURaidenConnectorWorker:
         )
         if req_id is not None:
             self._stage3_recv_intervals[str(req_id)] = []
+            self._stage3_load_start_times[str(req_id)] = time.perf_counter()
             if tokens > 0:
                 self._stage3_submitted_load_tokens[str(req_id)] = tokens
         return expected_pages
@@ -2558,6 +2559,8 @@ class TPURaidenConnectorWorker:
         dest_id = str(destination_req_id)
         if dest_id not in self._stage3_recv_intervals:
             self._stage3_recv_intervals[dest_id] = []
+        if dest_id not in self._stage3_load_start_times:
+            self._stage3_load_start_times[dest_id] = time.perf_counter()
         tokens = int(num_tokens) if num_tokens is not None else 0
         base = int(token_base) if token_base is not None else 0
         if tokens > 0 and base >= 0:
@@ -3566,11 +3569,10 @@ class TPURaidenConnectorWorker:
                 int(raw_base) if isinstance(raw_base, (int, float)) else 0
             )
             self._register_in_flight_recv_chunk(
-                transfer_id=destination_req_id,
+                transfer_id=source_req_id,
                 destination_req_id=destination_req_id,
                 token_base=token_base,
                 num_tokens=num_tokens,
-                alias_id=source_req_id,
             )
             self._bind_stage3_request_ids(destination_req_id, source_req_id)
             existing_uuid = self._stage3_submitted_loads.get(
@@ -3759,6 +3761,8 @@ class TPURaidenConnectorWorker:
         chunk_info = self._stage3_in_flight_recv_chunks.pop(rec_id_str, None)
         if chunk_info is not None:
             dest_id, base, count = chunk_info
+            if dest_id in self._failed_recving:
+                return
             if base >= 0 and count > 0:
                 interval = (base, base + count)
                 dest_intervals = self._stage3_recv_intervals.setdefault(
@@ -3767,6 +3771,9 @@ class TPURaidenConnectorWorker:
                 if interval not in dest_intervals:
                     dest_intervals.append(interval)
         elif rec_id_str in self._stage3_recv_chunk_meta:
+            if rec_id_str in self._failed_recving:
+                self._stage3_recv_chunk_meta.pop(rec_id_str, None)
+                return
             base, count = self._stage3_recv_chunk_meta.pop(rec_id_str)
             if base >= 0 and count > 0:
                 interval = (base, base + count)
@@ -3775,6 +3782,84 @@ class TPURaidenConnectorWorker:
                 )
                 if interval not in dest_intervals:
                     dest_intervals.append(interval)
+
+    def _mark_stage3_load_failed(self, dest_id: str) -> None:
+        """Marks a Stage-3 receive request as failed and stages its blocks.
+
+        Cleans up active interval tracking and in-flight sub-chunk records,
+        removes the request from completed receives, adds it to failed
+        receives, and stages all allocated physical blocks in
+        `_failed_block_ids` so the scheduler triggers local recomputation.
+
+        Args:
+            dest_id: Destination request identifier to mark as failed.
+        """
+        dest_id_str = str(dest_id)
+        mapped_dest_id = self._stage3_destination_request_id(dest_id_str)
+        if mapped_dest_id is not None:
+            dest_id_str = mapped_dest_id
+        self._stage3_recv_chunk_meta.pop(dest_id_str, None)
+        self._stage3_recv_intervals.pop(dest_id_str, None)
+        self._failed_recving.add(dest_id_str)
+        self._done_recving.discard(dest_id_str)
+        for k, v in list(self._stage3_in_flight_recv_chunks.items()):
+            if v[0] == dest_id_str or k == dest_id_str:
+                self._stage3_in_flight_recv_chunks.pop(k, None)
+                self._stage3_recv_chunk_meta.pop(k, None)
+        blocks = self._load_block_ids.get(dest_id_str)
+        if blocks:
+            self._failed_block_ids.update(blocks)
+
+    def _is_stage3_recv_complete(self, req_id: str) -> bool:
+        """Validates if a completed Stage-3 receive satisfies interval tiling.
+
+        Checks whether the accumulated received token intervals for a request
+        form an unbroken cover of the expected prompt token range. Resolves the
+        expected token count by querying submitted load tokens directly,
+        consulting source request ID alias mappings, or deriving token count
+        from allocated KV cache block counts and block size. If interval
+        tracking is active, verifies coverage via interval tiling validation.
+
+        Args:
+            req_id: Request identifier being checked.
+
+        Returns:
+            True if interval tiling check passes or if interval tracking is not
+            active for this request; False if interval validation fails.
+        """
+        if req_id in self._failed_recving:
+            return False
+        if req_id not in self._stage3_recv_intervals:
+            return True
+        expected_tokens = self._stage3_submitted_load_tokens.get(req_id)
+        if expected_tokens is None and req_id in self._stage3_source_req_ids:
+            expected_tokens = self._stage3_submitted_load_tokens.get(
+                self._stage3_source_req_ids[req_id]
+            )
+        if expected_tokens is None and req_id in self._load_block_ids:
+            block_size = int(
+                getattr(
+                    getattr(self.vllm_config, "cache_config", None),
+                    "block_size",
+                    1,
+                )
+                or 1
+            )
+            expected_tokens = len(self._load_block_ids[req_id]) * block_size
+        if expected_tokens is not None and expected_tokens > 0:
+            intervals = self._stage3_recv_intervals.get(req_id, [])
+            if not _validate_interval_tiling(intervals, expected_tokens):
+                logger.warning(
+                    "TPURaidenConnectorWorker rank%d --> req_id=%s "
+                    "failed interval tiling validation (intervals=%s, "
+                    "expected=%d)",
+                    self.tp_rank,
+                    req_id,
+                    intervals,
+                    expected_tokens,
+                )
+                return False
+        return True
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         """Polls transfer engine completion events and updates worker state.
@@ -3806,11 +3891,29 @@ class TPURaidenConnectorWorker:
             for req_id in failed_recving:
                 self._legacy_registered_sends.discard(str(req_id))
         elif not self.is_producer and not self._raiden_stage3_enabled():
+            mapped_done_recving = []
             for req_id in done_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
+                chunk_info = self._stage3_in_flight_recv_chunks.get(str(req_id))
+                dest_id = (
+                    chunk_info[0] if chunk_info is not None else str(req_id)
+                )
                 self._record_stage3_recv_chunk_completion(str(req_id))
+                mapped_done_recving.append(dest_id)
+            done_recving = mapped_done_recving
+            mapped_failed_recving = []
             for req_id in failed_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
+                chunk_info = self._stage3_in_flight_recv_chunks.get(
+                    str(req_id)
+                )
+                dest_id = (
+                    chunk_info[0] if chunk_info is not None else str(req_id)
+                )
+                self._stage3_recv_chunk_meta.pop(str(req_id), None)
+                self._mark_stage3_load_failed(dest_id)
+                mapped_failed_recving.append(dest_id)
+            failed_recving = mapped_failed_recving
         if self.is_producer and self._raiden_stage3_enabled():
             for send_id in done_sending:
                 self._active_tensor_refs.pop(str(send_id), None)
@@ -3834,19 +3937,37 @@ class TPURaidenConnectorWorker:
             # IDs exist.)
             native_done_recving = list(done_recving)
             native_failed_recving = list(failed_recving)
-            done_recving = [
-                destination_req_id for req_id in native_done_recving
-                if (destination_req_id := self._stage3_destination_request_id(
-                    req_id)) is not None
-            ]
-            failed_recving = [
-                destination_req_id for req_id in native_failed_recving
-                if (destination_req_id := self._stage3_destination_request_id(
-                    req_id)) is not None
-            ]
+            done_recving = []
+            for req_id in native_done_recving:
+                dest_id = self._stage3_destination_request_id(req_id)
+                if (
+                    dest_id is None
+                    and str(req_id) in self._stage3_in_flight_recv_chunks
+                ):
+                    dest_id = self._stage3_in_flight_recv_chunks[str(req_id)][0]
+                if dest_id is not None:
+                    done_recving.append(dest_id)
+            failed_recving = []
+            for req_id in native_failed_recving:
+                dest_id = self._stage3_destination_request_id(req_id)
+                if (
+                    dest_id is None
+                    and str(req_id) in self._stage3_in_flight_recv_chunks
+                ):
+                    dest_id = self._stage3_in_flight_recv_chunks[str(req_id)][0]
+                elif dest_id is None and (
+                    req_id in self._stage3_controller_accepted
+                    or req_id in self._load_block_ids
+                    or req_id in self._stage3_submitted_loads
+                ):
+                    dest_id = str(req_id)
+                if dest_id is not None:
+                    failed_recving.append(dest_id)
             unmapped_terminal_ids = (
-                set(native_done_recving) | set(native_failed_recving)
-            ) - self._stage3_destination_req_ids.keys()
+                (set(native_done_recving) | set(native_failed_recving))
+                - self._stage3_destination_req_ids.keys()
+                - self._stage3_in_flight_recv_chunks.keys()
+            )
             if unmapped_terminal_ids:
                 logger.warning(
                     "Ignoring unmapped Stage-3 native terminal request IDs: "
@@ -3857,7 +3978,12 @@ class TPURaidenConnectorWorker:
             ]
             failed_recving = [
                 req_id for req_id in failed_recving
-                if req_id in self._stage3_controller_accepted
+                if (
+                    req_id in self._stage3_controller_accepted
+                    or req_id in self._load_block_ids
+                    or req_id in self._stage3_recv_intervals
+                    or req_id in self._stage3_submitted_loads
+                )
             ]
             terminal_recvs = set(done_recving) | set(failed_recving)
             for req_id in terminal_recvs:
@@ -3873,13 +3999,45 @@ class TPURaidenConnectorWorker:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
                 for req_id in expired_uncertain:
                     self._stage3_pending_controller_failures.pop(req_id, None)
-            failed_ids = set(native_failed_recving) | set(failed_recving)
-            for failed_id in failed_ids:
-                self._stage3_in_flight_recv_chunks.pop(str(failed_id), None)
-                self._stage3_recv_chunk_meta.pop(str(failed_id), None)
-            for rec_id in list(native_done_recving) + list(done_recving):
+
+            # Check for timed-out in-flight load requests
+            timeout_s = float(dist_utils.get_p2p_wait_pull_timeout())
+            expired_loads: set[str] = set()
+            for load_id, start_time in list(
+                self._stage3_load_start_times.items()
+            ):
+                if (
+                    load_id not in self._stage3_terminal_loads
+                    and load_id not in self._failed_recving
+                    and (now - start_time) >= timeout_s
+                ):
+                    expired_loads.add(load_id)
+            if expired_loads:
+                failed_recving = list(set(failed_recving) | expired_loads)
+                for exp_id in expired_loads:
+                    self._stage3_load_start_times.pop(exp_id, None)
+                    logger.warning(
+                        "TPURaidenConnectorWorker rank%d --> Stage-3 load "
+                        "timed out for req_id=%s, marking failed for "
+                        "recomputation",
+                        self.tp_rank,
+                        exp_id,
+                    )
+
+            for native_id in set(native_failed_recving):
+                self._stage3_in_flight_recv_chunks.pop(str(native_id), None)
+                self._stage3_recv_chunk_meta.pop(str(native_id), None)
+
+            for dest_id in set(failed_recving):
+                self._mark_stage3_load_failed(dest_id)
+
+            for rec_id in set(native_done_recving):
                 self._record_stage3_recv_chunk_completion(rec_id)
-            self._stage3_terminal_loads.update(done_recving)
+            completed_recvs = [
+                req_id for req_id in done_recving
+                if self._is_stage3_recv_complete(req_id)
+            ]
+            self._stage3_terminal_loads.update(completed_recvs)
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
@@ -3911,11 +4069,14 @@ class TPURaidenConnectorWorker:
         terminal_sends = native_terminal_sends | cancelled_sends
         self._done_sending.update(terminal_sends)
         self._done_recving.update(done_recving)
+        self._done_recving.difference_update(self._failed_recving)
         newly_failed = set(failed_recving) - self._failed_recving
         self._failed_recving.update(failed_recving)
         # Stage the affected device blocks so get_block_ids_with_load_errors()
         # can report them no later than the pass that reports the req finished.
         for req_id in newly_failed:
+            self._stage3_recv_intervals.pop(req_id, None)
+            self._done_recving.discard(req_id)
             blocks = self._load_block_ids.get(req_id)
             if blocks:
                 self._failed_block_ids.update(blocks)
@@ -3960,7 +4121,7 @@ class TPURaidenConnectorWorker:
             for req_id in done_recving:
                 uuid = self._stage3_submitted_loads.get(req_id)
                 num_tokens = self._stage3_submitted_load_tokens.get(req_id)
-                source_req_id = self._stage3_source_request_id(req_id)
+                source_req_id = self._stage3_source_req_ids.get(req_id, req_id)
                 if (req_id not in self._reported_recving and uuid is not None
                         and num_tokens is not None):
                     start_time = self._stage3_load_start_times.get(req_id)
@@ -3982,7 +4143,7 @@ class TPURaidenConnectorWorker:
                         ),
                     )
             for req_id in failed_recving:
-                source_req_id = self._stage3_source_request_id(req_id)
+                source_req_id = self._stage3_source_req_ids.get(req_id, req_id)
                 logger.error(
                     "Stage-3 receiver native transfer failed req_id=%s "
                     "destination_req_id=%s uuid=%s",
@@ -4037,54 +4198,6 @@ class TPURaidenConnectorWorker:
                 self._stage3_registered_sends.pop(req_id, None)
                 del self._stage3_terminal_cleanup[req_id]
 
-    def _is_stage3_recv_complete(self, req_id: str) -> bool:
-        """Validates if a completed Stage-3 receive satisfies interval tiling.
-
-        Checks whether the accumulated received token intervals for a request
-        form an unbroken cover of the expected prompt token range. Resolves the
-        expected token count by querying submitted load tokens directly,
-        consulting source request ID alias mappings, or deriving token count
-        from allocated KV cache block counts and block size. If interval
-        tracking is active, verifies coverage via interval tiling validation.
-
-        Args:
-            req_id: Request identifier being checked.
-
-        Returns:
-            True if interval tiling check passes or if interval tracking is not
-            active for this request; False if interval validation fails.
-        """
-        if req_id not in self._stage3_recv_intervals:
-            return True
-        expected_tokens = self._stage3_submitted_load_tokens.get(req_id)
-        if expected_tokens is None and req_id in self._stage3_source_req_ids:
-            expected_tokens = self._stage3_submitted_load_tokens.get(
-                self._stage3_source_req_ids[req_id]
-            )
-        if expected_tokens is None and req_id in self._load_block_ids:
-            block_size = int(
-                getattr(
-                    getattr(self.vllm_config, "cache_config", None),
-                    "block_size",
-                    1,
-                )
-                or 1
-            )
-            expected_tokens = len(self._load_block_ids[req_id]) * block_size
-        if expected_tokens is not None and expected_tokens > 0:
-            intervals = self._stage3_recv_intervals.get(req_id, [])
-            if not _validate_interval_tiling(intervals, expected_tokens):
-                logger.warning(
-                    "TPURaidenConnectorWorker rank%d --> req_id=%s "
-                    "failed interval tiling validation (intervals=%s, "
-                    "expected=%d)",
-                    self.tp_rank,
-                    req_id,
-                    intervals,
-                    expected_tokens,
-                )
-                return False
-        return True
 
     def get_finished(
         self, finished_req_ids: set[str] | None = None
@@ -4156,6 +4269,7 @@ class TPURaidenConnectorWorker:
             self._load_block_ids.pop(req_id, None)
             self._stage3_submitted_loads.pop(req_id, None)
             self._stage3_submitted_load_tokens.pop(req_id, None)
+            self._stage3_load_start_times.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
             self._stage3_terminal_loads.discard(req_id)
@@ -4172,32 +4286,76 @@ class TPURaidenConnectorWorker:
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        # Drain the failed-load block ids for the scheduler to recompute. Paired
-        # with reporting the req as finished in get_finished() in the same pass.
+        """Returns physical block IDs with load errors and drains tracking.
+
+        Drains and clears the accumulated failed-load block IDs so that the
+        scheduler can recompute them on device rather than executing with absent
+        KV cache. This method is called in the same polling pass in which the
+        request is reported as finished.
+
+        Returns:
+            The set of physical device block IDs affected by load failures.
+        """
         failed = self._failed_block_ids
         self._failed_block_ids = set()
         return failed
 
+    def _is_recv_finished(self, req_id: str) -> bool:
+        """Determines whether a receive request has reached terminal state.
+
+        Evaluates whether the specified receive request has either failed or
+        completed full interval tiling validation.
+
+        Args:
+            req_id: Request identifier being checked.
+
+        Returns:
+            True if the request is in failed receives or completed receives with
+            valid interval tiling; False otherwise.
+        """
+        if req_id in self._failed_recving:
+            return True
+        if req_id in self._done_recving:
+            return self._is_stage3_recv_complete(req_id)
+        return False
+
     def _wait_for_recving(self, req_ids: set[str]) -> None:
+        """Blocks synchronously until all specified receive requests complete.
+
+        Polls the transfer engine in a loop until all requested receive
+        operations finish or the deadline expires. If a timeout occurs, marks
+        any remaining pending requests as failed and adds them to terminal loads
+        to prevent deadlocks.
+
+        Args:
+            req_ids: Set of request identifiers to wait for.
+        """
         if not req_ids:
             return
         engine = self._ensure_raiden_transfer_engine()
         deadline = (time.perf_counter() +
                     float(dist_utils.get_p2p_wait_pull_timeout()))
         while True:
-            finished = self._done_recving | self._failed_recving
-            if req_ids <= finished:
+            if all(self._is_recv_finished(req_id) for req_id in req_ids):
                 return
             self._poll_finished(engine)
-            finished = self._done_recving | self._failed_recving
-            if req_ids <= finished:
+            if all(self._is_recv_finished(req_id) for req_id in req_ids):
                 return
             if time.perf_counter() >= deadline:
-                pending = sorted(req_ids - finished)
+                pending = sorted(
+                    req_id for req_id in req_ids
+                    if not self._is_recv_finished(req_id)
+                )
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> timed out waiting "
                     "for Raiden load completion for req_ids=%s", self.tp_rank,
                     pending)
+                for req_id in pending:
+                    dest_id = (
+                        self._stage3_destination_request_id(req_id) or req_id
+                    )
+                    self._mark_stage3_load_failed(dest_id)
+                    self._stage3_terminal_loads.add(dest_id)
                 return
             time.sleep(0.001)
 

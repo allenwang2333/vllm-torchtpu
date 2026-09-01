@@ -9,6 +9,7 @@ upon request completion.
 """
 
 import math
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     TPUConnectorMetadata,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+    TPUConnector,
     TPURaidenConnectorWorker,
     _validate_interval_tiling,
 )
@@ -90,19 +92,24 @@ class _FakeRaidenControllerFacade:
         self.start_transfer_result: bool = True
 
     def register_work_unit(self, **kwargs: Any) -> None:
+        """Records a register_work_unit invocation."""
         self.register_work_unit_calls.append(kwargs)
 
     def register_request_blocks(self, **kwargs: Any) -> None:
+        """Records a register_request_blocks invocation."""
         self.register_request_blocks_calls.append(kwargs)
 
     def complete_request_blocks(self, **kwargs: Any) -> None:
+        """Records a complete_request_blocks invocation."""
         self.complete_request_blocks_calls.append(kwargs)
 
     def cancel_request_blocks_if_unclaimed(self, **kwargs: Any) -> bool:
+        """Records a cancel_request_blocks_if_unclaimed invocation."""
         self.cancel_request_blocks_calls.append(kwargs)
         return self.cancel_request_blocks_result
 
     def start_transfer(self, **kwargs: Any) -> bool:
+        """Records a start_transfer invocation."""
         self.start_transfer_calls.append(kwargs)
         return self.start_transfer_result
 
@@ -184,7 +191,7 @@ def _make_consumer_test_worker(
 
 
 def test_consumer_accumulates_ranges() -> None:
-    """Simulate out-of-order chunk arrivals for chunks 1 and 0.
+    """Simulates out-of-order chunk arrivals for chunks 1 and 0.
 
     Verifies that self._stage3_recv_intervals[req_id] accumulates both
     intervals accurately regardless of arrival order.
@@ -240,7 +247,7 @@ def test_consumer_accumulates_ranges() -> None:
 
 
 def test_destination_pages_preallocated() -> None:
-    """Verify allocation size matches ceil(total_tokens / block_size).
+    """Verifies allocation size matches ceil(total_tokens / block_size).
 
     Asserts that destination pages are calculated identically regardless of the
     number of sub-chunks the prompt will be delivered across.
@@ -271,7 +278,7 @@ def test_destination_pages_preallocated() -> None:
 
 
 def test_subchunk_start_read_dispatch() -> None:
-    """Verify start_read dispatch with 50-bit UUID and block IDs."""
+    """Verifies start_read dispatch with 50-bit UUID and block IDs."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     worker._start_stage3_recv_if_ready(
@@ -301,7 +308,7 @@ def test_subchunk_start_read_dispatch() -> None:
 
 
 def test_consumer_accumulates_three_sequential_chunks() -> None:
-    """Verify sequential accumulation across 3 sub-chunks in sequence."""
+    """Verifies sequential accumulation across 3 sub-chunks in sequence."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-3-chunks"
@@ -336,7 +343,7 @@ def test_consumer_accumulates_three_sequential_chunks() -> None:
 
 
 def test_legacy_consumer_process_send_load_accumulates_intervals() -> None:
-    """Verify non-Stage-3 process_send_load path registers intervals."""
+    """Verifies non-Stage-3 process_send_load path registers intervals."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     with patch.object(worker, "_raiden_stage3_enabled", return_value=False):
@@ -364,7 +371,7 @@ def test_legacy_consumer_process_send_load_accumulates_intervals() -> None:
 
 
 def test_consumer_cleanup_purges_recv_intervals() -> None:
-    """Verify get_finished cleans up _stage3_recv_intervals on retirement."""
+    """Verifies get_finished cleans up _stage3_recv_intervals on retirement."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-clean"
@@ -381,7 +388,7 @@ def test_consumer_cleanup_purges_recv_intervals() -> None:
 
 
 def test_update_stage3_state_after_alloc_calling_conventions() -> None:
-    """Verify _update_stage3_state_after_alloc polymorphic calling styles."""
+    """Verifies _update_stage3_state_after_alloc polymorphic calling styles."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     # 1. Dict-backed kv_transfer_params
@@ -432,7 +439,7 @@ def test_update_stage3_state_after_alloc_calling_conventions() -> None:
 
 
 def test_update_stage3_state_after_alloc_malformed_and_empty_params() -> None:
-    """Verify _update_stage3_state_after_alloc handles zero/negative tokens."""
+    """Verifies allocation update handles zero or negative tokens."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     # 1. Zero tokens
@@ -464,7 +471,7 @@ def test_update_stage3_state_after_alloc_malformed_and_empty_params() -> None:
 
 
 def test_register_in_flight_recv_chunk_coordinates_and_aliases() -> None:
-    """Verify coordinate tracking and alias mapping in _register_in_flight."""
+    """Verifies coordinate tracking and alias mapping in _register_in_flight."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     worker._register_in_flight_recv_chunk(
@@ -494,7 +501,7 @@ def test_register_in_flight_recv_chunk_coordinates_and_aliases() -> None:
 
 
 def test_register_in_flight_recv_chunk_invalid_inputs_ignored() -> None:
-    """Verify invalid coordinates are ignored during in-flight registration."""
+    """Verifies invalid coordinates are ignored during chunk registration."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     # 1. Zero num_tokens: should NOT register in-flight chunk
@@ -526,7 +533,7 @@ def test_register_in_flight_recv_chunk_invalid_inputs_ignored() -> None:
 
 
 def test_subchunk_start_read_with_destination_alias_resolution() -> None:
-    """Verify _start_stage3_recv_if_ready resolves destination alias."""
+    """Verifies _start_stage3_recv_if_ready resolves destination alias."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     # Map producer transfer ID prod-chunk-1 to consumer consumer-req-42
@@ -568,7 +575,7 @@ def test_subchunk_start_read_with_destination_alias_resolution() -> None:
 
 
 def test_consumer_duplicate_chunk_completion_idempotent() -> None:
-    """Verify duplicate chunk completions do not insert duplicate ranges."""
+    """Verifies duplicate chunk completions do not insert duplicate ranges."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-idempotent"
@@ -589,7 +596,7 @@ def test_consumer_duplicate_chunk_completion_idempotent() -> None:
 
 
 def test_poll_finished_failed_chunk_purged_without_recording_interval() -> None:
-    """Verify failed chunks are purged without recording partial ranges."""
+    """Verifies failed chunks are purged without recording partial ranges."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-fail-purge"
@@ -616,11 +623,11 @@ def test_poll_finished_failed_chunk_purged_without_recording_interval() -> None:
         # Failed chunk should be purged from in-flight tracking
         assert "chunk-failing" not in worker._stage3_in_flight_recv_chunks
         # No interval should have been recorded for the failing chunk
-        assert worker._stage3_recv_intervals[req_id] == []
+        assert worker._stage3_recv_intervals.get(req_id, []) == []
 
 
 def test_process_send_load_fallback_num_tokens_from_block_count() -> None:
-    """Verify fallback token count derivation from local_block_ids."""
+    """Verifies fallback token count derivation from local_block_ids."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     with patch.object(worker, "_raiden_stage3_enabled", return_value=False):
@@ -655,7 +662,7 @@ def test_process_send_load_fallback_num_tokens_from_block_count() -> None:
 
 
 def test_consumer_cleanup_with_source_alias_mapping() -> None:
-    """Verify get_finished cleans up both destination and source aliases."""
+    """Verifies get_finished cleans up both destination and source aliases."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     dest_id = "dest-req-cleanup"
@@ -686,7 +693,7 @@ def test_consumer_cleanup_with_source_alias_mapping() -> None:
 
 
 def test_consumer_accumulates_non_contiguous_intervals() -> None:
-    """Verify accumulator records disjoint [0, 1024) and [2048, 3072)."""
+    """Verifies accumulator records disjoint [0, 1024) and [2048, 3072)."""
     worker, _, engine = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-disjoint"
@@ -723,7 +730,7 @@ def test_consumer_accumulates_non_contiguous_intervals() -> None:
 
 
 def test_record_stage3_recv_chunk_completion_fallback_to_chunk_meta() -> None:
-    """Verify completion falls back to _stage3_recv_chunk_meta if needed."""
+    """Verifies completion falls back to _stage3_recv_chunk_meta if needed."""
     worker, _, _ = _make_consumer_test_worker(block_size=1024)
 
     req_id = "req-meta-fallback"
@@ -738,19 +745,19 @@ def test_record_stage3_recv_chunk_completion_fallback_to_chunk_meta() -> None:
 
 
 def test_tiling_check_contiguous_success() -> None:
-    """Test complete tiling of [0, 4096) via contiguous chunks returns True."""
+    """Tests complete tiling of [0, 4096) via contiguous chunks returns True."""
     intervals = [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096)]
     assert _validate_interval_tiling(intervals, 4096) is True
 
 
 def test_tiling_check_gap_rejection() -> None:
-    """Test intervals missing [1024, 2048) returns False due to gap."""
+    """Tests that intervals missing [1024, 2048) returns False due to gap."""
     intervals = [(0, 1024), (2048, 3072), (3072, 4096)]
     assert _validate_interval_tiling(intervals, 4096) is False
 
 
 def test_tiling_check_overlapping_success() -> None:
-    """Test intervals with partial overlap correctly merges and returns True."""
+    """Tests that overlapping intervals correctly merge and return True."""
     intervals = [(0, 1536), (1024, 3072), (3072, 4096)]
     assert _validate_interval_tiling(intervals, 4096) is True
     # Verify two-chunk overlap covering [0, 3072)
@@ -760,13 +767,13 @@ def test_tiling_check_overlapping_success() -> None:
 
 
 def test_tiling_check_shortfall_rejection() -> None:
-    """Test intervals reaching token 4000 when 4096 expected returns False."""
+    """Tests that intervals with shortfall tokens return False."""
     intervals = [(0, 2000), (2000, 4000)]
     assert _validate_interval_tiling(intervals, 4096) is False
 
 
 def test_tiling_check_empty_and_invalid_inputs() -> None:
-    """Test empty, None, non-positive, or offset intervals return False."""
+    """Tests that empty, None, or offset intervals return False."""
     assert _validate_interval_tiling([], 4096) is False
     assert _validate_interval_tiling(None, 4096) is False
     assert _validate_interval_tiling([(0, 1024)], 0) is False
@@ -823,7 +830,7 @@ def test_get_finished_validates_interval_tiling_admission() -> None:
 
 
 def test_validate_interval_tiling_advanced_boundaries() -> None:
-    """Test comprehensive boundary conditions for _validate_interval_tiling."""
+    """Tests comprehensive boundary conditions for _validate_interval_tiling."""
     # 1. Exact single interval match
     assert _validate_interval_tiling([(0, 2048)], 2048) is True
 
@@ -955,3 +962,475 @@ def test_get_finished_preserves_unadmitted_requests_until_completion() -> None:
     _, done_recving_step2 = worker.get_finished()
     # Fully tiled request should now be admitted
     assert req_id in done_recving_step2
+
+
+def test_failed_chunk_triggers_recomputation() -> None:
+    """Simulates chunk 2 failing in _failed_recving and verifies recomputation.
+
+    Registers 3 sub-chunks for a 3072-token prompt across blocks [101, 102,
+    103]. Chunks 0 and 1 succeed, accumulating intervals [0, 1024) and [1024,
+    2048). Chunk 2 fails in engine completion polling. Verifies that the base
+    request is placed into _failed_recving, partial interval state is cleared,
+    get_finished() reports the request as completed, and
+    get_block_ids_with_load_errors() returns the full allocated block set
+    {101, 102, 103} for local recomputation.
+    """
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-subchunk-fail"
+    blocks = [101, 102, 103]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=3072
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        # Register 3 sub-chunks
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-0",
+            uuid=10001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-1",
+            uuid=10002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-2",
+            uuid=10003,
+            endpoint="10.0.0.1:9000",
+            token_base=2048,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+
+        # Chunks 0 and 1 succeed
+        engine.complete_read_results = [([], ["chunk-0", "chunk-1"], [])]
+        worker._poll_finished(engine)
+        assert set(worker._stage3_recv_intervals[req_id]) == {
+            (0, 1024),
+            (1024, 2048),
+        }
+        assert req_id not in worker._failed_recving
+
+        # Chunk 2 fails
+        engine.complete_read_results = [([], [], ["chunk-2"])]
+        worker._poll_finished(engine)
+
+        # Base request must be marked in _failed_recving
+        assert req_id in worker._failed_recving
+        # Partial interval state must be purged
+        assert worker._stage3_recv_intervals.get(req_id) is None
+        # Remaining in-flight chunks must be cleared
+        assert "chunk-2" not in worker._stage3_in_flight_recv_chunks
+
+        # get_finished() must report the failed request in done_recving
+        done_sending, done_recving = worker.get_finished()
+        assert req_id in done_recving
+
+        # get_block_ids_with_load_errors() must return all affected blocks
+        failed_blocks = worker.get_block_ids_with_load_errors()
+        assert failed_blocks == {101, 102, 103}
+
+        # Subsequent call must return empty set (drained)
+        assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_tiling_timeout_triggers_error() -> None:
+    """Simulates missing final chunk causing timeout without deadlock.
+
+    Registers 2 sub-chunks for a 2048-token prompt across blocks [201, 202].
+    Chunk 0 completes, while Chunk 1 is lost / delayed. Simulates timeout
+    expiration in _poll_finished / _wait_for_recving. Verifies that the request
+    enters error recovery, is marked in _failed_recving, reports done_recving
+    in get_finished(), and surfaces block IDs {201, 202} for local
+    recomputation.
+    """
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-tiling-timeout"
+    blocks = [201, 202]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        # Register chunk 0 and chunk 1
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-0-ok",
+            uuid=20001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-1-lost",
+            uuid=20002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+
+        # Chunk 0 arrives and completes
+        engine.complete_read_results = [([], ["chunk-0-ok"], [])]
+        worker._poll_finished(engine)
+        assert worker._stage3_recv_intervals[req_id] == [(0, 1024)]
+
+        # Simulate timeout by setting start time far in the past
+        worker._stage3_load_start_times[req_id] = time.perf_counter() - 10000.0
+
+        # Poll finished detecting timeout
+        engine.complete_read_results = [([], [], [])]
+        worker._poll_finished(engine)
+
+        assert req_id in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_id) is None
+
+        # Verify get_finished reports request as completed without deadlock
+        done_sending, done_recving = worker.get_finished()
+        assert req_id in done_recving
+
+        # Verify blocks are marked for recomputation
+        assert worker.get_block_ids_with_load_errors() == {201, 202}
+
+
+def test_wait_for_recving_timeout_recovers_without_deadlock() -> None:
+    """Verifies that _wait_for_recving times out safely on incomplete chunks."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-wait-timeout"
+    blocks = [301, 302]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+
+    with (
+        patch.object(worker, "_raiden_stage3_enabled", return_value=True),
+        patch(
+            f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+            return_value=0.01,
+        ),
+    ):
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-wait-0",
+            uuid=30001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+
+        # Chunk 0 arrives, chunk 1 never submitted
+        engine.complete_read_results = [([], ["chunk-wait-0"], [])]
+        worker._wait_for_recving({req_id})
+
+        # Request must be marked failed
+        assert req_id in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_id) is None
+
+        _, done_recving = worker.get_finished()
+        assert req_id in done_recving
+        assert worker.get_block_ids_with_load_errors() == {301, 302}
+
+
+def test_legacy_consumer_chunk_failure_triggers_recomputation() -> None:
+    """Verifies sub-chunk failure in non-Stage3 legacy path."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-legacy-fail"
+    blocks = [401, 402]
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._register_in_flight_recv_chunk(
+        transfer_id="legacy-chunk-0",
+        destination_req_id=req_id,
+        token_base=0,
+        num_tokens=1024,
+    )
+    worker._register_in_flight_recv_chunk(
+        transfer_id="legacy-chunk-1",
+        destination_req_id=req_id,
+        token_base=1024,
+        num_tokens=1024,
+    )
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=False):
+        # Chunk 0 succeeds, chunk 1 fails in poll_stats
+        engine.poll_results = [
+            ([], ["legacy-chunk-0"], []),
+            ([], [], ["legacy-chunk-1"]),
+        ]
+        worker._poll_finished(engine)
+        worker._poll_finished(engine)
+
+        assert req_id in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_id) is None
+
+        _, done_recving = worker.get_finished()
+        assert req_id in done_recving
+        assert worker.get_block_ids_with_load_errors() == {401, 402}
+
+
+def test_absorbing_failure_state_ignores_late_chunks() -> None:
+    """Verifies that late-arriving chunks do not resurrect a failed request."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-absorbing-fail"
+    blocks = [501, 502]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        # Register chunk 0 and chunk 1
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-0-fails",
+            uuid=50001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-1-late",
+            uuid=50002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+
+        # 1. Chunk 0 fails -> request becomes failed
+        engine.complete_read_results = [([], [], ["chunk-0-fails"])]
+        worker._poll_finished(engine)
+        assert req_id in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_id) is None
+
+        # 2. Chunk 1 arrives late -> must be ignored and not resurrect intervals
+        engine.complete_read_results = [([], ["chunk-1-late"], [])]
+        worker._poll_finished(engine)
+        assert req_id in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_id) is None
+        assert worker._is_stage3_recv_complete(req_id) is False
+
+        # Verify get_finished reports request as completed (in failure state)
+        _, done_recving = worker.get_finished()
+        assert req_id in done_recving
+        assert worker.get_block_ids_with_load_errors() == {501, 502}
+
+
+def test_mixed_concurrent_requests_isolate_failure_and_success() -> None:
+    """Verifies error isolation across concurrent requests."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_ok = "req-ok"
+    req_fail = "req-fail"
+    blocks_ok = [601, 602]
+    blocks_fail = [701, 702]
+
+    worker._update_stage3_state_after_alloc(
+        req_id=req_ok, expected_tokens=2048
+    )
+    worker._load_block_ids[req_ok] = list(blocks_ok)
+    worker._stage3_controller_accepted.add(req_ok)
+
+    worker._update_stage3_state_after_alloc(
+        req_id=req_fail, expected_tokens=2048
+    )
+    worker._load_block_ids[req_fail] = list(blocks_fail)
+    worker._stage3_controller_accepted.add(req_fail)
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        # Register chunks for req_ok
+        worker._start_stage3_recv_if_ready(
+            req_id="ok-0",
+            uuid=60001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_ok,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="ok-1",
+            uuid=60002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_ok,
+        )
+
+        # Register chunks for req_fail
+        worker._start_stage3_recv_if_ready(
+            req_id="fail-0",
+            uuid=70001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_fail,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="fail-1",
+            uuid=70002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_fail,
+        )
+
+        # ok-0, ok-1 succeed, fail-0 succeeds, fail-1 fails
+        engine.complete_read_results = [(
+            [],
+            ["ok-0", "ok-1", "fail-0"],
+            ["fail-1"],
+        )]
+        worker._poll_finished(engine)
+
+        assert req_ok not in worker._failed_recving
+        assert req_fail in worker._failed_recving
+        assert worker._stage3_recv_intervals.get(req_fail) is None
+
+        _, done_recving = worker.get_finished()
+        assert req_ok in done_recving
+        assert req_fail in done_recving
+
+        # Only req_fail's blocks must be reported as load errors
+        assert worker.get_block_ids_with_load_errors() == {701, 702}
+
+
+def test_uncertain_controller_failure_timeout_triggers_recomputation() -> None:
+    """Verifies expired pending controller failures trigger recomputation."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-uncertain-timeout"
+    blocks = [801, 802]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+    # Set expired pending controller failure deadline
+    worker._stage3_pending_controller_failures[req_id] = (
+        time.perf_counter() - 5.0
+    )
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        engine.complete_read_results = [([], [], [])]
+        worker._poll_finished(engine)
+
+        assert req_id in worker._failed_recving
+        assert req_id not in worker._stage3_pending_controller_failures
+
+        _, done_recving = worker.get_finished()
+        assert req_id in done_recving
+        assert worker.get_block_ids_with_load_errors() == {801, 802}
+
+
+def test_incomplete_multichunk_does_not_retire_to_terminal_loads() -> None:
+    """Verifies that partial multi-chunk recvs do not enter terminal loads."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-multichunk-progression"
+    blocks = [901, 902]
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+    worker._load_block_ids[req_id] = list(blocks)
+    worker._stage3_controller_accepted.add(req_id)
+
+    with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-step0",
+            uuid=90001,
+            endpoint="10.0.0.1:9000",
+            token_base=0,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+        worker._start_stage3_recv_if_ready(
+            req_id="chunk-step1",
+            uuid=90002,
+            endpoint="10.0.0.1:9000",
+            token_base=1024,
+            num_tokens=1024,
+            engine=engine,
+            destination_req_id=req_id,
+        )
+
+        # Step 1: Only chunk 0 completes
+        engine.complete_read_results = [([], ["chunk-step0"], [])]
+        worker._poll_finished(engine)
+
+        # Request must NOT be in _stage3_terminal_loads yet
+        assert req_id not in worker._stage3_terminal_loads
+        _, done_recving = worker.get_finished()
+        assert req_id not in done_recving
+
+        # Step 2: Chunk 1 completes
+        engine.complete_read_results = [([], ["chunk-step1"], [])]
+        worker._poll_finished(engine)
+
+        # Request must NOW be in _stage3_terminal_loads
+        assert req_id in worker._stage3_terminal_loads
+        _, done_recving = worker.get_finished()
+        assert req_id in done_recving
+
+
+def test_tpu_connector_load_errors_group_index() -> None:
+    """Verifies get_block_ids_with_load_errors_group_index returns FA group."""
+    cfg = _make_mock_consumer_vllm_config()
+    cfg.kv_transfer_config.kv_connector_extra_config = {
+        "use_raiden_connector": True
+    }
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_groups = [
+        SimpleNamespace(kv_cache_spec=MagicMock())  # FA group 0
+    ]
+
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=0),
+        patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=1),
+        patch(f"{_MOD}.dist_utils.get_node_id", return_value=0),
+        patch(f"{_MOD}.dist_utils.get_host_ip", return_value="127.0.0.1"),
+        patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value=9100),
+    ):
+        connector = TPUConnector(
+            cfg, role=MagicMock(), kv_cache_config=kv_cache_config
+        )
+        connector._stage3_fa_group_index = 0
+        assert connector.get_block_ids_with_load_errors_group_index() == 0
+
+        # When Stage 3 is not enabled, returns None
+        with patch(f"{_MOD}._use_raiden_stage3_transport", return_value=False):
+            assert (
+                connector.get_block_ids_with_load_errors_group_index() is None
+            )
+
