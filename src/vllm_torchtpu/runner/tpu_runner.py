@@ -2888,6 +2888,33 @@ class TPUModelRunner(GPUModelRunner):
         assert num_reqs > 0
         assert start_index < num_reqs
 
+        # Zero-overhead fast path for steady decode:
+        # In steady decode (1 token scheduled per req, same batch, and async next tokens ready),
+        # all layout plans, attention metadata structures, and indices are 100% invariant.
+        # We advance positions and seq_lens directly on TPU in-place and early-return the cached tuple,
+        # completely bypassing ~440 lines of Python loops, layout planning, and object allocations.
+        cur_req_ids = self.input_batch.req_ids[start_index:num_reqs]
+        is_steady_step = (
+            start_index == 0
+            and scheduler_output.total_num_scheduled_tokens == num_reqs
+            and getattr(self, "_cached_steady_inputs_tuple", None) is not None
+            and getattr(self, "_steady_batch_req_ids", None) == cur_req_ids
+            and hasattr(self, "_device_positions")
+            and hasattr(self, "_device_seq_lens")
+            and (self._pre_async_results is not None and self._pre_async_results.next_tokens_tpu is not None)
+            and self.speculative_config is None
+        )
+        if is_steady_step:
+            self._device_positions.add_(1)
+            self._device_seq_lens.add_(1)
+            self.position_ids = self._device_positions
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[:len(self._device_positions)]
+            self._last_sequence_layout_plan = self._cached_steady_inputs_tuple[9]
+            return self._cached_steady_inputs_tuple
+
         # Get the number of scheduled tokens for each request.
         use_max_model_len = self.most_model_len is None
         num_scheduled_tokens_per_req = []
@@ -3308,7 +3335,7 @@ class TPUModelRunner(GPUModelRunner):
         self._collect_mamba_state_seed_copies(scheduler_output, start_index,
                                               num_reqs)
 
-        return (
+        res_tuple = (
             per_layer_attn_metadata,
             logits_indices,
             padded_num_reqs,
@@ -3320,6 +3347,12 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids,
             layout_plan,
         )
+        if (start_index == 0
+                and max_num_scheduled_tokens_all_reqs == 1
+                and self.speculative_config is None):
+            self._cached_steady_inputs_tuple = res_tuple
+            self._steady_batch_req_ids = list(cur_req_ids)
+        return res_tuple
 
     def _get_model_inputs(
         self,
