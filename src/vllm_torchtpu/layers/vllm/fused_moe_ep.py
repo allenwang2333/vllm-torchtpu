@@ -53,7 +53,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-from vllm_torchtpu.kernels.fused_moe.v2.host import ragged_stride_bound
+from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -63,10 +63,10 @@ logger = init_logger(__name__)
 # is not free to change here alone.
 _TILE_M = 128
 
-# SMEM the kernel's prefetched routing tables have to fit in, in bytes. The
-# tables are i32 and `ragged_stride_bound` long; see the gate in
-# `prebuild_fused_moe_ep` for why this is the real limit on the token count.
-_ROUTING_TABLE_SMEM_BUDGET = 1024 * 1024
+# SMEM used by the resident routing tables and Mosaic's scalar working set,
+# excluding the two fixed token-gather windows. Measured by subtracting the
+# former full token-gather scalar-prefetch table at the allocation boundary.
+_SMEM_OVERHEAD_BYTES = 236 * 1024
 
 # One op for every shape: `fused_ep_moe_v2` derives its routing block and ragged
 # stride from the operands when they are not given, so nothing here has to vary
@@ -92,18 +92,13 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # -- read things that are not in it. So prebuild hands the op back to the caller
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
-_OPS: dict[tuple[int, bool, str], Any] = {}
-_EP_SIZE: int | None = None
-# The next two are facts about the MESH, not about a layer, so one copy for the
-# process is what they are: every layer in a deployment sees the same EP group.
-#
+_OPS: dict[tuple[int, bool, str, tuple[int, ...] | None, bool], Any] = {}
+# This is a fact about the mesh, not about a layer, so one copy for the process
+# is what it is: every layer in a deployment sees the same EP group.
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
 # see the note in fused_ep_moe_v2 on why a value computed inside the traced
 # function turns into a `partition-id` XLA will not accept.
 _RANK_BUFFER: Any = None
-# Which EP rank's expert block sits at each mesh index, or None for the
-# identity. See `_to_mesh_expert_order`.
-_EXPERT_ORDER: Any = None
 
 # The attribute prebuild's result is recorded under, on the quant method that
 # owns the layer. vLLM builds one quant method per MoE layer
@@ -156,12 +151,13 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str):
+def _build_op(mesh, topk: int, renormalize: bool, activation: str,
+              mesh_expert_order: tuple[int, ...] | None, sharded_plan: bool):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import (WeightFormat,
                                                     fused_ep_moe_v2)
 
-    key = (topk, renormalize, activation)
+    key = (topk, renormalize, activation, mesh_expert_order, sharded_plan)
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -199,7 +195,9 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str):
                                block=None,
                                ragged_stride=None,
                                weight_format=WeightFormat.FP8,
-                               act_fn=activation)
+                               act_fn=activation,
+                               mesh_ep_ranks=mesh_expert_order,
+                               sharded_plan=sharded_plan)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
@@ -247,42 +245,31 @@ def fused_moe_ep(
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     return op(hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-              _squeeze_channel_scale_checked(w2_scale),
-              _to_mesh_expert_order(router_logits), _RANK_BUFFER)
+              _squeeze_channel_scale_checked(w2_scale), router_logits,
+              _RANK_BUFFER)
 
 
-def _to_mesh_expert_order(router_logits: torch.Tensor) -> torch.Tensor:
-    """Reindex the expert axis from EP-rank order to mesh order.
-
-    The kernel reads a token's expert id as `mesh_index * experts_per_shard +
-    j`, but vLLM numbers experts by EP rank, and the mesh is ordered by device
-    id (see `ep_mesh.ep_rank_order`). Where those two orders differ, the block
-    of logits for EP rank r has to move to the position of the mesh index that
-    rank sits at. The output is per token, so nothing has to be undone
-    afterwards. `_EXPERT_ORDER` is None when the orders already agree, which is
-    every deployment whose EP ranks come up in device-id order.
-    """
-    if _EXPERT_ORDER is None:
-        return router_logits
-    # Split and rejoin the expert axis without naming the token axis: reading
-    # `shape[0]` here would put the token count in the traced graph.
-    blocks = router_logits.unflatten(-1, (_EP_SIZE, -1))
-    return blocks.index_select(-2, _EXPERT_ORDER).flatten(-2)
-
-
-def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
+def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
     """Which EP rank's expert block belongs at each mesh index, or None.
 
-    None means the identity, so the hot path can skip the gather entirely.
+    The tuple is static configuration closed into the JAX op. The router keeps
+    its original EP-rank order; only the selected expert IDs are mapped inside
+    the op after top-k.
     """
     order = ep_rank_order()
-    if order is None or tuple(order) == tuple(range(ep)):
+    if order is None:
+        return None
+    order = tuple(order)
+    if tuple(sorted(order)) != tuple(range(ep)):
+        raise ValueError(
+            f"EP rank order must permute range({ep}); got {order}")
+    if order == tuple(range(ep)):
         return None
     # A tuple, not a list: `info_once` keys its cache on the arguments.
     logger.info_once(
         "Fused EP MoE: EP ranks are not in device-id order, so the expert "
-        "axis is reindexed to mesh order | ep_rank_at_mesh_index=%s", order)
-    return torch.tensor(order, dtype=torch.int32, device=device)
+        "IDs are relabelled after top-k | ep_rank_at_mesh_index=%s", order)
+    return order
 
 
 def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
@@ -314,7 +301,6 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     records it, which is what makes arming per layer rather than per process --
     several of the refusals below read things that vary by layer.
     """
-    global _EP_SIZE
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return None
 
@@ -331,39 +317,12 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             "expert-parallel, so each shard would hold the whole expert set.")
         return None
 
-    # Two separate things stop this kernel serving under tensor parallelism,
-    # and they were conflated for a long time. Both are gated here.
-    #
-    # FIRST, a compile-time SMEM bound, driven by the TOKEN COUNT rather than
-    # by TP.
-    #
-    # The kernel prefetches its routing tables into SMEM at the head of the
-    # program, and they are sized by `ragged_stride_bound(T, topk, e_total,
-    # capacity)` i32 entries against a 1 MiB budget. For Qwen3.5-397B
-    # (topk 10, 512 experts, capacity 128) that crosses 1 MiB between
-    # T = 25,843 and T = 32,768: `ragged_stride_bound(32768, ...) * 4` is
-    # 1,325,568, which is exactly the size the compiler reported when every
-    # worker died. So the failure is a token-count crossing.
-    #
-    # TP only LOOKED causal because under plain tensor parallelism the batch
-    # is replicated, so each rank hands the op a full copy as its shard and
-    # the kernel's global T becomes node_tokens * tp_size. At the benchmark's
-    # 16,384-token chunk that is 131,072 tokens and 5.25 MB of tables -- five
-    # times over -- while the same chunk under DP8 is 16,384 tokens and fits.
-    # "tp > 1" and "T too large" coincided at the batch we happened to run.
-    #
-    # The bound is gated below, once the mesh gives us the EP width. It is
-    # not TP-specific -- a DP deployment above ~3,200 tokens per engine
-    # crosses it too, and used to die the same way.
-    #
-    # SECOND, and independently, the kernel DEADLOCKS under tensor
-    # parallelism. With the SMEM bound respected (chunk 2048, so 16,384
-    # global tokens and 670 KB of tables) it now arms, compiles every bucket
-    # and enters the warmup ladder -- and then every worker hangs inside
-    # `_dummy_run` and is killed by a libtpu telemetry abort. Measured
-    # 2026-08-20 on TP8; chunk 3072 does not even compile ("Program smem
-    # requirement 1.11M", the tables plus ~115 KB of other prefetched
-    # operands).
+    # The former full token-gather scalar-prefetch table made this path look
+    # token-count limited under TP and at a 4K/rank DP8 bucket. The table now
+    # remains in HBM and is streamed through two fixed SMEM windows, so that
+    # compile-time limit is gone. Tensor parallelism is still refused for an
+    # independent reason: the kernel deadlocks during warmup, and a replicated
+    # batch would also make every rank repeat the full expert work.
     #
     # That hang is NOT specific to this kernel: the fused reduce-scatter MoE
     # kernel, written independently, fails at the same phase with the same
@@ -374,8 +333,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # XLA all-reduces. The untested candidate is GDN's `ragged_all_to_all`, a
     # data-dependent collective in 45 of this model's 60 layers.
     #
-    # So TP is still refused, but now for the reason that actually holds.
-    # There is a third thing worth knowing before anyone lifts it: under
+    # There is another thing worth knowing before anyone lifts it: under
     # replicated TP each rank hands the op a full copy of the batch as its
     # shard, so the kernel does ep_size times the expert work for one batch
     # of output. Lifting the refusal usefully needs the bridge to hand each
@@ -420,33 +378,25 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                          "the grouped-matmul path serves every step.")
         return None
     ep = mesh.shape[EP_AXIS_NAME]
-    _EP_SIZE = ep
 
-    # `_max_node_tokens(ep)` is already the GLOBAL token count this kernel
-    # sees: under DP it is the per-engine cap times the engines, and under
-    # replicated TP it is the per-rank batch times the ranks, because every
-    # rank hands the op a full copy as its shard.
-    global_tokens = _max_node_tokens(ep)
-    if global_tokens:
-        table_bytes = ragged_stride_bound(
-            global_tokens, topk, layer.global_num_experts, _TILE_M) * 4
-        if table_bytes > _ROUTING_TABLE_SMEM_BUDGET:
-            logger.warning_once(
-                "Fused EP MoE not engaged: at %d global tokens its routing "
-                "tables need %d B of SMEM, over the %d B budget. Cap "
-                "--max-num-batched-tokens at %d, or shard the token axis so "
-                "the kernel sees fewer tokens.", global_tokens, table_bytes,
-                _ROUTING_TABLE_SMEM_BUDGET,
-                _max_node_tokens_fitting_smem(topk, layer.global_num_experts,
-                                              ep))
-            return None
-    global _RANK_BUFFER, _EXPERT_ORDER
+    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
+    smem = _smem_capacity_bytes()
+    if needed_smem > smem:
+        logger.warning_once(
+            "Fused EP MoE not engaged: its fixed routing working set needs "
+            "%d B of this chip's %d B SMEM (%d B for two streamed "
+            "token-gather windows and about %d B for resident tables and "
+            "compiler working memory).", needed_smem, smem, gather_bytes,
+            _SMEM_OVERHEAD_BYTES)
+        return None
+    global _RANK_BUFFER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
     _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
                                 dtype=torch.int32,
                                 device=layer.w13_weight.device)
-    _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
+    mesh_expert_order = _mesh_expert_order(ep)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
@@ -490,10 +440,13 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
-    op = _build_op(mesh, topk, renormalize, activation)
+    sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    op = _build_op(mesh, topk, renormalize, activation, mesh_expert_order,
+                   sharded_plan)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d capacity=%d", hidden, inter, local_experts, ep, topk, _TILE_M)
+        "topk=%d capacity=%d sharded_plan=%s", hidden, inter, local_experts,
+        ep, topk, _TILE_M, sharded_plan)
     # Two knobs stop applying the moment this arms, and neither would say so on
     # its own: the fused call returns before `apply_monolithic` reaches either
     # the padding mask or the chunked path. Padding costs expert work and
@@ -607,21 +560,13 @@ def _max_node_tokens(ep: int) -> int:
     return int(cap) * ep if isinstance(cap, int) else 0
 
 
-def _max_node_tokens_fitting_smem(topk: int, e_total: int, ep: int) -> int:
-    """Largest per-step node-wide token count whose routing tables fit SMEM.
-
-    Reported in the refusal so the operator is told the number to set rather
-    than left to bisect --max-num-batched-tokens by hand. Divided by the EP
-    width to undo `_max_node_tokens`, which is the scheduler's per-engine cap
-    times the engines: what the operator sets is the per-engine number.
-    """
-    lo, hi = 1, 1 << 20
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        fits = ragged_stride_bound(mid, topk, e_total,
-                                   _TILE_M) * 4 <= _ROUTING_TABLE_SMEM_BUDGET
-        lo, hi = (mid, hi) if fits else (lo, mid - 1)
-    return lo // max(ep, 1)
+def _smem_capacity_bytes() -> int:
+    """This chip's scalar memory, or tpu7x's outside a device process."""
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+        return int(pltpu.get_tpu_info().smem_capacity_bytes)
+    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
+        return 1024 * 1024
 
 
 def _pcp_size(layer) -> int:
