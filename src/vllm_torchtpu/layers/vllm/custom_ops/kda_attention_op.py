@@ -9,6 +9,8 @@
 
 import math
 import os
+from collections.abc import Callable
+from typing import TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +29,18 @@ from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_VerifyWindowResult = TypeVar("_VerifyWindowResult")
+
+
+def _guard_kda_verify_window(
+    num_window_reqs: jax.Array,
+    run_verify_window: Callable[[], _VerifyWindowResult],
+    skip_verify_window: Callable[[], _VerifyWindowResult],
+) -> _VerifyWindowResult:
+    """Skip KDA verification when the device-side window is empty."""
+    return jax.lax.cond(num_window_reqs > 0, run_verify_window,
+                        skip_verify_window)
 
 
 def _use_fused_kda() -> bool:
@@ -583,8 +597,9 @@ def _dispatched_kda_core(
                 conv_after_decode, pool_after_decode)
 
     if num_spec_tokens > 0:
-        verify_out, conv_after_verify, pool_after_verify = jax.lax.cond(
-            decode_end < window_end, run_verify, skip_verify)
+        verify_out, conv_after_verify, pool_after_verify = \
+            _guard_kda_verify_window(window_end - decode_end, run_verify,
+                                     skip_verify)
     else:
         verify_out, conv_after_verify, pool_after_verify = skip_verify()
 
