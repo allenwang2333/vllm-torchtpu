@@ -2493,6 +2493,24 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
+        # On-device token passing in steady-state decode:
+        # If all input tokens match previous step's next_tokens_tpu 1:1 on device,
+        # directly slice next_tokens_tpu on-device without H2D index uploads or scatter kernel.
+        if (len(token_in_tpu_cur_input_indices) == len(input_ids)
+                and np.array_equal(token_in_tpu_cur_input_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))
+                and np.array_equal(token_in_tpu_pre_next_tokens_indices,
+                                   np.arange(len(input_ids), dtype=np.int32))):
+            if (self._pre_async_results is not None
+                    and self._pre_async_results.next_tokens_tpu is not None):
+                next_tpu = self._pre_async_results.next_tokens_tpu.flatten()
+                if len(next_tpu) >= len(input_ids):
+                    return next_tpu[:len(input_ids)]
+            elif getattr(self, "_last_selected_tokens_tpu", None) is not None:
+                next_tpu = self._last_selected_tokens_tpu.flatten()
+                if len(next_tpu) >= len(input_ids):
+                    return next_tpu[:len(input_ids)]
+
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside
@@ -3015,28 +3033,61 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
-        if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[:, total_num_scheduled_tokens:
-                                         padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:,
-                                                         local_token_slice].to(
-                                                             self.device,
-                                                             non_blocking=True)
+        cur_batch_req_ids = tuple(self.input_batch.req_ids[start_index:start_index + num_reqs])
+        is_steady_decode = (
+            total_num_scheduled_tokens == num_reqs
+            and (
+                (self._pre_async_results is not None and self._pre_async_results.next_tokens_tpu is not None)
+                or getattr(self, "_last_selected_tokens_tpu", None) is not None
+            )
+            and getattr(self, "_active_batch_req_ids", None) == cur_batch_req_ids
+            and hasattr(self, "_device_positions")
+            and hasattr(self, "_device_seq_lens")
+            and self._device_positions.shape == self.positions_cpu[local_token_slice].shape
+        )
+
+        if is_steady_decode:
+            # Steady-state decode: ZERO H2D Uploads!
+            # 1. input_ids sliced from on-device placeholder / buffer
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[local_token_slice]
+
+            # 2. position_ids advanced on-device via add_(1)
+            self._device_positions.add_(1)
+            self.position_ids = self._device_positions
+
+            # 3. seq_lens advanced on-device via add_(1)
+            self._device_seq_lens.add_(1)
+            seq_lens = self._device_seq_lens
+            target_num_reqs = self.num_reqs_most_model_len if not use_max_model_len else self.num_reqs_max_model_len
         else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
+            # Control-plane change or initial step: perform standard H2D upload
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
                 self.device, non_blocking=True)
-        if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
+            if self.uses_mrope:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.mrope_positions.cpu[:, total_num_scheduled_tokens:
+                                             padded_total_num_scheduled_tokens] = 0
+                self._device_positions = self.mrope_positions.cpu[:,
+                                                             local_token_slice].to(
+                                                                 self.device,
+                                                                 non_blocking=True)
+            else:
+                self._device_positions = self.positions_cpu[local_token_slice].to(
+                    self.device, non_blocking=True)
+            self.position_ids = self._device_positions
+
+            if use_max_model_len:
+                target_num_reqs = self.num_reqs_max_model_len
+            else:
+                assert self.num_reqs_most_model_len is not None
+                target_num_reqs = self.num_reqs_most_model_len
+            self._device_seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
                 self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_most_model_len
+            seq_lens = self._device_seq_lens
+            self._active_batch_req_ids = cur_batch_req_ids
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
@@ -3185,7 +3236,12 @@ class TPUModelRunner(GPUModelRunner):
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
-            combined_device = combined.to(self.device, non_blocking=True)
+            chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
+            if (not hasattr(self, "_cached_comb_dev")
+                    or getattr(self, "_cached_comb_key", None) != chunk_comb_key):
+                self._cached_comb_dev = combined.to(self.device, non_blocking=True)
+                self._cached_comb_key = chunk_comb_key
+            combined_device = self._cached_comb_dev
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
@@ -4137,6 +4193,7 @@ class TPUModelRunner(GPUModelRunner):
                 # inside AsyncTPUCopyState to avoid per-`num_reqs` recompiles.
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
+                self._last_selected_tokens_tpu = selected_token_ids
                 if self.scheduler_config.async_scheduling:
                     next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
                     for req_idx in range(cur_start_idx, cur_end_idx):

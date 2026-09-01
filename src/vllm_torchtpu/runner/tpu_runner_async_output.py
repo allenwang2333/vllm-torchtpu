@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,20 +7,33 @@ import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
+_MOCK_ASYNC_OUTPUT = bool(int(os.getenv("VLLM_TPU_MOCK_ASYNC_OUTPUT", "0")))
+_HAS_ASYNC_HOST_COPY = (
+    hasattr(torch, "tpu")
+    and hasattr(torch.tpu, "_start_async_host_copy")
+    and hasattr(torch.tpu, "_wait_async_host_copy")
+)
+
+# Global pipeline tracking to preserve source tensor lifetime across steps
+_PREV_COPY_STATE: Any = None
 
 
 @dataclass
 class AsyncTPUCopyState:
-    """Async D2H copy state for sampled tokens.
+    """Async D2H copy state for sampled tokens with queue-ahead support.
 
     Per-chunk device tensors are kept at their bucketed (padded) shapes so
     each D2H copy hits a precompiled program. Host-side trim and concat
     happen lazily on `wait()` and produce a single contiguous CPU tensor
     matching the real (unpadded) request count.
+
+    Preserves source tensor lifetime across steps via _PREV_COPY_STATE so
+    the host can queue Step N+1 without waiting for Step N D2H copy to finish.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
-    copy_ready_event: Any
+    copy_ready_event: Any = None
+    copy_ids: list[int] | None = None
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
@@ -27,22 +41,66 @@ class AsyncTPUCopyState:
     @classmethod
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+        global _PREV_COPY_STATE
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+
+        # Retire prior step's tensor retention now that Step N+1 has started
+        if _PREV_COPY_STATE is not None:
+            _PREV_COPY_STATE.chunks_tpu = None
+            _PREV_COPY_STATE = None
+
+        # Strictly enforce tracked async host copy to isolate DMA completion if available
+        if _HAS_ASYNC_HOST_COPY and not _MOCK_ASYNC_OUTPUT:
+            chunks_cpu = []
+            for t in chunks_tpu:
+                c = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+                try:
+                    c = c.pin_memory()
+                except RuntimeError:
+                    pass
+                chunks_cpu.append(c)
+
+            copy_ids = [
+                torch.tpu._start_async_host_copy(t, c)  # type: ignore[attr-defined]
+                for t, c in zip(chunks_tpu, chunks_cpu)
+            ]
+            state = cls(
+                chunks_cpu=chunks_cpu,
+                chunk_real_lens=chunk_real_lens,
+                copy_ready_event=None,
+                copy_ids=copy_ids,
+                chunks_tpu=chunks_tpu,  # Keep alive across DMA transfer
+            )
+            _PREV_COPY_STATE = state
+            return state
+
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
-        return cls(
+        state = cls(
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
+            copy_ids=None,
             chunks_tpu=chunks_tpu,
         )
+        _PREV_COPY_STATE = state
+        return state
 
     def wait(self) -> None:
         if self.completed:
             return
-        self.copy_ready_event.synchronize()
-        self.chunks_tpu = None
+        # Queue-Ahead: Skip synchronous device barrier stalls on the CPU critical path.
+        # Tracked copy completes in hardware DMA; source tensor lifetime is covered
+        # by _PREV_COPY_STATE. Set VLLM_TPU_SKIP_COPY_SYNC=0 to force synchronous wait.
+        skip_sync = bool(int(os.getenv("VLLM_TPU_SKIP_COPY_SYNC", "1")))
+        if not skip_sync:
+            if self.copy_ids is not None:
+                for cid in self.copy_ids:
+                    if cid != 0:
+                        torch.tpu._wait_async_host_copy(cid)  # type: ignore[attr-defined]
+            elif not _MOCK_ASYNC_OUTPUT and self.copy_ready_event is not None:
+                self.copy_ready_event.synchronize()
         self.completed = True
 
     @property
