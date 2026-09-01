@@ -3665,10 +3665,17 @@ class TPUModelRunner(GPUModelRunner):
                 curr_tokens = first_sampled
                 for _ in range(multi_step - 1):
                     self.position_ids = self.position_ids + 1
-                    if hasattr(attn_metadata, "input_positions"):
-                        attn_metadata.input_positions = self.position_ids
-                    if hasattr(attn_metadata, "seq_lens"):
-                        attn_metadata.seq_lens = attn_metadata.seq_lens + 1
+                    if isinstance(attn_metadata, dict):
+                        for meta in attn_metadata.values():
+                            if hasattr(meta, "input_positions") and meta.input_positions is not None:
+                                meta.input_positions = self.position_ids
+                            if hasattr(meta, "seq_lens") and meta.seq_lens is not None:
+                                meta.seq_lens = meta.seq_lens + 1
+                    else:
+                        if hasattr(attn_metadata, "input_positions") and attn_metadata.input_positions is not None:
+                            attn_metadata.input_positions = self.position_ids
+                        if hasattr(attn_metadata, "seq_lens") and attn_metadata.seq_lens is not None:
+                            attn_metadata.seq_lens = attn_metadata.seq_lens + 1
 
                     with set_forward_context(
                             attn_metadata,
