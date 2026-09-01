@@ -31,7 +31,11 @@
 #                                 to keep K3's vision modality out of the
 #                                 multimodal token budget
 #   +--model-loader-extra-config  runai host-memory cap; K3 streaming OOMs the
-#                                 host without it, and it is inert under dummy
+#                                 host without it. NOT inert under dummy --
+#                                 vLLM rejects it outright ("Model loader extra
+#                                 config is not supported for load format
+#                                 dummy", measured on CDK j-94240ea7) -- so it
+#                                 is emitted only on the streaming path
 MODEL="moonshotai/Kimi-K3"
 MODEL_URI="${MODEL_URI:-gs://tpu-commons-ci/moonshootai/kimi/k3}"
 # dummy => stage only the checkpoint's metadata and let vLLM randomise the
@@ -70,7 +74,16 @@ K3_COMPILE_SIZES="${K3_COMPILE_SIZES:-[4,8,16,32,8192]}"
 K3_BLOCK_SIZE="${K3_BLOCK_SIZE:-16}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size $K3_BLOCK_SIZE --compilation-config {\"compile_sizes\":$K3_COMPILE_SIZES}"
+# A loader knob is only legal on the loader that has it. vLLM raises
+# "Model loader extra config is not supported for load format dummy" and the
+# engine core dies at worker init, which is 40 s into a bring-up and looks
+# nothing like a config error in the job log.
+LOADER_EXTRA_CONFIG=""
+if [ "${LOAD_FORMAT:-}" != "dummy" ]; then
+  LOADER_EXTRA_CONFIG=" --model-loader-extra-config {\"memory_limit\":17179869184}"
+fi
+
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0}${LOADER_EXTRA_CONFIG} --block-size $K3_BLOCK_SIZE --compilation-config {\"compile_sizes\":$K3_COMPILE_SIZES}"
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }--trust-remote-code"
 
 BENCHMARK_TEMPERATURE="0"

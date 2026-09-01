@@ -21,6 +21,12 @@ run needs both:
       greedy continuation separates a model emitting text from a model stuck
       in a cycle, with no reference output and no tokenizer.
 
+  agree <root> <arm,arm,...>       (also runs `divergence`)
+  divergence <root> <arm,arm,...>
+      How far apart are two arms numerically, in nats of top-1 logprob over
+      the common token prefix? A boolean "not identical" cannot separate a
+      reordered reduction from a miscompile; a magnitude can.
+
   agree <root> <arm,arm,...>
       Do two arms produce THE SAME greedy tokens? Far more sensitive than the
       ratio: an arm whose collective is miscompiled can still emit fluent
@@ -104,11 +110,60 @@ def agree(root: str, arms: list[str]) -> int:
     return 0
 
 
+def divergence(root: str, arms: list[str]) -> int:
+    """Magnitude, not a boolean: how far apart are two arms numerically?
+
+    `agree` says whether two arms produced the same tokens. It cannot say
+    whether a difference is a reordered reduction (which any change of
+    collective implementation produces, and which is harmless) or a
+    miscompile. The top-1 logprob at each position is a continuous readout of
+    the same forward pass, so |dlogprob| over the COMMON token prefix
+    separates the two: bf16-scale reordering perturbs it by ~1e-2 nats,
+    corruption by O(1).
+    """
+    caps = {}
+    for arm in arms:
+        path = os.path.join(root, arm, "completions.json")
+        if os.path.exists(path):
+            caps[arm] = json.load(open(path))
+    for x, y in itertools.combinations(caps, 2):
+        deltas, first_tok_div, npos = [], [], 0
+        for key in sorted(caps[x]):
+            cx, cy = caps[x].get(key, {}), caps[y].get(key, {})
+            if "error" in cx or "error" in cy:
+                continue
+            tx, ty = _tokens(cx), _tokens(cy)
+            lx = cx.get("token_logprobs") or []
+            ly = cy.get("token_logprobs") or []
+            n = 0
+            while n < min(len(tx), len(ty)) and tx[n] == ty[n]:
+                n += 1
+            first_tok_div.append(n)
+            for i in range(min(n, len(lx), len(ly))):
+                if lx[i] is not None and ly[i] is not None:
+                    deltas.append(abs(lx[i] - ly[i]))
+                    npos += 1
+        if not deltas:
+            print(f"K3DIVERGE {x} vs {y}: no comparable positions")
+            continue
+        deltas.sort()
+        print(f"K3DIVERGE {x} vs {y}: over {npos} matched-token positions "
+              f"mean|dlogprob|={sum(deltas)/len(deltas):.4f} "
+              f"median={deltas[len(deltas)//2]:.4f} max={deltas[-1]:.4f} nats; "
+              f"first token divergence at index "
+              f"min={min(first_tok_div)} median="
+              f"{sorted(first_tok_div)[len(first_tok_div)//2]} max={max(first_tok_div)}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) >= 4 and argv[1] == "sanity":
         return sanity(argv[2], argv[3])
     if len(argv) >= 4 and argv[1] == "agree":
-        return agree(argv[2], argv[3].split(","))
+        rc = agree(argv[2], argv[3].split(","))
+        return rc or divergence(argv[2], argv[3].split(","))
+    if len(argv) >= 4 and argv[1] == "divergence":
+        return divergence(argv[2], argv[3].split(","))
     print(f"usage: {argv[0]} sanity <captures.json> <arm>\n"
           f"       {argv[0]} agree <root> <arm,arm,...>", file=sys.stderr)
     return 2
