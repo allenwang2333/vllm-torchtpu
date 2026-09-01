@@ -570,6 +570,7 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
+        skip_when: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
@@ -649,60 +650,89 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
-            out_shape=(out_shape, in_conv_state, in_recurrent_state),
-            in_specs=(
-                metadata_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                None if pooled else hbm_spec,
-                in_out_spec,
-                weights_spec,
-            ),
-            out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
-            input_output_aliases=input_output_aliases,
-            compiler_params=pltpu.CompilerParams(
-                disable_bounds_checks=True,
-                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
-            ),
-            name=cfg.get_kernel_name(),
-            metadata=cfg.get_metadata(),
-        )(
-            metadata_obj,
-            qkv,
-            b,
-            a,
-            in_conv_state,
-            in_recurrent_state,
-            in_act,
-            weights,
-        )
+        def launch():
+            return pl.pallas_call(
+                functools.partial(outer_kernel, cfg=cfg),
+                out_shape=(out_shape, in_conv_state, in_recurrent_state),
+                in_specs=(
+                    metadata_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    None if pooled else hbm_spec,
+                    in_out_spec,
+                    weights_spec,
+                ),
+                out_specs=(hbm_spec, hbm_spec,
+                           None if pooled else hbm_spec),
+                scratch_shapes=cfg.get_scratch_shape_dict(),
+                input_output_aliases=input_output_aliases,
+                compiler_params=pltpu.CompilerParams(
+                    disable_bounds_checks=True,
+                    vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+                ),
+                name=cfg.get_kernel_name(),
+                metadata=cfg.get_metadata(),
+            )(
+                metadata_obj,
+                qkv,
+                b,
+                a,
+                in_conv_state,
+                in_recurrent_state,
+                in_act,
+                weights,
+            )
 
-    # PERSEQ guard. The per-seq segment spans [distribution[0],
-    # distribution[-1]).  In pure decode it is empty, the PER_SEQ kernel's
-    # inner emit_pipeline grid has zero tiles, and the pallas_call is pure
-    # launch overhead (3.53 us x 45 linear-attention layers = 0.159 ms/step,
-    # measured).  The predicate is a traced device value, so lax.cond is the
-    # only available guard.  No numerics change: the false branch returns
-    # exactly what an empty-grid kernel would have written back through its
-    # input_output_aliases.
-    per_seq_nonempty = distribution[-1] > distribution[0]
+        if skip_when is None:
+            return launch()
+
+        # A segment with no sequences gives `num_tiles == 0`, so `launch()`
+        # runs the pipeline zero times and every output is its aliased input,
+        # unchanged. Skipping it is therefore an identity, not an
+        # approximation -- but only if the whole call is skipped, because the
+        # launch itself is not free: the metadata still lands in SMEM and the
+        # scoped VMEM windows and semaphores are still set up.
+        #
+        # This is a branch on a device value inside one traced graph, not a
+        # host branch on batch composition, so it is safe under the no-guards
+        # compile wrapper -- the same argument `layers/vllm/custom_ops/
+        # kda_attention_op.py:_short_conv` makes for the same situation, and
+        # `kernels/gdn/reference/ragged_gated_delta_rule_wrapper.py:274`
+        # already branches a whole GDN kernel on `is_decode_only` this way.
+        #
+        # `metadata_obj` is deliberately computed OUTSIDE this conditional.
+        # It is identical for all 45 GDN layers and XLA CSEs it to a single
+        # computation today; sinking it into 45 separate `conditional`
+        # regions would defeat that and could cost more than the launch.
+        def identity():
+            return (in_act, in_conv_state, in_recurrent_state)
+
+        return jax.lax.cond(skip_when, identity, launch)
+
+    # `distribution` is [decode_end, prefill_end, mixed_end], so the per-seq
+    # (ragged / prefill) segment is the half-open range
+    # [distribution[0], distribution[-1]). Empty on every pure-decode step.
+    #
+    # When it is empty the PER_SEQ kernel's inner emit_pipeline loop has zero
+    # tiles and the pallas_call is pure launch overhead: 3.53 us x 45
+    # linear-attention layers = 0.159 ms/step at bucket 32 (measured -- and
+    # NOT a constant; at MNBT=512 the same empty call costs 14.68 us). The
+    # predicate is a traced device value, so the lax.cond inside call_kernel
+    # is the only available guard. No numerics change: the skipped branch
+    # returns exactly what an empty kernel would have written back through
+    # its input_output_aliases.
+    no_per_seq_work = distribution[0] >= distribution[-1]
 
     if pooled:
         out_act, out_source, _ = call_kernel(state_source, None, None,
                                              config.GDNMode.BATCHED)
-        out_act, out_source = jax.lax.cond(
-            per_seq_nonempty,
-            lambda src, act: call_kernel(src, None, act,
-                                         config.GDNMode.PER_SEQ)[:2],
-            lambda src, act: (act, src),
-            out_source,
-            out_act,
-        )
+        out_act, out_source, _ = call_kernel(out_source,
+                                             None,
+                                             out_act,
+                                             config.GDNMode.PER_SEQ,
+                                             skip_when=no_per_seq_work)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -710,14 +740,12 @@ def fused_conv1d_gdn(
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
-        per_seq_nonempty,
-        lambda cs, rs, act: call_kernel(cs, rs, act, config.GDNMode.PER_SEQ),
-        lambda cs, rs, act: (act, cs, rs),
+    out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state,
         out_recurrent_state,
         out_act,
-    )
+        config.GDNMode.PER_SEQ,
+        skip_when=no_per_seq_work)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
