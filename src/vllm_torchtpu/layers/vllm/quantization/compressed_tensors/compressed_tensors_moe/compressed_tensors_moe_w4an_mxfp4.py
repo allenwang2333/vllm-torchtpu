@@ -7,6 +7,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
+from vllm_torchtpu.layers.vllm.dp_a2a_moe import (dp_a2a_fused_moe_gmm,
+                                                  get_dp_a2a_context,
+                                                  prebuild_dp_a2a)
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
                                                  load_kmajor_fp4,
@@ -39,8 +42,12 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     @property
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
-        # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        # to pipeline them with MoE computation when chunking is enabled, or to
+        # replace them with the DP all-to-all exchange when TPU_MOE_DP_A2A is
+        # armed. Reading the armed context (set at weight-load time) rather
+        # than the env keeps this answer identical at every trace.
+        return (enable_pipelined_collective_and_compute()
+                or get_dp_a2a_context() is not None)
 
     @staticmethod
     def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
@@ -224,6 +231,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             use_ep=use_ep,
             skip_padded_tokens=True,
         )
+        prebuild_dp_a2a(layer)
 
     def apply_monolithic(
         self,
@@ -243,10 +251,13 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
+        # The DP a2a exchange (like the pipelined path) takes control of the
+        # DP collectives, so routing ran on this rank's LOCAL tokens.
+        a2a_ctx = get_dp_a2a_context()
+        is_local = (a2a_ctx is not None
+                    or enable_pipelined_collective_and_compute())
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids,
-            topk_weights,
-            is_local_tensor=enable_pipelined_collective_and_compute())
+            topk_ids, topk_weights, is_local_tensor=is_local)
 
         kwargs = {
             "hidden_states": x,
@@ -264,6 +275,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "rhs_quant_dtype": None,
             "skip_padded_tokens": True,
         }
+        if a2a_ctx is not None:
+            return dp_a2a_fused_moe_gmm(a2a_ctx, **kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 

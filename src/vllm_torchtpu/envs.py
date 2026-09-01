@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_DP_A2A: str | None = None
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -366,6 +367,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Replace the DP dispatch/combine collectives around the MoE GMM (two
+    # all-gathers + a reduce-scatter) with an all-to-all inside the 4-member
+    # DP group: "ragged" sorts tokens by destination and exchanges them with
+    # jax.lax.ragged_all_to_all (DeepEP-style, data-dependent sizes);
+    # "padded" exchanges fixed per-destination buckets with lax.all_to_all.
+    # Routing then runs pre-dispatch on this rank's own tokens. Off when
+    # unset. Currently wired only into the W4AN mxfp4 MoE method (K3).
+    "TPU_MOE_DP_A2A":
+    env_with_choices("TPU_MOE_DP_A2A", None, ["ragged", "padded"]),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
