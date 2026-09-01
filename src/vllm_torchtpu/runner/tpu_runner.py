@@ -4537,6 +4537,15 @@ class TPUModelRunner(GPUModelRunner):
                 for module in self.model.modules():
                     if isinstance(module, LowLatencyRowParallelLinear):
                         module.initialize_llar()
+                # Assign each armed layer its ordinal in modules() order (==
+                # execution order for K3's sequential decoder). The kernel's
+                # workspace slot rotation keys on it -- consecutive calls
+                # alternate slots and the first call barriers before sending;
+                # see two_shot_all_reduce_static for the safety argument.
+                for module in self.model.modules():
+                    if isinstance(module, LowLatencyRowParallelLinear) \
+                            and module._llar_entry is not None:
+                        module._llar_ordinal = llar_layers
                         llar_layers += 1
                 if llar_layers:
                     logger.info(

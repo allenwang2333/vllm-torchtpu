@@ -97,9 +97,10 @@ def test_k3_out_proj_wires_through_8_tokens_by_default(monkeypatch):
 def test_gate_binds_before_the_batch_knob(monkeypatch):
     monkeypatch.setenv("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", "16")
     # Asking for 16 tokens does not wire T=16: the measured 128 KiB gate caps
-    # the payload at 9 tokens of this width. The knob lowers the ceiling; it
-    # does not raise the gate.
-    assert wired_max_numel(WIDTH, DTYPE, 32) == 9 * WIDTH
+    # the payload at 9 tokens of this width, and the lane-alignment rule then
+    # drops T=9 (9*224 = 2016 is not a 128-multiple), leaving T=8. The knob
+    # lowers the ceiling; it does not raise the gate.
+    assert wired_max_numel(WIDTH, DTYPE, 32) == 8 * WIDTH
 
 
 def test_batch_knob_can_only_lower_the_ceiling(monkeypatch):

@@ -19,16 +19,40 @@ gives compile_all_ranges' single FX graph a different interface per bucket
 the full post-mortem). Instead there is ONE opaque custom op whose signature
 never changes:
 
-    llar_out_proj_reduce_<width>(x, rs, ag, step) -> Tensor
+    llar_out_proj_reduce_<width>(x, rs_list, ag_list) -> Tensor
 
-The workspaces are sized for the largest wired payload, so every token bucket
-presents the same graph interface, and the op's *implementation* -- which runs
-eagerly with concrete shapes, invisible to dynamo -- routes: at or below the
-wired threshold the payload goes through the two-shot kernel over a
-multi-device shard_map (the slice of the workspace it needs), above it through
-an ordinary ``dist.all_reduce``. Every rank executes the same layer sequence
+The lists hold ONE workspace pair per wired token bucket, so every bucket
+presents the same graph interface (same tensors, same order, every call) yet
+each bucket's JAX module is fully static -- no runtime slicing of a max-size
+workspace. The op's *implementation* -- which runs with concrete shapes,
+invisible to dynamo -- routes: for a wired bucket the payload goes through
+the two-shot kernel over a multi-device shard_map, otherwise through an
+ordinary ``dist.all_reduce``. Every rank executes the same layer sequence
 with the same padded token count, so the branch is unanimous and the kernel's
 slot parity stays consistent.
+
+Batch R (arm-1) measured the cost of doing this the other way -- one max-size
+workspace sliced per shape in the JAX body: +1.33 ms/step of on-device glue
+(2 slices + 2 dynamic-update-slice fusions + relayout reshapes/reduces per
+layer, plus writeback copies) against a kernel win of only ~0.3 ms/step. So
+this revision keeps the JAX body a bare custom-call:
+
+* workspaces are per-bucket and exactly sized -- nothing to slice or update;
+* the kernel takes the payload in its natural [tokens, width] layout
+  (kernels/collectives/low_latency_all_reduce.py::two_shot_all_reduce_natural),
+  so the [T, 7168] -> [32, T*224] flatten -- a real relayout copy in both
+  directions, because the two shapes tile differently -- disappears;
+* the kernel drives its slot rotation from a STATIC argument -- the layer's
+  ordinal among the 93 callsites, known at compile time
+  (kernels/collectives/low_latency_all_reduce.py::two_shot_all_reduce_static).
+  A device-side step counter cannot work on this stack: XLA stages custom-call
+  operands into fresh VMEM/SMEM buffers per call, so a counter written through
+  its input ref never reaches the persistent buffer (measured on device). And
+  the counter is unnecessary: consecutive calls alternate slots, and the first
+  callsite of every execution barriers before sending, which is the whole
+  protocol. The workspaces carry no value across calls -- every slot is fully
+  rewritten before it is read -- so they are NOT returned, NOT donated, and
+  never written back with ``copy_``: the JAX body is a bare custom-call.
 
 The kernels need a mesh, and vLLM has none. Each vLLM worker drives one core
 and reduces through ``torch.distributed``; a Pallas collective instead needs a
@@ -86,9 +110,17 @@ _GATE: dict[int, tuple[int, int]] = {
 # Default for TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE. At 32 devices the
 # _GATE ceiling binds first at the widths K3 reduces (128 KiB is ~9 tokens of
 # a 7168-wide bf16 payload), so this default governs only which *buckets*
-# warmup-sized workspaces must cover. 8 is the derived crossover: T=16 is the
-# measured tie point (224 KiB) and is deliberately NOT wired by default.
+# workspaces are wired for. 8 is the derived crossover: T=16 is the measured
+# tie point (224 KiB) and is deliberately NOT wired by default.
 _DEFAULT_MAX_BATCH_SIZE = 8
+
+# The natural-shape kernel chunks the payload along the flat row-major index,
+# which on the [tokens, width] layout lands on whole lane tiles only when the
+# per-device chunk is a multiple of 128 elements (see
+# two_shot_all_reduce_natural). Buckets that fail this are never wired; the
+# fallback serves them. At width 7168 over 32 devices the wired buckets are
+# the multiples of 4 -- 4 and 8 by default.
+_LANE_TILE = 128
 
 
 def max_batch_size() -> int:
@@ -129,28 +161,57 @@ def _choose_kernel(num_devices: int, payload_bytes: int, numel: int) -> str:
     two_shot_min, two_shot_max = gate
     if (two_shot_max and two_shot_min <= payload_bytes <= two_shot_max
             and numel % num_devices == 0):
-        # two-shot scatters along rows. Flattening the payload and viewing it
-        # as (num_devices, numel/num_devices) satisfies its divisibility
-        # constraint for any token count, which the natural [tokens, hidden]
-        # view would not (decode has far fewer rows than devices).
+        # two-shot splits the payload into num_devices contiguous chunks of
+        # the flat row-major index; on the natural [tokens, hidden] layout
+        # that is a lane-aligned column run per device whenever the bucket is
+        # wired (see wired_buckets -- misaligned buckets are never built).
         return "two_shot"
     return "xla"
+
+
+def _chunk_width(numel: int, width: int, num_devices: int) -> int:
+    """Per-device chunk of this payload, or 0 if the kernel can't serve it.
+
+    The kernel needs the chunk to be a whole number of lane tiles contained
+    in one row of the natural [tokens, width] layout: ``width % w == 0``
+    keeps every chunk inside a single row and ``w % 128 == 0`` keeps its
+    transfers lane-aligned. w > width (more tokens than devices) would need
+    multi-row chunks, which the natural kernel does not implement -- no K3
+    decode bucket is there (tokens <= 32 = num_devices).
+    """
+    if numel % num_devices != 0:
+        return 0
+    w = numel // num_devices
+    if w > width or width % w != 0 or w % _LANE_TILE != 0:
+        return 0
+    return w
+
+
+def wired_buckets(width: int, dtype: torch.dtype, num_devices: int) -> list:
+    """The token counts that get a kernel workspace, in increasing order.
+
+    Every bucket from 1 to ``max_batch_size()`` that both clears the measured
+    gate window and yields a lane-aligned chunk. Buckets not listed take the
+    XLA fallback inside the op.
+    """
+    esize = torch.empty((), dtype=dtype).element_size()
+    buckets = []
+    for tokens in range(1, max_batch_size() + 1):
+        numel = tokens * width
+        if _chunk_width(numel, width, num_devices) == 0:
+            continue
+        if _choose_kernel(num_devices, numel * esize, numel) == "two_shot":
+            buckets.append(tokens)
+    return buckets
 
 
 def wired_max_numel(width: int, dtype: torch.dtype, num_devices: int) -> int:
     """Largest payload, in elements, that this op routes to the kernel.
 
-    The largest multiple-of-``num_devices`` element count that is both at or
-    below ``max_batch_size()`` tokens of ``width`` and inside the measured
-    gate window. 0 means "no payload takes the kernel" and the op is never
-    built.
+    0 means "no payload takes the kernel" and the op is never built.
     """
-    esize = torch.empty((), dtype=dtype).element_size()
-    for tokens in range(max_batch_size(), 0, -1):
-        numel = tokens * width
-        if _choose_kernel(num_devices, numel * esize, numel) == "two_shot":
-            return numel
-    return 0
+    buckets = wired_buckets(width, dtype, num_devices)
+    return buckets[-1] * width if buckets else 0
 
 
 class _TpMesh:
@@ -260,50 +321,51 @@ def _replicated_spec():
     return PartitionSpec()
 
 
-def _build_two_shot_fn(mesh, num_devices: int, collective_id: int):
-    """The shard_map-wrapped JAX fn the inner op lowers per input shape.
+def _build_two_shot_fn(mesh, num_devices: int, collective_id: int, slot: int,
+                       barrier_first: int):
+    """The shard_map-wrapped JAX fn for one (slot, barrier_first) variant.
 
-    The signature is fixed -- ``(x, rs, ag, step)`` -- and the workspaces are
-    sized for the largest wired payload, so one op serves every token bucket:
-    for a concrete ``x`` the body slices the workspace down to this payload's
-    column count and scatters the result back. ``x.size`` is a concrete int
-    here (the inner op lowers per shape), so any per-shape decision would be
-    ordinary trace-time Python; none is needed because the outer op only calls
-    this for payloads the kernel serves.
+    The signature is fixed -- ``(x, rs, ag)`` with the workspaces in the
+    bucket's exact shape -- and the body is a bare custom-call: the only
+    other ops are the [T, width] -> [T, per_row, 1, w] view and back, which
+    split/merge the minor dim at a lane-tile boundary (checked against the
+    dumped HLO on the check job). slot and barrier_first are compile-time
+    constants of the layer's ordinal; they MUST be baked into the closure
+    rather than passed as static args: torch_tpu's jax_placeholders zips
+    operands with partition specs, silently dropping trailing static args
+    (measured: '_fn() missing 1 required positional argument'). The
+    workspaces are per-call scratch; the kernel carries no runtime state
+    across calls (two_shot_all_reduce_static).
     """
     import jax
 
     from vllm_torchtpu.kernels.collectives.low_latency_all_reduce import \
-        two_shot_all_reduce
+        two_shot_all_reduce_static
 
     _REPLICATED = _replicated_spec()
 
-    def _fn(x: jax.Array, rs: jax.Array, ag: jax.Array, step: jax.Array
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    def _fn(x: jax.Array, rs: jax.Array, ag: jax.Array) -> jax.Array:
 
-        def body(x, rs, ag, step):
-            cols = x.size // num_devices
-            flat = x.reshape(num_devices, cols)
-            rs_slice = rs[..., :cols]
-            ag_slice = ag[..., :cols]
-            out, rs_slice, ag_slice, step = two_shot_all_reduce(
-                flat,
-                rs_slice,
-                ag_slice,
-                step,
-                axis_name="tp",
-                num_devices=num_devices,
-                collective_id=collective_id,
-                has_side_effects=False)
-            rs = rs.at[..., :cols].set(rs_slice)
-            ag = ag.at[..., :cols].set(ag_slice)
-            return out.reshape(x.shape), rs, ag, step
+        def body(x, rs, ag):
+            tokens, width = x.shape
+            w = (tokens * width) // num_devices
+            per_row = width // w
+            out = two_shot_all_reduce_static(x.reshape(tokens, per_row, 1, w),
+                                             rs,
+                                             ag,
+                                             slot=slot,
+                                             barrier_first=barrier_first,
+                                             axis_name="tp",
+                                             num_devices=num_devices,
+                                             collective_id=collective_id,
+                                             has_side_effects=False)
+            return out.reshape(x.shape)
 
         return jax.shard_map(body,
                              mesh=mesh,
-                             in_specs=(_REPLICATED, ) * 4,
-                             out_specs=(_REPLICATED, ) * 4,
-                             check_vma=False)(x, rs, ag, step)
+                             in_specs=(_REPLICATED, ) * 3,
+                             out_specs=_REPLICATED,
+                             check_vma=False)(x, rs, ag)
 
     return _fn
 
@@ -348,15 +410,15 @@ def get_out_proj_reduce_entry(width: int, dtype: torch.dtype):
 
     entry = None
     num_devices = int(communicator.world_size)
-    max_numel = wired_max_numel(width, dtype, num_devices)
-    if max_numel == 0:
+    buckets = wired_buckets(width, dtype, num_devices)
+    if not buckets:
         logger.info(
             "Low-latency all-reduce: no payload at width %d clears the gate "
             "for %d devices (batch limit %d); out-proj reduces stay on XLA.",
             width, num_devices, max_batch_size())
     else:
         try:
-            entry = _build_entry(communicator, width, dtype, max_numel)
+            entry = _build_entry(communicator, width, dtype, buckets)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Could not build the low-latency all-reduce for width %d "
@@ -367,8 +429,8 @@ def get_out_proj_reduce_entry(width: int, dtype: torch.dtype):
 
 
 def _build_entry(communicator, width: int, dtype: torch.dtype,
-                 max_numel: int) -> tuple:
-    """Build the opaque op and its workspace for one (width, dtype)."""
+                 buckets: list) -> tuple:
+    """Build the opaque op and its per-bucket workspaces for (width, dtype)."""
     import torch.distributed as dist
 
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
@@ -377,28 +439,41 @@ def _build_entry(communicator, width: int, dtype: torch.dtype,
     mesh = _TpMesh(communicator).get()
     if mesh is None:
         return None
-    cols_max = max_numel // num_devices
 
-    fn = _build_two_shot_fn(mesh, num_devices, _COLLECTIVE_ID_BASE)
+    # One inner op per (slot, barrier_first) combination that occurs: the
+    # first layer of an execution is (0, 1); every other layer is (0, 0) or
+    # (1, 0) alternating. Static args cannot flow through sharded_jax_op, so
+    # each variant is its own op with the statics baked into its closure.
     _REPLICATED = _replicated_spec()
-    inner_name = f"vllm_torchtpu::llar_two_shot_{width}"
-    inner = sharded_jax_op(
-        inner_name,
-        fn,
-        mesh=mesh,
-        input_partition_specs=(_REPLICATED, ) * 4,
-        output_partition_specs=(_REPLICATED, ) * 4,
-    )
+    inner_map = {}
+    for slot, first in ((0, 1), (0, 0), (1, 0)):
+        fn = _build_two_shot_fn(mesh, num_devices, _COLLECTIVE_ID_BASE, slot,
+                                first)
+        inner_map[(slot, first)] = sharded_jax_op(
+            f"vllm_torchtpu::llar_two_shot_{width}_s{slot}f{first}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(_REPLICATED, ) * 3,
+            output_partition_specs=_REPLICATED,
+        )
 
     device = torch.device("tpu")
-    rs = torch.zeros((2, num_devices - 1, 1, cols_max),
-                     dtype=dtype,
-                     device=device)
-    ag = torch.zeros((2, num_devices, 1, cols_max), dtype=dtype, device=device)
-    step = torch.zeros(1, dtype=torch.int32, device=device)
+    rs_list, ag_list = [], []
+    bucket_index = {}
+    for tokens in buckets:
+        w = _chunk_width(tokens * width, width, num_devices)
+        assert w > 0  # wired_buckets already filtered
+        bucket_index[tokens] = len(rs_list)
+        rs_list.append(
+            torch.zeros((2, num_devices - 1, 1, w), dtype=dtype,
+                        device=device))
+        ag_list.append(
+            torch.zeros((2, tokens, width // w, 1, w),
+                        dtype=dtype,
+                        device=device))
 
     def xla_fallback(x: torch.Tensor) -> torch.Tensor:
-        # Above the threshold this is byte-for-byte what RowParallelLinear
+        # Off the wired buckets this is byte-for-byte what RowParallelLinear
         # would have done: the same XLA ring reduction over the same group.
         # The clone is forced by the custom-op contract -- the op declares no
         # mutated arguments, so it cannot reduce x in place.
@@ -407,64 +482,65 @@ def _build_entry(communicator, width: int, dtype: torch.dtype,
         return out
 
     op = _build_outer_op(f"vllm_torchtpu::llar_out_proj_reduce_{width}",
-                         inner,
-                         max_numel=max_numel,
-                         num_devices=num_devices,
+                         inner_map,
+                         width=width,
+                         bucket_index=bucket_index,
                          xla_fallback=xla_fallback)
 
     logger.info(
         "Low-latency all-reduce: out-proj reduces at width %d take the "
-        "two-shot kernel at or below %d elements (%.1f KiB at %d devices, "
-        "batch limit %d tokens); larger payloads keep the XLA ring, inside "
-        "the same op.", width, max_numel,
-        max_numel * torch.empty((), dtype=dtype).element_size() / 1024,
-        num_devices, max_batch_size())
-    return op, rs, ag, step
+        "two-shot kernel at token buckets %s (%d devices, batch limit %d "
+        "tokens); other payloads keep the XLA ring, inside the same op.",
+        width, buckets, num_devices, max_batch_size())
+    return op, rs_list, ag_list
 
 
-def _takes_kernel(numel: int, max_numel: int, num_devices: int) -> bool:
-    """The switch predicate. Torch and test code share exactly this."""
-    return numel <= max_numel and numel % num_devices == 0
-
-
-def _build_outer_op(name: str, inner, *, max_numel: int, num_devices: int,
-                    xla_fallback):
+def _build_outer_op(name: str, inner_map: dict, *, width: int,
+                    bucket_index: dict, xla_fallback):
     """The single opaque custom op a layer calls on every bucket.
 
     Dynamo must not see the switch. Selecting a kernel in traced Python means
     reading dims, and reading vLLM's dynamic token dimension pins it and fails
     the whole compilation ("Constraints violated (L['input_ids'].size()[0])").
     ``torch.library.custom_op`` is not traced into, so the graph gets one call
-    node and the dims are read later, at execution, when they are ordinary
-    ints -- which is what lets the branch below exist at all.
+    node and the dims are read later, when they are ordinary ints -- which is
+    what lets the branch below exist at all.
 
-    The workspaces are *arguments*, sized once for the largest wired payload,
-    so every token bucket presents the same graph interface. They cannot be
+    The workspaces are *arguments* -- two parallel lists, one exactly-sized
+    pair per wired bucket, so every token bucket presents the same graph
+    interface while each bucket's JAX module is fully static. They cannot be
     captured inside the implementation: a tensor the compiled program
     references but was never handed aborts it with "identified an argument
     that was not provided: DeviceBufferRef".
+
+    The kernel branch does NO workspace writeback. The workspaces are
+    per-call scratch whose contents are fully rewritten before every read in
+    a round (the slot rotation is driven by the static ``slot`` argument, not
+    by runtime state), so there is no copy_ for XLA to pay per layer and no
+    donation to rely on. ``slot`` and ``barrier_first`` come from the layer's
+    ordinal: consecutive layers alternate slots, and the first layer of every
+    execution barriers before sending.
     """
 
-    def _impl(x: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor,
-              step: torch.Tensor) -> torch.Tensor:
+    def _impl(x: torch.Tensor, rs_list: list[torch.Tensor],
+              ag_list: list[torch.Tensor], slot: int,
+              barrier_first: int) -> torch.Tensor:
         # The token-count switch. x is a concrete tensor here -- the custom op
         # boundary is exactly what keeps this read out of the traced graph.
-        if _takes_kernel(x.numel(), max_numel, num_devices):
-            out, new_rs, new_ag, new_step = inner(x, rs, ag, step)
-            # The workspace has to be written back explicitly: the op returns
-            # fresh buffers, and the kernel needs the *same* buffer next call
-            # for its slot parity to mean anything. Only the kernel branch
-            # advances the workspace, so only it needs the writeback.
-            rs.copy_(new_rs)
-            ag.copy_(new_ag)
-            step.copy_(new_step)
-            return out
+        idx = bucket_index.get(x.numel() // width)
+        if idx is not None:
+            inner = inner_map[(slot, barrier_first)]
+            return inner(x, rs_list[idx], ag_list[idx])
         return xla_fallback(x)
 
-    # mutates_args stays empty even though the implementation writes the
-    # workspace in place. Declaring the mutation makes AOTAutograd add the
-    # buffers to the graph's outputs, and the compiled artifact then returns
-    # one where the runtime wrapper expects several:
+    # mutates_args stays empty even though the *kernel* writes its staged
+    # workspace operands. The mutation is invisible to torch and irrelevant
+    # to XLA's value semantics: the buffers are pure scratch (rewritten
+    # before every read) and no graph value depends on their contents.
+    # Declaring a mutation would make AOTAutograd add the buffers to the
+    # graph's
+    # outputs, and the compiled artifact then returns one where the runtime
+    # wrapper expects several:
     #
     #   AssertionError: expected 3 outputs, got 1
     #
@@ -475,5 +551,6 @@ def _build_outer_op(name: str, inner, *, max_numel: int, num_devices: int,
     # each layer passes a different x -- so nothing can be CSE'd on the
     # assumption that the op is pure.
     op = torch.library.custom_op(name, _impl, mutates_args=())
-    op.register_fake(lambda x, rs, ag, step: torch.empty_like(x))
+    op.register_fake(
+        lambda x, rs_list, ag_list, slot, barrier_first: torch.empty_like(x))
     return op

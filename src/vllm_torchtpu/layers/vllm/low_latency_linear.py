@@ -33,19 +33,26 @@ class LowLatencyRowParallelLinear(RowParallelLinear):
         # None means "stock all-reduce": the flag is off, the gate rejected
         # every payload at this width, or the mesh could not be built.
         self._llar_entry = None
+        # Position among the armed layers in execution order, assigned by the
+        # runner after initialize_llar. The kernel's workspace slot rotation
+        # is driven by it: consecutive calls alternate slots, and the first
+        # call of every execution barriers before sending. The default keeps
+        # an unassigned layer fully safe (slot 0, barrier first).
+        self._llar_ordinal = 0
 
-    def initialize_llar(self) -> None:
+    def initialize_llar(self) -> bool:
         from vllm_torchtpu.distributed.low_latency_all_reduce import \
             get_out_proj_reduce_entry
 
         if not (self.reduce_results and self.tp_size > 1):
-            return
+            return False
         # The workspace dtype comes from the weight, which is only the
         # activation dtype when nothing quantizes the layer.
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
-            return
+            return False
         self._llar_entry = get_out_proj_reduce_entry(self.output_size,
                                                      self.weight.dtype)
+        return self._llar_entry is not None
 
     def forward(self, input_: torch.Tensor):
         # Mirrors the TPU RowParallelLinear forward (the deferred-bias variant
@@ -72,8 +79,10 @@ class LowLatencyRowParallelLinear(RowParallelLinear):
 
         entry = self._llar_entry
         if do_all_reduce and entry is not None:
-            op, rs, ag, step = entry
-            output = op(output_parallel, rs, ag, step)
+            op, rs_list, ag_list = entry
+            output = op(output_parallel, rs_list, ag_list,
+                        self._llar_ordinal % 2,
+                        1 if self._llar_ordinal == 0 else 0)
         elif do_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

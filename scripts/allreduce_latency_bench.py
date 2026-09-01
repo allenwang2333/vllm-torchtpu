@@ -186,12 +186,19 @@ def make_op(impl: str, num_devices: int):
     raise ValueError(f"unknown impl {impl!r}")
 
 
-def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
+def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int, ws=None):
     """Jitted chain of ``n_ops`` data-dependent all-reduces.
 
     Each all-reduce is scaled by 1/N (exact in binary, so it neither perturbs
     the timing nor lets values overflow across the chain) and feeds the next,
     which stops XLA from CSE-ing or reordering them.
+
+    ``ws`` (rs, ag, step device arrays) is required by ``twoshot_nat``, the
+    natural-shape kernel: its workspaces are write-only scratch the kernel
+    mutates in place, so they must be *inputs* -- persistent buffers with
+    stable addresses -- not values created and threaded inside the trace.
+    That mirrors the production wiring exactly, including what it relies on:
+    XLA handing the custom-call the operand buffers uncopied.
     """
     scale = 1.0 / num_devices
 
@@ -202,6 +209,113 @@ def make_chain(impl: str, mesh: Mesh, num_devices: int, n_ops: int):
     # number of times in the same order). The per-round check below is a
     # tolerance-scaled comparison against psum, not a proof; treat these arms as
     # measurements of a configuration whose safety the caller must establish.
+    if impl == "twoshot_nat":
+        # Natural-shape kernel: v is [tokens, width] as the model has it; the
+        # 4-D view splits the lane dim at a 128-aligned boundary. Workspaces
+        # arrive as inputs (see the docstring) and are mutated in place.
+        def body(local_x, rs, ag, step):
+            v = local_x[0]
+            tokens, width = v.shape
+            w = (tokens * width) // num_devices
+            per_row = width // w
+            for _ in range(n_ops):
+                out = llar.two_shot_all_reduce_natural(v.reshape(
+                    tokens, per_row, 1, w),
+                                                       rs,
+                                                       ag,
+                                                       step,
+                                                       axis_name=AXIS,
+                                                       num_devices=num_devices)
+                v = out.reshape(v.shape) * scale
+            return v[None]
+
+        spec = P(AXIS, None, None)
+        return jax.jit(
+            jax.shard_map(body,
+                          mesh=mesh,
+                          in_specs=(spec, P(), P(), P()),
+                          out_specs=spec,
+                          check_vma=False))
+    if impl == "twoshot_sl":
+        # Stateless natural-shape kernel: one slot, full barrier per call,
+        # no step counter. Workspaces are per-call scratch, passed as inputs.
+        def body(local_x, rs, ag):
+            v = local_x[0]
+            tokens, width = v.shape
+            w = (tokens * width) // num_devices
+            per_row = width // w
+            for _ in range(n_ops):
+                out = llar.two_shot_all_reduce_stateless(
+                    v.reshape(tokens, per_row, 1, w),
+                    rs,
+                    ag,
+                    axis_name=AXIS,
+                    num_devices=num_devices)
+                v = out.reshape(v.shape) * scale
+            return v[None]
+
+        spec = P(AXIS, None, None)
+        return jax.jit(
+            jax.shard_map(body,
+                          mesh=mesh,
+                          in_specs=(spec, P(), P()),
+                          out_specs=spec,
+                          check_vma=False))
+    if impl == "twoshot_slconst":
+        # Stateless kernel with the workspaces as in-trace constants -- the
+        # flat arm's workspace regime (no operand staging at all), which is
+        # also the production regime: the op creates them inside the body.
+        def body(local_x):
+            v = local_x[0]
+            tokens, width = v.shape
+            w = (tokens * width) // num_devices
+            per_row = width // w
+            rs, ag = llar.make_two_shot_workspace_stateless(
+                (tokens, width), v.dtype, num_devices)
+            for _ in range(n_ops):
+                out = llar.two_shot_all_reduce_stateless(
+                    v.reshape(tokens, per_row, 1, w),
+                    rs,
+                    ag,
+                    axis_name=AXIS,
+                    num_devices=num_devices)
+                v = out.reshape(v.shape) * scale
+            return v[None]
+
+        spec = P(AXIS, None, None)
+        return jax.jit(
+            jax.shard_map(body,
+                          mesh=mesh,
+                          in_specs=spec,
+                          out_specs=spec,
+                          check_vma=False))
+    if impl == "twoshot_static":
+        # Static-slot kernel: slot = call index % 2, barrier-first on the
+        # first call of each execution -- exactly the production regime.
+        def body(local_x, rs, ag):
+            v = local_x[0]
+            tokens, width = v.shape
+            w = (tokens * width) // num_devices
+            per_row = width // w
+            for i in range(n_ops):
+                out = llar.two_shot_all_reduce_static(v.reshape(
+                    tokens, per_row, 1, w),
+                                                      rs,
+                                                      ag,
+                                                      slot=i % 2,
+                                                      barrier_first=(i == 0),
+                                                      axis_name=AXIS,
+                                                      num_devices=num_devices)
+                v = out.reshape(v.shape) * scale
+            return v[None]
+
+        spec = P(AXIS, None, None)
+        return jax.jit(
+            jax.shard_map(body,
+                          mesh=mesh,
+                          in_specs=(spec, P(), P()),
+                          out_specs=spec,
+                          check_vma=False))
     if impl == "twoshot_rs":
         # (1, numel) in, reshaped to (n, numel/n) inside the loop and back out
         # again -- exactly _build_two_shot's body. The reshape is not a bitcast:
@@ -276,17 +390,18 @@ def make_input(num_devices: int, rows: int, cols: int, dtype, sharding):
                    out_shardings=sharding)()
 
 
-def time_fn(fn, x, repeats: int, warmup: int) -> float:
+def time_fn(fn, x, repeats: int, warmup: int, ws=None) -> float:
     """Median wall time in seconds of a blocked call."""
+    args = (x, ) if ws is None else (x, *ws)
     for _ in range(warmup):
-        jax.block_until_ready(fn(x))
+        jax.block_until_ready(fn(*args))
     samples = []
     for _ in range(repeats):
         # Line the processes up so one straggler's dispatch does not land
         # inside another's timed region.
         multihost_utils.sync_global_devices("bench")
         t0 = time.perf_counter()
-        jax.block_until_ready(fn(x))
+        jax.block_until_ready(fn(*args))
         samples.append(time.perf_counter() - t0)
     return float(np.median(samples))
 
@@ -317,8 +432,12 @@ def verify(impl: str, mesh: Mesh, num_devices: int, x_dev) -> float:
     return float(fn(x_dev))
 
 
-def verify_chain(impl: str, mesh: Mesh, num_devices: int, x_dev,
-                 n_ops: int) -> float:
+def verify_chain(impl: str,
+                 mesh: Mesh,
+                 num_devices: int,
+                 x_dev,
+                 n_ops: int,
+                 ws=None) -> float:
     """Max relative deviation of an n_ops chain vs the same chain of psums.
 
     Needed for the two-shot kernel: its failure mode is a peer writing a slot
@@ -329,7 +448,8 @@ def verify_chain(impl: str, mesh: Mesh, num_devices: int, x_dev,
     chain outputs to host with device_get works single-process but raises on a
     multi-process slice, where each process only addresses its own shards.
     """
-    got = make_chain(impl, mesh, num_devices, n_ops)(x_dev)
+    got = (make_chain(impl, mesh, num_devices, n_ops)(x_dev) if ws is None else
+           make_chain(impl, mesh, num_devices, n_ops)(x_dev, *ws))
     want = make_chain("xla", mesh, num_devices, n_ops)(x_dev)
 
     def rel(a, b):
@@ -385,18 +505,44 @@ def main():
             sharding = NamedSharding(mesh, P(AXIS, None, None))
             x_dev = make_input(num_devices, rows, cols, dtype, sharding)
 
+            def _skips(impl, rows=rows, cols=cols):
+                if impl in ("twoshot_nat", "twoshot_sl", "twoshot_slconst",
+                            "twoshot_static"):
+                    if (rows * cols) % num_devices:
+                        return True
+                    w = (rows * cols) // num_devices
+                    # The natural kernels need a lane-aligned chunk that fits
+                    # in one row (see two_shot_all_reduce_natural).
+                    return w > cols or cols % w != 0 or w % 128 != 0
+                return impl.startswith("twoshot") and rows % num_devices != 0
+
+            ws_by_impl = {}
+            for impl in ("twoshot_nat", "twoshot_sl", "twoshot_static"):
+                if impl in impls and not _skips(impl):
+                    maker = {
+                        "twoshot_nat": llar.make_two_shot_workspace_natural,
+                        "twoshot_sl": llar.make_two_shot_workspace_stateless,
+                        "twoshot_static": llar.make_two_shot_workspace_static,
+                    }[impl]
+                    ws_by_impl[impl] = tuple(
+                        jax.device_put(a, NamedSharding(mesh, P()))
+                        for a in maker((rows, cols), dtype, num_devices))
+
             lat = {}
             absolute = {}
             for impl in impls:
-                if (impl.startswith("twoshot") and rows % num_devices != 0):
+                if _skips(impl):
                     lat[impl] = None
                     continue
+                ws = ws_by_impl.get(impl)
                 try:
                     if not ARGS.no_verify:
                         err = (verify_chain(impl, mesh, num_devices, x_dev,
-                                            ARGS.iters_lo) if impl
-                               in ("twoshot", "twoshot_nb") else verify(
-                                   impl, mesh, num_devices, x_dev))
+                                            ARGS.iters_lo, ws) if impl
+                               in ("twoshot", "twoshot_nb", "twoshot_nat",
+                                   "twoshot_sl", "twoshot_slconst",
+                                   "twoshot_static") else verify(
+                                       impl, mesh, num_devices, x_dev))
                         # bfloat16 sums N-1 peers in a different order than
                         # psum, and that drift grows with rounds and devices
                         # (0.02 at 8 devices, 0.05 at 32). A fixed threshold
@@ -411,8 +557,8 @@ def main():
                                 file=sys.stderr)
                     lo = make_chain(impl, mesh, num_devices, ARGS.iters_lo)
                     hi = make_chain(impl, mesh, num_devices, ARGS.iters_hi)
-                    t_lo = time_fn(lo, x_dev, ARGS.repeats, ARGS.warmup)
-                    t_hi = time_fn(hi, x_dev, ARGS.repeats, ARGS.warmup)
+                    t_lo = time_fn(lo, x_dev, ARGS.repeats, ARGS.warmup, ws)
+                    t_hi = time_fn(hi, x_dev, ARGS.repeats, ARGS.warmup, ws)
                     lat[impl] = (t_hi - t_lo) / (ARGS.iters_hi - ARGS.iters_lo)
                     # Wall time per call *without* cancelling fixed cost. The
                     # slope is the marginal cost of one more collective; this
