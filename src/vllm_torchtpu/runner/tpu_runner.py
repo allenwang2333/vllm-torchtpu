@@ -3642,6 +3642,62 @@ class TPUModelRunner(GPUModelRunner):
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
 
+            # Option 4: On-device multi-step execution in steady-state decode
+            # Reduces H2D upload and host-dispatch frequency by K times.
+            # Default to 4 steps as requested (tunable via VLLM_TPU_MULTI_STEP).
+            multi_step = int(os.getenv("VLLM_TPU_MULTI_STEP", "4"))
+            can_multi_step = (
+                multi_step > 1
+                and scheduler_output.total_num_scheduled_tokens == self.input_batch.num_reqs
+                and spec_decode_metadata is None
+                and not self.is_pooling_model
+            )
+            if can_multi_step:
+                block_size = getattr(self, "block_size", 256)
+                seq_lens_cpu = self.input_batch.num_computed_tokens_cpu[start_index:start_index + num_reqs]
+                rem_slots = block_size - (seq_lens_cpu % block_size)
+                if (rem_slots < multi_step).any():
+                    can_multi_step = False
+
+            if can_multi_step:
+                first_sampled = torch.argmax(logits, dim=-1, keepdim=True)
+                all_sampled = [first_sampled]
+                curr_tokens = first_sampled
+                for _ in range(multi_step - 1):
+                    self.position_ids = self.position_ids + 1
+                    if hasattr(attn_metadata, "input_positions"):
+                        attn_metadata.input_positions = self.position_ids
+                    if hasattr(attn_metadata, "seq_lens"):
+                        attn_metadata.seq_lens = attn_metadata.seq_lens + 1
+
+                    with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens_padded),
+                    ), set_vllm_model_wrapper_context(
+                            mesh=self.mesh,
+                            vllm_config=self.vllm_config,
+                            kv_cache_bundle=self._kv_cache_bundle,
+                    ):
+                        hidden_states, _ = self.forward_model(
+                            input_ids=curr_tokens,
+                            positions=self.position_ids,
+                            inputs_embeds=None,
+                        )
+                    if sample_hidden_states is None:
+                        hidden_states = sequence_layout_planner.finalize_hidden_states(
+                            hidden_states, layout_plan)
+                        step_logits = self.compute_selected_logits(hidden_states, logits_indices)
+                    else:
+                        step_logits = self.compute_logits_from_hidden_states(hidden_states)
+
+                    next_sampled = torch.argmax(step_logits, dim=-1, keepdim=True)
+                    all_sampled.append(next_sampled)
+                    curr_tokens = next_sampled
+
+                self._multi_step_sampled_tokens = torch.cat(all_sampled, dim=-1)
+
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
                 # num_scheduled_tokens_np, seq_lens_cpu for this chunk
@@ -4112,7 +4168,10 @@ class TPUModelRunner(GPUModelRunner):
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx)
-                if all_greedy:
+                if getattr(self, "_multi_step_sampled_tokens", None) is not None:
+                    selected_token_ids = self._multi_step_sampled_tokens
+                    self._multi_step_sampled_tokens = None
+                elif all_greedy:
                     selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
@@ -4138,7 +4197,10 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
-                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    if selected_token_ids.dim() > 1 and selected_token_ids.shape[-1] > 1:
+                        next_tokens_tpu_chunks.append(selected_token_ids[:, -1].contiguous())
+                    else:
+                        next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
                     for req_idx in range(cur_start_idx, cur_end_idx):
                         next_token_indices[req_idx] = (next_tokens_tpu_offset +
                                                        req_idx - cur_start_idx)
@@ -4393,6 +4455,10 @@ class TPUModelRunner(GPUModelRunner):
                     self.input_batch.token_ids_cpu[
                         req_idx, start_tok_idx:end_tok_idx] = valid_tokens
                     self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+                    if len(valid_tokens) > 1:
+                        extra_tokens = len(valid_tokens) - 1
+                        self.input_batch.num_computed_tokens_cpu[req_idx] += extra_tokens
+                        self.input_batch.num_computed_tokens_cpu_tensor[req_idx] += extra_tokens
 
                     req_state.output_token_ids.extend(valid_tokens)
 
