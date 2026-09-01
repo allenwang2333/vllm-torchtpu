@@ -595,7 +595,8 @@ def mla_attention(
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        sm_scale: float | None = None) -> Tuple[jax.Array, jax.Array]:
+        sm_scale: float | None = None,
+        use_causal_mask: bool = True) -> Tuple[jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
     Computes sharded MLA paged attention and applies in-place KV cache updates across
@@ -706,7 +707,8 @@ def mla_attention(
             mixed_q_split=mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
-            v_scale=v_scale)
+            v_scale=v_scale,
+            use_causal_mask=use_causal_mask)
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))

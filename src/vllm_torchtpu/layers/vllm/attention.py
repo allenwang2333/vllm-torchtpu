@@ -1386,6 +1386,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
+        self.non_causal_multi_token_decode = bool(
+            kwargs.get("non_causal_multi_token_decode", False))
 
     def _get_kv_scales(
             self,
@@ -1462,6 +1464,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                use_causal_mask=not self.non_causal_multi_token_decode,
             )
 
         op_name = f"pallas::mla_attention_{layer.layer_name.replace('.', '_')}"
