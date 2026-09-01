@@ -1825,6 +1825,248 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=32,
         vmem_limit_bytes=62914560,
     ),  # median 0.218 ms
+    # ------------------------------------------------------------------
+    # Kimi-K3 at DP=4 x TP=8 (Batch Q2) on TPU v7x: 12 local q heads per chip
+    # (96/8), per-rank max_num_seqs=8, pages_per_seq=640 (max_model_len 10240
+    # / block 16), fp8 KV, bf16 q. Job 382 showed these keys missing 100%
+    # (768 misses per case per bucket; every shipped entry is keyed at
+    # num_q_heads=3), so all ten keys below are new. Tuned in job 394 via
+    # scripts/k3/slurm_mla_tune_dp4tp8.sbatch; raw sweeps in
+    # results/mla-tune-dp4tp8/.
+    #
+    # batched_decode: upstream-port sweep (tools/kernel/tuner/
+    # mla_kernel_tuner.py, full 72-config grid: dbs x nkvpb x vmem) at an
+    # 8192-token benchmark context (bench_kv_len=8192, the sweep workload;
+    # the key keeps pages_per_seq=640). Decode inputs do not depend on
+    # max_num_tokens, so one sweep serves all five buckets. The default
+    # (dbs=4, nkvpb=3) measures 0.412 ms here; the winner is 3.25x. All 72
+    # configs ran clean (no OOM) at 12 heads. Runner-up if the winner ever
+    # OOMs under real weights: (dbs=8, nkvpb=128, vmem 60 MiB) at 0.1270 ms.
+    #
+    # mixed: scripts/mla_mixed_prefill_tuner.py via scripts/k3/
+    # mla_tune_node.sh with NUM_HEADS=12. Buckets 1/2/4/8 used the 16-entry
+    # small-tile list; bucket 2048 a 17-candidate list around the seqs=32
+    # 8192-bucket neighbourhood. At 12 heads the q operand is 4x the TP=32
+    # tune's and EVERY bq=512 candidate OOMed (scoped VMEM), including the
+    # TP=32 winner's tile; the 2048 winner is bq=256. Gains over the default
+    # tile (16,1,1): 0.2202 -> 0.2171 (b1), 0.2417 -> 0.2148 (b2), unchanged
+    # (b4, the default tile wins), 0.2546 -> 0.2275 (b8). Runner-up for 2048:
+    # (bq=256, bkvp=64, q_split=2) at 0.5618 ms.
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=1,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # 127 us vs 412 us with the default (dbs=4, nkvpb=3) params
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=2,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # bucket-1 measurement reused (decode inputs are bucket-independent)
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=4,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # bucket-1 measurement reused (decode inputs are bucket-independent)
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=8,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # bucket-1 measurement reused (decode inputs are bucket-independent)
+    TuningKey(
+        case="batched_decode",
+        max_num_tokens=2048,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+    ):
+    TunableParams(
+        decode_batch_size=8,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=1,
+        vmem_limit_bytes=67108864,
+    ),  # bucket-1 measurement reused (decode inputs are bucket-independent)
+    TuningKey(
+        case="mixed",
+        max_num_tokens=1,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=8,
+        num_queries_per_block=128,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.217 ms
+    TuningKey(
+        case="mixed",
+        max_num_tokens=2,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=8,
+        num_queries_per_block=64,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.215 ms
+    TuningKey(
+        case="mixed",
+        max_num_tokens=4,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=16,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.208 ms (the default tile wins this bucket)
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=4,
+        num_queries_per_block=64,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.227 ms
+    TuningKey(
+        case="mixed",
+        max_num_tokens=2048,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=640,
+        s_dtype="bfloat16",
+        soft_cap=None,
+        chunk_prefill_size=None,
+        sliding_window=None,
+        p_same_dtype_as_v=True,
+    ):
+    TunableParams(
+        q_split=1,
+        num_kv_pages_per_block=128,
+        num_queries_per_block=256,
+        vmem_limit_bytes=62914560,
+    ),  # median 0.560 ms; every bq=512 candidate OOMs at 12 heads
 }
 
 

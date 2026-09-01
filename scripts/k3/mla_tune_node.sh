@@ -11,6 +11,7 @@
 #   KV_TOKENS    optional --kv-tokens override applied to every bucket
 #                (used for the 16384 bucket: q=16384 over 10240-token pages)
 #   SHARDS       concurrent subprocesses, one per device (default: 8)
+#   NUM_HEADS    per-rank query heads -> --num-heads (default: 3, TP=32)
 #   MAX_NUM_SEQS tuning-key geometry (default: 64)
 #   PAGES_PER_SEQ tuning-key geometry (default: 640)
 #   TOTAL_PAGES  tuner cache size (default: 2112; only seq 0 is populated)
@@ -28,6 +29,7 @@ REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 TOKENS="${TOKENS:-8192}"
 KV_TOKENS="${KV_TOKENS:-}"
 SHARDS="${SHARDS:-8}"
+NUM_HEADS="${NUM_HEADS:-3}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 PAGES_PER_SEQ="${PAGES_PER_SEQ:-640}"
 TOTAL_PAGES="${TOTAL_PAGES:-2112}"
@@ -63,6 +65,7 @@ run_bucket() {
   local num_candidates
   num_candidates=$(wc -l < "${candidates}")
   local args=(--tokens="${tokens}"
+              --num-heads="${NUM_HEADS}"
               --max-num-seqs="${MAX_NUM_SEQS}"
               --pages-per-seq="${PAGES_PER_SEQ}"
               --total-pages="${TOTAL_PAGES}")
