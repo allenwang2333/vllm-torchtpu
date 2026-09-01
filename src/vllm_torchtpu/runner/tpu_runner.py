@@ -3688,7 +3688,7 @@ class TPUModelRunner(GPUModelRunner):
                             kv_cache_bundle=self._kv_cache_bundle,
                     ):
                         hidden_states, _ = self.forward_model(
-                            input_ids=curr_tokens,
+                            input_ids=curr_tokens.view(-1),
                             positions=self.position_ids,
                             inputs_embeds=None,
                         )
@@ -3704,6 +3704,9 @@ class TPUModelRunner(GPUModelRunner):
                     curr_tokens = next_sampled
 
                 self._multi_step_sampled_tokens = torch.cat(all_sampled, dim=-1)
+                extra_tokens = multi_step - 1
+                self.input_batch.num_computed_tokens_cpu[start_index:start_index + num_reqs] += extra_tokens
+                self.input_batch.num_computed_tokens_cpu_tensor[start_index:start_index + num_reqs] += extra_tokens
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()

@@ -629,6 +629,25 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_vllm_scheduler_multi_step() -> None:
+    """Patch Scheduler._update_request_with_output to sync multi-step token counts."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+    if getattr(Scheduler, "_tpu_multi_step_patch", False):
+        return
+    orig_update = Scheduler._update_request_with_output
+
+    def patched_update(self, request, new_token_ids, is_stale=False):
+        new_token_ids, stopped = orig_update(self, request, new_token_ids, is_stale)
+        if len(new_token_ids) > 1:
+            extra_tokens = len(new_token_ids) - 1
+            request.num_computed_tokens += extra_tokens
+        return new_token_ids, stopped
+
+    Scheduler._update_request_with_output = patched_update
+    Scheduler._tpu_multi_step_patch = True
+    logger.info("Applied TPU patch: sync request.num_computed_tokens for multi-step execution.")
+
+
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_offloading_config_build()
@@ -638,6 +657,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     # the first scheduler is created.
     _patch_vllm_hybrid_producer_prefix_hits()
     _patch_vllm_merge_multimodal_embeddings()
+    _patch_vllm_scheduler_multi_step()
 
     from vllm.v1.engine.core import EngineCoreProc
 
