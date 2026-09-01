@@ -2483,7 +2483,27 @@ class TPURaidenConnectorWorker:
 
     def _register_stage3_request_blocks(
             self, metadata: TPUConnectorMetadata) -> None:
-        """Registers only this PCP rank's interleaved physical source blocks."""
+        """Registers this PCP rank's interleaved physical source blocks.
+
+        Processes incoming SendMeta descriptors for active prefill requests or
+        sub-chunks, validates token range parameters and scheduler block
+        geometry, lowers FlashAttention byte spans offset into the global
+        destination coordinate space, collapses sibling state spans, and
+        registers work units with the Raiden controller facade. Detects and
+        handles registration idempotency, conflicting replays, and cancellation
+        race tombstones.
+
+        Args:
+            metadata: Container of per-request send and load metadata
+                descriptors to process.
+
+        Raises:
+            RuntimeError: If the Stage-3 producer work unit is uninitialized.
+            ValueError: If transfer rank is invalid, metadata parameters are
+                malformed (negative tokens/time/base), scheduler block count is
+                insufficient for the token window, or conflicting registration
+                parameters are detected under an active or terminal request ID.
+        """
         facade, _ = self._require_stage3_controller()
         if self._raiden_work_unit is None:
             raise RuntimeError("Stage-3 producer work unit is not registered")
@@ -2509,6 +2529,12 @@ class TPURaidenConnectorWorker:
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
             expiration_time = float(req_meta.expiration_time)
+            raw_base = getattr(req_meta, "token_base", 0)
+            token_base = (
+                int(raw_base) if isinstance(raw_base, (int, float)) else 0
+            )
+            raw_final = getattr(req_meta, "is_final", True)
+            is_final = bool(raw_final) if isinstance(raw_final, bool) else True
             if num_tokens <= 0:
                 raise ValueError(
                     "Stage-3 producer send metadata requires num_tokens")
@@ -2516,21 +2542,26 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a positive "
                     "expiration_time")
+            if token_base < 0:
+                raise ValueError(
+                    "Stage-3 producer send metadata requires a non-negative "
+                    "token_base")
             page_tokens = int(self.vllm_config.cache_config.block_size)
             interleave_tokens = self._raiden_interleave_tokens(
                 page_tokens, parallelism)
             scheduler_block_tokens = page_tokens * parallelism
             expected_scheduler_blocks = (
-                (num_tokens + scheduler_block_tokens - 1) //
+                (token_base + num_tokens + scheduler_block_tokens - 1) //
                 scheduler_block_tokens)
             scheduler_ids = tuple(
                 int(block_id) for block_id in req_meta.local_block_ids)
-            if len(scheduler_ids) != expected_scheduler_blocks:
+            if len(scheduler_ids) < expected_scheduler_blocks:
                 raise ValueError(
                     "Stage-3 producer scheduler block count is inconsistent "
                     f"with PCP geometry: blocks={len(scheduler_ids)}, "
                     f"expected={expected_scheduler_blocks}, "
-                    f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
+                    f"num_tokens={num_tokens}, token_base={token_base}, "
+                    f"page_tokens={page_tokens}, "
                     f"interleave_tokens={interleave_tokens}, "
                     f"parallelism={parallelism}")
             # This rank's declared source map, lowered from the kernel's own
@@ -2540,10 +2571,11 @@ class TPURaidenConnectorWorker:
             # page boundaries, scaled to bytes. The producer-side semantic
             # checks live in this construction and Raiden's byte-level
             # registration/planning validation.
-            from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (  # noqa: E501
-                lower_fa_spans, owned_token_ranges)
+            from vllm_torchtpu.distributed.kv_transfer.raiden import byte_spans
+
             owned_tokens = sum(end - start
-                               for start, end in owned_token_ranges(
+                               for start, end in byte_spans.owned_token_ranges(
+                                   token_base=token_base,
                                    num_tokens=num_tokens,
                                    transfer_rank=transfer_rank,
                                    parallelism=parallelism,
@@ -2553,7 +2585,8 @@ class TPURaidenConnectorWorker:
             local_ids = scheduler_ids[:owned_blocks]
             fa_pool_spans = []
             token_bytes = self._stage3_fa_token_bytes(page_tokens)
-            fa_registration = lower_fa_spans(
+            fa_registration = byte_spans.lower_fa_spans(
+                token_base=token_base,
                 num_tokens=num_tokens,
                 transfer_rank=transfer_rank,
                 parallelism=parallelism,
@@ -2568,7 +2601,8 @@ class TPURaidenConnectorWorker:
             if terminal is not None:
                 if (terminal.uuid != uuid
                         or terminal.local_block_ids != local_ids
-                        or terminal.num_tokens != num_tokens):
+                        or terminal.num_tokens != num_tokens
+                        or terminal.token_base != token_base):
                     raise ValueError(
                         "Conflicting replay after terminal Stage-3 producer "
                         f"registration for req_id={req_id}")
@@ -2577,7 +2611,8 @@ class TPURaidenConnectorWorker:
             if existing is not None:
                 if (existing.uuid != uuid
                         or existing.local_block_ids != local_ids
-                        or existing.num_tokens != num_tokens):
+                        or existing.num_tokens != num_tokens
+                        or existing.token_base != token_base):
                     raise ValueError(
                         "Conflicting duplicate Stage-3 producer registration "
                         f"for req_id={req_id}")
@@ -2616,6 +2651,8 @@ class TPURaidenConnectorWorker:
                     local_block_ids=local_ids,
                     num_tokens=num_tokens,
                     expiration_time=tombstone_deadline,
+                    token_base=token_base,
+                    is_final=is_final,
                 )
                 self._done_sending.add(req_id)
                 logger.warning(
@@ -2631,6 +2668,8 @@ class TPURaidenConnectorWorker:
                 local_block_ids=local_ids,
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
+                token_base=token_base,
+                is_final=is_final,
             )
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
@@ -2703,6 +2742,15 @@ class TPURaidenConnectorWorker:
 
         The caches are TP-replicated: every producer rank shares the full
         scheduler block table and owns a round-robin stripe of its pages.
+
+        Args:
+            metadata: Container of per-request send and load metadata
+                descriptors to process.
+
+        Raises:
+            RuntimeError: If the Stage-3 producer work unit is uninitialized.
+            ValueError: If metadata parameters are invalid or conflicting
+                registrations are detected.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
             lower_glm_row_spans
@@ -2730,6 +2778,12 @@ class TPURaidenConnectorWorker:
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
             expiration_time = float(req_meta.expiration_time)
+            raw_base = getattr(req_meta, "token_base", 0)
+            token_base = (
+                int(raw_base) if isinstance(raw_base, (int, float)) else 0
+            )
+            raw_final = getattr(req_meta, "is_final", True)
+            is_final = bool(raw_final) if isinstance(raw_final, bool) else True
             if num_tokens <= 0:
                 raise ValueError(
                     "Stage-3 producer send metadata requires num_tokens")
@@ -2737,6 +2791,10 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a positive "
                     "expiration_time")
+            if token_base < 0:
+                raise ValueError(
+                    "Stage-3 producer send metadata requires a non-negative "
+                    "token_base")
             scheduler_ids = tuple(
                 int(block_id) for block_id in req_meta.local_block_ids)
             pool_spans = [
@@ -2766,7 +2824,8 @@ class TPURaidenConnectorWorker:
             if terminal is not None:
                 if (terminal.uuid != uuid
                         or terminal.local_block_ids != registered_ids
-                        or terminal.num_tokens != num_tokens):
+                        or terminal.num_tokens != num_tokens
+                        or terminal.token_base != token_base):
                     raise ValueError(
                         "Conflicting replay after terminal Stage-3 producer "
                         f"registration for req_id={req_id}")
@@ -2775,7 +2834,8 @@ class TPURaidenConnectorWorker:
             if existing is not None:
                 if (existing.uuid != uuid
                         or existing.local_block_ids != registered_ids
-                        or existing.num_tokens != num_tokens):
+                        or existing.num_tokens != num_tokens
+                        or existing.token_base != token_base):
                     raise ValueError(
                         "Conflicting duplicate Stage-3 producer registration "
                         f"for req_id={req_id}")
@@ -2799,6 +2859,8 @@ class TPURaidenConnectorWorker:
                     local_block_ids=registered_ids,
                     num_tokens=num_tokens,
                     expiration_time=tombstone_deadline,
+                    token_base=token_base,
+                    is_final=is_final,
                 )
                 self._done_sending.add(req_id)
                 logger.warning(
@@ -2811,6 +2873,8 @@ class TPURaidenConnectorWorker:
                 local_block_ids=registered_ids,
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
+                token_base=token_base,
+                is_final=is_final,
             )
             if not owned_pages:
                 # No pages owned: terminal immediately, no transfer.
@@ -3620,6 +3684,8 @@ class TPURaidenConnectorWorker:
                     local_block_ids=registration.local_block_ids,
                     num_tokens=registration.num_tokens,
                     expiration_time=tombstone_deadline,
+                    token_base=registration.token_base,
+                    is_final=registration.is_final,
                 )
                 del self._stage3_registered_sends[req_id]
                 del self._stage3_terminal_cleanup[req_id]
