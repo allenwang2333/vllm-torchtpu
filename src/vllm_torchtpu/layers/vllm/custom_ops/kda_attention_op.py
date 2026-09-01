@@ -486,19 +486,28 @@ def _dispatched_kda_core(
     if num_spec_tokens > 0:
         if slot_read_offsets is None:
             raise ValueError("slot_read_offsets are required for KDA verify")
-        seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
-        is_decode = seq_ids < decode_end
-        decode_read_indices = state_indices + slot_read_offsets[state_indices]
-        decode_conv_seed = jnp.where(
-            is_decode.reshape((num_seqs, ) + (1, ) * (conv_state.ndim - 1)),
-            conv_in[decode_read_indices], conv_in[0])
-        decode_rec_seed = jnp.where(
-            is_decode.reshape((num_seqs, ) +
-                              (1, ) * (recurrent_state.ndim - 1)),
-            recurrent_state[decode_read_indices], recurrent_state[0])
-        conv_in = conv_in.at[decode_indices].set(decode_conv_seed)
-        recurrent_state = recurrent_state.at[decode_indices].set(
-            decode_rec_seed)
+
+        def seed_decode_state():
+            seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
+            is_decode = seq_ids < decode_end
+            decode_read_indices = (
+                state_indices + slot_read_offsets[state_indices])
+            decode_conv_seed = jnp.where(
+                is_decode.reshape((num_seqs, ) +
+                                  (1, ) * (conv_state.ndim - 1)),
+                conv_in[decode_read_indices], conv_in[0])
+            decode_rec_seed = jnp.where(
+                is_decode.reshape((num_seqs, ) +
+                                  (1, ) * (recurrent_state.ndim - 1)),
+                recurrent_state[decode_read_indices], recurrent_state[0])
+            return (conv_in.at[decode_indices].set(decode_conv_seed),
+                    recurrent_state.at[decode_indices].set(decode_rec_seed))
+
+        # The initial pure-prefill step has no checkpoint to restore. Keep its
+        # null-slot gather/scatter out of the graph to preserve Target logits.
+        conv_in, recurrent_state = jax.lax.cond(
+            decode_end > 0, seed_decode_state,
+            lambda: (conv_in, recurrent_state))
 
     # --- decode segment: fused convolution + recurrence ---------------
     decode_out, conv_after_decode, pool_after_decode = decode_kda(
