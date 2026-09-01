@@ -182,7 +182,13 @@ class InBufferedRef(BaseBufferedRef):
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             pltpu.make_async_copy(
                 src_ref.at[pl.ds(r_base, dma_size)],
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
+                # `..., 0` squeezes the VMEM block's unit axis so this matches
+                # the rank-2 HBM source. The activations are handed to the
+                # kernel as [padded_batch_size, dim]; carrying the unit axis on
+                # the HBM side instead would force XLA to retile the whole
+                # array to T(1,128) ahead of the call. See wrapper.py's note
+                # where the reshape used to be.
+                vmem_ref.at[idx, pl.ds(0, dma_size), 0],
                 sem,
             ).start()
 

@@ -539,9 +539,18 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    # The activations stay RANK 2 on the HBM side. They used to be reshaped to
+    # [padded_batch_size, 1, dim] so the DMA source slice would be rank-3 and
+    # shape-identical to its VMEM destination in `memory_ref.InBufferedRef`.
+    # That unit middle axis is what forces the layout: for f32[256, 12288] the
+    # two minormost dims are (256, 12288) and XLA tiles them T(8,128), but for
+    # f32[256, 1, 12288] they are (1, 12288), where an (8,128) tile would pad
+    # 1 -> 8, so XLA picks T(1,128) and inserts a full retiling copy of the
+    # whole activation in front of the custom call, every GDN layer, every
+    # step. The VMEM block keeps its unit axis -- the conv1d and the loads in
+    # `vmem_ldst` are written against it -- and `InBufferedRef` now squeezes it
+    # on the destination side instead, which costs nothing there because the
+    # VMEM block's shape is chosen by us, not by XLA's layout assignment.
 
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
