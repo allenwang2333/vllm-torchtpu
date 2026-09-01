@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -63,6 +65,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
+    VLLM_TPU_BLOCK_MAJOR_KV: bool = False
 
 
 def env_with_choices(
@@ -174,6 +177,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
+    # Off by default so tokenizer behavior matches stock vLLM; the DSv4
+    # eval config turns it on, since a prefilled assistant turn needs it.
+    "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
+    env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
@@ -311,6 +319,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Select the blockwise owner-output kernel after the outer one-hot MoE
+    # threshold has selected the TensorCore path. "off" keeps the dense
+    # one-hot combine; "on" enables the kernel for every shape that passes
+    # its dtype, alignment, and VMEM safety checks.
+    "TPU_MOE_OWNER_OUTPUT_MODE":
+    env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
+                     "off", ["off", "on"],
+                     case_sensitive=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
@@ -379,6 +395,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
+    # Build each rank's two consumed routing-plan slices instead of
+    # replicating the full T * topk * experts plan arithmetic on every rank.
+    "MOE_FUSED_EP_V2_SHARDED_PLAN":
+    env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
@@ -409,6 +429,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Enables the block-major KV cache layout for Raiden offloading. Bundles all
+    # attention layer fragments into a single contiguous array in HBM, collapsing
+    # per-block transfers from F independent DMAs into a single hardware DMA.
+    # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
+    "VLLM_TPU_BLOCK_MAJOR_KV":
+    env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
 }
 
 
