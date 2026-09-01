@@ -462,8 +462,8 @@ def _mla_ragged_paged_attention_kernel(
             kv_len = kv_lens_ref[seq_idx]
             q_span = (kv_len - q_len + bq_idx * bq_sz + unsigned_floor_div(
                 lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads))
-            mask = ((q_span < k_span) if use_causal_mask else
-                    jnp.zeros_like(q_span < k_span))
+            mask = ((q_span < k_span) if use_causal_mask else jnp.zeros_like(
+                q_span < k_span))
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
             mask_list.append(mask)
@@ -621,8 +621,8 @@ def _mla_ragged_paged_attention_kernel(
                     lax.broadcasted_iota(jnp.int32, s.shape, 0), num_q_heads))
             k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
                 jnp.int32, s.shape, 1)
-            mask = ((q_span < k_span) if use_causal_mask else
-                    jnp.zeros_like(q_span < k_span))
+            mask = ((q_span < k_span) if use_causal_mask else jnp.zeros_like(
+                q_span < k_span))
 
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)

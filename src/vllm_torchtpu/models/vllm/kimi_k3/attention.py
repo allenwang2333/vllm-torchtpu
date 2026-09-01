@@ -293,10 +293,10 @@ class MultiHeadLatentAttention(nn.Module):
                     "rope_theta": getattr(config, "rope_theta", 10000.0),
                 })
             if rope_parameters.get("rope_type", "default") != "default":
-                rope_parameters["rope_type"] = (
-                    "deepseek_yarn"
-                    if rope_parameters.get("apply_yarn_scaling", True) else
-                    "deepseek_llama_scaling")
+                rope_parameters["rope_type"] = ("deepseek_yarn"
+                                                if rope_parameters.get(
+                                                    "apply_yarn_scaling", True)
+                                                else "deepseek_llama_scaling")
             rotary_emb = get_rope(
                 self.qk_rope_head_dim,
                 max_position=config.max_position_embeddings,

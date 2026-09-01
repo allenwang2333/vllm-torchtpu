@@ -284,9 +284,12 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.model.embed_input_ids(input_ids)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        invalid = [idx for idx in layers if idx < 0 or idx > len(self.model.layers)]
+        invalid = [
+            idx for idx in layers if idx < 0 or idx > len(self.model.layers)
+        ]
         if invalid:
-            raise ValueError(f"Invalid Kimi aux hidden-state layers: {invalid}")
+            raise ValueError(
+                f"Invalid Kimi aux hidden-state layers: {invalid}")
         self.model.aux_hidden_state_layers = tuple(layers)
 
     def forward(
