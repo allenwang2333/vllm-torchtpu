@@ -38,6 +38,9 @@ class _FakeRaidenEngine:
     def __init__(self) -> None:
         self.calls: list[Any] = []
         self.poll_results: list[tuple[list[str], list[str], list[str]]] = []
+        self.complete_read_results: list[
+            tuple[list[str], list[str], list[str]]
+        ] = []
 
     def register_read(
         self, req_id: str, uuid: int, block_ids: list[int]
@@ -58,10 +61,20 @@ class _FakeRaidenEngine:
         )
         return 2
 
+    def complete_read(self) -> tuple[list[str], list[str], list[str]]:
+        self.calls.append(("complete_read",))
+        if self.complete_read_results:
+            return self.complete_read_results.pop(0)
+        if self.poll_results:
+            return self.poll_results.pop(0)
+        return [], [], []
+
     def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
         self.calls.append(("poll_stats",))
         if self.poll_results:
             return self.poll_results.pop(0)
+        if self.complete_read_results:
+            return self.complete_read_results.pop(0)
         return [], [], []
 
 
@@ -730,3 +743,376 @@ def test_worker_registration_conflicting_local_block_ids_rejected() -> None:
             match="Conflicting duplicate Stage-3 producer registration",
         ):
             worker.process_send_load(meta_conflict)
+
+
+
+def test_device_buffer_retained_during_dma() -> None:
+    """Verifies device buffer handles are retained during DMA."""
+    worker, facade, _ = _make_test_worker(
+        pcp_size=4, interleave_size=256, block_size=1024, transfer_rank=0
+    )
+    mock_tensor_k = MagicMock(name="mock_kv_tensor_k")
+    mock_tensor_v = MagicMock(name="mock_kv_tensor_v")
+    mock_runner = MagicMock()
+    mock_runner.kv_caches = [(mock_tensor_k, mock_tensor_v)]
+    worker.runner = mock_runner
+
+    req_id = "req-dma-001"
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send[req_id] = SendMeta(
+        uuid=90001,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=1024,
+        is_final=False,
+    )
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta)
+
+    assert req_id in worker._active_tensor_refs
+    assert req_id in worker._stage3_registered_sends
+    ref = worker._active_tensor_refs[req_id]
+    assert isinstance(ref, _Stage3RegisteredSend)
+    assert ref.uuid == 90001
+    assert ref.token_base == 1024
+    assert ref.num_tokens == 1024
+    assert ref.local_block_ids == (100,)
+    assert ref.device_buffers == (mock_tensor_k, mock_tensor_v)
+
+
+def test_device_buffer_released_on_dma_completion() -> None:
+    """Verifies device buffer handles are released when DMA completes."""
+    worker, facade, engine = _make_test_worker(
+        pcp_size=4, interleave_size=256, block_size=1024, transfer_rank=0
+    )
+    mock_tensor = MagicMock(name="mock_tensor")
+    mock_runner = MagicMock()
+    mock_runner.kv_caches = [mock_tensor]
+    worker.runner = mock_runner
+
+    req_id = "req-dma-002"
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send[req_id] = SendMeta(
+        uuid=90002,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=False,
+    )
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta)
+
+    assert req_id in worker._active_tensor_refs
+    assert worker._active_tensor_refs[req_id].device_buffers == (mock_tensor,)
+
+    # Mock complete_read reporting DMA completion for req_id
+    engine.complete_read_results = [([req_id], [], [])]
+
+    with _patch_raiden_worker_env(parallelism=4):
+        done_sending, _ = worker.get_finished()
+
+    assert req_id in done_sending
+    assert req_id not in worker._active_tensor_refs
+    assert req_id in worker._stage3_terminal_sends
+    assert worker._stage3_terminal_sends[req_id].device_buffers == ()
+    assert req_id not in worker._stage3_registered_sends
+
+
+def test_device_buffer_multiple_subchunks_independent_lifecycle() -> None:
+    """Verifies sub-chunks have independent buffer retention lifecycles."""
+    worker, facade, engine = _make_test_worker(
+        pcp_size=4, interleave_size=256, block_size=1024, transfer_rank=0
+    )
+    mock_tensor = MagicMock(name="mock_tensor")
+    mock_runner = MagicMock()
+    mock_runner.kv_caches = [mock_tensor]
+    worker.runner = mock_runner
+
+    meta0 = TPUConnectorMetadata()
+    meta0.reqs_to_send["req-sub:0"] = SendMeta(
+        uuid=91000,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=False,
+    )
+    meta1 = TPUConnectorMetadata()
+    meta1.reqs_to_send["req-sub:1"] = SendMeta(
+        uuid=91001,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=1024,
+        is_final=True,
+    )
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta0)
+        worker.process_send_load(meta1)
+
+    assert "req-sub:0" in worker._active_tensor_refs
+    assert "req-sub:1" in worker._active_tensor_refs
+
+    # Complete only chunk 0
+    engine.complete_read_results = [(["req-sub:0"], [], [])]
+    with _patch_raiden_worker_env(parallelism=4):
+        done_sending, _ = worker.get_finished()
+
+    assert "req-sub:0" in done_sending
+    assert "req-sub:0" not in worker._active_tensor_refs
+    assert "req-sub:1" in worker._active_tensor_refs  # Chunk 1 still pinned
+
+    # Complete chunk 1
+    engine.complete_read_results = [(["req-sub:1"], [], [])]
+    with _patch_raiden_worker_env(parallelism=4):
+        done_sending2, _ = worker.get_finished()
+
+    assert "req-sub:1" in done_sending2
+    assert "req-sub:1" not in worker._active_tensor_refs
+
+
+def test_device_buffer_unregistered_on_cancellation_race() -> None:
+    """Verifies buffer handles are dropped when registration is cancelled."""
+    worker, facade, _ = _make_test_worker(
+        pcp_size=4, interleave_size=256, block_size=1024, transfer_rank=0
+    )
+    mock_tensor = MagicMock(name="mock_tensor")
+    mock_runner = MagicMock()
+    mock_runner.kv_caches = [mock_tensor]
+    worker.runner = mock_runner
+
+    facade.register_request_blocks = MagicMock(
+        side_effect=RuntimeError(
+            "Request block registration was cancelled: generation expired"
+        )
+    )
+
+    req_id = "req-cancel-race"
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send[req_id] = SendMeta(
+        uuid=92000,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=1024,
+        is_final=False,
+    )
+
+    with _patch_raiden_worker_env(parallelism=4, wait_pull_timeout=5.0):
+        worker.process_send_load(meta)
+
+    assert req_id not in worker._active_tensor_refs
+    assert req_id in worker._stage3_terminal_sends
+    assert worker._stage3_terminal_sends[req_id].device_buffers == ()
+
+
+def test_flattened_kv_cache_tensors_variations() -> None:
+    """Verifies _flattened_kv_cache_tensors handles varied cache formats."""
+    worker, _, _ = _make_test_worker()
+
+    # 1. runner is None -> returns empty list
+    worker.runner = None
+    assert worker._flattened_kv_cache_tensors() == []
+
+    # 2. runner without kv_caches attribute -> returns empty list
+    worker.runner = SimpleNamespace()
+    assert worker._flattened_kv_cache_tensors() == []
+
+    # 3. runner.kv_caches is None -> returns empty list
+    worker.runner = SimpleNamespace(kv_caches=None)
+    assert worker._flattened_kv_cache_tensors() == []
+
+    # 4. runner.kv_caches is a flat list of tensors -> returns flat list
+    t1, t2 = MagicMock(name="t1"), MagicMock(name="t2")
+    worker.runner = SimpleNamespace(kv_caches=[t1, t2])
+    assert worker._flattened_kv_cache_tensors() == [t1, t2]
+
+    # 5. runner.kv_caches is a list of (key, value) tuples -> flattens to 1D
+    k1, v1 = MagicMock(name="k1"), MagicMock(name="v1")
+    k2, v2 = MagicMock(name="k2"), MagicMock(name="v2")
+    worker.runner = SimpleNamespace(kv_caches=[(k1, v1), (k2, v2)])
+    assert worker._flattened_kv_cache_tensors() == [k1, v1, k2, v2]
+
+    # 6. runner.kv_caches has mixed tuples and tensors -> flattens all entries
+    t3 = MagicMock(name="t3")
+    worker.runner = SimpleNamespace(kv_caches=[(k1, v1), t3])
+    assert worker._flattened_kv_cache_tensors() == [k1, v1, t3]
+
+
+def test_poll_finished_engine_interface_polymorphism() -> None:
+    """Verifies _poll_finished handles polymorphic engine interfaces."""
+    worker, _, _ = _make_test_worker(is_producer=True)
+    mock_tensor = MagicMock(name="mock_tensor")
+    worker.runner = SimpleNamespace(kv_caches=[mock_tensor])
+
+    # Register send 1 for complete_read test
+    req_id_1 = "req-poly-complete-read"
+    meta1 = TPUConnectorMetadata()
+    meta1.reqs_to_send[req_id_1] = SendMeta(
+        uuid=93001,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=True,
+    )
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta1)
+    assert req_id_1 in worker._active_tensor_refs
+
+    # Engine implementing only complete_read
+    class EngineWithCompleteRead:
+        def complete_read(self) -> tuple[list[str], list[str], list[str]]:
+            return [req_id_1], [], []
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker._poll_finished(EngineWithCompleteRead())
+    assert req_id_1 not in worker._active_tensor_refs
+
+    # Register send 2 for poll_stats test
+    req_id_2 = "req-poly-poll-stats"
+    meta2 = TPUConnectorMetadata()
+    meta2.reqs_to_send[req_id_2] = SendMeta(
+        uuid=93002,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=True,
+    )
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta2)
+    assert req_id_2 in worker._active_tensor_refs
+
+    # Engine implementing only poll_stats
+    class EngineWithPollStats:
+        def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
+            return [req_id_2], [], []
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker._poll_finished(EngineWithPollStats())
+    assert req_id_2 not in worker._active_tensor_refs
+
+    # Engine implementing neither method
+    class EngineWithoutPolling:
+        pass
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker._poll_finished(EngineWithoutPolling())
+
+
+def test_device_buffer_released_on_terminal_cleanup_force_release() -> None:
+    """Verifies buffer handles are purged during terminal cleanup."""
+    worker, facade, _ = _make_test_worker(
+        pcp_size=4, interleave_size=256, block_size=1024, transfer_rank=0
+    )
+    mock_tensor = MagicMock(name="mock_tensor")
+    worker.runner = SimpleNamespace(kv_caches=[mock_tensor])
+
+    req_id = "req-term-cleanup"
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send[req_id] = SendMeta(
+        uuid=94001,
+        local_block_ids=[100, 101],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=True,
+    )
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.process_send_load(meta)
+
+    assert req_id in worker._active_tensor_refs
+    assert worker._active_tensor_refs[req_id].device_buffers == (mock_tensor,)
+
+    # Queue terminal send for cleanup with force_release=True
+    worker._stage3_terminal_cleanup[req_id] = True
+
+    with _patch_raiden_worker_env(parallelism=4):
+        worker.get_finished()
+
+    assert req_id not in worker._active_tensor_refs
+    assert req_id not in worker._stage3_registered_sends
+    assert req_id in worker._stage3_terminal_sends
+    assert worker._stage3_terminal_sends[req_id].device_buffers == ()
+    assert len(facade.complete_request_blocks_calls) == 1
+    assert facade.complete_request_blocks_calls[0]["req_id"] == req_id
+    assert facade.complete_request_blocks_calls[0]["uuid"] == 94001
+
+
+def test_glm_device_buffer_retained_and_released_on_cancellation_race() -> None:
+    """Verifies GLM producer registration retains and releases buffers."""
+    worker, facade, _ = _make_test_worker(
+        tp_rank=0,
+        tp_size=4,
+        pcp_size=4,
+        interleave_size=256,
+        block_size=1024,
+        transfer_rank=0,
+    )
+    mock_tensor_k = MagicMock(name="mock_kv_tensor_k")
+    mock_tensor_v = MagicMock(name="mock_kv_tensor_v")
+    worker.runner = SimpleNamespace(kv_caches=[(mock_tensor_k, mock_tensor_v)])
+
+    # Setup GLM geometry for all required tags
+    worker._stage3_glm_geometry = {
+        "mla.nope": (1024 * 128, 128),
+        "mla.rope": (1024 * 64, 64),
+        "dsa.idx": (1024 * 16, 16),
+    }
+
+    req_id_ok = "req-glm-ok"
+    meta_ok = TPUConnectorMetadata()
+    meta_ok.reqs_to_send[req_id_ok] = SendMeta(
+        uuid=95001,
+        local_block_ids=[200],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=True,
+    )
+
+    with (
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        _patch_raiden_worker_env(parallelism=4),
+    ):
+        worker.process_send_load(meta_ok)
+
+    assert req_id_ok in worker._active_tensor_refs
+    assert req_id_ok in worker._stage3_registered_sends
+    assert worker._active_tensor_refs[req_id_ok].device_buffers == (
+        mock_tensor_k,
+        mock_tensor_v,
+    )
+
+    # Test cancellation race in GLM registration path
+    facade.register_request_blocks = MagicMock(
+        side_effect=RuntimeError(
+            "Request block registration was cancelled: generation expired"
+        )
+    )
+    req_id_cancel = "req-glm-cancel"
+    meta_cancel = TPUConnectorMetadata()
+    meta_cancel.reqs_to_send[req_id_cancel] = SendMeta(
+        uuid=95002,
+        local_block_ids=[202],
+        expiration_time=time.perf_counter() + 30.0,
+        num_tokens=1024,
+        token_base=0,
+        is_final=True,
+    )
+
+    with (
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        _patch_raiden_worker_env(parallelism=4, wait_pull_timeout=5.0),
+    ):
+        worker.process_send_load(meta_cancel)
+
+    assert req_id_cancel not in worker._active_tensor_refs
+    assert req_id_cancel in worker._stage3_terminal_sends
+    assert worker._stage3_terminal_sends[req_id_cancel].device_buffers == ()

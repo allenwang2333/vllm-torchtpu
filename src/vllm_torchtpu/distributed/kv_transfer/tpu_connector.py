@@ -207,7 +207,17 @@ def chunk_uuid(base_uuid: int, chunk_idx: int) -> int:
 
 @dataclass(frozen=True)
 class _Stage3RegisteredSend:
-    """Worker-local D5 registration retained until terminal send state."""
+    """Worker-local D5 registration retained until terminal send state.
+
+    Attributes:
+        uuid: Deterministic request or sub-chunk identifier.
+        local_block_ids: Physical page block IDs assigned to this PCP rank.
+        num_tokens: Number of tokens covered by this send descriptor.
+        expiration_time: Wall-clock expiration timestamp in seconds.
+        token_base: Starting token offset within the global sequence.
+        is_final: Whether this chunk is the final sub-chunk of the request.
+        device_buffers: Kept-alive physical device buffer tensor handles.
+    """
 
     uuid: int
     local_block_ids: tuple[int, ...]
@@ -215,6 +225,7 @@ class _Stage3RegisteredSend:
     expiration_time: float
     token_base: int = 0
     is_final: bool = True
+    device_buffers: tuple[Any, ...] = ()
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -1673,6 +1684,7 @@ class TPURaidenConnectorWorker:
         # reports done_sending. Consumer submissions are keyed by UUID so a
         # duplicate connector-metadata delivery cannot launch a second plan.
         self._stage3_registered_sends: dict[str, _Stage3RegisteredSend] = {}
+        self._active_tensor_refs: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_cleanup: dict[str, bool] = {}
         self._stage3_reported_sends: set[str] = set()
@@ -2481,6 +2493,32 @@ class TPURaidenConnectorWorker:
                 "registration with an explicit destination controller")
         return facade, address
 
+    def _flattened_kv_cache_tensors(self) -> list[Any]:
+        """Extracts a flat list of physical KV cache tensor handles from runner.
+
+        Traverses the runner's registered KV cache buffers, unwrapping nested
+        tuple or list structures (e.g. key/value tensor pairs per layer) into
+        a 1D list of device tensor references suitable for engine registration
+        and lifetime retention.
+
+        Returns:
+            A flat list of device buffer tensor handles, or an empty list if
+            runner or caches are uninitialized.
+        """
+        if (
+            self.runner is None
+            or not hasattr(self.runner, "kv_caches")
+            or self.runner.kv_caches is None
+        ):
+            return []
+        flat: list[Any] = []
+        for entry in self.runner.kv_caches:
+            if isinstance(entry, (tuple, list)):
+                flat.extend(entry)
+            else:
+                flat.append(entry)
+        return flat
+
     def _register_stage3_request_blocks(
             self, metadata: TPUConnectorMetadata) -> None:
         """Registers this PCP rank's interleaved physical source blocks.
@@ -2653,7 +2691,9 @@ class TPURaidenConnectorWorker:
                     expiration_time=tombstone_deadline,
                     token_base=token_base,
                     is_final=is_final,
+                    device_buffers=(),
                 )
+                self._active_tensor_refs.pop(req_id, None)
                 self._done_sending.add(req_id)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 request "
@@ -2663,14 +2703,18 @@ class TPURaidenConnectorWorker:
                     uuid,
                 )
                 continue
-            self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
+            device_buffers = tuple(self._flattened_kv_cache_tensors())
+            reg = _Stage3RegisteredSend(
                 uuid=uuid,
                 local_block_ids=local_ids,
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
                 token_base=token_base,
                 is_final=is_final,
+                device_buffers=device_buffers,
             )
+            self._stage3_registered_sends[req_id] = reg
+            self._active_tensor_refs[req_id] = reg
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
@@ -2861,21 +2905,27 @@ class TPURaidenConnectorWorker:
                     expiration_time=tombstone_deadline,
                     token_base=token_base,
                     is_final=is_final,
+                    device_buffers=(),
                 )
+                self._active_tensor_refs.pop(req_id, None)
                 self._done_sending.add(req_id)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 GLM "
                     "registration was already cancelled req_id=%s uuid=%d",
                     self.tp_rank, req_id, uuid)
                 continue
-            self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
+            device_buffers = tuple(self._flattened_kv_cache_tensors())
+            reg = _Stage3RegisteredSend(
                 uuid=uuid,
                 local_block_ids=registered_ids,
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
                 token_base=token_base,
                 is_final=is_final,
+                device_buffers=device_buffers,
             )
+            self._stage3_registered_sends[req_id] = reg
+            self._active_tensor_refs[req_id] = reg
             if not owned_pages:
                 # No pages owned: terminal immediately, no transfer.
                 self._stage3_send_outcomes.setdefault(req_id, "done")
@@ -3461,7 +3511,27 @@ class TPURaidenConnectorWorker:
         return done_sending, done_recving
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
-        done_sending, done_recving, failed_recving = engine.poll_stats()
+        """Polls transfer engine completion events and updates worker state.
+
+        Queries the underlying Raiden transfer manager for completed or failed
+        transfers, releasing kept-alive device buffer tensor handles upon DMA
+        completion, translating native engine completion keys to connector
+        request IDs, and reconciling completion records against controller
+        admission status for Stage-3 and legacy transfer paths.
+
+        Args:
+            engine: The low-level transfer manager instance to poll.
+        """
+        if hasattr(engine, "poll_stats") and callable(
+            getattr(engine, "poll_stats")
+        ):
+            done_sending, done_recving, failed_recving = engine.poll_stats()
+        elif hasattr(engine, "complete_read") and callable(
+            getattr(engine, "complete_read")
+        ):
+            done_sending, done_recving, failed_recving = engine.complete_read()
+        else:
+            done_sending, done_recving, failed_recving = [], [], []
         sender_failures: set[str] = set()
         cancelled_sends: set[str] = set()
         if self.is_producer and not self._raiden_stage3_enabled():
@@ -3475,6 +3545,8 @@ class TPURaidenConnectorWorker:
             for req_id in failed_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
         if self.is_producer and self._raiden_stage3_enabled():
+            for send_id in done_sending:
+                self._active_tensor_refs.pop(str(send_id), None)
             # The native manager's third tuple is named failed_recving for
             # historical pull semantics, but ReshardPush sender failures are
             # reported there too. Native completion is per transfer plan, so
@@ -3686,8 +3758,10 @@ class TPURaidenConnectorWorker:
                     expiration_time=tombstone_deadline,
                     token_base=registration.token_base,
                     is_final=registration.is_final,
+                    device_buffers=(),
                 )
-                del self._stage3_registered_sends[req_id]
+                self._active_tensor_refs.pop(req_id, None)
+                self._stage3_registered_sends.pop(req_id, None)
                 del self._stage3_terminal_cleanup[req_id]
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -3719,16 +3793,6 @@ class TPURaidenConnectorWorker:
                     pending)
                 return
             time.sleep(0.001)
-
-    def _flattened_kv_cache_tensors(self) -> list[Any]:
-        assert self.runner is not None
-        flat: list[Any] = []
-        for entry in self.runner.kv_caches:
-            if isinstance(entry, (tuple, list)):
-                flat.extend(entry)
-            else:
-                flat.append(entry)
-        return flat
 
     def _ensure_raiden_transfer_engine(self) -> "KVCacheManager":
         if self._raiden_transfer_engine is not None:
