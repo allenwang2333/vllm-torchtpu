@@ -1123,17 +1123,18 @@ class _RaidenOffloadingHandler:
                  src_block_size_factor: int,
                  dst_block_size_factor: int,
                  bytes_per_kernel_block: int,
-                 hybrid_num_groups: "int | None" = None,
-                 device_tensors: "list[torch.Tensor] | None" = None):
+                 hybrid_num_groups: "int | None" = None):
         self._mgr = mgr
         self.tpu_to_cpu = tpu_to_cpu
         self.src_block_size_factor = src_block_size_factor
         self.dst_block_size_factor = dst_block_size_factor
         self._bytes_per_kernel_block = bytes_per_kernel_block
-        # The live device KV tensors the store (D2h) reads. Synced before the
-        # copy so it cannot read a block the forward is still writing.
-        self._device_tensors = device_tensors
         self._pending: dict[int, tuple] = {}
+        # D2H stores not yet handed to raiden: the forward that wrote their
+        # source blocks may still be running. Each entry carries a device
+        # event recorded at submission time; the DMA is issued once that
+        # event reports the snapshotted work complete (insertion order).
+        self._deferred_d2h: dict[int, tuple] = {}
         # Hybrid unified-block-pool mode: same grouped row mapping as the
         # torch handler (see _expand_transfer_ids). Raiden host slots stay
         # uniform because every pool row has identical bytes.
@@ -1157,19 +1158,51 @@ class _RaidenOffloadingHandler:
                                                 self._hybrid_num_groups)
         n = len(dst_ids)
         sizes = [1] * n  # one major-dim slice (= one kernel block) per segment
+        num_bytes = n * self._bytes_per_kernel_block
         if self.tpu_to_cpu:
-            # Order the store copy after the forward's in-place KV write so it
-            # cannot read a block mid-write. Scoped to the KV tensors (not a
-            # global device sync); waits on their PJRT readiness event, the
-            # same event raiden's raw copy would otherwise race.
-            synchronize_tensors(self._device_tensors or None)
-            fut = self._mgr.d2h(src_ids.tolist(), dst_ids.tolist(), sizes)
-        else:
-            fut = self._mgr.h2d(src_ids.tolist(), dst_ids.tolist(), sizes)
-        self._pending[job_id] = (fut, n * self._bytes_per_kernel_block)
+            # The D2h DMA reads the KV blocks directly from HBM, outside XLA's
+            # program ordering, so it must not start before the forward that
+            # wrote them has finished. The forward and the seed copies are
+            # compiled programs, already enqueued when the store arrives:
+            # snapshot the device's in-flight work and defer the DMA until
+            # that snapshot has drained. The poll runs from get_finished and
+            # later submissions, never blocking the worker thread.
+            #
+            # TODO: issue the DMA the moment the snapshot drains instead of
+            # at the next poll (up to one step later). That needs an on-ready
+            # hook, which is neither exposed by torch_tpu (TpuEvent has only
+            # query()/synchronize()) nor wired in raiden (d2h takes no
+            # dependency on the source buffer's readiness). Once raiden can
+            # chain the copy on the buffer's ready future, drop the deferral
+            # and hand the tensors to raiden here.
+            event = torch.tpu.Event()
+            event.record()
+            self._deferred_d2h[job_id] = (event, src_ids.tolist(),
+                                          dst_ids.tolist(), sizes, num_bytes)
+            self.submit_deferred_d2h()
+            return True
+        fut = self._mgr.h2d(src_ids.tolist(), dst_ids.tolist(), sizes)
+        self._pending[job_id] = (fut, num_bytes)
         return True
 
+    def submit_deferred_d2h(self) -> None:
+        """Hand every deferred D2H store whose device snapshot has drained
+        to raiden, in submission order.
+
+        Stops at the first store still waiting: a later snapshot covers all
+        work still pending at an earlier one, so completion is monotonic in
+        submission order.
+        """
+        for job_id, entry in list(self._deferred_d2h.items()):
+            event, src_ids, dst_ids, sizes, num_bytes = entry
+            if not event.query():
+                break
+            del self._deferred_d2h[job_id]
+            fut = self._mgr.d2h(src_ids, dst_ids, sizes)
+            self._pending[job_id] = (fut, num_bytes)
+
     def get_finished(self) -> list[TransferResult]:
+        self.submit_deferred_d2h()
         results: list[TransferResult] = []
         for job_id in list(self._pending.keys()):
             fut, num_bytes = self._pending[job_id]
@@ -1210,6 +1243,15 @@ class _RaidenOffloadingHandler:
         `_pending`, emitting TransferResults) is left to the next
         `get_finished()`, which the scheduler relies on to mark jobs done.
         """
+        # The scheduler is about to reuse these stores' source blocks, so a
+        # deferred store must be handed to raiden now: wait for its device
+        # snapshot (the only place this handler blocks on the device), then
+        # submit it and its predecessors.
+        for jid in job_ids:
+            entry = self._deferred_d2h.get(jid)
+            if entry is not None:
+                entry[0].synchronize()
+        self.submit_deferred_d2h()
         # Flush by POLLING is_ready (never the blocking Await, which can
         # deadlock against the live model -- see get_finished). Bound the wait
         # with a dedicated offload timeout so a stalled raiden DMA can't
@@ -1396,7 +1438,6 @@ class CpuTpuOffloadingHandlers:
                 dst_block_size_factor=dst_block_size_factor,
                 bytes_per_kernel_block=bytes_per_kernel_block,
                 hybrid_num_groups=hybrid_num_groups,
-                device_tensors=tpu_tensors,
             )
             self.cpu_to_gpu_handler = _RaidenOffloadingHandler(
                 self._raiden_mgr,

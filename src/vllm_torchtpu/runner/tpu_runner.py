@@ -4169,11 +4169,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        self.maybe_wait_for_kv_save()
-        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
-         invalid_block_group_index,
-         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
-
         logprobs = []
         if needs_logprobs and len(combined_logprobs):
             # TODO: concatenate the LogprobsTensors (torch) first, then
@@ -4218,6 +4213,23 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        next_tokens_tpu = None
+        copy_state = None
+        if combined_selected_tokens:
+            copy_state = AsyncTPUCopyState.from_device_chunks(
+                combined_selected_tokens, combined_selected_tokens_real_lens)
+
+        if self.scheduler_config.async_scheduling:
+            self._modify_prev_results()
+
+        # Poll the KV connector only now: the wait above proves the previous
+        # forward finished, so a store deferred behind it can be handed to
+        # raiden in this step rather than the next.
+        self.maybe_wait_for_kv_save()
+        (finished_sending, finished_recving, kv_worker_meta, invalid_block_ids,
+         invalid_block_group_index,
+         kv_connector_stats) = self.get_finished_kv_transfers(scheduler_output)
+
         kv_connector_output = (None if (
             finished_sending is None and finished_recving is None
             and kv_worker_meta is None and not invalid_block_ids
@@ -4229,15 +4241,6 @@ class TPUModelRunner(GPUModelRunner):
                 invalid_block_group_index=invalid_block_group_index,
                 kv_connector_stats=kv_connector_stats,
             ))
-
-        next_tokens_tpu = None
-        copy_state = None
-        if combined_selected_tokens:
-            copy_state = AsyncTPUCopyState.from_device_chunks(
-                combined_selected_tokens, combined_selected_tokens_real_lens)
-
-        if self.scheduler_config.async_scheduling:
-            self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
         # (mirrors the tpu-inference reference, where a single
