@@ -10,8 +10,8 @@ import pytest
 
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import (_layout_supported,
                                                     kda_forward_inference)
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
-    _get_kda_prefill_kernel, _guard_kda_verify_window
+from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
+    _get_kda_prefill_kernel, _guard_kda_verify_window)
 
 
 @pytest.mark.parametrize(("num_window_reqs", "expected"), [(0, 2), (1, 1)])

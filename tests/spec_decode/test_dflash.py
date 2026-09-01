@@ -126,11 +126,10 @@ def test_propose_empty_batch():
 def test_precompile_skips_sub_block_draft_forward():
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.speculative_config.num_speculative_tokens = 7
-    proposer.draft_model = SimpleNamespace(
-        model=SimpleNamespace(
-            context_proj=SimpleNamespace(weight=torch.empty((1, 32))),
-            embed_tokens=SimpleNamespace(weight=torch.empty((1, 1))),
-        ))
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(
+        context_proj=SimpleNamespace(weight=torch.empty((1, 32))),
+        embed_tokens=SimpleNamespace(weight=torch.empty((1, 1))),
+    ))
     proposer.runner = SimpleNamespace(
         num_reqs_max_model_len=8,
         num_reqs_most_model_len=None,
@@ -147,8 +146,8 @@ def test_precompile_skips_sub_block_draft_forward():
     proposer.precompile()
 
     assert [
-        call.kwargs["num_tokens"]
-        for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
+        call.kwargs["num_tokens"] for call in
+        proposer._dummy_precompute_and_update_kv_cache.call_args_list
     ] == [1, 8, 16, 512]
     assert [
         call.kwargs["num_tokens"]

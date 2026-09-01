@@ -56,8 +56,8 @@ class K3DSparkDecoderLayer(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        layer_prefix = maybe_prefix(
-            prefix, f"layers.{start_layer_id + layer_idx}")
+        layer_prefix = maybe_prefix(prefix,
+                                    f"layers.{start_layer_id + layer_idx}")
         self.self_attn = MultiHeadLatentAttention(
             config,
             vllm_config,
@@ -73,8 +73,7 @@ class K3DSparkDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{layer_prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)
 
@@ -183,8 +182,7 @@ class K3DSparkModel(nn.Module):
             k_pe = k_pe.unsqueeze(1)
             assert wrapper.rotary_emb is not None
             dummy_q_pe = torch.zeros(
-                (num_tokens, wrapper.num_heads,
-                 self.config.qk_rope_head_dim),
+                (num_tokens, wrapper.num_heads, self.config.qk_rope_head_dim),
                 dtype=context.dtype,
                 device=context.device,
             )
@@ -306,17 +304,17 @@ class K3DSparkForCausalLM(nn.Module):
         return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.bias(markov_embed,
-                                           self.logits_processor)
+        return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
+
         def filtered_weights():
             for name, weight in weights:
-                if any(part in name for part in
-                       ("confidence_head", "embed_tokens", "lm_head")):
+                if any(part in name for part in ("confidence_head",
+                                                 "embed_tokens", "lm_head")):
                     continue
                 yield name, weight
 

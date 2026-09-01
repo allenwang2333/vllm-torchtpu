@@ -5,8 +5,8 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.models.vllm.kimi_k3.dspark import K3DSparkModel
+from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 
 
 class _FakeHFConfig:
@@ -137,7 +137,7 @@ def test_k3_context_rope_matches_mla_cache_dtype():
     class _Core:
 
         def __init__(self):
-            self.kv_cache = torch.empty((1,), dtype=torch.bfloat16)
+            self.kv_cache = torch.empty((1, ), dtype=torch.bfloat16)
             self.k_pe = None
 
         def mla_op(self, _cache, _q_nope, _q_pe, _kv_c, k_pe, *_metadata):
@@ -146,16 +146,13 @@ def test_k3_context_rope_matches_mla_cache_dtype():
     core = _Core()
     wrapper = SimpleNamespace(
         kv_a_layernorm=lambda value: value,
-        rotary_emb=lambda _positions, q_pe, k_pe: (q_pe.float(),
-                                                   k_pe.float()),
+        rotary_emb=lambda _positions, q_pe, k_pe: (q_pe.float(), k_pe.float()),
         num_heads=1,
         mla_attn=core,
     )
     model = SimpleNamespace(
         config=SimpleNamespace(kv_lora_rank=2, qk_rope_head_dim=2),
-        layers=[
-            SimpleNamespace(self_attn=SimpleNamespace(mla_attn=wrapper))
-        ],
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(mla_attn=wrapper))],
         combine_hidden_states=lambda _hidden_states: context,
         context_kv_proj=lambda _context: (
             torch.ones((2, 4), dtype=torch.bfloat16),

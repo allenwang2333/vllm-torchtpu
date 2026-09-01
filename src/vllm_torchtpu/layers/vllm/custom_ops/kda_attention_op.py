@@ -504,15 +504,15 @@ def _dispatched_kda_core(
         def seed_decode_state():
             seq_ids = jnp.arange(num_seqs, dtype=jnp.int32)
             is_decode = seq_ids < decode_end
-            decode_read_indices = (
-                state_indices + slot_read_offsets[state_indices])
+            decode_read_indices = (state_indices +
+                                   slot_read_offsets[state_indices])
             decode_conv_seed = jnp.where(
-                is_decode.reshape((num_seqs, ) +
-                                  (1, ) * (conv_state.ndim - 1)),
+                is_decode.reshape((num_seqs, ) + (1, ) *
+                                  (conv_state.ndim - 1)),
                 conv_in[decode_read_indices], conv_in[0])
             decode_rec_seed = jnp.where(
-                is_decode.reshape((num_seqs, ) +
-                                  (1, ) * (recurrent_state.ndim - 1)),
+                is_decode.reshape((num_seqs, ) + (1, ) *
+                                  (recurrent_state.ndim - 1)),
                 recurrent_state[decode_read_indices], recurrent_state[0])
             return (conv_in.at[decode_indices].set(decode_conv_seed),
                     recurrent_state.at[decode_indices].set(decode_rec_seed))
@@ -520,15 +520,15 @@ def _dispatched_kda_core(
         # The initial pure-prefill step has no checkpoint to restore. Keep its
         # null-slot gather/scatter out of the graph to preserve Target logits.
         conv_in, recurrent_state = jax.lax.cond(
-            decode_end > 0, seed_decode_state,
-            lambda: (conv_in, recurrent_state))
+            decode_end > 0, seed_decode_state, lambda:
+            (conv_in, recurrent_state))
 
     # --- decode segment: fused convolution + recurrence ---------------
     def run_decode():
         return decode_kda(
             _match_rows(mixed_qkv, num_seqs),
-            _match_rows(raw_gate,
-                        num_seqs).reshape(num_seqs, num_heads, head_dim),
+            _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads,
+                                                    head_dim),
             _activate_beta(_match_rows(beta, num_seqs)),
             conv_in,
             conv_weight,
@@ -544,8 +544,8 @@ def _dispatched_kda_core(
         )
 
     def skip_decode():
-        return (jnp.zeros((num_seqs, num_heads, head_dim), activation_dtype),
-                conv_in, recurrent_state)
+        return (jnp.zeros((num_seqs, num_heads, head_dim),
+                          activation_dtype), conv_in, recurrent_state)
 
     # A verify-only batch has no ordinary one-token decode segment. Avoid
     # launching a null-slot KDA kernel before its K+1 verification calls.
@@ -572,10 +572,10 @@ def _dispatched_kda_core(
             source_indices = jnp.where(t == 0, read_indices,
                                        state_indices + t - 1)
 
-            active_conv = active.reshape(
-                (num_seqs, ) + (1, ) * (verify_conv.ndim - 1))
-            active_rec = active.reshape(
-                (num_seqs, ) + (1, ) * (verify_pool.ndim - 1))
+            active_conv = active.reshape((num_seqs, ) + (1, ) *
+                                         (verify_conv.ndim - 1))
+            active_rec = active.reshape((num_seqs, ) + (1, ) *
+                                        (verify_pool.ndim - 1))
             conv_seed = jnp.where(active_conv, verify_conv[source_indices],
                                   verify_conv[0])
             rec_seed = jnp.where(active_rec, verify_pool[source_indices],
@@ -604,8 +604,9 @@ def _dispatched_kda_core(
         return verify_output, verify_conv, verify_pool
 
     def skip_verify():
-        return (jnp.zeros((num_tokens, num_heads, head_dim), activation_dtype),
-                conv_after_decode, pool_after_decode)
+        return (jnp.zeros(
+            (num_tokens, num_heads, head_dim),
+            activation_dtype), conv_after_decode, pool_after_decode)
 
     if num_spec_tokens > 0:
         verify_out, conv_after_verify, pool_after_verify = \
@@ -751,10 +752,10 @@ def _dispatched_kda_core(
     # Each side left the other's rows zero, so this is a select rather than
     # a sum only to keep the intent legible.
     decode_rows = _match_rows(decode_out, num_tokens).astype(chunk_out.dtype)
-    output = jnp.where(
-        (token_ids < decode_end)[:, None, None], decode_rows,
-        jnp.where((token_ids < first_prefill_token)[:, None, None],
-                  verify_out.astype(chunk_out.dtype), chunk_out))
+    output = jnp.where((token_ids < decode_end)[:, None, None], decode_rows,
+                       jnp.where(
+                           (token_ids < first_prefill_token)[:, None, None],
+                           verify_out.astype(chunk_out.dtype), chunk_out))
     output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                 activation_dtype)
 
