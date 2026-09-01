@@ -33,6 +33,7 @@ class SendMeta:
     # Sub-chunk coordinate tracking for pipelined transfers.
     token_base: int = 0
     is_final: bool = True
+    dst_skip_bytes: int | None = None
 
 
 @dataclass

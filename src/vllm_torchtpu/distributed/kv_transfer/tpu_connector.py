@@ -189,6 +189,7 @@ class _Stage3SendState:
     tokens_sent: int = 0
     next_chunk_idx: int = 0
     total_prompt_tokens: int = 0
+    cached_prefix_tokens: int = 0
 
 
 def chunk_uuid(base_uuid: int, chunk_idx: int) -> int:
@@ -210,6 +211,63 @@ def chunk_uuid(base_uuid: int, chunk_idx: int) -> int:
     int_val = int.from_bytes(digest[:8], "big")
     return int_val >> 14
 
+
+
+
+def _compute_cached_prefix_progress(
+    cached_prefix_tokens: int,
+    total_prompt_tokens: int,
+    min_transfer_tokens: int,
+) -> tuple[int, int]:
+    """Computes skipped token count and chunk index for a cached prompt prefix.
+
+    Calculates how many full context-parallel transfer strides are covered by
+    the cached prefix tokens without exceeding the total prompt length.
+
+    Args:
+        cached_prefix_tokens: Number of prompt prefix tokens cached locally.
+        total_prompt_tokens: Total length of the request prompt in tokens.
+        min_transfer_tokens: Minimum chunk transfer stride in tokens
+            (pcp_size * cp_kv_cache_interleave_size).
+
+    Returns:
+        A tuple of (tokens_sent, next_chunk_idx) where tokens_sent is the
+        aligned token offset to start chunk emission and next_chunk_idx is
+        the starting sub-chunk index.
+    """
+    if (min_transfer_tokens > 0
+            and 0 < cached_prefix_tokens < total_prompt_tokens):
+        cached_chunks = cached_prefix_tokens // min_transfer_tokens
+        tokens_sent = cached_chunks * min_transfer_tokens
+        return tokens_sent, cached_chunks
+    return 0, 0
+
+
+def _compute_boundary_skip_bytes(
+    cached_prefix_tokens: int,
+    token_base: int,
+    token_bytes: int,
+) -> int | None:
+    """Computes destination skip byte offset for a boundary chunk.
+
+    Determines the byte offset to skip on the destination buffer when a chunk
+    overlaps with the tail end of a cached prefix that was not aligned to a
+    stride boundary.
+
+    Args:
+        cached_prefix_tokens: Number of prompt prefix tokens cached locally.
+        token_base: Starting token offset of the current transfer chunk.
+        token_bytes: Byte size per FlashAttention token across layers and heads.
+
+    Returns:
+        The byte offset to skip on the destination tensor buffer, or None if
+        no prefix skip is needed for this chunk.
+    """
+    if cached_prefix_tokens > token_base and token_bytes > 0:
+        boundary_skip_tokens = cached_prefix_tokens - token_base
+        if boundary_skip_tokens > 0:
+            return boundary_skip_tokens * token_bytes
+    return None
 
 def _validate_interval_tiling(
     intervals: Sequence[tuple[int, int]] | None,
@@ -264,6 +322,7 @@ class _Stage3RegisteredSend:
     expiration_time: float
     token_base: int = 0
     is_final: bool = True
+    dst_skip_bytes: int | None = None
     device_buffers: tuple[Any, ...] = ()
 
 
@@ -1423,13 +1482,21 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 or (len(getattr(request, "prompt_token_ids", []))
                     if hasattr(request, "prompt_token_ids") else 0)
             )
+            min_transfer_tokens = self.pcp_size * self.interleave_tokens
+            tokens_sent, next_chunk_idx = _compute_cached_prefix_progress(
+                num_computed, total_prompt, min_transfer_tokens
+            )
+            cached_prefix = (
+                num_computed if 0 < num_computed < total_prompt else 0
+            )
             self._stage3_send_requests[req_id] = _Stage3SendState(
                 base_uuid=get_uuid(),
                 block_ids=fa_block_ids,
                 num_computed_tokens=num_computed,
-                tokens_sent=0,
-                next_chunk_idx=0,
+                tokens_sent=tokens_sent,
+                next_chunk_idx=next_chunk_idx,
                 total_prompt_tokens=total_prompt,
+                cached_prefix_tokens=cached_prefix,
             )
         else:
             if fa_block_ids:
@@ -1451,6 +1518,46 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if in_flight is None:
             in_flight = self._in_flight_chunks.get(str(req_id), 0)
         return in_flight < self.chunk_transfer_window
+
+    def _stage3_fa_token_bytes(self) -> int:
+        """Calculates FlashAttention bytes per token from configuration.
+
+        Computes the total byte size of a single token's KV cache across all
+        layers and KV heads for the current model architecture and data type.
+        Falls back to default 64 bytes with a warning if model geometry is
+        unavailable.
+
+        Returns:
+            Byte size per token for FlashAttention KV cache tensors.
+        """
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if model_config is None:
+            return 64
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        try:
+            num_layers = int(
+                getattr(model_config, "num_hidden_layers", 0) or
+                (model_config.get_num_layers(parallel_config)
+                 if hasattr(model_config, "get_num_layers") else 32)
+            )
+            num_heads = int(
+                model_config.get_num_kv_heads(parallel_config)
+                if hasattr(model_config, "get_num_kv_heads") else 8
+            )
+            head_size = int(
+                model_config.get_head_size()
+                if hasattr(model_config, "get_head_size") else 128
+            )
+            dtype = getattr(model_config, "dtype", torch.bfloat16)
+            dtype_bytes = int(
+                dtype.itemsize if hasattr(dtype, "itemsize") else 2
+            )
+            return 2 * num_layers * num_heads * head_size * dtype_bytes
+        except Exception as exc:
+            logger.warning(
+                "TPURaidenConnectorScheduler: failed to compute FA token bytes "
+                "from model config: %s; falling back to 64", exc)
+            return 64
 
     def build_connector_meta(
         self,
@@ -1480,6 +1587,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     if req_state is None:
                         continue
 
+                    # If request has a cached prefix of length M not yet
+                    # accounted for:
+                    if (min_transfer_tokens > 0 and req_state.tokens_sent == 0
+                            and req_state.cached_prefix_tokens > 0):
+                        tokens_sent, next_chunk_idx = (
+                            _compute_cached_prefix_progress(
+                                req_state.cached_prefix_tokens,
+                                req_state.total_prompt_tokens,
+                                min_transfer_tokens,
+                            )
+                        )
+                        req_state.tokens_sent = tokens_sent
+                        req_state.next_chunk_idx = next_chunk_idx
+
                     # Short-prompt bypass: skip intermediate chunk tracking
                     if (min_transfer_tokens > 0 and
                             0 < req_state.total_prompt_tokens <
@@ -1502,6 +1623,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                         expiration_time = (
                             time.perf_counter() +
                             dist_utils.get_p2p_wait_pull_timeout())
+
+                        # For the boundary chunk, configure dst_skip_bytes to
+                        # transfer only uncached suffix bytes
+                        token_bytes = self._stage3_fa_token_bytes()
+                        dst_skip_bytes = _compute_boundary_skip_bytes(
+                            req_state.cached_prefix_tokens,
+                            req_state.tokens_sent,
+                            token_bytes,
+                        )
+
                         self.reqs_to_send[req_id] = SendMeta(
                             uuid=sub_uuid,
                             local_block_ids=list(req_state.block_ids),
@@ -1509,6 +1640,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                             num_tokens=chunk_tokens,
                             token_base=req_state.tokens_sent,
                             is_final=False,
+                            dst_skip_bytes=dst_skip_bytes,
                         )
                         self._in_flight_chunks[req_id] = (
                             self._in_flight_chunks.get(req_id, 0) + 1)
@@ -1683,6 +1815,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
         if tokens_sent < num_tokens:
             remainder_tokens = num_tokens - tokens_sent
+            dst_skip_bytes = None
+            if req_state is not None:
+                token_bytes = self._stage3_fa_token_bytes()
+                dst_skip_bytes = _compute_boundary_skip_bytes(
+                    req_state.cached_prefix_tokens,
+                    tokens_sent,
+                    token_bytes,
+                )
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=sub_uuid,
                 local_block_ids=list(normalized_ids),
@@ -1691,6 +1831,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 mamba_state_block_ids=mamba_state_block_ids,
                 token_base=tokens_sent,
                 is_final=True,
+                dst_skip_bytes=dst_skip_bytes,
             )
 
         params: dict[str, Any] = {
@@ -2922,6 +3063,10 @@ class TPURaidenConnectorWorker:
             )
             raw_final = getattr(req_meta, "is_final", True)
             is_final = bool(raw_final) if isinstance(raw_final, bool) else True
+            raw_skip = getattr(req_meta, "dst_skip_bytes", None)
+            dst_skip_bytes = (
+                int(raw_skip) if isinstance(raw_skip, (int, float)) else None
+            )
             if num_tokens <= 0:
                 raise ValueError(
                     "Stage-3 producer send metadata requires num_tokens")
@@ -2933,6 +3078,10 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a non-negative "
                     "token_base")
+            if dst_skip_bytes is not None and dst_skip_bytes < 0:
+                raise ValueError(
+                    "Stage-3 producer send metadata requires a non-negative "
+                    f"dst_skip_bytes: got {dst_skip_bytes}")
             page_tokens = int(self.vllm_config.cache_config.block_size)
             interleave_tokens = self._raiden_interleave_tokens(
                 page_tokens, parallelism)
@@ -2989,7 +3138,8 @@ class TPURaidenConnectorWorker:
                 if (terminal.uuid != uuid
                         or terminal.local_block_ids != local_ids
                         or terminal.num_tokens != num_tokens
-                        or terminal.token_base != token_base):
+                        or terminal.token_base != token_base
+                        or terminal.dst_skip_bytes != dst_skip_bytes):
                     raise ValueError(
                         "Conflicting replay after terminal Stage-3 producer "
                         f"registration for req_id={req_id}")
@@ -2999,7 +3149,8 @@ class TPURaidenConnectorWorker:
                 if (existing.uuid != uuid
                         or existing.local_block_ids != local_ids
                         or existing.num_tokens != num_tokens
-                        or existing.token_base != token_base):
+                        or existing.token_base != token_base
+                        or existing.dst_skip_bytes != dst_skip_bytes):
                     raise ValueError(
                         "Conflicting duplicate Stage-3 producer registration "
                         f"for req_id={req_id}")
@@ -3011,16 +3162,21 @@ class TPURaidenConnectorWorker:
                 # The controller filters registrations per requested tag at
                 # plan build.
                 pool_spans = list(fa_pool_spans)
-                pool_spans.extend(
-                    self._stage3_state_pool_spans(
-                        getattr(req_meta, "mamba_state_block_ids", None),
-                        transfer_rank, parallelism))
+                if is_final:
+                    pool_spans.extend(
+                        self._stage3_state_pool_spans(
+                            getattr(req_meta, "mamba_state_block_ids", None),
+                            transfer_rank, parallelism))
+                facade_kwargs: dict[str, Any] = {}
+                if dst_skip_bytes is not None:
+                    facade_kwargs["dst_skip_bytes"] = [dst_skip_bytes]
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,
                     unit=self._raiden_work_unit,
                     block_ids=list(local_ids),
                     pool_spans=pool_spans,
+                    **facade_kwargs,
                 )
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
@@ -3040,6 +3196,7 @@ class TPURaidenConnectorWorker:
                     expiration_time=tombstone_deadline,
                     token_base=token_base,
                     is_final=is_final,
+                    dst_skip_bytes=dst_skip_bytes,
                     device_buffers=(),
                 )
                 self._active_tensor_refs.pop(req_id, None)
@@ -3060,6 +3217,7 @@ class TPURaidenConnectorWorker:
                 expiration_time=expiration_time,
                 token_base=token_base,
                 is_final=is_final,
+                dst_skip_bytes=dst_skip_bytes,
                 device_buffers=device_buffers,
             )
             self._stage3_registered_sends[req_id] = reg
@@ -4372,8 +4530,8 @@ class TPURaidenConnectorWorker:
 
         Drains and clears the accumulated failed-load block IDs so that the
         scheduler can recompute them on device rather than executing with absent
-        KV cache. This method is called in the same polling pass in which the
-        request is reported as finished.
+        KV cache. Called in the same polling pass in which the request is
+        reported as finished.
 
         Returns:
             The set of physical device block IDs affected by load failures.
