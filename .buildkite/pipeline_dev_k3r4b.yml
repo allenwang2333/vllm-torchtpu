@@ -161,6 +161,17 @@
 #     MISS LOW (dTTFT < -45%): dummy TTFT is worth more than every prefill
 #       lever we have found put together, and no dummy TTFT number anywhere
 #       may be quoted again.
+#     THIRD OUTCOME, NAMED 2026-09-01 18:44Z BEFORE THE BUILD, on lane E's TP8
+#       measurement: dTTFT may come out POSITIVE, i.e. dummy SLOWER. E measured
+#       -40.7% (c=1) and -45.3% (c=8) at mnbt 512, but that is the
+#       padding-dominated regime -- real packs ~10 rows into each of ~100
+#       groups and pays 64-row tiles, so the collapse looks like a saving. At
+#       mnbt 8192, THEIR config, the arithmetic reverses: real packs ~261
+#       rows/group while dummy concentrates ~16290 rows onto one rank against a
+#       4096 mean, and the straggler should dominate. If dTTFT > 0 then THEIR
+#       806 ms IS PESSIMISTIC and the real-weights TTFT gap is LARGER than the
+#       -43.9% they report -- the opposite of the story P5 was written for.
+#       Registering it now so that outcome is a prediction and not a rescue.
 # P6  dummy bring-up <= 0.6 x real bring-up. r3's real cells booted in
 #     597-1012 s; point estimate real ~900 s, dummy ~350 s.
 #     FALSIFIER: dummy > 0.8 x real => bring-up is compile-bound, not
