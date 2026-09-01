@@ -182,6 +182,7 @@ class KimiModel(nn.Module):
             ) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
@@ -197,7 +198,7 @@ class KimiModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
         block_residuals = (hidden_states.new_empty(
@@ -207,17 +208,26 @@ class KimiModel(nn.Module):
         ) if self.attn_res_block_size is not None else None)
         assert hidden_states is not None
 
-        for layer in self.layers:
+        aux_hidden_states: list[torch.Tensor] = []
+        if 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
+
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, block_residuals = layer(
                 positions,
                 hidden_states,
                 block_residuals,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(hidden_states,
                                                  block_residuals)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -272,6 +282,12 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        invalid = [idx for idx in layers if idx < 0 or idx > len(self.model.layers)]
+        if invalid:
+            raise ValueError(f"Invalid Kimi aux hidden-state layers: {invalid}")
+        self.model.aux_hidden_state_layers = tuple(layers)
 
     def forward(
         self,
@@ -483,6 +499,12 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
                 architectures=["KimiLinearForCausalLM"],
             )
         self.media_placeholder = config.media_placeholder_token_id
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if not hasattr(self.language_model, "set_aux_hidden_state_layers"):
+            raise RuntimeError(
+                "Kimi language model does not expose aux hidden states")
+        self.language_model.set_aux_hidden_state_layers(layers)
 
     @staticmethod
     def _maybe_ignore_quant_config(

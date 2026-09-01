@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mla import (MLAModules,
                                             MultiHeadLatentAttentionWrapper)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, sharded_weight_loader)
 from vllm.model_executor.parameter import BasevLLMParameter
@@ -168,8 +169,11 @@ class MultiHeadLatentAttention(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
+        *,
+        use_rope: bool = False,
+        non_causal_multi_token_decode: bool = False,
     ) -> None:
-        if not config.mla_use_nope:
+        if not use_rope and not config.mla_use_nope:
             raise ValueError("The TPU Kimi model supports NoPE MLA only")
         required = {
             "kv_lora_rank": config.kv_lora_rank,
@@ -281,10 +285,30 @@ class MultiHeadLatentAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        rotary_emb = None
+        if use_rope:
+            rope_parameters = dict(
+                getattr(config, "rope_parameters", None) or {
+                    "rope_type": "default",
+                    "rope_theta": getattr(config, "rope_theta", 10000.0),
+                })
+            if rope_parameters.get("rope_type", "default") != "default":
+                rope_parameters["rope_type"] = (
+                    "deepseek_yarn"
+                    if rope_parameters.get("apply_yarn_scaling", True) else
+                    "deepseek_llama_scaling")
+            rotary_emb = get_rope(
+                self.qk_rope_head_dim,
+                max_position=config.max_position_embeddings,
+                rope_parameters=rope_parameters,
+                is_neox_style=False,
+                dtype=torch.float32,
+            )
+
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
-            rotary_emb=None,
+            rotary_emb=rotary_emb,
             o_proj=self.o_proj,
             fused_qkv_a_proj=self.fused_qkv_a_proj,
             kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
@@ -314,6 +338,7 @@ class MultiHeadLatentAttention(nn.Module):
             vllm_config.cache_config,
             quant_config,
             prefix,
+            non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
     def forward(
@@ -363,9 +388,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         prefix: str,
     ) -> None:
         super().__init__()
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "TPU KDA does not support speculative decode")
         kda_config = config.linear_attn_config
         if kda_config is None:
             raise ValueError("KDA requires linear_attn_config")
@@ -381,6 +403,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.projection_size = self.total_heads * self.head_dim
         self.local_projection_size = self.num_heads * self.head_dim
         self.conv_size = int(kda_config["short_conv_kernel_size"])
+        self.num_spec_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config is not None else 0)
         self.gate_lower_bound = kda_config.get("gate_lower_bound")
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
         quant_config = vllm_config.quant_config
@@ -478,6 +503,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+            num_spec_tokens=self.num_spec_tokens,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -565,6 +591,17 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = torch.zeros_like(query)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
+            window_distribution = metadata.mamba_request_distribution
+            if window_distribution is None:
+                window_distribution = metadata.request_distribution
+            slot_read_offsets = metadata.mamba_slot_read_offsets
+            if slot_read_offsets is None:
+                # Non-speculative KDA keeps the legacy ABI without allocating
+                # a pool-sized offset tensor.  The op's static
+                # num_spec_tokens=0 path never indexes this dummy.
+                slot_read_offsets = metadata.mamba_state_indices
+                if slot_read_offsets is None:
+                    slot_read_offsets = metadata.seq_lens
             output = self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,
@@ -580,6 +617,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
                 metadata.request_distribution,
+                window_distribution,
+                slot_read_offsets,
             ).flatten(1)
 
         output, _ = self.o_proj(output)
