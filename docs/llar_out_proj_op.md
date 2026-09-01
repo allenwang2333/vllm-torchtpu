@@ -235,3 +235,64 @@ is not <= -0.2, so the arm does not ship. The fix that would matter is a
 custom-call result layout that matches XLA's own all-reduce output
 ({1,0:T(4,128)} on VMEM); that requires XLA-side layout control the current
 torch_tpu custom-op path does not expose.
+
+---
+
+# Batch W — packing-dimension layout pin: layout pins, kernel can't consume it
+
+Job 448 (4-node ici-2x2x4-d, phase-1 dumps only; server never ran). The
+ragged-paged-attention packing-dimension trick (Jiang et al. sec. 3.1.1):
+the op's XLA-visible view gains a size-4 packing dim in the second-minor
+position, `[T, per_row, 1, w]` -> `[T, per_row//4, 4, w]`, and the kernel
+unpicks it with a preprocessing `ref.reshape` back to the working view.
+
+**The pin works at the XLA level — measured result layout (after layout
+assignment, `module_0041.jit_chain_body.after_optimizations.txt`):**
+
+```
+bf16[4,2,4,896]{3,2,1,0:T(4,128)(2,1)S(1)} custom-call   (T=4, x20)
+bf16[8,1,4,1792]{3,2,1,0:T(4,128)(2,1)S(1)} custom-call  (T=8, x20)
+```
+
+i.e. exactly XLA's all-reduce tiling T(4,128) on VMEM, vs the committed
+op's `bf16[4,8,1,896]{3,2,1,0:T(2,128)(2,1)S(1)}` (job 414). The
+contagion terms would in principle have died.
+
+**But the packed buffer is unconsumable by the kernel.** All four dtype/T
+combos fail Mosaic compilation at the phase-1 DMA:
+
+```
+tpu.memref_reshape : memref<4x2x4x896xbf16, #tpu.tiled<(4,128)(2,1),[14,7,7,1]>>
+                  -> memref<4x8x1x896xbf16, #tpu.tiled<(4,128)(2,1),[56,7,7,1]>>
+"Expected the 2nd minor dimension is aligned to the tile"
+```
+
+The packed ref is DENSE (strides [14,7,7,1]: 4 chunks share one tile-row
+group, one sublane each); the working view is PADDED ([56,7,7,1]: one chunk
+per group, sublane 0). A view reshape cannot convert dense<->padded, and the
+three Mosaic rules this workstream has now measured close every other
+arrangement:
+
+1. extent-1 dynamic slice of the tiled (sublane) dim — refused
+   ("tiled-slice alignment"), which rules out indexing the packed ref
+   directly: the fastest-varying chunk bits always land on the sublane dim,
+   because the 896-element chunk is 1.75 lane tiles and the packing splits
+   the width *between* chunks;
+2. dense->padded view merge — refused ("2nd minor dimension aligned to the
+   tile", this job);
+3. 2-D <-> 4-D view reshape — refused ("minormost dimension unchanged",
+   job 440).
+
+Making the packing dim interior to the chunk instead ([T, 8, 4, 224]) keeps
+the tile but breaks lane alignment (minor 224) and reintroduces the
+relayout at the output squeeze. The only unconsumed route is a data-moving
+in-kernel unpack/repack (~2 extra payload round-trips per call, est.
++0.1-0.2 ms/step against the ~-0.34 the pin would have bought — at best
+marginal against the -0.2 bar, and a different arm than the one measured).
+
+**Conclusion: the two-shot AR op is shelved for good on this stack.** The
+result layout CAN be pinned to match XLA's all-reduce (that is the finding
+of record), but no Mosaic-legal consumption of the pinned buffer exists at
+the K3 chunk geometry, so the +0.313 ms/step of R2 cannot be converted.
+Branch state: the packed-view attempt is the uncommitted diff in this
+worktree (tests still 35/35; it fails only at Mosaic compile time).
