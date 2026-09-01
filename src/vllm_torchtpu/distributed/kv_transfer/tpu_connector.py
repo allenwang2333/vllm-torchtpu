@@ -156,6 +156,9 @@ class _Stage3LoadMeta:
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
     release_only: bool = False
+    # Sub-chunk coordinate tracking for pipelined transfers.
+    token_base: int = 0
+    is_final: bool = True
 
 
 @dataclass
@@ -442,6 +445,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
         assert self.connector_scheduler is not None
+        if hasattr(self.connector_worker, "_update_stage3_state_after_alloc"):
+            self.connector_worker._update_stage3_state_after_alloc(
+                request, blocks)
         return self.connector_scheduler.update_state_after_alloc(
             request, blocks, num_external_tokens)
 
@@ -1726,6 +1732,11 @@ class TPURaidenConnectorWorker:
         # native manager reports a terminal state, or until a full manager
         # timeout has elapsed after the RPC returned.
         self._stage3_pending_controller_failures: dict[str, float] = {}
+        # Stage-3 chunked KV transfer tracking: received intervals per request
+        # accumulated as sub-chunks arrive and complete transfer.
+        self._stage3_recv_intervals: dict[str, list[tuple[int, int]]] = {}
+        self._stage3_in_flight_recv_chunks: dict[str, tuple[str, int, int]] = {}
+        self._stage3_recv_chunk_meta: dict[str, tuple[int, int]] = {}
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
@@ -2411,10 +2422,203 @@ class TPURaidenConnectorWorker:
                 f"pcp_size={pcp_size}")
         return tp_local_heads // pcp_size
 
-    def process_send_load(self,
-                          metadata: TPUConnectorMetadata,
-                          wait_for_completion: bool = False,
-                          report_completion: bool = True) -> None:
+    def _update_stage3_state_after_alloc(
+        self,
+        request: Any = None,
+        blocks: Any = None,
+        *args: Any,
+        req_id: str | None = None,
+        expected_tokens: int | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Calculates destination memory allocation and initializes tracking.
+
+        Computes the required number of physical destination pages for an
+        incoming transfer by rounding up the prompt token count to block
+        boundaries, extracts request parameters across varying calling
+        conventions (objects, dictionaries, positional arguments, or keywords),
+        and initializes an empty interval accumulation list for tracking
+        subsequent sub-chunk DMA arrivals.
+
+        Args:
+            request: Optional request containing kv_transfer_params or string
+                identifier.
+            blocks: Optional block allocation structure.
+            *args: Additional positional arguments for calling compatibility.
+            req_id: Optional destination request identifier.
+            expected_tokens: Optional total expected prompt tokens.
+            **kwargs: Additional keyword arguments for calling compatibility.
+
+        Returns:
+            The number of destination pages required for the request.
+        """
+        del blocks, args
+        if request is not None:
+            if isinstance(request, str):
+                if req_id is None:
+                    req_id = request
+            elif hasattr(request, "kv_transfer_params"):
+                params = request.kv_transfer_params or {}
+                if isinstance(params, dict) and expected_tokens is None:
+                    expected_tokens = int(params.get("num_tokens", 0))
+                if req_id is None:
+                    req_id = getattr(request, "request_id", None)
+
+        if req_id is None and "request_id" in kwargs:
+            req_id = kwargs["request_id"]
+        if expected_tokens is None and "num_tokens" in kwargs:
+            expected_tokens = kwargs["num_tokens"]
+
+        tokens = 0
+        if expected_tokens is not None and not isinstance(
+            expected_tokens, (list, tuple, dict, set)
+        ):
+            try:
+                tokens = int(expected_tokens)
+            except (ValueError, TypeError):
+                tokens = 0
+
+        block_size = (
+            int(self.vllm_config.cache_config.block_size)
+            if hasattr(self.vllm_config, "cache_config")
+            else 1
+        )
+        expected_pages = (
+            (tokens + block_size - 1) // block_size
+            if (tokens > 0 and block_size > 0)
+            else 0
+        )
+        if req_id is not None:
+            self._stage3_recv_intervals[str(req_id)] = []
+        return expected_pages
+
+    def _register_in_flight_recv_chunk(
+        self,
+        transfer_id: str,
+        destination_req_id: str,
+        token_base: int = 0,
+        num_tokens: int = 0,
+        alias_id: str | None = None,
+    ) -> None:
+        """Registers in-flight chunk coordinates for range tracking.
+
+        Initializes the destination interval accumulator if not already
+        present, and associates the transfer identifier (and optional alias
+        identifier) with the destination request and token span (base offset
+        and length) for subsequent interval reconstruction upon transfer
+        completion.
+
+        Args:
+            transfer_id: Low-level transfer identifier or request ID.
+            destination_req_id: Target request ID owning the destination KV
+                buffer.
+            token_base: Starting token offset of the sub-chunk.
+            num_tokens: Number of tokens spanned by the sub-chunk.
+            alias_id: Optional alias identifier (such as destination ID) to
+                register.
+        """
+        dest_id = str(destination_req_id)
+        if dest_id not in self._stage3_recv_intervals:
+            self._stage3_recv_intervals[dest_id] = []
+        tokens = int(num_tokens) if num_tokens is not None else 0
+        base = int(token_base) if token_base is not None else 0
+        if tokens > 0 and base >= 0:
+            self._stage3_in_flight_recv_chunks[str(transfer_id)] = (
+                dest_id,
+                base,
+                tokens,
+            )
+            if alias_id is not None:
+                self._stage3_in_flight_recv_chunks[str(alias_id)] = (
+                    dest_id,
+                    base,
+                    tokens,
+                )
+            self._stage3_recv_chunk_meta[dest_id] = (base, tokens)
+
+    def _start_stage3_recv_if_ready(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str = "",
+        remote_blocks: list[int] | None = None,
+        local_blocks: list[int] | None = None,
+        *,
+        token_base: int = 0,
+        num_tokens: int | None = None,
+        engine: Any | None = None,
+        destination_req_id: str | None = None,
+    ) -> int:
+        """Dispatches sub-chunk receive and registers coordinate tracking.
+
+        Accepts token_base and num_tokens from incoming chunk metadata,
+        dispatches C++ start_read() with sub-chunk UUID and target block IDs,
+        and registers the chunk for range accumulation upon completion.
+
+        Args:
+            req_id: The request identifier (or sub-chunk transfer ID).
+            uuid: Deterministic 50-bit sub-chunk UUID.
+            endpoint: Remote data endpoint address.
+            remote_blocks: Remote block IDs (if applicable).
+            local_blocks: Local destination block IDs.
+            token_base: Starting token offset of the sub-chunk.
+            num_tokens: Token count for the sub-chunk.
+            engine: Optional transfer manager instance.
+            destination_req_id: Optional destination request identifier for
+                alias mapping.
+
+        Returns:
+            Return code from engine.start_read().
+        """
+        if engine is None:
+            engine = self._ensure_raiden_transfer_engine()
+
+        dest_req_id = str(
+            destination_req_id
+            or self._stage3_destination_request_id(req_id)
+            or req_id
+        )
+        self._register_in_flight_recv_chunk(
+            transfer_id=str(req_id),
+            destination_req_id=dest_req_id,
+            token_base=token_base,
+            num_tokens=num_tokens or 0,
+            alias_id=dest_req_id if dest_req_id != str(req_id) else None,
+        )
+
+        remotes = remote_blocks or []
+        locals_ = local_blocks or []
+        res = 0
+        if hasattr(engine, "start_read") and callable(
+            getattr(engine, "start_read")
+        ):
+            res = engine.start_read(
+                str(req_id), uuid, endpoint, remotes, locals_
+            )
+        return res
+
+    def process_send_load(
+        self,
+        metadata: TPUConnectorMetadata,
+        wait_for_completion: bool = False,
+        report_completion: bool = True,
+    ) -> None:
+        """Processes outgoing send registrations and incoming load transfers.
+
+        Dispatches transfer requests described by the connector metadata across
+        producer and consumer worker roles. On producers, registers local KV
+        cache blocks with the Raiden controller or local transfer engine. On
+        consumers, submits Stage-3 load plans or executes legacy DMA read
+        operations while registering in-flight sub-chunk coordinates for
+        range accumulation.
+
+        Args:
+            metadata: Container of send and load request metadata.
+            wait_for_completion: Whether to synchronously block until submitted
+                transfers complete.
+            report_completion: Whether completed transfers should be reported
+                in finished load queries.
+        """
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
             if self._raiden_stage3_enabled():
@@ -2444,6 +2648,28 @@ class TPURaidenConnectorWorker:
 
         submitted_loads: set[str] = set()
         for req_id, req_meta in metadata.reqs_to_load.items():
+            raw_base = getattr(req_meta, "token_base", 0)
+            token_base = (
+                int(raw_base) if isinstance(raw_base, (int, float)) else 0
+            )
+            raw_tokens = getattr(req_meta, "num_tokens", None)
+            if raw_tokens is not None and isinstance(raw_tokens, (int, float)):
+                num_tokens = int(raw_tokens)
+            elif getattr(req_meta, "local_block_ids", None):
+                block_size = (
+                    int(self.vllm_config.cache_config.block_size)
+                    if hasattr(self.vllm_config, "cache_config")
+                    else 1
+                )
+                num_tokens = len(req_meta.local_block_ids) * block_size
+            else:
+                num_tokens = 0
+            self._register_in_flight_recv_chunk(
+                transfer_id=req_id,
+                destination_req_id=req_id,
+                token_base=token_base,
+                num_tokens=num_tokens,
+            )
             endpoint = self._resolve_remote_endpoint(req_meta)
             if (req_meta.remote_block_ids is None
                     and req_meta.local_block_ids is None):
@@ -3260,9 +3486,25 @@ class TPURaidenConnectorWorker:
             ),
         )
 
-    def _submit_stage3_loads(self, metadata: TPUConnectorMetadata,
-                             engine: "KVCacheManager") -> None:
-        """Starts exactly one source-controller transfer per request."""
+    def _submit_stage3_loads(
+        self, metadata: TPUConnectorMetadata, engine: "KVCacheManager"
+    ) -> None:
+        """Starts source-controller transfers for incoming Stage-3 loads.
+
+        Validates the registered Stage-3 destination work unit and controller
+        address, handles release-only optimizations for prefix hits, registers
+        in-flight sub-chunk token coordinates for range accumulation, binds
+        bidirectional request aliases, and requests transfer plan generation and
+        execution from the source controller facade.
+
+        Args:
+            metadata: Connector metadata containing requests to load.
+            engine: Low-level transfer manager instance.
+
+        Raises:
+            RuntimeError: If the Stage-3 work unit is not registered.
+            TypeError: If metadata entries are not _Stage3LoadMeta instances.
+        """
         del engine  # Completion is observed through the manager in poll_stats.
         _, dst_controller_address = self._require_stage3_controller()
         if self._raiden_work_unit is None:
@@ -3281,6 +3523,17 @@ class TPURaidenConnectorWorker:
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens)
             source_req_id = req_meta.source_req_id
+            raw_base = getattr(req_meta, "token_base", 0)
+            token_base = (
+                int(raw_base) if isinstance(raw_base, (int, float)) else 0
+            )
+            self._register_in_flight_recv_chunk(
+                transfer_id=destination_req_id,
+                destination_req_id=destination_req_id,
+                token_base=token_base,
+                num_tokens=num_tokens,
+                alias_id=source_req_id,
+            )
             self._bind_stage3_request_ids(destination_req_id, source_req_id)
             existing_uuid = self._stage3_submitted_loads.get(
                 destination_req_id)
@@ -3453,9 +3706,24 @@ class TPURaidenConnectorWorker:
             )
 
     def get_finished(
-            self,
-            finished_req_ids: set[str] | None = None
+        self, finished_req_ids: set[str] | None = None
     ) -> tuple[set[str], set[str]]:
+        """Retrieves finished send and receive request IDs and reclaims state.
+
+        Polls the transfer engine for DMA completion events, computes newly
+        completed send and receive requests while filtering suppressed or
+        already-reported IDs, and cleans up internal tracking state (including
+        interval lists, in-flight coordinate mappings, and alias tables) for
+        retired requests.
+
+        Args:
+            finished_req_ids: Optional set of request IDs that the scheduler
+                has acknowledged as finished or aborted.
+
+        Returns:
+            A tuple of (done_sending, done_recving) sets containing the request
+            identifiers that completed transfer during this pass.
+        """
         engine = self._ensure_raiden_transfer_engine()
         self._poll_finished(engine)
         done_sending = self._done_sending
@@ -3506,9 +3774,49 @@ class TPURaidenConnectorWorker:
             self._stage3_pending_controller_failures.pop(req_id, None)
             self._stage3_terminal_loads.discard(req_id)
             self._stage3_finished_loads_pending_cleanup.discard(req_id)
+            self._stage3_recv_intervals.pop(req_id, None)
+            self._stage3_in_flight_recv_chunks.pop(req_id, None)
+            self._stage3_recv_chunk_meta.pop(req_id, None)
+            if source_req_id is not None:
+                self._stage3_in_flight_recv_chunks.pop(source_req_id, None)
+                self._stage3_recv_chunk_meta.pop(source_req_id, None)
+                self._stage3_recv_intervals.pop(source_req_id, None)
         self._done_sending = set()
         self._done_recving = set()
         return done_sending, done_recving
+
+    def _record_stage3_recv_chunk_completion(self, rec_id: str) -> None:
+        """Records the completion of a received sub-chunk interval.
+
+        Extracts the sub-chunk coordinates from in-flight tracking (or stored
+        metadata), computes the half-open token range interval from base to
+        base + count, and idempotently appends it to the destination request
+        accumulated intervals list.
+
+        Args:
+            rec_id: Transfer or request identifier associated with the
+                completed chunk.
+        """
+        rec_id_str = str(rec_id)
+        chunk_info = self._stage3_in_flight_recv_chunks.pop(rec_id_str, None)
+        if chunk_info is not None:
+            dest_id, base, count = chunk_info
+            if base >= 0 and count > 0:
+                interval = (base, base + count)
+                dest_intervals = self._stage3_recv_intervals.setdefault(
+                    dest_id, []
+                )
+                if interval not in dest_intervals:
+                    dest_intervals.append(interval)
+        elif rec_id_str in self._stage3_recv_chunk_meta:
+            base, count = self._stage3_recv_chunk_meta.pop(rec_id_str)
+            if base >= 0 and count > 0:
+                interval = (base, base + count)
+                dest_intervals = self._stage3_recv_intervals.setdefault(
+                    rec_id_str, []
+                )
+                if interval not in dest_intervals:
+                    dest_intervals.append(interval)
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         """Polls transfer engine completion events and updates worker state.
@@ -3542,6 +3850,7 @@ class TPURaidenConnectorWorker:
         elif not self.is_producer and not self._raiden_stage3_enabled():
             for req_id in done_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
+                self._record_stage3_recv_chunk_completion(str(req_id))
             for req_id in failed_recving:
                 self._legacy_submitted_loads.discard(str(req_id))
         if self.is_producer and self._raiden_stage3_enabled():
@@ -3606,6 +3915,12 @@ class TPURaidenConnectorWorker:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
                 for req_id in expired_uncertain:
                     self._stage3_pending_controller_failures.pop(req_id, None)
+            failed_ids = set(native_failed_recving) | set(failed_recving)
+            for failed_id in failed_ids:
+                self._stage3_in_flight_recv_chunks.pop(str(failed_id), None)
+                self._stage3_recv_chunk_meta.pop(str(failed_id), None)
+            for rec_id in list(native_done_recving) + list(done_recving):
+                self._record_stage3_recv_chunk_completion(rec_id)
             self._stage3_terminal_loads.update(done_recving)
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
