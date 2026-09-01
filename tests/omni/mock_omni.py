@@ -90,6 +90,14 @@ except ImportError:
         XPU = "xpu"
         MUSA = "musa"
 
+    class _MockLTXRuntime:
+
+        def _decode_output(self, *args, **kwargs):
+            video = self.video_processor.postprocess_video(
+                self.vae.decode(None)[0])
+            audio = self.vocoder(self.audio_vae.decode(None)[0])
+            return MagicMock(output=(video, audio))
+
     vllm_omni_mock = MagicMock()
     vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
     vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -97,6 +105,8 @@ except ImportError:
     vllm_omni_mock.diffusion.attention.backends.sdpa.SDPAImpl = _MockSDPAImpl
     vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend = (
         lambda *args, **kwargs: None)
+    vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = (
+        _MockLTXRuntime)
 
     sys.modules["vllm_omni"] = vllm_omni_mock
     sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -111,3 +121,9 @@ except ImportError:
         vllm_omni_mock.diffusion.attention.backends.registry)
     sys.modules["vllm_omni.diffusion.attention.backends.sdpa"] = (
         vllm_omni_mock.diffusion.attention.backends.sdpa)
+    sys.modules["vllm_omni.diffusion.models"] = (
+        vllm_omni_mock.diffusion.models)
+    sys.modules["vllm_omni.diffusion.models.ltx2"] = (
+        vllm_omni_mock.diffusion.models.ltx2)
+    sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
+        vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime)
