@@ -11,55 +11,174 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ==========================================================================
+# r4 lane B OWNS THIS FILE ON THIS BRANCH ONLY. `bootstrap_dev.sh` uploads
+# `${DEV_PIPELINE_FILE:-.buildkite/pipeline_dev.yml}` FROM THE BUILD'S OWN
+# BRANCH, so putting leg 1 here means a build created ANY way -- the
+# Buildkite UI's "New Build", a curl to /v2/.../builds, `bk build create` --
+# runs the right thing on `geyuhao/k3r4-repro` with no env var to remember.
+# The demo steps this file normally carries are untouched on every other
+# branch; the identical pipeline also remains at pipeline_dev_k3r4b.yml for
+# anyone who prefers to pass DEV_PIPELINE_FILE explicitly.
+# ==========================================================================
 
-# Dev pipeline for vllm-torchtpu-dev.
-# Demo/sample steps showing how to run one-off experiments on TPU.
-# Copy and adapt any step below for your own test.
+# Round-4 lane B, pod leg 1: Q2 (does gnovack/k3-dev's 15.58 ms / 806 ms
+# reproduce on our v7x-32?) and Q3 (what does `--load-format dummy` cost or
+# save, at the same config, in the same job?) -- ONE job, six cells.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r4b.yml
 #
-# WHY THIS EXISTS
-# ───────────────
-# vllm-torchtpu-ci runs the full suite (~build + unit tests + integration +
-# perf) on every push, which is slow and shared. This pipeline uploads ONLY the
-# steps on YOUR branch, so a single test costs one image build + one job.
+# ============================ WHAT IS UNDER TEST =============================
+# Branch base is THEIR d60a797ad, untouched, because Q2 is "does their number
+# reproduce on their code". src/ carries exactly four deviations, each of which
+# is either inert in the arm that matters or would otherwise invalidate a cell:
+#   1. the Run:AI expert-filter fix (geyuhao/k3r3-loaderfix). Their runs read a
+#      local HF snapshot; ours streams from GCS with --enable-ep-weight-filter,
+#      and TPU_MOE_HIERARCHICAL_EP=1 on THAT path loads half of every rank's
+#      routed-expert intermediates uninitialised. Without it the real-weights
+#      arm measures a corrupt model. INERT under dummy: no weight is read.
+#   2. the expert bank log line, so `[hier] bank` can prove (1) per cell.
+#   3. the MoE expert-load histogram (r3), OFF unless TPU_MOE_EXPERT_LOAD_EVERY
+#      is set -- which only the two profiled cells do.
+#   4. `[mla-key]`: one log line per distinct MLA TuningKey, HIT or MISS.
+# Everything else new here is .buildkite/ and scripts/ -- apparatus, not code.
 #
-# HOW TO TRIGGER
-# ──────────────
-# Option A — Buildkite UI:
-#   https://buildkite.com/tpu-commons/vllm-torchtpu-dev → "New Build",
-#   set branch to your branch, "Create Build".
+# =============================== THE ARMS ====================================
+#   dummy, real, dummyprof, realprof, real, dummy, dummyuniform
 #
-# Option B — Buildkite API (needs BUILDKITE_API_TOKEN in your env):
-#   curl -s -X POST \
-#     -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
-#     -H "Content-Type: application/json" \
-#     "https://api.buildkite.com/v2/organizations/tpu-commons/pipelines/vllm-torchtpu-dev/builds" \
-#     -d "{\"commit\": \"$(git rev-parse HEAD)\", \"branch\": \"$(git rev-parse --abbrev-ref HEAD)\", \"message\": \"my test\"}"
+# BK #329 and #336 both died in their LAST cell, so cells fail LATE and every
+# prefix must be a complete experiment on its own:
+#   after cell 1  Q2 is answered -- their whole concurrency table, 3 reps
+#   after cell 2  Q3's MAGNITUDE -- adjacent dummy/real, in-build, full table
+#   after cell 4  Q3's MECHANISM -- per-category device diff and the router
+#                 histogram at TP32, where lane E's CPU read cannot reach
+#   after cell 6  the ABBA is closed: unprofiled cells sit at 1,2,5,6, so both
+#                 arms have mean position 3.5 and monotone drift over the job
+#                 cannot alias onto the arm (A,B,A,B would put them at 3 and 4)
+#   cell 7        dummy + simulated uniform routing: the fix candidate
+# Cell 1 is dummy and not real, deliberately, against the intuition that the
+# real cell is the valuable one. Dummy-alone is a COMPLETE answer to Q2; real-
+# alone is not a comparison at all. And dummy is the cheap smoke test: it boots
+# without the ~900 s GCS stream and it is the arm exercising the new staging
+# path, so a config error surfaces sooner and costs less. What is sacrificial
+# here is cells 5-6, which are repeats -- their loss costs precision, not an
+# answer.
 #
-# HOW TO CUSTOMIZE
-# ────────────────
-# 1. On your branch, edit this file — start from whichever demo is closest.
-# 2. Delete the steps you don't need (each one costs a TPU slot).
-# 3. Trigger the pipeline — only your branch's copy of this file is used, so
-#    you can leave it modified indefinitely without affecting anyone else.
+# The two profiled cells are deliberately OUTSIDE the ABBA. The bench client's
+# --profile costs ~+11% TTFT / -4% throughput, so their serving numbers are not
+# comparable to the unprofiled cells'; they exist for the device-side category
+# diff, which both arms pay equally, and for the expert-load histogram that
+# tests the Q3 mechanism directly instead of inferring it from a timing delta.
 #
-# NOTES
-# ─────
-# * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
-#   pulls that exact tag, so all steps must depend_on `build_docker`.
-# * run_in_docker.sh runs your command inside the image at
-#   /root/torchtpu-vllm — that is a COPY of the repo at this commit, not the
-#   agent's checkout. Reference paths like `examples/...` / `tests/...`
-#   relative to the repo root.
-# * Anything written to /perf_eval_results inside the container is copied back
-#   out and uploaded as a Buildkite artifact.
-
+# THE SANITY PROBE WILL SAY `DEGENERATE` ON EVERY DUMMY CELL. That is the
+# control working, not the cell failing: random weights emit a degenerate
+# continuation by construction. A dummy cell reporting `OK`, or a real cell
+# reporting `DEGENERATE`, is the finding.
+#
+# ====================== PRE-REGISTERED, BEFORE THE BUILD =====================
+# Rig for every number below:
+#   [K3 93L, weights <dummy|real>, TP32+EP32, v7x-32, 8192/1024,
+#    page 16, KV fp8, mml 10240, mns 32, buckets 4/8/16/32/8192, async,
+#    hierEP=1, intra-chip latent TP=1, SparseCore hier-AR + 32 MiB offload,
+#    base=d60a797ad, BK #<this>]
+#
+# --- Q2, the reproduction. Judged against THEIR reported table. -------------
+# P1  median TPOT at c=1 = 15.58 ms, ACCEPT [14.33, 16.83] (+-8%).
+#     Not the 2.05% one-cell band: that band is for two cells of one job on one
+#     host. This is our pod against their slurm partition, our docker image's
+#     libtpu against their .venv's, and `vllm bench serve` against their Rust
+#     vllm-bench -- and cross-CLUSTER variance has never been measured here.
+#     8% is one order above the one-cell band and well below the 12.4% claim
+#     being adjudicated, so the test still discriminates.
+#     MISS HIGH (>16.83): their number does not reproduce on our pod at their
+#       own config => the gap is at least partly rig, not code, and Q4/Q5 must
+#       be re-scoped before any lever is credited. Report in those words.
+#     MISS LOW (<14.33): we beat their published number on their own config =>
+#       their table understates their branch; F's ladder needs a new anchor.
+# P2  median TTFT at c=1 = 806 ms, ACCEPT [685, 927] (+-15%). TTFT carries the
+#     staging difference (their local /mnt/models snapshot vs our GCS-staged
+#     metadata) and moved more than TPOT across every r3 rebuild.
+#     Falsifiers both sides, same reading as P1.
+# P3  `[keys]` reports block_size=16 and pages_per_seq=640, and the K3 rows at
+#     (mns=32, pps=640) are HIT for `mixed` at mnt=8192 and for
+#     `batched_decode` at mnt in {4,8,16,32}.
+#     FALSIFIER: any MISS on (mixed, 8192, mns 32, pps 640) => the reproduction
+#     is measuring the kvpb-1/qpb-16 fallback, not their 647 tuned rows, and
+#     P1/P2 must be reported as void rather than as a miss.
+#     Note for the write-up either way: this makes the comparison one between
+#     TWO TUNED configurations. Their geometry has rows; ours (page 256, mns 8)
+#     has one, on main; `mns 32 at page 256` has none in either table.
+#
+# --- Q3, dummy vs real. The hypothesis is on the table, not assumed. --------
+# The claim to test: MoE routing under random weights differs from trained
+# `noaux_tc` routing and moves the EP straggler term (r3 measured 4015 us of
+# transfer-free wait at TP32 on real weights). It predicts EITHER sign:
+#   degenerate routing (all tokens to a few experts) => dummy SLOWER;
+#   near-uniform routing (topk 16 of 896, one group) => flatter than any
+#   structured routing => dummy FASTER.
+# P4/P5 WERE RESTATED AT 2026-09-01 18:20Z, BEFORE THIS BUILD RAN, AND HERE IS
+# THE REASON. The first version predicted dTPOT -2.5% [-6%, 0%] and dTTFT 0%
+# [-3%, +3%] from a balls-in-bins argument: unstructured routing should have
+# less max-bin overshoot than trained `noaux_tc`. Lane E then read the actual
+# dummy tensors on CPU and the premise is wrong in kind, not in degree. Under
+# `initialize_dummy_weights` every float param is U(-1e-3, 1e-3) at a FIXED
+# seed, mxfp4 expert weights are zeroed rather than randomised, and K3's
+# e_score_correction_bias is a float32[896] that is randomised at the same
+# scale as everything else -- so the bias spread is ~80x the score spread and
+# top-k becomes the argmax of the bias, THE SAME 16 EXPERTS FOR EVERY TOKEN AND
+# EVERY LAYER. Measured on the sliced8 checkpoint: 30-31 distinct experts of
+# 896 against 805-892 real, 3.8 non-empty experts per EP8 rank against 100-112.
+# That is not a distribution shift, it is a structural collapse, and it makes
+# dummy CHEAPER in the gmm by construction. Both intervals move; the original
+# is kept above the line so the revision is auditable rather than invisible.
+# Both are still two-sided, and P5's sign has flipped, which is the point.
+#
+# P4  dTPOT(dummy - real) at c=1 = **-8%**, ACCEPT [-20%, -1%]. r3's own gmm
+#     cost model, cost(k) = 15.2 + 18.5*[k>=1] + 13.3*k us per layer per rank
+#     with k = non-empty local experts, gives ~-20% at their pad-4 decode floor
+#     but over-predicts r3's measured pad-1 -> pad-16 device delta by ~2x, so
+#     -20% is the edge and not the centre.
+#     MISS HIGH (dTPOT > -1%, i.e. dummy no cheaper): the collapse does not
+#       reach the decode step at TP32 => dummy IS a usable TPOT proxy and E's
+#       CPU read does not transfer. Report as a refutation of the mechanism at
+#       this interconnect level, not as noise.
+#     MISS LOW (dTPOT < -20%): dummy flatters TPOT by more than twice the whole
+#       hierEP lever (-9.63%) => no R2-class TPOT number in round 1's taxonomy
+#       may be compared to a real-weight number without a correction factor.
+#     SECOND, SHARPER TEST, and the falsifiable part: the gap must GROW with
+#       concurrency, because k grows with the padded token count under real
+#       weights and is pinned at ~0.5/rank under dummy. Predict
+#       |dTPOT(c=32)| >= 2 x |dTPOT(c=1)|. If the gap is flat across the table,
+#       the mechanism is not the expert count.
+# P5  dTTFT(dummy - real) at c=1 = **-25%**, ACCEPT [-45%, -8%]. THIS IS THE
+#     ONE THAT MATTERS FOR THE ROUND. An 8192-token prefill under real weights
+#     touches essentially every local expert; under dummy it touches ~4 of 112.
+#     If it lands, their 806 ms is not commensurable with our 1435.9 ms and a
+#     large part of the reported -43.9% TTFT is the weights, not their levers.
+#     MISS HIGH (dTTFT > -8%): prefill really does fill every expert in both
+#       arms => the collapse is decode-only, R2's TTFT numbers are safe, and
+#       their TTFT win is theirs. Report it as such; it is the outcome that
+#       most helps them.
+#     MISS LOW (dTTFT < -45%): dummy TTFT is worth more than every prefill
+#       lever we have found put together, and no dummy TTFT number anywhere
+#       may be quoted again.
+# P6  dummy bring-up <= 0.6 x real bring-up. r3's real cells booted in
+#     597-1012 s; point estimate real ~900 s, dummy ~350 s.
+#     FALSIFIER: dummy > 0.8 x real => bring-up is compile-bound, not
+#     weight-bound, "dummy is cheap" is false, and no future dummy job can
+#     afford more cells than a real one. Unmeasured anywhere before this.
+# P7  per-cell disk burn <= 4 GB, against r3's 7.6-14.4 GB. Two changes:
+#     Ray log dedup left ON (r3's leg 3 passed --no-log-dedup) and a
+#     copytruncate of any Ray log over 64 MB between cells.
+#     FALSIFIER: > 6 GB/cell => the r3 cell-loop leak is neither, and the
+#     `[du]` breakdown names what it is. r3 left this as an explicit open
+#     question ("one du -sh between cells settles what is left").
+#
+# ============================ HOW TO READ IT =================================
+# Everything lands on STDOUT before any file: `[cell]` per result json,
+# `[disk]`/`[du]`/`[prune]` per cell, `[boot]`, `[wall]`, `[keys]`, `[bucket]`,
+# `[hier]`, `[tuning]`, `[arm]`, `K3SANITY`. Two r3 results were recovered by
+# hand from the job log after the artifact upload produced 0-byte tarballs.
 steps:
-
-  # -----------------------------------------------------------------
-  # Build step (required by every demo below)
-  # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
-  # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -67,61 +186,35 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
-  # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  - label: ":dart: r4B leg 1: reproduce gnovack/k3-dev, dummy vs real (v7x-32)"
+    key: k3r4b
     depends_on: build_docker
+    timeout_in_minutes: 420
     agents:
-      queue: tpu_v7x_2_queue
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # Their config, the parts that are constant across all six cells. The
+      # per-arm parts (LOAD_FORMAT and the flags their sbatch pins) are set
+      # inside the container by k3_knob_matrix.sh, because LIBTPU_INIT_ARGS is
+      # not forwardable and because a per-arm value must not live in a step env
+      # that every cell shares.
+      MAX_NUM_SEQS: "32"
+      MAX_NUM_BATCHED_TOKENS: "8192"
+      MAX_MODEL_LEN: "10240"
+      KV_CACHE_DTYPE: "fp8"
+      K3_COMPILE_SIZES: "[4,8,16,32,8192]"
+      K3_BLOCK_SIZE: "16"
+      GPU_MEMORY_UTILIZATION: "0.82"
+      ASYNC_SCHEDULING: "true"
+      # Their whole table, so the reproduction is judged against six cells of
+      # theirs and not one. ~5.5 min per repeat; the profiled cells override
+      # this to c=1.
+      K3_CONCURRENCY: "1 2 4 8 16 32"
+      NUM_PROMPTS_BY_CONCURRENCY: "1:6 2:8 4:8 8:8 16:16 32:32"
     commands:
-      - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
-
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
