@@ -33,25 +33,31 @@
 # Everything else new here is .buildkite/ and scripts/ -- apparatus, not code.
 #
 # =============================== THE ARMS ====================================
-#   dummy, real, real, dummy, dummyprof, realprof
+#   dummy, real, dummyprof, realprof, real, dummy, dummyuniform
 #
-# A,B,B,A and not A,B,A,B: with two arms only A,B,B,A puts both arms' mean cell
-# position at 2.5, so monotone drift over the job cannot alias onto the arm.
 # BK #329 and #336 both died in their LAST cell, so cells fail LATE and every
 # prefix must be a complete experiment on its own:
 #   after cell 1  Q2 is answered -- their whole concurrency table, 3 reps
-#   after cell 2  Q3 is answered -- adjacent dummy/real, in-build, full table
-#   after cell 3  Q3 has two real reps
-#   after cell 4  the ABBA is closed and drift-controlled
-#   after cells 5-6  the per-category device diff and the router histogram
-# The real cells are the ones at risk (a ~900 s GCS stream and r3's ~9 GB of
-# disk each), and cell 2 is the earliest position a real cell can occupy.
+#   after cell 2  Q3's MAGNITUDE -- adjacent dummy/real, in-build, full table
+#   after cell 4  Q3's MECHANISM -- per-category device diff and the router
+#                 histogram at TP32, where lane E's CPU read cannot reach
+#   after cell 6  the ABBA is closed: unprofiled cells sit at 1,2,5,6, so both
+#                 arms have mean position 3.5 and monotone drift over the job
+#                 cannot alias onto the arm (A,B,A,B would put them at 3 and 4)
+#   cell 7        dummy + simulated uniform routing: the fix candidate
+# Cell 1 is dummy and not real, deliberately, against the intuition that the
+# real cell is the valuable one. Dummy-alone is a COMPLETE answer to Q2; real-
+# alone is not a comparison at all. And dummy is the cheap smoke test: it boots
+# without the ~900 s GCS stream and it is the arm exercising the new staging
+# path, so a config error surfaces sooner and costs less. What is sacrificial
+# here is cells 5-6, which are repeats -- their loss costs precision, not an
+# answer.
 #
 # The two profiled cells are deliberately OUTSIDE the ABBA. The bench client's
 # --profile costs ~+11% TTFT / -4% throughput, so their serving numbers are not
-# comparable to cells 1-4's; they exist for the device-side category diff,
-# which both arms pay equally, and for the expert-load histogram that tests the
-# Q3 mechanism directly instead of inferring it from a timing delta.
+# comparable to the unprofiled cells'; they exist for the device-side category
+# diff, which both arms pay equally, and for the expert-load histogram that
+# tests the Q3 mechanism directly instead of inferring it from a timing delta.
 #
 # THE SANITY PROBE WILL SAY `DEGENERATE` ON EVERY DUMMY CELL. That is the
 # control working, not the cell failing: random weights emit a degenerate
@@ -99,26 +105,52 @@
 #   degenerate routing (all tokens to a few experts) => dummy SLOWER;
 #   near-uniform routing (topk 16 of 896, one group) => flatter than any
 #   structured routing => dummy FASTER.
-# P4  dTPOT(dummy - real) at c=1 = **-2.5%**, ACCEPT [-6%, 0%]. Committing to
-#     the faster direction: `noaux_tc` is designed to flatten expert load and
-#     still leaves 4015 us of wait, so an unstructured router has less max-bin
-#     overshoot to pay for, and K3's num_expert_group=1 makes grouped top-k a
-#     plain top-16-of-896 in both arms.
-#     MISS HIGH (dTPOT > +2.05%): random routing DEGENERATES => dummy
-#       overstates cost and every R2-class number in round 1's taxonomy is
-#       pessimistic by this factor. The more interesting outcome.
-#     MISS LOW (dTPOT < -6%): dummy flatters by more than the whole hierEP
-#       lever is worth (-9.63%) => R2 numbers need a correction factor before
-#       any of them can be compared to a real-weight number.
-#     REFUTATION OF THE MECHANISM (not a miss of the size): |dTPOT| < 2.05%
-#       AND the two expert-load histograms agree within 10% on max-rank/mean
-#       => dummy IS a valid perf proxy at this config, and the routing story
-#       is refuted. That is the single most useful negative available here.
-# P5  dTTFT(dummy - real) at c=1 = **0%**, ACCEPT [-3%, +3%]. At an 8192-token
-#     prefill every expert is non-empty in both arms, so the routing
-#     distribution cannot bite; weights should be invisible to TTFT.
-#     A MISS EITHER WAY refutes "prefill fills every expert" and is worse news
-#     for R2 than P4, because TTFT is where their headline win lives.
+# P4/P5 WERE RESTATED AT 2026-09-01 18:20Z, BEFORE THIS BUILD RAN, AND HERE IS
+# THE REASON. The first version predicted dTPOT -2.5% [-6%, 0%] and dTTFT 0%
+# [-3%, +3%] from a balls-in-bins argument: unstructured routing should have
+# less max-bin overshoot than trained `noaux_tc`. Lane E then read the actual
+# dummy tensors on CPU and the premise is wrong in kind, not in degree. Under
+# `initialize_dummy_weights` every float param is U(-1e-3, 1e-3) at a FIXED
+# seed, mxfp4 expert weights are zeroed rather than randomised, and K3's
+# e_score_correction_bias is a float32[896] that is randomised at the same
+# scale as everything else -- so the bias spread is ~80x the score spread and
+# top-k becomes the argmax of the bias, THE SAME 16 EXPERTS FOR EVERY TOKEN AND
+# EVERY LAYER. Measured on the sliced8 checkpoint: 30-31 distinct experts of
+# 896 against 805-892 real, 3.8 non-empty experts per EP8 rank against 100-112.
+# That is not a distribution shift, it is a structural collapse, and it makes
+# dummy CHEAPER in the gmm by construction. Both intervals move; the original
+# is kept above the line so the revision is auditable rather than invisible.
+# Both are still two-sided, and P5's sign has flipped, which is the point.
+#
+# P4  dTPOT(dummy - real) at c=1 = **-8%**, ACCEPT [-20%, -1%]. r3's own gmm
+#     cost model, cost(k) = 15.2 + 18.5*[k>=1] + 13.3*k us per layer per rank
+#     with k = non-empty local experts, gives ~-20% at their pad-4 decode floor
+#     but over-predicts r3's measured pad-1 -> pad-16 device delta by ~2x, so
+#     -20% is the edge and not the centre.
+#     MISS HIGH (dTPOT > -1%, i.e. dummy no cheaper): the collapse does not
+#       reach the decode step at TP32 => dummy IS a usable TPOT proxy and E's
+#       CPU read does not transfer. Report as a refutation of the mechanism at
+#       this interconnect level, not as noise.
+#     MISS LOW (dTPOT < -20%): dummy flatters TPOT by more than twice the whole
+#       hierEP lever (-9.63%) => no R2-class TPOT number in round 1's taxonomy
+#       may be compared to a real-weight number without a correction factor.
+#     SECOND, SHARPER TEST, and the falsifiable part: the gap must GROW with
+#       concurrency, because k grows with the padded token count under real
+#       weights and is pinned at ~0.5/rank under dummy. Predict
+#       |dTPOT(c=32)| >= 2 x |dTPOT(c=1)|. If the gap is flat across the table,
+#       the mechanism is not the expert count.
+# P5  dTTFT(dummy - real) at c=1 = **-25%**, ACCEPT [-45%, -8%]. THIS IS THE
+#     ONE THAT MATTERS FOR THE ROUND. An 8192-token prefill under real weights
+#     touches essentially every local expert; under dummy it touches ~4 of 112.
+#     If it lands, their 806 ms is not commensurable with our 1435.9 ms and a
+#     large part of the reported -43.9% TTFT is the weights, not their levers.
+#     MISS HIGH (dTTFT > -8%): prefill really does fill every expert in both
+#       arms => the collapse is decode-only, R2's TTFT numbers are safe, and
+#       their TTFT win is theirs. Report it as such; it is the outcome that
+#       most helps them.
+#     MISS LOW (dTTFT < -45%): dummy TTFT is worth more than every prefill
+#       lever we have found put together, and no dummy TTFT number anywhere
+#       may be quoted again.
 # P6  dummy bring-up <= 0.6 x real bring-up. r3's real cells booted in
 #     597-1012 s; point estimate real ~900 s, dummy ~350 s.
 #     FALSIFIER: dummy > 0.8 x real => bring-up is compile-bound, not
@@ -172,7 +204,7 @@ steps:
       K3_CONCURRENCY: "1 2 4 8 16 32"
       NUM_PROMPTS_BY_CONCURRENCY: "1:6 2:8 4:8 8:8 16:16 32:32"
     commands:
-      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,real,dummy,dummyprof,realprof --reps 3 --probe"
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe"
       - "du -sh perf_eval_results/* || true"
     artifact_paths:
       - "perf_eval_results/**/*"

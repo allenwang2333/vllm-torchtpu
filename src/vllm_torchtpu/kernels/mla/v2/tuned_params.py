@@ -1838,9 +1838,10 @@ _logged_tuning_keys: set[TuningKey] = set()
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key not in _logged_tuning_keys:
         _logged_tuning_keys.add(tuning_key)
-        logger.info("[mla-key] %s %s",
-                    "HIT " if tuning_key in tuned_params_mapping else "MISS",
-                    tuning_key)
+        hit = tuning_key in tuned_params_mapping
+        logger.info("[mla-key] %s %s -> %s", "HIT " if hit else "MISS",
+                    tuning_key,
+                    tuned_params_mapping.get(tuning_key, "<fallback>"))
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
     else:

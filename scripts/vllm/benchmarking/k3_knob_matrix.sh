@@ -123,7 +123,7 @@ arm_env() {
     # branch, same flags, same server command, same client, same job, same
     # host. Everything below `real` is what their compile_flag_sweep.sbatch
     # exports, restated per arm so a cell's record is self-contained.
-    dummy|real|dummyprof|realprof)
+    dummy|real|dummyprof|realprof|dummyuniform)
       printf '%s\n' \
         "TPU_MOE_HIERARCHICAL_EP=1" \
         "TPU_LATENT_PROJ_INTRA_CHIP_TP=1" \
@@ -134,7 +134,21 @@ arm_env() {
         "RAY_memory_usage_threshold=0.99" \
         "LIBTPU_INIT_ARGS=$K3_THEIRS_LIBTPU"
       case "$1" in
-        dummy|dummyprof) echo "LOAD_FORMAT=dummy" ;;
+        dummy*) echo "LOAD_FORMAT=dummy" ;;
+      esac
+      case "$1" in
+        # Dummy weights, but with expert selection replaced by a uniform draw
+        # anchored to the real activations. Isolates the two halves of what
+        # `dummy` changes: the ROUTING COLLAPSE (lane E: 30 distinct experts of
+        # 896 against 805-892, because every float weight is <=1e-3 so top-k
+        # becomes the argmax of a randomised e_score_correction_bias) from the
+        # NUMERICS (mxfp4 expert weights zeroed). If this arm lands on the real
+        # arm's timing, the collapse is the whole story and simulated routing
+        # is the fix that makes a dummy rig quotable.
+        # No kernel-path confound: fused EP already refuses K3 on
+        # `e_score_correction_bias is not applied inside the kernel`, before it
+        # ever reaches the simulation check (fused_moe_ep.py:560).
+        *uniform) echo "VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random" ;;
       esac
       case "$1" in
         # The profiled cells are deliberately NOT part of the A,B,B,A: the
