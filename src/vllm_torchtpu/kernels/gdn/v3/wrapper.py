@@ -682,11 +682,27 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    # PERSEQ guard. The per-seq segment spans [distribution[0],
+    # distribution[-1]).  In pure decode it is empty, the PER_SEQ kernel's
+    # inner emit_pipeline grid has zero tiles, and the pallas_call is pure
+    # launch overhead (3.53 us x 45 linear-attention layers = 0.159 ms/step,
+    # measured).  The predicate is a traced device value, so lax.cond is the
+    # only available guard.  No numerics change: the false branch returns
+    # exactly what an empty-grid kernel would have written back through its
+    # input_output_aliases.
+    per_seq_nonempty = distribution[-1] > distribution[0]
+
     if pooled:
         out_act, out_source, _ = call_kernel(state_source, None, None,
                                              config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        out_act, out_source = jax.lax.cond(
+            per_seq_nonempty,
+            lambda src, act: call_kernel(src, None, act,
+                                         config.GDNMode.PER_SEQ)[:2],
+            lambda src, act: (act, src),
+            out_source,
+            out_act,
+        )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -694,8 +710,14 @@ def fused_conv1d_gdn(
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
+        per_seq_nonempty,
+        lambda cs, rs, act: call_kernel(cs, rs, act, config.GDNMode.PER_SEQ),
+        lambda cs, rs, act: (act, cs, rs),
+        out_conv_state,
+        out_recurrent_state,
+        out_act,
+    )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
