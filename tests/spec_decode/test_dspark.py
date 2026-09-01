@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
+from vllm_torchtpu.models.vllm.kimi_k3.dspark import K3DSparkModel
 
 
 class _FakeHFConfig:
@@ -128,3 +129,54 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+def test_k3_context_rope_matches_mla_cache_dtype():
+    context = torch.ones((2, 4), dtype=torch.bfloat16)
+
+    class _Core:
+
+        def __init__(self):
+            self.kv_cache = torch.empty((1,), dtype=torch.bfloat16)
+            self.k_pe = None
+
+        def mla_op(self, _cache, _q_nope, _q_pe, _kv_c, k_pe, *_metadata):
+            self.k_pe = k_pe
+
+    core = _Core()
+    wrapper = SimpleNamespace(
+        kv_a_layernorm=lambda value: value,
+        rotary_emb=lambda _positions, q_pe, k_pe: (q_pe.float(),
+                                                   k_pe.float()),
+        num_heads=1,
+        mla_attn=core,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(kv_lora_rank=2, qk_rope_head_dim=2),
+        layers=[
+            SimpleNamespace(self_attn=SimpleNamespace(mla_attn=wrapper))
+        ],
+        combine_hidden_states=lambda _hidden_states: context,
+        context_kv_proj=lambda _context: (
+            torch.ones((2, 4), dtype=torch.bfloat16),
+            None,
+        ),
+    )
+    metadata = [
+        SimpleNamespace(
+            seq_lens=torch.tensor([2]),
+            block_tables=torch.tensor([[0]]),
+            query_start_loc=torch.tensor([0, 2]),
+            request_distribution=torch.tensor([0]),
+        )
+    ]
+
+    K3DSparkModel.precompute_and_store_context_kv(
+        model,
+        target_hidden_states=context,
+        positions=torch.tensor([0, 1]),
+        metadata=metadata,
+    )
+
+    assert core.k_pe is not None
+    assert core.k_pe.dtype == core.kv_cache.dtype
