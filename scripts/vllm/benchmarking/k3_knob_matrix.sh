@@ -274,6 +274,39 @@ for arm in "${arm_list[@]}"; do
     done > "$cell_dir/libtpu_readback.txt"
     echo "readback: $(wc -l < "$cell_dir/libtpu_readback.txt") worker(s) report LIBTPU_INIT_ARGS"
 
+    # WHAT libtpu was actually given, not how many processes were asked. Three
+    # separate things can make this differ from the arm:
+    #   - LIBTPU_INIT_ARGS is not in the container passthrough allowlist, so it
+    #     is set here and reaches workers only via Ray's driver-env copy;
+    #   - env_override.py resolves a SparseCore offload default from
+    #     TPU_ACCELERATOR_TYPE / GCE metadata, and where neither resolves it
+    #     sets nothing, leaving libtpu's own 64 KiB default -- which offloads
+    #     almost everything and is not what any of our baselines assumed;
+    #   - an arm that overrides the variable replaces that default wholesale.
+    # Print the distinct values and libtpu's own argv echo of the two flags
+    # that decide it.
+    sed 's/^pid [0-9]*: /[libtpu] env: /' "$cell_dir/libtpu_readback.txt" \
+      | sort -u | head -4
+    grep -aoE "argv\[[0-9]+\]: '--xla_tpu_(enable_sparse_core[a-z_]*|sparse_core[a-z_]*)=[^']*'" \
+      "$cell_dir/server.log" 2>/dev/null | sed -E 's/argv\[[0-9]+\]/[libtpu] argv/' \
+      | sort | uniq -c | head -8
+    grep -aoiE '(sparse.?core|offload)[a-z_ ]*(min_size|threshold)[^,;]{0,60}' \
+      "$cell_dir/server.log" 2>/dev/null | sort -u | sed 's/^/[libtpu] resolved /' | head -4
+
+    # Per-RANK proof that the two env-only flags arrived. Neither is in
+    # TpuPlatform.additional_env_vars nor carries a VLLM_ prefix. The V2 Ray
+    # executor copies the driver's WHOLE environment (vllm's get_driver_env_vars
+    # returns all of os.environ minus the worker-specific names), so they do
+    # arrive on that path -- but the V1 executor filters by additional_env_vars
+    # and would drop them silently, and "I exported it" is not evidence either
+    # way. The intra-chip flag's own signal is the per-core column count.
+    printf '[intra] arm=%s group_ready=%s sharded=%s replicated_fallback=%s\n' "$arm" \
+      "$(grep -ac 'Intra-chip group ready' "$cell_dir/server.log" 2>/dev/null)" \
+      "$(grep -ac 'sharded across .* cores per chip' "$cell_dir/server.log" 2>/dev/null)" \
+      "$(grep -ac 'leaving the latent projections replicated\|leaving it replicated' "$cell_dir/server.log" 2>/dev/null)"
+    grep -aoE 'Latent MoE projection \[[0-9, ]*\] sharded across [0-9]+ cores per chip \([0-9]+ columns each\)' \
+      "$cell_dir/server.log" 2>/dev/null | sort | uniq -c | sed 's/^/[intra] /' | head -4
+
     # Echo the MLA tuning-table verdict to STDOUT. It is otherwise only in
     # server.log, which reaches nobody until the post-command artifact upload
     # -- so a cancelled job loses the one line that is the whole point of a
@@ -386,7 +419,14 @@ for arm in "${arm_list[@]}"; do
         --model_args "model=${model},base_url=http://localhost:$PORT/v1/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=8,timeout=5000,max_length=8192,max_gen_toks=256" \
         --tasks gsm8k --num_fewshot 5 --limit "$GSM8K_LIMIT" \
         --output_path "$cell_dir/gsm8k" 2>&1 | tee "$cell_dir/gsm8k.log"
+      # On STDOUT, and never fatal to the cell: an accuracy check is the only
+      # instrument that can see a miscompiled collective, and losing the cell's
+      # serving numbers because lm_eval is missing would be the wrong trade.
+      grep -aoE '\|(exact_match|flexible-extract|strict-match)\|[^|]*\|[0-9.]+' \
+        "$cell_dir/gsm8k.log" 2>/dev/null | sed 's/^/[acc] /' | head -4 \
+        || echo "[acc] $arm no gsm8k table parsed"
     fi
+    true
   )
   cell_status=$?
   [ "$cell_status" -eq 0 ] || { echo "::error::$cell_id failed ($cell_status)"; fail=1; }

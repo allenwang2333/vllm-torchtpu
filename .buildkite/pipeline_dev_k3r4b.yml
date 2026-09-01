@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ==========================================================================
+# `.buildkite/pipeline_dev.yml` IS A SYMLINK TO THIS FILE ON THIS BRANCH.
+# bootstrap_dev.sh uploads `${DEV_PIPELINE_FILE:-.buildkite/pipeline_dev.yml}`
+# from the BUILD'S OWN branch, so the symlink means a build created any way at
+# all -- the Buildkite UI's "New Build", a curl to /v2/.../builds, `bk build
+# create` -- runs leg 1 with no env var to remember. A symlink and not a copy
+# because two copies drift, and a silently-wrong pipeline behind a UI button is
+# precisely the failure class this round keeps finding. The demo steps
+# pipeline_dev.yml normally carries are untouched on every other branch.
+# ==========================================================================
 
 # Round-4 lane B, pod leg 1: Q2 (does gnovack/k3-dev's 15.58 ms / 806 ms
 # reproduce on our v7x-32?) and Q3 (what does `--load-format dummy` cost or
@@ -163,6 +173,34 @@
 #     `[du]` breakdown names what it is. r3 left this as an explicit open
 #     question ("one du -sh between cells settles what is left").
 #
+# --- Correctness. Added after lanes A and C read their own test file. -------
+# `tests/layers/vllm/test_latent_proj_intra_chip_multichip.py:88-99` pops
+# LIBTPU_INIT_ARGS because
+# `--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes` "miscompiles
+# this test's compiled GEMM+all-gather into garbage". Their recipe sets that
+# flag at 32 MiB -- BELOW our own 64 MiB default -- together with
+# TPU_LATENT_PROJ_INTRA_CHIP_TP=1, whose 8192-token up-proj gather is
+# 8192 x 3584 x 2 B = 56 MiB, i.e. squarely inside the [32, 64) MiB band the
+# override newly offloads. So their configuration routes to SparseCore exactly
+# the collective their own test says the flag miscompiles -- and it does so
+# under dummy weights, where nothing can detect it. THE REAL CELLS ARE THE ONLY
+# PLACE IN THIS ROUND WHERE THAT CAN BE CHECKED.
+# P8  K3SANITY verdict = OK on every real cell and DEGENERATE on every dummy
+#     cell. The dummy half is the POSITIVE CONTROL: it proves the probe can
+#     see a broken model at all, and that dummy is dummy.
+#     FALSIFIER: DEGENERATE on a real cell => their flag combination corrupts
+#     the model at TP32, their reported table is void, and this is the round's
+#     result regardless of any timing number.
+#     ALSO A FINDING: OK on a dummy cell => the probe cannot distinguish random
+#     weights from trained ones and P8 carries no information; say so and stop
+#     quoting it.
+# P9  gsm8k 5-shot on cell 2 (the first real cell) >= 0.90, against r3's 0.99
+#     on the same checkpoint at page 256 / mns 8 / flat EP. Runs AFTER the
+#     timed repeats, so it cannot perturb them, and it is never fatal to the
+#     cell.
+#     FALSIFIER: < 0.90 with the sanity probe still OK => the corruption is
+#     partial, which no TPOT number would ever have shown.
+#
 # ============================ HOW TO READ IT =================================
 # Everything lands on STDOUT before any file: `[cell]` per result json,
 # `[disk]`/`[du]`/`[prune]` per cell, `[boot]`, `[wall]`, `[keys]`, `[bucket]`,
@@ -204,7 +242,7 @@ steps:
       K3_CONCURRENCY: "1 2 4 8 16 32"
       NUM_PROMPTS_BY_CONCURRENCY: "1:6 2:8 4:8 8:8 16:16 32:32"
     commands:
-      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe"
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe --gsm8k 100 --gsm8k-cells 2"
       - "du -sh perf_eval_results/* || true"
     artifact_paths:
       - "perf_eval_results/**/*"
