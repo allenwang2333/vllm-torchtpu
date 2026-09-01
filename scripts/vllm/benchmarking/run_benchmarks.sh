@@ -315,6 +315,23 @@ start_vllm_server() {
         return
     fi
 
+    # 30 s here against a 300-900 s bring-up. vLLM refuses some flag
+    # combinations inside the engine core rather than in argparse -- the
+    # loader rejecting --model-loader-extra-config under load_format dummy
+    # cost three arms across two CDK jobs before this existed. Fatal on
+    # purpose: a rejected argv cannot produce a measurement.
+    if [ "${PREFLIGHT_SERVE:-1}" = "1" ]; then
+        # PIPESTATUS, not the pipeline's status: grep succeeds on a REJECTED
+        # line too, so `if ! ... | grep` would be a gate that never fires.
+        # shellcheck disable=SC2086  # deliberate word-splitting, as below
+        python3 "$SCRIPT_DIR/preflight_serve_argv.py" ${server_cmd#vllm serve } 2>&1 \
+            | grep -aE '^\[preflight\]'
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "ERROR: preflight rejected the serve command; not launching."
+            exit 1
+        fi
+    fi
+
     if curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; then
         echo "WARNING: Port $PORT is already occupied! Running cleanup_server.sh before launching new server..."
         bash "$SCRIPT_DIR/cleanup_server.sh"
