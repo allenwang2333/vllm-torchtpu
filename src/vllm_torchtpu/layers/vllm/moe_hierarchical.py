@@ -23,11 +23,27 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     if not envs.TPU_MOE_HIERARCHICAL_EP:
         return None
 
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.distributed import (get_tensor_model_parallel_rank,
-                                  get_tensor_model_parallel_world_size)
+                                  get_tensor_model_parallel_world_size,
+                                  get_world_group)
 
-    world_size = get_tensor_model_parallel_world_size()
-    rank = get_tensor_model_parallel_rank()
+    vllm_config = get_current_vllm_config_or_none()
+    use_ep = (vllm_config is not None
+              and vllm_config.parallel_config.enable_expert_parallel)
+    if use_ep:
+        # With expert parallelism the expert space is flattened across DP:
+        # FusedMoEParallelConfig.make sets ep_size = dp*pcp*tp and
+        # ep_rank = dp_rank*pcp*tp + ..., which is exactly the world group.
+        # Use it rather than the TP group so the chip split still sees every
+        # device under data-parallel attention (e.g. DP=4 x TP=8, where the
+        # TP group alone holds only 8 of the 32 devices and the split would
+        # refuse to engage).
+        world_size = get_world_group().world_size
+        rank = get_world_group().rank_in_group
+    else:
+        world_size = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
     if world_size <= 1:
         return None
 
