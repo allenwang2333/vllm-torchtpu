@@ -345,9 +345,10 @@ start_vllm_server() {
             # TPU (CDK j-94240ea7). Surface the FIRST real exception line, at
             # the top, where a job log reader will see it.
             echo "========== root cause (first exception lines) =========="
-            grep -aoE '(ValueError|TypeError|KeyError|IndexError|RuntimeError|AssertionError|NotImplementedError|OSError|ImportError|ShapeSpecializationError)[^\n]{0,300}' \
-                "$RESULTS_DIR/server.log" | grep -avF 'Engine core initialization failed' \
-                | sort -u | head -5
+            _exc='(ValueError|TypeError|KeyError|IndexError|RuntimeError|AssertionError|NotImplementedError|OSError|ImportError|ShapeSpecializationError):'
+            grep -aE "$_exc" "$RESULTS_DIR/server.log" \
+                | grep -avF 'Engine core initialization failed' \
+                | sed -E "s/.*($_exc.*)/\1/" | cut -c1-300 | sort -u | head -5
             echo "========== Last 200 lines of server.log =========="
             tail -200 "$RESULTS_DIR/server.log"
             echo "==================================================="
