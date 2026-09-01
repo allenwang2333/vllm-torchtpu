@@ -67,11 +67,11 @@ steps:
     commands:
       - buildkite-agent artifact download "perf_eval_results/coverage_*.dat" .
       - ls -la perf_eval_results/
-      - python3 -m venv /tmp/covenv && /tmp/covenv/bin/pip install -q coverage
-      - /tmp/covenv/bin/coverage combine perf_eval_results/coverage_2chip.dat perf_eval_results/coverage_8chip.dat
-      - /tmp/covenv/bin/coverage report | tee coverage_summary.txt
-      - /tmp/covenv/bin/coverage xml -o coverage.xml
-      - /tmp/covenv/bin/coverage html -d cov_html
+      - python3 -m pip install -q --user coverage
+      - python3 -m coverage combine perf_eval_results/coverage_2chip.dat perf_eval_results/coverage_8chip.dat
+      - python3 -m coverage report | tee coverage_summary.txt
+      - python3 -m coverage xml -o coverage.xml
+      - python3 -m coverage html -d cov_html
     artifact_paths:
       - "coverage_summary.txt"
       - "coverage.xml"
