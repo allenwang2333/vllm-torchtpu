@@ -556,10 +556,9 @@ class TestWaitFlushDrain(unittest.TestCase):
         # resurrect it.
         self.assertEqual(h.get_finished(), [])
 
-    def test_h2d_wait_times_out_on_stalled_dma(self):
-        """A DMA that never completes must not hang the engine: wait()
-        returns after the timeout and leaves the job in `_transfer_map`
-        for a later get_finished to report."""
+    def test_h2d_wait_raises_on_stalled_dma(self):
+        """A DMA that has not completed by the timeout raises instead of
+        letting the caller overwrite the source blocks."""
         import threading
 
         h = self._make_h2d_handler()
@@ -571,9 +570,9 @@ class TestWaitFlushDrain(unittest.TestCase):
         with patch(
                 "vllm_torchtpu.offload.cpu_tpu._RAIDEN_OFFLOAD_WAIT_TIMEOUT_S",
                 0.05):
-            h.wait({1})  # must return, not hang
-
-        self.assertIn(1, h._transfer_map)
+            with self.assertRaisesRegex(RuntimeError,
+                                        "timed out.*jobs=\\[1\\]"):
+                h.wait({1})
 
     def test_h2d_wait_ignores_unknown_jobs(self):
         h = self._make_h2d_handler()
@@ -1275,6 +1274,22 @@ class TestRaidenOffloadingHandlerTransferAsync(unittest.TestCase):
             handler.wait({7})
         self.assertTrue(event.synchronized)
         mgr.d2h.assert_called_once_with([3], [1], [1])
+        self.assertIn(7, handler._pending)
+
+    def test_flush_wait_raises_on_stalled_raiden_dma(self):
+        handler, mgr = self._make_handler(tpu_to_cpu=True)
+        fut = MagicMock()
+        fut.is_ready.return_value = False  # never completes
+        mgr.d2h.return_value = fut
+        _FakeTpuEvent.ready = True
+        with patch("vllm_torchtpu.offload.cpu_tpu.synchronize_tensors"
+                   ), _patch_tpu_event(), patch(
+                       "vllm_torchtpu.offload.cpu_tpu."
+                       "_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S", 0.05):
+            handler.transfer_async(7, (self._spec([3]), self._spec([1])))
+            with self.assertRaisesRegex(RuntimeError,
+                                        r"timed out.*jobs=\[7\]"):
+                handler.wait({7})
         self.assertIn(7, handler._pending)
 
     def test_h2d_load_uses_lowercase_wrapper_method(self):

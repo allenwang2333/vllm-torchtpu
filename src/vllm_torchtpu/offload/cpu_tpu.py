@@ -1038,10 +1038,10 @@ class SingleDirectionOffloadingHandler:
         past the scatter-now gate. The gate bypass is safe — every rank
         completes this wait before its next forward, so scatter-before-
         forward ordering still holds on all ranks; an early dispatch
-        just lands the data sooner. Bounded by the offload wait timeout
-        so a stalled DMA can't hang the engine (timed-out jobs stay in
-        `_transfer_map` and are reported by a later get_finished, as
-        before).
+        just lands the data sooner. A transfer that has not completed
+        within the offload wait timeout raises: the caller is about to
+        overwrite the source blocks, so returning without the data would
+        corrupt the restore silently.
         """
         if self.tpu_to_cpu:
             for jid in job_ids:
@@ -1070,11 +1070,10 @@ class SingleDirectionOffloadingHandler:
             if not remaining:
                 return
             if time.perf_counter() >= deadline:
-                logger.warning(
-                    "[kv-offload] H2D flush wait timed out after %.1fs "
-                    "for jobs=%s", _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
-                    sorted(remaining))
-                return
+                raise RuntimeError(
+                    "[kv-offload] H2D flush wait timed out after "
+                    f"{_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S:.1f}s for jobs="
+                    f"{sorted(remaining)}")
             time.sleep(0.0005)
 
     def shutdown(self) -> None:
@@ -1102,9 +1101,10 @@ class SingleDirectionOffloadingHandler:
 # buffer, no cpu_pool tensor, no scatter-now gate (the DMA writes kv_cache
 # directly; there is no scatter HLO to dispatch in lockstep).
 _USE_RAIDEN_OFFLOAD = os.environ.get("VLLM_TPU_OFFLOAD_RAIDEN", "0") == "1"
-# Upper bound on the raiden offload flush wait (seconds). Dedicated to the
-# offload path -- intentionally NOT the disagg p2p-pull timeout -- so it can be
-# tuned independently.
+# Upper bound (seconds) on the DMA polls in the offload flush wait: the torch
+# H2D poll and the raiden transfer poll raise once it is exceeded. Dedicated to
+# the offload path -- intentionally NOT the disagg p2p-pull timeout -- so it can
+# be tuned independently.
 _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S = float(
     os.environ.get("VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S", "30"))
 
@@ -1253,10 +1253,9 @@ class _RaidenOffloadingHandler:
                 entry[0].synchronize()
         self.submit_deferred_d2h()
         # Flush by POLLING is_ready (never the blocking Await, which can
-        # deadlock against the live model -- see get_finished). Bound the wait
-        # with a dedicated offload timeout so a stalled raiden DMA can't
-        # busy-poll forever; on timeout the jobs stay in _pending and are
-        # reported by a later get_finished().
+        # deadlock against the live model -- see get_finished). A DMA that has
+        # not completed within the offload wait timeout raises: the scheduler
+        # is about to overwrite these stores' source blocks.
         remaining = {jid for jid in job_ids if jid in self._pending}
         deadline = time.perf_counter() + _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S
         while remaining:
@@ -1267,11 +1266,10 @@ class _RaidenOffloadingHandler:
             if not remaining:
                 break
             if time.perf_counter() >= deadline:
-                logger.warning(
-                    "[kv-offload] Raiden wait timed out after %.1fs for "
-                    "jobs=%s", _RAIDEN_OFFLOAD_WAIT_TIMEOUT_S,
-                    sorted(remaining))
-                return
+                raise RuntimeError(
+                    "[kv-offload] Raiden wait timed out after "
+                    f"{_RAIDEN_OFFLOAD_WAIT_TIMEOUT_S:.1f}s for jobs="
+                    f"{sorted(remaining)}")
             time.sleep(0.0005)
 
     def shutdown(self) -> None:
