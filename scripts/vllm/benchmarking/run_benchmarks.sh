@@ -338,6 +338,16 @@ start_vllm_server() {
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo ""
             echo "ERROR: Server process died during startup."
+            # The tail is not the cause. A worker that refuses its config dies
+            # ~600 lines before the end and the tail shows only "Engine core
+            # initialization failed. See root cause above" -- which is how
+            # `--model-loader-extra-config` under load_format dummy reached a
+            # TPU (CDK j-94240ea7). Surface the FIRST real exception line, at
+            # the top, where a job log reader will see it.
+            echo "========== root cause (first exception lines) =========="
+            grep -aoE '(ValueError|TypeError|KeyError|IndexError|RuntimeError|AssertionError|NotImplementedError|OSError|ImportError|ShapeSpecializationError)[^\n]{0,300}' \
+                "$RESULTS_DIR/server.log" | grep -avF 'Engine core initialization failed' \
+                | sort -u | head -5
             echo "========== Last 200 lines of server.log =========="
             tail -200 "$RESULTS_DIR/server.log"
             echo "==================================================="
