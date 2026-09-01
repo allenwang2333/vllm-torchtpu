@@ -404,21 +404,12 @@ if set(data.get("input_lens", [])) != {expected_tokens}:
 if set(data.get("output_lens", [])) != {1}:
     raise SystemExit(f"unexpected output lengths: {data.get('output_lens')}")
 row = {
-    "variant": variant,
     "round": int(round_index),
     "tokens": expected_tokens,
     "seq_len": expected_tokens,
     "batch_size": 1,
     "concurrency": 1,
     "latency_ms": data["mean_ttft_ms"],
-    "mean_ttft_ms": data["mean_ttft_ms"],
-    "median_ttft_ms": data.get("median_ttft_ms"),
-    "p90_ttft_ms": data.get("p90_ttft_ms"),
-    "p99_ttft_ms": data.get("p99_ttft_ms"),
-    "request_throughput": data.get("request_throughput"),
-    "total_token_throughput": data.get("total_token_throughput"),
-    "completed": data["completed"],
-    "failed": data.get("failed", 0),
 }
 with pathlib.Path(metrics_path).open("a") as stream:
     stream.write(json.dumps(row, sort_keys=True) + "\n")
@@ -473,20 +464,23 @@ fi
 
 cleanup_server
 
-python - "$OUT/benchmark/metrics.jsonl" "$VARIANT_OUT/summary.json" <<'PY'
+python - "$OUT/benchmark/metrics.jsonl" "$VARIANT_OUT/summary.json" \
+  "$VARIANT" <<'PY'
 import json
 import pathlib
 import statistics
 import sys
 
-metrics_path, summary_path = map(pathlib.Path, sys.argv[1:])
+metrics_path = pathlib.Path(sys.argv[1])
+summary_path = pathlib.Path(sys.argv[2])
+variant = sys.argv[3]
 rows = [json.loads(line) for line in metrics_path.read_text().splitlines()
         if line.strip()]
 grouped = {}
 for row in rows:
-    grouped.setdefault(str(row["tokens"]), []).append(row["mean_ttft_ms"])
+    grouped.setdefault(str(row["tokens"]), []).append(row["latency_ms"])
 summary = {
-    "variant": rows[0]["variant"],
+    "variant": variant,
     "measurements": rows,
     "by_isl": {
         tokens: {
