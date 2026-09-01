@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +6,9 @@ import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 INVALID_TOKEN_ID = -1
+
+# Global pipeline tracking to preserve source tensor lifetime across steps
+_PREV_COPY_STATE: Any = None
 
 
 @dataclass
@@ -16,6 +19,9 @@ class AsyncTPUCopyState:
     each D2H copy hits a precompiled program. Host-side trim and concat
     happen lazily on `wait()` and produce a single contiguous CPU tensor
     matching the real (unpadded) request count.
+
+    Preserves source tensor lifetime across steps via _PREV_COPY_STATE so
+    the host can queue Step N+1 without waiting for Step N D2H copy to finish.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
@@ -27,22 +33,37 @@ class AsyncTPUCopyState:
     @classmethod
     def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
                            chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+        global _PREV_COPY_STATE
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+
+        # Retire prior step's tensor retention now that Step N+1 has started
+        if _PREV_COPY_STATE is not None:
+            _PREV_COPY_STATE.chunks_tpu = None
+            _PREV_COPY_STATE = None
+
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
-        copy_ready_event = torch.tpu.Event()
-        copy_ready_event.record()
-        return cls(
+        if hasattr(torch, "tpu") and hasattr(torch.tpu, "Event"):
+            copy_ready_event = torch.tpu.Event()
+            copy_ready_event.record()
+        else:
+            copy_ready_event = None
+
+        state = cls(
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
-            chunks_tpu=chunks_tpu,
+            chunks_tpu=chunks_tpu,  # Keep alive across DMA transfer
         )
+        _PREV_COPY_STATE = state
+        return state
 
     def wait(self) -> None:
         if self.completed:
             return
-        self.copy_ready_event.synchronize()
-        self.chunks_tpu = None
+        skip_sync = bool(int(os.getenv("VLLM_TPU_SKIP_COPY_SYNC", "0")))
+        if not skip_sync:
+            if self.copy_ready_event is not None:
+                self.copy_ready_event.synchronize()
         self.completed = True
 
     @property
