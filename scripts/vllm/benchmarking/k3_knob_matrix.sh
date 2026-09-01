@@ -465,4 +465,15 @@ done
 echo "--- summary"
 python3 "$SCRIPT_DIR/k3_knob_summary.py" --results-dir "$RESULTS_DIR" \
   | tee "$RESULTS_DIR/summary.txt"
+
+# Cross-cell greedy agreement, when --probe captured completions. Two things
+# it settles that no timing number can: whether two cells of the SAME arm are
+# deterministic (they must be, or every delta in this job is noise), and
+# whether two cells of DIFFERENT arms compute the same thing at all -- which
+# is how a miscompiled collective, or a dummy cell mislabelled as real, shows
+# itself. Free: the captures already exist.
+if [ "$PROBE" = "1" ]; then
+  cells=$(cd "$RESULTS_DIR" && ls -d cell*/ 2>/dev/null | tr -d / | paste -sd, -)
+  [ -n "$cells" ] && python3 "$SCRIPT_DIR/k3_arm_verdict.py" agree "$RESULTS_DIR" "$cells"
+fi
 exit "$fail"
