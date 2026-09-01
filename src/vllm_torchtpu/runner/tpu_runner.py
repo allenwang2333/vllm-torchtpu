@@ -3052,28 +3052,58 @@ class TPUModelRunner(GPUModelRunner):
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True)
-        if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[:, total_num_scheduled_tokens:
-                                         padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:,
-                                                         local_token_slice].to(
-                                                             self.device,
-                                                             non_blocking=True)
+        cur_batch_req_ids = tuple(self.input_batch.req_ids[start_index:start_index + num_reqs])
+        is_steady_decode = (
+            max_num_scheduled_tokens_all_reqs == 1
+            and (self._pre_async_results is not None and self._pre_async_results.next_tokens_tpu is not None)
+            and getattr(self, "_active_batch_req_ids", None) == cur_batch_req_ids
+            and hasattr(self, "_device_positions")
+            and hasattr(self, "_device_seq_lens")
+            and self._device_positions.shape == self.positions_cpu[local_token_slice].shape
+        )
+
+        if is_steady_decode:
+            # Steady-state decode: ZERO H2D Uploads!
+            # 1. input_ids sliced from on-device placeholder / buffer
+            if not hasattr(self, "_device_input_placeholder"):
+                self._device_input_placeholder = torch.zeros(
+                    self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.input_ids = self._device_input_placeholder[local_token_slice]
+
+            # 2. position_ids advanced on-device via add_(1)
+            self._device_positions.add_(1)
+            self.position_ids = self._device_positions
+
+            # 3. seq_lens advanced on-device via add_(1)
+            self._device_seq_lens.add_(1)
+            seq_lens = self._device_seq_lens
+            target_num_reqs = self.num_reqs_most_model_len if not use_max_model_len else self.num_reqs_max_model_len
         else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
+            self._active_batch_req_ids = cur_batch_req_ids
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
                 self.device, non_blocking=True)
-        if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True)
-            target_num_reqs = self.num_reqs_most_model_len
+            if self.uses_mrope:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.mrope_positions.cpu[:, total_num_scheduled_tokens:
+                                             padded_total_num_scheduled_tokens] = 0
+                self._device_positions = self.mrope_positions.cpu[:,
+                                                             local_token_slice].to(
+                                                                 self.device,
+                                                                 non_blocking=True)
+            else:
+                self._device_positions = self.positions_cpu[local_token_slice].to(
+                    self.device, non_blocking=True)
+            self.position_ids = self._device_positions
+            if use_max_model_len:
+                self._device_seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
+                    self.device, non_blocking=True)
+                target_num_reqs = self.num_reqs_max_model_len
+            else:
+                assert self.num_reqs_most_model_len is not None
+                self._device_seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
+                    self.device, non_blocking=True)
+                target_num_reqs = self.num_reqs_most_model_len
+            seq_lens = self._device_seq_lens
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
