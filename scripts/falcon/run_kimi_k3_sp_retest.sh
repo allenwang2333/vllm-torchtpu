@@ -22,7 +22,10 @@ readonly MODEL_REVISION="3c8e22fdac0c14409eebd48ba78c10a940f5267a"
 readonly VLLM_COMMIT="4bdc8a788d2e2ce9165d552b3d4d8b72604626bf"
 readonly TORCH_TPU_VERSION="0.1.1.dev20260813160135"
 readonly TORCH_TPU_SHA256="e1e326fd4efbc85e965618e6a97a653eb256f00f817d2955f1fffaa59d0e525a"
-readonly WHEEL_PATH="/wheels/torch_tpu-0.1.1.dev20260813160135-cp312-cp312-manylinux_2_31_x86_64.whl"
+readonly TORCH_TPU_WHEEL_SIZE="141595498"
+readonly MOUNTED_WHEEL_PATH="/wheels/torch_tpu-0.1.1.dev20260813160135-cp312-cp312-manylinux_2_31_x86_64.whl"
+readonly INJECTED_WHEEL_PATH="${FALCON_TORCH_TPU_WHEEL_PATH:-}"
+readonly INJECTED_WHEEL_WAIT_SECONDS="${FALCON_TORCH_TPU_WHEEL_WAIT_SECONDS:-0}"
 
 readonly ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/kimi-k3-sp-retest-artifact}"
 readonly OUT="$ROOT/rank-0"
@@ -104,10 +107,38 @@ mkdir -p \
   "$VARIANT_OUT/benchmarks"
 
 test -f "$MODEL_PATH/config.json"
-WHEEL_TO_INSTALL="$WHEEL_PATH"
+WHEEL_TO_INSTALL="$MOUNTED_WHEEL_PATH"
 if test -s "$WHEEL_TO_INSTALL"; then
   printf '%s  %s\n' "$TORCH_TPU_SHA256" "$WHEEL_TO_INSTALL" \
     | sha256sum -c -
+elif test -n "$INJECTED_WHEEL_PATH"; then
+  case "$INJECTED_WHEEL_WAIT_SECONDS" in
+    ''|*[!0-9]*)
+      printf 'FALCON_TORCH_TPU_WHEEL_WAIT_SECONDS must be an integer\n' >&2
+      exit 1
+      ;;
+  esac
+  mkdir -p "$(dirname "$INJECTED_WHEEL_PATH")"
+  printf 'FALCON_WHEEL_INJECTION_READY path=%s expected_size=%s timeout_seconds=%s\n' \
+    "$INJECTED_WHEEL_PATH" "$TORCH_TPU_WHEEL_SIZE" \
+    "$INJECTED_WHEEL_WAIT_SECONDS"
+  waited=0
+  while test "$(stat -c '%s' "$INJECTED_WHEEL_PATH" 2>/dev/null || printf 0)" \
+      != "$TORCH_TPU_WHEEL_SIZE" \
+      && test "$waited" -lt "$INJECTED_WHEEL_WAIT_SECONDS"; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  actual_size=$(stat -c '%s' "$INJECTED_WHEEL_PATH" 2>/dev/null || printf 0)
+  if test "$actual_size" != "$TORCH_TPU_WHEEL_SIZE"; then
+    printf 'Injected torch-tpu wheel unavailable after %s seconds (size=%s)\n' \
+      "$waited" "$actual_size" >&2
+    exit 1
+  fi
+  WHEEL_TO_INSTALL="$INJECTED_WHEEL_PATH"
+  printf '%s  %s\n' "$TORCH_TPU_SHA256" "$WHEEL_TO_INSTALL" \
+    | sha256sum -c -
+  printf 'FALCON_WHEEL_INJECTION_OK path=%s\n' "$WHEEL_TO_INSTALL"
 else
   WHEEL_TO_INSTALL=""
   printf 'Mounted torch-tpu wheel unavailable; using verified registry fallback\n'
