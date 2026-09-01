@@ -3080,8 +3080,10 @@ class TestTPURaidenConnectorWorker:
             # Per-block bytes: nope 8*4*128=4096, rope 2*4*128=1024,
             # idx 2*4*256=2048 -> 7168; x 4 blocks = 28672 per slot;
             # budget 1 GiB / tp_size 4.
-            assert self.worker._num_raiden_slots(
-                max_blocks=4) == ((1024**3 // 4) // 28672)
+            expected_slots = (
+                ((1024**3 // 4) // 28672) * self.worker.chunk_transfer_window
+            )
+            assert self.worker._num_raiden_slots(max_blocks=4) == expected_slots
 
     def test_dp_port_configurations(self):
         worker = _make_raiden_worker(dp_rank=0, tp_size=1)

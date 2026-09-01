@@ -67,6 +67,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 __all__ = [
+    "CHUNK_TRANSFER_WINDOW",
     "TPUConnector",
     "TPUConnectorScheduler",
     "TPUConnectorWorker",
@@ -90,6 +91,7 @@ class _DoneFuture:
         return
 
 
+CHUNK_TRANSFER_WINDOW: int = 2
 _DONE_FUTURE = _DoneFuture()
 _STAGE3_FINISH_DEDUP_LIMIT = 4096
 _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
@@ -284,6 +286,40 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         if value in ("0", "false", "no", "off"):
             return False
     return bool(value)
+
+
+def _get_chunk_transfer_window(vllm_config: VllmConfig | None) -> int:
+    """Extracts the configured chunk transfer window size (W).
+
+    Resolves the sliding window capacity for pipelined chunk emission by
+    querying the configuration hierarchy in order of precedence: first checking
+    the direct `chunk_transfer_window` attribute on `kv_transfer_config`, then
+    falling back to the `chunk_transfer_window` key in
+    `kv_connector_extra_config`, and finally defaulting to
+    `CHUNK_TRANSFER_WINDOW` (2). Clamps values to a minimum of 1.
+
+    Args:
+        vllm_config: The global vLLM configuration object, or None.
+
+    Returns:
+        The validated sliding window slot capacity (at least 1).
+    """
+    if vllm_config is None:
+        return CHUNK_TRANSFER_WINDOW
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return CHUNK_TRANSFER_WINDOW
+    window_value = getattr(kv_transfer_config, "chunk_transfer_window", None)
+    if window_value is not None:
+        return max(1, int(window_value))
+    extra_config = getattr(
+        kv_transfer_config, "kv_connector_extra_config", None
+    ) or {}
+    if (
+        isinstance(extra_config, dict) and "chunk_transfer_window" in extra_config
+    ):
+        return max(1, int(extra_config["chunk_transfer_window"]))
+    return CHUNK_TRANSFER_WINDOW
 
 
 def stage3_fa_raiden_id_fields(
@@ -996,6 +1032,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_send_requests: dict[ReqId, _Stage3SendState] = {}
+        self.chunk_transfer_window: int = _get_chunk_transfer_window(
+            vllm_config
+        )
+        self._in_flight_chunks: dict[str, int] = {}
         parallel_config = vllm_config.parallel_config if vllm_config else None
         if parallel_config is not None:
             self.pcp_size = int(
@@ -1407,7 +1447,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         Returns:
             True if the chunk can be emitted, False if deferred.
         """
-        return True
+        in_flight = self._in_flight_chunks.get(req_id)
+        if in_flight is None:
+            in_flight = self._in_flight_chunks.get(str(req_id), 0)
+        return in_flight < self.chunk_transfer_window
 
     def build_connector_meta(
         self,
@@ -1467,6 +1510,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                             token_base=req_state.tokens_sent,
                             is_final=False,
                         )
+                        self._in_flight_chunks[req_id] = (
+                            self._in_flight_chunks.get(req_id, 0) + 1)
                         req_state.tokens_sent = aligned_boundary
                         req_state.next_chunk_idx += 1
 
@@ -1619,6 +1664,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                  "mamba block tables were not provided")
             mamba_state_block_ids = _select_committed_mamba_blocks(
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks)
+        self._in_flight_chunks.pop(request.request_id, None)
+        self._in_flight_chunks.pop(str(request.request_id), None)
         req_state = (
             self._stage3_send_requests.pop(request.request_id, None)
             or self._stage3_send_requests.pop(str(request.request_id), None))
@@ -1673,9 +1720,41 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         )
         return True, params
 
+    def on_chunk_completed(self, req_id: str) -> None:
+        """Decrements in-flight chunk counter for a completed chunk transfer.
+
+        Performs decrement or cleanup of the active in-flight chunk accounting
+        entry for the given request ID upon receiving a transfer completion
+        acknowledgement. Cleans up dictionary keys when the active count
+        reaches zero.
+
+        Args:
+            req_id: The request identifier whose chunk transfer completed.
+        """
+        for key in (req_id, str(req_id)):
+            if key in self._in_flight_chunks:
+                if self._in_flight_chunks[key] > 1:
+                    self._in_flight_chunks[key] -= 1
+                else:
+                    self._in_flight_chunks.pop(key, None)
+                break
+
     def update_connector_output(self, connector_output: Any) -> None:
-        for req_id in connector_output.finished_sending or ():
+        """Updates internal scheduler state from worker connector output.
+
+        Processes completion signals returned in
+        `connector_output.finished_sending`, cleaning up terminal send records
+        from `_stage3_finished_sends` and decrementing sliding window in-flight
+        chunk counters via `on_chunk_completed()`. Safely handles None inputs or
+        missing `finished_sending` attributes.
+
+        Args:
+            connector_output: The worker connector output structure containing
+                transfer completion indicators.
+        """
+        for req_id in getattr(connector_output, "finished_sending", None) or ():
             self._stage3_finished_sends.pop(req_id, None)
+            self.on_chunk_completed(req_id)
 
     def get_finished_count(self) -> int:
         if not _use_raiden_stage3_transport():
@@ -1703,6 +1782,9 @@ class TPURaidenConnectorWorker:
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
+        self.chunk_transfer_window: int = _get_chunk_transfer_window(
+            vllm_config
+        )
         self.runner: Optional[TPUModelRunner] = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -4481,6 +4563,23 @@ class TPURaidenConnectorWorker:
         return max(1, (max_model_len + block_size - 1) // block_size)
 
     def _num_raiden_slots(self, max_blocks: int) -> int:
+        """Calculates host buffer slots to allocate for Raiden transfers.
+
+        Determines total shared memory slots to register with Raiden C++
+        transport by calculating aggregate byte footprint per slot across all
+        flattened KV cache tensors (e.g. MLA nope/rope cache entries and DSA
+        indexer tensors), computing base slot capacity fitting within the
+        per-rank shared memory budget, and scaling linearly by the configured
+        `chunk_transfer_window` (W) to accommodate concurrent in-flight chunks.
+        Respects manual slot count overrides if configured.
+
+        Args:
+            max_blocks: Maximum KV cache block capacity required per request
+                slot.
+
+        Returns:
+            The total number of host memory slots to allocate and register.
+        """
         override = dist_utils.get_raiden_transfer_num_slots()
         if override > 0:
             return override
@@ -4496,7 +4595,8 @@ class TPURaidenConnectorWorker:
             bytes_per_slot += tensor_bytes
         per_rank_budget = int(dist_utils.get_kv_shm_pool_gb() * (1024**3))
         per_rank_budget //= max(1, self.tp_size)
-        return max(1, per_rank_budget // max(1, bytes_per_slot))
+        base_slots = max(1, per_rank_budget // max(1, bytes_per_slot))
+        return base_slots * self.chunk_transfer_window
 
 
 def get_uuid() -> int:

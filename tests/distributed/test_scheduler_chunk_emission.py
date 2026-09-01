@@ -3,15 +3,11 @@
 
 from collections.abc import Iterator
 import contextlib
-import time
-from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
-    SendMeta,
     TPUConnectorMetadata,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
@@ -31,10 +27,12 @@ def _make_raiden_scheduler(
     block_size: int = 16,
     pcp_size: int = 4,
     interleave_size: int = 256,
+    chunk_transfer_window: int | None = None,
 ) -> TPURaidenConnectorScheduler:
     """Creates a mock-configured TPURaidenConnectorScheduler for testing."""
     cfg = MagicMock()
     cfg.kv_transfer_config.is_kv_producer = is_producer
+    cfg.kv_transfer_config.chunk_transfer_window = chunk_transfer_window
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
     cfg.cache_config.enable_prefix_caching = False
@@ -132,7 +130,10 @@ def test_scheduler_step_chunk_emission() -> None:
     on step 1, SendMeta([1024, 2048), is_final=False) on step 2, etc.
     """
     scheduler = _make_raiden_scheduler(
-        is_producer=True, pcp_size=4, interleave_size=256
+        is_producer=True,
+        pcp_size=4,
+        interleave_size=256,
+        chunk_transfer_window=4,
     )
     req_id = "req-4096"
     base_uuid = 123456789
@@ -229,7 +230,10 @@ def test_scheduler_unaligned_remainder_carry() -> None:
     SendMeta([0, 1024)) once 1536 tokens are computed.
     """
     scheduler = _make_raiden_scheduler(
-        is_producer=True, pcp_size=4, interleave_size=256
+        is_producer=True,
+        pcp_size=4,
+        interleave_size=256,
+        chunk_transfer_window=8,
     )
     req_id = "req-768"
     base_uuid = 54321
@@ -695,7 +699,10 @@ def test_terminal_remainder_emission() -> None:
     remainder [3072, 3500) marked with is_final=True.
     """
     scheduler = _make_raiden_scheduler(
-        is_producer=True, pcp_size=4, interleave_size=256
+        is_producer=True,
+        pcp_size=4,
+        interleave_size=256,
+        chunk_transfer_window=4,
     )
     req_id = "req-long-3500"
     base_uuid = 999111
@@ -852,7 +859,10 @@ def test_terminal_emission_exact_stride_aligned_all_tokens_sent() -> None:
     reqs_to_send.
     """
     scheduler = _make_raiden_scheduler(
-        is_producer=True, pcp_size=4, interleave_size=256
+        is_producer=True,
+        pcp_size=4,
+        interleave_size=256,
+        chunk_transfer_window=4,
     )
     req_id = "req-exact-4096"
     base_uuid = 777111
@@ -1009,7 +1019,10 @@ def test_request_finished_duplicate_idempotency_multi_chunk() -> None:
     subsequent request_finished() calls.
     """
     scheduler = _make_raiden_scheduler(
-        is_producer=True, pcp_size=4, interleave_size=256
+        is_producer=True,
+        pcp_size=4,
+        interleave_size=256,
+        chunk_transfer_window=4,
     )
     req_id = "req-dedup-multichunk"
     base_uuid = 123987
