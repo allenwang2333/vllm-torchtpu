@@ -2493,30 +2493,26 @@ class TPUModelRunner(GPUModelRunner):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
-        # Fast path 1: Direct device token slicing for 1:1 steady-state decode
+        # On-device token passing in steady-state decode:
+        # Instead of doing a synchronous H2D transfer of numpy index arrays,
+        # we generate the padded index tensors entirely on-device using torch.arange.
         n_subst = len(token_in_tpu_cur_input_indices)
-        if (n_subst == len(input_ids)
-                and np.array_equal(token_in_tpu_cur_input_indices,
-                                   np.arange(len(input_ids), dtype=np.int32))
-                and np.array_equal(token_in_tpu_pre_next_tokens_indices,
-                                   np.arange(len(input_ids), dtype=np.int32))):
-            if (self._pre_async_results is not None
-                    and self._pre_async_results.next_tokens_tpu is not None):
-                next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(input_ids.dtype)
-                if len(next_tpu) >= len(input_ids):
-                    return next_tpu[:len(input_ids)]
-
-        # Fast path 2: Cache persistent device indices to eliminate per-step H2D uploads
-        subst_key = (
-            len(input_ids),
-            tuple(token_in_tpu_cur_input_indices),
-            tuple(token_in_tpu_pre_next_tokens_indices),
+        is_steady_state = (
+            np.array_equal(token_in_tpu_cur_input_indices, np.arange(n_subst, dtype=np.int32)) and
+            np.array_equal(token_in_tpu_pre_next_tokens_indices, np.arange(n_subst, dtype=np.int32))
         )
-        if (getattr(self, "_cached_subst_key", None) == subst_key
-                and hasattr(self, "_cached_cur_input_indices")
-                and hasattr(self, "_cached_pre_next_tokens_indices")):
-            cur_input_indices = self._cached_cur_input_indices
-            pre_next_tokens_indices = self._cached_pre_next_tokens_indices
+        
+        if is_steady_state:
+            pad_len = len(input_ids)
+            cur_input_indices = torch.arange(pad_len, dtype=torch.int32, device=self.device)
+            # Create a 0-D scalar tensor for n_subst to avoid dynamic shape graph breaks, 
+            # though torch.where(arange < scalar) compiles fine.
+            n_subst_tensor = torch.tensor(n_subst, dtype=torch.int32, device=self.device)
+            pre_next_tokens_indices = torch.where(
+                cur_input_indices < n_subst_tensor,
+                cur_input_indices,
+                torch.tensor(-1, dtype=torch.int32, device=self.device)
+            )
         else:
             idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
             _missing_mask = np.ones(len(input_ids), dtype=bool)
@@ -2531,18 +2527,13 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1)
 
             cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices).to(self.device,
-                                                          non_blocking=True)
+                padded_token_in_tpu_cur_input_indices).to(self.device, non_blocking=True)
             pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices).to(self.device,
-                                                                non_blocking=True)
-            self._cached_subst_key = subst_key
-            self._cached_cur_input_indices = cur_input_indices
-            self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+                padded_token_in_tpu_pre_next_tokens_indices).to(self.device, non_blocking=True)
 
         return _substitute_placeholder_token(
             input_ids, cur_input_indices, pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu)
+            self._pre_async_results.next_tokens_tpu if self._pre_async_results else self._last_selected_tokens_tpu)
 
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
