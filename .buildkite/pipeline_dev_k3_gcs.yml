@@ -43,6 +43,24 @@ steps:
       # The CI image sets this to 1, making any compile at request time fatal.
       # The bench serves shapes the warmup sweep does not cover.
       VLLM_XLA_CHECK_RECOMPILATION: "0"
+      # MLA tuning-miss policy. Every field of the MLA v2 tuning key is a
+      # serving-configuration value -- max_num_seqs, page_size_per_kv_packing
+      # and pages_per_seq (i.e. --block-size and --max-model-len), and the
+      # padded token bucket -- and `get_tuned_params` never returns None: on a
+      # miss it silently substitutes default kernel block sizes and serves. So
+      # editing any argument below can de-tune MLA without any signal.
+      #
+      # This step's `batched_decode` key has never matched a row: TP32 gives 3
+      # local q heads, the KV cache is bf16, max_num_seqs=1, and all 37 shipped
+      # batched_decode rows are fp8-KV at (max_num_seqs, pages_per_seq) in
+      # {(8,3), (16,3), (64,9), (160,9)}. It has been running the decode kernel
+      # on default block sizes for its entire existence. Fix by tuning one row
+      # for this geometry; until then the default is the deliberate choice.
+      #
+      # Flipping this to "1" makes that miss raise during warm-up and fails the
+      # step -- correct for qualifying a new recipe, and what our own perf jobs
+      # should set. Left off here because this is a shared team pipeline.
+      TPU_MLA_TUNING_STRICT: "0"
     commands:
       - |
         .buildkite/scripts/run_multihost.sh \
