@@ -21,6 +21,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
@@ -206,6 +207,39 @@ def chunk_uuid(base_uuid: int, chunk_idx: int) -> int:
     digest = hashlib.sha256(data).digest()
     int_val = int.from_bytes(digest[:8], "big")
     return int_val >> 14
+
+
+def _validate_interval_tiling(
+    intervals: Sequence[tuple[int, int]] | None,
+    expected_total_tokens: int,
+) -> bool:
+    """Validates if half-open intervals cover the expected token range.
+
+    Verifies complete prompt reception before decode admission. Sorts all
+    accumulated intervals by start offset and sweeps a cursor forward to
+    confirm that intervals start at token 0, maintain contiguous coverage
+    without intermediate gaps, and reach or exceed expected total tokens.
+
+    Args:
+        intervals: Sequence of (start, end) half-open token range tuples.
+        expected_total_tokens: Total number of prompt tokens expected.
+
+    Returns:
+        True if intervals form an unbroken cover of [0, expected_total_tokens),
+        False otherwise.
+    """
+    if not intervals:
+        return False
+    if expected_total_tokens <= 0:
+        return False
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    cursor = 0
+    for start, end in sorted_intervals:
+        if start > cursor:
+            return False
+        if end > cursor:
+            cursor = end
+    return cursor >= expected_total_tokens
 
 
 @dataclass(frozen=True)
@@ -1663,6 +1697,8 @@ class TPURaidenConnectorWorker:
     H2H, H2D, readiness, and completion state.
     """
 
+    _validate_interval_tiling = staticmethod(_validate_interval_tiling)
+
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.config = vllm_config.kv_transfer_config
@@ -2490,6 +2526,8 @@ class TPURaidenConnectorWorker:
         )
         if req_id is not None:
             self._stage3_recv_intervals[str(req_id)] = []
+            if tokens > 0:
+                self._stage3_submitted_load_tokens[str(req_id)] = tokens
         return expected_pages
 
     def _register_in_flight_recv_chunk(
@@ -3705,86 +3743,6 @@ class TPURaidenConnectorWorker:
                 int(req_meta.num_tokens),
             )
 
-    def get_finished(
-        self, finished_req_ids: set[str] | None = None
-    ) -> tuple[set[str], set[str]]:
-        """Retrieves finished send and receive request IDs and reclaims state.
-
-        Polls the transfer engine for DMA completion events, computes newly
-        completed send and receive requests while filtering suppressed or
-        already-reported IDs, and cleans up internal tracking state (including
-        interval lists, in-flight coordinate mappings, and alias tables) for
-        retired requests.
-
-        Args:
-            finished_req_ids: Optional set of request IDs that the scheduler
-                has acknowledged as finished or aborted.
-
-        Returns:
-            A tuple of (done_sending, done_recving) sets containing the request
-            identifiers that completed transfer during this pass.
-        """
-        engine = self._ensure_raiden_transfer_engine()
-        self._poll_finished(engine)
-        done_sending = self._done_sending
-        if self.is_producer and self._raiden_stage3_enabled():
-            done_sending = done_sending - self._stage3_reported_sends
-            self._stage3_reported_sends.update(done_sending)
-        # Report failed recvs as finished too, so the scheduler stops waiting in
-        # WAITING_FOR_REMOTE_KVS until the API timeout; the affected blocks are
-        # surfaced via get_block_ids_with_load_errors() in the same pass so vLLM
-        # recomputes them rather than running with absent KV.
-        recv_finished = self._done_recving | self._failed_recving
-        done_recving = (recv_finished - self._suppress_done_recving -
-                        self._reported_recving)
-        self._suppress_done_recving.difference_update(recv_finished)
-        self._reported_recving.update(done_recving)
-        if done_recving:
-            logger.debug(
-                "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
-                self.tp_rank, done_recving)
-        # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
-        # but vLLM deliberately delays freeing its blocks until this connector
-        # reports a receive terminal. Retain accepted Stage-3 state across that
-        # abort so a later manager success/failure is not filtered as stale.
-        cleanup_req_ids: set[str] = set()
-        if finished_req_ids:
-            for req_id in finished_req_ids:
-                if (req_id in self._stage3_submitted_loads
-                        and req_id not in self._stage3_terminal_loads):
-                    self._stage3_finished_loads_pending_cleanup.add(req_id)
-                else:
-                    cleanup_req_ids.add(req_id)
-        cleanup_req_ids.update(
-            self._stage3_finished_loads_pending_cleanup.intersection(
-                self._stage3_terminal_loads))
-        for req_id in cleanup_req_ids:
-            source_req_id = self._stage3_source_req_ids.pop(req_id, None)
-            if (source_req_id is not None
-                    and self._stage3_destination_req_ids.get(source_req_id)
-                    == req_id):
-                self._stage3_destination_req_ids.pop(source_req_id, None)
-            self._reported_recving.discard(req_id)
-            self._failed_recving.discard(req_id)
-            self._suppress_done_recving.discard(req_id)
-            self._load_block_ids.pop(req_id, None)
-            self._stage3_submitted_loads.pop(req_id, None)
-            self._stage3_submitted_load_tokens.pop(req_id, None)
-            self._stage3_controller_accepted.discard(req_id)
-            self._stage3_pending_controller_failures.pop(req_id, None)
-            self._stage3_terminal_loads.discard(req_id)
-            self._stage3_finished_loads_pending_cleanup.discard(req_id)
-            self._stage3_recv_intervals.pop(req_id, None)
-            self._stage3_in_flight_recv_chunks.pop(req_id, None)
-            self._stage3_recv_chunk_meta.pop(req_id, None)
-            if source_req_id is not None:
-                self._stage3_in_flight_recv_chunks.pop(source_req_id, None)
-                self._stage3_recv_chunk_meta.pop(source_req_id, None)
-                self._stage3_recv_intervals.pop(source_req_id, None)
-        self._done_sending = set()
-        self._done_recving = set()
-        return done_sending, done_recving
-
     def _record_stage3_recv_chunk_completion(self, rec_id: str) -> None:
         """Records the completion of a received sub-chunk interval.
 
@@ -4078,6 +4036,140 @@ class TPURaidenConnectorWorker:
                 self._active_tensor_refs.pop(req_id, None)
                 self._stage3_registered_sends.pop(req_id, None)
                 del self._stage3_terminal_cleanup[req_id]
+
+    def _is_stage3_recv_complete(self, req_id: str) -> bool:
+        """Validates if a completed Stage-3 receive satisfies interval tiling.
+
+        Checks whether the accumulated received token intervals for a request
+        form an unbroken cover of the expected prompt token range. Resolves the
+        expected token count by querying submitted load tokens directly,
+        consulting source request ID alias mappings, or deriving token count
+        from allocated KV cache block counts and block size. If interval
+        tracking is active, verifies coverage via interval tiling validation.
+
+        Args:
+            req_id: Request identifier being checked.
+
+        Returns:
+            True if interval tiling check passes or if interval tracking is not
+            active for this request; False if interval validation fails.
+        """
+        if req_id not in self._stage3_recv_intervals:
+            return True
+        expected_tokens = self._stage3_submitted_load_tokens.get(req_id)
+        if expected_tokens is None and req_id in self._stage3_source_req_ids:
+            expected_tokens = self._stage3_submitted_load_tokens.get(
+                self._stage3_source_req_ids[req_id]
+            )
+        if expected_tokens is None and req_id in self._load_block_ids:
+            block_size = int(
+                getattr(
+                    getattr(self.vllm_config, "cache_config", None),
+                    "block_size",
+                    1,
+                )
+                or 1
+            )
+            expected_tokens = len(self._load_block_ids[req_id]) * block_size
+        if expected_tokens is not None and expected_tokens > 0:
+            intervals = self._stage3_recv_intervals.get(req_id, [])
+            if not _validate_interval_tiling(intervals, expected_tokens):
+                logger.warning(
+                    "TPURaidenConnectorWorker rank%d --> req_id=%s "
+                    "failed interval tiling validation (intervals=%s, "
+                    "expected=%d)",
+                    self.tp_rank,
+                    req_id,
+                    intervals,
+                    expected_tokens,
+                )
+                return False
+        return True
+
+    def get_finished(
+        self, finished_req_ids: set[str] | None = None
+    ) -> tuple[set[str], set[str]]:
+        """Retrieves finished transfer request IDs and reclaims state.
+
+        Polls the transfer engine for DMA completion events, computes newly
+        completed send and receive requests while filtering suppressed or
+        already-reported IDs, and cleans up internal tracking state (including
+        interval lists, in-flight coordinate mappings, and alias tables) for
+        retired requests.
+
+        Args:
+            finished_req_ids: Optional set of request IDs that the scheduler
+                has acknowledged as finished or aborted.
+
+        Returns:
+            A tuple of (done_sending, done_recving) sets containing the request
+            identifiers that completed transfer during this pass.
+        """
+        engine = self._ensure_raiden_transfer_engine()
+        self._poll_finished(engine)
+        done_sending = self._done_sending
+        if self.is_producer and self._raiden_stage3_enabled():
+            done_sending = done_sending - self._stage3_reported_sends
+            self._stage3_reported_sends.update(done_sending)
+        self._done_recving = {
+            req_id
+            for req_id in self._done_recving
+            if self._is_stage3_recv_complete(req_id)
+        }
+        # Report failed recvs as finished too, so the scheduler stops waiting in
+        # WAITING_FOR_REMOTE_KVS until the API timeout; the affected blocks are
+        # surfaced via get_block_ids_with_load_errors() in the same pass so vLLM
+        # recomputes them rather than running with absent KV.
+        recv_finished = self._done_recving | self._failed_recving
+        done_recving = (recv_finished - self._suppress_done_recving -
+                        self._reported_recving)
+        self._suppress_done_recving.difference_update(recv_finished)
+        self._reported_recving.update(done_recving)
+        if done_recving:
+            logger.debug(
+                "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
+                self.tp_rank, done_recving)
+        # A request aborted in WAITING_FOR_REMOTE_KVS is scheduler-finished,
+        # but vLLM deliberately delays freeing its blocks until this connector
+        # reports a receive terminal. Retain accepted Stage-3 state across that
+        # abort so a later manager success/failure is not filtered as stale.
+        cleanup_req_ids: set[str] = set()
+        if finished_req_ids:
+            for req_id in finished_req_ids:
+                if (req_id in self._stage3_submitted_loads
+                        and req_id not in self._stage3_terminal_loads):
+                    self._stage3_finished_loads_pending_cleanup.add(req_id)
+                else:
+                    cleanup_req_ids.add(req_id)
+        cleanup_req_ids.update(
+            self._stage3_finished_loads_pending_cleanup.intersection(
+                self._stage3_terminal_loads))
+        for req_id in cleanup_req_ids:
+            source_req_id = self._stage3_source_req_ids.pop(req_id, None)
+            if (source_req_id is not None
+                    and self._stage3_destination_req_ids.get(source_req_id)
+                    == req_id):
+                self._stage3_destination_req_ids.pop(source_req_id, None)
+            self._reported_recving.discard(req_id)
+            self._failed_recving.discard(req_id)
+            self._suppress_done_recving.discard(req_id)
+            self._load_block_ids.pop(req_id, None)
+            self._stage3_submitted_loads.pop(req_id, None)
+            self._stage3_submitted_load_tokens.pop(req_id, None)
+            self._stage3_controller_accepted.discard(req_id)
+            self._stage3_pending_controller_failures.pop(req_id, None)
+            self._stage3_terminal_loads.discard(req_id)
+            self._stage3_finished_loads_pending_cleanup.discard(req_id)
+            self._stage3_recv_intervals.pop(req_id, None)
+            self._stage3_in_flight_recv_chunks.pop(req_id, None)
+            self._stage3_recv_chunk_meta.pop(req_id, None)
+            if source_req_id is not None:
+                self._stage3_in_flight_recv_chunks.pop(source_req_id, None)
+                self._stage3_recv_chunk_meta.pop(source_req_id, None)
+                self._stage3_recv_intervals.pop(source_req_id, None)
+        self._done_sending = set()
+        self._done_recving = set()
+        return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Drain the failed-load block ids for the scheduler to recompute. Paired

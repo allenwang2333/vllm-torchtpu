@@ -19,6 +19,7 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     TPURaidenConnectorWorker,
+    _validate_interval_tiling,
 )
 
 _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
@@ -733,3 +734,224 @@ def test_record_stage3_recv_chunk_completion_fallback_to_chunk_meta() -> None:
 
     assert worker._stage3_recv_intervals[req_id] == [(1024, 2048)]
     assert req_id not in worker._stage3_recv_chunk_meta
+
+
+
+def test_tiling_check_contiguous_success() -> None:
+    """Test complete tiling of [0, 4096) via contiguous chunks returns True."""
+    intervals = [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096)]
+    assert _validate_interval_tiling(intervals, 4096) is True
+
+
+def test_tiling_check_gap_rejection() -> None:
+    """Test intervals missing [1024, 2048) returns False due to gap."""
+    intervals = [(0, 1024), (2048, 3072), (3072, 4096)]
+    assert _validate_interval_tiling(intervals, 4096) is False
+
+
+def test_tiling_check_overlapping_success() -> None:
+    """Test intervals with partial overlap correctly merges and returns True."""
+    intervals = [(0, 1536), (1024, 3072), (3072, 4096)]
+    assert _validate_interval_tiling(intervals, 4096) is True
+    # Verify two-chunk overlap covering [0, 3072)
+    assert (
+        _validate_interval_tiling([(0, 1536), (1024, 3072)], 3072) is True
+    )
+
+
+def test_tiling_check_shortfall_rejection() -> None:
+    """Test intervals reaching token 4000 when 4096 expected returns False."""
+    intervals = [(0, 2000), (2000, 4000)]
+    assert _validate_interval_tiling(intervals, 4096) is False
+
+
+def test_tiling_check_empty_and_invalid_inputs() -> None:
+    """Test empty, None, non-positive, or offset intervals return False."""
+    assert _validate_interval_tiling([], 4096) is False
+    assert _validate_interval_tiling(None, 4096) is False
+    assert _validate_interval_tiling([(0, 1024)], 0) is False
+    assert _validate_interval_tiling([(0, 1024)], -100) is False
+    assert _validate_interval_tiling([(100, 4096)], 4096) is False
+    # Duplicate and out-of-order intervals covering full range
+    assert (
+        _validate_interval_tiling(
+            [(1024, 2048), (0, 1024), (0, 1024)], 2048
+        )
+        is True
+    )
+    assert (
+        _validate_interval_tiling(
+            [(3072, 4096), (0, 1024), (2048, 3072), (1024, 2048)], 4096
+        )
+        is True
+    )
+
+
+def test_get_finished_validates_interval_tiling_admission() -> None:
+    """Verifies interval tiling admission during get_finished."""
+    worker, _, engine = _make_consumer_test_worker(block_size=1024)
+
+    # 1. Complete request: [0, 1024) + [1024, 2048), expected 2048
+    req_complete = "req-complete"
+    worker._update_stage3_state_after_alloc(
+        req_id=req_complete, expected_tokens=2048
+    )
+    worker._stage3_recv_intervals[req_complete] = [(0, 1024), (1024, 2048)]
+    worker._done_recving.add(req_complete)
+
+    # 2. Incomplete request with gap: [0, 1024) + [2048, 3072), expected 3072
+    req_gap = "req-gap"
+    worker._update_stage3_state_after_alloc(
+        req_id=req_gap, expected_tokens=3072
+    )
+    worker._stage3_recv_intervals[req_gap] = [(0, 1024), (2048, 3072)]
+    worker._done_recving.add(req_gap)
+
+    # 3. Shortfall request: [0, 1024), expected 2048
+    req_shortfall = "req-shortfall"
+    worker._update_stage3_state_after_alloc(
+        req_id=req_shortfall, expected_tokens=2048
+    )
+    worker._stage3_recv_intervals[req_shortfall] = [(0, 1024)]
+    worker._done_recving.add(req_shortfall)
+
+    _, done_recving = worker.get_finished()
+
+    assert req_complete in done_recving
+    assert req_gap not in done_recving
+    assert req_shortfall not in done_recving
+
+
+def test_validate_interval_tiling_advanced_boundaries() -> None:
+    """Test comprehensive boundary conditions for _validate_interval_tiling."""
+    # 1. Exact single interval match
+    assert _validate_interval_tiling([(0, 2048)], 2048) is True
+
+    # 2. Single interval overshooting expected token count
+    assert _validate_interval_tiling([(0, 3000)], 2048) is True
+
+    # 3. Fully subsumed / nested intervals
+    assert _validate_interval_tiling([(0, 2048), (512, 1024)], 2048) is True
+
+    # 4. Multi-gap disjoint intervals
+    assert (
+        _validate_interval_tiling(
+            [(0, 512), (1024, 1536), (2048, 2560)], 2560
+        )
+        is False
+    )
+
+    # 5. Gap at origin (start offset > 0)
+    assert _validate_interval_tiling([(1, 1024)], 1024) is False
+
+    # 6. Inverted interval where end < start (does not advance cursor)
+    assert _validate_interval_tiling([(1024, 512)], 1024) is False
+
+    # 7. Zero-length intervals alongside covering interval
+    assert _validate_interval_tiling([(0, 0), (0, 1024)], 1024) is True
+
+    # 8. Negative start interval covering through target
+    assert _validate_interval_tiling([(-50, 1024)], 1024) is True
+
+
+def test_is_stage3_recv_complete_fallback_and_resolution_paths() -> None:
+    """Verifies token resolution paths for _is_stage3_recv_complete."""
+    worker, _, _ = _make_consumer_test_worker(block_size=1024)
+
+    # 1. Untracked request ID returns True (interval tracking inactive)
+    assert worker._is_stage3_recv_complete("untracked-req") is True
+
+    # 2. Resolution via direct _stage3_submitted_load_tokens
+    req_direct = "req-direct-tokens"
+    worker._stage3_recv_intervals[req_direct] = [(0, 1024), (1024, 2048)]
+    worker._stage3_submitted_load_tokens[req_direct] = 2048
+    assert worker._is_stage3_recv_complete(req_direct) is True
+
+    # Direct resolution fails on incomplete interval
+    req_direct_incomplete = "req-direct-incomplete"
+    worker._stage3_recv_intervals[req_direct_incomplete] = [(0, 1024)]
+    worker._stage3_submitted_load_tokens[req_direct_incomplete] = 2048
+    assert worker._is_stage3_recv_complete(req_direct_incomplete) is False
+
+    # 3. Resolution via source alias mapping _stage3_source_req_ids
+    dest_alias_req = "dest-alias-req"
+    source_alias_req = "source-alias-req"
+    worker._stage3_source_req_ids[dest_alias_req] = source_alias_req
+    worker._stage3_submitted_load_tokens[source_alias_req] = 2048
+    worker._stage3_recv_intervals[dest_alias_req] = [(0, 1024), (1024, 2048)]
+    assert worker._is_stage3_recv_complete(dest_alias_req) is True
+
+    # Source alias resolution fails on incomplete interval
+    dest_alias_incomplete = "dest-alias-incomplete"
+    source_alias_incomplete = "source-alias-incomplete"
+    worker._stage3_source_req_ids[dest_alias_incomplete] = (
+        source_alias_incomplete
+    )
+    worker._stage3_submitted_load_tokens[source_alias_incomplete] = 3072
+    worker._stage3_recv_intervals[dest_alias_incomplete] = [
+        (0, 1024),
+        (1024, 2048),
+    ]
+    assert worker._is_stage3_recv_complete(dest_alias_incomplete) is False
+
+    # 4. Resolution via block count fallback _load_block_ids
+    req_block_fallback = "req-block-fallback"
+    # 3 blocks * 1024 = 3072 expected tokens
+    worker._load_block_ids[req_block_fallback] = [10, 11, 12]
+    worker._stage3_recv_intervals[req_block_fallback] = [
+        (0, 1024),
+        (1024, 2048),
+        (2048, 3072),
+    ]
+    assert worker._is_stage3_recv_complete(req_block_fallback) is True
+
+    # Block count fallback fails on shortfall
+    req_block_shortfall = "req-block-shortfall"
+    worker._load_block_ids[req_block_shortfall] = [10, 11, 12]  # 3072 expected
+    worker._stage3_recv_intervals[req_block_shortfall] = [(0, 2048)]
+    assert worker._is_stage3_recv_complete(req_block_shortfall) is False
+
+
+def test_tpu_connector_worker_staticmethod_binding() -> None:
+    """Verifies _validate_interval_tiling binding on connector worker class."""
+    intervals = [(0, 1024), (1024, 2048)]
+    # Call directly via class
+    assert (
+        TPURaidenConnectorWorker._validate_interval_tiling(intervals, 2048)
+        is True
+    )
+    assert (
+        TPURaidenConnectorWorker._validate_interval_tiling(intervals, 3072)
+        is False
+    )
+
+    # Call via instance
+    worker, _, _ = _make_consumer_test_worker(block_size=1024)
+    assert worker._validate_interval_tiling(intervals, 2048) is True
+    assert worker._validate_interval_tiling(intervals, 3072) is False
+
+
+def test_get_finished_preserves_unadmitted_requests_until_completion() -> None:
+    """Verifies unadmitted requests persist across passes until completed."""
+    worker, _, _ = _make_consumer_test_worker(block_size=1024)
+
+    req_id = "req-two-step-arrival"
+    worker._update_stage3_state_after_alloc(
+        req_id=req_id, expected_tokens=2048
+    )
+
+    # Step 1: Only chunk 0 [0, 1024) has arrived; reported done by engine
+    worker._stage3_recv_intervals[req_id] = [(0, 1024)]
+    worker._done_recving.add(req_id)
+
+    _, done_recving_step1 = worker.get_finished()
+    # Incomplete request should be filtered out
+    assert req_id not in done_recving_step1
+
+    # Step 2: Chunk 1 [1024, 2048) arrives and completes
+    worker._stage3_recv_intervals[req_id].append((1024, 2048))
+    worker._done_recving.add(req_id)
+
+    _, done_recving_step2 = worker.get_finished()
+    # Fully tiled request should now be admitted
+    assert req_id in done_recving_step2
