@@ -49,11 +49,11 @@ class DSparkProposer(DFlashProposer):
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and K < int(block):
+        if block is not None and K != int(block):
             raise ValueError(
-                f"num_speculative_tokens={K} is smaller than the DSpark "
+                f"num_speculative_tokens={K} does not match the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery yields garbled output below the trained block.")
+                "machinery is trained for exactly that block length.")
         logger.info("DSpark: sample_from_anchor=%s, K=%d.",
                     self.sample_from_anchor, K)
 
@@ -73,7 +73,8 @@ class DSparkProposer(DFlashProposer):
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
         for attr in ("compute_draft_logits", "markov_embed", "markov_bias",
-                     "map_draft_to_target"):
+                     "map_draft_to_target", "has_own_lm_head",
+                     "has_own_embed_tokens"):
             if not hasattr(self.draft_model, attr):
                 raise RuntimeError(
                     f"DSpark draft model lacks {attr}(); expected a "

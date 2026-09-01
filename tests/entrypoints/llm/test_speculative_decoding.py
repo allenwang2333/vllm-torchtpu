@@ -794,6 +794,7 @@ def test_dspark_performance_greedy(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
