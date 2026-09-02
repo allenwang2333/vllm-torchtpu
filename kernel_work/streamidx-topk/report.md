@@ -269,16 +269,61 @@ derivation above is subtle enough that an independent device-side reading is che
 
 ## 6. Baseline, instruments, cross-check
 
-- **Baseline number**: pending.
-- **Achieved fraction**: pending — cannot be computed before the baseline.
-- **Instruments**: `instruments/bench_streamidx_topk.py` and
-  `instruments/test_streamidx_topk_correctness.py`, being built. The unit test's oracle is
-  `streamindex_topk_ref` (`tests/kernels/test_dsv4_streamindex_topk.py:58-118`), an exact NumPy
-  triple loop, compared as sorted index sets because a re-ordered emit is legitimate.
+**Baseline: job `j-8b1e7acc-ebdc-45d2-b46c`, `JobStatus=Succeeded`**, tpu7x single-host, image
+`vllm-torchtpu-hning_google_com:ec4bcecf...`, code at `cbabaf9b` (md5s of all four scripts and both
+kernel modules verified against the local tree in the pod log). Per-call medians. Times in µs.
+
+| shape | total | stage B | init | stage A (derived) | stage A (dispatch-corrected) |
+| --- | --- | --- | --- | --- | --- |
+| `prod_decode_b64_ctx8192` | 198.5 | 66.6 | 43.7 | 88.2 | ~130 |
+| **`prod_decode_b64_ctx8704`** | **221.4** | 67.4 | 44.8 | 109.2 | ~151 |
+| `prod_decode_b64_ctx9216` | 223.4 | 64.2 | 43.4 | 115.8 | ~158 |
+| `prod_decode_b8_ctx8704` | 142.5 | 90.3 | 42.5 | 9.7 | ~52 |
+| `prod_decode_b32_ctx8704` | 147.2 | 63.6 | 59.5 | 24.0 | ~66 |
+| `prod_prefill_q1024_ctx1024` | 50.6 | (205.0) | 46.0 | n/a | n/a — early-exit fast path |
+| `prod_prefill_q1024_ctx5120` | 607.7 | 338.7 | 46.0 | 223.0 | ~265 |
+| **`prod_prefill_q1024_ctx9216`** | **857.3** | 481.0 | 41.2 | 335.1 | ~376 |
+
+Column definitions. **total** = the whole `streamindex_topk` call. **stage B** = `sparsecore_topk`
+alone at the exact `(num_tokens, num_positions, k)` the op feeds it. **init** = the
+`jnp.full(-inf)` fill alone. **stage A (derived)** = `total − stage B − init`; it is **not
+measured**. **stage A (dispatch-corrected)** = the same subtraction after removing one measured
+host-dispatch floor (**42.0 µs/call**) from each separately-timed arm, since `total` pays that cost
+once while `stage B` and `init` each pay it again. The corrected column is the better estimate and
+is still an estimate — the floor was measured on a one-argument op and `streamindex_topk` takes
+seven, so 42.0 µs is a *lower* bound on the real dispatch cost.
+
+The fast-path row's `stage B` of 205.0 µs exceeds its `total` of 50.6 µs. That is not a
+contradiction: on the fast path `total` skips stage B entirely, while the `stage B` arm still times
+it standalone. Both are host-bound. No stage A is derivable there and none is claimed.
+
+### Achieved fraction, against the modelled floors of §4
+
+| phase | measured | modelled floor | **achieved** | exit-table band |
+| --- | --- | --- | --- | --- |
+| decode, b64 ctx8704 | 221.4 µs | 47.5 µs | **21.5%** | **< 50% — structural** |
+| prefill, q1024 ctx9216 | 857.3 µs | 623.3 µs | **72.7%** | 50–80% — one iteration |
+
+**These fractions are lower bounds, and the reason matters more than the numbers.** The §4 floor
+models stage B only as an HBM read of the score matrix — it gives its *compute* no term at all.
+Stage B measures 67 µs at decode and **481 µs at prefill, 56% of the whole call**. So the true floor
+is higher than modelled and the true achieved fraction is higher than tabulated. Quantifying the
+sensitivity:
+
+- **Decode survives it.** Even crediting half of stage B as irreducible, the floor goes 47.5 → 81 µs
+  and achieved goes 21.5% → 37%. Still well inside the structural band. The decode verdict is robust
+  to this uncertainty.
+- **Prefill does not.** The same adjustment puts the floor at 864 µs against a measured 857 µs —
+  **101%**, i.e. already at or past its floor. Prefill's verdict is therefore *unresolved*, not
+  "72.7%", and it would be wrong to carry that figure forward as headroom.
+
+- **Correctness: PASSED.** Same job, shard 1: **`13 passed in 21.41s`**, no failures, no skips, and a
+  non-zero collected count. Oracle is `streamindex_topk_ref`
+  (`tests/kernels/test_dsv4_streamindex_topk.py:58-118`), an exact NumPy triple loop, imported by
+  path so it cannot drift, compared as sorted index sets with zero tolerance.
 - **What the instruments cannot measure**: end-to-end effect; contention with the co-resident engine
   on the same chip; the MoE layers the op is interleaved with; and — because stage A cannot be
-  invoked in isolation without editing the incumbent — **stage A's time is derived by subtraction,
-  not measured directly.**
+  invoked in isolation without editing the incumbent — **stage A's time is derived, not measured.**
 - **Profile cross-check against xprof**: in progress against **existing** profiles — no new profiled
   run needed. Four GLM-5.2 jobs captured 2026-09-02 carry `.xplane.pb` at
 
@@ -336,8 +381,121 @@ decided:  stage B can be measured, so the incumbent can be measured end to end; 
 increase in `n` is the signature of fixed overhead dominating, not of a bandwidth wall. The implied
 0.00–0.09 TB/s against a 3.7 TB/s peak is therefore meaningless as a rate.
 
-**But the magnitude is a warning worth carrying into step 2.** If stage B really costs on the order
-of 200 µs at any shape, it dwarfs the entire modelled decode floor of 47.5 µs, and the op would be
-dominated by the top-k rather than by the scoring the roofline models. That would relocate the
-optimization target completely. The microbenchmark's `stage_b` arm is what settles it; until then
-this is a flag, not a finding.
+**The warning it raised was correct.** The microbenchmark confirms stage B is a first-order cost:
+67 µs at decode (30% of the call) and **481 µs at prefill (56%)**. §4's floor gives stage B's
+compute no term at all, which is the single largest known defect in that floor — see §6.
+
+---
+
+```
+probe:    Is the K-cache row physically padded from 129 bytes to 256?
+config:   same job j-8b1e7acc, shard 2. jnp.zeros at (512,1024,129) / (512,1024,256) /
+          (512,256,4,129) / (512,256,4,256) / control (512,1024,128) uint8,
+          read via device memory_stats and Array.format
+job:      j-8b1e7acc-ebdc-45d2-b46c, JobStatus Succeeded
+answer:   Every allocation is charged its logical size (ratios 1.001-1.002). A 129-wide
+          array is NOT padded -- XLA avoids it by reordering, choosing
+          major_to_minor=(0,3,2,1) at 129 wide versus (0,1,2,3) at 256, moving the
+          129 dim out of the minor position. Tiling is ((4,128),(4,1)) in both.
+decided:  see below -- the probe's own printed VERDICT is answering the wrong question.
+```
+
+**The probe's `VERDICT_lkv_dim: 129 - there is no padding to reclaim` is wrong, and I wrote the
+logic that printed it.** It tests whether XLA pads a 129-wide array. The live cache is not
+129-wide: `align_to` bakes 256 into the *shape* before allocation, as §5 establishes from code and
+as the benchmark's own geometry line independently confirms — `cache_kv shape = (total_pages, 256,
+4, 256) uint8`, `useful 129/256 bytes = 50.4%`. There is no XLA padding because the padding is
+explicit in the shape.
+
+**Read correctly, the probe strengthens the case rather than killing it.** It shows XLA is perfectly
+able to lay out a 129-wide array with no padding at all (charged ratio 1.001). So the 127 wasted
+bytes per record are a *choice made in the shape computation*, not a hardware or layout constraint —
+which is precisely what makes them reclaimable. Had the answer been "the layout forces 256", the
+lever would not exist.
+
+The lesson for later probes: a probe that asks about a shape the production code does not allocate
+can return a clean, confident, correctly-computed answer to a question nobody asked.
+
+---
+
+```
+probe:    Is the prefill floor's VPU term right? Measures the relu -> *w -> sum_h chain
+          at the production tile, collapsing the assumed 1.72 Tops/s rate and the
+          assumed 3 ops/element into one measured number.
+config:   same job j-8b1e7acc, shard 3. [128, 32, 10240] f32 tile, x8 for the full
+          T=1024 chunk. Three forms: as-is, folded relu(x*w), and sum-only.
+job:      j-8b1e7acc-ebdc-45d2-b46c, JobStatus Succeeded
+answer:   as-is 227.1us/tile -> 1816.7us full;  folded 215.7us -> 1725.3us;
+          sum-only 226.0us -> 1807.7us.  Fold is bit-exact on TPU (max_abs_diff 0.0).
+decided:  NOTHING about the VPU rate. The probe does not measure what it set out to --
+          see below.
+```
+
+**This probe failed at its actual purpose, and the data says so plainly.** Sum-only does one op per
+element and the as-is chain does three, yet they time the same: **226.0 µs versus 227.1 µs**. If VPU
+op count were the binding constraint, sum-only would be roughly 3x faster. It is not, so all three
+forms are bound by something they share — moving the materialized 167.8 MB tile — and not by VPU
+throughput. 167.8 MB / 227 µs ≈ 0.74 TB/s is a plausible rate for a strided reduction over HBM and
+an implausible one for a VPU limit.
+
+**The probe measures the one thing the real kernel is built to avoid.** `compute_scores` keeps that
+intermediate in VMEM and never materializes it; this probe materializes it and then measures the
+memory traffic. So it cannot be read as either confirming or refuting the 586 µs VPU term, and
+comparing its 1816.7 µs against 586 µs — which the probe's own `READ_THIS_AS` line invites — would
+be comparing two different quantities. The contention caveat (four shards sharing the pod) is real
+but secondary; the design of the probe is the primary defect.
+
+**What it would take to answer the question:** the same chain inside a Pallas kernel with the tile
+resident in VMEM, so that HBM is out of the loop and the VPU is the only thing left to bind. That is
+a step-2 probe, and until it runs the prefill floor's dominant term remains **`assumed`**.
+
+Two things it did establish, both incidental:
+- **The fold `relu(x)*w == relu(x*w)` is bit-exact on TPU** (`max_abs_diff = 0.000e+00`, versus
+  3.8e-6 on CPU). It is still only valid where `w >= 0`, which the weights' construction
+  (`indexer_weights * softmax_scale * n_head**-0.5 * q_scales`) does not guarantee. Must be checked
+  against real weights before any design uses it.
+- Whatever removes one elementwise op from this chain buys ~5% here (215.7 vs 227.1 µs), in a regime
+  that is not the one the kernel runs in. Not a basis for a design.
+
+---
+
+## 8. Step-1 verdict
+
+**There is headroom worth a kernel at decode. Prefill is unresolved and must not be treated as
+headroom.**
+
+| | decode | prefill |
+| --- | --- | --- |
+| measured (job `j-8b1e7acc`) | 221.4 µs | 857.3 µs |
+| modelled floor (§4) | 47.5 µs | 623.3 µs |
+| achieved, as tabulated | 21.5% | 72.7% |
+| achieved, crediting half of stage B as irreducible | 37% | **101%** |
+| verdict | **structural — proceed** | **unresolved — do not proceed on this number** |
+
+Three findings order the work at decode, and they are not the ones the roofline alone predicted:
+
+1. **The op barely scales with batch.** 142.5 µs at 8 sequences, 147.2 at 32, 221.4 at 64 — 1.55x
+   the time for 8x the tokens. Decode is dominated by cost that does not depend on how much work is
+   asked for: full-width `[T, 10240]` buffers regardless of context, a `-inf` init of the whole
+   thing, and per-call fixed overhead. An optimization that speeds up the *work* addresses the
+   minority of the call.
+2. **Stage B is 30% of decode and 56% of prefill**, and the floor models none of its compute. It is
+   an exact 4-pass radix select over 10240 f32 per row. Whether that is near its own floor is the
+   single most valuable unanswered question, because it decides whether prefill has any headroom at
+   all and it re-ranks every decode candidate.
+3. **127 of every 256 K-cache bytes are padding**, in the term that is 95% of decode HBM traffic,
+   and §7 establishes the padding is a shape choice rather than a layout constraint.
+
+**What step 2 must probe before designing** — each of these currently carries a decision:
+
+- stage B's own floor, and whether an exact top-k is required or an approximate one would do
+  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; why is not recorded here)
+- the VPU term, properly, in VMEM — §7 explains why the first attempt does not count
+- whether the `-inf` init is needed at all, given `sparsecore_topk` takes `row_lengths`
+- whether the 42.0 µs dispatch floor is real per-call overhead in the model, or an artifact of
+  timing the op standalone. At 21 invocations per step this is the difference between a rounding
+  error and 0.9 ms/step.
+
+**Not yet done:** the xprof cross-check against the in-model cost. Until it lands, every number
+above is a microbenchmark number, and the skill is explicit that a gap between the two is the most
+expensive thing to get wrong in step 1.
