@@ -16,6 +16,7 @@ set -e
 IMAGE_TAG="vllm-torchtpu-local"
 BASE_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu-base:nightly-latest"
 VLLM_SOURCE=""
+VLLM_COMMIT_HASH=""
 TARGET="prod"
 
 # Parse arguments
@@ -31,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -s|--vllm-source)
       VLLM_SOURCE="$2"
+      shift 2
+      ;;
+    -c|--vllm-commit-hash)
+      VLLM_COMMIT_HASH="$2"
       shift 2
       ;;
     --target)
@@ -51,6 +56,22 @@ echo "Base Image: $BASE_IMAGE"
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../" && pwd)"
+
+# Enforce VLLM_COMMIT_HASH to prevent silently building from unpinned main
+if [ -z "$VLLM_COMMIT_HASH" ]; then
+  # Extract the pinned vLLM commit directly from pyproject.toml
+  VLLM_COMMIT_HASH="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+
+  if [ -n "$VLLM_COMMIT_HASH" ]; then
+    echo "-c/--vllm-commit-hash not provided. Defaulting to pyproject.toml pin: $VLLM_COMMIT_HASH"
+  else
+    echo "ERROR: VLLM_COMMIT_HASH could not be parsed from pyproject.toml." >&2
+    exit 1
+  fi
+fi
+
+
+echo "vLLM Commit Hash: $VLLM_COMMIT_HASH"
 
 if [ -z "${ACCESS_TOKEN:-}" ]; then
   if command -v gcloud >/dev/null 2>&1; then
@@ -95,6 +116,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
+  --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
 
 if [ -n "${ACCESS_TOKEN:-}" ]; then
