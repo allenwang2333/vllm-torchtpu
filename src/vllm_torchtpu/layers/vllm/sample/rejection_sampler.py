@@ -338,6 +338,7 @@ def _random_rejection_sample_with_segment(
     vocab_size = target_logits.shape[-1]
 
     draft_token_ids = draft_token_ids.to(torch.int64)
+    valid_draft_token_ids = draft_token_ids >= 0
     safe_draft_token_ids = draft_token_ids.clamp(min=0)
 
     # Shape the target distribution with temperature + top-k/top-p, then
@@ -360,7 +361,7 @@ def _random_rejection_sample_with_segment(
         accepted = accept_u < conditional_rates
     else:
         accepted = target_token_probs >= accept_u
-    accepted = accepted & (draft_token_ids >= 0)
+    accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
     # x, subtracting q only touches entry x, so the residual is just p with the
@@ -368,6 +369,10 @@ def _random_rejection_sample_with_segment(
     draft_token_mask = torch.nn.functional.one_hot(safe_draft_token_ids,
                                                    num_classes=vocab_size).to(
                                                        torch.bool)
+    # Placeholder drafts have no q mass to subtract, so their recovery
+    # distribution remains the full target distribution. In particular, do
+    # not let the safe clamp above accidentally mask vocabulary token 0.
+    draft_token_mask = draft_token_mask & valid_draft_token_ids.unsqueeze(-1)
     recovered_dist = torch.where(
         draft_token_mask,
         torch.tensor(0.0, dtype=target_probs.dtype, device=device),
