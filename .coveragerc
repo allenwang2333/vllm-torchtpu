@@ -3,6 +3,11 @@ parallel = true
 concurrency = multiprocessing
 sigterm = true
 
+[report]
+omit =
+    */tests/*
+    /workspace/*
+
 [paths]
 source =
     src/vllm_torchtpu

@@ -67,7 +67,7 @@ steps:
     commands:
       - buildkite-agent artifact download "perf_eval_results/coverage_*" .
       - ls -la perf_eval_results/
-      - python3 -m pip install -q --user coverage
+      - python3 -m pip install -q --break-system-packages --user coverage
       - python3 -m coverage combine perf_eval_results/coverage_*chip.dat*
       - python3 -m coverage report | tee coverage_summary.txt
       - python3 -m coverage xml -o coverage.xml
