@@ -69,6 +69,11 @@ class Tuning:
         tile_m: overrides the tile `gather_tiling` derives, which reads mean live
             rows per group and is blind to `max_group`, where the cliff is. None
             keeps the law; a value must be a multiple of the lhs sublane block.
+        issue_in_dot: issue the next tile's row DMAs from inside the dot, one
+            slice per matmul block, each pinned there by a one-vreg load from
+            the ring. Off, the chain is issued ahead of the dot and stays
+            exposed (LLO sinks a DMA start to the end of its region unless a
+            later load may alias its target).
         smem_index_fraction: the share of SMEM the index table may take.
         smem_capacity_bytes: the device's SMEM; `from_device` reads it.
     """
@@ -78,6 +83,7 @@ class Tuning:
     num_buckets: int = 6
     blocked_rows: bool = True
     tile_m: int | None = None
+    issue_in_dot: bool = True
     smem_index_fraction: float = (V7X_SMEM_INDEX_LIMIT_BYTES /
                                   V7X_SMEM_CAPACITY_BYTES)
     smem_capacity_bytes: int = V7X_SMEM_CAPACITY_BYTES
@@ -244,6 +250,7 @@ class Config:
     gmm: gmm_v2.GmmConfigs
     tuning: Tuning
     num_lanes: int
+    mxu_columns: int
 
     @property
     def dims(self) -> gmm_v2.Dimensions:
@@ -288,6 +295,18 @@ class Config:
         """The ring: [num_slots, tile_m, tile_k // lanes, lanes] in the pool dtype."""
         return (self.tuning.num_slots, self.tiles.tile_m,
                 self.tiles.tile_k // self.num_lanes, self.num_lanes)
+
+    @property
+    def dot_blocks_per_tile(self) -> int:
+        """(n, k) matmul blocks `inner_kernel` runs per gm tile, in its own order."""
+        fuse_factor = 2 if self.gmm.fuse_act is not None else 1
+        if self.gmm.lhs_cfgs.should_quantize:
+            k_block = self.gmm.lhs_cfgs.quant_block_size
+        else:
+            k_block = self.gmm.rhs_cfgs.quant_block_size or self.tiles.tile_k
+        n_blocks = pl.cdiv(fuse_factor * self.tiles.tile_n, self.mxu_columns)
+        return n_blocks * pl.cdiv(self.tiles.tile_k,
+                                  min(k_block, self.tiles.tile_k))
 
     @property
     def zero_tile_rows(self) -> int:

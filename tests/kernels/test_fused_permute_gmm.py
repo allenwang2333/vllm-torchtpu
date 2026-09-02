@@ -172,10 +172,12 @@ DEGENERATE_TOKENS = sorted(
                                  Tuning().lookahead)})
 
 
+@pytest.mark.parametrize("issue_in_dot", [True, False])
 @pytest.mark.parametrize("live_groups", [64, 24])
 @pytest.mark.parametrize("num_tokens", [512, 2048])
-def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups):
-    """The fused permute is bit-for-bit the materialized one.
+def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups,
+                                                issue_in_dot):
+    """The fused permute is bit-for-bit the materialized one, either issue form.
 
     Concentrated routing (`live_groups=24`) is a separate case, not a variant:
     a gather tile sized from the mean rows per group splits the few fat groups
@@ -183,12 +185,14 @@ def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups):
     """
     _require_tpu()
     case = Case.routed(num_tokens, live_groups=live_groups)
-    case.assert_bitwise(case.fused(), case.materialized())
+    case.assert_bitwise(case.fused(tuning=Tuning(issue_in_dot=issue_in_dot)),
+                        case.materialized())
 
 
+@pytest.mark.parametrize("issue_in_dot", [True, False])
 @pytest.mark.parametrize("num_tokens", DEGENERATE_TOKENS)
 def test_fused_permute_gmm_survives_a_grid_shorter_than_the_lookahead(
-        num_tokens):
+        num_tokens, issue_in_dot):
     """A grid with fewer steps than the prefetch depth must leave no live DMA.
 
     The warm-up issues the first few tiles, but tile t is waited by step t and
@@ -207,7 +211,8 @@ def test_fused_permute_gmm_survives_a_grid_shorter_than_the_lookahead(
     case = Case.routed(num_tokens, live_groups=1, seed=num_tokens)
 
     for _ in range(2):
-        out = jax.block_until_ready(case.fused())
+        out = jax.block_until_ready(
+            case.fused(tuning=Tuning(issue_in_dot=issue_in_dot)))
     case.assert_bitwise(out, case.materialized())
 
 

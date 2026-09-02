@@ -18,7 +18,7 @@ row into a VMEM ring, `lookahead` tiles ahead of the dot, and handed to
 `gmm_v2.inner_kernel` unchanged.
 """
 import functools
-from typing import Callable
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,64 @@ def issue_row(
     ).start()
 
 
+def issue_row_sized(
+    row: int,
+    *,
+    pool_ref: jax.Ref,
+    idx_smem: jax.Ref,
+    gather: memory_ref.GatherRefs,
+    slot: jax.Array,
+    m_offset: jax.Array,
+    live: jax.Array,
+) -> None:
+    """One row DMA of size 0 past the live rows: no bytes, no signal, one descriptor."""
+    size = jnp.where(row < live, 1, 0)
+    pltpu.make_async_copy(
+        pool_ref.at[pl.ds(idx_smem[m_offset + row], size)],
+        gather.buf.at[slot, pl.ds(row, size)],
+        gather.sem.at[slot],
+    ).start()
+
+
+class DotIssueHook:
+    """Issues the next tile's rows from inside the dot, one slice per matmul block.
+
+    A DMA start has no consumer in its region, so LLO sinks it to the region's
+    end unless a later load may alias its target. Each slice is therefore
+    followed by a one-vreg load from the ring at a traced slot, folded into the
+    block's product through a select that is always false at run time: the
+    load pins the slice inside the matmul stream and adds 0.0.
+    """
+
+    def __init__(self, *, pool_ref: jax.Ref, idx_smem: jax.Ref,
+                 gather: memory_ref.GatherRefs, slot: jax.Array,
+                 next_slot: jax.Array, m_offset_next: jax.Array,
+                 live_next: jax.Array, never: jax.Array, cfg: config.Config):
+        self.issue = functools.partial(issue_row_sized,
+                                       pool_ref=pool_ref,
+                                       idx_smem=idx_smem,
+                                       gather=gather,
+                                       slot=next_slot,
+                                       m_offset=m_offset_next,
+                                       live=live_next)
+        self.ring = gather.buf.at[slot]
+        self.never = never
+        self.num_blocks = cfg.dot_blocks_per_tile
+        self.lanes = cfg.num_lanes
+
+    def at_block(self, block: int, bucket_m: int,
+                 col_size: int) -> jax.Array | int:
+        rows = -(-bucket_m // self.num_blocks)
+        if block * rows >= bucket_m:
+            return 0  # every row of the tile is issued; nothing left to pin
+        for row in range(block * rows, min((block + 1) * rows, bucket_m)):
+            self.issue(row)
+        sentinel = self.ring[pl.ds(0, 1),
+                             pl.ds(0, col_size // self.lanes), :].reshape(
+                                 1, col_size)
+        return jnp.where(self.never, sentinel, jnp.zeros_like(sentinel))
+
+
 def _issue_block(block: jax.Array, carry: int, *, issue: RowIssueFn,
                  unroll: int) -> int:
     base = block * unroll
@@ -93,8 +151,10 @@ def issue_tile(
     scratch: memory_ref.PipelineScratchRef,
     num_gm: jax.Array,
     cfg: config.Config,
+    first: jax.Array | int = 0,
+    live_cap: jax.Array | None = None,
 ) -> None:
-    """Issue the tile's LIVE rows.
+    """Issue the tile's LIVE rows, from `first` on, up to `live_cap` if given.
 
     The trip count is a runtime value, so a dead row costs nothing rather than
     an issue slot each: `pl.when` predicates the instruction, not its issue.
@@ -118,7 +178,11 @@ def issue_tile(
                               slot=slot,
                               m_offset=m_offset)
     unroll = cfg.tuning.issue_unroll
-    n = jnp.minimum(live, cfg.tiles.tile_m)
+    n = jnp.minimum(live if live_cap is None else live_cap, cfg.tiles.tile_m)
+    if not isinstance(first, int) or first:
+        # The rows past what the dot already issued: shift the loop's origin.
+        issue = functools.partial(_issue_from, issue=issue, first=first)
+        n = jnp.maximum(n - first, 0)
     n_full = n // unroll
     lax.fori_loop(0, n_full,
                   functools.partial(_issue_block, issue=issue, unroll=unroll),
@@ -129,6 +193,11 @@ def issue_tile(
                           issue=issue,
                           n_full=n_full,
                           unroll=unroll), 0)
+
+
+def _issue_from(row: jax.Array, *, issue: RowIssueFn,
+                first: jax.Array | int) -> None:
+    issue(first + row)
 
 
 def wait_tile(
@@ -221,14 +290,26 @@ def pipeline_body(
 
     slot = lax.rem(step, tuning.num_slots)
     next_slot = (slot + tuning.lookahead) % tuning.num_slots
-    # Issue-first: feed the engine for the next tile before this tile's data
-    # is touched, so the next gather runs under this tile's dot.
-    pl.when(step + tuning.lookahead < num_steps)(functools.partial(
-        _issue_lookahead,
-        issue=issue,
-        step=step,
-        slot=next_slot,
-        lookahead=tuning.lookahead))
+    if tuning.issue_in_dot:
+        hook, tail = _in_dot_issue(step,
+                                   slot,
+                                   next_slot,
+                                   num_steps,
+                                   pool_ref=pool_ref,
+                                   idx_smem=idx_smem,
+                                   scratch=scratch,
+                                   num_gm=num_gm,
+                                   cfg=cfg)
+    else:
+        hook, tail = None, None
+        # Issue-first: feed the engine for the next tile before this tile's
+        # data is touched, so the next gather runs under this tile's dot.
+        pl.when(step + tuning.lookahead < num_steps)(functools.partial(
+            _issue_lookahead,
+            issue=issue,
+            step=step,
+            slot=next_slot,
+            lookahead=tuning.lookahead))
 
     wait_tile(step, slot, scratch=scratch, num_gm=num_gm, cfg=cfg)
     gmm_v2.inner_kernel(gathered_rows(scratch.gather, slot, cfg),
@@ -237,7 +318,67 @@ def pipeline_body(
                         scratch.partial_out,
                         scratch.acc,
                         scratch.metadata,
-                        cfgs=cfg.gmm)
+                        cfgs=cfg.gmm,
+                        inject=hook)
+    if tail is not None:
+        tail()
+
+
+def _in_dot_issue(
+    step: jax.Array,
+    slot: jax.Array,
+    next_slot: jax.Array,
+    num_steps: jax.Array,
+    *,
+    pool_ref: jax.Ref,
+    idx_smem: jax.Ref,
+    scratch: memory_ref.PipelineScratchRef,
+    num_gm: jax.Array,
+    cfg: config.Config,
+) -> tuple[DotIssueHook, Any]:
+    """The hook issuing tile `step + lookahead`'s first `bucket_m` rows from
+    inside the dot, and the loop issuing the rest after it.
+
+    The step guard is a size, not a branch: past the grid every descriptor is
+    0-size. The dot's bucket height is recomputed the way gmm_v2 picks it, so
+    the tail knows where the hook stopped; the tail's rows are still two dots
+    ahead of their wait at the default lookahead.
+    """
+    tuning = cfg.tuning
+    next_step = step + tuning.lookahead
+    m_offset_next, live_next = tile_rows(next_step,
+                                         metadata=scratch.metadata,
+                                         num_gm=num_gm,
+                                         sublane=cfg.sublane)
+    live_next = jnp.where(next_step < num_steps,
+                          jnp.minimum(live_next, cfg.tiles.tile_m), 0)
+    _, live = tile_rows(step,
+                        metadata=scratch.metadata,
+                        num_gm=num_gm,
+                        sublane=cfg.sublane)
+    bucket_base = cfg.tiles.bucket_base
+    issued = jnp.minimum(bucket_base * (live // bucket_base + 1),
+                         cfg.tiles.tile_m)
+    hook = DotIssueHook(pool_ref=pool_ref,
+                        idx_smem=idx_smem,
+                        gather=scratch.gather,
+                        slot=slot,
+                        next_slot=next_slot,
+                        m_offset_next=m_offset_next,
+                        live_next=live_next,
+                        never=step < 0,
+                        cfg=cfg)
+    tail = functools.partial(issue_tile,
+                             next_step,
+                             next_slot,
+                             pool_ref=pool_ref,
+                             idx_smem=idx_smem,
+                             scratch=scratch,
+                             num_gm=num_gm,
+                             cfg=cfg,
+                             first=issued,
+                             live_cap=live_next)
+    return hook, tail
 
 
 def kernel_main(

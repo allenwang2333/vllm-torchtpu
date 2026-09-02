@@ -113,7 +113,8 @@ def fused_permute_gmm(
     if tuning is None:
         tuning = config.Tuning.from_device()
 
-    lanes = pltpu.get_tpu_info().num_lanes
+    info = pltpu.get_tpu_info()
+    lanes = info.num_lanes
     pool = _blocked_pool(lhs, lanes)
     size_k = pool.shape[1] * lanes
 
@@ -136,8 +137,7 @@ def fused_permute_gmm(
     elif group_offset.ndim == 0:
         group_offset = group_offset[None]
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes *
-                               VMEM_LIMIT_FRACTION)
+        vmem_limit_bytes = int(info.vmem_capacity_bytes * VMEM_LIMIT_FRACTION)
     gmm_cfgs = gmm_v2.make_gmm_configs(jax.ShapeDtypeStruct(
         (padded_size_m, size_k), lhs.dtype),
                                        rhs,
@@ -153,7 +153,10 @@ def fused_permute_gmm(
                                        maybe_quantize_lhs=maybe_quantize_lhs,
                                        zero_initialize=zero_initialize,
                                        fuse_act=fuse_act)
-    cfg = config.Config(gmm=gmm_cfgs, tuning=tuning, num_lanes=lanes)
+    cfg = config.Config(gmm=gmm_cfgs,
+                        tuning=tuning,
+                        num_lanes=lanes,
+                        mxu_columns=info.mxu_column_size)
 
     if cfg.tiles.tile_k != cfg.dims.size_k:
         raise NotImplementedError(

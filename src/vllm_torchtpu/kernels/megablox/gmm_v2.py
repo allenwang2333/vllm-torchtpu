@@ -413,6 +413,7 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    inject: Any | None = None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -432,6 +433,10 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        inject: Optional per-block hook, `at_block(block, bucket_m, col_size)`,
+            called once per (n, k) matmul block in block order; its return value
+            is added to that block's partial product. A caller uses it to issue
+            DMAs from inside the dot's scheduling region.
     """
 
     gm_id = pl.program_id(1)
@@ -474,6 +479,7 @@ def inner_kernel(
 
         # Step 2: Matmul.
         acc_list = []
+        block = 0
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
             for start_n in range(0, rhs_tile_n, mxu_size):
@@ -497,6 +503,9 @@ def inner_kernel(
                                                      col_size]
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
+                    if inject is not None:
+                        block_acc += inject.at_block(block, bucket_m, col_size)
+                    block += 1
                     acc_n += block_acc
                 acc_list.append(acc_n)
         else:
@@ -568,6 +577,9 @@ def inner_kernel(
                                                      col_size]
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
+                    if inject is not None:
+                        block_acc += inject.at_block(block, bucket_m, col_size)
+                    block += 1
                     acc_n += block_acc
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
