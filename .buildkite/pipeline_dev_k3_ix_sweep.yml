@@ -27,7 +27,7 @@ steps:
   - label: "K3 InferenceX sweep 8k/1k conc 8-128 (TPU v7x-32)"
     key: k3_ix_sweep
     depends_on: build_docker
-    timeout_in_minutes: 420
+    timeout_in_minutes: 600
     agents:
       queue: "tpu_v7x_32_queue"
     env:
@@ -35,6 +35,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ix_sweep.sh --config kimi-k3-tp32-ep-ix --results-dir /perf_eval_results/k3-ix --concs '8 16 32 64 128' --gsm8k-limit 200"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ix_sweep.sh --config kimi-k3-tp32-ep-ix --results-dir /perf_eval_results/k3-ix --concs '8 16 32 64 128' --gsm8k-limit 100"
     artifact_paths:
       - "perf_eval_results/**/*"

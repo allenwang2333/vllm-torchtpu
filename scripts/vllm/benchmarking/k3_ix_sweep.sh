@@ -45,6 +45,13 @@ if [ ! -d "$IX_DIR" ]; then
 fi
 LM_EVAL_PATCH_DIR=$(mktemp -d)
 cp "$IX_DIR/utils/evals/patches/lm_eval_sitecustomize.py" "$LM_EVAL_PATCH_DIR/sitecustomize.py"
+# Pin lm-eval to the ref InferenceX's sitecustomize patch targets (their
+# harness does the same force-reinstall). The image ships 0.5.0.dev1, whose
+# response objects the patch mis-parses into empty strings -> gsm8k scored
+# 0.0 on both filters (dev build 346). --no-deps: runtime deps are present.
+pip install -q --no-deps --force-reinstall \
+    "git+https://github.com/EleutherAI/lm-evaluation-harness.git@b315ef3b05176acc9732bb7fdec116abe1ecc476" \
+    || echo "[k3-ix-sweep] WARNING: lm-eval pin install failed; using image version"
 python3 -c "import lm_eval; print('[k3-ix-sweep] lm_eval', lm_eval.__version__)" || true
 
 # ------------------------------------------------- server (harness bring-up)
@@ -99,9 +106,26 @@ run_gsm8k() {
         --tasks "$IX_DIR/utils/evals/gsm8k.yaml" \
         --output_path "$out" --log_samples \
         --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$c,timeout=1800,tokenized_requests=False,max_length=9216" \
-        --gen_kwargs "max_tokens=2048,temperature=0,top_p=1" \
+        --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
         --limit "$GSM8K_LIMIT" 2>&1 | tee "$out.log"
-    return "${PIPESTATUS[0]}"
+    local rc="${PIPESTATUS[0]}"
+    # Echo two sample responses into the job log so a zero score is
+    # diagnosable without waiting for artifacts (empty vs truncated vs
+    # format mismatch).
+    python3 - "$out" << 'PYEOF'
+import glob, json, sys
+files = sorted(glob.glob(sys.argv[1] + "/**/samples_gsm8k*.jsonl", recursive=True))
+if files:
+    with open(files[-1]) as fh:
+        for i, line in enumerate(fh):
+            if i >= 2: break
+            s = json.loads(line)
+            resp = (s.get("resps") or [[""]])[0][0]
+            print(f"[k3-ix-sweep] sample {i}: filtered={s.get('filtered_resps')} resp_len={len(resp)} resp_tail={resp[-300:]!r}")
+else:
+    print("[k3-ix-sweep] no samples jsonl found under", sys.argv[1])
+PYEOF
+    return "$rc"
 }
 
 # ------------------------------------------------------------- profile mode
