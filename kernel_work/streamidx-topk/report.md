@@ -7,16 +7,25 @@ achieved fractions, and an attempted cross-check against the in-model xprof prof
 than silently editing them out.** Five things an earlier draft asserted are withdrawn: the 11%
 profile cross-check (§6.2 — it compared a `--concurrency 1` profile against a full-batch
 microbenchmark and could not have failed), the 3.42× `max_model_len` ratio (§8 finding 1 —
-confounded with page size; ≈2.5× survives), the ~43 µs dispatch add-back (§6.2 — it was fitting; the
-profile has the real number), the 8%/16% AgentX achieved fractions (§8 — MiB read as MB, and one
-cell used the wrong formula), and "AgentX is the right target" (§6.2 — no artifact supports it being
-a served configuration). Where a retraction is marked, read the retraction and not the claim.
+confounded with page size), the ~43 µs dispatch add-back (§6.2 — it was fitting; the profile has the
+real number), the 8%/16% AgentX achieved fractions (§8 — MiB read as MB, and one cell used the wrong
+formula), and "AgentX is the right target" (§6.2 — no artifact supports it being a served
+configuration). Where a retraction is marked, read the retraction and not the claim.
+
+**§6.3 is the newest section and it changes two findings.** The deconfounding run
+`j-63b9f2e4-26c9-4e3a-99ce` measured `max_model_len` in isolation for the first time: the effect is
+real but **1.07–1.78× at decode, not the 5.9× the confounded comparison showed**, and stage B turns
+out to have a cost model that fits neither buffer width nor row count. That makes stage B the first
+thing step 2 must probe. The same job confirms, to 4.7%, that stage A's KV walk is unguarded within
+groups of four — priced at ≈0.050 ms per full-length slot.
 
 **Nothing here is a measurement unless it carries a job id.** Everything from §4 is `modelled`. The
 jobs that measured something: `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe),
 `j-8b1e7acc-ebdc-45d2-b46c` (baseline, correctness, two layout/VPU probes),
-`j-c13c8436-ee1e-49ee-b514` (the two deployments side by side). The profile read is
-`j-a71a648c-3064-471a-a131` rank 0, corroborated on `j-97102390-e817-4ca6-a9cf`.
+`j-c13c8436-ee1e-49ee-b514` (the two deployments side by side),
+`j-63b9f2e4-26c9-4e3a-99ce` (the `max_model_len` deconfound and the profile-matched bracket, §6.3).
+The profile read is `j-a71a648c-3064-471a-a131` rank 0, corroborated on
+`j-97102390-e817-4ca6-a9cf`.
 
 **Read §6.1 before §3–§6.** GLM-5.2 is served here at **two different operating points** —
 `max_model_len` 9216 and 262144 — and §3 through §6 are built on the first while every available
@@ -686,6 +695,98 @@ against. **The nightly config is the baseline of record.**
   row, so both shards exited 0 and `JobStatus` was green with a missing measurement inside. Reading
   the exit code alone would have missed it.
 
+## 6.3 The deconfounded run — finding (1) shrinks, finding (2) is confirmed on hardware
+
+**Job `j-63b9f2e4-26c9-4e3a-99ce`, `JobStatus=Succeeded`, 4/4 shards `rc=0`.** Same image as
+`j-c13c8436` (`...:ec4bcecf78...`), code at `9e880312`, checkout clean, in-pod md5s of
+`bench_streamidx_topk.py` (`c72b23e8…`) and `streamindex_topk.py` (`1e221f10…`) verified against the
+local tree, import resolving to the mapped `src/` rather than site-packages. No row OOM'd, none was
+skipped, all 31 rows across the four shards report `"status": "success"`.
+
+**Noise floor, measured rather than assumed.** Shards 0 and 3 ran the *same* three shapes at 15 and
+5 trials as a free repeatability check: 0.488 vs 0.492, 1.082 vs 1.109, 0.501 vs 0.503 ms —
+agreement within **0.8–2.5%**. Treat anything smaller as noise. The four shards shared one pod, so
+the per-shard host-dispatch floor varies 31.9–39.8 µs, and shard 1 flags five rows `[HOST BOUND]`
+by its own criterion. Those rows are not measuring the kernel and are not used below.
+
+### The `max_model_len` deconfound: the effect is real, and much smaller than §6.2 claimed
+
+This is the experiment §6.2 said was already in the file and had not been run. Each pair below is
+**identical in every respect except `max_model_len`** — same context, same page size 1024, same
+batch, byte-identical KV streamed. The only thing that changes is the score-buffer width.
+
+| shape | width ↑ | total | stage B |
+| --- | ---: | --- | --- |
+| `decode_b8_ctx4096` | 16× | 0.115 → 0.171 (**1.49×**) | 0.073 → 0.129 (**1.77×**) |
+| `decode_b32_ctx4096` | 16× | 0.105 → 0.112 (1.07×) | 0.042 → 0.049 (1.17×) |
+| `decode_b64_ctx4096` | 16× | 0.139 → 0.156 (1.12×) | 0.055 → 0.064 (1.16×) |
+| `decode_b8_ctx16384` | 4× | 0.147 → 0.208 (**1.41×**) | 0.079 → 0.141 (**1.78×**) |
+| `decode_b32_ctx16384` | 4× | 0.189 → 0.196 (1.04×) | 0.061 → 0.065 (1.07×) |
+| `prefill_q1024_ctx4096` | 16× | 0.451 → 0.784 (1.74×) | 0.245 → 0.706 (**2.88×**) |
+| `prefill_q4096_ctx4096` | 16× | 1.274 → 2.512 (1.97×) | 0.695 → 2.373 (**3.41×**) |
+
+ms, best-of-N. "width ↑" is the ratio of `num_sublanes_total`, i.e. of `max_model_len`, between the
+two members of the pair (4096 or 16384 → 65536).
+
+**The direction of finding (1) holds and the magnitude does not.** `max_model_len` costs, it costs
+in stage B, and stage A is untouched by it — all three confirmed cleanly here for the first time.
+But **at decode a 16× score buffer buys only 1.07–1.78× on stage B**, where §6.2 reported 5.9× at
+25.6×. Those cannot both describe one linear mechanism, and a floor-plus-linear model does not
+reconcile them either: fitting `F + W·width` to the `b64_ctx4096` pair predicts 0.093 ms at
+262144-wide, against the 0.371 ms `j-c13c8436` measured.
+
+**So stage B's cost is not a function of buffer width, and I do not know what it is a function of.**
+Three observations that any explanation has to fit, all from this job:
+
+- **It is not row count either.** `profile_b1_ctx110592` — one row of 262144 — costs **0.340 ms** in
+  stage B, while `profile_b16_…` — sixteen rows of the same width — costs **0.254–0.269 ms**. One
+  row is *more expensive* than sixteen.
+- **The effect is 2–3× stronger at prefill than at decode** at the same width ratio (2.88–3.41×
+  against 1.07–1.78×), so it scales with something about the query dimension too.
+- **Small batches are hit harder than large ones** (b8 1.77× vs b64 1.16×), which is the opposite of
+  a fixed-overhead story.
+
+A cliff rather than a slope would fit all three — `sparsecore_topk` splitting into a two-pass select
+above some width, which §8 already notes the correctness test does not exercise. That is a
+hypothesis with no evidence behind it yet. **What is now established is that the largest single
+component of this op has a cost model nobody here understands, and every candidate's predicted
+speedup depends on it.** This is the first probe of step 2, not the sixth.
+
+### Finding (2) is confirmed on hardware, and the arithmetic closes to 5%
+
+The profile-matched bracket. Per §8's instrument defect the `pad0` arm declares all 16 slots real to
+`distribution`, so it runs **four** slots at full length (one group of `decode_req_batch_size=4`)
+plus twelve at the one-block minimum — not the one slot production would run. That makes it a
+sharper test of finding (2) than the one it was built for, because it puts a *third* point on the
+line. At page 256, `bkv_p=2` so `bkv_sz=512`, and `ctx=110592` gives `num_bkv = 216`:
+
+| arm | slots × blocks | slot-blocks | stage A* | ns / slot-block |
+| --- | --- | ---: | ---: | ---: |
+| `pad0` | 4×216 + 12×1 | 876 | 0.192 ms | 219 |
+| `padfull` | 16×216 | 3456 | 0.793 ms | 229 |
+
+**Predicted work ratio 3.945×, measured stage A ratio 4.130× — agreement to 4.7%, against a 2.5%
+noise floor.** The cost per slot-block is constant to within 5% across a 4× change in how much of
+the batch is real.
+
+That is a hardware confirmation of the source reading in finding (2), by a route independent of it:
+**every slot in a group of four pays the full `kv_len_max` walk, and there is no per-sequence
+guard.** Had the DMA been guarded, `pad0` would have cost ~1/4 of what it did.
+
+It also prices the lever. Stage A costs **≈0.050 ms per full-length slot** at this geometry, so a
+group of four holding one long sequence and three short ones wastes ≈0.15 ms — and there is no
+comparable waste from batch-bucket padding, which the grid already skips. **The lever is
+length-grouping within fours, not padding.** How much it is worth end to end depends on the length
+spread of a served batch, which no artifact here has and which §8 lists as a step-2 probe.
+
+Two caveats on these three shapes. `stage A*` is derived by subtraction, and the same subtraction
+goes negative on three of shard 1's rows (−0.003, −0.021, −0.218 ms), which bounds its error. And
+the bench's `kv_stream` geometry column reports 28.9 MB for `pad0` — that is the per-sequence
+*guarded* lower bound, and the guard does not exist; the real figure is 876/3456 × 432 ≈ 110 MB.
+The column is wrong for that arm by 3.8× and right for every homogeneous shape.
+
+---
+
 ## 7. Probes run in this step
 
 ```
@@ -859,21 +960,25 @@ measure. Prefill is out of scope for a step-2 design until that probe is redone 
 
 ### The findings that order step 2
 
-**1. `max_model_len` sets the op's cost, and the cost lives in stage B.** §6.2 measures this at
-byte-identical real work — same 64 sequences, same 8192-token context, same 128 MB of KV streamed —
-and the mml-attributable spread is **≈2.5×**, not the 3.42× an earlier draft claimed: the raw
-196→671 µs comparison also changed page size 1024→256, which quadrupled `num_bkv` and moved stage A
-by +166 µs for reasons having nothing to do with `max_model_len`. Decomposed:
+**1. Stage B has a cost model nobody here understands, and it is the largest component.
+`max_model_len` is one input to it, but not the dominant one it was reported to be.**
 
-| | Δ | driven by |
-| --- | ---: | --- |
-| stage B | **+308 µs (5.9×)** | `max_model_len` ✓ |
-| stage A | +166 µs | page size ✗ |
-| init | +1.5 µs | `max_model_len`, negligible |
+This finding has been cut down twice. As first written it claimed a **3.42×** `max_model_len`
+effect; that comparison also moved page size 1024→256, quadrupling `num_bkv`, so ≈2.5× survived the
+deconfounding on paper. §6.3 then ran the experiment properly — pairs identical in everything but
+`max_model_len` — and **at decode a 16× score buffer costs only 1.07–1.78× in stage B**, against the
+5.9× the confounded comparison showed at 25.6×. Prefill is stronger, 2.88–3.41×.
 
-The clean half is the large half and it is **entirely in stage B**, whose row width is
-`num_sublanes_total` and therefore literally `max_model_len`. This is a finding about the score
-buffer, not about the KV walk — and finding (2) explains why it could not have been otherwise.
+The direction survives and is now cleanly established for the first time: `max_model_len` costs, the
+cost is **entirely in stage B**, and stage A is untouched by it. The magnitude does not survive, and
+neither does any simple model of it — §6.3 shows one row of 262144 costing *more* than sixteen rows
+of 262144, small batches hit harder than large, and prefill hit harder than decode. A cliff (a
+two-pass select above some width) would fit; nothing yet shows one.
+
+**Read this as a warning about ranking, not just a corrected number.** Stage B is 30% of the nightly
+decode call and 61% of the AgentX one, and finding (3)'s Amdahl bound means it is also the ceiling
+on everything a stage-A design can win. A candidate's predicted speedup is a function of a cost
+model that is currently unknown. **Probe it first.**
 
 **2. Stage A's KV walk is already `seq_len`-bounded across the batch, and unguarded within groups of
 four.** Read from source (`streamindex_topk.py`, corroborating the decomposition above by an
@@ -895,6 +1000,14 @@ The waste is therefore bounded by the length spread **within groups of 4**, not 
 is a real lever but a much smaller one than "the padding slots pay for the longest sequence", which
 is what §6.2's bracket was built to measure. Contrast `_fetch_bq` at `:209-219`, which *does* issue
 a variable-length copy — the machinery exists and is simply not used for KV.
+
+**§6.3 confirms this on hardware, by a route independent of the source reading.** The
+`pad0`/`padfull` bracket gives stage A at 876 and 3456 slot-blocks: predicted work ratio 3.945×,
+measured 4.130×, **agreeing to 4.7% against a 2.5% noise floor**, at a constant ≈220 ns per
+slot-block. Had the DMA been guarded, `pad0` would have cost a quarter of what it did. Stage A is
+**≈0.050 ms per full-length slot**, so a group of four holding one long sequence wastes ≈0.15 ms.
+Of the two theories about where padding cost goes, this measurement rules out the bucket and
+confirms the group.
 
 **3. Stage B is the largest single component and the floor models none of its compute.** 30% of the
 nightly decode call, 56% of prefill, 61% of the AgentX decode call (165 of 269 µs). It is an exact
@@ -920,17 +1033,22 @@ measurement. **The nightly config is the baseline of record.**
 
 Each of these currently carries a design decision. Ordered by what they gate:
 
-- **stage B's own floor**, and whether exact top-k is required or approximate would do
-  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; the reason is not recorded). By
-  findings (1) and (3) this is now the **first** probe, not one of seven — it decides whether the
-  mml cost is attackable at all and it bounds every stage-A candidate.
-- **whether stage B's row width can be bounded by `seq_len` instead of `max_model_len`.** Finding
-  (1) locates the lever precisely here. `sparsecore_topk` already takes `row_lengths`
-  (`eff_row_lengths`, `:505-506`), so the information is present; what is unknown is whether the
-  radix select's cost tracks it or the buffer width.
-- **whether sorting or grouping sequences by length is worth it**, given finding (2)'s
-  group-of-4 granularity — this needs the real length distribution of a served batch, which no
-  artifact here has.
+- **What stage B's cost is actually a function of, and what its floor is.** This is now *the* probe
+  and everything else waits behind it. §6.3 rules out buffer width alone (16× width → 1.16× time at
+  b64) and rules out row count alone (one row of 262144 costs more than sixteen). It must at minimum
+  establish: whether the cost tracks the `row_lengths` the op already passes
+  (`eff_row_lengths`, `:505-506`) or the allocated width; whether there is a two-pass split and
+  where its threshold is; and what an exact radix select's floor is at `k=2048` out of 10240, a
+  1-in-5 selection ratio that is dense for a top-k. Findings (1) and (3) both terminate here, and
+  no candidate can be ranked without it.
+- **whether exact top-k is required at all** — `sparsecore_topk` replaced `approx_max_topk` in
+  `6142d5e7` and the reason is not recorded. If approximation is admissible this is the largest
+  lever in the document; if `6142d5e7` moved away from it deliberately, that closes the branch and
+  is worth knowing before a design proposes it.
+- **whether sorting or grouping sequences by length is worth it.** §6.3 prices the lever at
+  **≈0.050 ms per full-length slot** and confirms the group-of-4 granularity to 4.7%, so the
+  remaining unknown is purely the length spread of a served batch — which no artifact here has.
+  This is the one probe that needs production data rather than a pod.
 - **the VPU term, properly, in VMEM** — §7 explains why the first attempt does not count. Gates
   prefill entirely.
 - **whether `StreamIdxTC-d`'s bimodality is by design** — 114.63 µs against 5.40 µs (§6.1).
