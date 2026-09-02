@@ -292,6 +292,29 @@ understanding; it is not worth resolving before acting.
 
 ### 1.6 The floors, recomputed — and the definition that matters
 
+> ⚠️ **PARTIALLY FALSIFIED by an adversarial review — see `briefs/ROOFLINE-REVIEW.md`.**
+> The three named corrections in §6 items 1, 4 and 5 hold, and both corrected fractions
+> reproduce exactly from this section's stated inputs. **The prefill gate does not.** The
+> 80.4 % figure is circular: its dominant term `t_sc = 481.0 µs` — 69.8 % of the 689.3 µs
+> floor — is numerically the measured stage-B time it is divided into (`stage_b_ms =
+> 0.48097`), and `area5 §C.7` admits the 1.7 ns/elem constant was fitted to that
+> measurement. Across six defensible treatments prefill runs **46.5 %–80.4 %**, only the
+> published one clearing the bar, and by 0.4 points.
+>
+> **Consequences, both live:**
+> - **Prefill is NOT gated.** Do not read "≥80 %, do not write a kernel" off this section.
+>   Options C and B are in scope. This document's own `F_common` puts prefill at 56.1 %.
+> - **Decode's verdict is safe** — below 80 % under every treatment (25.6 %–56.8 %) — but
+>   **do not quote 39.9 %.** It rests on a `t_sc` of 30.0 µs that `report.md` §6.2
+>   explicitly retracts, against P2/P3's isolated 48.2–52.1 µs. Say **26–57 %, structural
+>   band, proceed.**
+>
+> Also falsified: **§1.1's relabelling of the 44.8 µs `init` column as a metadata
+> "residual"**. It is `init_ms`, a standalone `jnp.full(-inf)` arm, and it sits at 1.07× the
+> measured `dispatch_floor_ms = 0.042` — ~94 % host dispatch, which no hoist can remove.
+> Option D's rank-3 placement is **unevidenced**, not merely wide-ranged. A genuine residual
+> of ≈60 µs does exist by a different subtraction; see the review.
+
 `report.md` §1 defines the floor as `max(t_hbm, t_vpu + t_mxu)`: **HBM is assumed to overlap
 compute; the compute units are assumed not to overlap each other.** It is *not* the largest of
 three or four columns. That definition is kept.
