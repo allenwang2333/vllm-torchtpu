@@ -1,17 +1,25 @@
 # Step 1 — `streamindex_topk` (the `streamidx_topk_jax` op) for GLM-5.2
 
-Status: **step 1 complete except the xprof cross-check.** The roofline, the instruments, the
-baseline, the correctness pass and the achieved fractions are all in. The cross-check against the
-in-model profile is outstanding and is named as such in §6 and §8.
+Status: **step 1 complete.** Roofline, instruments, baseline, correctness, achieved fractions, and
+the cross-check against the in-model xprof profile — which **agrees to 11%** (§6.2).
 
-**Nothing here is a measurement unless it carries a job id.** Everything from §4 is `modelled`; the
-two jobs that measured anything are `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe) and
-`j-8b1e7acc-ebdc-45d2-b46c` (baseline, correctness, two layout/VPU probes).
+**Nothing here is a measurement unless it carries a job id.** Everything from §4 is `modelled`. The
+jobs that measured something: `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe),
+`j-8b1e7acc-ebdc-45d2-b46c` (baseline, correctness, two layout/VPU probes),
+`j-c13c8436-ee1e-49ee-b514` (the two deployments side by side). The profile read is
+`j-a71a648c-3064-471a-a131` rank 0, corroborated on `j-97102390-e817-4ca6-a9cf`.
 
-**The verdict is in §8**: decode has structural headroom at **21.5%** of its modelled floor; prefill
-is **unresolved**, and its 72.7% must not be carried forward as headroom. Two of the three probes
-returned confident answers to questions other than the ones asked — §7 corrects both rather than
-quoting them.
+**Read §6.1 before §3–§6.** GLM-5.2 is served here at **two different operating points** —
+`max_model_len` 9216 and 262144 — and §3 through §6 are built on the first while every available
+profile captures the second. §6.1 keeps them apart; §6.2 measures both in one job.
+
+**The verdict is in §8.** Decode has structural headroom on both deployments — **21.5%** of its
+modelled floor at the nightly config, **8%** at AgentX — and the AgentX config is the target, for
+the reason in finding (4). Prefill is **unresolved**: its 72.7% must not be carried forward as
+headroom, and no captured profile contains an indexer-active prefill step to check it against.
+
+Two of the three step-1 probes returned confident answers to questions other than the ones asked;
+§7 corrects both rather than quoting them.
 
 Branch `annyan/streamidx-topk-opt` in `/home/annyan_google_com/workspaces/copy1/vllm-torchtpu`,
 based on `0976305d`. The three files under study are byte-identical to `7e4d67b2`, the commit the
@@ -476,6 +484,97 @@ Both usable captures also report `Trace Buffers Dropped` (18537 ms and 8536 ms),
 over the window are short. Per-invocation averages and per-step ratios — which is all that is
 quoted above — are unaffected.
 
+## 6.2 The like-for-like run — the cross-check passes, and finds the real target
+
+**Job `j-c13c8436-ee1e-49ee-b514`, `JobStatus=Succeeded`, 4/4 shards**, image
+`us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-hning_google_com:ec4bcecf784d0bc3aeb8be37554431e3b5eef70b`
+(byte-identical to the baseline job's — no image was built), code `da40156a`, bench script md5
+`bbf9a3db99a7f683351768d4a794476d` verified in-pod against the local file. Four shards, one per
+chip: both deployments at 5 trials and both again at 15, so every row below has an independent
+replicate. **They agree to within a few µs on every row.**
+
+### The cross-check itself
+
+Both quantities below are the same thing — the wall-clock of one `streamindex_topk` call. In the
+model the TensorCore is *blocked* during the SparseCore stages, so the profile's per-layer
+TensorCore timeline is the call's cost, not just its compute.
+
+| | value | source |
+| --- | ---: | --- |
+| profile, per indexer layer | **298.4 µs** | 6.267 ms/step ÷ 21 layers, `j-a71a648c` rank 0 |
+| bench, `agentx_decode_b16_ctx8192` | **269 µs** | `j-c13c8436`, 15 trials (276 µs at 5) |
+| bench, `agentx_decode_b16_ctx32768` | **472 µs** | `j-c13c8436`, 15 trials (470 µs at 5) |
+
+The profile lands **between the two context rows**, 11% above the ctx-8192 one — exactly where a
+replayed agent workload with contexts somewhat over 8k should land. The decomposition agrees too,
+after adding back the 43.4 µs/call host dispatch floor each derived arm double-pays:
+
+| | bench (b16, ctx8192) | profile | |
+| --- | ---: | ---: | --- |
+| stage A — the three scoring kernels | ~118 µs | **125.25 µs** | `StreamIdxTC-d` 114.63 + 5.40, `-m` 5.22 |
+| stage B — SparseCore top-k + offload | 165 µs | **174.6 µs** | 2×`gather_offload` 51.77, `sc_topk` done 56.19 + 14.88 |
+
+**The microbenchmark measures what the model pays.** This also resolves §6.1's open worry that
+`gather_offload` was unmeasured: at 262144 the bench's stage-B arm goes through the same two-pass
+split and captures it.
+
+### The finding this run exists to have made
+
+The two deployments can now be compared at **identical real work** — same 64 sequences, same 8192
+tokens of context, byte-identical KV streamed. Only `max_model_len` differs.
+
+| | nightly, `mml` 9216 | AgentX, `mml` 262144 | ratio |
+| --- | ---: | ---: | ---: |
+| `num_positions` (score width) | 10240 | 262144 | 25.6× |
+| **`kv_stream` — the actual work** | **128.0 MB** | **128.0 MB** | **1.00×** |
+| `score_buf` | 2.5 MB | 64.0 MB | 25.6× |
+| **total** | **196 µs** | **671 µs** | **3.42×** |
+| stage B | 64 µs | 371 µs | 5.8× |
+| stage A (derived) | 87 µs | 264 µs | 3.0× |
+| init | 45 µs | 35 µs | 0.76× |
+
+**Identical work, 3.4× the time.** The op's cost is set by `max_model_len` and not by the context
+it is actually asked to score. At the AgentX deployment 8192 real tokens sit in a 262144-wide
+buffer — 3.1% useful — and the call costs three and a half times what the same work costs when the
+buffer is sized to it.
+
+Stage A is the surprise. It streams the *same 128 MB* of KV in both columns and still takes 3× as
+long, so its extra cost is not the read: it is the grid. At `bkv_p`=2 the padded position range
+gives 5 kv blocks at the nightly config and 512 at AgentX, and the kernel walks all of them,
+writing `-inf` across a buffer 25.6× too large. That is the mechanism behind §8's finding (1), now
+isolated rather than inferred.
+
+### This reframes which deployment to optimize
+
+The nightly config's own comment says model-len 9216 beat the 32768 geometry by **+7% throughput /
+−7% TPOT** — someone already met this cost at the whole-model level and worked around it by
+shrinking `max_model_len`. **The AgentX deployment cannot use that workaround**: replayed agent
+traces need the long context, which is what the 262144 is for. So the headroom is 3.4× larger there
+*and* it is the configuration with no other way out.
+
+Rough achieved fractions at the AgentX config, against an HBM floor recomputed the same way as §4
+(`kv_stream` + score write + score read, ÷ 2.97e12 B/s achieved per-TensorCore):
+
+| shape | HBM bytes | modelled floor | measured | achieved |
+| --- | ---: | ---: | ---: | ---: |
+| `agentx_decode_b16_ctx8192` | 64 MB | 21.5 µs | 269 µs | **8%** |
+| `agentx_decode_b64_ctx8192` | 256 MB | 86 µs | 671 µs | **13%** |
+
+Both are `modelled` and both are rougher than §4 — they are a recomputation, not a rederivation.
+But at 8–13% the exit table's verdict does not depend on the precision: this is far below the 50%
+line, and it is a stronger **proceed** than the nightly config's 21.5%.
+
+### Two things the run turned up that are not results about the kernel
+
+- **`agentx_decode_b64_ctx32768` OOM'd** — "attempting to allocate 16.00G, there are 14.74G free" —
+  on both shards that tried it. This is a microbenchmark artifact of running unsharded on one chip:
+  the bench allocates `max_num_seqs × pages_per_seq` = 65536 pages, while production's HLO shows
+  `u8[3027,...]`, a cache sized to available HBM. It does not change the streamed bytes or the score
+  width, so the rows that did run stand.
+- **The OOM did not turn the shard red.** `main()` catches per shape and emits a structured `oom`
+  row, so both shards exited 0 and `JobStatus` was green with a missing measurement inside. Reading
+  the exit code alone would have missed it.
+
 ## 7. Probes run in this step
 
 ```
@@ -592,41 +691,62 @@ Two things it did establish, both incidental:
 
 ## 8. Step-1 verdict
 
-**There is headroom worth a kernel at decode. Prefill is unresolved and must not be treated as
-headroom.**
+**Step 1 is complete. The gate is passed at decode, on both deployments, and the cross-check
+against the in-model profile agrees to 11%.** Prefill is unresolved and must not be treated as
+headroom.
 
-| | decode | prefill |
-| --- | --- | --- |
-| measured (job `j-8b1e7acc`) | 221.4 µs | 857.3 µs |
-| modelled floor (§4) | 47.5 µs | 623.3 µs |
-| achieved, as tabulated | 21.5% | 72.7% |
-| achieved, crediting half of stage B as irreducible | 37% | **101%** |
-| verdict | **structural — proceed** | **unresolved — do not proceed on this number** |
+| | nightly decode | **AgentX decode** | prefill (nightly) |
+| --- | ---: | ---: | ---: |
+| measured | 221.4 µs (`j-8b1e7acc`) | **269 µs** (`j-c13c8436`) | 857.3 µs (`j-8b1e7acc`) |
+| modelled floor | 47.5 µs (§4) | 21.5 µs (§6.2, rough) | 623.3 µs (§4) |
+| achieved | 21.5% | **8%** | 72.7% |
+| crediting half of stage B as irreducible | 37% | 16% | **101%** |
+| in-model cross-check | not captured | **298.4 µs, +11%** | no capture exists |
+| verdict | structural — proceed | **structural — proceed, and this is the target** | **unresolved — do not proceed on this number** |
 
-Three findings order the work at decode, and they are not the ones the roofline alone predicted:
+Every floor figure is `modelled`; every measured figure carries its job id. The AgentX floor is a
+recomputation in §6.2 rather than a rederivation, and is the rougher of the two — but at 8% the
+exit-table verdict does not turn on its precision.
 
-1. **The op barely scales with batch.** 142.5 µs at 8 sequences, 147.2 at 32, 221.4 at 64 — 1.55x
-   the time for 8x the tokens. Decode is dominated by cost that does not depend on how much work is
-   asked for: full-width `[T, 10240]` buffers regardless of context, a `-inf` init of the whole
-   thing, and per-call fixed overhead. An optimization that speeds up the *work* addresses the
-   minority of the call.
-2. **Stage B is 30% of decode and 56% of prefill**, and the floor models none of its compute. It is
-   an exact 4-pass radix select over 10240 f32 per row. Whether that is near its own floor is the
-   single most valuable unanswered question, because it decides whether prefill has any headroom at
-   all and it re-ranks every decode candidate.
-3. **127 of every 256 K-cache bytes are padding**, in the term that is 95% of decode HBM traffic,
-   and §7 establishes the padding is a shape choice rather than a layout constraint.
+### The four findings that order step 2
 
-**What step 2 must probe before designing** — each of these currently carries a decision:
+1. **The op's cost is set by `max_model_len`, not by the work.** §6.2 measures this at identical
+   real work — same 64 sequences, same 8192-token context, byte-identical 128 MB of KV streamed —
+   and gets **196 µs against 671 µs, a 3.4× spread**, with the only difference being a score buffer
+   25.6× too wide. The same signature appears in the batch sweep (1.55× the time for 8× the tokens)
+   and in the profile (6.4× the score elements for 1.0–1.5× the time). **Three independent
+   measurements at two configurations; this is the most robust thing in this document, and it is
+   what a kernel should attack.**
 
-- stage B's own floor, and whether an exact top-k is required or an approximate one would do
-  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; why is not recorded here)
-- the VPU term, properly, in VMEM — §7 explains why the first attempt does not count
-- whether the `-inf` init is needed at all, given `sparsecore_topk` takes `row_lengths`
-- whether the 42.0 µs dispatch floor is real per-call overhead in the model, or an artifact of
-  timing the op standalone. At 21 invocations per step this is the difference between a rounding
-  error and 0.9 ms/step.
+2. **Stage B is the largest single component and the floor models none of its compute.** 30% of
+   the nightly decode call, 56% of prefill, **61% of the AgentX decode call** (165 of 269 µs), and
+   confirmed in the profile at 174.6 µs of the 298.4. It is an exact MSB-first radix select. Whether
+   it is near its own floor decides whether prefill has any headroom at all and re-ranks every
+   decode candidate.
 
-**Not yet done:** the xprof cross-check against the in-model cost. Until it lands, every number
-above is a microbenchmark number, and the skill is explicit that a gap between the two is the most
-expensive thing to get wrong in step 1.
+3. **127 of every 256 K-cache bytes are padding**, in the term that is 95% of nightly decode HBM
+   traffic. §7 establishes the padding is a shape choice, not a layout constraint; §6.1 confirms the
+   shape in production HLO (`u8[3027,64,4,256]`).
+
+4. **The AgentX deployment is the right target, and it is not the one §3 was built on.** The nightly
+   config already worked this cost around by shrinking `max_model_len` to 9216 — its own comment
+   records +7% throughput / −7% TPOT for doing so. A long-context agent deployment cannot. The
+   headroom is 3.4× larger there and there is no configuration escape from it.
+
+### What step 2 must probe before designing
+
+Each of these currently carries a design decision:
+
+- **stage B's own floor**, and whether exact top-k is required or approximate would do
+  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; the reason is not recorded)
+- **whether the grid can be bounded by `seq_len` instead of `max_model_len`** — finding (1) says
+  this is the lever; nothing yet says what stops the incumbent from doing it
+- **whether the `-inf` init is needed at all**, given `sparsecore_topk` takes `row_lengths`
+- **the VPU term, properly, in VMEM** — §7 explains why the first attempt does not count
+- **whether `StreamIdxTC-d`'s bimodality is by design** — 114.63 µs against 5.40 µs across 21+21
+  instructions (§6.1), unexplained at the XLA op level
+- **whether the ~43 µs dispatch floor is real per-call overhead in the model** or an artifact of
+  timing the op standalone. At 21 invocations per step, the difference between a rounding error and
+  0.9 ms/step.
+- **whether the indexer weights are non-negative**, which gates the bit-exact `relu(x)*w == relu(x*w)`
+  fold (§7)
