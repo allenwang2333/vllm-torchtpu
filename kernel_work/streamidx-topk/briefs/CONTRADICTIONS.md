@@ -73,10 +73,41 @@ qualifications so this kill is not over-read:
   SparseCore). But the conclusion is insensitive: a 3× better true rate moves decode to 0.1%, further
   in the same direction. There is no plausible rate at which this becomes worth taking at nightly.
 
-**Prefill's 2.88× / 3.41× therefore remain unexplained by any mechanism yet named**, since the
-partition branch is `p=1` at both widths (area 5, A12) and the DMA guard is now priced out. That is
-a genuine open question, but it is a question about a configuration we are not targeting — it does
-not gate a nightly design.
+**Prefill's 2.88× / 3.41× are explained, and by this same mechanism — which does not resurrect the
+lever.** Area 5 built the model the source forces: at `p=1` exactly one term is width-dependent, so
+`t_stageB = ceil(b/32) × (a·n + c·eff_len)`. A joint fit of two coefficients to four measurements
+gives max residual **7.5%** across a 4× range in row count and a 16× range in width:
+
+| arm | n | measured | model | residual |
+| --- | ---: | ---: | ---: | ---: |
+| `prefill_q1024_ctx4096`, mml 4096 | 4096 | 245 µs | 263 µs | +7.5% |
+| `prefill_q1024_ctx4096`, mml 65536 | 65536 | 706 µs | 703 µs | −0.4% |
+| `prefill_q4096_ctx4096`, mml 4096 | 4096 | 695 µs | 652 µs | −6.2% |
+| `prefill_q4096_ctx4096`, mml 65536 | 65536 | 2373 µs | 2413 µs | +1.7% |
+
+Two things lift this above a curve fit: `a` is stable to 9% when fitted independently on each pair,
+and `c` = 2.04 ns/element lands within **19% of the 1.72–1.73 ns/element derived in area 5's §C.7
+from a different job, a different context length and a different route.**
+
+**And the two dissenting sheets turn out to agree numerically to two significant figures.** Applying
+area 5's fitted `a` to the nightly widths — where `slice_len` = 10240 against `eff_len` ≈ 8704 —
+gives the reclaimable term directly:
+
+| phase | `waves × a × (slice_len − eff_len)` | area 5 (fitted model) | area 3 (0.57 TB/s route) |
+| --- | --- | --- | --- |
+| decode | 2 × 0.224 ns × 1536 | **0.69 µs = 0.31%** | 0.7 µs = 0.3% |
+| prefill | 32 × 0.224 ns × 1536 | **11.0 µs = 1.28%** | 11 µs = 1.3% |
+
+Area 3 reached this from a fitted bandwidth; area 5 from a two-parameter joint fit on four
+measurements. **The kill is now derived twice, independently.** The mechanism fully explains the
+width sweep *and* is worth under the noise floor at the width we actually run — those are consistent
+statements, and the second is the one that governs the design.
+
+Area 5 names what its model does not do: `c` should not depend on `q` and does (1.87 vs 2.23
+ns/elem), so cross-prediction between the two prefill shapes is off by −14%/+18%. Its candidate
+explanation — a wave's duration is set by its longest row, not its mean — is **not established**, and
+is flagged rather than smoothed over. It does not affect the reclaimable-term arithmetic above, which
+depends only on `a`.
 
 ---
 
