@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.extend.core import Jaxpr
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -722,3 +723,171 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
         })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def _routing_kwargs(topk_indices_np, local_num_experts, hidden=8):
+    num_tokens, topk = topk_indices_np.shape
+    hidden_states = (jnp.arange(num_tokens * hidden, dtype=jnp.float32) /
+                     13).reshape(num_tokens, hidden).astype(jnp.bfloat16)
+    return dict(
+        hidden_states_local=hidden_states,
+        topk_indices_local=jnp.asarray(topk_indices_np, dtype=jnp.int32),
+        topk_weights_local=jnp.full((num_tokens, topk), 0.5,
+                                    dtype=jnp.float32),
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+    )
+
+
+def _sparse_routing(num_tokens, topk, local_num_experts, valid_frac, seed):
+    """Routed slots with `-1` for the experts that live on another rank."""
+    rng = np.random.default_rng(seed)
+    ids = rng.integers(0, local_num_experts, size=(num_tokens, topk))
+    return np.where(rng.random((num_tokens, topk)) < valid_frac, ids,
+                    -1).astype(np.int32)
+
+
+def _ragged_routing(num_tokens, topk, local_num_experts, seed):
+    """Almost every valid slot on one expert: the imbalanced-load case."""
+    rng = np.random.default_rng(seed)
+    ids = np.where(
+        rng.random((num_tokens, topk)) < 0.9, 3,
+        rng.integers(0, local_num_experts, size=(num_tokens, topk)))
+    return np.where(rng.random((num_tokens, topk)) < 0.3, -1,
+                    ids).astype(np.int32)
+
+
+_COUNTING_RANK_CASES = {
+    # Fewer rows than one counting block, hand-written, with EP holes.
+    "tiny": (np.array([[0, 1], [1, -1], [2, 0], [-1, 3]], dtype=np.int32), 4),
+    # Exactly one block.
+    "one_block": (_sparse_routing(64, 4, 8, 0.6, seed=1), 8),
+    # Several whole blocks at production-like EP sparsity.
+    "multi_block": (_sparse_routing(256, 4, 64, 0.125, seed=2), 64),
+    # Row count not a multiple of the block: exercises the sentinel padding.
+    "unaligned": (_sparse_routing(75, 4, 16, 0.5, seed=3), 16),
+    # One expert takes ~90% of the load.
+    "ragged": (_ragged_routing(150, 2, 16, seed=4), 16),
+    # Every slot non-local: group_sizes all zero, keys all sentinel.
+    "all_padding": (np.full((32, 4), -1, dtype=np.int32), 8),
+}
+
+
+def _prepare_both_paths(monkeypatch, kwargs):
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", False, raising=False)
+    baseline = fused_moe_gmm.prepare_routed_gmm_inputs(**kwargs)
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", True, raising=False)
+    counting = fused_moe_gmm.prepare_routed_gmm_inputs(**kwargs)
+    return baseline, counting
+
+
+@pytest.mark.parametrize("case", sorted(_COUNTING_RANK_CASES))
+def test_counting_rank_matches_argsort(monkeypatch, case):
+    topk_indices_np, local_num_experts = _COUNTING_RANK_CASES[case]
+    kwargs = _routing_kwargs(topk_indices_np, local_num_experts)
+    baseline, counting = _prepare_both_paths(monkeypatch, kwargs)
+
+    # (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask)
+    for got, want in zip(counting, baseline):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert counting[1].dtype == baseline[1].dtype
+    assert counting[2].dtype == baseline[2].dtype
+
+
+@pytest.mark.parametrize("case", sorted(_COUNTING_RANK_CASES))
+def test_counting_rank_destination_is_a_permutation(monkeypatch, case):
+    topk_indices_np, local_num_experts = _COUNTING_RANK_CASES[case]
+    kwargs = _routing_kwargs(topk_indices_np, local_num_experts)
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", True, raising=False)
+    _, group_sizes, revert, _, valid_mask = (
+        fused_moe_gmm.prepare_routed_gmm_inputs(**kwargs))
+
+    rows = topk_indices_np.size
+    np.testing.assert_array_equal(np.sort(np.asarray(revert)), np.arange(rows))
+    # Valid rows sort ahead of the sentinel, so they occupy the prefix.
+    assert int(group_sizes.sum()) == int(valid_mask.sum())
+    assert bool(jnp.all(revert[valid_mask] < group_sizes.sum()))
+
+
+def test_counting_rank_off_by_default(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_COUNTING_RANK", raising=False)
+    assert envs.environment_variables["TPU_MOE_COUNTING_RANK"]() is False
+
+
+def test_counting_rank_is_in_the_compile_cache_key():
+    from vllm_torchtpu.compilation.tpu_compiler import (
+        _TPU_COMPILE_ENV_IGNORED, _tpu_compile_env_factors)
+
+    assert "TPU_MOE_COUNTING_RANK" not in _TPU_COMPILE_ENV_IGNORED
+    assert "TPU_MOE_COUNTING_RANK" in _tpu_compile_env_factors()
+
+
+def _count_primitive(jaxpr, name):
+    total = 0
+    for eqn in jaxpr.eqns:
+        total += eqn.primitive.name == name
+        for value in eqn.params.values():
+            inner = getattr(value, "jaxpr", value)
+            if isinstance(inner, Jaxpr):
+                total += _count_primitive(inner, name)
+    return total
+
+
+def test_counting_rank_removes_the_second_sort(monkeypatch):
+    """Negative control: the equality tests above would also pass if the
+    counting branch quietly fell through to `jnp.argsort`. It does not --
+    it drops one of the two `sort`s the baseline traces.
+    """
+    topk_indices_np, local_num_experts = _COUNTING_RANK_CASES["multi_block"]
+    kwargs = _routing_kwargs(topk_indices_np, local_num_experts)
+    trace = lambda: jax.make_jaxpr(  # noqa: E731
+        lambda: fused_moe_gmm.prepare_routed_gmm_inputs(**kwargs))().jaxpr
+
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", False, raising=False)
+    assert _count_primitive(trace(), "sort") == 2
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", True, raising=False)
+    assert _count_primitive(trace(), "sort") == 1
+
+
+def test_counting_rank_equality_check_can_fail(monkeypatch):
+    """Negative control: perturbing the counting rank by one row must break
+    `test_counting_rank_matches_argsort`, so that test can actually fail.
+    """
+    topk_indices_np, local_num_experts = _COUNTING_RANK_CASES["ragged"]
+    kwargs = _routing_kwargs(topk_indices_np, local_num_experts)
+    exact = fused_moe_gmm._counting_rank_and_counts
+
+    def off_by_one(sort_keys, num_experts, **rest):
+        destination, counts = exact(sort_keys, num_experts, **rest)
+        return destination.at[0].add(1), counts
+
+    monkeypatch.setattr(fused_moe_gmm, "_counting_rank_and_counts", off_by_one)
+    with pytest.raises(AssertionError):
+        baseline, counting = _prepare_both_paths(monkeypatch, kwargs)
+        for got, want in zip(counting, baseline):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_counting_rank_compiles(monkeypatch):
+    """The Pallas counting sort did not lower on this JAX; this one must."""
+    topk_indices_np, local_num_experts = _COUNTING_RANK_CASES["multi_block"]
+    kwargs = _routing_kwargs(topk_indices_np, local_num_experts)
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_RANK", True, raising=False)
+    compiled = jax.jit(
+        lambda hs, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+            hs, ti, tw, **{
+                k: v
+                for k, v in kwargs.items() if not k.endswith("_local")
+            })).lower(kwargs["hidden_states_local"],
+                      kwargs["topk_indices_local"],
+                      kwargs["topk_weights_local"]).compile()
+
+    _, group_sizes, revert, _, valid_mask = compiled(
+        kwargs["hidden_states_local"], kwargs["topk_indices_local"],
+        kwargs["topk_weights_local"])
+    np.testing.assert_array_equal(np.sort(np.asarray(revert)),
+                                  np.arange(topk_indices_np.size))
+    assert int(group_sizes.sum()) == int(valid_mask.sum())

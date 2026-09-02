@@ -172,6 +172,51 @@ def gmm_wrapper(lhs,
     )
 
 
+_COUNTING_RANK_BLOCK = 256
+
+
+def _counting_rank_and_counts(
+    sort_keys: jax.Array,
+    local_num_experts: int,
+    block: int = _COUNTING_RANK_BLOCK,
+) -> tuple[jax.Array, jax.Array]:
+    """Destination of each routed row under a stable sort by `sort_keys`.
+
+    That destination is `argsort(argsort(sort_keys))`, so it replaces the
+    second routing argsort directly -- no scatter is needed to invert it,
+    which is what makes this cheaper than the sort. Keeping the cumsum inside
+    `block`-row tiles is the other half: a full-length cumsum over the one-hot
+    is 2.7x slower than the sort it replaces. Per-expert counts fall out of
+    the same one-hot.
+
+    Rows are padded up to a multiple of `block` with the `local_num_experts`
+    sentinel. That key is the largest and the padding sits at the tail, so no
+    real row's destination moves and the returned counts are unaffected.
+    """
+    num_rows = sort_keys.shape[0]
+    num_keys = local_num_experts + 1
+    num_blocks = -(-num_rows // block)
+    padded_rows = num_blocks * block
+    if padded_rows != num_rows:
+        sort_keys = jnp.pad(sort_keys, (0, padded_rows - num_rows),
+                            constant_values=local_num_experts)
+
+    onehot = (sort_keys.reshape(num_blocks, block, 1) == jnp.arange(
+        num_keys, dtype=jnp.int32).reshape(1, 1, num_keys))
+    # int16 holds a within-block rank up to `block`; it halves the bytes the
+    # cumsum moves.
+    onehot_i16 = onehot.astype(jnp.int16)
+    within_block = jnp.cumsum(onehot_i16, axis=1) - onehot_i16
+    block_counts = jnp.sum(onehot_i16, axis=1).astype(jnp.int32)
+    counts = block_counts.sum(axis=0)
+    base = ((jnp.cumsum(block_counts, axis=0) - block_counts) +
+            (jnp.cumsum(counts) - counts)[None, :])
+    destination = jnp.where(onehot,
+                            within_block.astype(jnp.int32) + base[:, None, :],
+                            0).sum(axis=2).reshape(padded_rows)
+    return destination[:num_rows], counts[:local_num_experts]
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -208,14 +253,18 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+    if envs.TPU_MOE_COUNTING_RANK:
+        argsort_revert_indices, group_sizes_local = _counting_rank_and_counts(
+            sort_keys, local_num_experts)
+    else:
+        argsort_revert_indices = jnp.argsort(sorted_indices)
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:

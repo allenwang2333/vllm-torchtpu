@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_PACK_ROUTING_AG: bool = False
+    TPU_MOE_COUNTING_RANK: bool = False
     TPU_MOE_EXPERT_PERM_URI: str = ""
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
@@ -410,6 +411,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-chunked path only (TPU_MOE_COLLECTION_CHUNK_SIZE=0, the default).
     "TPU_MOE_PACK_ROUTING_AG":
     env_bool("TPU_MOE_PACK_ROUTING_AG"),
+    # Replace the second MoE routing argsort -- the one that inverts the first
+    # to get argsort_revert_indices -- with a blocked counting rank, which
+    # computes that inverse directly and drops the separate group_sizes
+    # one-hot. Same values, cheaper: the cumsum runs over 256-row blocks
+    # instead of the full routed length. See _counting_rank_and_counts in
+    # layers/common/fused_moe_gmm.py.
+    "TPU_MOE_COUNTING_RANK":
+    env_bool("TPU_MOE_COUNTING_RANK"),
     # Path or gs:// URI of a per-layer expert permutation, applied at weight
     # load so the contiguous EP blocks the fused-MoE kernel requires carry
     # equal expert load. Empty (the default) leaves placement untouched. See
