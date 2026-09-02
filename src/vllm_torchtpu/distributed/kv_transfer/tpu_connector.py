@@ -23,7 +23,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
-from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 import torch
 from torch_tpu._internal.batch_transfer import (batch_transfer_d2h,
@@ -41,6 +40,8 @@ from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
+
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
     from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
@@ -1947,9 +1948,19 @@ class TPURaidenConnectorWorker:
             self._stage3_prune_state_send_tracking(req_id)
 
         for req_id, req_meta in metadata.reqs_to_send.items():
-            try: bytes = self._stage3_fa_token_bytes(getattr(req_meta, "num_tokens", 0))
-            except Exception: bytes = 0
-            with TraceAnnotation("KV_Cache_Push_Register", phase="Prefill", req_id=req_id, num_tokens=getattr(req_meta, "num_tokens", 0), bytes=bytes, transfer_rank=transfer_rank, source_node=self.node_id if hasattr(self, "node_id") else "unknown"):
+            try:
+                bytes = self._stage3_fa_token_bytes(
+                    getattr(req_meta, "num_tokens", 0))
+            except Exception:
+                bytes = 0
+            with TraceAnnotation("KV_Cache_Push_Register",
+                                 phase="Prefill",
+                                 req_id=req_id,
+                                 num_tokens=getattr(req_meta, "num_tokens", 0),
+                                 bytes=bytes,
+                                 transfer_rank=transfer_rank,
+                                 source_node=self.node_id if hasattr(
+                                     self, "node_id") else "unknown"):
                 uuid = int(req_meta.uuid)
                 num_tokens = int(req_meta.num_tokens or 0)
                 expiration_time = float(req_meta.expiration_time)
@@ -2055,12 +2066,13 @@ class TPURaidenConnectorWorker:
                     tombstone_deadline = (
                         time.perf_counter() +
                         float(dist_utils.get_p2p_wait_pull_timeout()))
-                    self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
-                        uuid=uuid,
-                        local_block_ids=local_ids,
-                        num_tokens=num_tokens,
-                        expiration_time=tombstone_deadline,
-                    )
+                    self._stage3_terminal_sends[
+                        req_id] = _Stage3RegisteredSend(
+                            uuid=uuid,
+                            local_block_ids=local_ids,
+                            num_tokens=num_tokens,
+                            expiration_time=tombstone_deadline,
+                        )
                     self._done_sending.add(req_id)
                     logger.warning(
                         "TPURaidenConnectorWorker rank%d --> Stage-3 request "
@@ -2086,7 +2098,8 @@ class TPURaidenConnectorWorker:
                     "%s",
                     json.dumps(
                         {
-                            "event": ("raiden_stage3_request_blocks_registered"),
+                            "event":
+                            ("raiden_stage3_request_blocks_registered"),
                             "req_id":
                             req_id,
                             "uuid":
@@ -2107,8 +2120,8 @@ class TPURaidenConnectorWorker:
                             len(local_ids),
                             "owned_tokens":
                             owned_tokens,
-                            "declared_spans":
-                            (len(fa_pool_spans[0].spans) if fa_pool_spans else 0),
+                            "declared_spans": (len(fa_pool_spans[0].spans)
+                                               if fa_pool_spans else 0),
                         },
                         sort_keys=True,
                     ),
@@ -2123,6 +2136,7 @@ class TPURaidenConnectorWorker:
                     parallelism,
                     list(local_ids),
                 )
+
     @staticmethod
     def _measure_glm_tag_geometry(manifest: Any) -> dict[str, tuple[int, int]]:
         """Per-tag (live_bytes_per_block, row_bytes) of an admitted GLM
@@ -2502,7 +2516,8 @@ class TPURaidenConnectorWorker:
         deadline = time.perf_counter() + min(max(configured_timeout, 0.0),
                                              _STAGE3_D5_REGISTRATION_WAIT_S)
         attempts = 0
-        with TraceAnnotation("KV_Cache_Pull_Wait", blocked_request_ids=",".join(req_ids)):
+        with TraceAnnotation("KV_Cache_Pull_Wait",
+                             blocked_request_ids=",".join(req_ids)):
             while True:
                 attempts += 1
                 try:
@@ -2521,7 +2536,8 @@ class TPURaidenConnectorWorker:
         def _bind_stage3_request_ids(self, destination_req_id: str,
                                      source_req_id: str) -> None:
             """Binds the native/controller identity to the local scheduler ID."""
-            existing_source = self._stage3_source_req_ids.get(destination_req_id)
+            existing_source = self._stage3_source_req_ids.get(
+                destination_req_id)
             if existing_source is not None and existing_source != source_req_id:
                 raise ValueError(
                     "Conflicting Stage-3 source request ID for destination "
@@ -2536,7 +2552,8 @@ class TPURaidenConnectorWorker:
                     f"destination request: source={source_req_id!r}, existing="
                     f"{existing_destination!r}, new={destination_req_id!r}")
             self._stage3_source_req_ids[destination_req_id] = source_req_id
-            self._stage3_destination_req_ids[source_req_id] = destination_req_id
+            self._stage3_destination_req_ids[
+                source_req_id] = destination_req_id
 
         def _stage3_source_request_id(self, destination_req_id: str) -> str:
             source_req_id = self._stage3_source_req_ids.get(destination_req_id)
@@ -2546,8 +2563,8 @@ class TPURaidenConnectorWorker:
                     f"destination={destination_req_id!r}")
             return source_req_id
 
-        def _stage3_destination_request_id(self,
-                                           source_req_id: str) -> Optional[str]:
+        def _stage3_destination_request_id(
+                self, source_req_id: str) -> Optional[str]:
             # Native completion IDs are controller plan IDs. Never treat an
             # unknown ID as a decode-local ID: it may be a stale terminal record
             # that happens to collide with an active destination request.
@@ -2564,10 +2581,21 @@ class TPURaidenConnectorWorker:
 
             for destination_req_id, req_meta in metadata.reqs_to_load.items():
                 try:
-                    tr_bytes = self._stage3_fa_token_bytes(getattr(req_meta, "num_tokens", 0))
+                    tr_bytes = self._stage3_fa_token_bytes(
+                        getattr(req_meta, "num_tokens", 0))
                 except Exception:
                     tr_bytes = 0
-                with TraceAnnotation("KV_Cache_Pull_Register", phase="Decode", destination_req_id=destination_req_id, source_req_id=getattr(req_meta, "source_req_id", "unknown"), num_tokens=getattr(req_meta, "num_tokens", 0), bytes=tr_bytes, dest_network=str(getattr(self, "_stage3_facade_cache", "RaidenController"))):
+                with TraceAnnotation(
+                        "KV_Cache_Pull_Register",
+                        phase="Decode",
+                        destination_req_id=destination_req_id,
+                        source_req_id=getattr(req_meta, "source_req_id",
+                                              "unknown"),
+                        num_tokens=getattr(req_meta, "num_tokens", 0),
+                        bytes=tr_bytes,
+                        dest_network=str(
+                            getattr(self, "_stage3_facade_cache",
+                                    "RaidenController"))):
                     if not isinstance(req_meta, _Stage3LoadMeta):
                         raise TypeError(
                             "Stage-3 consumer requires controller load metadata, got "
@@ -2575,7 +2603,8 @@ class TPURaidenConnectorWorker:
                     uuid = int(req_meta.uuid)
                     num_tokens = int(req_meta.num_tokens)
                     source_req_id = req_meta.source_req_id
-                    self._bind_stage3_request_ids(destination_req_id, source_req_id)
+                    self._bind_stage3_request_ids(destination_req_id,
+                                                  source_req_id)
                     existing_uuid = self._stage3_submitted_loads.get(
                         destination_req_id)
                     if existing_uuid is not None:
@@ -2587,7 +2616,8 @@ class TPURaidenConnectorWorker:
                                 f"req_id={destination_req_id}")
                         continue
                     self._stage3_submitted_loads[destination_req_id] = uuid
-                    self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
+                    self._stage3_submitted_load_tokens[
+                        destination_req_id] = num_tokens
                     self._stage3_load_start_times[
                         destination_req_id] = time.perf_counter()
                     local_blocks = list(req_meta.local_block_ids)
@@ -2600,14 +2630,15 @@ class TPURaidenConnectorWorker:
                         src_controller_address = str(
                             req_meta.src_controller_address).strip()
                         if not src_controller_address:
-                            raise ValueError("empty Stage-3 source controller address")
+                            raise ValueError(
+                                "empty Stage-3 source controller address")
                         source_facade = self._stage3_source_facades.get(
                             src_controller_address)
                         if source_facade is None:
                             source_facade = self._new_raiden_controller_facade(
                                 src_controller_address)
-                            self._stage3_source_facades[src_controller_address] = (
-                                source_facade)
+                            self._stage3_source_facades[
+                                src_controller_address] = (source_facade)
                         # The facade RPC returns only after the source controller
                         # server has awaited its RaidenFuture (receiver arm + sender
                         # dispatch). Actual byte completion is deliberately *not*
@@ -2623,8 +2654,8 @@ class TPURaidenConnectorWorker:
                                              ) else _STAGE3_TRANSFER_POOL_TAGS)
                         dst_blocks = list(local_blocks) * len(transfer_tags)
                         dst_counts = [len(local_blocks)] * len(transfer_tags)
-                        mamba_state_block_ids = getattr(req_meta,
-                                                        "mamba_state_block_ids", None)
+                        mamba_state_block_ids = getattr(
+                            req_meta, "mamba_state_block_ids", None)
                         if self._stage3_state_group_count:
                             if not mamba_state_block_ids or len(
                                     mamba_state_block_ids
@@ -2633,7 +2664,8 @@ class TPURaidenConnectorWorker:
                                     "GDN state load requires one destination state "
                                     "block per mamba group")
                             for tag in _STAGE3_STATE_CLASS_TAGS:
-                                for ordinal, slot in enumerate(mamba_state_block_ids):
+                                for ordinal, slot in enumerate(
+                                        mamba_state_block_ids):
                                     transfer_tags.append(f"{tag}.g{ordinal}")
                                     dst_blocks.append(int(slot))
                                     dst_counts.append(1)
@@ -2663,13 +2695,14 @@ class TPURaidenConnectorWorker:
                                 "source controller rejected Stage-3 transfer")
                         fa_accepted = True
                     except Exception as exc:  # pylint: disable=broad-except
-                        missing_d5 = "Missing producer block registration" in str(exc)
+                        missing_d5 = "Missing producer block registration" in str(
+                            exc)
                         if not controller_contacted or (missing_d5
                                                         and not fa_accepted):
                             # FA D5 lookup and local validation fail before receiver
                             # arming, so no late H2D is possible.
-                            self._record_stage3_load_failure(destination_req_id,
-                                                             local_blocks)
+                            self._record_stage3_load_failure(
+                                destination_req_id, local_blocks)
                             logger.error(
                                 "Stage-3 controller transfer failed before receiver "
                                 "arming req_id=%s destination_req_id=%s uuid=%d: %s",
@@ -2679,16 +2712,18 @@ class TPURaidenConnectorWorker:
                             # Keep the request blocked and accept native terminal
                             # records; only surface recompute after manager failure or
                             # a full post-RPC manager timeout.
-                            self._stage3_controller_accepted.add(destination_req_id)
-                            deadline = (time.perf_counter() +
-                                        float(dist_utils.get_p2p_wait_pull_timeout()))
+                            self._stage3_controller_accepted.add(
+                                destination_req_id)
+                            deadline = (
+                                time.perf_counter() +
+                                float(dist_utils.get_p2p_wait_pull_timeout()))
                             self._stage3_pending_controller_failures[
                                 destination_req_id] = deadline
                             logger.error(
                                 "Stage-3 controller transfer outcome uncertain; "
                                 "waiting for native terminal state req_id=%s "
-                                "destination_req_id=%s uuid=%d: %s", source_req_id,
-                                destination_req_id, uuid, exc)
+                                "destination_req_id=%s uuid=%d: %s",
+                                source_req_id, destination_req_id, uuid, exc)
                         continue
                     self._stage3_controller_accepted.add(destination_req_id)
                     logger.info(
@@ -2701,7 +2736,8 @@ class TPURaidenConnectorWorker:
                                 "uuid": uuid,
                                 "num_tokens": num_tokens,
                                 "recv_armed_before_push": True,
-                                "state_group_count": self._stage3_state_group_count,
+                                "state_group_count":
+                                self._stage3_state_group_count,
                                 "destination_pages": len(local_blocks),
                                 "controller_submit_ms": submit_ms,
                             },
@@ -2730,10 +2766,11 @@ class TPURaidenConnectorWorker:
                     )
 
             def get_finished(
-                    self,
-                    finished_req_ids: set[str] | None = None
+                self,
+                finished_req_ids: set[str] | None = None
             ) -> tuple[set[str], set[str]]:
                 engine = self._ensure_raiden_transfer_engine()
+
             self._poll_finished(engine)
             done_sending = self._done_sending
             if self.is_producer and self._raiden_stage3_enabled():
@@ -2824,13 +2861,13 @@ class TPURaidenConnectorWorker:
                 native_failed_recving = list(failed_recving)
                 done_recving = [
                     destination_req_id for req_id in native_done_recving
-                    if (destination_req_id := self._stage3_destination_request_id(
-                        req_id)) is not None
+                    if (destination_req_id := self.
+                        _stage3_destination_request_id(req_id)) is not None
                 ]
                 failed_recving = [
                     destination_req_id for req_id in native_failed_recving
-                    if (destination_req_id := self._stage3_destination_request_id(
-                        req_id)) is not None
+                    if (destination_req_id := self.
+                        _stage3_destination_request_id(req_id)) is not None
                 ]
                 unmapped_terminal_ids = (
                     set(native_done_recving) | set(native_failed_recving)
@@ -2858,9 +2895,11 @@ class TPURaidenConnectorWorker:
                     if deadline <= now
                 }
                 if expired_uncertain:
-                    failed_recving = list(set(failed_recving) | expired_uncertain)
+                    failed_recving = list(
+                        set(failed_recving) | expired_uncertain)
                     for req_id in expired_uncertain:
-                        self._stage3_pending_controller_failures.pop(req_id, None)
+                        self._stage3_pending_controller_failures.pop(
+                            req_id, None)
                 self._stage3_terminal_loads.update(done_recving)
                 self._stage3_terminal_loads.update(failed_recving)
             if self.is_producer and self._raiden_stage3_enabled():
@@ -2943,12 +2982,13 @@ class TPURaidenConnectorWorker:
                     uuid = self._stage3_submitted_loads.get(req_id)
                     num_tokens = self._stage3_submitted_load_tokens.get(req_id)
                     source_req_id = self._stage3_source_request_id(req_id)
-                    if (req_id not in self._reported_recving and uuid is not None
-                            and num_tokens is not None):
+                    if (req_id not in self._reported_recving
+                            and uuid is not None and num_tokens is not None):
                         start_time = self._stage3_load_start_times.get(req_id)
                         latency_ms = None
                         if start_time is not None:
-                            latency_ms = (time.perf_counter() - start_time) * 1000
+                            latency_ms = (time.perf_counter() -
+                                          start_time) * 1000
                         logger.info(
                             "%s",
                             json.dumps(
@@ -3006,12 +3046,13 @@ class TPURaidenConnectorWorker:
                     tombstone_deadline = (
                         time.perf_counter() +
                         float(dist_utils.get_p2p_wait_pull_timeout()))
-                    self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
-                        uuid=registration.uuid,
-                        local_block_ids=registration.local_block_ids,
-                        num_tokens=registration.num_tokens,
-                        expiration_time=tombstone_deadline,
-                    )
+                    self._stage3_terminal_sends[
+                        req_id] = _Stage3RegisteredSend(
+                            uuid=registration.uuid,
+                            local_block_ids=registration.local_block_ids,
+                            num_tokens=registration.num_tokens,
+                            expiration_time=tombstone_deadline,
+                        )
                     del self._stage3_registered_sends[req_id]
                     del self._stage3_terminal_cleanup[req_id]
 
@@ -3040,8 +3081,8 @@ class TPURaidenConnectorWorker:
                     pending = sorted(req_ids - finished)
                     logger.warning(
                         "TPURaidenConnectorWorker rank%d --> timed out waiting "
-                        "for Raiden load completion for req_ids=%s", self.tp_rank,
-                        pending)
+                        "for Raiden load completion for req_ids=%s",
+                        self.tp_rank, pending)
                     return
                 time.sleep(0.001)
 

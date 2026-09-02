@@ -34,7 +34,6 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -57,6 +56,7 @@ from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import (HostKVShmPool,
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import \
     TpuKVConnectorStats
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 logger = init_logger(__name__)
 
@@ -919,14 +919,27 @@ class ZmqShmKvConnectorBase:
         their own inline stage in parallel with us."""
         assert self.is_producer
         num_blocks = self._blocks_token(req_meta.local_block_ids)
-        try: shape_size = self._coord_pool.spec.layer_shard_shape_size; itemsize = self._coord_pool.spec.dtype.itemsize; dim = str(self._coord_pool.spec.layer_shard_shape)
-        except Exception: shape_size = 0; itemsize = 1; dim = "unknown"
-        with TraceAnnotation("KV_Cache_Push_Staging", phase="Prefill", req_id=req_id, uuid=req_meta.uuid, num_blocks=num_blocks, bytes=num_blocks * shape_size * itemsize, dimension=dim, source_node=self.node_id):
+        try:
+            shape_size = self._coord_pool.spec.layer_shard_shape_size
+            itemsize = self._coord_pool.spec.dtype.itemsize
+            dim = str(self._coord_pool.spec.layer_shard_shape)
+        except Exception:
+            shape_size = 0
+            itemsize = 1
+            dim = "unknown"
+        with TraceAnnotation("KV_Cache_Push_Staging",
+                             phase="Prefill",
+                             req_id=req_id,
+                             uuid=req_meta.uuid,
+                             num_blocks=num_blocks,
+                             bytes=num_blocks * shape_size * itemsize,
+                             dimension=dim,
+                             source_node=self.node_id):
             logger.info(
                 "TPUConnectorWorker(%s) rank0 --> handle_new_send req_id=%s uuid=%s "
                 "blocks=%s", self.node_id, req_id, req_meta.uuid, num_blocks)
-            logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f", req_id,
-                        req_meta.uuid, time.time())
+            logger.info("PERF P handle_new_send req_id=%s uuid=%s ts=%.6f",
+                        req_id, req_meta.uuid, time.time())
             try:
                 slot_idx = self._coord_pool.acquire_slot(timeout=0.0)
             except Exception:
@@ -961,9 +974,9 @@ class ZmqShmKvConnectorBase:
 
             # Enqueue broadcast first so other ranks can start their own stage
             # while we run ours.
-            self._coord_broadcast(
-                _IPC_STAGE_NOTIFY,
-                (req_meta.uuid, slot_idx, num_blocks, req_meta.local_block_ids))
+            self._coord_broadcast(_IPC_STAGE_NOTIFY,
+                                  (req_meta.uuid, slot_idx, num_blocks,
+                                   req_meta.local_block_ids))
             logger.info(
                 "TPUConnectorWorker(%d) rank0 --> handle_new_send broadcast uuid=%s "
                 "slot=%d to %d non-zero ranks", self.node_id, req_meta.uuid,
@@ -1342,16 +1355,34 @@ class ZmqShmKvConnectorBase:
         uuid_bytes = str(entry.uuid).encode("utf-8")
         timeout_s = dist_utils.get_p2p_wait_pull_timeout()
         req_blocks_pickle = _secure_dumps(entry.remote_blocks)
-        try: dtype_name = self._coord_pool.spec.dtype.name; itemsize = self._coord_pool.spec.dtype.itemsize; shape_size = self._coord_pool.spec.layer_shard_shape_size; 
-        except (AttributeError, Exception): dtype_name = "unknown"; itemsize = 1; shape_size = 0
-        try: dim = str(self._coord_pool.spec.layer_shard_shape)
-        except Exception: dim = "unknown"
-        with TraceAnnotation("KV_Cache_Pull", phase="Decode", req_id=entry.req_id, uuid=entry.uuid, num_blocks=entry.num_blocks, n_channels=n_channels, bytes=entry.num_blocks * shape_size * itemsize, dtype=dtype_name, dimension=dim, source_hosts=",".join(hosts), dest_node=self.node_id):
+        try:
+            dtype_name = self._coord_pool.spec.dtype.name
+            itemsize = self._coord_pool.spec.dtype.itemsize
+            shape_size = self._coord_pool.spec.layer_shard_shape_size
+        except (AttributeError, Exception):
+            dtype_name = "unknown"
+            itemsize = 1
+            shape_size = 0
+        try:
+            dim = str(self._coord_pool.spec.layer_shard_shape)
+        except Exception:
+            dim = "unknown"
+        with TraceAnnotation("KV_Cache_Pull",
+                             phase="Decode",
+                             req_id=entry.req_id,
+                             uuid=entry.uuid,
+                             num_blocks=entry.num_blocks,
+                             n_channels=n_channels,
+                             bytes=entry.num_blocks * shape_size * itemsize,
+                             dtype=dtype_name,
+                             dimension=dim,
+                             source_hosts=",".join(hosts),
+                             dest_node=self.node_id):
             logger.info(
                 "TPUConnectorWorker(%s) rank0 --> PULL req_id=%s uuid=%s "
                 "from=%s:%s+0..%s blocks=%s n_channels=%s", self.node_id,
-                entry.req_id, entry.uuid, entry.remote_host, ports, n_channels - 1,
-                entry.num_blocks, n_channels)
+                entry.req_id, entry.uuid, entry.remote_host, ports,
+                n_channels - 1, entry.num_blocks, n_channels)
 
             num_layers = self.num_layers
 
@@ -1374,9 +1405,10 @@ class ZmqShmKvConnectorBase:
                 try:
                     t0 = time.perf_counter()
                     logger.info(
-                        "PERF D pull_send host_idx=%d ch=%d uuid=%s ts=%.6f", h,
-                        ch, entry.uuid, time.time())
-                    sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
+                        "PERF D pull_send host_idx=%d ch=%d uuid=%s ts=%.6f",
+                        h, ch, entry.uuid, time.time())
+                    sock.send_multipart(
+                        [_MSG_PULL, uuid_bytes, req_blocks_pickle])
                     deadline = t0 + timeout_s
                     frames = None
                     while time.perf_counter() < deadline:
@@ -1401,8 +1433,8 @@ class ZmqShmKvConnectorBase:
                             f"[{tag!r}, {payload_hint!r}]")
                     t_wire_done = time.perf_counter()
                     logger.info(
-                        "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f", h,
-                        ch, entry.uuid, time.time())
+                        "PERF D wire_done host_idx=%d ch=%d uuid=%s ts=%.6f",
+                        h, ch, entry.uuid, time.time())
 
                     # Wire format after OK:
                     #   frames[1]=uuid echo, frames[2]=n_ranks ascii
@@ -1486,7 +1518,8 @@ class ZmqShmKvConnectorBase:
                         seen.add(r)
                 if header_frame is None:
                     raise RuntimeError(
-                        f"PULL req_id={entry.req_id}: channel 0 omitted header")
+                        f"PULL req_id={entry.req_id}: channel 0 omitted header"
+                    )
                 if len(seen) != self.ranks_per_host:
                     raise RuntimeError(
                         f"PULL req_id={entry.req_id}: got {len(seen)} ranks, "
@@ -1519,9 +1552,10 @@ class ZmqShmKvConnectorBase:
             finally:
                 # Tell workers the slot is ready (or drop it on failure).
                 if entry.pull_ok:
-                    self._coord_broadcast(_IPC_LOAD_NOTIFY,
-                                          (entry.uuid, entry.slot_idx,
-                                           entry.num_blocks, entry.local_blocks))
+                    self._coord_broadcast(
+                        _IPC_LOAD_NOTIFY,
+                        (entry.uuid, entry.slot_idx, entry.num_blocks,
+                         entry.local_blocks))
                 else:
                     self._coord_broadcast(_IPC_DROP, (entry.uuid, ))
                     # Clean up: failed pulls will never reach COPY_DONE, so
