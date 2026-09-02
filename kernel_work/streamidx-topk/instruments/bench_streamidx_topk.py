@@ -248,8 +248,63 @@ def _production_shapes() -> list[Shape]:
     return out
 
 
+# The *other* GLM-5.2 deployment. The nightly perf config above is not the only
+# shape this model is served at: the InferenceX AgentX trajectory-replay jobs
+# (`j-a71a648c-3064-471a-a131` and its three siblings, read back verbatim from
+# `cdk job recipe`) serve the same checkpoint at
+#
+#     --max-model-len=262144  --block-size=256  --max-num-seqs=64
+#     --max-num-batched-tokens=1024  --kv-cache-dtype=fp8
+#
+# which is a 28x wider score buffer and a 4x smaller page than the nightly.
+# Those are the jobs the only available xprof captures come from, so these rows
+# exist for exactly one purpose: to make the profile's per-invocation numbers
+# comparable to a microbenchmark number. Without them the cross-check is
+# comparing two different deployments and calling the difference a discrepancy.
+#
+# Run these with `--page-size 256`; PAGE_SIZE is global rather than per-shape,
+# so the two families cannot share one process. `--filter agentx` selects them.
+AGENTX_MAX_MODEL_LEN = 262144
+AGENTX_PAGE_SIZE = 256
+AGENTX_CHUNK = 1024
+
+
+def _agentx_shapes() -> list[Shape]:
+    mml = AGENTX_MAX_MODEL_LEN
+    out = []
+    # Batch 16 is what the capture actually ran at (`MLA-p_2048-bz_16-gcz_16`,
+    # `router_topk` output f32[16,8]); batch 64 is the recipe's max_num_seqs.
+    # The replayed traces' real context lengths are not recoverable from the
+    # profile -- the compiled shapes are max_model_len-sized regardless -- so
+    # sweep the context instead of guessing one, and let the sweep say whether
+    # it matters.
+    for num_seqs in (16, 64):
+        for ctx in (8192, 32768):
+            out.append(
+                Shape(f"agentx_decode_b{num_seqs}_ctx{ctx}",
+                      "decode",
+                      num_seqs,
+                      1,
+                      ctx,
+                      note=f"AGENTX: the profiled deployment, mml={mml}, "
+                      f"page={AGENTX_PAGE_SIZE}",
+                      max_model_len=mml))
+    out.append(
+        Shape(f"agentx_prefill_q{AGENTX_CHUNK}_ctx8192",
+              "prefill",
+              1,
+              AGENTX_CHUNK,
+              8192,
+              note="AGENTX chunked prefill. No captured window contains an "
+              "indexer-active prefill step, so this row has no profile twin "
+              "and is a microbenchmark number only.",
+              max_model_len=mml))
+    return out
+
+
 def _default_shapes() -> list[Shape]:
     shapes: list[Shape] = _production_shapes()
+    shapes += _agentx_shapes()
 
     # `enable_early_exit` short-circuits when max(seq_lens) // compression_ratio
     # <= k. At k=2048 and compression_ratio=1 that is contexts <= 2048, so
@@ -790,6 +845,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--filter",
                         default="",
                         help="substring match on the shape name")
+    parser.add_argument("--page-size",
+                        type=int,
+                        default=PAGE_SIZE,
+                        help=f"KV page size (vLLM's --block-size). Default "
+                        f"{PAGE_SIZE}, the nightly perf config. The AgentX "
+                        f"deployment the xprof captures come from uses "
+                        f"{AGENTX_PAGE_SIZE}; pass it with `--filter agentx`. "
+                        f"This is a module global rather than a per-shape "
+                        f"field, so one process serves one page size.")
     parser.add_argument("--max-score-buffer-bytes",
                         type=int,
                         default=8 << 30,
@@ -812,6 +876,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+
+    # PAGE_SIZE feeds pages_per_seq, num_positions, the cache shape and the
+    # modelled byte counts, and SHAPES was built at import time under the
+    # default. Rebind both before anything reads them, and say so in the header
+    # -- a page-size change that is not printed is a silent reshape of every
+    # number below it.
+    global PAGE_SIZE, SHAPES  # noqa: PLW0603 - see above
+    if args.page_size != PAGE_SIZE:
+        print(f"page_size overridden: {PAGE_SIZE} -> {args.page_size}")
+        PAGE_SIZE = args.page_size
+        SHAPES = _default_shapes()
 
     shapes = [s for s in SHAPES if args.filter in s.name]
     if not shapes:
