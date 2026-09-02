@@ -376,6 +376,12 @@ largest lever on the sheet is not inside stage A — it is the serialisation bet
 
 ## 10. The empty-launch price is now triangulated, and D1's expensive half is closed
 
+> **PARTLY FALSIFIED by P4 (§15.4).** The *structural* claim below stands — two decode calls per
+> layer, one of them empty. The *price* does not: an empty launch costs **0.55 µs (`sbs1`) / 0.04 µs
+> (`sbs4`) at the nightly width**, not ~5.3 µs, and the "invocation-driven, not allocation-driven"
+> inference at the end of this section is **wrong — it is allocation-driven.** Both design tiers this
+> section recommended are dead. Read §15.4 before using anything here.
+
 `report.md` §8 listed `StreamIdxTC-d`'s bimodality as an open probe and area 1's D1 asked for a
 hardware job to price an empty launch. **Area 7's CSE table closes the structural half from an
 artifact already on GCS.** `measured (j-a71a648c rank 0, hlo_stats, untruncated 16554/16554 rows)`:
@@ -405,12 +411,11 @@ width**.
 Still open and still worth the cheap arm of D1: whether ~5.3 µs holds at the nightly score width.
 The counts are structural and carry over unchanged; the µs do not.
 
-**Consequence for the lever list.** Area 1's tier 1 — merge calls 1 and 2, both `MlaCase.DECODE`,
-both `bq_sz=1`, differing only in `seq_batch_size`, handling the remainder by masking inside the
-batched kernel — recovers ~5.4 µs/layer with **no scratch growth**, and area 2 c12 reaches the same
-conclusion independently. That is now the best-evidenced cheap win in step 2. Note it is ~2.4% of a
-221.4 µs decode call, which is inside §8's ±8.5% run-to-run spread: **it must be measured by the
-microbenchmark in the same job, and cannot be shown end to end.**
+**Consequence for the lever list — RETRACTED.** This section recommended area 1's tier 1 (merge
+calls 1 and 2) as "the best-evidenced cheap win in step 2", on the strength of a ~5.4 µs/layer
+recovery. **P4 measured it at the nightly width and it is 0.55 µs/layer = 0.25% of the call.** The
+AgentX figure did not transfer, for the reason §15.4 gives. Tier 1 is not worth writing and tier 2
+is actively harmful. See §15.4.
 
 ---
 
@@ -538,16 +543,16 @@ new.
 | | probe | cost | what it gates |
 | --- | --- | --- | --- |
 | ~~**P0**~~ | ~~`donate_argnums` elision at `mla:140`~~ — **DONE: ELIDED** (§11) | free | Settled, negative. No copy exists, and the bucket it was probing nearly vanishes at nightly (§11.4) |
-| **P1** | DMA-stall fraction in `StreamIdxTC-d` via `/xprof-llo` (semaphore-wait at `sx:398`) | one pod job | §2's gate question — stage A near its floor (**≥50% confirms, ≤15% refutes**) — *and*, on refutation, the `assumed` VPU rate |
-| **P2** | `approx_max_k(recall_target=1.0)` and `lax.top_k` vs `sparsecore_topk` at `(64, 10240, 2048)` | minutes | §12. The only probe that can delete a design option |
-| **P3** | Can a TensorCore grid and a `VectorSubcoreMesh` be in flight together? | one pod job | §9's unit edge — the largest lever on the sheet. Area 1 D2 and area 5 name the same probe |
-| **P4** | Empty-`pallas_call` price at grid extent 0 / 1 / 16 at the **nightly** score width, plus a `lax.cond`-guarded arm | minutes | §10's residual. Tier 1 vs tier 2 of area 1 C2 |
+| ~~**P1**~~ | ~~DMA-stall fraction~~ — **DONE: 16.65% mean / 5.51% median** (§15.1) | done | Refutes DMA-bound; lands 1.65pt above the compute threshold, so **§2 stays open**. VPU rate now measured at 50.97% |
+| ~~**P2**~~ | ~~XLA vs `sparsecore_topk`~~ — **DONE: SC wins 11×, bit-identical** (§15.2) | done | §12 closes. Stage B stays; the option is removed, not taken |
+| ~~**P3**~~ | ~~TC/SC overlap~~ — **DONE: yes, 41.6%, single jitted program only** (§15.3) | done | §9's unit edge confirmed at a modelled 12.7% of the call, with a hard implementation constraint |
+| ~~**P4**~~ | ~~Empty-launch price at nightly~~ — **DONE: 0.55 / 0.04 µs, not 5.4** (§15.4) | done | Both tiers rejected. Cost is allocation-driven, falsifying §10. New candidate: 2.9 µs prologue |
 | ~~**P5**~~ | ~~Area 4's D1 falsifier~~ — **DONE: `PASS`, one consumer set** (§14.1) | done | Settled. A repack touches one file. Route 1 refused as non-discriminating |
 | ~~**P6**~~ | ~~`[:129]` strided read charge~~ — **DONE: charge ratio 1.02, but w=129 is inexpressible** (§14.2) | done | The one-line change does not exist; a 128+scale repack does, and realises ~98% |
 | ~~**P7**~~ | ~~`bkv_p` sweep; prefill spill~~ — **DONE: `bkv_p=3` is −11.9%; prefill spills 23.5× over** (§14.3-4) | done | Settles §5. Stage A is DMA-**block**-bound, not bandwidth-bound — partially pre-empts P1 |
 
 P0 ran first and alone, because it could have changed what the rest were for. It did not — see §11.
-**P5–P7 have since returned (§14); P1–P4 are still in flight.** Four of the eight are closed.
+**All eight probes have returned — P0 in §11, P5–P7 in §14, P1–P4 in §15.** Wave 2 is complete.
 
 **A note on P0's yield, because it generalises to the probes still running.** P0 answered its own
 question in the negative and was still the highest-value probe run so far — it itemized 96% of a
@@ -695,3 +700,162 @@ That ordering is sound and this document adopts it. **The 1.81× is computed fro
 number** (90.87 µs against a ~50 µs modelled floor), so it is an order-of-magnitude argument rather
 than a measurement, and it should be recomputed once `bkv_p=3` is measured uncontended in the same
 job as the incumbent, per §8.
+
+---
+
+## 15. Wave 2, second job: P1, P2, P3 and P4
+
+`measured (j-e107f728-6fdc-47d8-98f9)`, image `ec4bcecf…`, `TPU_TOPOLOGY 2x2x1`, four chips, one
+probe per chip. Write-ups in `../probes/P1-dma-stall.md`, `P2-xla-vs-sparsecore.md`,
+`P3-tc-sc-overlap.md`, `P4-empty-launch.md`.
+
+**Two caveats that govern every number here.** The job's `JobStatus` was **`Running`, not green**,
+when the results were read: all four shards returned `rc=0` and printed complete JSON, and the data
+was recovered by mid-run `cdk job sync-outputs`; the job remained `Running` only because shard 0's
+cosmetic `pack` step was tarring 1.5 GB of LLO text. And **four shards shared one pod, so absolute
+microseconds are contended** — every conclusion below is a ratio taken within one process against
+its own controls.
+
+### 15.1 P1 — stage A is not DMA-bound, and §2's gate question stays open
+
+Sampled GFC counters at `interval_us: 20`, 66,053 samples, wrap-checked (max_raw 38,521 < 65,535;
+the 1000 µs control did wrap, as expected):
+
+**`count_sync_wait` = 16.65% mean, 5.51% median.**
+
+The **≥50% branch is decisively refuted**, so area 3's challenge to `report.md` §4's 21.5%-of-floor
+figure is **not sustained**. But at 1.65 points above the ≤15% line it does not formally confirm the
+compute-bound branch either. **§2 does not close.** The honest reading is: discriminating against
+DMA-bound, weakly for compute-bound.
+
+This must be reconciled with **P7a, which found stage A DMA-*block*-bound** (§14.3). They are
+compatible and the synthesis matters: time responds to `bkv_p` because the *number and size of
+transfers* is badly chosen, but the core is not sitting idle waiting on them for most of its cycles.
+The `bkv_p=3` win is real and is not a bandwidth win.
+
+**The `assumed` VPU rate is now measured — this was the roofline's single largest soft input.**
+`VPU issue rate = 50.97%`. Any recomputation of the floor should use it.
+
+**The sharpest new fact of the session, and it needs one number re-derived.** `count_mxu_busy_0` =
+**95.5%**, against the static analysis's MXU figure of 4.61%. These are not in conflict: the counter
+counts busy *cycles*, the static pass counts *issue slots*. The prober's reconciliation is that **the
+MXU is busy nearly every cycle while filling a small fraction of the array**, because the einsum
+contracts `d=128` against only `H=32` heads — so the array is fed 32 of 128 columns.
+
+**Flagged rather than adopted:** the prober quotes that fill as 6.25% and the resulting throughput as
+≈4.4% of peak. I cannot reproduce 6.25% from "128 deep × 32 wide" — that ratio is 32/128 = **25%** —
+and 4.4/95.5 implies a fill of 4.6%, which is a third number. **The counters (95.5%, 50.97%) are
+measured and usable; the fill percentage and the "% of peak" derived from it are not, until the
+arithmetic is redone.** The qualitative claim — MXU perpetually busy at low occupancy — is
+well-supported by the shape argument alone and is what the design should act on.
+
+Static (compile-time analysis, **not** measurement): VMEM 4.17 MiB with 96.7% headroom; spills+fills
+996+999 over 2,779 bundles = 0.72/bundle against the reference's 0.49. The tool's
+`mem_stall_mxu_idle` label is misleading here — dumping bundles `0x7ac`–`0x7e0` shows a
+`vrot.slane`/`vadd.f32` reduction tree with spill stores and no DMA.
+
+### 15.2 P2 — stage B stays. SparseCore beats XLA by ~11×, bit-identically
+
+At `(b=64, n=10240, k=2048)` f32, one process:
+
+| implementation | time | vs `sparsecore_topk` |
+| --- | ---: | ---: |
+| `lax.approx_max_k(recall_target=1.0)` | 533.72 µs | 10.2× slower |
+| `lax.top_k` | 572.48 µs | 11.0× slower |
+| **`sparsecore_topk`** | **52.12 µs** | — |
+| `sparsecore_topk`, rows masked | 48.45 µs | (11.0× / 11.8×) |
+
+**All six agreement checks pass exactly: max |Δscore| = 0.0, index sets identical, 131,072 /
+131,072 selected.**
+
+**§12 closes.** This was the only probe that could have *removed* a design option and it closes the
+option instead: **no candidate may propose deleting stage B's 457 lines**, and the TensorCore↔
+SparseCore boundary is load-bearing rather than incidental. Deleting stage B would cost a `modelled`
+521.3 µs/layer, ≈10.9 ms/step.
+
+It also supplies, retroactively, **the margin and the equivalence baseline that commit `6142d5e7`
+never recorded** — the gap §12 was written about. Bit-identical output against an exact XLA reference
+is the correctness evidence that commit lacked.
+
+### 15.3 P3 — the overlap is real, worth 12.7%, and carries a constraint nobody knew about
+
+**This is the finding that most changes the design.** In one `jax.jit`:
+
+| | µs |
+| --- | ---: |
+| `t_a` (TensorCore arm alone) | 118.45 |
+| `t_b` (SparseCore arm alone) | 48.22 |
+| `t_both` | 140.35 |
+
+Correcting for one program's fixed cost, measured independently from the same-unit control as
+`F = 2 × 118.45 − 230.63 = 6.27 µs`: **20.05 µs of the SparseCore arm is genuinely hidden = 41.6%
+overlap.** (57.5% at `reps=2`; 41.6% is the figure to use, since the SC arm is not perfectly serial
+with itself, `b2/b1 = 1.659`.) The additive model is validated by the control
+`t_a(2)/t_a(1) = 1.947`.
+
+So §9's reframe holds: **the stage-A(g) / stage-B(g−1) pipeline through HBM is viable, and needs no
+TC↔SC shared memory.** Worth a `modelled` **28.0 µs/layer = 12.7%** of the 221.4 µs nightly call.
+
+**The new constraint, and it rules out the obvious implementation.** Overlap happens **only inside a
+single XLA program**:
+
+| expression | overlap |
+| --- | ---: |
+| one jitted program | **+41.6%** |
+| two executables | −1.8% |
+| two Python threads | −11.5% |
+
+The latter two are zero overlap. **"Just enqueue stage A and stage B back to back" does not work** —
+the pipeline has to be expressed as one jitted program. This was not known before and it is a hard
+requirement on any option that claims the lever.
+
+Independence was ensured by feeding arm B a pre-made score matrix arm A never writes, distinct PRNG
+keys per rep, and returning both outputs. No framework refusal was encountered.
+
+### 15.4 P4 — the AgentX empty-launch figure does not transfer, and both tiers die
+
+Timed by slope over a chain of M launches in one program, because the ~20 µs dispatch floor is 36×
+the quantity being measured and the intercept is therefore useless.
+
+| | empty-launch cost at **nightly** width |
+| --- | ---: |
+| `sbs1` | **0.55 µs** |
+| `sbs4` | **0.04 µs** |
+
+Against 5.40 / 5.22 µs at AgentX — **~10× cheaper**.
+
+- **Tier 1** (merge the two decode calls) recovers 0.55 µs/layer = **0.25%** of the call. Not worth
+  writing.
+- **Tier 2** (`lax.cond` the empty call away) saves 0.63 µs when skipped and costs **+5.2 to +5.9 µs
+  whenever taken** — ~9× more expensive than what it removes. **Reject.**
+
+**§10's hypothesis is falsified in the direction that matters.** 6.4× less output (2.62 MB vs
+16.8 MB) yields a ~10× cheaper launch, so the fixed cost is **allocation-driven, not
+invocation-driven** — the opposite of what §10 inferred and of what `07-precomputation.md`
+hypothesised. Under the correct branch, **capping the score width beats merging calls**, which is the
+reverse of the recommendation §10 made.
+
+**Two findings the probe was not asked for, and one is a new candidate.**
+
+1. `sbs4_grid16 = 110.38 µs` is the **first direct isolated measurement of stage A**, and it confirms
+   `report.md` §6's *derived* 109.2 µs to **1.1%**. §6's derived column was flagged in area 1 as soft
+   (a subtraction of three best-of-N timings that goes negative on three rows elsewhere). It is now
+   corroborated by direct measurement at this shape.
+2. Extrapolating `sbs4` from grids 1 and 16 puts the grid-0 intercept at **2.86 µs** against a
+   measured 0.04 µs. That gap is **~2.9 µs/layer of un-overlapped first-grid-step prologue** — 5×
+   what tier 1 would have recovered, and **entirely unexamined**. New candidate for the designer.
+
+### 15.5 Net effect of wave 2 on the design space
+
+| | |
+| --- | --- |
+| **removed** | delete stage B and return to XLA — forbidden by P2 (11× slower) |
+| **rejected** | both empty-launch tiers — P4 (0.25% and net-negative respectively) |
+| **confirmed, with a new hard constraint** | TC/SC pipelining — P3, 41.6% overlap, **single jitted program only** |
+| **confirmed, larger than estimated** | `bkv_p = 2 → 3` — P7a, −11.9% |
+| **converged from two directions** | repack the K cache to 128-wide payload + scale array — P5 (one consumer) and P6 (1.02× charge ratio, and w=129 inexpressible) |
+| **still open** | §2, stage A's headroom — P1 landed between the thresholds |
+| **`assumed` → measured** | VPU issue rate = 50.97% |
+| **new candidates** | P4's ~2.9 µs/layer first-grid-step prologue; P1's low-occupancy MXU |
+
+All eight probes ran. None failed or was dropped.
