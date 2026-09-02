@@ -163,6 +163,72 @@ def counting_dest_only_blocked(keys, block=256):
     return _blocked_destination(keys, block)[0]
 
 
+def prepare_routed_count_s2(keys, valid, block=256):
+    """The permutation block with S2 replaced by the blocked counting rank.
+
+    S1 stays a real argsort (its output is used as a gather index and the
+    scatter that would reproduce it costs more than the sort). group_sizes
+    falls out of the same one-hot, so the separate one-hot goes away too.
+    """
+    si = jnp.argsort(keys)
+    dest, counts = _blocked_destination(keys, block)
+    _ = valid
+    return si, dest, counts[:E]
+
+
+# ------------------------------------------------- S3: boolean stable partition
+
+R3 = 8            # cfg.num_row_partitions
+C3 = N // R3      # cfg.row_partition_size
+
+
+def _excl_cumsum_blocked(v, block):
+    """Exclusive cumsum along the last axis, computed two-level."""
+    r, c = v.shape
+    nb = c // block
+    vb = v.reshape(r, nb, block)
+    within = jnp.cumsum(vb, axis=-1) - vb
+    bc = vb.sum(axis=-1)                            # [r, nb]
+    bbase = jnp.cumsum(bc, axis=-1) - bc            # [r, nb]
+    return (within + bbase[..., None]).reshape(r, c)
+
+
+def s3_dest_cumsum(valid_2d):
+    """Where each source row lands under the stable partition (flat cumsum)."""
+    v = valid_2d.astype(jnp.int32)
+    iv = 1 - v
+    rank_v = jnp.cumsum(v, axis=-1) - v
+    rank_i = jnp.cumsum(iv, axis=-1) - iv
+    nvalid = v.sum(axis=-1, keepdims=True)
+    return jnp.where(valid_2d, rank_v, nvalid + rank_i)
+
+
+def s3_dest_blocked(valid_2d, block=512):
+    v = valid_2d.astype(jnp.int32)
+    iv = 1 - v
+    rank_v = _excl_cumsum_blocked(v, block)
+    rank_i = _excl_cumsum_blocked(iv, block)
+    nvalid = v.sum(axis=-1, keepdims=True)
+    return jnp.where(valid_2d, rank_v, nvalid + rank_i)
+
+
+def _s3_scatter_from_dest(dest):
+    off = jnp.arange(R3, dtype=jnp.int32)[:, None] * C3
+    flat_dest = (dest + off).reshape(-1)
+    iota = jnp.broadcast_to(jnp.arange(C3, dtype=jnp.int32),
+                            (R3, C3)).reshape(-1)
+    return jnp.zeros(R3 * C3, jnp.int32).at[flat_dest].set(iota).reshape(
+        R3, C3)
+
+
+def s3_partition_cumsum(valid_2d):
+    return _s3_scatter_from_dest(s3_dest_cumsum(valid_2d))
+
+
+def s3_partition_blocked(valid_2d, block=512):
+    return _s3_scatter_from_dest(s3_dest_blocked(valid_2d, block))
+
+
 # ------------------------------------------------------------------- Pallas
 
 def _pallas_counting(keys, block, rank_mode):
@@ -187,23 +253,28 @@ def _pallas_counting(keys, block, rank_mode):
         # Built inside the kernel: pallas_call refuses captured constants.
         return jax.lax.broadcasted_iota(jnp.int32, shape, 1)
 
+    # The per-block histogram is [nb, e1p], but a (1, e1p) block of it is
+    # rejected: Pallas TPU wants the last two block dims divisible by (8, 128)
+    # *or* equal to the array dims. Carrying it as [nb, 1, e1p] with a
+    # (1, 1, e1p) block satisfies the second form (1 == 1, 128 % 128 == 0).
     def hist_kernel(k_ref, o_ref):
         oh = (k_ref[...] == _lanes((block, e1p))).astype(jnp.int32)
-        o_ref[...] = jnp.sum(oh, axis=0, keepdims=True)
+        o_ref[...] = jnp.sum(oh, axis=0, keepdims=True)[None]
 
-    hist = pl.pallas_call(
+    hist3 = pl.pallas_call(
         hist_kernel,
         grid=(nb, ),
         in_specs=[pl.BlockSpec((block, 1), lambda i: (i, 0))],
-        out_specs=pl.BlockSpec((1, e1p), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((nb, e1p), jnp.int32),
+        out_specs=pl.BlockSpec((1, 1, e1p), lambda i: (i, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct((nb, 1, e1p), jnp.int32),
         interpret=interpret,
     )(k2)
+    hist = hist3[:, 0, :]                           # [nb, e1p]
 
     counts = hist.sum(axis=0)                       # [e1p]
     block_base = jnp.cumsum(hist, axis=0) - hist    # [nb, e1p]
     key_base = jnp.cumsum(counts) - counts          # [e1p]
-    base = block_base + key_base[None, :]           # [nb, e1p]
+    base = (block_base + key_base[None, :])[:, None, :]   # [nb, 1, e1p]
 
     tri = None
     if rank_mode == "trimm":
@@ -211,7 +282,7 @@ def _pallas_counting(keys, block, rank_mode):
         tri = (r[:, None] > r[None, :]).astype(jnp.bfloat16)  # strictly lower
 
     def _finish(ohb, rank, b_ref, o_ref):
-        mine = jnp.sum(jnp.where(ohb, b_ref[...], 0), axis=1, keepdims=True)
+        mine = jnp.sum(jnp.where(ohb, b_ref[0], 0), axis=1, keepdims=True)
         o_ref[...] = rank + mine
 
     def dest_kernel_cumsum(k_ref, b_ref, o_ref):
@@ -237,7 +308,7 @@ def _pallas_counting(keys, block, rank_mode):
 
     in_specs = [
         pl.BlockSpec((block, 1), lambda i: (i, 0)),
-        pl.BlockSpec((1, e1p), lambda i: (i, 0)),
+        pl.BlockSpec((1, 1, e1p), lambda i: (i, 0, 0)),
     ]
     operands = [k2, base]
     if rank_mode == "trimm":
@@ -365,8 +436,14 @@ def main():
             bench(f"counting_sort_blocked b={blk} (S1+S2)",
                   lambda k, b=blk: counting_sort_blocked(k, b), (keys, ), dev,
                   iters=50)
-        bench("counting_dest_only b=256 (S2 only)", counting_dest_only_blocked,
-              (keys, ), dev, iters=50)
+        for blk in (128, 256, 512, 1024):
+            bench(f"counting_dest_only b={blk} (S2 only)",
+                  lambda k, b=blk: counting_dest_only_blocked(k, b), (keys, ),
+                  dev, iters=50)
+        bench("prepare_routed w/ counting S2 (block)", prepare_routed_count_s2,
+              (keys, valid), dev, iters=50)
+        bench("prepare_routed CURRENT (block, A/B ref)",
+              prepare_routed_current, (keys, valid), dev)
         for blk in (512, 1024, 2048, 8192):
             bench(f"pallas_counting cumsum b={blk} (S2 only)",
                   lambda k, b=blk: _pallas_counting(k, b, "cumsum"), (keys, ),
@@ -375,6 +452,29 @@ def main():
             bench(f"pallas_counting trimm b={blk} (S2 only)",
                   lambda k, b=blk: _pallas_counting(k, b, "trimm"), (keys, ),
                   dev)
+
+    if group in ("s3", "all"):
+        banner("S3 - boolean stable partition, [8, 20480] bool")
+        want_s3 = np.asarray(s3_bool_argsort(valid_2d))
+        r = guarded("s3_partition_cumsum", s3_partition_cumsum, valid_2d)
+        if r is not None:
+            check("s3_partition_cumsum", r, want_s3)
+        for blk in (128, 256, 512, 1024, 2048):
+            r = guarded(f"s3_partition_blocked b={blk}", s3_partition_blocked,
+                        valid_2d, blk)
+            if r is not None:
+                check(f"s3_partition_blocked b={blk}", r, want_s3)
+
+        bench("S3 CURRENT argsort(~valid) stable", s3_bool_argsort,
+              (valid_2d, ), dev)
+        bench("s3_partition_cumsum (full argsort out)", s3_partition_cumsum,
+              (valid_2d, ), dev, iters=50)
+        for blk in (128, 256, 512, 1024, 2048):
+            bench(f"s3_partition_blocked b={blk}",
+                  lambda v, b=blk: s3_partition_blocked(v, b), (valid_2d, ),
+                  dev, iters=50)
+        bench("s3_dest_blocked b=512 (no scatter)",
+              lambda v: s3_dest_blocked(v, 512), (valid_2d, ), dev, iters=50)
 
 
 if __name__ == "__main__":

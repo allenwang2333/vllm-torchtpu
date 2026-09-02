@@ -74,11 +74,15 @@ def make_inputs(k, n, dev, lhs_dtype=jnp.bfloat16, rhs_dtype=jnp.float8_e4m3fn,
 def show_metadata(tag, lhs, rhs, rhs_scale, gs, fuse_act, maybe_quantize_lhs,
                   acc_dtype=None):
     try:
+        from jax.experimental.pallas import tpu as pltpu
+        # gmm_v2 itself defaults None -> 90% of VMEM before calling this;
+        # calculate_tiling compares against it with >, so None raises.
+        vmem = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
         cfgs = gmm_mod.make_gmm_configs(
             lhs, rhs, rhs_scale, None, gs,
             jnp.array([0], dtype=jnp.int32),
             tile_info=gmm_mod.calculate_tiling,
-            vmem_limit_bytes=None,
+            vmem_limit_bytes=vmem,
             out_dtype=None,
             acc_dtype=acc_dtype,
             maybe_quantize_lhs=maybe_quantize_lhs,
