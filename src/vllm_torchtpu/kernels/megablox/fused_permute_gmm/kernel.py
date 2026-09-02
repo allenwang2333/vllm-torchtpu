@@ -18,7 +18,7 @@ row into a VMEM ring, `lookahead` tiles ahead of the dot, and handed to
 `gmm_v2.inner_kernel` unchanged.
 """
 import functools
-from typing import Any
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.megablox.fused_permute_gmm import config, memory_ref
+
+RowIssueFn = Callable[[jax.Array], None]
+TileIssueFn = Callable[[jax.Array | int, jax.Array | int], None]
 
 
 def tile_rows(
@@ -53,8 +56,8 @@ def tile_rows(
 def issue_row(
     row: jax.Array,
     *,
-    pool_ref: Any,
-    idx_smem: Any,
+    pool_ref: jax.Ref,
+    idx_smem: jax.Ref,
     gather: memory_ref.GatherRefs,
     slot: jax.Array,
     m_offset: jax.Array,
@@ -67,7 +70,7 @@ def issue_row(
     ).start()
 
 
-def _issue_block(block: jax.Array, carry: int, *, issue: Any,
+def _issue_block(block: jax.Array, carry: int, *, issue: RowIssueFn,
                  unroll: int) -> int:
     base = block * unroll
     for t in range(unroll):
@@ -75,8 +78,8 @@ def _issue_block(block: jax.Array, carry: int, *, issue: Any,
     return carry
 
 
-def _issue_tail(j: jax.Array, carry: int, *, issue: Any, n_full: jax.Array,
-                unroll: int) -> int:
+def _issue_tail(j: jax.Array, carry: int, *, issue: RowIssueFn,
+                n_full: jax.Array, unroll: int) -> int:
     issue(n_full * unroll + j)
     return carry
 
@@ -85,8 +88,8 @@ def issue_tile(
     step: jax.Array,
     slot: jax.Array,
     *,
-    pool_ref: Any,
-    idx_smem: Any,
+    pool_ref: jax.Ref,
+    idx_smem: jax.Ref,
     scratch: memory_ref.PipelineScratchRef,
     num_gm: jax.Array,
     cfg: config.Config,
@@ -165,7 +168,7 @@ def gathered_rows(gather: memory_ref.GatherRefs, slot: jax.Array,
     return gather.buf[slot].reshape(cfg.tiles.tile_m, cfg.tiles.tile_k)
 
 
-def warm_up(*, issue: Any, num_steps: jax.Array,
+def warm_up(*, issue: TileIssueFn, num_steps: jax.Array,
             tuning: config.Tuning) -> None:
     """Issue the first `lookahead` tiles, each only if the grid has its step.
 
@@ -182,7 +185,7 @@ def warm_up(*, issue: Any, num_steps: jax.Array,
                 issue, tile, tile % tuning.num_slots))
 
 
-def _issue_lookahead(*, issue: Any, step: jax.Array, slot: jax.Array,
+def _issue_lookahead(*, issue: TileIssueFn, step: jax.Array, slot: jax.Array,
                      lookahead: int) -> None:
     issue(step + lookahead, slot)
 
@@ -191,13 +194,13 @@ def pipeline_body(
         # In (pipelined)
         tiled_rhs_ref: gmm_v2.RhsRef,
         # Out (pipelined)
-        tiled_out_ref: Any,
+        tiled_out_ref: jax.Ref,
         # Scratch
         scratch: memory_ref.PipelineScratchRef,
         *,
         cfg: config.Config,
-        idx_smem: Any,  # int32[index_rows] SMEM, kernel-invariant
-        pool_ref: Any,  # [size_src, size_k // lanes, lanes] HBM
+        idx_smem: jax.Ref,  # int32[index_rows] SMEM, kernel-invariant
+        pool_ref: jax.Ref,  # [size_src, size_k // lanes, lanes] HBM
 ) -> None:
     """One grid step: issue tile s + lookahead, wait tile s, run the dot on it."""
     tuning = cfg.tuning
@@ -239,14 +242,14 @@ def pipeline_body(
 
 def kernel_main(
     # Scalar prefetch
-    lhs_group_sizes_ref: Any,
-    group_offset_ref: Any,
-    idx_smem: Any,
+    lhs_group_sizes_ref: jax.Ref,
+    group_offset_ref: jax.Ref,
+    idx_smem: jax.Ref,
     # In
-    lhs_ref: Any,
+    lhs_ref: jax.Ref,
     rhs_ref: gmm_v2.WeightsRef,
     # Out
-    out_ref: Any,
+    out_ref: jax.Ref,
     # Scratch
     scratch: memory_ref.ScratchRef,
     *,
