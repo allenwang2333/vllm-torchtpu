@@ -247,13 +247,17 @@ steps:
       K3_BLOCK_SIZE: "16"
       GPU_MEMORY_UTILIZATION: "0.82"
       ASYNC_SCHEDULING: "true"
-      # Their whole table, so the reproduction is judged against six cells of
-      # theirs and not one. ~5.5 min per repeat; the profiled cells override
-      # this to c=1.
-      K3_CONCURRENCY: "1 2 4 8 16 32"
-      NUM_PROMPTS_BY_CONCURRENCY: "1:6 2:8 4:8 8:8 16:16 32:32"
+      # NOTE: the concurrency sweep and the per-concurrency prompt counts are
+      # deliberately NOT set here. run_multihost_ray.sh interpolates the
+      # passthrough env unquoted into the worker's ssh command line, so any
+      # value containing a space is word-split and its fragments land as bare
+      # positional arguments to run_cluster.sh -- which then hands one of them
+      # to `docker run` as the image. Builds 341/342 died that way, pulling an
+      # image literally named '2:8', the second word of the prompt-count table.
+      # Both values now come from the config file instead. Keep every value in
+      # this block space-free.
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe --gsm8k 100 --gsm8k-cells 2"
+      - "bash .buildkite/scripts/run_with_incremental_upload.sh bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_knob_matrix.sh --config kimi-k3-tp32-theirs --results-dir /perf_eval_results/k3r4b --arms dummy,real,dummyprof,realprof,real,dummy,dummyuniform --reps 3 --probe --gsm8k 100 --gsm8k-cells 2"
       - "du -sh perf_eval_results/* || true"
     artifact_paths:
       - "perf_eval_results/**/*"

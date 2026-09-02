@@ -50,7 +50,7 @@ ENABLE_EP=true
 QUANTIZATION="compressed-tensors"
 
 ISL_OSL_CONFIGS="8192:1024"
-CONCURRENCY_OPTIONS="${K3_CONCURRENCY:-1 8}"
+CONCURRENCY_OPTIONS="${K3_CONCURRENCY:-1 2 4 8 16 32}"
 NUM_PROMPTS="${NUM_PROMPTS:-6}"
 # Their PROMPTS_PER_SLOT=6 with a floor of 5. At c>=8 that is many minutes of
 # decode per rep for no extra precision, so cap each level at one full batch
