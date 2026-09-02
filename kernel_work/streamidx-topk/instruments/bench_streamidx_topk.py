@@ -175,6 +175,11 @@ class Shape:
     note: str = ""
     # 0 means "the deployment is sized to this request", i.e. == context_len.
     max_model_len: int = 0
+    # 0 means "every slot in the batch is a real sequence of context_len".
+    # Otherwise: this many slots hold context_len and the rest hold
+    # `pad_seq_len`, modelling a compiled batch bucket that is mostly padding.
+    num_real_seqs: int = 0
+    pad_seq_len: int = 0
 
     @property
     def num_tokens(self) -> int:
@@ -302,9 +307,55 @@ def _agentx_shapes() -> list[Shape]:
     return out
 
 
+# The operating point the xprof capture was actually taken at. Read from the
+# job's own artifacts, not assumed:
+#
+#   benchmark_command.txt      --concurrency 1
+#   profile_export_console.txt Effective Decode Concurrency avg 1.02, p50 1.00
+#   profile_export_console.txt Prompt Tokens avg 105864, p50 110897, max 169053
+#
+# So the profiled call is ONE real sequence of ~110k tokens sitting in a
+# compiled batch-16 bucket with fifteen padding slots -- not sixteen real
+# sequences of 8192, which is what `agentx_decode_b16_ctx8192` models. Those
+# two differ on both axes at once and the errors run in opposite directions on
+# total KV volume, which is exactly how two unlike numbers land 11% apart and
+# look like agreement.
+#
+# What the padding slots' seq_lens entries hold in production is not yet
+# established, and it is the whole question: if they hold 0 the call does one
+# sequence's work, if they pay kv_len_max it does sixteen. So both are here.
+# The pair brackets the truth and the gap between them IS the measurement.
+PROFILE_CTX = 110592  # 432 pages of 256; nearest page-aligned to the p50 110897
+PROFILE_BUCKET = 16
+
+
+def _profile_shapes() -> list[Shape]:
+    mml = AGENTX_MAX_MODEL_LEN
+    common = dict(max_model_len=mml, num_real_seqs=1)
+    return [
+        Shape(f"profile_b{PROFILE_BUCKET}_1real_ctx{PROFILE_CTX}_pad0",
+              "decode", PROFILE_BUCKET, 1, PROFILE_CTX,
+              note="PROFILE-MATCHED, padding slots seq_len=0: the cost if the "
+              "15 padding slots are guarded out",
+              pad_seq_len=0, **common),
+        Shape(f"profile_b{PROFILE_BUCKET}_1real_ctx{PROFILE_CTX}_padfull",
+              "decode", PROFILE_BUCKET, 1, PROFILE_CTX,
+              note="PROFILE-MATCHED, padding slots seq_len=context: the cost "
+              "if every slot pays kv_len_max",
+              pad_seq_len=PROFILE_CTX, **common),
+        # The control the pair needs: one real sequence and nothing else, so
+        # the bucket's own contribution is visible rather than inferred.
+        Shape(f"profile_b1_ctx{PROFILE_CTX}",
+              "decode", 1, 1, PROFILE_CTX,
+              note="PROFILE-MATCHED control: batch 1, no padding slots at all",
+              max_model_len=mml),
+    ]
+
+
 def _default_shapes() -> list[Shape]:
     shapes: list[Shape] = _production_shapes()
     shapes += _agentx_shapes()
+    shapes += _profile_shapes()
 
     # `enable_early_exit` short-circuits when max(seq_lens) // compression_ratio
     # <= k. At k=2048 and compression_ratio=1 that is contexts <= 2048, so
@@ -377,6 +428,23 @@ class Geometry:
     num_bkv: int
 
 
+def _per_seq_bkv(shape: Shape, bkv_sz: int) -> list[int]:
+    """Per-slot kv-block count, matching the seq_lens the builder constructs.
+
+    Homogeneous batches give `num_seqs` identical entries; a batch with
+    `num_real_seqs` set gives that many at `context_len` and the rest at
+    `pad_seq_len`. A zero-length slot still gets one block, because the loop
+    runs `max(1, ...)` times.
+    """
+    if shape.num_real_seqs and shape.num_real_seqs < shape.num_seqs:
+        lens = ([shape.context_len] * shape.num_real_seqs +
+                [shape.pad_seq_len] *
+                (shape.num_seqs - shape.num_real_seqs))
+    else:
+        lens = [shape.context_len] * shape.num_seqs
+    return [max(1, cdiv(n // COMPRESSION_RATIO, bkv_sz)) for n in lens]
+
+
 def geometry(shape: Shape) -> Geometry:
     """Everything derivable from a shape without running anything."""
     # streamindex_topk.py:594 -- `pages_per_seq = page_indices.shape[0] //
@@ -413,14 +481,25 @@ def geometry(shape: Shape) -> Geometry:
 
     bkv_sz = bkv_p * PAGE_SIZE
     kv_len = shape.context_len // COMPRESSION_RATIO
+    # The loop trip count is derived from the LONGEST sequence in the batch
+    # (`kv_len_max = jnp.max(jnp.stack(kv_lens))`, streamindex_topk.py:275-276),
+    # so it does not shrink for a batch that is mostly padding.
     num_bkv = max(1, cdiv(kv_len, bkv_sz))
     num_bq = max(1, cdiv(shape.q_len, bq_sz))
 
     # `_fetch_bkv` DMAs bkv_p whole pages per (sequence, bq block, bkv block);
     # a bq block re-streams the entire KV range (streamindex_topk.py:385-418).
-    kv_stream_bytes = (shape.num_seqs * num_bq * num_bkv * bkv_sz * LKV_DIM)
-    kv_stream_useful = (shape.num_seqs * num_bq * num_bkv * bkv_sz *
-                        LKV_USEFUL_BYTES)
+    #
+    # For a heterogeneous batch this is a LOWER BOUND, and deliberately so. It
+    # charges each slot only for its own length -- i.e. it assumes the per-slot
+    # DMA is guarded. If it is not, every slot pays `num_bkv` and the true
+    # figure is the homogeneous one, up to `num_seqs / num_real_seqs` higher.
+    # Which of the two holds is the question these shapes exist to answer, so
+    # the geometry must not quietly pick a side; `useful%` and the header say
+    # which bound this is.
+    per_seq_bkv = _per_seq_bkv(shape, bkv_sz)
+    kv_stream_bytes = sum(per_seq_bkv) * num_bq * bkv_sz * LKV_DIM
+    kv_stream_useful = sum(per_seq_bkv) * num_bq * bkv_sz * LKV_USEFUL_BYTES
 
     return Geometry(
         pages_per_seq=pages_per_seq,
@@ -537,7 +616,19 @@ def build_inputs(shape: Shape, geo: Geometry, seed: int = 0) -> dict[str, Any]:
                             dtype=jnp.int32)).reshape(num_seqs,
                                                       geo.pages_per_seq)
 
-    seq_lens = jnp.full((num_seqs, ), shape.context_len, jnp.int32)
+    # Every row up to now has a homogeneous batch: num_seqs sequences all of
+    # context_len. Real serving batches are not like that -- vLLM compiles to
+    # bucket sizes (16, 32, 64, ...) and pads, so a batch-16 program can carry
+    # one real sequence and fifteen padding slots. That distinction is invisible
+    # in a homogeneous batch and decides whether the padding slots pay for the
+    # longest sequence's KV walk, which is the single largest open question
+    # about this op. `num_real_seqs` makes it askable.
+    if shape.num_real_seqs and shape.num_real_seqs < num_seqs:
+        seq_lens = jnp.where(
+            jnp.arange(num_seqs, dtype=jnp.int32) < shape.num_real_seqs,
+            shape.context_len, shape.pad_seq_len).astype(jnp.int32)
+    else:
+        seq_lens = jnp.full((num_seqs, ), shape.context_len, jnp.int32)
     cu_q_lens = (jnp.arange(num_seqs + 1, dtype=jnp.int32) * shape.q_len)
     num_decodes = num_seqs if shape.q_len == 1 else 0
     distribution = jnp.array([num_decodes, num_decodes, num_seqs], jnp.int32)
