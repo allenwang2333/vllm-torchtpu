@@ -382,6 +382,7 @@ def apply_tpu_patches() -> None:
         _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
         _patch_multiproc_worker_global_rank_env,
         _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
+        _patch_vllm_force_v1_runner_tpu,
         _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
@@ -389,6 +390,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
     _patch_vllm_merge_multimodal_embeddings()
+    _patch_vllm_force_v1_runner_tpu()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
@@ -647,7 +649,8 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
+        "MOE_FUSED_EP_V2_SHARDED_PLAN"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -954,10 +957,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
-        # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # the pool's align-mode mamba state seed copies; other cache modes
-        # must be rejected up front instead of failing partway through warmup.
-        if is_hybrid and cache_config.enable_prefix_caching:
+        # Real hybrid prefix hits need pooled Mamba state seed copies.
+        # DecodeBench installs synthetic state for each request instead.
+        transfer_config = vllm_config.kv_transfer_config
+        is_decode_bench = (transfer_config is not None
+                           and transfer_config.kv_connector
+                           == "DecodeBenchConnector")
+        if (is_hybrid and cache_config.enable_prefix_caching
+                and not is_decode_bench):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -1103,6 +1110,7 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
+                "DecodeBenchConnector",
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
