@@ -64,6 +64,20 @@ USEFUL_BYTES = 129  # D_IDX + D_IDX // QUANT_BLOCK
 
 MINOR_WIDTHS = (32, 64, 96, 128, 129, 160, 192, 224, 256)
 
+# The unsliced-memory-space name moved across jax versions: `pltpu.ANY` does
+# not exist on the image's jax 0.10.2 (job j-9e113359, shard 0, every arm
+# failed with AttributeError). `pltpu.HBM` is what the incumbent kernel itself
+# uses for `cache_kv` (`streamindex_topk.py:648`), so it is the name this probe
+# should be using anyway -- it puts the source ref in exactly the memory space
+# `_fetch_bkv` reads from.
+_HBM_SPACE = (getattr(pltpu, "HBM", None)
+              or getattr(getattr(pltpu, "MemorySpace", None), "ANY", None)
+              or getattr(pltpu, "ANY", None))
+
+# 100 MiB, matching `streamindex_topk.DEFAULT_VMEM_LIMIT_BYTES`, so the VMEM
+# scratch below is never the thing that fails to fit.
+VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
 
 def _p(tag, *rest):
     print(f"[P6] {tag}:", *rest, flush=True)
@@ -190,13 +204,17 @@ def run_minor_arm(total_rows, rows_per_copy, widths):
             f = pl.pallas_call(
                 kernel,
                 grid=(ngrid, ),
-                in_specs=[pl.BlockSpec(memory_space=pltpu.ANY)],
+                in_specs=[pl.BlockSpec(memory_space=_HBM_SPACE)],
                 out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
                 out_shape=jax.ShapeDtypeStruct((1, ), jnp.int32),
                 scratch_shapes=[
                     pltpu.VMEM(buf_shape, jnp.uint8),
                     pltpu.SemaphoreType.DMA((NBUF, )),
                 ],
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary", ),
+                    vmem_limit_bytes=VMEM_LIMIT_BYTES,
+                ),
             )
             f = jax.jit(f)
             t, iters = _time_pallas(f, x)
@@ -252,13 +270,17 @@ def run_major_arm(total_rows, rows_per_copy, S):
             f = pl.pallas_call(
                 kernel,
                 grid=(ngrid, ),
-                in_specs=[pl.BlockSpec(memory_space=pltpu.ANY)],
+                in_specs=[pl.BlockSpec(memory_space=_HBM_SPACE)],
                 out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
                 out_shape=jax.ShapeDtypeStruct((1, ), jnp.int32),
                 scratch_shapes=[
                     pltpu.VMEM(buf_shape, jnp.uint8),
                     pltpu.SemaphoreType.DMA((NBUF, )),
                 ],
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary", ),
+                    vmem_limit_bytes=VMEM_LIMIT_BYTES,
+                ),
             )
             f = jax.jit(f)
             tt, iters = _time_pallas(f, x)
@@ -380,6 +402,14 @@ def main():
 
     dev = jax.devices()[0]
     _p("device", dev.device_kind, "jax", jax.__version__)
+    _p("hbm memory space", repr(_HBM_SPACE),
+       "(names present on this pltpu: " +
+       ", ".join(n for n in ("HBM", "ANY", "SMEM", "VMEM")
+                 if hasattr(pltpu, n)) + ")")
+    if _HBM_SPACE is None:
+        _p("ABORT", "no usable unsliced memory-space name on this jax; "
+           "every arm would fail identically and the run would say nothing")
+        return 2
     _p("geometry", f"total_rows={args.total_rows}",
        f"rows_per_copy={args.rows_per_copy}",
        f"ngrid={args.total_rows // args.rows_per_copy}",
