@@ -1,0 +1,41 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# [branch-local] K3 generation-quality diagnostic: server bring-up, sanity
+# probes (/v1/completions vs /v1/chat/completions, pulled-dir inspection),
+# then a 20-question GSM8K at conc 8. No throughput bench. Select with
+# DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_ix_diag.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 generation-quality diagnostic (TPU v7x-32)"
+    key: k3_ix_diag
+    depends_on: build_docker
+    timeout_in_minutes: 240
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ix_sweep.sh --config kimi-k3-tp32-ep-ix --results-dir /perf_eval_results/k3-ix-diag --concs '8' --gsm8k-limit 20 --skip-bench"
+    artifact_paths:
+      - "perf_eval_results/**/*"

@@ -17,6 +17,7 @@ RESULTS_DIR="/perf_eval_results/k3-ix"
 SWEEP_CONCS="8 16 32 64 128"
 GSM8K_LIMIT=200
 PROFILE_CONC=0
+SKIP_BENCH=0
 PORT=8000
 
 while [[ $# -gt 0 ]]; do
@@ -26,6 +27,7 @@ while [[ $# -gt 0 ]]; do
         --concs)        SWEEP_CONCS="$2"; shift 2 ;;
         --gsm8k-limit)  GSM8K_LIMIT="$2"; shift 2 ;;
         --profile-conc) PROFILE_CONC="$2"; shift 2 ;;
+        --skip-bench)   SKIP_BENCH=1; shift ;;
         *) echo "[k3-ix-sweep] unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -74,6 +76,45 @@ if [ -n "$MODEL_URI" ]; then
 fi
 
 server_alive() { curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; }
+
+# Single-request generation-quality probes: plain completion (no chat
+# template) vs chat completion. Discriminates broken chat-template handling
+# from genuine garbage generation (gsm8k scored 0.0 with 1-token junk
+# responses in dev builds 346/348 while the content-blind bench passed).
+sanity_probe() {
+    echo "[k3-ix-sweep] --- sanity probe: pulled dir contents ---"
+    if [ -n "${TOK_DIR:-}" ]; then
+        find "$TOK_DIR" -maxdepth 1 -printf '%s\t%p\n' 2>/dev/null | head -20
+        python3 - "$TOK_DIR" << 'PYEOF'
+import json, os, sys
+d = sys.argv[1]
+tc = os.path.join(d, "tokenizer_config.json")
+if os.path.exists(tc):
+    cfg = json.load(open(tc))
+    ct = cfg.get("chat_template")
+    print(f"[k3-ix-sweep] tokenizer_config: keys={sorted(cfg)[:12]} chat_template_len={len(ct) if isinstance(ct,str) else type(ct).__name__}")
+else:
+    print("[k3-ix-sweep] no tokenizer_config.json in pulled dir")
+PYEOF
+    fi
+    echo "[k3-ix-sweep] --- sanity probe: /v1/completions (no template) ---"
+    curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$MODEL\",\"prompt\":\"The capital of France is\",\"max_tokens\":16,\"temperature\":0}" \
+        | python3 -c "import sys,json; r=json.load(sys.stdin); c=r.get('choices',[{}])[0]; print('[k3-ix-sweep] completion text:', repr(c.get('text'))); print('[k3-ix-sweep] finish_reason:', c.get('finish_reason'))" \
+        || echo "[k3-ix-sweep] completions probe FAILED"
+    echo "[k3-ix-sweep] --- sanity probe: /v1/chat/completions ---"
+    curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+3? Answer with just the number.\"}],\"max_tokens\":64,\"temperature\":0}" \
+        | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+c = r.get('choices', [{}])[0]
+m = c.get('message', {})
+print('[k3-ix-sweep] chat content:', repr(m.get('content')))
+print('[k3-ix-sweep] chat reasoning_content:', repr((m.get('reasoning_content') or '')[:200]))
+print('[k3-ix-sweep] finish_reason:', c.get('finish_reason'))
+" || echo "[k3-ix-sweep] chat probe FAILED"
+}
 
 run_ix_bench() {
     # run_ix_bench <concurrency> <num_prompts> <num_warmups> <result_stem> [--profile]
@@ -128,6 +169,8 @@ PYEOF
     return "$rc"
 }
 
+sanity_probe
+
 # ------------------------------------------------------------- profile mode
 if [ "$PROFILE_CONC" -gt 0 ]; then
     echo "[k3-ix-sweep] PROFILE MODE at concurrency $PROFILE_CONC"
@@ -166,8 +209,13 @@ for c in $SWEEP_CONCS; do
     np=$((4 * c)); [ "$np" -lt 32 ] && np=32
     warm=$((2 * c)); [ "$warm" -gt 32 ] && warm=32
     echo "[k3-ix-sweep] ===== conc=$c num_prompts=$np ====="
-    run_ix_bench "$c" "$np" "$warm" "ix_8k1k_c$c"
-    bench_rc=$?
+    if [ "$SKIP_BENCH" = "1" ]; then
+        bench_rc=99
+        echo "[k3-ix-sweep] bench skipped (--skip-bench)"
+    else
+        run_ix_bench "$c" "$np" "$warm" "ix_8k1k_c$c"
+        bench_rc=$?
+    fi
 
     bench_row="- | - | - | -"
     if [ $bench_rc -eq 0 ]; then
@@ -204,7 +252,9 @@ PYEOF
         gsm8k_cell="SERVER DOWN"
     fi
 
-    bench_state=$([ $bench_rc -eq 0 ] && echo ok || echo "FAILED(rc=$bench_rc)")
+    if [ $bench_rc -eq 0 ]; then bench_state=ok
+    elif [ $bench_rc -eq 99 ]; then bench_state=skipped
+    else bench_state="FAILED(rc=$bench_rc)"; fi
     echo "| $c | $bench_state | $bench_row | $gsm8k_cell |" >> "$SUMMARY"
     echo "[k3-ix-sweep] conc=$c bench=$bench_state gsm8k=$gsm8k_cell"
 done
