@@ -237,11 +237,33 @@ The stakes are the largest single number in this document:
 - **129 wide** → nothing to reclaim. Decode floor **39.0 µs, VPU-bound**, and decode has to attack
   the elementwise chain instead, the same as prefill.
 
-Opposite verdicts about what to optimize, so it is settled by measurement rather than argument.
-`probes/probe_lkv_dim.py` reads it two independent ways — the HBM the device is actually charged
-for a 129-wide versus a 256-wide allocation, and the tiled layout (`Array.format.tiling`) that
-would explain the charge. Two readings because a single surprising one is not something to build a
-design on. **Pending.**
+**Settled from code: 256.** Found while building the instruments, by following the allocation
+rather than the spec. The runner takes the `isinstance(kv_cache_spec, MLAAttentionSpec)` branch at
+`tpu_runner.py:6318` → `PallasMLAttentionBackend.get_kv_cache_shape` (`attention.py:1221-1264`) →
+`mla/v2/kernel.py:101-106`, which aligns the minor dim with `unsigned_align_to(kv_dim, 128)`. That
+is the 4-D shape `_streamidx_topk_jax` unpacks at `mla_attention_op.py:84`. The cache is
+`(total_num_pages, 256, 4, 256)` uint8: **129 of 256 bytes useful, 127 bytes of padding per
+record.**
+
+So the decode line of the roofline stands as written — floor **47.5 µs, HBM-bound**, with about
+half the dominant term being padding.
+
+**The 256 is a coincidence at this head dim, not a design.** It is reached through the DS-MLA
+packed-width formula, not through `align(129, 128)`. `_is_ds_mla_packed_cache` returns True for
+`torch.uint8` (`attention.py:1212-1218`) and the runner leaves `head_size_is_packed_width` at its
+default `False` (`tpu_runner.py:6342-6347`), so the indexer's `head_size = 129` is put through a
+nope/rope decomposition it does not have: `nope = 129 - 64 = 65`, `packed = 65 + 64*2 + 65//64 =
+194`, `align(194, 128) = 256`. The direct reading gives 256 too, so the value is right here — but
+the two disagree elsewhere. At `D_idx = 64` the formula gives 256 where the direct reading gives
+128, a 2x over-allocation. Anyone changing the indexer head dim needs this.
+
+There is also a second, unused allocation path: `VllmTPUDeepseekV32IndexerBackend`
+(`attention.py:1342-1371`) deliberately inherits upstream's **3-D** `get_kv_cache_shape`. The live
+GLM path does not use it, and the kernel only accepts the 4-D form (`streamindex_topk.py:592`
+unpacks four values). Recorded so it is not mistaken for the live one.
+
+`probes/probe_lkv_dim.py` now confirms rather than decides, and it is still worth running: the
+derivation above is subtle enough that an independent device-side reading is cheap insurance.
 
 ---
 
@@ -282,11 +304,40 @@ design on. **Pending.**
 
 ```
 probe:    Is SparseCore reachable on this stack, and does sparsecore_topk run at GLM-5.2 shapes?
-config:   tpu7x single-host, jax 0.10.2; sparsecore_topk at (b,n,k) =
-          (32,4096,512), (32,32768,2048), (64,65536,2048), (256,65536,2048)
-job:      pending
-answer:   pending
-decided:  whether the incumbent's stage B can be measured at all, and whether a challenger may
-          keep the top-k on SparseCore. references/hardware-facts.md records that no SparseCore
-          fact has ever been measured on this stack, while sparsecore_topk hard-raises without it.
+config:   tpu7x single-host 2x2x1 (pool tpu7x-singlehost-2026), jax/jaxlib 0.10.2, image
+          vllm-torchtpu-hning_google_com:ec4bcecf784d0bc3aeb8be37554431e3b5eef70b.
+          sparsecore_topk at (b,n,k) = (32,4096,512), (32,32768,2048),
+          (64,65536,2048), (256,65536,2048)
+job:      j-0b008512-36f2-4eb2-bdc6, JobStatus Succeeded
+answer:   PRESENT, and it works. get_tpu_info().sparse_core returned
+          SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16,
+          vmem_capacity_bytes=524288, dma_granule_size_bytes=32).
+          All four shapes ran with no NotImplementedError and no OOM, and all four
+          matched the numpy top-k set oracle exactly, including (256, 65536, 2048).
+          Host wall-clock, best of 5: 207.9 / 222.4 / 339.0 / 779.6 us.
+decided:  stage B can be measured, so the incumbent can be measured end to end; and a
+          challenger is allowed to keep the top-k on SparseCore rather than being
+          forced to fold it into the TensorCore kernel.
 ```
+
+**Two corrections this probe forces, both to documents that would otherwise have misled a design:**
+
+- **`references/hardware-facts.md` is wrong on this point.** It records that no SparseCore fact has
+  ever been measured on this stack and that "there is no SparseCore path on this stack to check it
+  against". There is, it works, and job `j-0b008512-36f2-4eb2-bdc6` is the evidence. A design that
+  had trusted that line would have ruled out the entire SparseCore option space for no reason.
+- **`sparsecore_topk.py`'s module docstring says "all 32 subcores on the chip".** The hardware
+  reports `num_cores=2, num_subcores=16` — that is 16 subcores *per* SparseCore, and 32 per chip
+  only if the two are multiplied. The kernel's partitioning constraint should be checked against
+  the field it actually reads before any candidate relies on a subcore count.
+
+**The timings are not a bandwidth measurement and must not be reused as one.** They are host
+`perf_counter` around `block_until_ready`, so they include dispatch. 208 µs → 222 µs across an 8x
+increase in `n` is the signature of fixed overhead dominating, not of a bandwidth wall. The implied
+0.00–0.09 TB/s against a 3.7 TB/s peak is therefore meaningless as a rate.
+
+**But the magnitude is a warning worth carrying into step 2.** If stage B really costs on the order
+of 200 µs at any shape, it dwarfs the entire modelled decode floor of 47.5 µs, and the op would be
+dominated by the top-k rather than by the scoring the roofline models. That would relocate the
+optimization target completely. The microbenchmark's `stage_b` arm is what settles it; until then
+this is a flag, not a finding.
