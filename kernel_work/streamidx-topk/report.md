@@ -1,7 +1,16 @@
 # Step 1 — `streamindex_topk` (the `streamidx_topk_jax` op) for GLM-5.2
 
-Status: **step 1 complete.** Roofline, instruments, baseline, correctness, achieved fractions, and
-the cross-check against the in-model xprof profile — which **agrees to 11%** (§6.2).
+Status: **step 1 complete, and self-corrected.** Roofline, instruments, baseline, correctness,
+achieved fractions, and an attempted cross-check against the in-model xprof profile.
+
+**This document has been through an adversarial review and carries its retractions inline rather
+than silently editing them out.** Five things an earlier draft asserted are withdrawn: the 11%
+profile cross-check (§6.2 — it compared a `--concurrency 1` profile against a full-batch
+microbenchmark and could not have failed), the 3.42× `max_model_len` ratio (§8 finding 1 —
+confounded with page size; ≈2.5× survives), the ~43 µs dispatch add-back (§6.2 — it was fitting; the
+profile has the real number), the 8%/16% AgentX achieved fractions (§8 — MiB read as MB, and one
+cell used the wrong formula), and "AgentX is the right target" (§6.2 — no artifact supports it being
+a served configuration). Where a retraction is marked, read the retraction and not the claim.
 
 **Nothing here is a measurement unless it carries a job id.** Everything from §4 is `modelled`. The
 jobs that measured something: `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe),
@@ -13,10 +22,14 @@ jobs that measured something: `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe),
 `max_model_len` 9216 and 262144 — and §3 through §6 are built on the first while every available
 profile captures the second. §6.1 keeps them apart; §6.2 measures both in one job.
 
-**The verdict is in §8.** Decode has structural headroom on both deployments — **21.5%** of its
-modelled floor at the nightly config, **8%** at AgentX — and the AgentX config is the target, for
-the reason in finding (4). Prefill is **unresolved**: its 72.7% must not be carried forward as
-headroom, and no captured profile contains an indexer-active prefill step to check it against.
+**The verdict is in §8, and it survives every retraction above.** Decode has structural headroom on
+both deployments: **21.5%** of its modelled floor at the nightly config and **8.4%** at AgentX, or
+**37% and 39%** once half of stage B is credited as irreducible. Far below the 80% line and below
+50%. **Writing a kernel is justified.** The two deployments are equivalent on this measure, so the
+nightly config — the one §3–§6 are built on, and the one the repo actually ships — is the baseline
+of record. Prefill is **unresolved**: its 72.7% must not be carried forward as headroom, its
+dominant floor term is an `assumed` rate that §7's probe failed to measure, and no captured profile
+contains an indexer-active prefill step to check it against.
 
 Two of the three step-1 probes returned confident answers to questions other than the ones asked;
 §7 corrects both rather than quoting them.
@@ -288,7 +301,14 @@ derivation above is subtle enough that an independent device-side reading is che
 
 **Baseline: job `j-8b1e7acc-ebdc-45d2-b46c`, `JobStatus=Succeeded`**, tpu7x single-host, image
 `vllm-torchtpu-hning_google_com:ec4bcecf...`, code at `cbabaf9b` (md5s of all four scripts and both
-kernel modules verified against the local tree in the pod log). Per-call medians. Times in µs.
+kernel modules verified against the local tree in the pod log). Times in µs.
+
+**These are best-of-N per call, not medians** — `bench_streamidx_topk.py:624` is
+`best = min(best, (time.perf_counter() - t0) / iters)` over the trial loop. An earlier draft of this
+section said "per-call medians"; it was wrong. Best-of-N is the right choice here (four shards share
+the pod, so the distribution's upper tail is contention rather than the kernel), but it means every
+number below is an *optimistic* estimate of the op's cost, and the two arms of a subtraction are
+each optimistic independently. That is one more reason the derived `stage A` column is soft.
 
 | shape | total | stage B | init | stage A (derived) | stage A (dispatch-corrected) |
 | --- | --- | --- | --- | --- | --- |
@@ -304,15 +324,29 @@ kernel modules verified against the local tree in the pod log). Per-call medians
 Column definitions. **total** = the whole `streamindex_topk` call. **stage B** = `sparsecore_topk`
 alone at the exact `(num_tokens, num_positions, k)` the op feeds it. **init** = the
 `jnp.full(-inf)` fill alone. **stage A (derived)** = `total − stage B − init`; it is **not
-measured**. **stage A (dispatch-corrected)** = the same subtraction after removing one measured
-host-dispatch floor (**42.0 µs/call**) from each separately-timed arm, since `total` pays that cost
-once while `stage B` and `init` each pay it again. The corrected column is the better estimate and
-is still an estimate — the floor was measured on a one-argument op and `streamindex_topk` takes
-seven, so 42.0 µs is a *lower* bound on the real dispatch cost.
+measured**. **stage A (dispatch-corrected)** — ⚠️ **RETRACTED, do not use this column.** It added
+back a measured one-argument host-dispatch floor (42.0 µs/call) on the theory that `total` pays it
+once while `stage B` and `init` each pay it again. §6.2 shows that was fitting, not correction: the
+floor varies 34.6–44.9 µs across concurrent shards, `init` comes in *below* it in 15 of 20 rows
+(which would imply negative device time), and `time_arm` blocks once at the end of its loop, so a
+call costs roughly `max(host, device)` and not their sum. The column is left in place because the
+arithmetic that produced it should be visible; the values are not evidence of anything. Use the
+**stage A (derived)** column, understanding that it is a subtraction of three
+independently-optimistic best-of-N timings and therefore soft in both directions.
 
 The fast-path row's `stage B` of 205.0 µs exceeds its `total` of 50.6 µs. That is not a
 contradiction: on the fast path `total` skips stage B entirely, while the `stage B` arm still times
 it standalone. Both are host-bound. No stage A is derivable there and none is claimed.
+
+**Run-to-run spread, measured.** `j-c13c8436` re-ran `prod_prefill_q1024_ctx9216` and got
+**929.9 µs** against the 857.3 µs above — **+8.5% on the total, +27% on the derived stage A** — at
+the same code and the same shape, differing only in which shard of the pod it landed on and what
+the other three shards were doing. Nothing in §8 turns on the difference, but two things follow.
+Any comparison below that pairs a number from `j-8b1e7acc` with one from `j-c13c8436` is
+cross-job, and I have built arguments on the 857.3 while a later job said 929.9. And a variant in
+step 3 beating the incumbent by less than ~10% on a derived stage A has not beaten it: **the
+incumbent must be re-measured in the same job as every challenger**, which the skill requires
+anyway and this number is the reason why.
 
 ### Achieved fraction, against the modelled floors of §4
 
@@ -493,30 +527,67 @@ quoted above — are unaffected.
 chip: both deployments at 5 trials and both again at 15, so every row below has an independent
 replicate. **They agree to within a few µs on every row.**
 
-### The cross-check itself
+### The cross-check itself — RETRACTED, it compared unlike things
 
-Both quantities below are the same thing — the wall-clock of one `streamindex_topk` call. In the
-model the TensorCore is *blocked* during the SparseCore stages, so the profile's per-layer
-TensorCore timeline is the call's cost, not just its compute.
+**What this section originally claimed:** that the profile's 298.4 µs/layer landed "between the two
+context rows, 11% above the ctx-8192 one — exactly where a replayed agent workload with contexts
+somewhat over 8k should land", and therefore that the microbenchmark measures what the model pays.
 
-| | value | source |
-| --- | ---: | --- |
-| profile, per indexer layer | **298.4 µs** | 6.267 ms/step ÷ 21 layers, `j-a71a648c` rank 0 |
-| bench, `agentx_decode_b16_ctx8192` | **269 µs** | `j-c13c8436`, 15 trials (276 µs at 5) |
-| bench, `agentx_decode_b16_ctx32768` | **472 µs** | `j-c13c8436`, 15 trials (470 µs at 5) |
+**That is withdrawn.** A `/critical-review` of this document pulled the profiled job's own artifacts
+— which this report had recorded as unread — and they contradict the assumption the check rested on:
 
-The profile lands **between the two context rows**, 11% above the ctx-8192 one — exactly where a
-replayed agent workload with contexts somewhat over 8k should land. The decomposition agrees too,
-after adding back the 43.4 µs/call host dispatch floor each derived arm double-pays:
+| | assumed here | what the job's artifacts say |
+| --- | --- | --- |
+| batch | 16 real sequences | **`--concurrency 1`**; effective decode concurrency avg 1.02, p50 1.00, max 4.00 |
+| context | "somewhat over 8k" | **prompt tokens avg 105,864, p50 110,897, max 169,053** |
 
-| | bench (b16, ctx8192) | profile | |
-| --- | ---: | ---: | --- |
-| stage A — the three scoring kernels | ~118 µs | **125.25 µs** | `StreamIdxTC-d` 114.63 + 5.40, `-m` 5.22 |
-| stage B — SparseCore top-k + offload | 165 µs | **174.6 µs** | 2×`gather_offload` 51.77, `sc_topk` done 56.19 + 14.88 |
+Source: `benchmark_command.txt` and `aiperf_artifacts/profile_export_console.txt` under
+`gs://cloud-devkit/jobs/j-a71a648c-3064-471a-a131/outputs/.../sidecar-bench/conc_1/`.
 
-**The microbenchmark measures what the model pays.** This also resolves §6.1's open worry that
-`gather_offload` was unmeasured: at 262144 the bench's stage-B arm goes through the same two-pass
-split and captures it.
+So the profiled call is **one real sequence of ~110k tokens in a compiled batch-16 bucket with
+fifteen padding slots** — 16 is the smallest entry in `compile_sizes`, the bucket floor. The bench
+arm it was compared against is **sixteen real sequences of 8,192 tokens**. The two differ on both
+axes at once, and the errors run in opposite directions on total KV volume. That is how two unlike
+numbers land 11% apart and look like corroboration.
+
+**And the check could not have failed.** Any profile value in [269, 472] µs would have been "between
+the two rows" — a 1.76× acceptance window, one free parameter, no residual test. §6.1 had listed the
+trace distribution under *"What the profile does not establish"* and recorded that it was not read;
+§6.2 then closed the cross-check on an assumption about it. It was one `gcloud storage cat` away.
+
+The decomposition claim went with it. The ~118 µs stage-A figure depended on adding back a 43.4 µs
+"host dispatch floor" per derived arm, and that correction does not survive either — see below.
+
+**What replaces this:** the bench now models the profiled batch directly
+(`num_real_seqs`/`pad_seq_len`, commit `9e880312`), as a *bracket* — padding slots at `seq_len` 0
+against padding slots at the full context, 28.9 MB against 432 MB of streamed KV. Which end is
+right depends on whether the per-slot KV DMA is guarded, which the loop bound
+(`kv_len_max = jnp.max(jnp.stack(kv_lens))`, `streamindex_topk.py:275-276`) does not settle on its
+own. Until those rows are measured **there is no validated cross-check between this microbenchmark
+and the model**, and §8's numbers are microbenchmark numbers.
+
+### The dispatch add-back was fitting, and the profile has the real number
+
+The `stageA*` column is derived as `t_total - t_b - t_init`, and each arm separately pays a host
+dispatch cost, so I added ~43 µs back. The algebra is right; the model underneath it is not:
+
+- **It implies negative device time.** `t_init = D + I` requires `init_ms >= dispatch_floor_ms`. In
+  **15 of the 20 successful rows** of `j-c13c8436` it is not — including the headline row, where
+  init is 28.6 µs against a 43.4 µs floor.
+- **The floor is not a constant.** 44.9, 34.6, 43.4, 43.4 µs across four shards running
+  concurrently — a 30% spread on a correction that is 58% of the quantity being corrected.
+- **`time_arm` cannot support additivity.** It enqueues `iters` calls and blocks *once* at the end,
+  so per-call ≈ max(host enqueue, device), not their sum — and `iters` differs per arm.
+
+**The profile supplies the correct figure.** The in-model `-inf` init is
+`%broadcast.33911 = f32[16,2048,128] broadcast(f32[] constant)`, 21 instructions, avg self time
+**6.02 µs**, which is 2.79 TB/s for a 16.78 MB write — physically sensible. The shape is exactly the
+bench's `init_shape`. The bench's init arm reads 28.6 µs for the same write, so ~22.6 µs of that arm
+is harness overhead, not 43.4.
+
+**This answers one of §8's step-2 probe questions outright: the `-inf` init is 6.02 µs of a ~300 µs
+call — 2% — and is not worth attacking.** Removing it from the candidate list is the one unambiguous
+gain from this cross-check.
 
 ### The finding this run exists to have made
 
@@ -533,36 +604,76 @@ tokens of context, byte-identical KV streamed. Only `max_model_len` differs.
 | stage A (derived) | 87 µs | 264 µs | 3.0× |
 | init | 45 µs | 35 µs | 0.76× |
 
-**Identical work, 3.4× the time.** The op's cost is set by `max_model_len` and not by the context
-it is actually asked to score. At the AgentX deployment 8192 real tokens sit in a 262144-wide
-buffer — 3.1% useful — and the call costs three and a half times what the same work costs when the
-buffer is sized to it.
+**3.4× the time — but the two columns differ in page size as well, and that is a confound I did not
+isolate.** The review sized it, and the effect splits cleanly in two:
 
-Stage A is the surprise. It streams the *same 128 MB* of KV in both columns and still takes 3× as
-long, so its extra cost is not the read: it is the grid. At `bkv_p`=2 the padded position range
-gives 5 kv blocks at the nightly config and 512 at AgentX, and the kernel walks all of them,
-writing `-inf` across a buffer 25.6× too large. That is the mechanism behind §8's finding (1), now
-isolated rather than inferred.
+| component | nightly | AgentX | gap | driven by |
+| --- | ---: | ---: | ---: | --- |
+| stage B | 63.1 | 371.3 | **+308 µs** | `num_positions` 10240 → 262144 — **`max_model_len`** ✓ |
+| stage A (derived) | 98.8 | 264.5 | +166 µs | `num_bkv` 4 → 16 — **page size**, confounded ✗ |
+| init | 33.6 | 35.1 | +1.5 | neither; dispatch-dominated at both |
 
-### This reframes which deployment to optimize
+Page size sets `bkv_sz = bkv_p × PAGE` = 2048 vs 512, hence `num_bkv = cdiv(kv_len_max, bkv_sz)` =
+**4 vs 16** at identical context. The bench records this itself in `geo_num_bkv` and I did not read
+it. So the inner KV loop runs 4× more iterations at AgentX purely because the pages are smaller.
 
-The nightly config's own comment says model-len 9216 beat the 32768 geometry by **+7% throughput /
-−7% TPOT** — someone already met this cost at the whole-model level and worked around it by
-shrinking `max_model_len`. **The AgentX deployment cannot use that workaround**: replayed agent
-traces need the long context, which is what the 262144 is for. So the headroom is 3.4× larger there
-*and* it is the configuration with no other way out.
+**The stage-B half is clean and is the real finding: 5.9× for a 25.6× wider score buffer at
+byte-identical KV.** The stage-A half is not evidence for `max_model_len` at all. Holding stage A
+fixed, the `max_model_len`-attributable ratio is **≈2.5×**, not 3.42×.
 
-Rough achieved fractions at the AgentX config, against an HBM floor recomputed the same way as §4
-(`kv_stream` + score write + score read, ÷ 2.97e12 B/s achieved per-TensorCore):
+**My stated mechanism for stage A was also wrong.** I wrote that the grid "gives 5 kv blocks at the
+nightly config and 512 at AgentX". Those are `num_positions / bkv_sz`; the loop is bounded by
+`kv_len_max`, giving 4 and 16. And the `-inf` write is the separate `jnp.full` measured by the
+`init` arm, which `t_a = t_total - t_b - t_init` subtracts out by construction — it cannot be inside
+derived stage A. The adjacent `init` row (45 → 35 µs, *smaller* at 25.6× the width) said so and I
+wrote past it.
 
-| shape | HBM bytes | modelled floor | measured | achieved |
-| --- | ---: | ---: | ---: | ---: |
-| `agentx_decode_b16_ctx8192` | 64 MB | 21.5 µs | 269 µs | **8%** |
-| `agentx_decode_b64_ctx8192` | 256 MB | 86 µs | 671 µs | **13%** |
+**The deconfounding experiment was already in the file and I did not run it.** `PINNED_MAX_MODEL_LEN
+= 65536` with `PINNED_DECODE` gives rows that vary `max_model_len` at **fixed page size 1024**, each
+with a `max_model_len == context_len` twin. Running.
 
-Both are `modelled` and both are rougher than §4 — they are a recomputation, not a rederivation.
-But at 8–13% the exit table's verdict does not depend on the precision: this is far below the 50%
-line, and it is a stronger **proceed** than the nightly config's 21.5%.
+### "This reframes which deployment to optimize" — WITHDRAWN
+
+This section argued AgentX was the target. It does not hold, for three separate reasons, and the
+retraction is more useful than the claim was.
+
+**1. The achieved-fraction gap was an arithmetic error.** §8 tabulated the AgentX sensitivity cell
+as 16%, which is simply `2 × 8%` — the floor was doubled instead of half of stage B being added.
+The correct figure under the same formula the other two cells use, `(floor + stage_B/2) / measured`:
+
+| | nightly | AgentX | prefill |
+| --- | ---: | ---: | ---: |
+| as published | 37% | **16%** ✗ | 101% |
+| recomputed | 36.7% ✓ | **38.7%** | 100.8% ✓ |
+
+**37% and 39% — indistinguishable.** The b64 like-for-like row lands at 41%. Stage B is 61% of the
+AgentX call against 30% of the nightly one, so the term that was dropped is precisely the one that
+dominates the column the argument depended on. There is no headroom gap between the deployments.
+
+**2. The raw fractions are also slightly off**, from reading MiB as MB: **8.4% and 13.5%**, not 8%
+and 13%. Immaterial to the gate, and in the self-serving direction.
+
+**3. No artifact supports AgentX being a served configuration.** The scenario is
+`inferencex-agentx-mvp` over a public trace replay, at `--concurrency 1` for 30 minutes, and §6.1's
+own sibling list (TP×DP of 16×1, 2×8, 8×2, 1×16) is a **sharding sweep** — the signature of
+bring-up. The repo's nightly config describes TP=16 as "13× the TP=16 bring-up throughput" *worse*
+than the layout it ships. The string "agentx" appears nowhere in `vllm-torchtpu` outside
+`kernel_work/`. My claim that "a long-context agent deployment cannot shrink `max_model_len`" is
+about a hypothetical deployment class and is supported by nothing here; it may be true, but this
+document did not establish it and presented it as settled.
+
+**4. The `+7% / −7%` citation is confounded twice and is one number, not two.** The comment at
+`glm-5.2-fp8-dp16-ep.sh:9-10` reads "model-len 9216 **+ 64 seqs/engine** beat the **32768/1024**
+geometry" — `max_num_seqs` changed 16× alongside `max_model_len` — and it is a **cross-build**
+comparison (dev 190 vs 196). At fixed concurrency throughput ≈ concurrency/TPOT, so +7% and −7% are
+the same measurement stated twice, not mutual corroboration. CLAUDE.md's rule about recovering a
+repo number's configuration before quoting it applies, and I did not follow it.
+
+**What survives:** `max_model_len` really does drive stage B (5.9× at byte-identical KV), and that
+is deployment-independent — it would appear at the nightly's TP=1×DP=16 too, given a long
+`max_model_len`. What must not be carried forward is AgentX's **absolute** numbers, its achieved
+fractions, or its step composition (indexer 32.8%, collectives 18.7%) as the thing to optimize
+against. **The nightly config is the baseline of record.**
 
 ### Two things the run turned up that are not results about the kernel
 
@@ -637,11 +748,26 @@ as the benchmark's own geometry line independently confirms — `cache_kv shape 
 4, 256) uint8`, `useful 129/256 bytes = 50.4%`. There is no XLA padding because the padding is
 explicit in the shape.
 
-**Read correctly, the probe strengthens the case rather than killing it.** It shows XLA is perfectly
-able to lay out a 129-wide array with no padding at all (charged ratio 1.001). So the 127 wasted
-bytes per record are a *choice made in the shape computation*, not a hardware or layout constraint —
-which is precisely what makes them reclaimable. Had the answer been "the layout forces 256", the
-lever would not exist.
+**Read correctly, the probe shows the padding is a choice — but a weaker one than I first wrote.**
+XLA did lay out a 129-wide array with no padding (charged ratio 1.001), so the 127 wasted bytes are
+a choice made in the shape computation and not a hardware constraint. My original text went on to
+call them "reclaimable", and the probe's own second reading does not support that:
+
+```
+layout_129:  major_to_minor=(0,3,2,1),  tiling ((4,128),(4,1))
+layout_256:  major_to_minor=(0,1,2,3),  tiling ((4,128),(4,1))
+```
+
+**XLA avoided the padding by transposing, not by packing 129 into the minor dimension.** At 129 wide
+it moved that dimension *out* of minor position. The kernel cannot consume that layout: `_fetch_bkv`
+DMAs contiguous `[page_size_per_kv_packing, kv_packing, lkv_dim]` slabs and `compute_scores` needs
+`lkv` minor for 128-lane loads. And the cache is not the indexer's to reshape — it is the same
+`cache_kv` the MLA v2 attention kernel reads.
+
+So the correct statement is: **the 49.6% padding is real and is not forced by the layout engine, but
+no free layout that removes it has been demonstrated.** Reclaiming it means a packing change across
+two consumers, which is a step-2 design question with a real cost, not a lever lying on the floor.
+The decode floor of §4 keeps the 256-wide byte count.
 
 The lesson for later probes: a probe that asks about a shape the production code does not allocate
 can return a clean, confident, correctly-computed answer to a question nobody asked.
@@ -679,11 +805,17 @@ but secondary; the design of the probe is the primary defect.
 resident in VMEM, so that HBM is out of the loop and the VPU is the only thing left to bind. That is
 a step-2 probe, and until it runs the prefill floor's dominant term remains **`assumed`**.
 
-Two things it did establish, both incidental:
-- **The fold `relu(x)*w == relu(x*w)` is bit-exact on TPU** (`max_abs_diff = 0.000e+00`, versus
-  3.8e-6 on CPU). It is still only valid where `w >= 0`, which the weights' construction
-  (`indexer_weights * softmax_scale * n_head**-0.5 * q_scales`) does not guarantee. Must be checked
-  against real weights before any design uses it.
+Two things it did establish, both incidental — and the first is weaker than I originally wrote:
+- **The fold `relu(x)*w == relu(x*w)` matched to `max_abs_diff = 0.000e+00`.** I recorded this as
+  "bit-exact on TPU", which overstates it in two ways. It is **algebraically exact for any `w >= 0`**
+  under IEEE-754 — `relu` either returns `x` or `+0.0`, and multiplication distributes over both —
+  so it is a property of the arithmetic, not of TPU. And the probe draws `w` from
+  `rng.random()` ∈ [0, 1) (`probe_vpu_chain.py:94`), so **the check could not have failed**; it
+  confirms the implementation matches the algebra, nothing more. My original text also cited
+  "versus 3.8e-6 on CPU" — **that figure appears in no artifact**; the probe never ran on CPU. It
+  is deleted, not corrected. The real precondition is unchanged and untested: valid only where
+  `w >= 0`, which `indexer_weights * softmax_scale * n_head**-0.5 * q_scales` does not guarantee.
+  Must be checked against real weights before any design uses it.
 - Whatever removes one elementwise op from this chain buys ~5% here (215.7 vs 227.1 µs), in a regime
   that is not the one the kernel runs in. Not a basis for a design.
 
@@ -691,62 +823,143 @@ Two things it did establish, both incidental:
 
 ## 8. Step-1 verdict
 
-**Step 1 is complete. The gate is passed at decode, on both deployments, and the cross-check
-against the in-model profile agrees to 11%.** Prefill is unresolved and must not be treated as
-headroom.
+**Step 1 is complete. The gate is passed at decode. Writing a kernel is justified.** Prefill is
+unresolved and must not be treated as headroom. The in-model cross-check is **retracted** (§6.2) —
+it compared a `--concurrency 1` profile against a full-batch microbenchmark and could not have
+failed; the gate does not rest on it.
 
-| | nightly decode | **AgentX decode** | prefill (nightly) |
+| | nightly decode | AgentX decode | prefill (nightly) |
 | --- | ---: | ---: | ---: |
-| measured | 221.4 µs (`j-8b1e7acc`) | **269 µs** (`j-c13c8436`) | 857.3 µs (`j-8b1e7acc`) |
-| modelled floor | 47.5 µs (§4) | 21.5 µs (§6.2, rough) | 623.3 µs (§4) |
-| achieved | 21.5% | **8%** | 72.7% |
-| crediting half of stage B as irreducible | 37% | 16% | **101%** |
-| in-model cross-check | not captured | **298.4 µs, +11%** | no capture exists |
-| verdict | structural — proceed | **structural — proceed, and this is the target** | **unresolved — do not proceed on this number** |
+| measured | 221.4 µs (`j-8b1e7acc`) | 269 µs (`j-c13c8436`) | 857.3 µs (`j-8b1e7acc`) |
+| modelled floor | 47.5 µs (§4) | 22.6 µs (§6.2, rough) | 623.3 µs (§4) |
+| achieved | 21.5% | 8.4% | 72.7% |
+| crediting half of stage B as irreducible | **36.7%** | **38.7%** | **100.8%** |
+| verdict | structural — proceed | structural — proceed | **unresolved — do not proceed on this number** |
 
-Every floor figure is `modelled`; every measured figure carries its job id. The AgentX floor is a
-recomputation in §6.2 rather than a rederivation, and is the rougher of the two — but at 8% the
-exit-table verdict does not turn on its precision.
+Every floor figure is `modelled`; every measured figure carries its job id. Read this table by the
+**bottom** row, not the one above it: the floor of §4 gives stage B's compute no term at all, and
+stage B is 30% of the nightly call and 61% of the AgentX one, so the raw `achieved` row is a lower
+bound that flatters the two deployments unequally. The sensitivity row applies
+`(floor + stage_B / 2) / measured` uniformly.
 
-### The four findings that order step 2
+Three corrections against an earlier draft of this table, all found by review: the AgentX
+sensitivity cell read **16%**, which was `2 × floor / measured` — the wrong formula, in the one cell
+that carried the retarget argument; the raw fractions read 8% and 13% from taking MiB as MB; and
+`--concurrency 1` in the profiled job broke the cross-check row, which is now gone.
 
-1. **The op's cost is set by `max_model_len`, not by the work.** §6.2 measures this at identical
-   real work — same 64 sequences, same 8192-token context, byte-identical 128 MB of KV streamed —
-   and gets **196 µs against 671 µs, a 3.4× spread**, with the only difference being a score buffer
-   25.6× too wide. The same signature appears in the batch sweep (1.55× the time for 8× the tokens)
-   and in the profile (6.4× the score elements for 1.0–1.5× the time). **Three independent
-   measurements at two configurations; this is the most robust thing in this document, and it is
-   what a kernel should attack.**
+**The two deployments have the same achieved fraction — 37% against 39%.** There is no headroom gap
+between them, and §6.2 withdraws the claim that AgentX is the target. Both are far below the 80%
+line and comfortably below 50%. **This conclusion is the one thing in this document that no finding
+above disturbs.**
 
-2. **Stage B is the largest single component and the floor models none of its compute.** 30% of
-   the nightly decode call, 56% of prefill, **61% of the AgentX decode call** (165 of 269 µs), and
-   confirmed in the profile at 174.6 µs of the 298.4. It is an exact MSB-first radix select. Whether
-   it is near its own floor decides whether prefill has any headroom at all and re-ranks every
-   decode candidate.
+**The prefill column is the one to be careful with.** At 101% the modelled floor is *below* the
+measurement, which by the exit table means the floor is wrong or the code is skipping work — not
+that prefill is optimal. Its dominant term is the `assumed` VPU rate that §7's probe failed to
+measure. Prefill is out of scope for a step-2 design until that probe is redone in VMEM.
 
-3. **127 of every 256 K-cache bytes are padding**, in the term that is 95% of nightly decode HBM
-   traffic. §7 establishes the padding is a shape choice, not a layout constraint; §6.1 confirms the
-   shape in production HLO (`u8[3027,64,4,256]`).
+### The findings that order step 2
 
-4. **The AgentX deployment is the right target, and it is not the one §3 was built on.** The nightly
-   config already worked this cost around by shrinking `max_model_len` to 9216 — its own comment
-   records +7% throughput / −7% TPOT for doing so. A long-context agent deployment cannot. The
-   headroom is 3.4× larger there and there is no configuration escape from it.
+**1. `max_model_len` sets the op's cost, and the cost lives in stage B.** §6.2 measures this at
+byte-identical real work — same 64 sequences, same 8192-token context, same 128 MB of KV streamed —
+and the mml-attributable spread is **≈2.5×**, not the 3.42× an earlier draft claimed: the raw
+196→671 µs comparison also changed page size 1024→256, which quadrupled `num_bkv` and moved stage A
+by +166 µs for reasons having nothing to do with `max_model_len`. Decomposed:
+
+| | Δ | driven by |
+| --- | ---: | --- |
+| stage B | **+308 µs (5.9×)** | `max_model_len` ✓ |
+| stage A | +166 µs | page size ✗ |
+| init | +1.5 µs | `max_model_len`, negligible |
+
+The clean half is the large half and it is **entirely in stage B**, whose row width is
+`num_sublanes_total` and therefore literally `max_model_len`. This is a finding about the score
+buffer, not about the KV walk — and finding (2) explains why it could not have been otherwise.
+
+**2. Stage A's KV walk is already `seq_len`-bounded across the batch, and unguarded within groups of
+four.** Read from source (`streamindex_topk.py`, corroborating the decomposition above by an
+independent route):
+
+- The Pallas grid is `((end_seq_idx - start_seq_idx) // seq_batch_size,)` at `:643`, and
+  `end_seq_idx` comes from `distribution`, which `tpu_runner.py:3175` sets to the **real** request
+  count, not the padded bucket. **Batch-bucket padding slots are never visited.** The 15 padding
+  slots in a batch-16 bucket cost nothing in stage A.
+- Within one grid step, `_fetch_bkv` (`:168-194`) is a *Python* loop over `seq_batch_size` emitting
+  an unconditional, constant-length `_async_copy` per slot. There is no `pl.when`, no predicated
+  size. The trip count is the single scalar `kv_len_max = jnp.max(...)` at `:275-276`. Per-sequence
+  `seq_lens` appears **only** in output masks (`:344`, `:347`). So **every slot in a group of
+  `decode_req_batch_size = 4` pays the longest sequence in that group** — full DMA, full einsum,
+  full VPU chain, full score write-back, with only the values discarded.
+- The authors knew: the TODO at `:751-754` proposes sorting sequences by length for exactly this.
+
+The waste is therefore bounded by the length spread **within groups of 4**, not by the bucket. That
+is a real lever but a much smaller one than "the padding slots pay for the longest sequence", which
+is what §6.2's bracket was built to measure. Contrast `_fetch_bq` at `:209-219`, which *does* issue
+a variable-length copy — the machinery exists and is simply not used for KV.
+
+**3. Stage B is the largest single component and the floor models none of its compute.** 30% of the
+nightly decode call, 56% of prefill, 61% of the AgentX decode call (165 of 269 µs). It is an exact
+MSB-first radix select. **Amdahl bounds everything step 2 can do to stage A: a stage A reduced to
+zero caps the AgentX op at 1.64× and the nightly at 1.43×.** Combined with finding (1) — the
+mml cost *is* stage B — this makes stage B's own floor the single most consequential unknown in the
+document, not a footnote to a stage-A design.
+
+**4. 127 of every 256 K-cache bytes are padding**, in the term that is 95% of nightly decode HBM
+traffic. §6.1 confirms the shape in production HLO (`u8[3027,64,4,256]`). §7 establishes the padding
+is a shape choice rather than a layout constraint — but **not that it is cheaply reclaimable**: the
+only no-padding layout XLA demonstrated is a transpose the kernel cannot consume, and the cache is
+shared with the MLA v2 attention kernel. Reclaiming it is a two-consumer packing change.
+
+**Withdrawn: "AgentX is the right target."** See §6.2. The achieved fractions are equal once the
+arithmetic is right (37% vs 39%), no artifact supports AgentX being a served configuration rather
+than a bring-up sweep, and the `+7% / −7%` citation that argued the nightly config had "already
+worked the cost around" is confounded twice — it moved `max_num_seqs` 16× alongside
+`max_model_len`, across two dev builds, and at fixed concurrency its two halves are one
+measurement. **The nightly config is the baseline of record.**
 
 ### What step 2 must probe before designing
 
-Each of these currently carries a design decision:
+Each of these currently carries a design decision. Ordered by what they gate:
 
 - **stage B's own floor**, and whether exact top-k is required or approximate would do
-  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; the reason is not recorded)
-- **whether the grid can be bounded by `seq_len` instead of `max_model_len`** — finding (1) says
-  this is the lever; nothing yet says what stops the incumbent from doing it
-- **whether the `-inf` init is needed at all**, given `sparsecore_topk` takes `row_lengths`
-- **the VPU term, properly, in VMEM** — §7 explains why the first attempt does not count
-- **whether `StreamIdxTC-d`'s bimodality is by design** — 114.63 µs against 5.40 µs across 21+21
-  instructions (§6.1), unexplained at the XLA op level
-- **whether the ~43 µs dispatch floor is real per-call overhead in the model** or an artifact of
-  timing the op standalone. At 21 invocations per step, the difference between a rounding error and
-  0.9 ms/step.
-- **whether the indexer weights are non-negative**, which gates the bit-exact `relu(x)*w == relu(x*w)`
-  fold (§7)
+  (`sparsecore_topk` replaced `approx_max_topk` in `6142d5e7`; the reason is not recorded). By
+  findings (1) and (3) this is now the **first** probe, not one of seven — it decides whether the
+  mml cost is attackable at all and it bounds every stage-A candidate.
+- **whether stage B's row width can be bounded by `seq_len` instead of `max_model_len`.** Finding
+  (1) locates the lever precisely here. `sparsecore_topk` already takes `row_lengths`
+  (`eff_row_lengths`, `:505-506`), so the information is present; what is unknown is whether the
+  radix select's cost tracks it or the buffer width.
+- **whether sorting or grouping sequences by length is worth it**, given finding (2)'s
+  group-of-4 granularity — this needs the real length distribution of a served batch, which no
+  artifact here has.
+- **the VPU term, properly, in VMEM** — §7 explains why the first attempt does not count. Gates
+  prefill entirely.
+- **whether `StreamIdxTC-d`'s bimodality is by design** — 114.63 µs against 5.40 µs (§6.1).
+  Finding (2) supplies a candidate explanation that did not exist before: of the three
+  `run_scores_kernel` calls, two get a **zero-length grid** when `distribution[0] % 4 == 0` and
+  `distribution[1] == distribution[2]`, so 5.40 µs may simply be an empty kernel's fixed cost.
+  Cheap to confirm, and it would remove a mystery rather than a cost.
+- **whether the indexer weights are non-negative**, which gates the `relu(x)*w == relu(x*w)` fold
+  (§7).
+
+**Closed during step 1, no longer probes:**
+
+- ~~whether the `-inf` init is needed~~ — the profile has it directly:
+  `%broadcast.33911 = f32[16,2048,128]`, **6.02 µs at 2.79 TB/s**, ~2% of the call. Real, near
+  bandwidth, and not worth attacking. The ~43 µs the standalone bench attributes to it is host
+  dispatch.
+- ~~whether the ~43 µs dispatch floor is real in-model overhead~~ — it is not; see §6.2. The
+  add-back was fitting, and the same profile row above replaces it with a measurement.
+
+### One instrument defect to fix before step 2 measures anything
+
+`bench_streamidx_topk.py:634` sets `distribution = [num_seqs, num_seqs, num_seqs]` unconditionally,
+including for the `num_real_seqs=1` bracket shapes added in §6.2. By finding (2) the grid is sized
+from `distribution`, so `profile_b16_1real_ctx110592_pad0` runs **four** slots at full length
+(one group of `decode_req_batch_size=4`), not one — roughly 4× the production call it was built to
+model. The `padfull` arm and every homogeneous `prod_*` / `agentx_*` shape are unaffected, since
+there `distribution` and the real count agree.
+
+The fix is one line — `distribution = [num_real_seqs, num_real_seqs, num_real_seqs]` where
+`num_real_seqs` is set. It is deferred only because a job using the current file is in flight;
+the `pad0` numbers it returns must be read as *four* real sequences, and `_per_seq_bkv`'s
+lower-bound geometry is wrong for that arm in the opposite direction.
