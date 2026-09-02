@@ -6,6 +6,7 @@
 # SIGTERM; without them only the pytest parent process is measured and
 # runner/worker/executor coverage is drastically understated.
 [run]
+branch = true
 parallel = true
 concurrency = multiprocessing
 sigterm = true
