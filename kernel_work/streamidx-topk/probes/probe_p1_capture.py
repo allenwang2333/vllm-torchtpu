@@ -37,10 +37,12 @@ Workload: the nightly decode stage-A `pallas_call` **in isolation**
 ctx 8704, num_positions 10240, out 2.62 MB f32), launched through
 `_stage_a.py`, which transcribes the incumbent's own launch without editing it.
 
-A reference arm (`--ref`) runs the same shape through a plain XLA formulation
-of the same score computation, so the five discriminating LLO fields have
-something to be diffed against -- `/xprof-llo` is explicit that a single
-kernel's absolute numbers do not support a conclusion.
+A reference arm (`--arm ref`) runs the **same kernel at `bkv_p=1`** -- same
+bytes, same compute, half the DMA granule and twice as many transfers.  This is
+the reference the reading needs: /xprof-llo is explicit that a single kernel's
+absolute numbers do not support a conclusion, and this particular pair is also
+area 3's own crude DMA discriminator, so the LLO fields and the wall clock are
+answering the same question two ways.
 """
 
 from __future__ import annotations
@@ -97,9 +99,26 @@ import jax.numpy as jnp  # noqa: E402
 import _stage_a  # noqa: E402
 
 
-def build_stage_a():
+def build_stage_a(bkv_p: int = 2):
     g, inp = _stage_a.build_nightly_inputs()
-    fn = _stage_a.nightly_decode_call1(g)
+    # `num_sublanes_total` is held at the production value (80) for both arms,
+    # so the output buffer -- and therefore the write-back traffic -- is
+    # identical and only the DMA granule moves.  bkv_p=1 writes 9 blocks x 8
+    # sublanes = 72 <= 80, so it fits.
+    fn = _stage_a.make_stage_a_fn(
+        num_q_heads=g["h_idx"],
+        head_dim=g["d_idx"],
+        page_size_per_kv_packing=g["page_size"] // g["kv_packing"],
+        kv_packing=g["kv_packing"],
+        lkv_dim=g["lkv_dim"],
+        num_sublanes_total=g["num_sublanes_total"],
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=g["bq_per_block"],
+        static_q_len=1,
+        seq_batch_size=g["decode_req_batch_size"],
+        case=_stage_a.MlaCase.DECODE,
+        compression_ratio=g["compression_ratio"],
+    )
     n_seqs = jnp.int32(g["num_seqs"])
     zero = jnp.int32(0)
 
@@ -115,39 +134,8 @@ def build_stage_a():
     return g, run, args
 
 
-def build_ref():
-    """Reference arm: the same score computation expressed in plain XLA.
-
-    Dequantizes the fp8 K cache, gathers each sequence's pages, and evaluates
-    `sum_h relu(q_h . k) * w_h` densely.  It is NOT a candidate -- it is only
-    here so the LLO fields have a reference to be diffed against, as
-    /xprof-llo requires.  It is a *different* program (an XLA fusion, not a
-    Pallas kernel), so `list_llo_programs` will name it differently.
-    """
-    g, inp = _stage_a.build_nightly_inputs()
-    T, H, D = g["num_tokens"], g["h_idx"], g["d_idx"]
-    S = g["num_positions"]
-    pps = g["pages_per_seq"]
-    ps = g["page_size"]
-
-    @jax.jit
-    def run(q, w, cache_kv, seq_lens, page_indices, cu_q_lens):
-        # cache_kv: u8[pages, ps//4, 4, 256] -> per (page, slot) row of 256 B
-        pages = page_indices.reshape(T, pps)
-        sel = cache_kv[pages]  # [T, pps, ps//4, 4, 256]
-        sel = sel.reshape(T, pps * ps, g["lkv_dim"])[:, :S, :]
-        kv = sel[:, :, :D].view(jnp.float8_e4m3fn).astype(jnp.float32)
-        qf = q.astype(jnp.float32)  # [T, H, D]
-        logits = jnp.einsum("thd,tsd->ths", qf, kv)
-        return (jax.nn.relu(logits) * w[:, :, None]).sum(axis=1)
-
-    args = (inp["q"], inp["weights"], inp["cache_kv"], inp["seq_lens"],
-            inp["page_indices"], inp["cu_q_lens"])
-    return g, run, args
-
-
 def main():
-    g, run, args = build_stage_a() if ARGS.arm == "stage_a" else build_ref()
+    g, run, args = build_stage_a(2 if ARGS.arm == "stage_a" else 1)
     print(f"[p1] stage_a source {_stage_a.source_path()} "
           f"md5={_stage_a.source_md5()}", flush=True)
     print(f"[p1] geometry {g}", flush=True)
@@ -157,8 +145,6 @@ def main():
 
     if ARGS.mode == "dump":
         # One run is enough: the dump is written by the compiler, not the run.
-        for root, dirs, files in os.walk(OUT):
-            pass
         tot = sum(
             os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(OUT)
             for f in fs)
@@ -181,9 +167,15 @@ def main():
 
     # --mode server: hold the device busy while a client captures over gRPC.
     import time
+    for _ in range(5):  # warm, so the client never captures a compile
+        out = run(*args)
+    jax.block_until_ready(out)
     jax.profiler.start_server(ARGS.port)
-    print(f"[p1] profiler server on :{ARGS.port}; spinning for "
-          f"{ARGS.seconds}s", flush=True)
+    ready = os.path.join(OUT, "READY")
+    with open(ready, "w") as f:
+        f.write(str(ARGS.port))
+    print(f"[p1] profiler server on :{ARGS.port}; READY at {ready}; "
+          f"spinning for {ARGS.seconds}s", flush=True)
     t_end = time.time() + ARGS.seconds
     n = 0
     while time.time() < t_end:

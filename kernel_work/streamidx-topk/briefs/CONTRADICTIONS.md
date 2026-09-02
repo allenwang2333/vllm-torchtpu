@@ -398,42 +398,94 @@ microbenchmark in the same job, and cannot be shown end to end.**
 
 ---
 
-## 11. ~964 µs/step/core of the plumbing bucket is unattributed, and a KV-cache copy is the right shape to be hiding in it
+## 11. RESOLVED — the copy is elided, my subtraction was wrong, and the bucket is now itemized
 
-**This inference exists only by combining area 1 and area 7, and it is the highest
-value-per-cost item in step 2 because it costs no hardware at all.**
+**This section previously argued that ~964 µs/step/core of the "indexer plumbing" bucket was
+unattributed and that an un-elided KV-cache copy was the likely occupant. Probe P0 refutes both
+halves.** The original argument is replaced rather than annotated, because two of its numbers were
+wrong and leaving them readable invites requoting.
 
-- Area 1 A9 `measured (j-a71a648c, AgentX)`: the bucket *indexer plumbing (`conditional`,
-  `bitcast_convert`, cond copies)* is **1.230 ms/core-step = 4.6%** of a 26.584 ms step. Area 1
-  states plainly that its internal composition **is not attributed in any artifact I read**.
-- Area 7 has now attributed part of it. Summing the seven named metadata scopes (`lt`, `reduce_sum`,
-  `select_n`, `dynamic_slice`, `gather`, `slice`, `concatenate`) gives **265.7 µs/step/core**, of
-  which 225.8 µs is scalar plumbing around the `pallas_call`s rather than the token→seq maps.
+### 11.1 The copy is elided. VERDICT: **ELIDED**
 
-**1230 − 266 ≈ 964 µs/step/core is unattributed**, i.e. ~3.6% of the step, sitting in the
-`conditional` machinery and the cond copies.
+`measured (j-a71a648c rank 0)`, two independent routes:
 
-Area 1 A10 names a candidate occupant of exactly that space. At `mla:140`:
+- **Static.** The module header declares `input_output_alias` with 177 entries. Of `ENTRY
+  main.1741_spmd`'s 2070 parameters, exactly **21 have shape `u8[3027,64,4,256]` and all 21 are
+  aliased** (`param 22 -> out{0}` … `param 1975 -> out{169}`, all `may-alias`). A whole-module
+  opcode scan on that shape finds 63 `custom-call`, 42 `parameter`, 21 `scatter`, 21
+  `get-tuple-element`, 21 `fusion` — and **zero `copy`, `copy-start`, `copy-done`, `bitcast`**. XLA
+  inserted no defensive un-donation copy.
+- **Dynamic.** The 21 aliased rows average **3.024 µs** self time, 63.50 µs/core-step. A real copy of
+  `3027×64×4×256 = 198,377,472 B` read+write is 396.75 MB, which at this core's own
+  `peak_hbm_bw = 3686.16 GB/s` cannot finish under **107.6 µs**; 3.024 µs would require 131 TB/s,
+  36× over peak. Read the other way, `3.024 µs × 2.525 GiB/s = 8197 B` against the **8192 B** a
+  16-row in-place scatter actually moves — agreement to 0.06%.
 
-```python
-new_cache, topk_indices = jax_op(*args)
-args[2].copy_(new_cache)          # mla:140
-```
+So `donate_argnums=(2,)` does its job and `args[2].copy_(new_cache)` at `mla:140` costs nothing.
+Area 1's A10 and D3 are closed on the copy question. **Still not determined:** whether the elision is
+*caused by* donation or whether XLA's copy insertion would reach the same in-place assignment
+regardless. That needs an A/B compile and no design depends on it.
 
-`donate_argnums=(2,)` at `mla:128` *should* make this a self-copy. **Whether donation actually
-elides it is not established by any artifact either briefer read.** If it does not, it is a full KV
-cache copy per indexer layer — 198 MB at the AgentX shape `u8[3027,64,4,256]`, **≈67 µs/layer
-`modelled`**, i.e. ≈1.4 ms/step across 21 layers. That is the same order as the entire unattributed
-residue, and it would be larger than every other item in area 1's section C combined.
+### 11.2 My arithmetic was wrong: the two figures were over disjoint sets
 
-**This is an HLO read against an artifact already on GCS, not a hardware run.** It is promoted to
-**P0** below and must be answered before the design ranks anything, because a positive result
-relocates the whole optimization: the block's largest single cost would then be a framework-level
-copy that no kernel design touches.
+The subtraction `1230 − 265.7 ≈ 964` was invalid. Area 7's seven metadata scopes live under
+`custom_kernel/custom_kernel/cond/branch_0_fun/*`; area 1's bucket is `conditional` + scope `cond:` +
+scope `bitcast_convert_type:`. **These do not overlap**, so nothing was ever subtractable. P0
+reproduces area 7's figure independently at 268.91 µs against its 265.7, so that number was fine —
+the error was mine, in combining them.
 
-Cross-check available in the same artifact: area 7 found `%broadcast.33911` (the `-inf` init)
-appearing 21 times, so per-layer buffer-sized ops are visibly *not* CSE'd here — consistent with a
-per-layer cache copy surviving if donation does not elide it.
+Corrected statement, `measured (j-a71a648c, AgentX)`:
+
+| | µs/core-step |
+| --- | ---: |
+| the `conditional` / `cond:` / `bitcast_convert_type:` bucket | ~1255 (area 1 reported 1230) |
+| the `branch_0_fun` metadata scopes, **separately** | ~269 |
+| **total non-kernel indexer overhead** | **~1524** |
+
+### 11.3 What is actually in the bucket — 96% of it is three items
+
+`measured (j-a71a648c, AgentX)`. This is the useful output of P0 and it is not what the probe went
+looking for.
+
+| µs/core-step | n | what |
+| ---: | ---: | --- |
+| **496.16** | 21 | `copy f32[2,8,2048,128] {3,2,1,0}S(1) -> {3,1,2,0}`, 23.63 µs each — a **transposing 16 MiB copy of the whole score buffer, once per indexer layer**. 352 MiB/core-step moved for zero arithmetic |
+| **255.27** | 21 | `bitcast-convert s32[16,2048,128] <- f32[16,2048,128]`, 12.16 µs each. Same shape, same layout, same tiling — **a semantically free reinterpret that XLA has fully materialised** |
+| 178.08 | 21 | `conditional` self time (the early-exit guard), plus 70.89 µs of boundary copies and 134.71 µs of `slice-start/done` it forces — ~384 µs total for a guard that never takes the cheap branch at these contexts |
+
+Two of these close open questions with a **negative** answer that matters:
+
+- **The `bitcast_convert_type` at `sc:320` is not free.** Area 1's C3 listed both bitcasts as "free in
+  principle… whether XLA elides it is `[unverified]`". It does **not** elide it: 255 µs/core-step at
+  AgentX for a reinterpret between two identically-shaped, identically-tiled buffers. This is
+  plausibly the most directly deletable item in the block.
+- **Stage A emits a layout its consumer does not want.** The transposing copy sits between stage A's
+  output and stage B's input and is a *third and fourth* pass over the score matrix, on top of the
+  write and the read area 1's A1 priced. A1's `2 × bytes` round-trip formula therefore **understates**
+  the matrix's true HBM traffic — though see 11.4 before rescaling any conclusion off that.
+
+### 11.4 The correction that guts all of it: this is an AgentX problem, not a nightly one
+
+Items 1 and 2 are **linear in the score-buffer width**, which is 262144 on the profiled job and
+**10240** at the baseline of record — 25.6× narrower. Rescaled `modelled`, the 496 µs becomes ~19 µs
+and the 255 µs becomes ~10 µs, **per step across all 21 layers**, i.e. ~0.9 µs and ~0.5 µs per
+221.4 µs decode call. Both fall under §8's ±8.5% run-to-run spread and neither is measurable end to
+end.
+
+**So the honest verdict on the whole plumbing bucket is: it nearly vanishes at nightly.** That is a
+clean negative result and it is worth as much as a positive one — it removes an entire ~1.5 ms/step
+line item from the nightly design's candidate list, and it does so before anyone spent a job on it.
+
+What the designer should still carry from 11.3 is **structure, not µs**: stage A's output layout is
+wrong for its consumer, and a candidate that changes that layout must check it has not made the
+transpose worse rather than better. The `bitcast` is worth deleting on principle at any width.
+
+### 11.5 One structural fact, unaffected by width
+
+The 21 `scatter_fusion` instructions that write the KV cache sit in `ENTRY`, **outside** the
+`conditional`. The KV write therefore runs unconditionally even when `STREAMIDX_ENABLE_EARLY_EXIT`
+fires and the fast path is taken. Any option that touches the early-exit structure must preserve
+this.
 
 ---
 
@@ -469,7 +521,7 @@ new.
 
 | | probe | cost | what it gates |
 | --- | --- | --- | --- |
-| **P0** | Does `donate_argnums=(2,)` elide `args[2].copy_(new_cache)` at `mla:140`? HLO read of `j-a71a648c` | **free** — artifact on GCS | §11. ≈67 µs/layer if not. Relocates the whole optimization if positive |
+| ~~**P0**~~ | ~~`donate_argnums` elision at `mla:140`~~ — **DONE: ELIDED** (§11) | free | Settled, negative. No copy exists, and the bucket it was probing nearly vanishes at nightly (§11.4) |
 | **P1** | DMA-stall fraction in `StreamIdxTC-d` via `/xprof-llo` (semaphore-wait at `sx:398`) | one pod job | §2's gate question — stage A near its floor (**≥50% confirms, ≤15% refutes**) — *and*, on refutation, the `assumed` VPU rate |
 | **P2** | `approx_max_k(recall_target=1.0)` and `lax.top_k` vs `sparsecore_topk` at `(64, 10240, 2048)` | minutes | §12. The only probe that can delete a design option |
 | **P3** | Can a TensorCore grid and a `VectorSubcoreMesh` be in flight together? | one pod job | §9's unit edge — the largest lever on the sheet. Area 1 D2 and area 5 name the same probe |
@@ -478,5 +530,14 @@ new.
 | **P6** | Is a `[:129]` strided read charged 129 bytes or 256? | minutes | If ~129, a one-line movement-only change recovers 37% of the dominant decode term |
 | **P7** | `bkv_p` sweep {1,2,3,4}; and does prefill's 33.55 MB intermediate **spill**? (instrument for spills, not wall-clock) | one pod job | Area 3's cheap discriminator for P1; area 2's top candidate; §5's prefill binding term |
 
-P0 runs first and alone, because it can change what the rest are for. P1–P7 fan out four to a pod,
-so P1–P4 is one job and P5–P7 is a second.
+P0 ran first and alone, because it could have changed what the rest were for. It did not — see §11.
+P1–P7 fan out four to a pod, so P1–P4 is one job and P5–P7 is a second; both are in flight.
+
+**A note on P0's yield, because it generalises to the probes still running.** P0 answered its own
+question in the negative and was still the highest-value probe run so far — it itemized 96% of a
+1.5 ms/step overhead bucket nobody had opened, closed area 1's C3 `bitcast` question with a
+measured "not free", found a per-layer transposing copy of the whole score buffer, and caught an
+arithmetic error of mine that would otherwise have propagated into the design. **Judge the probes
+still in flight on what they establish, not on whether they confirm the hypothesis that motivated
+them.** A probe that refutes its own premise and itemizes the thing it was digging through has done
+the more useful job.
