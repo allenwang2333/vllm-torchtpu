@@ -1,8 +1,17 @@
 # Step 1 — `streamindex_topk` (the `streamidx_topk_jax` op) for GLM-5.2
 
-Status: **in progress.** The roofline below is complete; the baseline measurement, the achieved
-fraction and the profile cross-check are pending and are marked as such. Nothing here is a
-measurement unless it carries a job id.
+Status: **step 1 complete except the xprof cross-check.** The roofline, the instruments, the
+baseline, the correctness pass and the achieved fractions are all in. The cross-check against the
+in-model profile is outstanding and is named as such in §6 and §8.
+
+**Nothing here is a measurement unless it carries a job id.** Everything from §4 is `modelled`; the
+two jobs that measured anything are `j-0b008512-36f2-4eb2-bdc6` (SparseCore probe) and
+`j-8b1e7acc-ebdc-45d2-b46c` (baseline, correctness, two layout/VPU probes).
+
+**The verdict is in §8**: decode has structural headroom at **21.5%** of its modelled floor; prefill
+is **unresolved**, and its 72.7% must not be carried forward as headroom. Two of the three probes
+returned confident answers to questions other than the ones asked — §7 corrects both rather than
+quoting them.
 
 Branch `annyan/streamidx-topk-opt` in `/home/annyan_google_com/workspaces/copy1/vllm-torchtpu`,
 based on `0976305d`. The three files under study are byte-identical to `7e4d67b2`, the commit the
