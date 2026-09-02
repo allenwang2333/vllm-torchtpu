@@ -916,3 +916,106 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
         })
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+@pytest.mark.parametrize("num_tokens,topk", [(1, 4), (3, 2), (256, 8),
+                                             (257, 8)])
+def test_fused_permute_gmm_matches_materialised_path(monkeypatch):
+    """The fused dispatch only changes how GMM1 reads its LHS.
+
+    It runs whenever the kernel's envelope allows, so the comparison arm here is
+    the materialised path forced by shrinking the envelope; the switch is
+    covered separately below.
+    """
+    _require_tpu()
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
+     topk) = _make_ep_inputs(16)
+    common = dict(hidden_states=hidden_states,
+                  w1=w1,
+                  w2=w2,
+                  w1_scale=None,
+                  w2_scale=None,
+                  w1_bias=w1_bias,
+                  w2_bias=w2_bias,
+                  topk_weights=topk_weights,
+                  topk_ids=local_ids,
+                  experts_start=jnp.zeros((), dtype=jnp.int32),
+                  topk=topk,
+                  activation="silu",
+                  use_ep=True,
+                  use_sparse_core=True)
+
+    calls = []
+    real = fused_moe_gmm.fused_permute_gmm
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "fused_permute_gmm", counted)
+    fused = fused_moe_func(**common)
+    assert calls, "the fused path did not run, so the arms are the same path"
+
+    # force the materialised path by shrinking the SMEM index budget below what
+    # this shape needs -- the same gate a too-large token count would trip
+    calls.clear()
+    monkeypatch.setattr(
+        fused_moe_gmm.Tuning, "from_device",
+        classmethod(lambda cls, **kw: cls(smem_capacity_bytes=0)))
+    materialised = fused_moe_func(**common)
+    assert not calls, "the envelope gate did not send it to the materialised path"
+
+    np.testing.assert_allclose(np.asarray(fused, np.float32),
+                               np.asarray(materialised, np.float32),
+                               atol=2e-2,
+                               rtol=2e-2)
+
+
+def test_use_fused_permute_gmm_switches_the_whole_path(monkeypatch):
+    """Off, the kernel must not run and the result must still agree.
+
+    The switch's other consumer is the communicator's pre-gather blocking
+    ceiling; that half is covered in test_moe_routing.py.
+    """
+    _require_tpu()
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids,
+     topk) = _make_ep_inputs(16)
+    common = dict(hidden_states=hidden_states,
+                  w1=w1,
+                  w2=w2,
+                  w1_scale=None,
+                  w2_scale=None,
+                  w1_bias=w1_bias,
+                  w2_bias=w2_bias,
+                  topk_weights=topk_weights,
+                  topk_ids=local_ids,
+                  experts_start=jnp.zeros((), dtype=jnp.int32),
+                  topk=topk,
+                  activation="silu",
+                  use_ep=True,
+                  use_sparse_core=True)
+
+    calls = []
+    real = fused_moe_gmm.fused_permute_gmm
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "fused_permute_gmm", counted)
+    # The switch is read at TRACE time, so a warm jit cache would run the
+    # previous program and neither arm would be what it claims.
+    jax.clear_caches()
+    on = fused_moe_func(**common)
+    assert calls, "the fused path did not run with the switch on"
+
+    calls.clear()
+    monkeypatch.setattr(envs, "USE_FUSED_PERMUTE_GMM", False)
+    jax.clear_caches()
+    off = fused_moe_func(**common)
+    assert not calls, "the switch did not reach the dispatch"
+
+    np.testing.assert_allclose(np.asarray(on, np.float32),
+                               np.asarray(off, np.float32),
+                               atol=2e-2,
+                               rtol=2e-2)

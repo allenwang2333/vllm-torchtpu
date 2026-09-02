@@ -19,8 +19,9 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.fused_permute_gmm import (
-    fused_permute_gmm, smem_index_limit_bytes)
+from vllm_torchtpu.kernels.megablox.fused_permute_gmm.config import Tuning
+from vllm_torchtpu.kernels.megablox.fused_permute_gmm.wrapper import \
+    fused_permute_gmm
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -562,7 +563,7 @@ def fused_moe_func(
     # measured against; outside its envelope the materialised path stands.
     num_lanes = pltpu.get_tpu_info().num_lanes
     use_fpg = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
-               and num_tokens * topk * 4 <= smem_index_limit_bytes()
+               and num_tokens * topk <= Tuning.from_device().max_index_rows
                and padded_hidden_size % num_lanes == 0
                and rhs_quant_dtype is None)  # no packed-carrier bitcast
 

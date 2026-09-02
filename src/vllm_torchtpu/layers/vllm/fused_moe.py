@@ -22,8 +22,7 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed import tpu_communicator
-from vllm_torchtpu.kernels.megablox.fused_permute_gmm import \
-    smem_index_limit_bytes
+from vllm_torchtpu.kernels.megablox.fused_permute_gmm.config import Tuning
 from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, quantize_to_native_fp4_kmajor, requant_unpack_kmajor,
     resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
@@ -147,10 +146,10 @@ def _build_fused_moe_custom_op(
 
     # The fused permute path's static eligibility, so the communicator can skip
     # pre-gather blocking on a model that will never consume it.
-    tpu_communicator.set_fpg_max_tokens(
-        smem_index_limit_bytes() //
-        (topk * 4) if (envs.USE_FUSED_PERMUTE_GMM and use_ep
-                       and use_sparse_core and rhs_quant_dtype is None) else 0)
+    fpg_eligible = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
+                    and rhs_quant_dtype is None)
+    tpu_communicator.set_fpg_max_tokens(Tuning.from_device().max_index_rows //
+                                        topk if fpg_eligible else 0)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
