@@ -1033,31 +1033,59 @@ measurement. **The nightly config is the baseline of record.**
 
 Each of these currently carries a design decision. Ordered by what they gate:
 
-- **What stage B's cost is actually a function of, and what its floor is.** This is now *the* probe
-  and everything else waits behind it. §6.3 rules out buffer width alone (16× width → 1.16× time at
-  b64) and rules out row count alone (one row of 262144 costs more than sixteen). It must at minimum
-  establish: whether the cost tracks the `row_lengths` the op already passes
-  (`eff_row_lengths`, `:505-506`) or the allocated width; whether there is a two-pass split and
-  where its threshold is; and what an exact radix select's floor is at `k=2048` out of 10240, a
-  1-in-5 selection ratio that is dense for a top-k. Findings (1) and (3) both terminate here, and
-  no candidate can be ranked without it.
-- **whether exact top-k is required at all** — `sparsecore_topk` replaced `approx_max_topk` in
-  `6142d5e7` and the reason is not recorded. If approximation is admissible this is the largest
-  lever in the document; if `6142d5e7` moved away from it deliberately, that closes the branch and
-  is worth knowing before a design proposes it.
+> **Step-2 note (added after the eight area briefs returned).** Two of the bullets below are
+> superseded and one is withdrawn — marked inline. The `briefs/` directory is the authority for
+> everything step 2 established; where a brief and this section disagree, the brief is later and
+> better sourced.
+
+- **What stage B's cost is actually a function of, and what its floor is.** ⚠️ **SUPERSEDED —
+  substantially answered from source. Do not run this probe as written.** Four area briefers, working
+  independently in different areas, read the same mechanism out of `sparsecore_topk.py`: every scan
+  loop in `_topk_kernel` is bounded by `i_hi = min(slice_len, eff_len)`, but the DMA at `:160` fills
+  `resident_vmem` with a static `slice_len = align_to(n, 16)` **unconditionally**. The question as
+  posed is a false dichotomy: **the compute tracks `row_lengths` and the HBM read tracks the
+  allocated width.** A fifth reading supplies the branch half — `_pick_partition` returns `p=1`
+  whenever `b ≥ 32` and `n ≤ 65536`, so the two-stage path and both `take_along_axis` gathers exist
+  at AgentX and **not at the baseline of record**, which is why §6.3 measured 1.07-1.17× at b32/b64
+  against 1.77× at b8. Prefill's 2.88× and 3.41× are *not* yet explained by either half and remain
+  open. The narrower probe that replaces this one: *can that DMA take a dynamic or
+  power-of-two-bucketed length under a `plsc` mesh, and must `resident_vmem` still be allocated at
+  `slice_len` regardless?* See `briefs/area5-compute-units.md` §C, which separates what is read from
+  code from what is inferred, and gives a modelled floor for an exact select at ≈0.4× the incumbent
+  — not the much larger headroom §4's zero-compute floor implied.
+- **whether exact top-k is required at all** — ⚠️ **WITHDRAWN. The premise is false.** The
+  pre-`6142d5e7` call was `jax.lax.approx_max_k(..., recall_target=1.0)`, and `recall_target=1.0` is
+  **exact**. That commit was an exact→exact swap made for performance (PR #724: +9.3% output token
+  throughput, top-k 430 µs → 33.8 µs at decode); its title names the API, not the semantics. Nothing
+  in the history speaks to accuracy, because no accuracy was traded — so this bullet's inference that
+  the authors "moved away from approximate" was reading a signal that does not exist, and it must not
+  be cited either for or against approximation. What replaces it is a cost rather than a question:
+  no `baselines/eval/glm-5.2-*.baseline.json` exists in the repo, so **there is no accuracy gate for
+  this model to run**, and any approximate candidate must first pay to establish one on the
+  unmodified kernel. See `briefs/area6-algorithm.md` §C.
 - **whether sorting or grouping sequences by length is worth it.** §6.3 prices the lever at
   **≈0.050 ms per full-length slot** and confirms the group-of-4 granularity to 4.7%, so the
   remaining unknown is purely the length spread of a served batch — which no artifact here has.
   This is the one probe that needs production data rather than a pod.
 - **the VPU term, properly, in VMEM** — §7 explains why the first attempt does not count. Gates
   prefill entirely.
-- **whether `StreamIdxTC-d`'s bimodality is by design** — 114.63 µs against 5.40 µs (§6.1).
-  Finding (2) supplies a candidate explanation that did not exist before: of the three
-  `run_scores_kernel` calls, two get a **zero-length grid** when `distribution[0] % 4 == 0` and
-  `distribution[1] == distribution[2]`, so 5.40 µs may simply be an empty kernel's fixed cost.
-  Cheap to confirm, and it would remove a mystery rather than a cost.
+- **whether `StreamIdxTC-d`'s bimodality is by design** — ⚠️ **SUPERSEDED — confirmed from source,
+  no probe needed.** `mla_attention_op.py:184` builds `distribution = stack([rd[0], rd[0], rd[2]])`,
+  so `distribution[0] == distribution[1]` **always, by construction**. Call 2's grid is
+  `distribution[1] - decode_batch_end = rd[0] % 4` and call 3's is `distribution[2] -
+  distribution[1]`, which is 0 in pure decode; at the profiled batch 16, `16 % 4 == 0` makes both
+  empty. So `StreamIdxTC-d`'s 5.40 µs mode and `StreamIdxTC-m`'s 5.22 µs are **empty-grid Pallas
+  launch cost, ≈10.6 µs per indexer layer of pure overhead** — 8.5% of the 125.25 µs per-layer
+  TensorCore total. The conjecture in this bullet was right; it is now read out of code rather than
+  guessed. See `briefs/area5-compute-units.md` A18 and `briefs/area7-precomputation.md` constraint 4,
+  which reached it independently.
 - **whether the indexer weights are non-negative**, which gates the `relu(x)*w == relu(x*w)` fold
-  (§7).
+  (§7). ⚠️ **DROPPED — not probeable, and not worth a gate.** The weights are
+  `weights_proj(hidden_states) * q_scale * softmax_scale * n_head**-0.5`; the three scalars are
+  positive but `weights_proj` is a plain linear output with no relu, softplus or abs anywhere, so the
+  sign is **activation-dependent**. No probe can prove it — only bound it empirically on sampled
+  data — which makes the fold an *approximation* carrying the full accuracy gate above, for a prize
+  independently priced at ~2% of decode traffic. See `briefs/area6-algorithm.md` constraint 6.
 
 **Closed during step 1, no longer probes:**
 
@@ -1078,6 +1106,17 @@ model. The `padfull` arm and every homogeneous `prod_*` / `agentx_*` shape are u
 there `distribution` and the real count agree.
 
 The fix is one line — `distribution = [num_real_seqs, num_real_seqs, num_real_seqs]` where
-`num_real_seqs` is set. It is deferred only because a job using the current file is in flight;
-the `pad0` numbers it returns must be read as *four* real sequences, and `_per_seq_bkv`'s
-lower-bound geometry is wrong for that arm in the opposite direction.
+`num_real_seqs` is set.
+
+**Add a shape; do not mutate this one.** §6.3's confirmation of finding (2) works *because*
+`pad0` runs four full-length slots — that is what put a third point on the slot-block line and let
+the predicted and measured ratios be compared at all. Editing `pad0` in place would silently
+invalidate a measurement this document now rests on, and the job that produced it would have to be
+re-run to say anything. The correct change is a new shape carrying the honest `distribution`,
+leaving `pad0` and `padfull` as the bracket they turned out to be. Rename them in the same change,
+since `pad0` no longer means what it says: it is `4real_of_16`, and `padfull` is `16real_of_16`.
+
+`_per_seq_bkv`'s `kv_stream` geometry is a separate defect in the same arm and in the opposite
+direction — it assumes the per-sequence guard that finding (2) shows does not exist, so it reports
+28.9 MB where the real figure is ≈110 MB. It is correct for every homogeneous shape. Both fixes
+belong in one commit, before step 3 measures any variant against this file.
