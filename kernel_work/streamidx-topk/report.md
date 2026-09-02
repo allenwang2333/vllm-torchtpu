@@ -80,9 +80,10 @@ GLM-5.2 as served by the nightly perf config
 
 | Quantity | Value | Source |
 | --- | --- | --- |
-| `index_n_heads` (H) | **32** | `GlmMoeDsaConfig` default; GLM differs from DeepSeek-V3.2's 64 |
-| `index_head_dim` (D) | **128** | same |
-| `index_topk` (k) | **2048** | same |
+| `index_n_heads` (H) | **32** | checkpoint `config.json`; GLM differs from DeepSeek-V3.2's 64 |
+| `index_head_dim` (D) | **128** | checkpoint `config.json` |
+| `index_topk` (k) | **2048** | checkpoint `config.json` |
+| indexer-computing layers | **21 of 78** | checkpoint `config.json`, `indexer_types` — see below |
 | `compression_ratio` | **1** | hardcoded at the call site, `mla_attention_op.py:116` |
 | TP / DP / EP | **TP=1, DP=16, EP on** | nightly config |
 | `max_model_len` | **9216** (8192 in + 1024 out) | nightly config |
@@ -102,12 +103,19 @@ the other engine on the same chip, and any interaction with the MoE layers aroun
 
 **Two configuration facts are unresolved and are recorded as unknown rather than guessed:**
 
-- **How many of the 78 layers run the indexer.** `roofline-analysis/model/architecture/glm/5_2.md`
-  states IndexShare frequency 4 with a skip offset, giving layers 0,1,2,6,10,…,74 = **21 of 78**.
-  vLLM's code default is `index_topk_freq = 1`, which would give **78 of 78**. No GLM-5.2
-  `config.json` exists on this machine to settle it. This scales the block's share of a step by
-  3.7x and so decides how much an optimization is worth end to end — but it does not change the
-  per-call shape or the floor, so step 1 is not blocked on it.
+- ~~How many of the 78 layers run the indexer.~~ **Settled: 21 of 78.** Read from the checkpoint's
+  own `config.json` (`zai-org/GLM-5.2-FP8`, fetched from HuggingFace), which is authoritative over
+  both the roofline spec file and vLLM's code default. `"index_topk_freq": 4`, and the config
+  carries an explicit 78-entry `indexer_types` list: `full` at layers 0, 1, 2 and then every 4th
+  from 6 to 74 — 3 + 18 = **21 `full`, 57 `shared`**. A `shared` layer reuses the preceding `full`
+  layer's indices and does not run the op. vLLM's `index_topk_freq = 1` default, which would have
+  given 78 of 78, is not what this checkpoint uses. The op therefore runs **21 times per forward
+  step**, and an optimization is worth 21x its per-call saving, not 78x.
+
+  The checkpoint also carries `num_nextn_predict_layers: 1` and
+  `index_share_for_mtp_iteration: true`, so MTP would add indexer invocations — but the nightly
+  benchmark recipe enables no speculative decoding (no `mtp` / `speculative` / `nextn` key in it),
+  so 21 stands for the configuration under study. It would not stand if MTP were turned on.
 - **Which vLLM actually serves GLM-5.2.** In the vLLM pinned in this checkout's `uv_venv` there is
   no `glm5.py`, and `SparseAttnIndexer` — the class the op under study registers against — is
   referenced only from `deepseek_v2.py`. So the GLM-5.2 model definition that drives this op is not
