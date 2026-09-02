@@ -549,6 +549,41 @@ def test_rejection_sampler_synthetic_random_placeholder_recovers_target(
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(
+        device):
+    sampler = _synthetic_sampler([0.0], device)
+    draft_token_ids = torch.tensor([3, 1], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1, 1], dtype=torch.int32, device=device)
+    target_logits = torch.tensor(
+        [[-100.0, -100.0, -100.0, 100.0, -100.0],
+         [-100.0, -0.5108256, -100.0, -100.0, -0.9162907]],
+        device=device,
+    )
+    bonus_token_ids = torch.tensor([4, 3], dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.zeros(2, device=device),
+        recover_u=torch.full_like(target_logits, 0.5),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[3, -1], [4, -1]],
+                            dtype=torch.int32,
+                            device=device)
+    assert torch.equal(output, expected)
+
+
 def test_rejection_sampler_random_top_k_forces_recovery(device):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1], dtype=torch.int32, device=device)

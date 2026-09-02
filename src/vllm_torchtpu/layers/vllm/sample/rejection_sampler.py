@@ -388,6 +388,16 @@ def _random_rejection_sample_with_segment(
         recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
         dim=-1,
     ).to(torch.int32)
+    # A synthetic rejection can reject a greedy draft that matches the target
+    # argmax. In that case p and q are the same one-hot distribution, leaving
+    # no residual mass. Match upstream's greedy path by recovering the target
+    # argmax instead of letting argmax(all-zero) fall through to token 0.
+    has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
+    recovered_token_ids = torch.where(
+        has_recovery_mass,
+        recovered_token_ids,
+        torch.argmax(target_probs, dim=-1).to(torch.int32),
+    )
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
