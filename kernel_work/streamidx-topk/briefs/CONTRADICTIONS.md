@@ -211,6 +211,8 @@ address the other.
 
 ## 4. Does the indexer K cache have one consumer or two?
 
+> **RESOLVED by P5 — one consumer set. `D1_VERDICT PASS`. See §14.1.**
+
 **A real contradiction, with a runnable falsifier already written.**
 
 `report.md` §7 and §8-finding-4 record the 49.6% K-cache padding as a *two-consumer* packing change,
@@ -231,6 +233,9 @@ should not be read as settled.
 ---
 
 ## 5. What binds prefill — VPU throughput, or VMEM capacity?
+
+> **RESOLVED by P7b — VPU, and specifically register pressure, not VMEM capacity.
+> The question's own premise was false: there is no 32 MiB scoped ceiling. See §14.4 and §7.4.**
 
 **Three sheets converge against `report.md`, and the report half-agrees with them already.**
 
@@ -298,6 +303,17 @@ wrong. Recorded here because a designer who trusts the reference will discard a 
 3. **Correct and load-bearing:** `sparse_core.vmem_capacity_bytes = 524288` is **per vector subcore
    and is not divided**. It is the constraint behind `MAX_SLICE_WORDS`, therefore behind `p`,
    therefore behind whether the two `take_along_axis` gathers exist at all.
+
+4. **There is no 32 MiB scoped VMEM ceiling on this stack.** `hardware-facts.md`'s claim that the
+   scoped limit defaults to half the 64 MiB physical unless `vmem_limit_bytes` is raised is wrong
+   here: `DEFAULT_VMEM_LIMIT_BYTES = 100 MiB` `read from source`, and neither production nor the
+   microbenchmark overrides it. **Raising `vmem_limit_bytes` is a no-op**, and any design reasoning
+   from a 32 MiB budget is reasoning about a constraint that does not exist. `measured (P7b,
+   j-9e113359)` corroborates: the prefill kernel's real working set is 9.52 MiB and it compiles at
+   a 12 MiB bisection bound.
+
+   **I propagated this error into the P7 dispatch myself**, which is how it got tested. It is the
+   third wrong claim in that file and the second that would have mis-shaped a design.
 
 Whether to amend `references/hardware-facts.md` is the user's call and has been raised with them; it
 is outside this kernel's scope and no design should wait on it.
@@ -526,12 +542,12 @@ new.
 | **P2** | `approx_max_k(recall_target=1.0)` and `lax.top_k` vs `sparsecore_topk` at `(64, 10240, 2048)` | minutes | §12. The only probe that can delete a design option |
 | **P3** | Can a TensorCore grid and a `VectorSubcoreMesh` be in flight together? | one pod job | §9's unit edge — the largest lever on the sheet. Area 1 D2 and area 5 name the same probe |
 | **P4** | Empty-`pallas_call` price at grid extent 0 / 1 / 16 at the **nightly** score width, plus a `lax.cond`-guarded arm | minutes | §10's residual. Tier 1 vs tier 2 of area 1 C2 |
-| **P5** | Area 4's D1 falsifier (`D1_VERDICT PASS/FAIL/INCONCLUSIVE`) | runnable as-is | §4. One vs two consumers of the K cache → whether 83.2 MB of padding is reclaimable |
-| **P6** | Is a `[:129]` strided read charged 129 bytes or 256? | minutes | If ~129, a one-line movement-only change recovers 37% of the dominant decode term |
-| **P7** | `bkv_p` sweep {1,2,3,4}; and does prefill's 33.55 MB intermediate **spill**? (instrument for spills, not wall-clock) | one pod job | Area 3's cheap discriminator for P1; area 2's top candidate; §5's prefill binding term |
+| ~~**P5**~~ | ~~Area 4's D1 falsifier~~ — **DONE: `PASS`, one consumer set** (§14.1) | done | Settled. A repack touches one file. Route 1 refused as non-discriminating |
+| ~~**P6**~~ | ~~`[:129]` strided read charge~~ — **DONE: charge ratio 1.02, but w=129 is inexpressible** (§14.2) | done | The one-line change does not exist; a 128+scale repack does, and realises ~98% |
+| ~~**P7**~~ | ~~`bkv_p` sweep; prefill spill~~ — **DONE: `bkv_p=3` is −11.9%; prefill spills 23.5× over** (§14.3-4) | done | Settles §5. Stage A is DMA-**block**-bound, not bandwidth-bound — partially pre-empts P1 |
 
 P0 ran first and alone, because it could have changed what the rest were for. It did not — see §11.
-P1–P7 fan out four to a pod, so P1–P4 is one job and P5–P7 is a second; both are in flight.
+**P5–P7 have since returned (§14); P1–P4 are still in flight.** Four of the eight are closed.
 
 **A note on P0's yield, because it generalises to the probes still running.** P0 answered its own
 question in the negative and was still the highest-value probe run so far — it itemized 96% of a
@@ -541,3 +557,141 @@ arithmetic error of mine that would otherwise have propagated into the design. *
 still in flight on what they establish, not on whether they confirm the hypothesis that motivated
 them.** A probe that refutes its own premise and itemizes the thing it was digging through has done
 the more useful job.
+
+---
+
+## 14. Wave 2, first job: P5, P6 and P7
+
+Three probes, `measured` on jobs `j-9e113359-47c6-41b2-ad85` and `j-170ed342-8cc7-4719-82b5`.
+Full write-ups in `../probes/P5-cache-consumers.md`, `P6-strided-read-charge.md`,
+`P7-bkvp-and-spill.md`. **Read the contention caveat in 14.5 before quoting any absolute µs from
+this section.**
+
+### 14.1 P5 — the indexer K cache has exactly one consumer set. `D1_VERDICT PASS`
+
+`measured (j-a71a648c, hlo_stats, two sessions)` plus an independent source derivation. The cache
+`u8[3027,64,4,256]` is a separate allocation from every MLA-side buffer, and its complete toucher
+set is **three instructions, all in the indexer path**: readers `StreamIdxTC-d-bq_1-bkvp_2` and
+`StreamIdxTC-m-bq_128-bkvp_2`, writer `scatter_fusion`. The MLA attention kernel reads different
+buffers (`u8[16,8192,128]` + `u8[16,2048,128]`), and `sc_dsa_gather` reads different ones again.
+Source agrees for a shape-independent reason: all 78 MLA layers take the split-tuple `use_sparse`
+branch, while `DeepseekV32IndexerCache` has no `use_sparse` and takes the single-4-D branch.
+
+**Settles:** a repack of the indexer K cache is confined to `streamindex_topk.py` and its one
+writer. No MLA-side coordination, no second reader to keep in sync. **Does not settle:** whether the
+repack pays — see 14.6.
+
+**The falsifier's route 1 was correctly refused rather than run.** Its final `else` prints
+`D1_VERDICT PASS distinct-buffers` whenever the indexer set is non-empty and the MLA single-tensor
+set is empty — *including when the MLA side classified nothing at all* — so it would go green in a
+state where it had proven nothing. Its `shared`-storage pointer check is also dead on this config.
+This is exactly the hollow-check failure mode the review policy exists to catch, and it was caught
+by the prober rather than downstream. Route 2 carried the verdict.
+
+**One term correction.** The "83.2 MB of padding" quoted in §4 and in the dispatch is read *traffic*
+per decode call (`report.md` §4), **not storage**. Storage padding is 98.4 MB/layer at AgentX
+geometry and 74.9 MB at the nightly microbenchmark shape, `modelled`. Do not add them.
+
+### 14.2 P6 — a strided read is charged for its bytes, but the 129-byte read cannot be written
+
+`measured (j-170ed342, run alone on an uncontended 4-chip pod, RUN_CMD read back from
+`cdk job recipe`)`:
+
+| pattern | time | achieved B/s on useful bytes |
+| --- | ---: | ---: |
+| w=256 contiguous (control) | 160.39 µs | **3.347e12** |
+| w=128 of every 256 | 81.84 µs | **3.280e12** |
+
+Time ratio 0.510 against a byte ratio of 0.500 → **charge ratio 1.02**; the strided read achieves
+**98.0%** of contiguous bandwidth. Calibration passed (112.7% of the 2.97e12 read-write reference,
+90.5% of spec), so this is bandwidth-bound rather than latency-bound and the ratio is meaningful.
+
+**But the probe's headline arm failed, and the failure is the finding.** `w = 32, 64, 96, 129, 160,
+192, 224` **all refused to lower**: Mosaic requires *"Slice sizes along tiled dimensions … divisible
+by the tile dimension 128."* So `P6_VERDICT: INCONCLUSIVE at w=129`, and **narrowing to 129 bytes is
+not expressible in Pallas at any charge ratio.** The granule is bounded at ≤128 B and cannot be
+located more precisely, because what binds first is Mosaic tile alignment, not the DMA engine —
+`dma_granule_size_bytes = 32` is therefore neither confirmed nor refuted for TensorCore.
+
+**Consequence, and it is a good one.** The "one-line movement-only change" this probe was meant to
+price **does not exist**. What replaces it is better evidenced: since 129 = 128 + 1, and a
+128-aligned strided read is charged 1.02× its bytes, the reachable design is a **repack into a
+128-wide payload plus a separate scale array** — the nope/rope split — which would realise ~98% of
+the byte saving. P5 says that repack touches one file. **P5 and P6 converge on the same design
+option from opposite directions**, which is the strongest structural result in wave 2.
+
+### 14.3 P7a — `bkv_p = 3` is worth −11.9%, four times the estimate
+
+`measured (j-9e113359 shard 1)`, `prod_decode_b64_ctx8704`, **contended pod — ratios only**:
+
+| `bkv_p` | total µs | stage A µs | vs `bkv_p=2` |
+| ---: | ---: | ---: | ---: |
+| 1 | 213.34 | 136.24 | +11.88% / +19.95% |
+| **2** (incumbent) | 190.68 | 113.58 | — |
+| **3** | **167.97** | **90.87** | **−11.91% / −19.99%** |
+| 4 | 189.17 | 110.05 | ❌ confounded (`n_pos` 12288, not 10240) |
+
+Area 2's top candidate is confirmed and is **~4× larger than its ≈2.5-3% estimate**. It is a
+one-tuple change with no layout surface, which makes it the cheapest evidenced win in step 2.
+
+**The second reading matters more than the first.** `P7a_DMA_VERDICT: MOVES` — time responds to
+`bkv_p`, so the fetch *is* the constraint. But it moves at **near-constant bytes** (9 / 10 / 9 pages
+fetched across the sweep), so **stage A is DMA-*block*-bound, not bandwidth-bound.** Those demand
+opposite fixes: bandwidth-bound says move fewer bytes (the P5/P6 repack), block-bound says issue
+fewer, larger transfers. Corroborated by the LLO decode program: **MXU 4.61%, 15.5% fully idle,
+15.5% SALU bubble.**
+
+This partially pre-empts P1, still in flight, and the two must be reconciled when it lands.
+
+**Two caveats the designer must carry.** The absolute times are contended and disagree with the
+221.4 µs baseline of record by more than `report.md`'s documented spread — use ratios only. And
+`bkv_p=3` may be exploiting `9 = 3×3` at ctx 8704 specifically; **sweep other context lengths before
+defaulting it.**
+
+### 14.4 P7b — prefill spills registers 23.5× over, and the question's premise was false
+
+All of this is **static compile-time analysis from the LLO dump, not measurement.** No timings.
+
+**First, my dispatch was wrong and the probe caught it.** There is no 32 MiB scoped VMEM ceiling:
+`DEFAULT_VMEM_LIMIT_BYTES = 100 MiB`, unoverridden. Recorded as §7.4.
+
+**Not VMEM-capacity-bound.** Working set **9.52 MiB** — 4.20 MiB named scratch plus a **5.33 MiB
+spill arena** — confirmed by an independent bisection (compiles at 12 MiB, rejected at 8 and 4).
+Note `get_llo_fit_summary`'s headline of 4.2 MiB **omits the spill arena and is wrong by 2.3×**;
+do not use it as a VMEM figure.
+
+**It spills registers, hard.** 8,458 spills + 10,130 fills over 11,658 bundles = **1.59 per bundle**;
+**1,506 live vregs against 64 physical, 23.5× oversubscribed**; `VSTORE:SPILL` is 97.1% of all
+VSTOREs and `VLOAD:FILL` 87.8% of all VLOADs. VALU 94.19% (89.45% saturated) against MXU 35.13%.
+
+**The 32 MiB intermediate is not a buffer but is produced in full.** The score block is
+`f32[2,128,16,128]` — no H axis — so nothing of that size is allocated; but 8,744 `vpop` × 1024 f32
+= **34.16 MiB** is produced, 6.6% above the modelled figure, and 86.2% of spill stores are
+vpop-sourced, occupying 4.87 MiB of the arena.
+
+**Settles §5, and against both of its options.** Prefill is **VPU-bound on the post-matmul
+reduce/score/select chain**, not on the einsum and not on VMEM capacity: 12,320 `vadd` + 10,240
+`vmul` + 8,960 `vrot.slane` + 8,192 `vmax` against **1,024 `vmatmul`**. Stop looking for a capacity
+fix. **Opens:** register pressure as the lever — flagged as a *hypothesis*, because the remedy sits
+near an `xprof-cli` recommendation that ships self-labelled `TRACK RECORD 0/5, directly refuted
+twice`. Treat accordingly.
+
+Also corrected: the `f32[1024,80,128]` buffers named in the OOM messages are **HBM arguments**, not
+VMEM.
+
+### 14.5 Contention, and what may be quoted from this section
+
+`j-9e113359` fanned out on a shared pod; its absolute µs are contended and disagree with the
+baseline of record. **P7a's ratios are usable; its absolute times are not.** P6 ran alone on the
+whole pod and its absolutes are usable. P7b produced no timings at all by design.
+
+### 14.6 The prober's cross-probe recommendation, and one reason to hold it lightly
+
+Its conclusion: take `bkv_p = 2 → 3` first — cheap, evidenced, no layout surface — re-measure, and
+only repack the cache if stage A then approaches its ~50 µs HBM floor, since it is currently
+**1.81×** above even the un-repacked floor and the byte saving is therefore not yet binding.
+
+That ordering is sound and this document adopts it. **The 1.81× is computed from a contended
+number** (90.87 µs against a ~50 µs modelled floor), so it is an order-of-magnitude argument rather
+than a measurement, and it should be recomputed once `bkv_p=3` is measured uncontended in the same
+job as the incumbent, per §8.
