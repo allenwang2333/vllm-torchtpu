@@ -180,6 +180,35 @@ class Shape:
     # `pad_seq_len`, modelling a compiled batch bucket that is mostly padding.
     num_real_seqs: int = 0
     pad_seq_len: int = 0
+    # How many slots `distribution` declares as real decode requests, i.e.
+    # what the op is *told* the batch contains, as opposed to how the buffers
+    # are sized. 0 means "all `num_seqs` of them", which is what every shape
+    # written before this field existed does.
+    #
+    # This is a separate axis from `num_real_seqs`, and conflating them is the
+    # defect this field fixes. `num_real_seqs` sets the *contents* of
+    # `seq_lens` -- how long each slot's sequence is. `decode_slots` sets
+    # `distribution[0]`, which is what bounds the kernel grid
+    # (streamindex_topk.py:754-756, 767). A shape can therefore size its
+    # buffers for 16, fill 15 of them with padding, and still tell the op
+    # there are 16 decode requests -- in which case the grid walks all 16 and
+    # the padding is paid for, not guarded out. That is what the `_pad0` /
+    # `_padfull` pair below measures, and it is deliberate.
+    #
+    # Production does not do that: vLLM sets `distribution` from the real
+    # request count, so a batch-16 bucket carrying one request declares 1.
+    decode_slots: int = 0
+
+    @property
+    def decode_group_size(self) -> int:
+        """`decode_req_batch_size`, the grid's sequence-group width.
+
+        `streamindex_topk.py:536` defaults it to 4 and this harness never
+        overrides it (see the `streamindex_topk(...)` call in `run_shape`).
+        Slots are processed in groups of this many, and every slot in a group
+        pays the group's longest sequence -- see `_per_seq_bkv`.
+        """
+        return 4
 
     @property
     def num_tokens(self) -> int:
@@ -349,6 +378,22 @@ def _profile_shapes() -> list[Shape]:
               "decode", 1, 1, PROFILE_CTX,
               note="PROFILE-MATCHED control: batch 1, no padding slots at all",
               max_model_len=mml),
+        # The row production actually runs, which neither `_pad0` nor
+        # `_padfull` is. Both of those declare `distribution[0] = 16`, so the
+        # grid visits all sixteen slots and the pair brackets "what if the
+        # padding is guarded" against "what if it is paid for". vLLM does not
+        # present the op with that choice: it sets `distribution` from the
+        # real request count, so the grid never reaches the padding at all.
+        #
+        # Keep all three. The pair is still the right instrument for its own
+        # question and two step-2 findings rest on it, so it is not edited --
+        # this is an addition. But when the question is "what does the served
+        # workload cost", this is the row to read.
+        Shape(f"profile_b{PROFILE_BUCKET}_1declared_ctx{PROFILE_CTX}",
+              "decode", PROFILE_BUCKET, 1, PROFILE_CTX,
+              note="PRODUCTION-MATCHED: buffers sized for 16, distribution "
+              "declares 1 -- the grid never visits the 15 padding slots",
+              pad_seq_len=0, decode_slots=1, **common),
     ]
 
 
@@ -429,12 +474,30 @@ class Geometry:
 
 
 def _per_seq_bkv(shape: Shape, bkv_sz: int) -> list[int]:
-    """Per-slot kv-block count, matching the seq_lens the builder constructs.
+    """Per-slot kv-block count, as the kernel actually walks it.
 
-    Homogeneous batches give `num_seqs` identical entries; a batch with
-    `num_real_seqs` set gives that many at `context_len` and the rest at
-    `pad_seq_len`. A zero-length slot still gets one block, because the loop
-    runs `max(1, ...)` times.
+    Two things decide this, and an earlier version of this function got both
+    wrong in opposite directions, so both are spelled out.
+
+    **Which slots run at all.** The grid is bounded by `distribution`, not by
+    `num_seqs`: `decode_batch_end = distribution[0] // drbs * drbs`
+    (`streamindex_topk.py:754-756`) bounds the grouped call, and a second
+    call with `seq_batch_size=1` mops up `[decode_batch_end,
+    distribution[1])`. Slots past `distribution[0]` are never visited. See
+    `Shape.decode_slots`.
+
+    **What a slot that does run costs.** Not its own length. The kernel takes
+    the max over its group of `decode_req_batch_size` --
+    `kv_len_max = jnp.max(jnp.stack(kv_lens))` then
+    `num_bkv = max(1, cdiv(kv_len_max, bkv_sz))`
+    (`streamindex_topk.py:275-276`) -- so every slot in a group pays the
+    group's longest sequence. Charging each slot its own length understates a
+    heterogeneous batch by up to `decode_req_batch_size`x. This is a fact
+    read off the source, not an open question: the older comment here framed
+    it as one, and by then it had been answered.
+
+    The remainder slots run with `seq_batch_size=1`, so they pay only their
+    own length; the grouping applies to the first call alone.
     """
     if shape.num_real_seqs and shape.num_real_seqs < shape.num_seqs:
         lens = ([shape.context_len] * shape.num_real_seqs +
@@ -442,7 +505,29 @@ def _per_seq_bkv(shape: Shape, bkv_sz: int) -> list[int]:
                 (shape.num_seqs - shape.num_real_seqs))
     else:
         lens = [shape.context_len] * shape.num_seqs
-    return [max(1, cdiv(n // COMPRESSION_RATIO, bkv_sz)) for n in lens]
+
+    # Slots the op is told about. Everything past this is never visited.
+    declared = shape.decode_slots or shape.num_seqs
+    if shape.q_len != 1:
+        # Prefill / mixed runs with seq_batch_size=1 and is bounded by
+        # distribution[1]..distribution[2]; no grouping to model.
+        return [
+            max(1, cdiv(n // COMPRESSION_RATIO, bkv_sz))
+            for n in lens[:declared]
+        ]
+
+    g = shape.decode_group_size
+    grouped_end = declared // g * g
+    out: list[int] = []
+    for start in range(0, grouped_end, g):
+        group = lens[start:start + g]
+        blocks = max(1, cdiv(max(group) // COMPRESSION_RATIO, bkv_sz))
+        out.extend([blocks] * len(group))  # every slot pays the group max
+    # The seq_batch_size=1 mop-up call: own length only.
+    out.extend(
+        max(1, cdiv(n // COMPRESSION_RATIO, bkv_sz))
+        for n in lens[grouped_end:declared])
+    return out
 
 
 def geometry(shape: Shape) -> Geometry:
@@ -490,13 +575,13 @@ def geometry(shape: Shape) -> Geometry:
     # `_fetch_bkv` DMAs bkv_p whole pages per (sequence, bq block, bkv block);
     # a bq block re-streams the entire KV range (streamindex_topk.py:385-418).
     #
-    # For a heterogeneous batch this is a LOWER BOUND, and deliberately so. It
-    # charges each slot only for its own length -- i.e. it assumes the per-slot
-    # DMA is guarded. If it is not, every slot pays `num_bkv` and the true
-    # figure is the homogeneous one, up to `num_seqs / num_real_seqs` higher.
-    # Which of the two holds is the question these shapes exist to answer, so
-    # the geometry must not quietly pick a side; `useful%` and the header say
-    # which bound this is.
+    # This used to be documented as a deliberate LOWER BOUND that charged each
+    # slot its own length, on the grounds that whether the per-slot DMA is
+    # guarded was "the question these shapes exist to answer". It is not a
+    # question -- `streamindex_topk.py:275-276` takes the max over the group
+    # of `decode_req_batch_size` and the whole group pays it. `_per_seq_bkv`
+    # now models that, and also honours `decode_slots`, so this is the figure
+    # the kernel actually moves rather than a bound on it.
     per_seq_bkv = _per_seq_bkv(shape, bkv_sz)
     kv_stream_bytes = sum(per_seq_bkv) * num_bq * bkv_sz * LKV_DIM
     kv_stream_useful = sum(per_seq_bkv) * num_bq * bkv_sz * LKV_USEFUL_BYTES
@@ -630,8 +715,17 @@ def build_inputs(shape: Shape, geo: Geometry, seed: int = 0) -> dict[str, Any]:
     else:
         seq_lens = jnp.full((num_seqs, ), shape.context_len, jnp.int32)
     cu_q_lens = (jnp.arange(num_seqs + 1, dtype=jnp.int32) * shape.q_len)
-    num_decodes = num_seqs if shape.q_len == 1 else 0
-    distribution = jnp.array([num_decodes, num_decodes, num_seqs], jnp.int32)
+    # `distribution` is what the op is TOLD the batch contains, and it is what
+    # bounds the grid -- not `num_seqs`, which only sizes the buffers. Default
+    # to `num_seqs` so every shape predating `decode_slots` is unchanged; a
+    # shape that sets `decode_slots` declares that many instead, which is what
+    # production does with a padded bucket.
+    #
+    # `distribution[0] == distribution[1]` always, matching
+    # `mla_attention_op.py:183` (`torch.stack([rd[0], rd[0], rd[2]])`).
+    declared = shape.decode_slots or num_seqs
+    num_decodes = declared if shape.q_len == 1 else 0
+    distribution = jnp.array([num_decodes, num_decodes, declared], jnp.int32)
 
     return {
         "q": q,
