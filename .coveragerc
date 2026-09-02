@@ -1,5 +1,7 @@
 [run]
-relative_files = false
+parallel = true
+concurrency = multiprocessing
+sigterm = true
 
 [paths]
 source =

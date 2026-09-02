@@ -38,7 +38,7 @@ steps:
             --cov=vllm_torchtpu --cov-report= tests/ || true;
           ls -la /perf_eval_results/'
     artifact_paths:
-      - "perf_eval_results/coverage_2chip.dat"
+      - "perf_eval_results/coverage_2chip.dat*"
 
   - label: "coverage: 8-chip (multichip)"
     key: cov_8chip
@@ -54,7 +54,7 @@ steps:
             --cov=vllm_torchtpu --cov-report= tests/ || true;
           ls -la /perf_eval_results/'
     artifact_paths:
-      - "perf_eval_results/coverage_8chip.dat"
+      - "perf_eval_results/coverage_8chip.dat*"
 
   - label: "coverage: combine + report"
     key: cov_combine
@@ -65,10 +65,10 @@ steps:
       queue: cpu
     timeout_in_minutes: 30
     commands:
-      - buildkite-agent artifact download "perf_eval_results/coverage_*.dat" .
+      - buildkite-agent artifact download "perf_eval_results/coverage_*" .
       - ls -la perf_eval_results/
       - python3 -m pip install -q --user coverage
-      - python3 -m coverage combine perf_eval_results/coverage_2chip.dat perf_eval_results/coverage_8chip.dat
+      - python3 -m coverage combine perf_eval_results/coverage_*chip.dat*
       - python3 -m coverage report | tee coverage_summary.txt
       - python3 -m coverage xml -o coverage.xml
       - python3 -m coverage html -d cov_html
