@@ -21,11 +21,13 @@ ENABLE_EP=true
 QUANTIZATION=""
 ISL_OSL_CONFIGS="8192:1024"
 CONCURRENCY_OPTIONS="1"
-# check_regression.py fails a cell when completed < 0.95 x baseline
-# completed; 20 sequential bs=1 requests (~42 s each) put that floor at
-# 19, so one transient request failure does not fail the nightly on the
-# single tpu_v7x_32 agent. 10 would make the floor 9.5 = zero tolerance.
-NUM_PROMPTS=20
+# 64 sequential bs=1 requests (~42 s each, ~45 min of bench time) give a
+# stabler median for the gated metrics; checkpoint stream + compile still
+# dominate the step's wall clock. check_regression.py fails a cell when
+# completed < 0.95 x baseline completed, so the floor is 60.8 and up to 3
+# transient request failures do not fail the nightly on the single
+# tpu_v7x_32 agent.
+NUM_PROMPTS=64
 
 # Disable random length jitter: benchmark requests use exact nominal
 # 8192:1024 lengths, so TTFT/TPOT medians are comparable run to run.
@@ -63,9 +65,9 @@ ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,512]}"
 
 # The bench client tokenizes from the dir the server pulled from GCS
-# (run_benchmarks.sh derives --tokenizer from MODEL_URI); the custom
-# tokenizer code in that dir still needs --trust-remote-code.
-EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }--trust-remote-code"
+# (run_benchmarks.sh derives --tokenizer from MODEL_URI); the harness
+# passes --trust-remote-code to the client unconditionally, which covers
+# the custom tokenizer code in that dir.
 
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
