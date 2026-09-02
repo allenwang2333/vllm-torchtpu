@@ -827,7 +827,13 @@ def _masked_dense_ragged_paged_attention(
             jnp.full((4, ), -1, jnp.int32),
         )
 
-        scope_name = f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
+        # Keep the selected dispatcher tier in the custom-call name. Unlike
+        # compiler diagnostics (which contain every lax.switch branch), XPlane
+        # records only custom calls that actually execute, so this label makes
+        # the per-step route and its device time directly attributable.
+        mask_kind = "analytic" if analytic_mask else "bitmap"
+        scope_name = (f"MLA-masked-{mask_kind}-{case.symbol}-bq_{bq_sz}"
+                      f"-bkvp_{bkv_p}-p_{page_size}")
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(

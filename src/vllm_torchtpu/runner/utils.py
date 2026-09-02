@@ -84,8 +84,17 @@ def get_batch_composition_stats(
     num_reqs: int,
     padded_total_num_scheduled_tokens: int,
     scheduler_output: "VllmSchedulerOutput",
+    num_decode_reqs: int = 0,
+    num_windowed_reqs: int = 0,
 ) -> dict:
-    """Logs batch composition stats and returns them as a dict."""
+    """Returns phase and route inputs for one reordered scheduler step.
+
+    ``q_lens`` and ``kv_lens`` retain request order after the runner's RPA/MLA
+    partition. Together with ``request_distribution`` and the padded token
+    count, they are sufficient to replay the masked-dense selector offline.
+    Keeping these host-owned values in the profiler sidecar avoids a
+    device-to-host callback in the timed model graph.
+    """
     num_prefill_tokens = 0
     num_decode_tokens = 0
 
@@ -94,6 +103,7 @@ def get_batch_composition_stats(
     # Get the number of tokens already processed for each request.
     num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:
                                                                       num_reqs]
+    kv_lens = []
 
     scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
     min_kv_len = float("inf") if num_reqs > 0 else 0
@@ -101,12 +111,14 @@ def get_batch_composition_stats(
         assert req_id is not None
 
         # This is the number of tokens to process in the current step for this request
-        num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
+        num_scheduled_for_req = int(
+            scheduler_output.num_scheduled_tokens[req_id])
         num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
 
         # This is the number of tokens already processed for this request (before this step)
         num_already_computed = int(
             num_computed_tokens_per_req[i])  # Cast from np.int32
+        kv_lens.append(num_already_computed + num_scheduled_for_req)
         min_kv_len = min(min_kv_len, num_already_computed)
 
         # When speculative decoding is enabled for this request, the extra
@@ -137,6 +149,11 @@ def get_batch_composition_stats(
         "padded_total_num_scheduled_tokens": padded_total_num_scheduled_tokens,
         "num_reqs": num_reqs,
         "min_kv_len": min_kv_len if min_kv_len != float("inf") else 0,
+        "q_lens": num_scheduled_tokens_per_req_list,
+        "kv_lens": kv_lens,
+        "request_distribution": [num_decode_reqs, num_windowed_reqs, num_reqs],
+        "num_decode_reqs": num_decode_reqs,
+        "num_windowed_reqs": num_windowed_reqs,
     }
     stats["phase"] = determine_phase_from_batch_composition_stats(stats).name
     return stats

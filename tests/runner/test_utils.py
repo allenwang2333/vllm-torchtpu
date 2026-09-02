@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -6,7 +8,8 @@ import pytest
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
-    PhaseBasedProfiler, determine_phase_from_batch_composition_stats)
+    PhaseBasedProfiler, determine_phase_from_batch_composition_stats,
+    get_batch_composition_stats)
 
 
 @pytest.fixture
@@ -153,6 +156,39 @@ def test_determine_phase_treats_single_token_step_as_decode_only():
         "num_prefill_tokens":
         0,
     }) == InferencePhase.DECODE_ONLY
+
+
+def test_batch_composition_stats_preserve_masked_dense_route_inputs():
+    input_batch = SimpleNamespace(
+        req_ids=["decode", "long-prefill", "short-prefill"],
+        num_computed_tokens_cpu=[8192, 7680, 1024],
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={
+            "decode": 1,
+            "long-prefill": 512,
+            "short-prefill": 512,
+        },
+        scheduled_spec_decode_tokens={},
+    )
+
+    stats = get_batch_composition_stats(
+        batch_id=42,
+        input_batch=input_batch,
+        total_num_scheduled_tokens=1025,
+        num_reqs=3,
+        padded_total_num_scheduled_tokens=2048,
+        scheduler_output=scheduler_output,
+        num_decode_reqs=1,
+        num_windowed_reqs=1,
+    )
+
+    assert stats["q_lens"] == [1, 512, 512]
+    assert stats["kv_lens"] == [8193, 8192, 1536]
+    assert stats["request_distribution"] == [1, 1, 3]
+    assert stats["num_decode_reqs"] == 1
+    assert stats["num_windowed_reqs"] == 1
+    json.dumps(stats)
 
 
 def test_phased_profiler_full_cycle_at_batch_size_one(profiler_fixture):

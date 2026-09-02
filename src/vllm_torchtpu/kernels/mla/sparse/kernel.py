@@ -587,7 +587,13 @@ def _sparse_ragged_paged_attention(
             jnp.zeros((2, ), jnp.int32),
         )
 
-        scope_name = f"MLA-p_{cache_kv_rope.shape[1]}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
+        # A hybrid route invokes this kernel only for its sparse prefix. Make
+        # that distinguishable from a full sparse step in runtime XPlane
+        # traces; compiler logs alone enumerate both conditional branches.
+        route_kind = "prefix" if segmented else "full"
+        scope_name = (f"MLA-sparse-{route_kind}-p_"
+                      f"{cache_kv_rope.shape[1]}-bz_{batch_size}"
+                      f"-gcz_{cache_kv_nope.shape[0]}")
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(

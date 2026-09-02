@@ -309,8 +309,34 @@ out of them into the shared `plugins/profile/<timestamp>/` directory with a
 `rank<N>_` filename prefix; the sandbox survives only because the batch
 composition stats are left behind in it. Those JSON files record, for every
 profiled step, the batch id, scheduled/prefill/decode token counts, request
-count, minimum KV length, and the phase that was assigned — which is what lets
-you tie a trace back to the batch that produced it.
+count, minimum KV length, reordered per-request `q_lens` and `kv_lens`, the MLA
+`request_distribution`, and the phase that was assigned — which is what lets
+you tie a trace back to the batch that produced it or replay the masked-dense
+selector without synchronizing a device value back to the host.
+
+### Attributing masked-dense MLA routes
+
+For GLM-5.2 masked-dense diagnostics, enable
+`TPU_MLA_MASKED_DENSE_ENABLED=1` and use phased profiling. Each
+`ModelForward` annotation carries `batch_id`, `chunk_index`, `num_chunks`, and
+the scalar request-distribution boundaries. Its matching
+`batch_composition_stats_*.json` contains the complete ordered selector inputs.
+
+The device timeline identifies the route that actually ran:
+
+| XPlane custom-call name | Meaning |
+|---|---|
+| `MLA-sparse-full-*` | Full step used sparse gather attention |
+| `MLA-sparse-prefix-*` | Hybrid route used sparse attention for its prefix |
+| `MLA-masked-analytic-*` | Masked-dense suffix used the analytic causal mask |
+| `MLA-masked-bitmap-*` | Masked-dense suffix used the materialized CSA bitmap |
+| `sc_mask_generate` | SparseCore bitmap generation for the bitmap tier |
+| `sc_dsa_gather` | SparseCore KV gather for sparse or hybrid routes |
+
+A hybrid step contains one of the `MLA-sparse-prefix-*` calls followed by a
+masked call. Compiler logs are not runtime evidence because they enumerate all
+branches of the compiled `lax.switch`; use the XPlane event occurrence and
+duration for invocation and timing attribution.
 
 ### Standard (non-phased) runs
 

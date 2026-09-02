@@ -3542,6 +3542,8 @@ class TPUModelRunner(GPUModelRunner):
                 num_reqs=self.input_batch.num_reqs,
                 padded_total_num_scheduled_tokens=padded_total_tokens,
                 scheduler_output=scheduler_output,
+                num_decode_reqs=num_decode_reqs,
+                num_windowed_reqs=num_windowed_reqs,
             )
             self.phase_based_profiler.step(batch_composition_stats)
 
@@ -3710,6 +3712,14 @@ class TPUModelRunner(GPUModelRunner):
             with TraceAnnotation(
                     name=trace_name,
                     num_reqs=num_reqs,
+                    chunk_index=chunk_index,
+                    num_chunks=target_num_chunks,
+                    mla_num_decode_reqs=max(
+                        0,
+                        min(end_index, num_decode_reqs) - start_index),
+                    mla_num_windowed_reqs=max(
+                        0,
+                        min(end_index, num_windowed_reqs) - start_index),
                     **trace_kwargs,
             ), set_forward_context(
                     attn_metadata,
