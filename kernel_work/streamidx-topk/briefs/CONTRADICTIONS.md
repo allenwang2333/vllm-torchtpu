@@ -320,3 +320,163 @@ constrain how those numbers may be used, both recorded in `report.md` §6:
 reconciles this with `03-pipelining.md`'s 150 µs per-`pallas_call` dispatch floor correctly: that
 floor is scoped to a single `block_until_ready`, and the bench enqueues `iters` calls and blocks
 once, so it amortises. **Use 5.2–5.4 µs for an empty in-model launch; never 126.8 or 150 µs.**
+
+---
+
+## 9. The A→B boundary is two edges with prizes three orders of magnitude apart
+
+Area 1 supplies the distinction the other seven sheets were eliding, and it is the single most
+useful structural point in step 2. Terms, because they are routinely conflated:
+
+- a **kernel boundary** is a place where an intermediate is materialised to HBM and a launch is
+  paid. Removing it means putting both sides in one `pallas_call`.
+- a **unit boundary** is a place where work moves between physically distinct compute — the
+  TensorCore's VPU/MXU and SparseCore's 2 cores × 16 subcores. Removing it means moving the
+  algorithm to the other unit, or writing one kernel that spans both.
+
+Stage A → stage B is **both at once**, and the two edges price out completely differently:
+
+| edge | prize at nightly decode | source |
+| --- | ---: | --- |
+| kernel edge — the score matrix's HBM round trip, `2 × 2.62 MB / 3.0e12` | **1.75 µs = 0.79%** of the 221.4 µs call | `modelled`, area 1 A1; measured call `j-8b1e7acc` |
+| unit edge — TensorCore stalled while SparseCore works | **≈71 µs/layer** attributable to `sc_topk_direct` | `measured (j-a71a648c, AgentX)`, area 1 C4(ii) / area 5 |
+
+**A design that conflates them will spend its effort on the 1.75 µs.** Area 1's reframe is the
+recommendation this document adopts: the unit edge is worth ~40× the kernel edge, **and attacking it
+does not require TC↔SC shared memory** — overlapping the two units means pipelining *through* HBM,
+stage A scoring group *g* while stage B selects on group *g−1*. Area 1 A4 establishes that the
+incumbent's loop nest already emits complete score rows at a natural granularity (4 rows per decode
+grid step), and A11 that the score write-back is already a deferred-wait async copy — i.e. this
+block is already shaped for the overlap.
+
+Two things must not be claimed together: that fusing A and B removes the HBM traffic **and**
+delivers the overlap. Separate mechanisms, separate prizes; quoting one number for both
+double-counts.
+
+This also settles §2's framing indirectly. Whatever stage A's achieved fraction turns out to be, the
+largest lever on the sheet is not inside stage A — it is the serialisation between the two stages.
+
+---
+
+## 10. The empty-launch price is now triangulated, and D1's expensive half is closed
+
+`report.md` §8 listed `StreamIdxTC-d`'s bimodality as an open probe and area 1's D1 asked for a
+hardware job to price an empty launch. **Area 7's CSE table closes the structural half from an
+artifact already on GCS.** `measured (j-a71a648c rank 0, hlo_stats, untruncated 16554/16554 rows)`:
+
+| scope | distinct HLO instrs | per layer |
+| --- | ---: | ---: |
+| `StreamIdxTC-d-bq_1-bkvp_2/…/pallas_call` | 42 | **2** |
+| `StreamIdxTC-m-bq_128-bkvp_2/…/pallas_call` | 21 | **1** |
+
+Two decode instructions per layer is exactly area 1's A7 structure — call 1 (`seq_batch_size=4`) and
+call 2 (`seq_batch_size=1`) — and at AgentX b=16, call 1's grid is `16//4 = 4` while call 2's is
+`16 % 4 = 0`. So the bimodal pair is **one running call at 114.63 µs and one empty call at 5.40 µs**,
+not an unexplained bimodality; area 7 confirms the average over all 42 is 60.0134 µs = (114.63 +
+5.40)/2 to four figures. Call 3 (`StreamIdxTC-m`) is empty at a pure-decode step and costs 5.22 µs.
+
+**This is no longer a candidate explanation. Mark it confirmed** and supersede `report.md` §8's probe
+accordingly.
+
+What that leaves, and it is worth stating because it is the useful part: **two independent empty
+launches landing within 3.5% of each other (5.40 and 5.22 µs) is strong evidence both are measuring
+launch overhead rather than residual work.** It also refutes `07-precomputation.md`'s hypothesis that
+the per-invocation cost is allocation-driven — these two launches carry a **16.8 MB** output
+allocation and cost 5.4 µs, against that file's 26.2 µs at a smaller one. Invocation-driven, not
+allocation-driven, which is the branch under which **merging the calls beats capping the score
+width**.
+
+Still open and still worth the cheap arm of D1: whether ~5.3 µs holds at the nightly score width.
+The counts are structural and carry over unchanged; the µs do not.
+
+**Consequence for the lever list.** Area 1's tier 1 — merge calls 1 and 2, both `MlaCase.DECODE`,
+both `bq_sz=1`, differing only in `seq_batch_size`, handling the remainder by masking inside the
+batched kernel — recovers ~5.4 µs/layer with **no scratch growth**, and area 2 c12 reaches the same
+conclusion independently. That is now the best-evidenced cheap win in step 2. Note it is ~2.4% of a
+221.4 µs decode call, which is inside §8's ±8.5% run-to-run spread: **it must be measured by the
+microbenchmark in the same job, and cannot be shown end to end.**
+
+---
+
+## 11. ~964 µs/step/core of the plumbing bucket is unattributed, and a KV-cache copy is the right shape to be hiding in it
+
+**This inference exists only by combining area 1 and area 7, and it is the highest
+value-per-cost item in step 2 because it costs no hardware at all.**
+
+- Area 1 A9 `measured (j-a71a648c, AgentX)`: the bucket *indexer plumbing (`conditional`,
+  `bitcast_convert`, cond copies)* is **1.230 ms/core-step = 4.6%** of a 26.584 ms step. Area 1
+  states plainly that its internal composition **is not attributed in any artifact I read**.
+- Area 7 has now attributed part of it. Summing the seven named metadata scopes (`lt`, `reduce_sum`,
+  `select_n`, `dynamic_slice`, `gather`, `slice`, `concatenate`) gives **265.7 µs/step/core**, of
+  which 225.8 µs is scalar plumbing around the `pallas_call`s rather than the token→seq maps.
+
+**1230 − 266 ≈ 964 µs/step/core is unattributed**, i.e. ~3.6% of the step, sitting in the
+`conditional` machinery and the cond copies.
+
+Area 1 A10 names a candidate occupant of exactly that space. At `mla:140`:
+
+```python
+new_cache, topk_indices = jax_op(*args)
+args[2].copy_(new_cache)          # mla:140
+```
+
+`donate_argnums=(2,)` at `mla:128` *should* make this a self-copy. **Whether donation actually
+elides it is not established by any artifact either briefer read.** If it does not, it is a full KV
+cache copy per indexer layer — 198 MB at the AgentX shape `u8[3027,64,4,256]`, **≈67 µs/layer
+`modelled`**, i.e. ≈1.4 ms/step across 21 layers. That is the same order as the entire unattributed
+residue, and it would be larger than every other item in area 1's section C combined.
+
+**This is an HLO read against an artifact already on GCS, not a hardware run.** It is promoted to
+**P0** below and must be answered before the design ranks anything, because a positive result
+relocates the whole optimization: the block's largest single cost would then be a framework-level
+copy that no kernel design touches.
+
+Cross-check available in the same artifact: area 7 found `%broadcast.33911` (the `-inf` init)
+appearing 21 times, so per-layer buffer-sized ops are visibly *not* CSE'd here — consistent with a
+per-layer cache copy surviving if donation does not elide it.
+
+---
+
+## 12. `6142d5e7` replaced an exact XLA op with the kernel, and the margin was never recorded
+
+Area 1's D4, corroborated by area 6. `sparsecore_topk` displaced
+`lax.approx_max_k(recall_target=1.0)` — which is **exact**, not approximate; this is the false
+premise that withdrew `report.md` §8's exact-top-k probe — and it was displaced **for performance**.
+**No margin was recorded in the commit, and no GLM-5.2 eval baseline exists in the repo**, so the
+size of the win the kernel bought is unknown to this session.
+
+Per §CLAUDE-file rule, a number nobody measured is not a number, and this one does not even exist.
+It matters because it decides whether a design option is *allowed to propose deleting stage B*:
+
+- if XLA's `approx_max_k` was close, a candidate may return stage B to XLA and delete 457 lines,
+  which also dissolves §9's unit edge entirely — there would be no SparseCore boundary to overlap.
+- if the kernel was much better, stage B's 30% has to be attacked from inside the kernel.
+
+This is minutes on a pod — `lax.approx_max_k(recall_target=1.0)` and `lax.top_k` against
+`sparsecore_topk` at `(64, 10240, 2048)`, one job — and it is the only probe that can *remove* a
+design option rather than rank one. Ranked **P2**.
+
+Note what it does **not** license: proposing the XLA path on the strength of the deletion alone. The
+incumbent is a candidate in step 3 and this is measured against it in the same job, per §8.
+
+---
+
+## 13. The probe set, after all eight sheets
+
+Reordered from the six articulated before areas 1 and 7 landed. Two probes are gone (the E1 lever,
+killed by arithmetic in §1; `StreamIdxTC-d` bimodality, confirmed from source in §10) and two are
+new.
+
+| | probe | cost | what it gates |
+| --- | --- | --- | --- |
+| **P0** | Does `donate_argnums=(2,)` elide `args[2].copy_(new_cache)` at `mla:140`? HLO read of `j-a71a648c` | **free** — artifact on GCS | §11. ≈67 µs/layer if not. Relocates the whole optimization if positive |
+| **P1** | DMA-stall fraction in `StreamIdxTC-d` via `/xprof-llo` (semaphore-wait at `sx:398`) | one pod job | §2's gate question — stage A near its floor (**≥50% confirms, ≤15% refutes**) — *and*, on refutation, the `assumed` VPU rate |
+| **P2** | `approx_max_k(recall_target=1.0)` and `lax.top_k` vs `sparsecore_topk` at `(64, 10240, 2048)` | minutes | §12. The only probe that can delete a design option |
+| **P3** | Can a TensorCore grid and a `VectorSubcoreMesh` be in flight together? | one pod job | §9's unit edge — the largest lever on the sheet. Area 1 D2 and area 5 name the same probe |
+| **P4** | Empty-`pallas_call` price at grid extent 0 / 1 / 16 at the **nightly** score width, plus a `lax.cond`-guarded arm | minutes | §10's residual. Tier 1 vs tier 2 of area 1 C2 |
+| **P5** | Area 4's D1 falsifier (`D1_VERDICT PASS/FAIL/INCONCLUSIVE`) | runnable as-is | §4. One vs two consumers of the K cache → whether 83.2 MB of padding is reclaimable |
+| **P6** | Is a `[:129]` strided read charged 129 bytes or 256? | minutes | If ~129, a one-line movement-only change recovers 37% of the dominant decode term |
+| **P7** | `bkv_p` sweep {1,2,3,4}; and does prefill's 33.55 MB intermediate **spill**? (instrument for spills, not wall-clock) | one pod job | Area 3's cheap discriminator for P1; area 2's top candidate; §5's prefill binding term |
+
+P0 runs first and alone, because it can change what the rest are for. P1–P7 fan out four to a pod,
+so P1–P4 is one job and P5–P7 is a second.
