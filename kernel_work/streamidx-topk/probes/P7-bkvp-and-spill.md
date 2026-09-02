@@ -118,6 +118,13 @@ close: `stage A ≈ a·nblocks + c` fitted on (9, 136.24) and (5, 113.58) gives 
 c = 85.25 µs, which predicts 102.2 µs at nblocks = 3 against a measured 90.87 µs. So the mechanism
 is *not* a fixed cost per block either. Recorded as unexplained rather than curve-fitted.
 
+**Independent corroboration from P7b's LLO dump** (`static compile-time analysis (j-9e113359,
+shard 3)`, §B3.4): the decode program `StreamIdxTC-d-bq_1-bkvp_2.2` shows **MXU occupancy 4.61 %,
+MXU-only 0.2 %, overlap 6.3 %, mem-stall-MXU-idle 54.9 %, SALU bubble 15.5 %, fully idle 15.5 %.**
+Thirty-one percent of the decode body is scalar bubble or outright idle. A kernel saturating HBM
+does not idle for 15.5 % of its bundles; a kernel paying per-block address-computation and
+fetch-issue cost at bq=1 does exactly this. Two instruments, one reading.
+
 ## A4. Caveats — read these before shipping `bkv_p = 3`
 
 1. **The absolute times are from a contended pod and do not transfer.** This shard shared the
@@ -158,18 +165,35 @@ is *not* a fixed cost per block either. Recorded as unexplained rather than curv
 
 # P7b — Does prefill's large intermediate spill?
 
-## VERDICT
+## VERDICT — two parts, and both matter
 
-**No — and the premise it was built on is false from source.** The prefill kernel's VMEM working
-set has a **static upper bound of 12 MiB**, identical to the decode kernel's, against a modelled
-32.00 MiB einsum intermediate. The 32 MiB intermediate is **not materialized in VMEM**. There is no
-capacity pressure to relieve at 32 MiB, so **"prefill is VMEM-capacity-bound" is not supported** and
-the blocking-side fixes (reduce over `h` incrementally, shrink `bq_sz`, accumulate in bf16) are
-aimed at a constraint that is not binding.
+**1. Not VMEM-capacity-bound. Established twice, by independent methods that agree.** The prefill
+kernel's total VMEM working set is **9.52 MiB** — against a configured `vmem_limit_bytes` of
+**100 MiB** and a physical VMEM of at least 64 MiB. There is no capacity pressure to relieve, and
+the blocking-side fixes the hypothesis pointed at (reduce over `h` incrementally, shrink `bq_sz`,
+accumulate in bf16) are aimed at a constraint that is not binding.
 
-> **Everything in P7b is static compile-time analysis, not measurement.** No number below is a
-> timing, a throughput, or a benchmark result, and none of it may be reported as one or reach
-> `/log-experiment`.
+**2. It nonetheless spills, heavily — but it is spilling *registers*, not VMEM.** 8,458 spills +
+10,130 fills over 11,658 bundles (**1.59 per bundle**), with **1,506 live vector registers against
+64 physical — 23.5× oversubscribed.** 97.1 % of all vector stores and 87.8 % of all vector loads
+in the compiled body are spill traffic. This is a real and large finding, and it is *not* what the
+hypothesis predicted: the pressure is inside a single grid step's register allocation, not against
+a VMEM ceiling.
+
+**3. The 32.00 MiB intermediate is never a buffer, but it is produced in full.** No VMEM allocation
+in the program exceeds 2.0 MiB. The score staging buffer is `f32[2,128,16,128]` — the H=32 head
+axis is *absent*, exactly 1/32 of the modelled figure, because heads are reduced inside the MXU
+accumulation. Yet 8,744 MXU result pops × 1024 f32 = **34.16 MiB** of intermediate is generated,
+6.6 % above the 32.00 MiB model. It is streamed and consumed — and ~4.87 MiB of it is resident at
+any moment **in the spill arena**, put there by the register allocator rather than by the kernel
+author.
+
+**Design decision settled:** stop looking for a VMEM capacity fix. **Design decision opened:** the
+lever is *vector register pressure*, which is a different resource with a different fix.
+
+> **Everything in P7b is static compile-time analysis** — issue slots and allocation sizes emitted
+> by the compiler. No number below is a timing, a throughput, or a benchmark result. None of it may
+> be reported as one or reach `/log-experiment`.
 
 ## B0. The premise, refuted from source before anything ran
 
@@ -181,39 +205,33 @@ raised". On this branch it is not 32 MiB:
 - the production call site (`mla_attention_op.py:107-122`) does **not** override it
 - the microbenchmark (`instruments/bench_streamidx_topk.py:770-777`) does **not** override it
 
-**100 MiB is the scoped ceiling in force, and it is already above the 64 MiB physical VMEM.** So
-"32-33 MB sitting against a 32 MiB scope" cannot be the mechanism as stated — that scope does not
-exist here. Raising `vmem_limit_bytes` as a "second arm" is a no-op: it is already raised, by
-default, everywhere.
+**100 MiB is the scoped ceiling in force, above even physical VMEM.** So "32-33 MB sitting against a
+32 MiB scope" cannot be the mechanism as stated — that scope does not exist here. Raising
+`vmem_limit_bytes` as a "second arm" is a no-op: it is already raised, by default, everywhere.
 
-That refutation is why the probe was built as a **capacity bisection** rather than as a wall-clock
-A/B. A wall-clock number cannot separate VPU-bound from VMEM-bound, and the brief was explicit
-about that; a bisection produces a bound that cannot be misread as a timing.
+That refutation is why the probe was built as a **capacity bisection plus an LLO dump** rather than
+as a wall-clock A/B. A wall-clock number cannot separate VPU-bound from VMEM-bound; a bisection
+produces a bound that cannot be misread as a timing, and the dump produces the spill counts.
 
 ## B1. The `vmem_limit_bytes` bisection
 
 `static compile-time analysis (j-9e113359, shard 2)`. Both shapes walked over
-`VMEM_LADDER_MIB = (4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 100, 128)`. A rejected limit
-means the compiler could not fit the kernel's scoped VMEM inside it; the smallest limit that
-compiles is a direct upper bound on the working set.
+`VMEM_LADDER_MIB = (4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 100, 128)`.
 
 | shape | 4 MiB | 8 MiB | 12 MiB | ≥ 16 MiB | `SMALLEST_LIMIT_THAT_COMPILES` |
 | --- | :---: | :---: | :---: | :---: | ---: |
 | `prod_prefill_q1024_ctx9216` (bq_sz=128, num_bq=8, bkv_sz=2048, ctx 9216) | REJECTED | REJECTED | **OK** | OK | **12 MiB** |
 | `prod_decode_b64_ctx8704` (bq_sz=1, bkv_sz=2048, 64 seqs) — the reference | REJECTED | REJECTED | **OK** | OK | **12 MiB** |
 
-12 MiB is **37.5 % of the 32 MiB Mosaic scoped default** and **18.75 % of the 64 MiB physical VMEM**
-on tpu7x.
+**The two shapes bottom out identically**, because `streamindex_topk` issues all three pallas calls
+regardless of which shape is executed. The floor is set by whichever call has the largest scoped
+requirement — §B3 identifies it as the prefill/mixed `-m-` program in both runs. Running the decode
+shape as a reference is what made that visible; without it, 12 MiB would have looked like a
+prefill-specific fact.
 
-**The two shapes bottom out identically, and that is the load-bearing observation.** `streamindex_topk`
-issues all three pallas calls (decode `-d-`, mixed `-m-`, prefill) regardless of which shape is being
-executed, so the floor is set by whichever call has the largest scoped requirement — not by the shape
-under test. That is why the reference arm was run: without it, 12 MiB for prefill alone would have
-looked like a prefill-specific fact.
+## B2. What the rejection messages name — and the correction the dump forced
 
-## B2. What the rejection messages name — and what they do not
-
-The `CompileTimeScopedVmemOom` diagnostics name the **score buffers**, not the einsum intermediate:
+The `CompileTimeScopedVmemOom` diagnostics name:
 
 - 4 MiB rejection: `%StreamIdxTC-d-bq_1-bkvp_2.2 = f32[1024,80,128]{2,1,0:T(8,128...`
 - 8 MiB rejection: `%StreamIdxTC-m-bq_128-bkvp_2.1 = f32[1024,80,128]...`
@@ -221,52 +239,199 @@ The `CompileTimeScopedVmemOom` diagnostics name the **score buffers**, not the e
 `modelled`: `f32[1024, 80, 128]` = 1024 · 80 · 128 · 4 B = 41,943,040 B = **40.0 MiB** — the stage A
 score matrix (1024 query tokens × 80 sublanes × 128 lanes = 10240 positions).
 
+> **Correction.** An earlier reading of this file inferred from these messages that the *score
+> buffers* set the VMEM floor. The Mosaic IR says otherwise: `f32[1024,80,128]` appears as
+> `%arg10`/`%arg11: memref<1024x80x128xf32, …, #tpu.memory_space<hbm>>` — **HBM, not VMEM** — read
+> through `tpu.memref_slice … -> memref<?x16x128xf32, hbm>`. The only VMEM-space arguments are
+> `%arg12..%arg15`, the four scratch operands in §B3.1. The diagnostic names the *instruction* whose
+> scoped allocation overflowed, not the buffer that overflowed it. What actually sets the floor is
+> §B3.1's 9.52 MiB.
+
 `modelled`, the intermediate the brief is about: `bq_sz · H · bkv_sz · 4 = 128 · 32 · 2048 · 4 =
-33,554,432 B = 32.00 MiB`.
+33,554,432 B = 32.00 MiB`. It is named nowhere in the diagnostics, and it is not a buffer — §B3.3.
 
-**The einsum intermediate is named nowhere in the diagnostics, and 12 MiB is less than a third of
-its modelled 32.00 MiB.** It therefore cannot be resident in VMEM as a whole. Whatever the kernel is
-doing with the `[bq_sz, H, bkv_sz]` product, it is consuming it incrementally — blocked over `h`,
-or fused into the reduction — and never materializes it. Area 2 and area 4 both computed the 32 MiB
-figure correctly *as an arithmetic product*; the mistake was in assuming the product is a buffer.
+## B3. The LLO dump
 
-## B3. The LLO dump — captured, read separately
+`static compile-time analysis (j-9e113359, shard 3)`. Capture: `LIBTPU_INIT_ARGS` (not `XLA_FLAGS`)
+set **before `import jax`**, with `--xla_jf_dump_to`, `--xla_jf_dump_llo_text=true`,
+`--xla_mosaic_dump_to`; decode then prefill in one process. Produced `jf: 22911 files / 2329.7 MB`
+and `mosaic: 202 files / 179.4 MB`, tarred to `p7b-llo.tar.gz` (391,330,930 B). Read with this
+repo's vendored `xprof-cli` (`get_llo_fit_summary`, `get_llo_static_utilization`,
+`get_llo_schedule_analysis`, `get_llo_bundles`, `--bypass_cache=True`).
 
-`/xprof-llo`'s dump-side capture ran as shard 3 and succeeded:
+> **A trap worth recording.** Each program has **two compile instances**, one per shape run, and
+> `get_llo_fit_summary` picks a "primary" that is not the obvious one — for `StreamIdxTC-m-…` it
+> picked the instance from the **decode** run. The dump had to be split into per-run views by
+> timestamp (decode = the run whose custom-call output is `f32[64,80,128]`; prefill =
+> `f32[1024,80,128]`) and re-read. Here the two compiles turned out near-identical (prefill `-m-`:
+> 11601 vs 11600 bundles, VMEM byte-for-byte the same) so no answer changed — but it would have if
+> the shapes had diverged. Anyone repeating this must split by run.
+
+Three kernel programs exist: `StreamIdxTC-m-bq_128-bkvp_2.1` (subject) and
+`StreamIdxTC-d-bq_1-bkvp_2.2` / `.3` (reference; `.2` stages 4 kv blocks per step, `.3` stages 1).
+
+### B3.1 VMEM: 9.52 MiB, and the headline number is wrong by 2.3×
+
+**`get_llo_fit_summary`'s headline VMEM figure counts only the named scratch allocations and omits
+the register-allocator spill arena.** Recomputed from the `…-53-post-ra.txt` allocation table over
+every `space=vmem` allocation:
+
+| program | named scratch | **spill arena** | **total VMEM** | spill slots |
+| --- | ---: | ---: | ---: | ---: |
+| **prefill `-m-bq_128`** | 4,399,104 B = 4.20 MiB | 5,586,944 B = **5.33 MiB** | **9,986,048 B = 9.52 MiB** | 1364 × 0x1000 |
+| decode `-d-.2` | 4,370,432 B = 4.17 MiB | 1,429,504 B = 1.36 MiB | 5,799,936 B = 5.53 MiB | 349 × 0x1000 |
+| decode `-d-.3` | 1,147,904 B = 1.09 MiB | 630,784 B = 0.60 MiB | 1,778,688 B = 1.70 MiB | 154 × 0x1000 |
+
+Every spill slot is exactly 0x1000 = 4096 B = one 8×128 f32 vreg. The five named prefill
+allocations, verbatim from post-ra:
 
 ```
-[P7b] LIBTPU_INIT_ARGS: --xla_jf_dump_to=<out>/jf --xla_jf_dump_llo_text=true --xla_mosaic_dump_to=<out>/mosaic
-[P7b] dump jf: 22911 files, 2329.7 MB
-[P7b] dump mosaic: 202 files, 179.4 MB
+#allocation1 u32[144,128]                        0x12000  =    73,728 B  internal scratch
+#allocation2 s8[2,1,512,4,256]                  0x100000  = 1,048,576 B  kv cache block, double buffered
+#allocation3 f8e4m3fn[2,1,128,32,128]           0x100000  = 1,048,576 B  q block (bq=128, H=32, D=128), double buffered
+#allocation4 f32[2,1,128,32]                     0x20000  =   131,072 B
+#allocation5 f32[2,128,16,128]                  0x200000  = 2,097,152 B  score block (bq=128 x 2048 kv), double buffered
 ```
 
-tarred to `p7b-llo.tar.gz`, 391,330,930 bytes, in the job's `command-container` output directory.
-Decode and prefill were run in one process so both programs land in one dump and can be diffed. The
-flags were set **before `import jax`**, as `LIBTPU_INIT_ARGS` (not `XLA_FLAGS`) — the two failure
-modes that leave a job green with no data.
+**The two methods agree tightly.** 9.52 MiB is **> 8 MiB and ≤ 12 MiB** — exactly the bracket B1's
+bisection found. It also explains why the *decode* shape was rejected at 8 MiB despite its own
+program needing 5.53 MiB: the decode run compiles all three calls, and the 9.52 MiB `-m-` program is
+the binding constraint in both runs. Two independent instruments, one answer.
 
-Non-empty dumps mean the capture gated clean. Reading it (`get_llo_fit_summary`,
-`get_llo_static_utilization` on `StreamIdxTC-m-bq_128-bkvp_2` with `StreamIdxTC-d-bq_1-bkvp_2` as
-reference) for VMEM high-water and spill/fill counts is **in flight at time of writing and is not
-recorded here**. B1 and B2 do not depend on it: the bisection is an independent, self-contained
-static bound, and it already answers the capacity question. The dump would add the spill counts and
-the per-unit occupancy that would positively identify the VPU-bound alternative, rather than merely
-failing to find the VMEM-bound one.
+Against the limits: 9.52 MiB is **29.7 % of a 32 MiB scoped default**, **14.9 % of 64 MiB physical**,
+**7.4 % if physical is 128 MiB**. The operative limit in this capture was 100 MiB. Nowhere near any
+ceiling on any reading.
 
-## B4. What P7b settles
+### B3.2 Spills: 1.59 per bundle, and 23.5× register oversubscription
 
-- **Settled:** the prefill kernel's VMEM working set is ≤ 12 MiB, the same as decode's, and the
-  32.00 MiB intermediate is not materialized. `briefs/area4-layout-precision.md` §D5's hypothesis —
-  "prefill's binding term may be VMEM capacity/spill" — is **not supported**.
-- **Settled:** raising `vmem_limit_bytes` is not an available lever. It is already 100 MiB by
-  default at every call site, above physical VMEM.
-- **Not settled by P7b alone:** that prefill is therefore VPU-bound. Ruling out one hypothesis does
-  not establish the other. `report.md` §4's prefill floor of 623.3 µs "VPU-bound by 14×" rests on
-  two `assumed` inputs (the 1.72e12 ops/s VPU rate and "3 VPU ops per element"), so it is not
-  independent confirmation. The per-unit occupancy in the LLO fit summary is what would confirm it.
-- **Also not settled:** whether the 40.0 MiB `f32[1024,80,128]` score matrix — which *is* named, and
-  is larger than the intermediate that was being hunted — is worth attacking. It is the stage A
-  output and lives in HBM; P7b says only that its scoped requirement is what sets the 12 MiB floor.
+| | **prefill `-m-`** | decode `-d-.2` | decode `-d-.3` |
+| --- | ---: | ---: | ---: |
+| spills (stores) | **8,458** | 996 | 196 |
+| fills (loads) | **10,130** | 999 | 197 |
+| bundles | 11,658 | 2,779 | 757 |
+| (spills+fills)/bundle | **1.59** | 0.72 | 0.52 |
+| `VSTORE:SPILL` as share of `VSTORE` | 36.27/37.37 = **97.1 %** | 99.2 % | 99.1 % |
+| `VLOAD:FILL` as share of `VLOAD` | 28.96/32.98 = **87.8 %** | 31.4 % | 26.4 % |
+| register pressure (live vregs) | **1,506** | 376 | 195 |
+
+64 architectural vregs exist (highest index observed `_v63`), so the prefill body is **23.5×
+oversubscribed**. Zero `vld` from a named non-spill allocation appears in the steady state of any of
+the three programs — every vector load there is a fill. Instruction-level evidence from inside the
+largest stall run (`0x28aa-0x2d89`, 1248 bundles, `mem_stall_mxu_idle`):
+
+```
+0x28b0  { vcmask ;; vadd.f32 ;; vmul.f32 ;;
+          %162437 = vst [vmem:[#allocation203_spill]] /*vst_source=*/%v131854_v4 ;;
+          vmax.f32 ;; vld [vmem:[#allocation302_spill]] ;; vld [vmem:[#allocation1136_spill]] }
+```
+
+### B3.3 The 32.00 MiB intermediate: not a buffer, but produced in full
+
+*Not a buffer.* No VMEM allocation exceeds 2.0 MiB. The score staging buffer `f32[2,128,16,128]` is
+bq 128 × 2048 kv × f32, double-buffered — **the H=32 axis is absent**, exactly 1/32 of the modelled
+32 MiB per buffer. Heads are reduced inside the MXU accumulation. Materialized as modelled, that one
+allocation would read 32 MiB (64 MiB double-buffered) and the kernel would not compile at 12 MiB.
+
+*But produced in full.* The compiled body contains **8,744 `vpop.f32.mrb[..].mxu{0,1}`** MXU
+result-buffer pops, each yielding one 8×128 f32 vreg:
+
+- `modelled` intermediate: 128 · 32 · 2048 = 8,388,608 f32 = **32.00 MiB**
+- popped from the MXU, statically counted: 8,744 · 1024 = 8,953,856 f32 = **34.16 MiB** — **6.6 %
+  above the model**, the excess being padding and tail
+
+Corroborated by the matmul count: 1,024 `vmatmul` for 128·32·2048·128 = 1.074e9 MACs is 1.049e6
+MACs per instruction = 256·256·16, i.e. a full 256-lane MXU tile with 16 pushed rows. One compiled
+body = one (bq=128 × bkv=2048) grid step, generating the whole intermediate.
+
+Where it goes: **7,292 of the 8,458 spill stores (86.2 %) take an MXU `vpop` result as their
+`vst_source`**, landing in 1,190 distinct spill slots = **4.87 MiB**. So ~4.9 MiB of the 5.33 MiB
+spill arena is holding matmul output. The intermediate *is* streamed through VMEM, in 4 KiB pieces,
+by the register allocator — and it is invisible in the tool's headline VMEM number.
+
+### B3.4 What each kernel is bound by
+
+| static field | **prefill `-m-bq_128`** | decode `-d-.2` | decode `-d-.3` |
+| --- | ---: | ---: | ---: |
+| **VALU occupancy** | **94.19 %** (saturated 89.45 %) | 62.08 % | 57.00 % |
+| MXU occupancy | 35.13 % (sat 29.11 %) | 4.61 % | 4.23 % |
+| VLOAD / of which FILL | 32.98 / 28.96 | 38.18 / 11.99 | 32.98 / 8.69 |
+| VSTORE / of which SPILL | 37.37 / 36.27 | 18.08 / 17.93 | 13.08 / 12.96 |
+| SALU | 1.43 % | 13.35 % | 18.63 % |
+| XLU | 10.16 % | 20.09 % | 18.25 % |
+| EUP | 0.0 % | 0.0 % | 0.0 % |
+| **fully idle bundles** | **0.5 %** | 15.5 % | 9.5 % |
+| overlap (MXU+mem) | 35.2 % | 6.3 % | 5.9 % |
+| mem-stall, MXU idle | 45.7 % | 54.9 % | 43.7 % |
+| SALU bubble | 1.5 % | 15.5 % | 19.9 % |
+| MXU matmuls | 1,024 | 32 | 8 |
+| compiler-inserted `tpu.relayout` | 16 | 37 | 13 |
+
+All three verdict lines read `VPU-serialized (vector ALU dominates, MXU starved)`, which is a label,
+not evidence. The raw fields separate them, consistently:
+
+- **Prefill is the better-scheduled of the two.** 0.5 % fully idle against 15.5 %, 35.2 % overlap
+  against 6.3 %, SALU bubble 1.5 % against 15.5 %. Near-zero idle with high overlap is a fed
+  pipeline; the decode's 15.5 % idle + 15.5 % scalar bubble is the small-batch address-computation
+  tax at bq=1.
+- **Prefill is VALU-saturated.** 94.19 % occupancy with 89.45 % of bundles saturating all four VALU
+  slots. Opcode histogram of the body: 12,320 `vadd.f32`, 10,240 `vmul.f32`, 8,960 `vrot.slane` (a
+  lane-reduction tree, rotate amounts 1/2/4/7), 8,192 `vmax.f32`, 2,096 `vsel` (top-k `-inf`
+  masking) — against only 1,024 `vmatmul`. **The vector work is the post-matmul reduce/score/select
+  chain, not the einsum.**
+- **But the saturation is partly self-inflicted.** With `VSTORE:SPILL` at 97.1 % and `VLOAD:FILL` at
+  87.8 %, spill and fill instructions occupy the same VLIW bundles as the arithmetic. The tool's own
+  flag says so: *"VPU-active% is inflated by spill traffic."*
+- Relayouts are **not** the problem: `post-infer-vector-layout` reads 0 on every function, so all
+  132 in the dump are compiler-inserted, and prefill's 16 is the lowest of the three.
+
+## B4. What P7b settles, and what it opens
+
+**Settled:**
+- The prefill working set is **9.52 MiB**, confirmed by two independent methods (bisection bracket
+  8 < x ≤ 12 MiB; post-ra allocation sum 9.52 MiB). It is nowhere near any VMEM ceiling.
+- `briefs/area4-layout-precision.md` §D5's hypothesis — "prefill's binding term may be VMEM
+  capacity/spill" — is **half right in a way that matters**. There is no capacity problem. There is
+  a severe spill problem, and it is register spilling, which §D5's proposed fixes do not address.
+- Raising `vmem_limit_bytes` is not an available lever; it is already 100 MiB everywhere by default.
+- The 32.00 MiB intermediate is not a buffer. Area 2 and area 4 both computed the product correctly;
+  the error was assuming a product is an allocation.
+- Prefill is **VPU-bound**, on the post-matmul reduce/score/select chain rather than on the einsum —
+  the opcode histogram is 1,024 `vmatmul` against ~40,000 vector-arithmetic ops.
+
+**Opened, and this is the actionable one:** the prefill body holds **1,506 live vregs against 64
+physical**, and 86.2 % of its spill stores are MXU results. Shortening the live ranges of popped
+MXU results — consuming each `vpop` into the reduction chain before pushing the next tile, instead
+of accumulating ~1,190 slots' worth — is the lever the evidence points at. **Treat it as a
+hypothesis, not a plan:** it is close to `xprof-cli`'s own third recommendation, which ships
+self-labelled `TRACK RECORD 0/5 — directly refuted twice`. The evidence here is counted facts
+(7,292-of-8,458 vpop-sourced spills; 1,506 vs 64 registers) rather than the tool's inference, but
+the base rate on this lever is bad. Refutable prediction: spills/fills fall toward the decode's
+~1/bundle, `VSTORE:SPILL` drops well below `VSTORE`, and the spill arena shrinks from 5.33 MiB
+toward ~1 MiB (total VMEM ~5 MiB). That is a cheap `/xprof-llo` re-capture, not a benchmark.
+
+**Not settled:**
+- **How much of the 45.7 % `mem_stall_mxu_idle` is spill traffic versus genuine memory latency.**
+  These are entangled and the dump cannot separate them. What the dump *does* rule out is the
+  capacity story.
+- **Whether physical VMEM on this target is 64 or 128 MiB.** `xprof-cli` hardcodes 128 MiB; the
+  brief says 64 MiB. Not resolvable from the dump, and it changes nothing — 9.52 MiB is far under
+  either.
+- **Whether the 1,364 spill slots overlap in address.** post-ra prints no offsets for spill
+  allocations, so 5.33 MiB is an upper bound on the arena. The 8/12 MiB bisection bracket is
+  consistent with it being exact.
+- **Any timing.** There is no trace-side capture in this tarball — `jf/` and `mosaic/` only, no
+  `.xplane.pb`. No `get_llo_utilization` (needs a sampled capture, which this is not) and no step-0
+  `xprof-dump` gate was possible. Nothing here maps to a fraction of wall-clock.
+- **Which decode variant (`.2` or `.3`) carries production's decode work, and in what proportion.**
+  Both are emitted; the dump gives no invocation counts. Both are reported.
+- `report.md` §4's prefill floor of 623.3 µs "VPU-bound by 14×" is **not** independently confirmed
+  by this. It rests on two `assumed` inputs (1.72e12 ops/s VPU rate; "3 VPU ops per element"), and
+  the dump's opcode histogram — ~40,000 vector ops per grid step — is a chance to replace that
+  assumption with a count. That recomputation was not done here.
+
+Artifacts, if anyone needs to re-read the dump: `/home/annyan_google_com/llo_p7b/p7b-llo/{jf,mosaic}`
+(2.5 GB), with per-run views at `/tmp/jf_runA` (decode) and `/tmp/jf_runB` (prefill). These are
+scratch and will not survive; the tarball in `j-9e113359`'s outputs is the durable copy.
 
 ---
 
@@ -276,8 +441,10 @@ failing to find the VMEM-bound one.
 | --- | --- |
 | every µs in the P7a table | `measured (j-9e113359-47c6-41b2-ad85, shard 1)`, shape `prod_decode_b64_ctx8704`, `q f8_e4m3fn[64,32,128]` / `weights bf16[64,32]` / `cache_kv u8[576,256,4,256]`, best-of-N, **contended pod — ratios only** |
 | `num_sublanes_total`, blocks/seq, pages fetched | `modelled` — arithmetic shown inline |
-| every MiB in P7b | **static compile-time analysis** `(j-9e113359, shard 2)` — not a timing |
-| `f32[1024,80,128]` = 40.0 MiB, `128·32·2048·4` = 32.00 MiB | `modelled` — arithmetic shown inline |
+| B1 bisection ladder | **static compile-time analysis** `(j-9e113359, shard 2)` — not a timing |
+| every VMEM byte count, spill/fill count, occupancy %, opcode count, bundle count in B3 | **static compile-time analysis** from the LLO/Mosaic dump `(j-9e113359, shard 3)` — issue slots and allocation sizes emitted by the compiler, **not measured time** |
+| `f32[1024,80,128]` = 40.0 MiB; `128·32·2048·4` = 32.00 MiB; 8,744·1024 = 34.16 MiB; 23.5× | `modelled` — arithmetic shown inline |
 | `DEFAULT_VMEM_LIMIT_BYTES = 100 MiB` | source, `streamindex_topk.py:28` |
 | 221.4 / 109.2 µs baseline of record | `report.md` §6, `measured (j-8b1e7acc)` — quoted, not re-measured |
-| 47.5 µs decode floor, 623.3 µs prefill floor | `report.md` §4, `modelled`, and resting on `assumed` VPU inputs |
+| 47.5 µs decode floor, 623.3 µs prefill floor | `report.md` §4, `modelled`, resting on `assumed` VPU inputs |
+| physical VMEM = 64 MiB | `assumed` (brief); `xprof-cli` asserts 128 MiB — **unresolved** |
