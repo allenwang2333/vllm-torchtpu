@@ -402,7 +402,6 @@ def _build_fused_core(lower_bound: float | None, eps: float,
         window_distribution: jax.Array,  # [3]: [decode+verify end, _, mixed]
         slot_read_offsets: jax.Array,  # pool-sized checkpoint read offsets
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del window_distribution, slot_read_offsets
         num_tokens, _, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
