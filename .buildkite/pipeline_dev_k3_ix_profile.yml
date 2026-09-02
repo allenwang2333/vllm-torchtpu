@@ -1,0 +1,65 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# [branch-local] Kimi-K3 8k/1k phased-profile capture driven by the
+# InferenceX client (--profile) on the tpu7x-32 pod, traces copied to GCS
+# (agent-side, mirrors the DSv4 xprof capture step in pipeline_perf.yml).
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_ix_profile.yml.
+# Edit --profile-conc below to change the traced concurrency.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 InferenceX phased-profile capture (TPU v7x-32)"
+    key: k3_ix_profile
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+      RUN_TYPE: "PROFILE"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ix_sweep.sh --config kimi-k3-tp32-ep-ix-profile --results-dir /perf_eval_results/k3-ix-profile --profile-conc 32"
+      - |
+        results_dir=perf_eval_results/k3-ix-profile
+        profile_dir=$$results_dir/profile
+        for phase in "$$profile_dir"/*/; do
+          [ -d "$$phase" ] || continue
+          echo "phase $$(basename "$$phase"): $$(find "$$phase" -name '*.xplane.pb' | wc -l) xplane files"
+        done
+        if ! find "$$profile_dir" -name '*.xplane.pb' -print -quit | grep -q .; then
+          echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
+          exit 1
+        fi
+        dest=$$(jq -r '.profile_gcs_dir // ""' "$$results_dir/config.json")
+        if [ -z "$$dest" ]; then
+          echo "::error::config.json carries no profile_gcs_dir."
+          exit 1
+        fi
+        if gcloud storage cp -r "$$profile_dir"/* "$$dest/"; then
+          echo "traces uploaded to $$dest"
+          rm -rf "$$profile_dir"
+        else
+          echo "GCS upload to $$dest failed (agent SA may lack access); keeping traces as Buildkite artifacts instead."
+        fi
+    artifact_paths:
+      - "perf_eval_results/**/*"
