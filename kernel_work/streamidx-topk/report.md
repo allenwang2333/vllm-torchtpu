@@ -352,7 +352,129 @@ sensitivity:
   **Caveat on what these profiles are.** They are `vllm-torchtpu-glm-5.2-ix-agentx` — an InferenceX
   agent workload — **not** the nightly benchmark recipe whose config §3 is built on. The serving
   shape must be read back from `cdk job recipe` before any number from them is compared against a
-  figure derived at §3's config. Pending.
+  figure derived at §3's config. **Read back; the caveat was justified — see §6.1.**
+
+## 6.1 The cross-check: two deployments, not one
+
+The read-back settles it. GLM-5.2 is served here at **two materially different operating points**,
+and every number in §3, §4 and §6 above is the first of them:
+
+| | **nightly perf** — §3's config | **AgentX** — what the profiles captured |
+| --- | --- | --- |
+| source | `scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh` | `cdk job recipe j-a71a648c-3064-471a-a131`, verbatim |
+| `max_model_len` | **9216** | **262144** |
+| `block_size` (page) | 1024 (`get_page_size`, a literal) | **256**, `--block-size=256` |
+| TP × DP | 1 × 16 | 16 × 1 (siblings: 2×8, 8×2, 1×16) |
+| `max_num_seqs` | 64 | 64 (observed padded batch **16**) |
+| `max_num_batched_tokens` | 1024 | 1024 |
+| workload | fixed 8192:1024, no jitter | replayed SemiAnalysis CC agent traces |
+| `num_positions` (score width) | 10240 | **262144** |
+
+A 25.6× wider score buffer and a 4× smaller page. **Comparing the profile's per-invocation cost
+against §6's baseline would have been comparing two deployments and reporting the difference as a
+property of the kernel.** The like-for-like row is being measured; until it lands, what follows is
+split into what the profile establishes *regardless* of configuration and what it does not
+establish at all.
+
+### What the profile establishes, and does not depend on which deployment
+
+Primary: `j-a71a648c-3064-471a-a131` rank 0, decode, 36 steps. Corroborated on
+`j-97102390-e817-4ca6-a9cf` rank 0 — a completely different sharding (DP=2/TP=8) — with
+per-invocation figures matching to within 1%.
+
+1. **21 of 78 layers carry an indexer.** `StreamIdxTC-m` 21 distinct HLO instructions and
+   `sc_topk_direct_*` 21, against `MLA-*` 78 and `sc_dsa_gather` 78. This is a static property of
+   the compiled HLO, so it is not a sampling artifact, and it **independently confirms the
+   `config.json` reading in §3** (`index_topk_freq: 4` plus the explicit 78-entry `indexer_types`
+   list). vLLM's code default of 1 → 78 is not what this checkpoint runs.
+
+2. **The indexer is the largest single item in the decode step.** `hlo_stats` self-time, module
+   self time 26.584 ms/core-step:
+
+   | bucket | ms/core-step | % |
+   | --- | ---: | ---: |
+   | **indexer top-k** (kernels + SparseCore + offload) | **8.720** | **32.8%** |
+   | collectives (`all-reduce`) | 4.983 | 18.7% |
+   | MLA attention (`MLA-*` + `sc_dsa_gather`) | 4.233 | 15.9% |
+   | MoE (`gmm_v2`, `router_topk`, permute/combine) | 2.743 | 10.3% |
+   | dense GEMM | 2.616 | 9.8% |
+   | indexer plumbing (`conditional`, `bitcast_convert`, cond copies) | 1.230 | 4.6% |
+
+   Larger than MLA and MoE **combined**. The conservative cross-check — raw TensorCore timeline
+   against wall — is 6.267 ms of a 23.665 ms step = **26.5%**, and 22.4% on the DP=2/TP=8 sibling.
+   Collectives at 18.7% are inflated by this job's TP=16; at the nightly's TP=1 that share
+   collapses and the indexer's relative share rises further.
+
+3. **The 256-wide K cache is confirmed in production HLO.** The operand is `u8[3027,64,4,256]`.
+   §5 derived that shape from `unsigned_align_to(kv_dim, 128)`; the compiled program has it. The
+   microbenchmark's dry run at `--page-size 256` prints `cache_kv shape = (total_pages, 64, 4, 256)`
+   — the same geometry. **129 of 256 bytes useful, measured, not inferred.**
+
+4. **The score buffer is `max_model_len`-wide, not context-wide.** `gather_offload_async_done` takes
+   `f32[16,262144]`; `sc_topk_direct_b64_n65536_k2048` consumes `s32[4194304]` = 16 × 262144. The
+   compiled shape does not depend on how long the sequences actually are. This is direct HLO
+   evidence for §8's "full-width buffers regardless of context", which was until now an inference
+   from the source.
+
+5. **Both stages are strongly sublinear in score width and batch.** The profile has 6.4× more score
+   elements than §6's `prod_decode_b64_ctx8704` row (16×262144 vs 64×10240) and costs:
+
+   | | §6 microbenchmark, nightly config | profile, AgentX config | ratio |
+   | --- | ---: | ---: | ---: |
+   | stage A (all three scoring calls) | ~109–151 µs | 125.25 µs | ≈1.0× |
+   | stage B (SparseCore top-k) | 67.4 µs | 100.5 µs | 1.49× |
+
+   6.4× the elements for 1.0–1.5× the time. **This is finding (1) of §8 — "the op barely scales
+   with the work" — reproduced by a completely independent measurement at a completely different
+   configuration.** It is the most robust thing in this document.
+
+6. **`StreamIdxTC-d` is bimodal, and unexplained.** Two calls per indexer layer: 21 distinct
+   instructions averaging **114.63 µs** (tight — 114.71–114.73 at the top) and 21 averaging
+   **5.40 µs**, a 21× spread. `StreamIdxTC-m` is 5.22 µs. The reason is not visible at the XLA op
+   level and the microbenchmark does not currently separate the two. **Step-2 probe.**
+
+7. **A cost the microbenchmark does not measure at all: `gather_offload`.** 2 per indexer layer,
+   51.54 µs each on SparseCore, and 51.77 µs each of *TensorCore stall* waiting on them — 2.148 of
+   the 6.267 ms TC timeline, **34% of the indexer's TensorCore cost**. It sits between the two
+   top-k stages, gathering the candidate logits for the 131072 stage-1 survivors. The two-stage
+   structure (`b64_n65536` → gather → `b16_n8192`) exists *because* n = 262144 is too wide for one
+   pass; at the nightly's 10240 a single pass suffices, so this term is expected to be absent
+   there. **Expected, not verified** — the like-for-like run is what checks it.
+
+   Per indexer layer the profile therefore reads: **125.25 µs of TensorCore compute, 174.6 µs of
+   TensorCore stalled on SparseCore, 203.6 µs of SparseCore time.** A TensorCore-only floor such as
+   §4's does not contain the third of those at all.
+
+### What the profile does not establish
+
+- **Any prefill number.** No captured window in any of the four jobs contains an indexer-active
+  prefill step. §4's 623 µs prefill floor is **unchecked**, on top of §8 already recording prefill
+  as `unresolved`. Nothing here changes that verdict in either direction.
+- **The real context lengths.** The compiled shapes are `max_model_len`-sized regardless, so the
+  profile cannot distinguish "scored 262144 real tokens" from "scored 262144 slots of which most
+  were padding". The AgentX trace distribution was not read.
+- **Anything inside the Pallas kernels.** `StreamIdxTC-*` and `sc_topk_direct_*` are opaque
+  `tpu_custom_call`s and XLA attributes zero FLOPs to them, so no roofline, MXU or DMA-stall figure
+  from this profile is meaningful for them. That needs `/xprof-llo` and a capture with the
+  kernel-trace `LIBTPU_INIT_ARGS`, which these do not have.
+
+### Two of the four jobs are unusable, and the reason is worth recording
+
+`j-7afc895e` — the job I named first — and `j-f37c33fb` captured **only DP lockstep dummy batches**:
+`execute_dummy_batch` 212, `_run_dp_dummy_chunk` 212, `execute_model` **0**, on rank 2 and all seven
+odd ranks available (ranks 0 and 1 absent from GCS). The indexer sits inside an XLA `conditional`
+and only the cheap branch executed, so `StreamIdxTC-*` and `sc_topk_direct_*` have **zero rows** in
+the full 16131-row `hlo_stats` and zero raw events on any core plane. That is a real absence of
+execution, not a profiling gap — the same profile shows `sc_dsa_gather` and `MLA-*` firing normally.
+The cause is `CLIENT_CONCURRENCIES=1` against `--data-parallel-size=8`.
+
+**A profile of a DP rank running dummy batches looks exactly like a profile of a kernel that is
+free.** Check `execute_model` against `execute_dummy_batch` on the host plane before reading any
+per-op number off a DP capture.
+
+Both usable captures also report `Trace Buffers Dropped` (18537 ms and 8536 ms), so absolute totals
+over the window are short. Per-invocation averages and per-step ratios — which is all that is
+quoted above — are unaffected.
 
 ## 7. Probes run in this step
 
