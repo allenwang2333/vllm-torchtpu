@@ -948,8 +948,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         """
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
-            k_scale_value = layer._k_scale_float
-            v_scale_value = layer._v_scale_float
+            k_scale_value = getattr(layer, "_k_scale_float", 0.0)
+            v_scale_value = getattr(layer, "_v_scale_float", 0.0)
             if k_scale_value != 0.0 and v_scale_value != 0.0:
                 k_scale = k_scale_value
                 v_scale = v_scale_value

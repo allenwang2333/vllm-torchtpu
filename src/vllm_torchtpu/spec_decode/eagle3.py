@@ -176,6 +176,56 @@ class Eagle3Proposer:
             set_eagle3_aux_hidden_state_layers(target_model,
                                                self.speculative_config)
 
+        if self.speculative_config.method == "mtp":
+            self._setup_gemma4_kv_sharing(target_model, target_attn_layer_names)
+
+    def _setup_gemma4_kv_sharing(
+        self,
+        target_model,
+        target_attn_layer_names: set[str],
+    ) -> None:
+        """Wire draft layers to share KV with the target model."""
+        from collections import defaultdict
+        draft_config = self.draft_model.config
+        draft_text_config = draft_config.get_text_config()
+        target_config = target_model.config
+        target_text_config = target_config.get_text_config()
+        target_layer_types = getattr(target_text_config, "layer_types", [])
+
+        if not (hasattr(self.draft_model, "model") and hasattr(self.draft_model.model, "layers")):
+            return
+
+        target_num_kv_shared = getattr(target_text_config, "num_kv_shared_layers", 0)
+        num_non_shared = len(target_layer_types) - target_num_kv_shared
+        type_to_target_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, lt in enumerate(target_layer_types[:num_non_shared]):
+            type_to_target_indices[lt].append(idx)
+
+        target_prefix = "model.layers"
+        for name in sorted(target_attn_layer_names):
+            if ".layers." in name:
+                target_prefix = name.split(".layers.")[0] + ".layers"
+                break
+
+        for draft_idx, layer in enumerate(self.draft_model.model.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            attn = getattr(layer.self_attn, "attn", None)
+            if attn is None:
+                continue
+
+            # Map to the last N layers of the target backbone (e.g., layers 56 to 59 for a 60-layer model with 4 draft layers)
+            total_target_layers = len(target_attn_layer_names)
+            target_idx = total_target_layers - len(self.draft_model.model.layers) + draft_idx
+            target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            attn.kv_sharing_target_layer_name = target_layer_name
+
+            logger.info(
+                "Gemma4 MTP (TPU): draft layer %d -> %s",
+                draft_idx,
+                target_layer_name,
+            )
+
     def _load_draft_model(self) -> None:
         logger.info(f"Loading {self.speculative_config.method} draft model...")
         model_loader = get_model_loader(self.vllm_config.load_config)
@@ -223,14 +273,18 @@ class Eagle3Proposer:
         # the K-step propose loop -> a fresh fused program per context. Enclosing
         # them makes a fixed, bucketed program per [n, hidden] shape.
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
+
         if d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
             return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(
                 torch.int32)
-        draft_id = self.draft_model.logits_processor(self.draft_model.lm_head,
-                                                     hidden).argmax(dim=-1)
+            
+        draft_logits = self.draft_model.logits_processor(self.draft_model.lm_head,
+                                                     hidden)
+
+        draft_id = draft_logits.argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -497,6 +551,7 @@ class Eagle3Proposer:
         per_chunk_stacked = [
             torch.stack(toks, dim=1) for toks in draft_tokens_per_chunk
         ]
+
         if return_device:
             return torch.cat(
                 [s[:c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)],
@@ -831,6 +886,32 @@ class Eagle3Proposer:
         effective_num_tokens = (num_tokens_padded
                                 if num_tokens_padded else num_tokens)
 
+        # --- DIAGNOSTIC LOG START ---
+        try:
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+                is_driver = getattr(runner, "is_driver_worker", True) and (get_tensor_model_parallel_rank() == 0)
+            except Exception:
+                is_driver = getattr(runner, "is_driver_worker", True)
+
+            if is_driver:
+                start = chunk.start_index
+                req_ids = runner.input_batch.req_ids[start:start + num_reqs]
+                for i, req_id in enumerate(req_ids):
+                    if req_id in runner.input_batch.req_id_to_index:
+                        req_idx = runner.input_batch.req_id_to_index[req_id]
+                        cpu_seq_len = int(runner.input_batch.num_tokens_no_spec[req_idx])
+                        if step_idx >= 1:
+                            cpu_seq_len += step_idx
+                        logger.info(
+                            "[DIAG] DRAFT METADATA | Req: %s | DraftStep: %d | Chunk: %d | "
+                            "CPU calculated seq_len: %d",
+                            req_id, step_idx, chunk.start_index, cpu_seq_len
+                        )
+        except Exception as e:
+            logger.error("[DIAG] Error during draft metadata logging: %s", e)
+        # --- DIAGNOSTIC LOG END ---
+
         mamba_state_indices = (runner._build_mamba_state_indices(
             chunk.start_index, num_reqs, kernel_num_reqs)
                                if runner._has_mamba_state else None)
@@ -865,11 +946,24 @@ class Eagle3Proposer:
 
         assert self._draft_attn_layer_names is not None, (
             "draft attn layer names were not captured during load_model")
-        result = {
-            name: md
-            for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
-        }
+        result = dict(per_layer_attn_metadata)
+
+        # Explicitly alias draft layer names to their corresponding target layer metadata
+        static_fwd_ctx = runner.vllm_config.compilation_config.static_forward_context
+        for name in self._draft_attn_layer_names:
+            layer_module = static_fwd_ctx.get(name)
+            if layer_module is not None:
+                target_name = getattr(layer_module, "kv_sharing_target_layer_name", None)
+                if target_name is not None:
+                    if target_name in result:
+                        result[name] = result[target_name]
+                    else:
+                        logger.warning(
+                            "Target layer name '%s' for draft layer '%s' "
+                            "not found in attention metadata results.",
+                            target_name, name
+                        )
+
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
         return result

@@ -2684,6 +2684,40 @@ class TPUModelRunner(GPUModelRunner):
                 f"req {req_id}: sampled {len(sampled_ids)} tokens > "
                 f"{n_placeholder} optimistic placeholders -- output_token_ids "
                 "rollback would drop the wrong elements")
+
+            # --- DIAGNOSTIC LOG START ---
+            try:
+                try:
+                    from vllm.distributed import get_tensor_model_parallel_rank
+                    is_driver = getattr(self, "is_driver_worker", True) and (get_tensor_model_parallel_rank() == 0)
+                except Exception:
+                    is_driver = getattr(self, "is_driver_worker", True)
+                
+                if is_driver:
+                    num_draft = pre_num_draft_per_req.get(pre_req_idx, 0) if pre_num_draft_per_req else 0
+                    if num_draft > 0 and req_id in self.input_batch.req_id_to_index:
+                        req_idx = self.input_batch.req_id_to_index[req_id]
+                        draft_token_ids = self.input_batch.token_ids_cpu[req_idx, seq_len : seq_len + num_draft].tolist()
+                        tokens_no_spec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
+                        tokens_no_spec_after = tokens_no_spec_before - n_placeholder + len(sampled_ids)
+                        
+                        for d_idx, d_token_id in enumerate(draft_token_ids):
+                            t_token_id = sampled_ids[d_idx] if d_idx < len(sampled_ids) else None
+                            status = "ACCEPT" if d_token_id == t_token_id else "REJECT"
+                            logger.info(
+                                "[DIAG] REJECTION EVENT | Req: %s | StepIndex: %d | DraftToken: %d | TargetToken: %s | Status: %s | "
+                                "SeqLen Before: %d | SeqLen After: %d | "
+                                "num_tokens_no_spec Before: %d | num_tokens_no_spec After: %d | "
+                                "req_state.num_computed_tokens: %d",
+                                req_id, seq_len + d_idx, d_token_id, t_token_id, status,
+                                seq_len + n_placeholder, seq_len + len(sampled_ids),
+                                tokens_no_spec_before, tokens_no_spec_after,
+                                req_state.num_computed_tokens
+                            )
+            except Exception as e:
+                logger.error("[DIAG] Error during rejection logging: %s", e)
+            # --- DIAGNOSTIC LOG END ---
+
             del req_state.output_token_ids[-n_placeholder:]
             req_state.output_token_ids.extend(sampled_ids)
 
