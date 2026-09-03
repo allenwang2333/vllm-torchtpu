@@ -1,0 +1,160 @@
+===== D1LITE PROVENANCE =====
+jax 0.10.2 jaxlib 0.10.2
+jax                                      0.10.2
+jaxlib                                   0.10.2
+libtpu                                   0.0.44.1
+PKG vllm_torchtpu /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/__init__.py
+MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532
+MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py md5=8bc9e25b8701a53a97704564b9fbc658
+MODULE /root/kw/variants/d1-lite/streamindex_topk_d1lite.py md5=9d287fb7f6512b4393b144c252d8f9ae
+MODULE /root/kw/instruments/bench_streamidx_topk.py md5=e8e492d13e59c4a1675cc7a98c5a0813
+EARLY_EXIT_IN_SIG True
+KERNEL_IDENTITY d1lite.kernel is streamindex_topk.kernel: True
+HELPER_IDENTITY d1lite._effective_row_lengths is incumbent's: True
+BENCH_CONSTS k=2048 cr=1 page=1024 bkvp=(2, 2, 2) nqpb=(1, 128, 128) mml=9216
+===== D1LITE PROVENANCE END =====
+===== D1LITE/1 STEP j11_venv BEGIN =====
+Using CPython 3.12.14 interpreter at: /usr/local/bin/python3
+Creating virtual environment at: /tmp/j11_dl_1
+Activate with: source /tmp/j11_dl_1/bin/activate
+0.11.0
+===== D1LITE/1 STEP j11_venv END rc=0 =====
+===== D1LITE/1 L21_ctx2048__inc STEP hlo BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788426903.073732    5030 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__inc:hlo] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__inc:hlo] arm=inc module=incumbent enable_early_exit=True hoist=None
+[d1lite:L21_ctx2048__inc:hlo] optimized HLO: 5.26 MB
+[d1lite:L21_ctx2048__inc:hlo] instructions=8476 computations=632 conditionals=21 custom_calls=315 branch_comps=106
+===== D1LITE/1 L21_ctx2048__inc STEP hlo END rc=0 =====
+===== D1LITE/1 L21_ctx2048__inc STEP trace BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788426922.789918   60634 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__inc:trace] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__inc:trace] arm=inc module=incumbent enable_early_exit=True hoist=None
+[d1lite:L21_ctx2048__inc:trace] jax 0.11.0
+[d1lite:L21_ctx2048__inc:trace] warmup+compile 6.122s outs=21 shape=(64, 2048)
+[d1lite:L21_ctx2048__inc:trace] traced 40 invocations in 4.218s = 105447.1 us/prog (CONTENDED wall clock, enqueued async -- NOT A RESULT)
+[d1lite:L21_ctx2048__inc:trace] xplane: /cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__inc/plugins/profile/2026_09_03_09_15_38/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb (34.94 MB)
+===== D1LITE/1 L21_ctx2048__inc STEP trace END rc=0 =====
+===== D1LITE/1 L21_ctx2048__d1 STEP hlo BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788426944.503147   98710 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__d1:hlo] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__d1:hlo] arm=d1 module=incumbent enable_early_exit=False hoist=None
+[d1lite:L21_ctx2048__d1:hlo] optimized HLO: 2.97 MB
+[d1lite:L21_ctx2048__d1:hlo] instructions=616 computations=55 conditionals=0 custom_calls=129 branch_comps=1
+===== D1LITE/1 L21_ctx2048__d1 STEP hlo END rc=0 =====
+===== D1LITE/1 L21_ctx2048__d1 STEP trace BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788426961.439087  135498 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__d1:trace] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__d1:trace] arm=d1 module=incumbent enable_early_exit=False hoist=None
+[d1lite:L21_ctx2048__d1:trace] jax 0.11.0
+[d1lite:L21_ctx2048__d1:trace] warmup+compile 4.757s outs=21 shape=(64, 2048)
+[d1lite:L21_ctx2048__d1:trace] traced 40 invocations in 4.195s = 104880.4 us/prog (CONTENDED wall clock, enqueued async -- NOT A RESULT)
+[d1lite:L21_ctx2048__d1:trace] xplane: /cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__d1/plugins/profile/2026_09_03_09_16_17/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb (41.93 MB)
+===== D1LITE/1 L21_ctx2048__d1 STEP trace END rc=0 =====
+===== D1LITE/1 L21_ctx2048__dl STEP hlo BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788426983.413563  174458 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__dl:hlo] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__dl:hlo] arm=dl module=d1lite enable_early_exit=True hoist=plain
+[d1lite:L21_ctx2048__dl:hlo] optimized HLO: 5.04 MB
+[d1lite:L21_ctx2048__dl:hlo] instructions=7912 computations=532 conditionals=21 custom_calls=315 branch_comps=86
+===== D1LITE/1 L21_ctx2048__dl STEP hlo END rc=0 =====
+===== D1LITE/1 L21_ctx2048__dl STEP trace BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788427001.396356  219761 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__dl:trace] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__dl:trace] arm=dl module=d1lite enable_early_exit=True hoist=plain
+[d1lite:L21_ctx2048__dl:trace] jax 0.11.0
+[d1lite:L21_ctx2048__dl:trace] warmup+compile 5.670s outs=21 shape=(64, 2048)
+[d1lite:L21_ctx2048__dl:trace] traced 40 invocations in 4.446s = 111154.7 us/prog (CONTENDED wall clock, enqueued async -- NOT A RESULT)
+[d1lite:L21_ctx2048__dl:trace] xplane: /cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dl/plugins/profile/2026_09_03_09_16_58/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb (34.80 MB)
+===== D1LITE/1 L21_ctx2048__dl STEP trace END rc=0 =====
+===== D1LITE/1 L21_ctx2048__dlc STEP hlo BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788427025.270775  263681 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__dlc:hlo] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__dlc:hlo] arm=dlc module=d1lite enable_early_exit=True hoist=cond
+[d1lite:L21_ctx2048__dlc:hlo] optimized HLO: 5.60 MB
+[d1lite:L21_ctx2048__dlc:hlo] instructions=9207 computations=674 conditionals=42 custom_calls=315 branch_comps=148
+===== D1LITE/1 L21_ctx2048__dlc STEP hlo END rc=0 =====
+===== D1LITE/1 L21_ctx2048__dlc STEP trace BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788427043.524768  293861 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:L21_ctx2048__dlc:trace] page_size=1024 shape=decode_b64_ctx2048 mml=9216 num_positions=10240 num_tokens=64 pages_per_seq=9 score_buffer=2.50 MiB kv_cache=144.00 MiB layers=21 k=2048 cr=1 fast_path_fires=True
+[d1lite:L21_ctx2048__dlc:trace] arm=dlc module=d1lite enable_early_exit=True hoist=cond
+[d1lite:L21_ctx2048__dlc:trace] jax 0.11.0
+[d1lite:L21_ctx2048__dlc:trace] warmup+compile 6.279s outs=21 shape=(64, 2048)
+[d1lite:L21_ctx2048__dlc:trace] traced 40 invocations in 3.747s = 93684.6 us/prog (CONTENDED wall clock, enqueued async -- NOT A RESULT)
+[d1lite:L21_ctx2048__dlc:trace] xplane: /cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dlc/plugins/profile/2026_09_03_09_17_39/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb (36.76 MB)
+===== D1LITE/1 L21_ctx2048__dlc STEP trace END rc=0 =====
+===== D1LITE/1 TABLE =====
+L21_ctx2048__inc_hlo                         rc=0
+j11_venv                                     rc=0
+L21_ctx2048__dlc_trace                       rc=0
+L21_ctx2048__dl_trace                        rc=0
+L21_ctx2048__inc_trace                       rc=0
+L21_ctx2048__dl_hlo                          rc=0
+L21_ctx2048__d1_hlo                          rc=0
+L21_ctx2048__dlc_hlo                         rc=0
+L21_ctx2048__d1_trace                        rc=0
+===== D1LITE/1 ARTIFACTS =====
+199K	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L1_ctx8704__d1
+272K	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L1_ctx8704__dl
+280K	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L1_ctx8704__dlc
+265K	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L1_ctx8704__dlctl
+264K	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L1_ctx8704__inc
+2.9M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx2048__d1
+4.9M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx2048__dl
+5.5M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx2048__dlc
+5.2M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx2048__inc
+2.9M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx8704__d1
+4.9M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx8704__dl
+5.5M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx8704__dlc
+5.2M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/hlo/L21_ctx8704__inc
+32M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__d1
+32M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dl
+32M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dlc
+0	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dlctl
+32M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__inc
+44M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__d1
+38M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dl
+40M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dlc
+38M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__inc
+44M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__d1
+49M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__dl
+50M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__dlc
+50M	/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__inc
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__d1/plugins/profile/2026_09_03_09_16_06/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dl/plugins/profile/2026_09_03_09_16_40/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dlc/plugins/profile/2026_09_03_09_17_14/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__dlctl/plugins/profile/2026_09_03_09_17_46/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L1_ctx8704__inc/plugins/profile/2026_09_03_09_15_32/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__d1/plugins/profile/2026_09_03_09_16_17/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dl/plugins/profile/2026_09_03_09_16_58/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__dlc/plugins/profile/2026_09_03_09_17_39/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx2048__inc/plugins/profile/2026_09_03_09_15_38/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__d1/plugins/profile/2026_09_03_09_16_17/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__dl/plugins/profile/2026_09_03_09_16_58/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__dlc/plugins/profile/2026_09_03_09_17_39/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+/cdk-outputs/outputs/j-e985297a-67f8-4998-99f8-tpu-job-0/j-e985297a-67f8-4998-99f8-tpu-job-0-0-wbqzf/command-container/d1lite/traces/L21_ctx8704__inc/plugins/profile/2026_09_03_09_15_38/j-e985297a-67f8-4998-99f8-tpu-job-0-0.xplane.pb
+===== D1LITE/1 failed_steps=0 =====

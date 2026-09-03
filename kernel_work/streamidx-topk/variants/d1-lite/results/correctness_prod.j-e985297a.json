@@ -1,0 +1,128 @@
+{
+ "results": [
+  {
+   "ctx": 1024,
+   "arm": "dl_none",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 1024,
+   "arm": "dl_plain",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 1024,
+   "arm": "dl_cond",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 1024,
+   "arm": "d1",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ],
+   "informational": true
+  },
+  {
+   "ctx": 2048,
+   "arm": "dl_none",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 2048,
+   "arm": "dl_plain",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 2048,
+   "arm": "dl_cond",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 2048,
+   "arm": "d1",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ],
+   "informational": true
+  },
+  {
+   "ctx": 8704,
+   "arm": "dl_none",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 8704,
+   "arm": "dl_plain",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 8704,
+   "arm": "dl_cond",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ]
+  },
+  {
+   "ctx": 8704,
+   "arm": "d1",
+   "equal": true,
+   "n_differing": 0,
+   "shape": [
+    64,
+    2048
+   ],
+   "informational": true
+  }
+ ],
+ "failures": 0
+}

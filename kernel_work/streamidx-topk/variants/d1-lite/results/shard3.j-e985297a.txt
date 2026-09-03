@@ -1,0 +1,59 @@
+===== D1LITE PROVENANCE =====
+jax 0.10.2 jaxlib 0.10.2
+jax                                      0.10.2
+jaxlib                                   0.10.2
+libtpu                                   0.0.44.1
+PKG vllm_torchtpu /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/__init__.py
+MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532
+MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py md5=8bc9e25b8701a53a97704564b9fbc658
+MODULE /root/kw/variants/d1-lite/streamindex_topk_d1lite.py md5=9d287fb7f6512b4393b144c252d8f9ae
+MODULE /root/kw/instruments/bench_streamidx_topk.py md5=e8e492d13e59c4a1675cc7a98c5a0813
+EARLY_EXIT_IN_SIG True
+KERNEL_IDENTITY d1lite.kernel is streamindex_topk.kernel: True
+HELPER_IDENTITY d1lite._effective_row_lengths is incumbent's: True
+BENCH_CONSTS k=2048 cr=1 page=1024 bkvp=(2, 2, 2) nqpb=(1, 128, 128) mml=9216
+===== D1LITE PROVENANCE END =====
+===== D1LITE/3 STEP grid BEGIN =====
+..........................................                               [100%]
+42 passed in 65.19s (0:01:05)
+===== D1LITE/3 STEP grid END rc=0 =====
+===== D1LITE/3 STEP incumbent_kernel_test BEGIN =====
+................                                                         [100%]
+=============================== warnings summary ===============================
+../../../usr/local/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+16 passed, 14 warnings in 28.15s
+===== D1LITE/3 STEP incumbent_kernel_test END rc=0 =====
+===== D1LITE/3 STEP prod BEGIN =====
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1788427007.859591  229557 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[d1lite:correctness-prod] ctx=1024 num_tokens=64 num_positions=10240 k=2048 fast_path_predicate=True
+[d1lite:correctness-prod] ctx=1024 incumbent output == _fast_path closed form: True (expected True)
+[d1lite:correctness-prod] ctx=1024 hoist=none  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=1024 hoist=plain array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=1024 hoist=cond  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=1024 arm=d1    array_equal_to_incumbent=True (informational: on a firing ctx the two take different paths and may legitimately differ in ORDER only)
+[d1lite:correctness-prod] ctx=2048 num_tokens=64 num_positions=10240 k=2048 fast_path_predicate=True
+[d1lite:correctness-prod] ctx=2048 incumbent output == _fast_path closed form: True (expected True)
+[d1lite:correctness-prod] ctx=2048 hoist=none  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=2048 hoist=plain array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=2048 hoist=cond  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=2048 arm=d1    array_equal_to_incumbent=True (informational: on a firing ctx the two take different paths and may legitimately differ in ORDER only)
+[d1lite:correctness-prod] ctx=8704 num_tokens=64 num_positions=10240 k=2048 fast_path_predicate=False
+[d1lite:correctness-prod] ctx=8704 incumbent output == _fast_path closed form: False (expected False)
+[d1lite:correctness-prod] ctx=8704 hoist=none  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=8704 hoist=plain array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=8704 hoist=cond  array_equal_to_incumbent=True n_differing=0
+[d1lite:correctness-prod] ctx=8704 arm=d1    array_equal_to_incumbent=True (informational: on a firing ctx the two take different paths and may legitimately differ in ORDER only)
+[d1lite:correctness-prod] failures=0
+===== D1LITE/3 STEP prod END rc=0 =====
+===== D1LITE/3 TABLE =====
+prod                     rc=0
+grid                     rc=0
+incumbent_kernel_test    rc=0
+===== D1LITE/3 failed_steps=0 =====
