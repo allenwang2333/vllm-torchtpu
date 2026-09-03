@@ -20,6 +20,12 @@ handed in as static metadata. Only `G` has to be static, and `G` is a pure funct
 `jax.jit`. Everything else is masked arithmetic on the traced `seq_lens` / `cu_q_lens` /
 `distribution` the caller already has. §4 gives the formula and the evidence.
 
+**Read the `vs incumbent` figures with §9.1 in hand.** The `bG1` baseline is the merged module, and
+two of the three changes in it (D1 and the `bkv_p` ladder) were withdrawn by a concurrent effort
+while this was being measured. That does not touch the Option B deltas — both arms share the same
+module, so it cancels — but it does mean the compound `vs inc` column describes a configuration
+nobody currently proposes to ship.
+
 **Nothing here is an end-to-end benchmark.** Every number is device self time from `hlo_stats` on
 a 4-chip `tpu7x` pod, for one call of the indexer op, at hand-built shapes. No model was run.
 
@@ -524,6 +530,37 @@ are the whole-cache copy that donation removes.
 - **No end-to-end model benchmark was run**, per the brief. What is established is device time for
   one op at hand-built shapes and index-identical selection. Whether −10.6 % of this op moves
   GLM-5.2 end to end depends on the op's share of the step, which is not measured here.
+
+### 9.1 The baseline this was built on has since been partly withdrawn — read the `vs inc` column with care
+
+The brief said to take Option B *with* D1 rather than instead of it, so `bG1` is the merged module:
+the `bkv_p` ladder + D1 + Option C. While this was being measured, a concurrent effort
+(`j-d17207d1-05fb-4e10-93b3`, commit `46c62c14`) withdrew two of those three:
+
+- **D1** deletes an early-exit branch that *does* fire. At runtime `ctx` 1024/2048 with `k=2048`
+  the incumbent's fast path costs 7.7 µs and D1 costs **7.4–7.6×** that, against 4.67 % bought at
+  the production shape.
+- **`bkv_p` sized to `max_model_len`** makes the block the quantum of overfetch, so a short request
+  scans the whole 9216-position bucket: **+98 %** on the scoring path at `ctx` 1024. Composed, the
+  merged op is 14.7× slower than the incumbent at `ctx` 1024.
+
+Option C, prefill-gated, survives unqualified.
+
+What this does and does not do to the numbers above:
+
+- **The Option B columns are unaffected.** Every `Δ vs bG1` divides two arms that share the same
+  merged module, so D1's and `bkv_p`'s behaviour cancels exactly. `−10.59 %` at `G=4` is Option B.
+- **The `Δ vs inc` columns are not a shipping claim.** They compound B with two changes that are
+  now withdrawn, so `−13.36 %` describes a configuration nobody currently proposes to ship. Read
+  those columns as "B on top of the merged module as it stood on 2026-09-03", not as the effect of
+  landing B.
+- **Every config here is long-context** (`ctx` 8704–9216), which is precisely the regime where D1
+  and `bkv_p` look good. This exercise could not have caught what `j-d17207d1` caught, and did not.
+- **Nothing here was re-measured against a D1-less or `bkv_p`-less base.** If the shipping candidate
+  becomes C-only, Option B needs one more sweep on that base before its `vs inc` number is quoted.
+  The `Δ vs bG1` mechanism — the TensorCore stops idling through the SparseCore top-k — has no
+  dependence on either withdrawn change, so the expectation is that it carries over largely intact;
+  that is an argument, not a measurement.
 
 ---
 
