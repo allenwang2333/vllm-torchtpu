@@ -22,8 +22,9 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_mod
 from vllm_torchtpu.kernels.megablox.fused_permute_gmm.config import (
-    Tuning, gather_tiling)
+    Tuning, estimate_vmem_bytes, gather_tiling, ring_chunks)
 from vllm_torchtpu.kernels.megablox.fused_permute_gmm.wrapper import \
     fused_permute_gmm
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
@@ -172,12 +173,10 @@ DEGENERATE_TOKENS = sorted(
                                  Tuning().lookahead)})
 
 
-@pytest.mark.parametrize("issue_in_dot", [True, False])
 @pytest.mark.parametrize("live_groups", [64, 24])
 @pytest.mark.parametrize("num_tokens", [512, 2048])
-def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups,
-                                                issue_in_dot):
-    """The fused permute is bit-for-bit the materialized one, either issue form.
+def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups):
+    """The fused permute is bit-for-bit the materialized one.
 
     Concentrated routing (`live_groups=24`) is a separate case, not a variant:
     a gather tile sized from the mean rows per group splits the few fat groups
@@ -185,14 +184,12 @@ def test_fused_permute_gmm_matches_materialized(num_tokens, live_groups,
     """
     _require_tpu()
     case = Case.routed(num_tokens, live_groups=live_groups)
-    case.assert_bitwise(case.fused(tuning=Tuning(issue_in_dot=issue_in_dot)),
-                        case.materialized())
+    case.assert_bitwise(case.fused(), case.materialized())
 
 
-@pytest.mark.parametrize("issue_in_dot", [True, False])
 @pytest.mark.parametrize("num_tokens", DEGENERATE_TOKENS)
 def test_fused_permute_gmm_survives_a_grid_shorter_than_the_lookahead(
-        num_tokens, issue_in_dot):
+        num_tokens):
     """A grid with fewer steps than the prefetch depth must leave no live DMA.
 
     The warm-up issues the first few tiles, but tile t is waited by step t and
@@ -211,8 +208,7 @@ def test_fused_permute_gmm_survives_a_grid_shorter_than_the_lookahead(
     case = Case.routed(num_tokens, live_groups=1, seed=num_tokens)
 
     for _ in range(2):
-        out = jax.block_until_ready(
-            case.fused(tuning=Tuning(issue_in_dot=issue_in_dot)))
+        out = jax.block_until_ready(case.fused())
     case.assert_bitwise(out, case.materialized())
 
 
@@ -276,9 +272,11 @@ def test_dispatch_forms_agree():
     num_tokens = pool.shape[0]
     valid = jnp.sum(gs, dtype=jnp.int32)
     onehot = jax.nn.one_hot(idx, num_tokens, dtype=pool.dtype)
+    # materialised off-graph, so `ideal` is a different program from `xla_gather`
+    permuted = jnp.asarray(np.asarray(pool)[np.asarray(idx)])
     forms = {
         "ideal":
-        lambda: _gmm1(pool[idx], case.rhs, case.scale, gs),
+        lambda: _gmm1(permuted, case.rhs, case.scale, gs),
         "onehot":
         lambda: _gmm1(onehot @ pool, case.rhs, case.scale, gs),
         "xla_gather":
@@ -322,6 +320,104 @@ def test_gather_tiling_is_live_rows_per_group(rows, size_group, expected):
     to 32.
     """
     assert gather_tiling(rows, size_group) == expected
+
+
+def _gmm_cfgs(rhs_quant_block: int) -> "gmm_v2_mod.GmmConfigs":
+    return gmm_v2_mod.GmmConfigs(
+        tiles=gmm_v2_mod.TileSizes(tile_m=192,
+                                   tile_k=4096,
+                                   tile_n=1024,
+                                   bucket_base=32),
+        dims=gmm_v2_mod.Dimensions(size_m=81920,
+                                   size_k=4096,
+                                   size_n=2048,
+                                   size_group=64,
+                                   size_lhs_group=64,
+                                   size_lhs_sublane=16),
+        lhs_cfgs=gmm_v2_mod.InputConfigs(quant_dtype=None,
+                                         quant_block_size=None,
+                                         dtype=jnp.bfloat16),
+        rhs_cfgs=gmm_v2_mod.InputConfigs(quant_dtype=jnp.float8_e4m3fn,
+                                         quant_block_size=rhs_quant_block,
+                                         dtype=jnp.float8_e4m3fn,
+                                         has_scale=True),
+        out_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        zero_init=False,
+        fuse_act="silu")
+
+
+def test_blocks_per_tile_follows_the_collapsed_k_loop():
+    """A dequantized-before-matmul rhs collapses the k loop, and the count must follow.
+
+    `inner_kernel` rebinds `rhs_qbs = tile_k` in that case, so its (n, k) loop runs
+    one k block. The issue hook slices its rows by this count, so a count derived
+    from the scale block instead would issue a fraction of the tile's rows while
+    `wait_tile` still waits for all of them -- a nonzero DMA semaphore at exit,
+    which halts the core rather than returning a wrong answer.
+    """
+    _require_tpu(
+    )  # `should_dequantize_before_matmul` reads the MXU column size
+    mxu = pltpu.get_tpu_info().mxu_column_size
+    n_blocks = -(-2 * 1024 // mxu)
+
+    collapsed = _gmm_cfgs(rhs_quant_block=mxu // 4)
+    assert collapsed.rhs_cfgs.should_dequantize_before_matmul
+    assert collapsed.blocks_per_tile(mxu) == n_blocks
+
+    wide = _gmm_cfgs(rhs_quant_block=4096)
+    assert not wide.rhs_cfgs.should_dequantize_before_matmul
+    assert wide.blocks_per_tile(mxu) == n_blocks
+
+
+def test_ring_pad_is_priced_into_the_vmem_estimate():
+    """The VMEM estimate must price the ring the shape actually allocates.
+
+    `gather_tile_sizes` shrinks the tile until `estimate_vmem_bytes` fits, so an
+    estimate narrower than `ring_chunks` hands back a tile whose ring overflows.
+    They agree trivially when `size_k` is a multiple of 1024; the case that
+    separates them is one where the pad has to round up, so this uses
+    `size_k=3584` (28 lane-blocks + 8 = 36, rounded to 40).
+
+    The estimate is read through `num_slots`, which scales the gather term and
+    nothing else. Differencing a padded estimate against a zero-pad one would
+    not work: `ring_chunks(28, 0)` rounds to 40 as well, so both sides read zero
+    and the assertion would hold for any ring width.
+    """
+    size_k, lanes, tile_m, tile_n, fuse = 3584, 128, 192, 1024, 2
+    tuning = Tuning()
+    chunks = ring_chunks(size_k // lanes, tuning.ring_pad_slots)
+    assert chunks == 40 and chunks * lanes != size_k + tuning.ring_pad_slots * lanes
+
+    dims = gmm_v2_mod.Dimensions(size_m=81920,
+                                 size_k=size_k,
+                                 size_n=2048,
+                                 size_group=64,
+                                 size_lhs_group=64,
+                                 size_lhs_sublane=16)
+    lhs_cfgs = gmm_v2_mod.InputConfigs(quant_dtype=jnp.float8_e4m3fn,
+                                       quant_block_size=size_k,
+                                       dtype=jnp.bfloat16)
+    rhs_cfgs = gmm_v2_mod.InputConfigs(quant_dtype=jnp.float8_e4m3fn,
+                                       quant_block_size=128,
+                                       dtype=jnp.float8_e4m3fn,
+                                       has_scale=True)
+
+    # One extra slot costs exactly one ring row-block: the only term it scales.
+    def est(num_slots):
+        return estimate_vmem_bytes(dims,
+                                   lhs_cfgs,
+                                   rhs_cfgs,
+                                   tile_m,
+                                   tile_n,
+                                   fuse,
+                                   tuning=dataclasses.replace(
+                                       tuning, num_slots=num_slots),
+                                   num_lanes=lanes)
+
+    per_slot = est(tuning.num_slots + 1) - est(tuning.num_slots)
+    itemsize = jnp.dtype(jnp.bfloat16).itemsize
+    assert per_slot == tile_m * chunks * lanes * itemsize
 
 
 def test_tuning_rejects_a_ring_that_aliases_before_its_wait():

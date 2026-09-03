@@ -13,12 +13,13 @@
 # limitations under the License.
 """Kernel body of the fused permute + grouped matmul.
 
-rhs and out stay pipelined by `emit_pipeline`; the LHS tile is gathered per
-row into a VMEM ring, `lookahead` tiles ahead of the dot, and handed to
-`gmm_v2.inner_kernel` unchanged.
+rhs and out stay pipelined by `emit_pipeline`; the LHS tile is gathered per row
+into a VMEM ring `lookahead` tiles ahead of the dot, which issues those rows
+from inside itself and builds its own LHS from the ring through
+`gmm_v2.inner_kernel`'s `inject` and `lhs_load` hooks.
 """
 import functools
-from typing import Any, Callable
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -65,7 +66,8 @@ def issue_row(
     """Start the DMA of gathered row `row` of the tile into `slot`."""
     pltpu.make_async_copy(
         pool_ref.at[pl.ds(idx_smem[m_offset + row], 1)],
-        gather.buf.at[slot, pl.ds(row, 1)],
+        gather.buf.at[slot, pl.ds(row, 1),
+                      pl.ds(0, pool_ref.shape[-2])],
         gather.sem.at[slot],
     ).start()
 
@@ -84,7 +86,9 @@ def issue_row_sized(
     size = jnp.where(row < live, 1, 0)
     pltpu.make_async_copy(
         pool_ref.at[pl.ds(idx_smem[m_offset + row], size)],
-        gather.buf.at[slot, pl.ds(row, size)],
+        gather.buf.at[slot,
+                      pl.ds(row, size),
+                      pl.ds(0, pool_ref.shape[-2])],
         gather.sem.at[slot],
     ).start()
 
@@ -211,30 +215,50 @@ def wait_tile(
     """Wait for exactly what `issue_tile` issued.
 
     The live rows are the tile's FIRST `live`, so one descriptor of that many
-    rows describes exactly the bytes issued. Same-src/dst is the documented
-    idiom for waiting once on N DMAs sharing a semaphore.
+    rows describes exactly the bytes issued -- the row window has to skip the
+    ring's pad, or the wait expects bytes no DMA sent. Same-src/dst is the
+    documented idiom for waiting once on N DMAs sharing a semaphore.
     """
     _, live = tile_rows(step,
                         metadata=scratch.metadata,
                         num_gm=num_gm,
                         sublane=cfg.sublane)
     gather = scratch.gather
-    pltpu.make_async_copy(gather.buf.at[slot, pl.ds(0, live)],
-                          gather.buf.at[slot, pl.ds(0, live)],
-                          gather.sem.at[slot]).wait()
+    win = gather.buf.at[slot, pl.ds(0, live), pl.ds(0, cfg.row_chunks)]
+    pltpu.make_async_copy(win, win, gather.sem.at[slot]).wait()
 
 
-def gathered_rows(gather: memory_ref.GatherRefs, slot: jax.Array,
-                  cfg: config.Config) -> jax.Array:
-    """The tile's gathered rows, for the dot.
+def strided_lhs(ring: jax.Ref, rows: int, *, cfg: config.Config) -> jax.Array:
+    """`inner_kernel`'s LHS for the branch's first `rows` rows, in the MXU's packing.
 
-    `inner_kernel` reshapes to `tile_k` whatever it is given, so passing the
-    blocked buffer straight through leaves that relayout to it rather than
-    doing a second one here.
+    A ring row is whole 32-bit words so the per-row DMA is legal, which puts a
+    word's two bf16 in one row; the MXU wants a word to hold two adjacent ROWS.
+    In the ring's u32 view a row occupies `row_slots` sublanes, so at one chunk
+    the even rows sit at stride `2 * row_slots` and the odd rows at the same
+    stride one row along: two strided loads and a pack give the (2,1) packing
+    with no cross-sublane move.
     """
-    if cfg.tuning.blocked_rows:
-        return gather.buf[slot]
-    return gather.buf[slot].reshape(cfg.tiles.tile_m, cfg.tiles.tile_k)
+    lanes, row_slots = cfg.num_lanes, cfg.ring_chunks // 2
+    stride, span = 2 * row_slots, (rows // 2) * 2 * row_slots
+    flat = ring.bitcast(jnp.uint32).reshape(-1, lanes)
+    cols = []
+    for chunk in range(cfg.row_chunks // 2):
+        # An explicit stop, or the even and odd starts round to different counts.
+        even = flat[chunk:chunk + span:stride, :]
+        odd = flat[chunk + row_slots:chunk + row_slots + span:stride, :]
+        for half in range(2):
+            cols.append(
+                pltpu.pack_elementwise([
+                    pltpu.unpack_elementwise(
+                        part,
+                        index=half,
+                        packed_dtype=cfg.gmm.lhs_cfgs.dtype,
+                        unpacked_dtype=jnp.float32) for part in (even, odd)
+                ],
+                                       packed_dtype=cfg.gmm.lhs_cfgs.dtype))
+    # One bitcast of the assembled value: on vreg data it can force a relayout.
+    return pltpu.bitcast(jnp.concatenate(cols, axis=-1),
+                         cfg.gmm.lhs_cfgs.dtype)
 
 
 def warm_up(*, issue: TileIssueFn, num_steps: jax.Array,
@@ -254,11 +278,6 @@ def warm_up(*, issue: TileIssueFn, num_steps: jax.Array,
                 issue, tile, tile % tuning.num_slots))
 
 
-def _issue_lookahead(*, issue: TileIssueFn, step: jax.Array, slot: jax.Array,
-                     lookahead: int) -> None:
-    issue(step + lookahead, slot)
-
-
 def pipeline_body(
         # In (pipelined)
         tiled_rhs_ref: gmm_v2.RhsRef,
@@ -271,7 +290,7 @@ def pipeline_body(
         idx_smem: jax.Ref,  # int32[index_rows] SMEM, kernel-invariant
         pool_ref: jax.Ref,  # [size_src, size_k // lanes, lanes] HBM
 ) -> None:
-    """One grid step: issue tile s + lookahead, wait tile s, run the dot on it."""
+    """One grid step: wait tile s, run its dot, and issue tile s + lookahead inside it."""
     tuning = cfg.tuning
     num_gm = pl.num_programs(1)
     step = pl.program_id(0) * num_gm + pl.program_id(1)
@@ -290,38 +309,27 @@ def pipeline_body(
 
     slot = lax.rem(step, tuning.num_slots)
     next_slot = (slot + tuning.lookahead) % tuning.num_slots
-    if tuning.issue_in_dot:
-        hook, tail = _in_dot_issue(step,
-                                   slot,
-                                   next_slot,
-                                   num_steps,
-                                   pool_ref=pool_ref,
-                                   idx_smem=idx_smem,
-                                   scratch=scratch,
-                                   num_gm=num_gm,
-                                   cfg=cfg)
-    else:
-        hook, tail = None, None
-        # Issue-first: feed the engine for the next tile before this tile's
-        # data is touched, so the next gather runs under this tile's dot.
-        pl.when(step + tuning.lookahead < num_steps)(functools.partial(
-            _issue_lookahead,
-            issue=issue,
-            step=step,
-            slot=next_slot,
-            lookahead=tuning.lookahead))
+    hook, tail = _in_dot_issue(step,
+                               slot,
+                               next_slot,
+                               num_steps,
+                               pool_ref=pool_ref,
+                               idx_smem=idx_smem,
+                               scratch=scratch,
+                               num_gm=num_gm,
+                               cfg=cfg)
 
     wait_tile(step, slot, scratch=scratch, num_gm=num_gm, cfg=cfg)
-    gmm_v2.inner_kernel(gathered_rows(scratch.gather, slot, cfg),
+    gmm_v2.inner_kernel(scratch.gather.buf.at[slot],
                         tiled_rhs_ref,
                         tiled_out_ref,
                         scratch.partial_out,
                         scratch.acc,
                         scratch.metadata,
                         cfgs=cfg.gmm,
-                        inject=hook)
-    if tail is not None:
-        tail()
+                        inject=hook,
+                        lhs_load=functools.partial(strided_lhs, cfg=cfg))
+    tail()
 
 
 def _in_dot_issue(
@@ -335,7 +343,7 @@ def _in_dot_issue(
     scratch: memory_ref.PipelineScratchRef,
     num_gm: jax.Array,
     cfg: config.Config,
-) -> tuple[DotIssueHook, Any]:
+) -> tuple[DotIssueHook, Callable[[], None]]:
     """The hook issuing tile `step + lookahead`'s first `bucket_m` rows from
     inside the dot, and the loop issuing the rest after it.
 

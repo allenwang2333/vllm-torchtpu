@@ -32,11 +32,14 @@ from vllm_torchtpu.kernels.megablox import gmm_v2
 INDEX_BYTES = 4
 # TPU7x SMEM. Stands in for the device when op construction runs before one exists.
 V7X_SMEM_CAPACITY_BYTES = 1 << 20
+# `tpu.memref_reshape` refuses a 2nd-minor off the tile, and the u32 view of the ring
+# is tiled (4, 128).
+_U32_SUBLANE_TILE = 4
 # Where a scalar-prefetch operand starts to cliff on v7x. Measured, not derived.
 V7X_SMEM_INDEX_LIMIT_BYTES = 480_000
 # gmm_v2's own zero-init staging budget, kept so both kernels tile the zero fill alike.
 ZERO_TILE_TARGET_BYTES = 2 * 1024 * 1024
-# `gather_tiling`'s law, fitted on v7x at the serving fill. TODO: re-fit per generation.
+# `gather_tiling`'s law, fitted on v7x at the serving fill; the constants are per-generation.
 TILE_MIN_ROWS = 16  # the fewest rows the law reasons about: one bf16 sublane block
 TILE_SPREAD_SIGMAS = 2.5  # headroom over the mean so a fat group still fits one tile
 TILE_ALIGN = 32  # a multiple of every lhs sublane block (16 bf16, 8 f32)
@@ -64,16 +67,12 @@ class Tuning:
             so the dot covers the live rows rather than the tile. Saturates at 6 on
             the serving fill; a quotient that is not a sublane multiple dividing
             `tile_m` silently degrades to one bucket.
-        blocked_rows: hand `inner_kernel` the lane-blocked buffer, which reshapes it
-            once. False reshapes here as well and pays the relayout twice.
         tile_m: overrides the tile `gather_tiling` derives, which reads mean live
             rows per group and is blind to `max_group`, where the cliff is. None
             keeps the law; a value must be a multiple of the lhs sublane block.
-        issue_in_dot: issue the next tile's row DMAs from inside the dot, one
-            slice per matmul block, each pinned there by a one-vreg load from
-            the ring. Off, the chain is issued ahead of the dot and stays
-            exposed (LLO sinks a DMA start to the end of its region unless a
-            later load may alias its target).
+        ring_pad_slots: lane-blocks of pad per ring row, which takes the LHS
+            load's row stride off a power of two, where VMEM banking costs most.
+            `ring_chunks` rounds any even value up to a legal row.
         smem_index_fraction: the share of SMEM the index table may take.
         smem_capacity_bytes: the device's SMEM; `from_device` reads it.
     """
@@ -81,9 +80,8 @@ class Tuning:
     lookahead: int = 3
     issue_unroll: int = 16
     num_buckets: int = 6
-    blocked_rows: bool = True
     tile_m: int | None = None
-    issue_in_dot: bool = True
+    ring_pad_slots: int = 8
     smem_index_fraction: float = (V7X_SMEM_INDEX_LIMIT_BYTES /
                                   V7X_SMEM_CAPACITY_BYTES)
     smem_capacity_bytes: int = V7X_SMEM_CAPACITY_BYTES
@@ -92,6 +90,9 @@ class Tuning:
         if self.num_slots <= self.lookahead:
             raise ValueError("num_slots must exceed lookahead: the ring would "
                              "alias a slot before its wait")
+        if self.ring_pad_slots % 2:
+            raise ValueError("ring_pad_slots must be even: two lane-blocks "
+                             "share a u32 sublane")
 
     @classmethod
     def from_device(cls, **overrides) -> "Tuning":
@@ -142,9 +143,25 @@ def gather_tiling(rows: int, size_group: int) -> int:
         min(TILE_M_MAX, max(TILE_M_MIN, gmm_v2.align_to(live, TILE_ALIGN))))
 
 
+def ring_chunks(row_chunks: int, pad: int) -> int:
+    """Lane-blocks a padded ring row occupies.
+
+    Grows the pad rather than rejecting a shape: only a `size_k` multiple of 1024
+    satisfies the u32 tile at the nominal pad, and a row that lands back on a
+    power-of-two stride is the banking case the pad exists to avoid. The VMEM
+    estimate reads this too -- a second derivation there is how the tile law ends
+    up sizing a ring that does not fit.
+    """
+    step = 2 * _U32_SUBLANE_TILE
+    chunks = row_chunks + pad
+    chunks += -chunks % step
+    return chunks + step if chunks & (chunks - 1) == 0 else chunks
+
+
 def estimate_vmem_bytes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
                         rhs_cfgs: gmm_v2.InputConfigs, tile_m: int,
-                        tile_n: int, fuse_factor: int, num_slots: int) -> int:
+                        tile_n: int, fuse_factor: int, *, tuning: "Tuning",
+                        num_lanes: int) -> int:
     """This kernel's VMEM footprint at tile_k == size_k.
 
     `calculate_tiling`'s estimate does not apply: the pipelined LHS tile is
@@ -154,7 +171,11 @@ def estimate_vmem_bytes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
     tile_k = dims.size_k
     lhs_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
 
-    gather = num_slots * tile_m * tile_k * lhs_bytes
+    # The ring is padded per row; pricing it any other way lets the tile law pick
+    # a tile whose ring does not fit.
+    ring_k = ring_chunks(tile_k // num_lanes,
+                         tuning.ring_pad_slots) * num_lanes
+    gather = tuning.num_slots * tile_m * ring_k * lhs_bytes
     lhs = tile_m * tile_k * lhs_bytes  # the rows as the dot wants them
     if lhs_cfgs.should_quantize:
         lhs += tile_m * tile_k * (
@@ -214,9 +235,14 @@ def gather_tile_sizes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
     # gmm_v2's MXU floor: below it the dot stalls.
     tile_n_floor = min(2 * info.mxu_column_size // fuse_factor,
                        gmm_v2.align_to(size_n_per_rhs, lanes))
-    while (estimate_vmem_bytes(dims, lhs_cfgs, rhs_cfgs, tile_m, tile_n,
-                               fuse_factor, tuning.num_slots)
-           > vmem_limit_bytes):
+    while (estimate_vmem_bytes(dims,
+                               lhs_cfgs,
+                               rhs_cfgs,
+                               tile_m,
+                               tile_n,
+                               fuse_factor,
+                               tuning=tuning,
+                               num_lanes=lanes) > vmem_limit_bytes):
         if tile_n > tile_n_floor or (tile_m <= sublane and tile_n > lanes):
             num_n_tiles += 1
             tile_n = gmm_v2.align_to(size_n_per_rhs,
@@ -291,22 +317,40 @@ class Config:
         return self.tiles.tile_n
 
     @property
+    def row_chunks(self) -> int:
+        """Lane-blocks of a gathered row that hold data.
+
+        The LHS build walks the row two lane-blocks at a time, so an odd count
+        would drop the last one. The layer guard keeps those shapes on the
+        materialised path; this is the backstop for a direct caller.
+        """
+        chunks = self.tiles.tile_k // self.num_lanes
+        if chunks % 2:
+            raise ValueError(
+                f"size_k must be a multiple of {2 * self.num_lanes}: the LHS "
+                f"build pairs lane-blocks, and {self.tiles.tile_k} leaves one "
+                "unpaired")
+        return chunks
+
+    @property
+    def ring_chunks(self) -> int:
+        """Lane-blocks a ring row occupies, pad included."""
+        return ring_chunks(self.row_chunks, self.tuning.ring_pad_slots)
+
+    @property
     def gather_buffer_shape(self) -> tuple[int, int, int, int]:
-        """The ring: [num_slots, tile_m, tile_k // lanes, lanes] in the pool dtype."""
-        return (self.tuning.num_slots, self.tiles.tile_m,
-                self.tiles.tile_k // self.num_lanes, self.num_lanes)
+        """The ring: [num_slots, tile_m, ring_chunks, lanes] in the pool dtype."""
+        return (self.tuning.num_slots, self.tiles.tile_m, self.ring_chunks,
+                self.num_lanes)
 
     @property
     def dot_blocks_per_tile(self) -> int:
-        """(n, k) matmul blocks `inner_kernel` runs per gm tile, in its own order."""
-        fuse_factor = 2 if self.gmm.fuse_act is not None else 1
-        if self.gmm.lhs_cfgs.should_quantize:
-            k_block = self.gmm.lhs_cfgs.quant_block_size
-        else:
-            k_block = self.gmm.rhs_cfgs.quant_block_size or self.tiles.tile_k
-        n_blocks = pl.cdiv(fuse_factor * self.tiles.tile_n, self.mxu_columns)
-        return n_blocks * pl.cdiv(self.tiles.tile_k,
-                                  min(k_block, self.tiles.tile_k))
+        """How many times the dot calls the issue hook, from `inner_kernel` itself.
+
+        The hook slices its rows by this count, so a second derivation that
+        disagrees would issue fewer rows than the tile waits for.
+        """
+        return self.gmm.blocks_per_tile(self.mxu_columns)
 
     @property
     def zero_tile_rows(self) -> int:

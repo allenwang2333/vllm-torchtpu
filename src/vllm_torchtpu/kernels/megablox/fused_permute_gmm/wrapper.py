@@ -50,10 +50,10 @@ VMEM_LIMIT_FRACTION = 0.9
 
 def _blocked_pool(lhs: jax.Array, lanes: int) -> jax.Array:
     """The pool as the per-row DMA reads it: [size_src, size_k // lanes, lanes]."""
-    if lhs.dtype.itemsize not in (2, 4):
+    if lhs.dtype.itemsize != 2:
         raise NotImplementedError(
-            f"pool dtype {lhs.dtype} unsupported: only 2- and 4-byte pools "
-            "are implemented")
+            f"pool dtype {lhs.dtype} unsupported: the LHS build pairs two "
+            "elements per 32-bit word, so only 2-byte pools are implemented")
     if lhs.ndim == 3:
         if lhs.shape[-1] != lanes:
             raise ValueError(
@@ -104,8 +104,9 @@ def fused_permute_gmm(
     defaults to `Tuning.from_device()`.
 
     `lhs` is the un-permuted pool, either `[size_src, size_k]` or the blocked
-    `[size_src, size_k // 128, 128]` the rows are actually read in. size_k
-    must be a multiple of 128 either way; a caller that cannot meet that
+    `[size_src, size_k // 128, 128]` the rows are actually read in. The LHS
+    build pairs lane-blocks and packs two elements per word, so size_k must be
+    a multiple of 256 and the pool 2-byte; a caller that cannot meet that
     should materialise the permute and use `gmm_v2`.
     """
     if gather_indices.ndim != 1:

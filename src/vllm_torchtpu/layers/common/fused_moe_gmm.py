@@ -559,12 +559,12 @@ def fused_moe_func(
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     # fused_permute_gmm folds the dispatch permute into GMM1, reading the
-    # un-permuted pool per row. Scoped to the EP SparseCore dispatch it was
-    # measured against; outside its envelope the materialised path stands.
+    # un-permuted pool per row; outside its envelope the materialised path stands.
     num_lanes = pltpu.get_tpu_info().num_lanes
     use_fpg = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
                and num_tokens * topk <= Tuning.from_device().max_index_rows
-               and padded_hidden_size % num_lanes == 0
+               and padded_hidden_size % (2 * num_lanes) == 0
+               and hidden_states.dtype.itemsize == 2
                and rhs_quant_dtype is None)  # no packed-carrier bitcast
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,

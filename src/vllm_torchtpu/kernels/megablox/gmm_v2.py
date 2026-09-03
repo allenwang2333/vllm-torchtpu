@@ -15,7 +15,7 @@
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Protocol, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -148,6 +148,14 @@ def get_packing_factor(storage_dtype: jnp.dtype,
 
 
 # Define data classes.
+
+
+class BlockInject(Protocol):
+    """A per-(n, k)-block hook `inner_kernel` adds into that block's product."""
+
+    def at_block(self, block: int, bucket_m: int,
+                 col_size: int) -> jax.Array | int:
+        ...
 
 
 class RhsRef(ABC):
@@ -288,6 +296,24 @@ class GmmConfigs:
     def num_quant_blocks_per_tile_k(self) -> int:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
 
+    def blocks_per_tile(self, mxu_columns: int) -> int:
+        """(n, k) matmul blocks `inner_kernel` runs per gm tile, in its own order.
+
+        Lives here because `inner_kernel`'s loops do: a caller that re-derives it
+        elsewhere gets the `should_dequantize_before_matmul` case wrong, where the
+        k loop collapses to one block.
+        """
+        fuse_factor = 2 if self.fuse_act is not None else 1
+        if self.lhs_cfgs.should_quantize:
+            k_block = self.lhs_cfgs.quant_block_size
+        elif self.rhs_cfgs.should_dequantize_before_matmul:
+            k_block = self.tiles.tile_k
+        else:
+            k_block = self.rhs_cfgs.quant_block_size or self.tiles.tile_k
+        n_blocks = pl.cdiv(fuse_factor * self.tiles.tile_n, mxu_columns)
+        return n_blocks * pl.cdiv(self.tiles.tile_k,
+                                  min(k_block, self.tiles.tile_k))
+
     @property
     def out_size_n(self) -> int:
         if self.fuse_act is None:
@@ -413,7 +439,8 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
-    inject: Any | None = None,
+    inject: "BlockInject | None" = None,
+    lhs_load: Callable[[Any, int], jax.Array] | None = None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -433,6 +460,9 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        lhs_load: Optional `(tiled_lhs_ref, bucket_m) -> lhs` replacing the default
+            whole-ref reshape, so a caller whose lhs ref needs a relayout can build
+            only the rows the bucket uses, inside the branch.
         inject: Optional per-block hook, `at_block(block, bucket_m, col_size)`,
             called once per (n, k) matmul block in block order; its return value
             is added to that block's partial product. A caller uses it to issue
@@ -452,7 +482,9 @@ def inner_kernel(
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+        tiled_lhs = (lhs_load(tiled_lhs_ref, bucket_m)
+                     if lhs_load is not None else tiled_lhs_ref.reshape(
+                         -1, cfgs.tiles.tile_k)[:bucket_m])
         tiled_rhs = tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize

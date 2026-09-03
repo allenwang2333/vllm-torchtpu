@@ -32,7 +32,7 @@ from vllm_torchtpu.kernels.megablox.fused_permute_gmm import config
 @dataclasses.dataclass(frozen=True)
 class GatherRefs:
     """The ring the per-row DMAs land in: one slot per in-flight tile."""
-    buf: Any  # [num_slots, tile_m, tile_k // lanes, lanes] pool dtype
+    buf: Any  # [num_slots, tile_m, ring_chunks, lanes] pool dtype
     sem: Any  # DMA[num_slots]
 
 
