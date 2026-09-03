@@ -1,8 +1,9 @@
 # Step 3 — variants built, measured and ranked
 
-**Status: DRAFT, four agents still in flight.** Options C, D and E are complete and are reported
-here in full. Option A, Option B and the recalibrated incumbent baseline are marked `in flight`
-and their rows are placeholders. Do not quote this file as final until this banner is gone.
+**Status: DRAFT, agents still in flight.** Options C, D, E and candidate 0 are complete and are
+reported in full, as is the recalibrated baseline (§1). **Options A and B are placeholders**, and
+three follow-ups are running: candidate 0's `p=9` sweep and reference check, and Option F (§9.2).
+Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
 the GLM-5.2 DSA lightning indexer, on TPU7x. Baseline branch `annyan/streamidx-topk-opt`, incumbent
