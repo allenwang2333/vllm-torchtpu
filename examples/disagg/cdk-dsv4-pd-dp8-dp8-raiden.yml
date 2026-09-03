@@ -1,8 +1,9 @@
 # DeepSeek-V4-Flash P/D disaggregation, DP8 prefill + DP8 decode, two tpu7x nodes.
 #
-# Tier 2 of examples/disagg/VERIFICATION_DSV4_PD.md. Read that first: Tier 1 on a
-# single host is currently red, and this configuration is not worth booking nodes
-# for until the `dsv4.state.csa.g4` trim crash is fixed.
+# Tier 2 of examples/disagg/VERIFICATION_DSV4_PD.md. Read that first. Tier 1 on a
+# single host is green as of the recycled-page guard, which the tarball this
+# recipe pulls has to contain; without it the `dsv4.state.csa.g4` trim crash
+# takes the prefill replica down and the run is wasted.
 #
 # Shape. Each `2x2x1` tpu7x node is 4 chips and 8 devices, so one node is a DP8
 # replica: prefill on the first, decode on the second, KV crossing the network
@@ -53,12 +54,27 @@
 #
 # Run with:
 #   cdk recipe run examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml
+#
+# Without the cdk CLI, render_cdk_recipe.py substitutes the `{{ }}` defaults and
+# adds the namespace, the Kueue labels and the name that cdk would otherwise
+# supply, and the result goes in with plain kubectl:
+#
+#   python3 examples/disagg/render_cdk_recipe.py \
+#       examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml --name dsv4-pd-<you> \
+#     | kubectl apply -f -
 
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   name: vllm-dsv4-pd-dp8-dp8-raiden
 spec:
+  # The proxy, the consumer and Raiden all address peers as
+  # `${JS_NAME}-prefill-0-0.${JS_NAME}`, so the headless service has to publish
+  # those names, and it has to publish them before the pods are ready: the
+  # producer resolves the consumer while it is still loading weights.
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
   successPolicy:
     operator: All
     targetReplicatedJobs:
@@ -493,17 +509,42 @@ spec:
                         2>&1 | tee "$CDK_OUTPUT_DIR/oracle.log"
                       ORACLE_RC=${PIPESTATUS[0]}
 
-                      # Tier 1 found that a short prompt after a long sweep kills
-                      # the prefill replica. Exit 0 from this means the crash
-                      # reproduced across hosts too.
-                      python3 dsv4_pd_trim_repro.py --base "$PROXY" \
-                        2>&1 | tee "$CDK_OUTPUT_DIR/trim_repro.log" || true
+                      # The guard regression, which cannot go through the proxy.
+                      # The proxy pins the prefill leg to max_tokens=1, and that
+                      # clamp is exactly what stops the producer running past the
+                      # handoff token, so nothing sent through it reaches the
+                      # recycled-page path. Go straight at the producer: a
+                      # 114-token prompt at max_tokens=48 is what took the DP4/DP4
+                      # prefill engine down before the guard existed.
+                      PREFILL="http://${JS_NAME}-prefill-0-0.${JS_NAME}:8000"
+                      python3 dsv4_pd_guard_probe.py --base "$PREFILL" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/guard_probe.log"
+                      GUARD_RC=${PIPESTATUS[0]}
 
-                      if [ "$ORACLE_RC" = "0" ]; then
-                        echo "RESULT: PASS"
-                      else
+                      # The oracle again, after the probe. If the guard had let
+                      # the send through, the producer would be gone by now and
+                      # this second pass is what notices.
+                      python3 dsv4_pd_oracle.py \
+                        --base "$PROXY" \
+                        --model deepseek-ai/DeepSeek-V4-Flash \
+                        --window 128 \
+                        --lengths 127,512,2048 \
+                        --repeats 1 \
+                        --out "$CDK_OUTPUT_DIR/oracle_after.json" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/oracle_after.log"
+                      AFTER_RC=${PIPESTATUS[0]}
+
+                      if [ "$ORACLE_RC" != "0" ]; then
                         echo "RESULT: FAIL (oracle had misses; see oracle.json)"
                         exit 1
+                      elif [ "$GUARD_RC" != "0" ]; then
+                        echo "RESULT: FAIL (the guard probe killed the producer)"
+                        exit 1
+                      elif [ "$AFTER_RC" != "0" ]; then
+                        echo "RESULT: FAIL (P/D broken after the guard probe)"
+                        exit 1
+                      else
+                        echo "RESULT: PASS"
                       fi
                   env:
                     - name: JS_NAME

@@ -155,6 +155,27 @@ and between them those hold only Qwen, nvidia/GLM, gpt-oss and llama. The
 `vllm serve --model` as a `gs://` URI, which is how every other recipe loads
 its weights.
 
+**Launching it without the cdk CLI.** `alynie-v7x-8` has no `cdk` binary and no
+`cloud-devkit` checkout, but a cdk recipe is a JobSet with `{{ }}` placeholders
+and without the metadata the CLI injects, so `kubectl` can submit it directly.
+The cluster is `cloud-devkit-gke` in `us-central1`, the namespace is
+`cloud-devkit-jobs`, and jobs are gated by Kueue through `cdk-local-queue`.
+`gcloud container clusters get-credentials` writes a kubeconfig that wants
+`gke-gcloud-auth-plugin`, which the snap `gcloud` will not install; setting the
+user credential to `gcloud auth print-access-token` avoids the plugin entirely.
+`examples/disagg/render_cdk_recipe.py` fills in the placeholder defaults, the
+namespace, the queue label and the priority class.
+
+Two things the recipe needed before it would work this way. It addresses peers
+by pod DNS name, which the JobSet only publishes if `spec.network` sets
+`enableDNSHostnames` and `publishNotReadyAddresses`, and the producer resolves
+the consumer while the consumer is still loading weights, so not-ready
+addresses have to be published too. The benchmark job also ran
+`dsv4_pd_trim_repro.py`, which cannot reproduce anything through the proxy for
+the reason given under T1.3, so it is replaced by `dsv4_pd_guard_probe.py`
+against the producer's own port, followed by a second oracle pass to catch a
+producer that died just after answering.
+
 **Known risk to check first.** The image pins `tpu_sync`, and the PR calls
 `facade.register_request_blocks(..., pool_spans=...)` per tag. If the pinned
 `tpu_sync` predates multi-tag span registration, admission fails at startup
