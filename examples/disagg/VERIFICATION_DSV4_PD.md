@@ -165,8 +165,11 @@ job. Check it before burning a two-hour slot.
 
 Tier 1 ran against `launch_dsv4_dp4_dp4.sh` on this host, DP4 prefill on local
 ranks 0-3 and DP4 decode on 4-7. Admission is healthy and the transfer is
-correct over a wide range of prompt lengths, but a short prompt kills the
-prefill replica, so Tier 1 is red and Tier 2 is not worth booking yet.
+correct over a wide range of prompt lengths. A short prompt killed the prefill
+replica, which is T1.3 below; with the guard added in this branch Tier 1 is
+green and Tier 2 is worth booking. The underlying disagreement is contained
+rather than repaired, so read T1.3 before treating the green as a clean bill of
+health.
 
 **T1.4 passed, and the page geometry is wider than this document assumed.**
 Both replicas log `pool admission complete ... pools=188 storages=84 tags=9`,
@@ -184,41 +187,81 @@ nothing was re-prefilled locally. At 8774 tokens the SWA trim drops 63 of 64
 pages and producer and consumer still agreed page for page. This is the part
 the PR's 16-token probe could not have shown.
 
-**T1.3 crashed the prefill replica, and T1.5 never got to run.** The first
-exact-equality request, a 114-token prompt, took the whole prefill engine down
-with an `EngineDeadError`. The root cause is this PR's own guard:
+**T1.3 crashed the prefill replica.** A 114-token prompt took the whole prefill
+engine down with an `EngineDeadError`, out of this PR's own guard:
 
 ```
 Stage-3 sliding-window block table still repeats a page after trimming:
-group=dsv4.state.csa.g4, kept=[0, 0], num_tokens=113, page_tokens=16, window=8
+group=dsv4.state.csa.g4, kept=[0, 0], ids=[0, 0, 0, 0, 0, 0, 0, 0], skipped=6,
+num_tokens=113, page_tokens=16, window=8
 ```
 
-The guard is right to fire; what it caught is real. The whole eight-entry
-block table was the null block, because the companion warning about a
-non-uniform dropped prefix did not fire even once. So the trim's stated
-premise, a run of null pages followed by live ones, does not hold here.
+The guard is right to fire, and what it caught is worse than a crash. Dumping
+every producer block table under `TPU_RAIDEN_DEBUG_BLOCK_TABLES=1` shows the
+same defect firing quietly on the ordinary path. Across 178 requests through
+the proxy, 14 shipped a page the allocator had already taken back: six in
+`state.csa.g4`, four in `state.hca.g5`, three in `state.idx.g3`, one in each
+SWA group. The crash is the same bug with the disagreement large enough that
+two dead pages collide.
 
-The two arithmetics are identical, which is what makes this subtle.
-`SlidingWindowManager.get_num_skipped_tokens` is
-`max(0, num_computed_tokens - sliding_window + 1)`, exactly what
-`_stage3_skipped_window_pages` computes. They differ in the argument. vLLM
-passes `processed_computed_tokens`, the scheduler's committed prefix, and the
-connector passes the request's `num_tokens`. For all eight blocks to be null,
-vLLM's skip must have covered at least 128 tokens, so its count had reached
-135 or more while the connector still said 113. The disagreement is not
-between producer and consumer; it is between the connector and the scheduler.
+The connector and the allocator disagree about which pages are dead because
+they measure from different positions. The connector skips
+`_stage3_skipped_window_pages(num_tokens)`, where `num_tokens` is the transfer
+prefix, `prompt - 1`. The allocator freed pages against `num_computed_tokens`,
+wherever the producer actually stopped. On a clean captured example the
+producer computed 375 tokens and the prefix was 374: the allocator freed
+`(375 - 8 + 1) // 16 = 23` pages, which is exactly the 23 null entries the
+table shows, while the connector skipped 22. Page 22 went over the wire as the
+null block. One page of drift is a hole in the decode replica's window that
+nothing reports; the accuracy oracle still passes, because a single dead page
+of an 8-token compressor-state window rarely changes which token comes out.
 
-It reproduces deterministically from a fresh pair, twice out of two attempts,
-but only after history: run the oracle sweep, then send a ~114-token prompt.
-The same prompt sent first, to an idle replica, completes normally. So the
-trigger depends on allocator state, not on length alone, which is why both the
-PR's smoke test and a long-prompt sweep miss it from opposite sides. `113` is
-also small enough that ordinary chat traffic will reach it.
+The crash needs the same drift, just more of it. It is not allocator history,
+as the first pass at this suggested; it is the producer generating past the
+prompt. The proxy pins the prefill leg to `max_tokens=1`
+(`toy_proxy_server.py:272`), so through the intended path the producer stops at
+`computed == prompt` and the drift stays under one page. A request sent
+straight at the producer skips that clamp. Of 26 distinct request IDs in the
+crashed run, 25 were proxy-generated UUIDs and exactly one was not, and that
+one was the request that died. Reproducing it is a single request to port 8400
+with `max_tokens=48`: the producer ran to 161 computed tokens, the allocator
+freed 9 of its 11 pages, `_stage3_normalize_producer_blocks` kept the first 8
+because the transfer prefix is 8 pages long, and all 8 were the null block.
 
-Two things follow for the PR. The connector should derive the skip from the
-same committed-token count the scheduler used rather than from the request
-length. Separately, a mis-trim should fail the request, not raise out of
-`execute_model` and kill every other request on the replica.
+The fix here counts the null blocks left in the transfer range, which reads
+what the block table says rather than re-deriving where the allocator got to,
+and refuses the send when any group has two of them. That request prefills on
+the decode side instead, costing one prefill rather than an engine.
+
+It deliberately lets the single dead page through, with a warning. Refusing
+those too was the first attempt and it was worse: the decode replica is
+provisioned to decode, with `compile_sizes:[256]`, and asking it to prefill the
+oracle's 2174-token prompt walked off the end of its padding buckets and killed
+it in `_get_padded_token_len`. Trading a quiet hole in one window for a dead
+decode engine is not a trade worth making. So the crash is gone and the latent
+corruption is now visible in the logs, but it is still there.
+
+**Re-run with the guard in place.** The request that killed the engine now
+returns its 48 tokens and both replicas stay at HTTP 200. The guard logged the
+skip once, for exactly that request: the producer ran to 161 computed tokens
+against a 113-token prefix, with dead pages `[(3, 1), (4, 2), (5, 1)]`, and
+group 4's two dead pages are the duplicate destination Raiden would have
+refused. Over the rest of the run, 148 Stage-3 sends, the oracle returned 18 of
+18 codes through the proxy at prompt lengths from 95 to 4372 tokens, 128
+concurrent requests at 16 in flight finished with no failures, and no send
+raised the "still repeats a page" error. Nine sends carried a single dead page
+and said so, which is the latent hole described above rather than anything the
+guard introduced.
+
+This is containment, not repair. The design still has both peers deriving the
+skip from a token count that matches the allocator's only while the producer
+halts at the handoff token. The repair is for the producer to publish the
+number of pages it actually dropped, per group, rather than having the consumer
+re-derive it. That is a wire-format change and it belongs to whoever owns the
+PR. Worth noting alongside it: the decode-side prefill fallback, which the
+connector reaches whenever it declines a transfer, is not survivable for long
+prompts in this launcher's configuration. That is independent of this bug and
+worth fixing on its own.
 
 ### Why no other model hits this
 
@@ -235,14 +278,14 @@ table back untouched.
 
 The structural reason is worth stating separately, because it says which
 future models are at risk. A full-attention group never frees a page while its
-request is alive; its block table only grows, and every entry stays live. So
-it does not matter that the connector and the scheduler count committed tokens
+request is alive; its block table only grows, and every entry stays live. So it
+does not matter that the connector and the allocator count computed tokens
 differently, because the page list is the same under either count. DSv4 is the
 first model to put groups whose pages are freed mid-request into Stage 3. Once
-pages can be freed, what the block table contains depends on when you read it
-and on which token count drove the freeing, and the two peers have to agree on
-both. That is the bug, and it is a property of windowed groups rather than of
-DeepSeek.
+pages can be freed, what the block table holds depends on which token count
+drove the freeing, and the connector has to use that same count rather than the
+transfer prefix. That is the bug, and it is a property of windowed groups
+rather than of DeepSeek.
 
 The geometry makes DSv4 the worst case rather than a marginal one. Its
 compressor state groups run a window of 8 tokens against a 16-token page, so

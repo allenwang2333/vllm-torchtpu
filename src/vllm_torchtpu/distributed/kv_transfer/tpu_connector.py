@@ -134,6 +134,12 @@ class _Stage3TransferGroup:
 
     cache_group_index: int
     page_tokens: int
+    window_tokens: Optional[int] = None
+
+
+# vLLM reserves block 0 as the null block and points every freed sliding-window
+# entry at it, so a transfer range containing it is a range whose KV is gone.
+_STAGE3_NULL_BLOCK_ID = 0
 
 
 def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
@@ -200,6 +206,35 @@ def _stage3_trim_window_pages(
     return kept
 
 
+def _stage3_recycled_transfer_pages(
+    block_ids: Sequence[int],
+    *,
+    num_tokens: int,
+    page_tokens: int,
+    window_tokens: Optional[int],
+) -> int:
+    """How many pages this group would transfer that the allocator already freed.
+
+    Both peers derive their skip from `num_tokens`, the transfer prefix, but the
+    allocator freed pages against wherever the producer actually got to. Those
+    two agree only while the producer stops at the handoff token. Let it run one
+    page further and it has recycled a page the send still lists, which arrives
+    as the null block: `num_tokens=374` with a 16-token page and an 8-token
+    window skips 22 pages while the allocator freed 23, so page 22 goes over the
+    wire dead. Let it run far enough and two dead pages collide, which is a
+    duplicate destination that Raiden rejects outright.
+
+    Counting the null blocks left in the range beats re-deriving the allocator's
+    position, because it reads what the block table actually says rather than
+    assuming the two formulas line up.
+    """
+    skipped = _stage3_skipped_window_pages(num_tokens=num_tokens,
+                                           page_tokens=page_tokens,
+                                           window_tokens=window_tokens)
+    return sum(1 for block_id in tuple(block_ids)[skipped:]
+               if int(block_id) == _STAGE3_NULL_BLOCK_ID)
+
+
 def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
     """The sliding window of a cache group, or None if it is full attention.
 
@@ -231,8 +266,10 @@ def _stage3_transfer_groups(
     ``allow_multiple=False`` keeps enforced.
     """
     groups = tuple(
-        _Stage3TransferGroup(cache_group_index=index,
-                             page_tokens=int(group.kv_cache_spec.block_size))
+        _Stage3TransferGroup(
+            cache_group_index=index,
+            page_tokens=int(group.kv_cache_spec.block_size),
+            window_tokens=_stage3_group_window_tokens(group.kv_cache_spec))
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec))
     if not groups:
@@ -1372,6 +1409,52 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "groups=%s", request.request_id, computed_tokens,
                 prompt_tokens, num_tokens,
                 [list(ids) for ids in (group_block_ids or [])])
+
+        # Count the pages this send would carry that the allocator has already
+        # taken back. The connector skips against `num_tokens`, the transfer
+        # prefix, while the allocator freed against wherever the producer
+        # actually stopped, so the two drift apart as soon as the producer runs
+        # past the handoff token.
+        if normalized_group_block_ids is not None:
+            recycled = [
+                (group.cache_group_index, dead)
+                for group, ids in zip(self._stage3_transfer_groups,
+                                      normalized_group_block_ids)
+                if (dead := _stage3_recycled_transfer_pages(
+                    ids,
+                    num_tokens=num_tokens,
+                    page_tokens=group.page_tokens,
+                    window_tokens=group.window_tokens))
+            ]
+            # Two dead pages in one group are two copies of the null block, a
+            # duplicate destination that Raiden rejects by raising out of
+            # `execute_model` and killing the engine along with every other
+            # request on it. Nothing can be salvaged, so drop the send.
+            if any(dead > 1 for _, dead in recycled):
+                logger.warning(
+                    "Stage-3 skipping the send for req=%s: the producer ran to "
+                    "%d computed tokens and recycled sliding-window pages the "
+                    "%d-token transfer prefix still lists, as (cache group, "
+                    "dead pages) %s. The decode replica will prefill this "
+                    "request itself.", request.request_id, computed_tokens,
+                    num_tokens, recycled)
+                return False, {}
+            if recycled:
+                # A single dead page is a hole in one group's window rather
+                # than a transfer Raiden will refuse, and it predates this
+                # check: roughly one send in twelve hits it on the ordinary
+                # proxy path. Skipping it here would be worse than shipping it,
+                # because the decode replica is provisioned to decode and falls
+                # over trying to prefill a long prompt. Say so and carry on.
+                # The repair is for the producer to publish the page count it
+                # actually dropped instead of having the consumer re-derive it.
+                logger.warning(
+                    "Stage-3 send for req=%s carries sliding-window pages the "
+                    "allocator already recycled, as (cache group, dead pages) "
+                    "%s. The producer ran to %d computed tokens against a "
+                    "%d-token transfer prefix; the decode replica will attend "
+                    "over a hole in those groups' windows.",
+                    request.request_id, recycled, computed_tokens, num_tokens)
 
         producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
                             if self.vllm_config.parallel_config else 0)
