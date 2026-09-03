@@ -1,0 +1,37 @@
+# Kimi-K3 TP32 best-known flags on current main PLUS the one pending fix main
+# needs to serve an object-storage model on a multihost Ray topology:
+# `runai_repull` from OPEN PR #539 (Qiliang Cui, 2026-08-20).
+#
+# Without it, dev build 362 died at worker init on stock main:
+#   OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name':
+#            '/root/.cache/vllm/assets/model_streamer/bd38833a'
+# The API server pulls config/tokenizer/custom code into a hashed local dir and
+# rewrites model_config.model to it; that path exists only on the head host, so
+# every rank elsewhere fails its per-rank config re-parse. Build 360 passed with
+# the same recipe because the branch it ran on carried this fix.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_best_repull.yml.
+
+steps:
+- label: ':docker: Build and Push Dev Image'
+  key: build_docker
+  agents:
+    queue: cpu_64_core
+  commands:
+  - bash .buildkite/scripts/setup_docker_env.sh
+- label: ':rocket: K3 TP32 best flags on main + PR539 repull fix, REAL weights (8k/1k)'
+  key: k3_best_real_repull
+  depends_on: build_docker
+  timeout_in_minutes: 420
+  agents:
+    queue: tpu_v7x_32_queue
+  env:
+    TPU_ACCELERATOR_TYPE: tpu7x
+    VLLM_ENGINE_READY_TIMEOUT_S: '14400'
+    VLLM_XLA_CHECK_RECOMPILATION: '0'
+    SKIP_DB_UPLOAD: '1'
+  commands:
+  - bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-best --results-dir /perf_eval_results/k3-best-real-repull
+  - du -sh perf_eval_results/* || true
+  artifact_paths:
+  - perf_eval_results/**/*
