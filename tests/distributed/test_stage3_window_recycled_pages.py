@@ -77,7 +77,8 @@ def test_producer_that_kept_generating_is_caught():
     two live ones at the tail. Skipping six leaves two null blocks, which is
     the duplicate destination that killed the engine.
     """
-    ids = [0] * 8  # [0] * 9 + [250, 18], normalized down to the eight-page prefix
+    # [0] * 9 + [250, 18], normalized down to the eight-page prefix.
+    ids = [0] * 8
     assert _stage3_recycled_transfer_pages(
         ids,
         num_tokens=113,

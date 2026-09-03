@@ -22,7 +22,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 from uuid import uuid4
 
 import torch
@@ -271,10 +271,10 @@ def _stage3_transfer_groups(
     fail at runtime rather than here.
     """
     groups = tuple(
-        _Stage3TransferGroup(
-            cache_group_index=index,
-            page_tokens=int(group.kv_cache_spec.block_size),
-            window_tokens=_stage3_group_window_tokens(group.kv_cache_spec))
+        _Stage3TransferGroup(cache_group_index=index,
+                             page_tokens=int(group.kv_cache_spec.block_size),
+                             window_tokens=_stage3_group_window_tokens(
+                                 group.kv_cache_spec))
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec))
     if not groups:
@@ -621,14 +621,16 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                             f"index={mamba_gid}, groups={len(block_ids)}")
                     mamba_block_ids.append(list(block_ids[mamba_gid]))
             # use_raiden here means __init__ selected
-            # TPURaidenConnectorScheduler -- the only one of the two
-            # schedulers accepting mamba block ids. The checker cannot
-            # narrow the union to that subclass.
-            return self.connector_scheduler.request_finished(
+            # TPURaidenConnectorScheduler, the only one of the two schedulers
+            # accepting mamba block ids. The checker cannot narrow the union
+            # to that subclass on its own, so say which one it is.
+            scheduler = cast(TPURaidenConnectorScheduler,
+                             self.connector_scheduler)
+            return scheduler.request_finished(
                 request,
                 block_ids[self._stage3_fa_group_index],
                 mamba_block_ids=mamba_block_ids,
-                group_block_ids=group_block_ids)  # type: ignore
+                group_block_ids=group_block_ids)
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
             f"{len(block_ids)} groups")
@@ -1421,16 +1423,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # actually stopped, so the two drift apart as soon as the producer runs
         # past the handoff token.
         if normalized_group_block_ids is not None:
-            recycled = [
-                (group.cache_group_index, dead)
-                for group, ids in zip(self._stage3_transfer_groups,
-                                      normalized_group_block_ids)
-                if (dead := _stage3_recycled_transfer_pages(
+            recycled: list[tuple[int, int]] = []
+            for group, ids in zip(self._stage3_transfer_groups,
+                                  normalized_group_block_ids):
+                dead = _stage3_recycled_transfer_pages(
                     ids,
                     num_tokens=num_tokens,
                     page_tokens=group.page_tokens,
-                    window_tokens=group.window_tokens))
-            ]
+                    window_tokens=group.window_tokens)
+                if dead:
+                    recycled.append((group.cache_group_index, dead))
             # Two dead pages in one group are two copies of the null block, a
             # duplicate destination that Raiden rejects by raising out of
             # `execute_model` and killing the engine along with every other
@@ -2028,7 +2030,8 @@ class TPURaidenConnectorWorker:
             raise ValueError("TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
                              "TPU_KV_RESHARD_TRANSPORT=raiden")
 
-        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+        from vllm_torchtpu.distributed.kv_transfer.raiden import \
+            pool_manifest as rpm
 
         topology = self._raiden_dsv4_admission_topology()
         role = "kv_producer" if self.is_producer else "kv_consumer"
@@ -2168,8 +2171,8 @@ class TPURaidenConnectorWorker:
     @staticmethod
     def _measure_raiden_dsv4_layout(
         manifest: Any, ) -> tuple[str, dict[str, Any]]:
-        from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
-            measured_dsv4_layout_fingerprint, )
+        from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import \
+            measured_dsv4_layout_fingerprint
 
         return measured_dsv4_layout_fingerprint(manifest)
 
@@ -2995,8 +2998,8 @@ class TPURaidenConnectorWorker:
         adds over GLM is that the tags no longer share a block table: each
         one is lowered against its own cache group's pages.
         """
-        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-            lower_dsv4_row_spans, )
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
+            lower_dsv4_row_spans
 
         facade, _ = self._require_stage3_controller()
         if self._raiden_work_unit is None:
