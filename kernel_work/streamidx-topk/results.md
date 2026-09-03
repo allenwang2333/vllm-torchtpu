@@ -26,6 +26,7 @@ a term of art elsewhere in the stack.
 | **chain slope** | marginal device time per call, obtained as the slope of R chained calls inside one `jit` joined by a real data dependency. See §1 — this is the only per-call timing method used here that is valid. |
 | **`num_bkv`** | the number of KV blocks the grid walks per sequence group. 5 at the prefill shape measured; 1 when `ctx ≤ bkv_sz`. |
 | **modelled** | computed from a floor or a cost model, **not measured**. Tagged every time it appears. |
+| **Δ sign** | every percentage in this document is a change in **time**: **negative is faster**, positive is a regression. Option C's prefill −20.64% is a win; its decode +59.62% is not. Note that `variants/option-b-pipeline/RESULTS.md` uses the *opposite* sign for Option B's headline (its "+16.4%" is this document's −16.4%); §8 here is stated in this document's convention. |
 
 ---
 
@@ -101,17 +102,83 @@ reason decode is the better target, and it is not the reason the earlier documen
 
 ---
 
+## 1b. The denominator: this op is **3.80% of a GLM-5.2 decode step**
+
+Every percentage in this document is **op-level**. Until 2026-09-03 nothing here established what
+share of a real GLM-5.2 step the op is, so none of them could be converted into a model-level
+number. They now can, and the conversion is unflattering.
+
+Measured from **`j-9b23bb32-0426-4080-be91`** (recipe `torchtpu-vllm-glm-5.2-v7x-16-profile`,
+`Succeeded`, owner `wppark`). Read back from `cdk job recipe`: `zai-org/GLM-5.2-FP8`,
+`--data-parallel-size=16 --max-model-len=9216 --max-num-seqs=64 --max-num-batched-tokens=1024
+--kv-cache-dtype=fp8`, 2 ray nodes x 8 chips, v7x. **This is the nightly config the microbenchmark
+targeted.** Rank 8, `/device:TPU:0`, mean of decode steps 1-4 (step 0 dropped as warm-up),
+reproduced independently on rank 12 to within 0.2%.
+
+| | ms/step | % TC busy | % step wall |
+| --- | ---: | ---: | ---: |
+| stage A, `StreamIdxTC-{d,m}-bq_*-bkvp_2` | 1.8965 | **2.80%** | 2.73% |
+| stage B, `sc_topk_direct_b64_n10240_k2048` | 0.6780 | **1.00%** | 0.98% |
+| **op total** | **2.5745** | **3.80%** | **3.71%** |
+| denominator: TC busy (XLA Ops union) | 67.756 | | |
+| denominator: module wall | 69.459 | | |
+
+**`report.md`'s 32.8%-of-decode-step figure is a different model configuration and must not be used
+here.** It is AgentX -- `j-a71a648c-3064-471a-a131`, `max_model_len=262144`, `n=65536`, TP=16. At
+the nightly shape the score buffer is `n=10240` and the share is 3.80%. The gap is ~9x. This is the
+exact failure `CLAUDE.md` warns about: a figure measured at a non-production shape reproduces
+faithfully and mispredicts production. It also went unnoticed for the whole exercise because
+`cdk job list` defaults to 32 jobs and the GLM-5.2 profile predates that window, so a search for a
+denominator concluded there was none.
+
+**What the recommendations in §12 are therefore worth** (arithmetic on the row above; each is the
+op-level figure times the op's share, so each is an upper bound that assumes no interaction):
+
+| change | op-level | ~ decode step | ~ prefill step |
+| --- | ---: | ---: | ---: |
+| candidate 0 (`bkv_p`) | -14.6% of op | **~0.55%** | -- |
+| D1 | -10.0% of op | **~0.38%** | -- |
+| Option C, prefill-gated | -20.6% of prefill stage A | 0 (gated off) | **~0.06%** |
+| Option B + runner change | +24.4% of prefill op | ~0 (wash) | **~0.15%** |
+
+Prefill is worse: the op is **order 1%** of a prefill step. The `prefill_heavy` capture contains
+exactly one indexer-active step (stage A 1.813 ms, stage B 2.007 ms of 620.5 ms TC busy = 0.62%),
+but n=1, 37% of that step is collectives, and its per-call times are 3-4.5x below the microbenchmark
+at the nominally identical shape -- so it is an early short-context chunk. Treat prefill as "order
+1%", not as 0.62%. `prefill_only` rank 8 has **zero** StreamIdx events.
+
+### Three things from the profile that outlive this op
+
+1. **`sc_dsa_gather` is 4.205 ms/step, 6.21% -- 1.6x this entire op.** It is the gather that
+   consumes the top-k indices this op produces. The whole DSA-indexer complex is 6.78 ms = **10.0%**
+   of the decode step, and the kernel optimized here is the small end of it. Rest of the step:
+   `other` 25.7 ms, `sc_ragged_gather` (MoE dispatch/combine) 18.3, collectives 13.8, `moe_gmm` 5.9.
+
+2. **TensorCore and SparseCore do not overlap, confirmed on a real model step.** The intersection of
+   stage B's TC-side `call-done` window with the SparseCore-plane `sc_topk` interval is 0.6485 ms --
+   *exactly* the whole SC-plane top-k time. The TC is blocked for the SC's entire duration, so stage
+   B's device time is its wall-clock contribution with no discount. This confirms
+   `probes/baseline-device-time.md:141-145` on hardware, and it means the 83.5-98.2% overlap Option
+   B (§8) demonstrated is real headroom the incumbent does not take.
+
+3. **The microbenchmark overstates stage A by 19%** -- 111.7 µs/layer against the profile's 90.3.
+   Stage B agrees almost exactly (31.73 vs 32.3). Op-level stage-A wins measured here are therefore
+   slightly optimistic when carried to the model.
+
+At this shape stage A is the larger half (2.80% vs 1.00%), inverting the microbenchmark's
+prefill-driven picture in which stage B was 57.5% of the call.
+
 ## 2. Scoreboard
 
 | option | what it changes | verdict | best evidence |
 | --- | --- | --- | --- |
 | **C** — head-major score layout | transposes the q block `(bq,H,D)→(H,bq,D)` **inside** the kernel, once per bq block | **PASS on prefill, −17.8% to −20.7%** across all `num_bkv`; correctness verified, index-identical. **Must be gated to prefill — decode regresses +59.62%** | §3 |
-| **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
+| **D1** — delete the `cond` | drops the early-exit `lax.cond`; live in production via `STREAMIDX_ENABLE_EARLY_EXIT=True` | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent at `bkv_p=9` | one constant, on the shipping kernel | **−14.6% full op / −24.8% stage A at decode, ctx 8704. Correctness verified.** Wrong at short ctx (+38% at 4096), so it wants per-bucket dispatch | §6 |
 | **F** — bf16 operands | *proposed on a false premise* — the operands are already fp8 | **REJECTED, +4.63% prefill / +9.80% decode.** Its by-product closes the block: stage A has no roofline headroom left | §11.2–11.3 |
 | **A** — 128-byte K record | halves the K record so half the bytes move | **Gate passes at `bkv_p=9` (47.9%) and it does not matter** — 94.3% of the fetch is already hidden, so the bytes buy nothing. Net −15.30 µs vs an 18.64 µs floor. Not recommended | §7.1 |
-| **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill +16.4/+24.4%. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
+| **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill −16.4%/−24.4%, i.e. faster. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
 
 ---
 
@@ -197,8 +264,11 @@ Full write-up: `variants/option-d-hoist/RESULTS.md`. Correctness `20 passed in 3
 The reason is that XLA compiles each `lax.cond` branch into its own computation **per call site**
 (86 `region_*_spmd`, 84 `conditional`s), so CSE cannot span the branches. Remove the `cond`
 boundary and XLA's ordinary CSE performs the entire 21→1 collapse by itself. **D1 — simply deleting
-the `cond` — is the whole win, and it requires no new code: `enable_early_exit=False` already
-selects that path.** 17.053 µs/layer removed, 93% of the 18.39 µs R2 found reachable.
+the `cond` — is the whole win.** It needs no new *kernel* code, but it is not free: production
+sets `STREAMIDX_ENABLE_EARLY_EXIT = True` (`mla_attention_op.py:57`), so the `cond` is live in
+production and D1 is a real change at the call site, not a default already in force. (An earlier
+revision of this file said it "requires no new code" on the strength of the kernel signature's
+`enable_early_exit: bool = False` default; the caller overrides it.) 17.053 µs/layer removed, 93% of the 18.39 µs R2 found reachable.
 
 The builder also **discarded a 32.5 µs apparent win** on its own initiative: it came from
 cross-layer overlap that its independent probe layers could exploit and the real decoder cannot,
@@ -475,12 +545,18 @@ shards; gate job **`j-c397124b-3d9c-476b-a03e`**.
 and `ideal = min(t_a, t_b)/G × (G−1)` — the most a perfect pipeline could hide. All chain-slope
 device times, every fit r² ≥ 0.99981.
 
-| phase | G | t_a | t_b | t_pipe | **overlap** | vs G=1 |
+The `Δ time` column is against `t_pipe` **at G=1** — the honest serial reference, since the G=1
+program is itself slightly slower than `t_a + t_b` measured apart (its stage B reads a buffer stage A
+has just written rather than a resident one). **Negative is faster**, per §0.
+
+| phase | G | t_a | t_b | t_pipe | **overlap** | **Δ time vs G=1** |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decode | 2 | 120.34 | 44.11 | 142.80 | **98.2%** | **+4.67%** |
-| decode | 4 | 133.27 | 85.85 | 157.43 | 95.8% | −5.09% |
-| prefill | 2 | 272.99 | 449.28 | 608.34 | **83.5%** | **+16.40%** |
-| prefill | 4 | 288.09 | 466.34 | 549.84 | **94.7%** | **+24.44%** |
+| decode | 1 | 114.11 | 34.90 | 149.80 | n/a | — |
+| decode | 2 | 120.34 | 44.11 | 142.80 | **98.2%** | **−4.67%** |
+| decode | 4 | 133.27 | 85.85 | 157.43 | 95.8% | **+5.09%** (slower) |
+| prefill | 1 | 263.32 | 440.77 | 727.67 | n/a | — |
+| prefill | 2 | 272.99 | 449.28 | 608.34 | **83.5%** | **−16.40%** |
+| prefill | 4 | 288.09 | 466.34 | 549.84 | **94.7%** | **−24.44%** |
 
 **PASS on both phases, against bars of 20% decode / 7% prefill — by ~5× and ~12×.** TensorCore and
 SparseCore genuinely overlap; P3's 41.6% is exceeded at every `G`. The design's own worry, that XLA
@@ -505,19 +581,20 @@ runner packs the batch**, not a kernel-local change. B's entire prize sits behin
 
 That puts B outside this exercise: it is not a kernel change, so it belongs to `/preflight-check`
 and an end-to-end benchmark rather than to a Pallas variant. **Recorded as a live runner-level
-candidate with a measured prize of +16–24% on the op**, which is a good position for it to be in —
+candidate with a measured prize of −16% to −24% on the op**, which is a good position for it to be in —
 it is the largest prefill number in this document and the only one that is not a kernel edit.
 
 Three further arguments, all the agent's own:
 
 - **The chunk plan is data, and vLLM calls this op under `jax.jit`** where `cu_q_lens` and
   `distribution` are traced, so the runner must pass the plan down as static metadata.
-- **Decode's +4.67% is inside the ±8.5% end-to-end spread**, and `t_a` there counts one stage-A
+- **Decode's −4.67% at G=2 is inside the ±8.5% end-to-end spread**, and `t_a` there counts one stage-A
   launch per chunk against the incumbent's three — ~23 µs unaccounted at decode G=4, which makes
   decode *worse*, not better. Decode is a wash.
 - **Decode G=4 is blocked by the 32-row wave quantum, not by the partition cliff it was blamed on.**
   Forcing `p=1` does remove that cliff — stage B goes 203.44 → 85.85 µs, the pipeline
-  −92.36% → −5.09% — so the gathers were binding and *are* removable. But per-chunk stage B is
+  +92.36% → +5.09% (both still slower than G=1) — so the gathers were binding and *are* removable.
+  But per-chunk stage B is
   22.06 µs at b=32 and 21.46 µs at b=16: halving the rows buys 2.7%, so `t_b` simply doubles.
   **G ≤ num_tokens/32, i.e. G ≤ 2 at batch 64.**
 
@@ -571,7 +648,7 @@ not 1.02.
    (§7.2). It does not rescue A; the reader-side variant needs a bf16 K operand, which is Option F,
    measured at +9.80% decode.
 5. ~~Options A and B~~ — **DONE** (§7, §8).
-6. **Option B belongs to the runner, and nobody owns it.** +16.4/+24.4% on prefill, measured, and
+6. **Option B belongs to the runner, and nobody owns it.** −16.4%/−24.4% on prefill (faster), measured, and
    it needs the scheduler to pack the batch into chunks and pass the plan down as static metadata.
    Route to `/preflight-check` and an end-to-end benchmark, not to a Pallas variant.
 7. **Decode stage B, real scores: chain slope +11.5% over `hlo_stats`** (3.7 µs). Named by the
@@ -723,8 +800,10 @@ or which serves short contexts through the same compiled bucket, gets slower. Th
 per-bucket compilation and dispatch, because `bkv_p` is a compile-time static while `num_bkv` is
 runtime.
 
-**2. D1 — delete the early-exit `cond` (§4).** **−10.0%** on device self time, correctness verified,
-and it needs **no new code**: `enable_early_exit=False` already selects the path. XLA's ordinary CSE
+**2. D1 — delete the early-exit `cond` (§4).** **−10.0%** on device self time, correctness verified.
+It needs no new kernel code, but it **is** a real change: production sets
+`STREAMIDX_ENABLE_EARLY_EXIT = True` (`mla_attention_op.py:57`), so the `cond` is live and the
+−10.0% is available rather than already banked. XLA's ordinary CSE
 does the whole 21→1 collapse once the `cond` boundary is gone. Note the safety argument leans on
 `test_streamindex_topk_early_exit_*` — tests of the branch being removed.
 
@@ -754,7 +833,7 @@ claiming −24%.
 
 ### Hand off, don't drop
 
-**Option B is the largest prefill number in this document — +16.4%/+24.4% on the op, gate passed by
+**Option B is the largest prefill number in this document — −16.4%/−24.4% on the op, gate passed by
 5–12× — and it is not a kernel change (§8).** It needs the runner to pack the batch into chunks and
 pass the plan down as static metadata, because the production prefill shape is one sequence of 1024
 tokens and stage A's grid is over sequences. Route it to `/preflight-check` and an end-to-end
