@@ -1,10 +1,28 @@
 # `streamindex_topk` — final report
 
-**Status: REOPENED 2026-09-03 — do not review as final.** The runner-side change that Option B
-needs was ruled out of scope while this was written; it has since been authorized, and Option B is
-back in the candidate set with a measured **B×C = −26.18% on the prefill op** (§5 is stale as a
-result). A runner prototype is being built and measured. `/critical-review` is running against the
-version below. No end-to-end benchmark has been run.
+**Status: REOPENED 2026-09-03 — do not review as final. §7's "land the merged op" is WITHDRAWN.**
+
+Three things landed after this was written and two of them change the recommendation:
+
+1. **D1 is not safe to ship as written.** §7 recommends it; `j-d17207d1-05fb-4e10-93b3` measured the
+   regime the deleted branch actually serves. At runtime `ctx` 1024/2048 with `k=2048` the incumbent
+   takes the fast path in **7.7 µs with no stage A at all**; D1 runs the full scoring path,
+   **7.44×/7.60× slower**. It buys **4.67%** at production. Risk 5's "provably never fires" is wrong.
+2. **`bkv_p` sized to `max_model_len` is not safe either.** The block is the quantum of overfetch and
+   `bkv_p` is compile-time static. At `mml=9216` the recommender returns 9, so every request scans
+   9216 positions: **+98% on the scoring path at ctx 1024**. The win lives only in
+   `6144 < ctx ≤ 9216`. Composed, merged is **14.7× slower** than the incumbent at ctx 1024.
+3. **Option B is back in the candidate set** — the runner change it needs is now authorized.
+   **B×C = −26.18% on the prefill op** at G=4, `j-caf973f4-163d-42e0-89e6`. §5's "defer" is stale.
+
+What survives unqualified: **Option C, prefill-gated**. Its composition is now properly tested (the
+old additivity check was algebraically circular on the C axis) and the genuine three-way residual is
+**+0.113% / +0.005% / −0.026% / −0.046%** across the four prefill configs.
+
+Also: ~5.5 pp of the headline −20.24% is scan-extent reduction unique to `ctx=8704 / mml=9216`; the
+grid's honest expectation at buckets whose context divides evenly is −13% to −16%.
+
+A runner prototype and a `D1-lite` variant are being measured. No end-to-end benchmark has been run.
 
 The shipping candidate is **three changes composed into one op**, measured together, index-identical
 to the incumbent at every config tested. Detail lives in `results.md` (per-option) and
