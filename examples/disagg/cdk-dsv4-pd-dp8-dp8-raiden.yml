@@ -194,35 +194,55 @@ spec:
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
 
                       echo "===== Starting DeepSeek-V4 DP8 prefill ====="
-                      exec vllm serve \
-                        "$MODEL" \
-                        --load-format runai_streamer \
-                        --served-model-name "$SERVED_MODEL" \
-                        --trust-remote-code \
-                        --seed 42 \
-                        --max-model-len 9216 \
-                        --enable-expert-parallel \
-                        --disable-custom-all-reduce \
-                        --gpu-memory-utilization 0.92 \
-                        --kv-cache-dtype fp8_e4m3 \
-                        --language-model-only \
-                        --max-num-batched-tokens 1024 \
-                        --max-num-seqs 8 \
-                        --no-disable-hybrid-kv-cache-manager \
-                        --attention-backend CUSTOM \
-                        --enable-prompt-tokens-details \
-                        --no-enable-log-requests \
-                        --compilation-config "$COMPILATION_CONFIG" \
-                        --no-enable-prefix-caching \
-                        --no-async-scheduling \
-                        --tensor-parallel-size 1 \
-                        --prefill-context-parallel-size 1 \
-                        --data-parallel-size 8 \
-                        --data-parallel-size-local 8 \
-                        --host 0.0.0.0 \
-                        --port 8000 \
-                        --kv-transfer-config "$KV_TRANSFER_CONFIG" \
-                        2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                      # Grabbing the TPU fails outright when the previous tenant of
+                      # this node has not finished releasing it: PjRtClient reports
+                      # "Failed to start the gRPC server" and every worker dies inside
+                      # init_device. That is transient, and on a shared cluster it has
+                      # already cost two runs, so retry it. Only a death in the first
+                      # four minutes is retried; the weights are still streaming then,
+                      # so anything later is a real fault and should surface.
+                      for attempt in 1 2 3; do
+                        started=$SECONDS
+                        set +e
+                        vllm serve \
+                          "$MODEL" \
+                          --load-format runai_streamer \
+                          --served-model-name "$SERVED_MODEL" \
+                          --trust-remote-code \
+                          --seed 42 \
+                          --max-model-len 9216 \
+                          --enable-expert-parallel \
+                          --disable-custom-all-reduce \
+                          --gpu-memory-utilization 0.92 \
+                          --kv-cache-dtype fp8_e4m3 \
+                          --language-model-only \
+                          --max-num-batched-tokens 1024 \
+                          --max-num-seqs 8 \
+                          --no-disable-hybrid-kv-cache-manager \
+                          --attention-backend CUSTOM \
+                          --enable-prompt-tokens-details \
+                          --no-enable-log-requests \
+                          --compilation-config "$COMPILATION_CONFIG" \
+                          --no-enable-prefix-caching \
+                          --no-async-scheduling \
+                          --tensor-parallel-size 1 \
+                          --prefill-context-parallel-size 1 \
+                          --data-parallel-size 8 \
+                          --data-parallel-size-local 8 \
+                          --host 0.0.0.0 \
+                          --port 8000 \
+                          --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                          2>&1 | tee -a "$CDK_OUTPUT_DIR/server.log"
+                        rc=${PIPESTATUS[0]}
+                        set -e
+                        elapsed=$(( SECONDS - started ))
+                        if [ "$rc" -eq 0 ] || [ "$elapsed" -gt 240 ]; then
+                          exit "$rc"
+                        fi
+                        echo "vllm serve died after ${elapsed}s (rc=$rc) on attempt $attempt; retrying"
+                        sleep 30
+                      done
+                      exit 1
                   env: &dsv4-env
                     - name: JS_NAME
                       valueFrom:
@@ -473,36 +493,56 @@ spec:
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
 
                       echo "===== Starting DeepSeek-V4 DP8 decode ====="
-                      exec vllm serve \
-                        "$MODEL" \
-                        --load-format runai_streamer \
-                        --served-model-name "$SERVED_MODEL" \
-                        --trust-remote-code \
-                        --seed 42 \
-                        --max-model-len 9216 \
-                        --enable-expert-parallel \
-                        --disable-custom-all-reduce \
-                        --gpu-memory-utilization 0.92 \
-                        --kv-cache-dtype fp8_e4m3 \
-                        --language-model-only \
-                        --max-num-batched-tokens 1024 \
-                        --max-num-seqs 8 \
-                        --no-disable-hybrid-kv-cache-manager \
-                        --attention-backend CUSTOM \
-                        --enable-prompt-tokens-details \
-                        --no-enable-log-requests \
-                        --compilation-config "$COMPILATION_CONFIG" \
-                        --no-enable-prefix-caching \
-                        --no-async-scheduling \
-                        --tensor-parallel-size 1 \
-                        --prefill-context-parallel-size 1 \
-                        --api-server-count 1 \
-                        --data-parallel-size 8 \
-                        --data-parallel-size-local 8 \
-                        --host 0.0.0.0 \
-                        --port 7200 \
-                        --kv-transfer-config "$KV_TRANSFER_CONFIG" \
-                        2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                      # Grabbing the TPU fails outright when the previous tenant of
+                      # this node has not finished releasing it: PjRtClient reports
+                      # "Failed to start the gRPC server" and every worker dies inside
+                      # init_device. That is transient, and on a shared cluster it has
+                      # already cost two runs, so retry it. Only a death in the first
+                      # four minutes is retried; the weights are still streaming then,
+                      # so anything later is a real fault and should surface.
+                      for attempt in 1 2 3; do
+                        started=$SECONDS
+                        set +e
+                        vllm serve \
+                          "$MODEL" \
+                          --load-format runai_streamer \
+                          --served-model-name "$SERVED_MODEL" \
+                          --trust-remote-code \
+                          --seed 42 \
+                          --max-model-len 9216 \
+                          --enable-expert-parallel \
+                          --disable-custom-all-reduce \
+                          --gpu-memory-utilization 0.92 \
+                          --kv-cache-dtype fp8_e4m3 \
+                          --language-model-only \
+                          --max-num-batched-tokens 1024 \
+                          --max-num-seqs 8 \
+                          --no-disable-hybrid-kv-cache-manager \
+                          --attention-backend CUSTOM \
+                          --enable-prompt-tokens-details \
+                          --no-enable-log-requests \
+                          --compilation-config "$COMPILATION_CONFIG" \
+                          --no-enable-prefix-caching \
+                          --no-async-scheduling \
+                          --tensor-parallel-size 1 \
+                          --prefill-context-parallel-size 1 \
+                          --api-server-count 1 \
+                          --data-parallel-size 8 \
+                          --data-parallel-size-local 8 \
+                          --host 0.0.0.0 \
+                          --port 7200 \
+                          --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                          2>&1 | tee -a "$CDK_OUTPUT_DIR/server.log"
+                        rc=${PIPESTATUS[0]}
+                        set -e
+                        elapsed=$(( SECONDS - started ))
+                        if [ "$rc" -eq 0 ] || [ "$elapsed" -gt 240 ]; then
+                          exit "$rc"
+                        fi
+                        echo "vllm serve died after ${elapsed}s (rc=$rc) on attempt $attempt; retrying"
+                        sleep 30
+                      done
+                      exit 1
                   env: *dsv4-env
                   volumeMounts:
                     - name: hf-token-volume
