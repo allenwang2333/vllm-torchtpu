@@ -37,7 +37,6 @@ import math
 from typing import Tuple
 
 import jax.numpy as jnp
-import numpy as np
 import torch
 
 # MXFP4 block size as stored in checkpoints
@@ -115,49 +114,25 @@ def quantize_kv(
     return key, value
 
 
-# Cache of normalized Hadamard rotation matrices keyed by (dim, device).
-_HADAMARD_MATRICES: dict[tuple[int, torch.device], torch.Tensor] = {}
 # Cache of unnormalized +-1 Hadamard matrices keyed by (dim, device, dtype).
 _HADAMARD_PM1_MATRICES: dict[tuple[int, torch.device, torch.dtype],
                              torch.Tensor] = {}
 
 
-def _hadamard_pm1_np(dim: int) -> np.ndarray:
-    """Unnormalized +-1 Sylvester-Hadamard matrix as float32 numpy."""
-    if dim <= 0 or dim & (dim - 1):
-        raise ValueError(
-            "Hadamard rotation requires head_dim to be a power of two, got"
-            f" {dim}.")
-    h = np.array([[1.0]], dtype=np.float32)
-    while h.shape[0] < dim:
-        h = np.block([[h, h], [h, -h]])
-    return h
-
-
-def _hadamard_np(dim: int) -> np.ndarray:
-    """Normalized Sylvester-Hadamard matrix as float32 numpy.
-
-    Must stay bitwise identical to
-    `vllm_torchtpu.kernels.experimental.batched_rpa.hadamard.hadamard_matrix_np`:
-    the K/V rotation applied here at quantization time is undone by the
-    Q-rotation / output-unrotation the batched RPA wrapper performs with its
-    own copy of the matrix.
-    """
-    return (_hadamard_pm1_np(dim) *
-            np.float32(1.0 / math.sqrt(dim))).astype(np.float32)
-
-
 def _hadamard_pm1_torch(dim: int, device: torch.device,
                         dtype: torch.dtype) -> torch.Tensor:
-    """Same +-1 Sylvester recursion as `_hadamard_pm1_np`, in torch ops.
+    """Unnormalized +-1 Sylvester-Hadamard matrix, built in torch ops.
 
     `apply_hadamard_transform` runs inside the traced model forward, and
     Dynamo has no rule for `np.block`, so building the matrix through numpy
     there aborts the `fullgraph=True` capture. The recursion is pure
     constants, so XLA folds it away at compile time. Entries are +-1 exactly,
-    which is representable in any float dtype, so this stays bitwise
-    identical to the numpy reference (and hence to the JAX-side
-    `hadamard_pm1_np` the batched RPA wrapper un-rotates with).
+    which is representable in any float dtype, so this stays bitwise identical
+    to the JAX-side
+    `vllm_torchtpu.kernels.experimental.batched_rpa.hadamard.hadamard_pm1_np`:
+    the K/V rotation applied here at quantization time is undone by the
+    Q-rotation / output-unrotation the batched RPA wrapper performs with its
+    own copy of the matrix.
     """
     if dim <= 0 or dim & (dim - 1):
         raise ValueError(
@@ -191,24 +166,12 @@ def hadamard_pm1_matrix(dim: int,
     return built
 
 
-def hadamard_matrix(dim: int,
-                    device: torch.device | None = None) -> torch.Tensor:
-    """Normalized Sylvester-Hadamard matrix as a float32 torch tensor.
+def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Rotates `x` by the normalized Hadamard matrix along the last dim.
 
     H is symmetric and orthonormal (H == H.T == inv(H)), so applying it twice
     is the identity up to float rounding.
-    """
-    device = device if device is not None else torch.device("cpu")
-    key = (dim, device)
-    cached = _HADAMARD_MATRICES.get(key)
-    if cached is None:
-        cached = torch.from_numpy(_hadamard_np(dim)).to(device)
-        _HADAMARD_MATRICES[key] = cached
-    return cached
 
-
-def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-    """Rotates `x` by the normalized Hadamard matrix along the last dim.
 
     The +-1 matmul runs in `x`'s own floating dtype -- products with +-1
     entries are exact, so a bf16 input stays on the fast native MXU matmul
@@ -274,7 +237,7 @@ def _quantize_to_fp4_packed(
     return packed, scale
 
 
-def quantize_kv_fp4_per_tensor(
+def quantize_kv_fp4_per_token(
     key: torch.Tensor,
     value: torch.Tensor,
     scale_dtype: torch.dtype = torch.bfloat16,

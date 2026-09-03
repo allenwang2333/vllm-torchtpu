@@ -29,10 +29,8 @@ from vllm_torchtpu.layers.common.attention_interface import (
     attention, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.quantization import quantize_kv
-from vllm_torchtpu.layers.common.quantization import (is_floating_dtype,
-                                                      quantize_kv,
-                                                      quantize_kv_fp4_per_tensor)
+from vllm_torchtpu.layers.common.quantization import (quantize_kv,
+                                                      quantize_kv_fp4_per_token)
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
@@ -1194,7 +1192,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         k_scale_tensor = v_scale_tensor = None
         if self.kv_cache_quantized_dtype:
             if self.per_token_fp4_quantization:
-                key, value, k_scale_tensor, v_scale_tensor = quantize_kv_fp4_per_tensor(
+                key, value, k_scale_tensor, v_scale_tensor = quantize_kv_fp4_per_token(
                     key, value, scale_dtype=self.per_token_scale_dtype,
                     hadamard_mode=self.hadamard_mode,
                 )

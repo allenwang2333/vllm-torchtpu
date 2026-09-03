@@ -605,7 +605,7 @@ def _ragged_paged_attention_inner(
     out_dtype: Dtype of output. Defaults to dtype of queries.
     use_causal_mask: Not used.
     hadamard_mode: Hadamard rotation mode matching how keys/values were
-      quantized (see hadamard.py and quantize_kv_fp4_per_tensor). None: no
+      quantized (see hadamard.py and quantize_kv_fp4_per_token). None: no
       rotation. "k": keys (new and cached) are stored rotated by the
       normalized Hadamard matrix along head_dim; queries are rotated by the
       same matrix before the kernel. "kv": values are additionally stored
