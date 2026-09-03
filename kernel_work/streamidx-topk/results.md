@@ -102,7 +102,21 @@ reason decode is the better target, and it is not the reason the earlier documen
 
 ---
 
-## 1b. The denominator: this op is **3.80% of a GLM-5.2 decode step**
+## 1b. The denominator: this op is **4.299% of a GLM-5.2 decode step**
+
+> **SUPERSEDED 2026-09-03 — the 3.80% below is wrong; use 4.299%.** Re-read from the same profile
+> with **complete** `hlo_stats` (no `--top-n` truncation) and with the **TensorCore plane only** on
+> both ends. The corrected table is §1c. Three things changed: the op scope now includes the
+> `conditional` wrapper, the `branch_0_fun` plumbing and the KV-cache write, which the 2.5745 numerator
+> did not account for; the denominator rose 67.756 -> 69.492 ms/step; and the prefill share, previously
+> only ever estimated as "order 1%", is measured at **3.331%**. The direction is the opposite of what
+> was assumed while withdrawing the merged op: this op is **larger** than believed, not smaller.
+>
+> The trap worth carrying: `hlo_stats` in this profile has a `TPU core type` column with both
+> `TensorCore` and `SparseCore` rows, and summing without filtering **double-counts** -- the TC row for
+> `sc_topk_direct` is the TensorCore's blocking wait while the SparseCore row is the SparseCore's
+> concurrent execution. TC+SC = 81.488 ms/step *exceeds* the 72.039 ms measured module wall; TC-only
+> lands at 96.5% of it. Filter to one plane, on numerator and denominator both.
 
 Every percentage in this document is **op-level**. Until 2026-09-03 nothing here established what
 share of a real GLM-5.2 step the op is, so none of them could be converted into a model-level
@@ -152,6 +166,62 @@ exactly one indexer-active step (stage A 1.813 ms, stage B 2.007 ms of 620.5 ms 
 but n=1, 37% of that step is collectives, and its per-call times are 3-4.5x below the microbenchmark
 at the nominally identical shape -- so it is an early short-context chunk. Treat prefill as "order
 1%", not as 0.62%. `prefill_only` rank 8 has **zero** StreamIdx events.
+
+---
+
+## 1c. The corrected denominator (2026-09-03) — supersedes §1b
+
+Same profile, `j-9b23bb32-0426-4080-be91`, rank 8. Re-read with **complete** `hlo_stats` and
+filtered to the **TensorCore plane on both ends**. See the note at the head of §1b for why the
+plane filter is not optional. Every share below has its numerator and denominator stated.
+
+**Denominators, TC plane, per model step** (each capture holds 5 decode steps x 2 cores, or 1
+prefill step x 2 cores): decode **69.492 ms**, `prefill_heavy` **622.485 ms**, `prefill_only`
+**635.463 ms**. Cross-check: TC-only is 96.5-98.3% of the measured `tt_jit_layernorm_...` module
+wall time; TC+SC *exceeds* it, which is what exposed the double count.
+
+| component | decode ms/step | % | `prefill_heavy` ms/step | % |
+| --- | ---: | ---: | ---: | ---: |
+| stage A `StreamIdxTC-{d,m}` | 1.8259 | 2.627% | 1.2491 | 0.201% |
+| stage B `sc_topk_direct`, **TC rows** (blocking wait) | 0.6588 | 0.948% | 2.0123 | 0.323% |
+| KV-cache write — **relayout round trip** (2 reshapes) | 0 | -- | **13.7780** | **2.213%** |
+| KV-cache write — `scatter_fusion` | 0.1863 | 0.268% | 2.8100 | 0.451% |
+| `conditional` wrapper | 0.1573 | 0.226% | 0.1438 | 0.023% |
+| `branch_0_fun` plumbing | 0.1589 | 0.229% | 0.7427 | 0.119% |
+| **op total** | **2.9872** | **4.299%** | **20.7359** | **3.331%** |
+| *stage B, SparseCore rows — excluded, never added* | *0.3249* | *--* | *1.0013* | *--* |
+
+Two readings that were not previously available:
+
+- **The op is larger than §1b said, at both phases.** 4.299% not 3.80% at decode; 3.331% not
+  "order 1%" at prefill. `report.md`'s 32.8% remains repudiated -- that is AgentX, a different shape.
+- **At prefill the op is mostly not the kernel.** The relayout round trip is **68%** of the whole op
+  (13.778 / 20.736) and stage A is 6%. Optimizing the scoring kernel at prefill is optimizing the
+  small end of the op, which is itself the small end of the step.
+- Stage B occupies **0.6588 ms** of TensorCore at decode against **0.3249 ms** of actual SparseCore
+  work: the TC blocks about **2x** as long as the SC computes. That gap is what Option B attacks.
+
+Prefill caveats that survive: **n=1 model step** per capture, and `prefill_only`'s captured step has
+**zero** `StreamIdxTC` and zero `sc_topk_direct` rows (`min_kv_len = 0`), so only `prefill_heavy`
+carries the indexer at all. Collectives are 40.4% of the prefill step.
+
+### What each change is worth on the corrected denominators
+
+Arithmetic on the rows above and on the measured op-level deltas — **derived, not observed.** No
+end-to-end run supports any row.
+
+| change | measured op-level effect | phase | ~ % of that step |
+| --- | --- | --- | ---: |
+| **KV-cache relayout removal** | 13.778 ms/step, measured directly in the profile | prefill | **~2.21%** |
+| Option B, runner chunking, G=4 | -29.6% of stage A+B (3.2614 ms/step) | prefill | ~0.155% |
+| **D1-lite** | -6.982 us/layer of residual x 21 layers, scaled 0.918 for the microbenchmark's larger residual bucket | decode | **~0.19-0.21%** |
+| Option C, prefill-gated | -20.6% of stage A (1.2491 ms/step) | prefill | ~0.041% |
+| *D1 (full) — withdrawn* | *-16.980 us/layer x 21* | *decode* | *~0.49-0.51%* |
+| *`bkv_p` ladder — withdrawn as sized* | *-14.6% of op* | *decode* | *~0.63%* |
+
+The two largest decode entries are the two that were withdrawn, and the largest entry overall is
+not a kernel change. Ordering the work by these numbers rather than by op-level percentages is the
+single most useful thing §1c provides.
 
 ### Three things from the profile that outlive this op
 
