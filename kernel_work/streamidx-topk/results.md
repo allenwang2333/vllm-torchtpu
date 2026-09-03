@@ -1,10 +1,10 @@
 # Step 3 — variants built, measured and ranked
 
-**Status: DRAFT — every option is measured. One thread is open: Option A's revival at
-`bkv_p=9`.** Options A, B, C,
+**Status: COMPLETE.** Every option is built, measured and ranked; the recommendation is §12. Options A, B, C,
 D, E and candidate 0 are all complete and reported in full, as is the recalibrated baseline (§1).
-Outstanding: Option A re-measured at `bkv_p=8/9`, plus the consumer-side cost A was never charged
-for. It can only *add* an option, not overturn one. Do not quote this file as final until this banner is gone.
+Six options plus the incumbent were measured. Three are recommended (§12), three are rejected on
+measurements, and one — the largest prefill number here — is handed to the runner because it is not
+a kernel change. Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
 the GLM-5.2 DSA lightning indexer, on TPU7x. Baseline branch `annyan/streamidx-topk-opt`, incumbent
@@ -418,17 +418,44 @@ written against the 221.4 µs *wall clock*; at 170.58 µs device the bar is 22.1
 143.39 µs `p=9` ship configuration it is 18.64–31.55 µs.) Correctness is **bit-identical** by
 checksum at both `bkv_p` and both A forms.
 
-**The remaining question, and the one thing still running.** A `/critical-review` pass found the
-mechanism attribution wrong-footed: the agent led with "it is the eliminated transpose", but the
-`a_concat` arm builds that operand a completely different way and lands within 0.6%, which points at
-the **halved payload width** instead. That distinction decides everything left:
+### 7.2 The mechanism, settled — and it does not rescue A
 
-- **if the 974 ns is the transpose**, a variant captures it **without touching the cache format** —
-  no writer-side scatter, no prefill exposure — and **strictly dominates Option A**;
-- **if it is payload width**, the saving is only reachable through the cache format and A stays as
-  measured.
+A `/critical-review` pass found the first mechanism attribution wrong-footed (`a_concat` builds the
+operand a completely different way and lands within 0.6%), and a first `/xprof-llo` census could not
+resolve it either: the three arms are **collinear** — `inc` = {lane-128 scale, 256-lane record},
+both A arms = {lane-major rows, 128-lane record} — so they vary the transpose (T) and the payload
+width (W) together.
 
-An `/xprof-llo` static census of the two `compute` arms decides it in minutes. Dispatched.
+The missing 2×2 cell was compiled: **`w_reshape`, the incumbent's 256-lane record with Option A's
+lane-major scale rows** (job `j-a0566857-c6f2-4667-9eed`). Position is
+`(w − a_reshape) / (inc − a_reshape)`: **0.00 = follows scale placement, 1.00 = follows record
+width.**
+
+| metric | inc | a_reshape | w_reshape | position |
+| --- | ---: | ---: | ---: | ---: |
+| **XLU bundle occupancy** | 46.24% | 1.05% | 1.04% | **−0.000** |
+| `tpu.transpose` | 288 | 0 | 0 | +0.000 |
+| spills + fills | 10,715 | 1,168 | 1,218 | +0.005 |
+| VLIW bundles | 8,417 | 6,590 | 6,614 | +0.013 |
+| **VMEM read bytes/block** | 9,750,528 | 5,068,800 | 9,787,392 | **+1.008** |
+
+**The instruction cost follows the scale placement, not the record width** — `w_reshape` carries the
+incumbent's full byte traffic and still lands on `a_reshape` everywhere instructions are counted.
+Clean separation, and `inc`/`a_reshape` reproduced the earlier job exactly, so the cross-job tie
+holds. **All static compile-time analysis**; the arm was compiled, never timed.
+
+**How the 973.9 ns divides between the two axes remains unmeasured**, and the agent struck its own
+"98.7% is scale placement" from four places before reporting: 98.7% is a share of *VLIW bundles*, and
+converting that to a share of a measured nanosecond delta needs bundles ∝ time and the byte channel
+priced at zero — while a static dump cannot price bytes at all.
+
+**The reader-side variant does not survive its own cost.** Folding the scale onto the K operand
+(`scale[bkv_sz,1]` lane broadcast) is the only genuinely reader-side route, ceiling **−15.58 µs
+(static ceiling, not a prediction)**. But an fp8 K operand cannot absorb an e8m0 scale without
+saturating — e4m3 maxes at 448 — so the operand widens to **bf16**, which *is* Option F, measured at
+**+9.80% decode / +4.63% prefill with HBM held byte-for-byte constant** (§11.2). Measured at another
+geometry so not directly subtractable, but it is a counter-cost of the prize's own order. **There is
+no dominating variant.**
 
 **Unreproduced, and it is the whole rest of A:** everything measured here is the **reader**.
 Producing layout A needs a changed caller-side scatter in XLA, unmeasured and unproven — and prefill
@@ -540,10 +567,9 @@ not 1.02.
    more important result: **prefill stage A has no roofline headroom left** — 75.4% issue/VPU,
    which C already attacked, and an infinitely fast score matmul would save ≤5.4% (§11.3).
 4. ~~Candidate 0's `p=9` sweep and reference check~~ — **DONE** (§6).
-5. **The one open thread: is Option A's 974 ns/block the transpose or the payload width?** (§7.1)
-   If the transpose, a variant captures it **without touching the cache format** and strictly
-   dominates A. If payload width, no such variant exists. An `/xprof-llo` static census decides it;
-   dispatched.
+5. ~~Is Option A's 974 ns/block the transpose or the payload width?~~ — **SETTLED: scale placement**
+   (§7.2). It does not rescue A; the reader-side variant needs a bf16 K operand, which is Option F,
+   measured at +9.80% decode.
 5. ~~Options A and B~~ — **DONE** (§7, §8).
 6. **Option B belongs to the runner, and nobody owns it.** +16.4/+24.4% on prefill, measured, and
    it needs the scheduler to pack the batch into chunks and pass the plan down as static metadata.
