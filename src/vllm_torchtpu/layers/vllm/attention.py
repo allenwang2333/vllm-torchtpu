@@ -685,9 +685,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         max_model_len = (vllm_config.model_config.max_model_len
                          if use_pcp_streaming and vllm_config is not None else
                          None)
+        additional_config = (vllm_config.additional_config
+                             if vllm_config is not None else None) or {}
+        q_block_size = (additional_config.get(
+            "pcp_streaming_rpa_q_block_size") if use_pcp_streaming else None)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len)
+                      cp_kv_cache_interleave_size, q_block_size, max_model_len)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -704,7 +708,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         self.sliding_window, self.scale, self.logits_soft_cap,
                         id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+                        q_block_size, max_model_len, self.use_causal_mask)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -725,6 +729,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 skip_kv_update=skip_kv_update,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
+            if q_block_size is not None:
+                pcp_make_kwargs["q_block_size"] = int(q_block_size)
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             # Prepare wrapper function with static arguments.
