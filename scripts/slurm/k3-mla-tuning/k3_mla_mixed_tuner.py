@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Tune Kimi-K3 MLA mixed-extend tiles at the serving kernel boundary.
+"""Tune Kimi-K3 MLA tiles for DSpark target-verify windows.
 
-This is a stage-1 kernel tuner.  Its geometry must be copied from an observed
-serving compile; candidates that fail compilation are rejected before latency
-ranking.  Finalists still require the stage-2 full-model compile gate described
-in this directory's README.
+Although target verification happens during decode, a request containing more
+than one query token is routed through the MLA kernel's mixed segment.  The
+default shapes model six and eight valid verify tokens in the same eight-token
+compile bucket.  Candidates that fail compilation or the all-ones numerical
+check are rejected before latency ranking.
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ import json
 import logging
 import math
 import os
-from pathlib import Path
 import statistics
 import sys
 import time
 import types
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SOURCE_ROOT = REPO_ROOT / "src"
@@ -40,9 +41,9 @@ def _install_lightweight_package_stubs() -> None:
 _install_lightweight_package_stubs()
 
 # Match the serving process' libtpu flags and JAX lowering patches before the
-# first JAX import.  Importing the raw kernel without this module is not a
+# first JAX import. Importing the raw kernel without this module is not a
 # serving-equivalent compiler environment.
-import vllm_torchtpu.env_override  # noqa: E402,F401
+import vllm_torchtpu.env_override  # isort: skip  # noqa: E402,F401
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -51,8 +52,8 @@ from jax.experimental import shard_map  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
-from vllm_torchtpu.kernels.mla.v2.kernel import (  # noqa: E402
-    mla_ragged_paged_attention, )
+from vllm_torchtpu.kernels.mla.v2.kernel import \
+    mla_ragged_paged_attention  # noqa: E402
 
 
 def parse_shapes(value: str) -> list[tuple[int, int]]:
@@ -81,7 +82,8 @@ def parse_candidates(value: str) -> list[tuple[int, int]]:
 def parse_positive_ints(value: str) -> list[int]:
     values = [int(item) for item in value.split(",")]
     if not values or any(item <= 0 for item in values):
-        raise argparse.ArgumentTypeError(f"invalid positive integer list: {value}")
+        raise argparse.ArgumentTypeError(
+            f"invalid positive integer list: {value}")
     return values
 
 
@@ -104,6 +106,8 @@ def make_inputs(
     physical_tokens: int,
     valid_tokens: int,
     *,
+    kv_len: int,
+    kv_dtype: str,
     total_pages: int,
     max_num_seqs: int,
     pages_per_seq: int,
@@ -116,32 +120,36 @@ def make_inputs(
     model_axis_size = len(jax.devices())
     num_heads = local_num_heads * model_axis_size
     logical_page_size = page_size_per_kv_packing * kv_packing
-    required_pages = math.ceil(valid_tokens / logical_page_size)
+    if kv_len < valid_tokens:
+        raise ValueError(
+            f"kv_len={kv_len} must include the {valid_tokens} query tokens")
+    required_pages = math.ceil(kv_len / logical_page_size)
     if required_pages > pages_per_seq:
-        raise ValueError(
-            f"valid_tokens={valid_tokens} needs {required_pages} pages, "
-            f"but pages_per_seq={pages_per_seq}")
+        raise ValueError(f"kv_len={kv_len} needs {required_pages} pages, "
+                         f"but pages_per_seq={pages_per_seq}")
     if required_pages > total_pages:
-        raise ValueError(
-            f"valid_tokens={valid_tokens} needs {required_pages} pages, "
-            f"but total_pages={total_pages}")
+        raise ValueError(f"kv_len={kv_len} needs {required_pages} pages, "
+                         f"but total_pages={total_pages}")
 
     # Match mla_attention's serving boundary: queries are token-major with the
     # global head count and are sharded over the eight-device model axis.
     ql_nope = jnp.ones((physical_tokens, num_heads, lkv_dim),
                        dtype=jnp.bfloat16)
     q_pe = jnp.ones((physical_tokens, num_heads, r_dim), dtype=jnp.bfloat16)
-    new_kv_c = jnp.ones((physical_tokens, lkv_dim), dtype=jnp.bfloat16)
-    new_k_pe = jnp.ones((physical_tokens, r_dim), dtype=jnp.bfloat16)
+    cache_dtype = {
+        "bfloat16": jnp.bfloat16,
+        "float8_e4m3fn": jnp.float8_e4m3fn,
+    }[kv_dtype]
+    new_kv_c = jnp.ones((physical_tokens, lkv_dim), dtype=cache_dtype)
+    new_k_pe = jnp.ones((physical_tokens, r_dim), dtype=cache_dtype)
     padded_r_dim = math.ceil(r_dim / 128) * 128
-    cache_kv = jnp.zeros(
+    cache_kv = jnp.ones(
         (total_pages, page_size_per_kv_packing, kv_packing,
          lkv_dim + padded_r_dim),
-        dtype=jnp.bfloat16,
+        dtype=cache_dtype,
     )
 
-    kv_lens = jnp.zeros((max_num_seqs, ),
-                        dtype=jnp.int32).at[0].set(valid_tokens)
+    kv_lens = jnp.zeros((max_num_seqs, ), dtype=jnp.int32).at[0].set(kv_len)
     cu_q_lens = jnp.full((max_num_seqs + 1, ), valid_tokens, dtype=jnp.int32)
     cu_q_lens = cu_q_lens.at[0].set(0)
     page_indices = jnp.full((max_num_seqs * pages_per_seq, ),
@@ -248,6 +256,8 @@ def tune_candidate(
     physical_tokens: int,
     valid_tokens: int,
     *,
+    kv_len: int,
+    kv_dtype: str,
     bkv: int,
     bq: int,
     q_split: int,
@@ -266,6 +276,8 @@ def tune_candidate(
     mesh, inputs = make_inputs(
         physical_tokens,
         valid_tokens,
+        kv_len=kv_len,
+        kv_dtype=kv_dtype,
         total_pages=total_pages,
         max_num_seqs=max_num_seqs,
         pages_per_seq=pages_per_seq,
@@ -316,6 +328,8 @@ def tune_candidate(
         "event": "result",
         "physical_tokens": physical_tokens,
         "valid_tokens": valid_tokens,
+        "kv_len": kv_len,
+        "kv_dtype": kv_dtype,
         "logical_page_size": page_size_per_kv_packing * kv_packing,
         "page_size_per_kv_packing": page_size_per_kv_packing,
         "kv_packing": kv_packing,
@@ -335,6 +349,13 @@ def tune_candidate(
         "max_ms": max(latencies_ms),
         "output_shape": list(output.shape),
     }
+    host_output = np.asarray(output[:valid_tokens], dtype=np.float32)
+    result["finite"] = bool(np.isfinite(host_output).all())
+    result["max_abs_error_from_one"] = float(np.max(np.abs(host_output - 1.0)))
+    if not result["finite"] or result["max_abs_error_from_one"] > 0.02:
+        raise ValueError("numerical validation failed: "
+                         f"finite={result['finite']} "
+                         f"max_abs_error={result['max_abs_error_from_one']}")
     del inputs, mutable_inputs, output, updated_cache, invoke, mesh
     gc.collect()
     return result
@@ -345,25 +366,35 @@ def main() -> int:
     parser.add_argument(
         "--shapes",
         type=parse_shapes,
-        default=parse_shapes("4096:4000"),
+        default=parse_shapes("8:6,8:8"),
     )
     parser.add_argument(
         "--candidates",
         type=parse_candidates,
-        default=parse_candidates(
-            "1x64,1x128,1x256,2x64,2x128,2x256,4x64,4x128,4x256"),
+        default=parse_candidates("1x8,1x16,1x32,2x8,2x16,2x32,4x8,4x16,4x32"),
     )
     parser.add_argument("--q-splits",
                         type=parse_positive_ints,
-                        default=parse_positive_ints("1,2,4"))
-    parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--total-pages", type=int, default=493)
-    parser.add_argument("--max-num-seqs", type=int, default=8)
-    parser.add_argument("--pages-per-seq", type=int, default=128)
+                        default=parse_positive_ints("1,2"))
+    parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--kv-len",
+        type=int,
+        default=1024,
+        help="Total sequence length, including the target-verify window.",
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        choices=("bfloat16", "float8_e4m3fn"),
+        default="bfloat16",
+    )
+    parser.add_argument("--total-pages", type=int, default=8)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument("--pages-per-seq", type=int, default=768)
     parser.add_argument("--page-size-per-kv-packing", type=int, default=128)
     parser.add_argument("--kv-packing", type=int, default=2)
-    parser.add_argument("--local-num-heads", type=int, default=12)
+    parser.add_argument("--local-num-heads", type=int, default=2)
     parser.add_argument("--lkv-dim", type=int, default=512)
     parser.add_argument("--r-dim", type=int, default=64)
     parser.add_argument("--vmem-mib", type=int, default=60)
@@ -375,10 +406,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.warmups < 0 or args.iterations <= 0:
-        parser.error("iterations must be positive; warmups must be nonnegative")
+        parser.error(
+            "iterations must be positive; warmups must be nonnegative")
+    expected_packing = 2 if args.kv_dtype == "bfloat16" else 4
+    if args.kv_packing != expected_packing:
+        parser.error(f"kv-packing={args.kv_packing} does not match "
+                     f"kv-dtype={args.kv_dtype}; expected {expected_packing}")
     invalid_splits = [
-        split for split in args.q_splits
-        if args.local_num_heads % split != 0
+        split for split in args.q_splits if args.local_num_heads % split != 0
     ]
     if invalid_splits:
         parser.error("q-splits must divide local-num-heads; invalid: "
@@ -399,48 +434,76 @@ def main() -> int:
         )
     devices = jax.devices()
     if len(devices) != args.expected_device_count:
-        parser.error("device-count mismatch: "
-                     f"observed={len(devices)}, expected={args.expected_device_count}")
+        parser.error(
+            "device-count mismatch: "
+            f"observed={len(devices)}, expected={args.expected_device_count}")
     mismatched_devices = [
         device.device_kind for device in devices
         if args.expected_device_kind.lower() not in device.device_kind.lower()
     ]
     if mismatched_devices:
-        parser.error("device-kind mismatch: "
-                     f"observed={mismatched_devices}, expected={args.expected_device_kind}")
+        parser.error(
+            "device-kind mismatch: "
+            f"observed={mismatched_devices}, expected={args.expected_device_kind}"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO)
     with args.output.open("a", encoding="utf-8") as output_file:
         emit(
             {
-                "event": "manifest",
-                "repo_root": str(REPO_ROOT),
-                "source_commit": os.environ.get("SOURCE_COMMIT", "unknown"),
-                "kernel_sha256": os.environ.get("KERNEL_SHA256", "unknown"),
-                "jax": versions["jax"],
-                "jaxlib": versions["jaxlib"],
-                "libtpu": versions["libtpu"],
+                "event":
+                "manifest",
+                "repo_root":
+                str(REPO_ROOT),
+                "source_commit":
+                os.environ.get("SOURCE_COMMIT", "unknown"),
+                "kernel_sha256":
+                os.environ.get("KERNEL_SHA256", "unknown"),
+                "jax":
+                versions["jax"],
+                "jaxlib":
+                versions["jaxlib"],
+                "libtpu":
+                versions["libtpu"],
                 "devices": [str(device) for device in devices],
-                "device_kinds":
-                [device.device_kind for device in devices],
-                "shapes": args.shapes,
-                "candidates": args.candidates,
-                "q_splits": args.q_splits,
-                "warmups": args.warmups,
-                "iterations": args.iterations,
-                "total_pages": args.total_pages,
-                "max_num_seqs": args.max_num_seqs,
-                "pages_per_seq": args.pages_per_seq,
-                "page_size_per_kv_packing": args.page_size_per_kv_packing,
-                "kv_packing": args.kv_packing,
-                "local_num_heads": args.local_num_heads,
-                "lkv_dim": args.lkv_dim,
-                "r_dim": args.r_dim,
-                "cache_row_dim": args.lkv_dim + math.ceil(args.r_dim / 128) * 128,
-                "vmem_mib": args.vmem_mib,
-                "geometry_source": os.environ.get("SERVING_GEOMETRY_SOURCE",
-                                                  "unknown"),
+                "device_kinds": [device.device_kind for device in devices],
+                "shapes":
+                args.shapes,
+                "candidates":
+                args.candidates,
+                "q_splits":
+                args.q_splits,
+                "warmups":
+                args.warmups,
+                "iterations":
+                args.iterations,
+                "kv_len":
+                args.kv_len,
+                "kv_dtype":
+                args.kv_dtype,
+                "total_pages":
+                args.total_pages,
+                "max_num_seqs":
+                args.max_num_seqs,
+                "pages_per_seq":
+                args.pages_per_seq,
+                "page_size_per_kv_packing":
+                args.page_size_per_kv_packing,
+                "kv_packing":
+                args.kv_packing,
+                "local_num_heads":
+                args.local_num_heads,
+                "lkv_dim":
+                args.lkv_dim,
+                "r_dim":
+                args.r_dim,
+                "cache_row_dim":
+                args.lkv_dim + math.ceil(args.r_dim / 128) * 128,
+                "vmem_mib":
+                args.vmem_mib,
+                "geometry_source":
+                os.environ.get("SERVING_GEOMETRY_SOURCE", "unknown"),
             },
             output_file,
         )
@@ -453,6 +516,8 @@ def main() -> int:
                         result = tune_candidate(
                             physical_tokens,
                             valid_tokens,
+                            kv_len=args.kv_len,
+                            kv_dtype=args.kv_dtype,
                             bkv=bkv,
                             bq=bq,
                             q_split=q_split,
@@ -461,7 +526,8 @@ def main() -> int:
                             total_pages=args.total_pages,
                             max_num_seqs=args.max_num_seqs,
                             pages_per_seq=args.pages_per_seq,
-                            page_size_per_kv_packing=args.page_size_per_kv_packing,
+                            page_size_per_kv_packing=args.
+                            page_size_per_kv_packing,
                             kv_packing=args.kv_packing,
                             vmem_limit_bytes=args.vmem_mib * 1024 * 1024,
                             local_num_heads=args.local_num_heads,
@@ -473,6 +539,8 @@ def main() -> int:
                             "event": "error",
                             "physical_tokens": physical_tokens,
                             "valid_tokens": valid_tokens,
+                            "kv_len": args.kv_len,
+                            "kv_dtype": args.kv_dtype,
                             "bkv": bkv,
                             "bq": bq,
                             "q_split": q_split,
