@@ -1,0 +1,1035 @@
+{
+  "methodology": {
+    "trials": 9,
+    "warmup": 3,
+    "target_s": 0.05,
+    "chain_r": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "chain_r_grid": [
+      1,
+      2,
+      3
+    ],
+    "quick": false,
+    "r2_reject_below": 0.999,
+    "wall_statistic": "best-of-N batched async (bench_prod's own method)",
+    "device_statistic": "chain slope: d t / d R, intercept discarded",
+    "note": "batched per-call wall = max(device, host enqueue); the dispatch floor is a clamp, not an addend, and is never subtracted anywhere in this file."
+  },
+  "baseline_of_record_wall_us": {
+    "source": "bench_prod.json, job j-8b1e7acc-ebdc-45d2-b46c",
+    "decode_call": 221.4,
+    "prefill_call": 857.3,
+    "decode_stage_b": 67.4,
+    "prefill_stage_b": 481.0,
+    "decode_stage_a_derived": 109.2,
+    "prefill_stage_a_derived": 335.1
+  },
+  "modules": {
+    "streamindex_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+      "md5": "1e221f10cbf3573aa0d2ae78c3463532"
+    },
+    "sparsecore_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "md5": "8bc9e25b8701a53a97704564b9fbc658"
+    },
+    "bench_streamidx_topk.py": {
+      "path": "/root/instruments/bench_streamidx_topk.py",
+      "md5": "e8e492d13e59c4a1675cc7a98c5a0813"
+    },
+    "_stage_a.py": {
+      "path": "/root/probes/_stage_a.py",
+      "md5": "eea6a51bb40a2bbf7cf5b39571753b62"
+    }
+  },
+  "jax": "0.10.2",
+  "device_kind": "TPU7x",
+  "num_devices": 8,
+  "static_common": {
+    "k": 2048,
+    "compression_ratio": 1,
+    "num_queries_per_block": [
+      1,
+      128,
+      128
+    ],
+    "enable_early_exit": true
+  },
+  "geometry": {
+    "decode": {
+      "pages_per_seq": 9,
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "num_tokens": 64,
+      "score_buffer_bytes": 2621440,
+      "kv_cache_bytes": 150994944,
+      "kv_stream_bytes": 167772160,
+      "kv_stream_useful_bytes": 84541440,
+      "total_pages": 576,
+      "bq_sz": 1,
+      "bkv_sz": 2048,
+      "num_bq": 1,
+      "num_bkv": 5
+    },
+    "prefill": {
+      "pages_per_seq": 9,
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "num_tokens": 1024,
+      "score_buffer_bytes": 41943040,
+      "kv_cache_bytes": 2359296,
+      "kv_stream_bytes": 20971520,
+      "kv_stream_useful_bytes": 10567680,
+      "total_pages": 9,
+      "bq_sz": 128,
+      "bkv_sz": 2048,
+      "num_bq": 8,
+      "num_bkv": 5
+    },
+    "page_size": 1024,
+    "num_kv_pages_per_block": [
+      2,
+      2,
+      2
+    ],
+    "num_queries_per_block": [
+      1,
+      128,
+      128
+    ]
+  },
+  "shape_preflight": {
+    "full_decode": "ShapeDtypeStruct(shape=(64, 2048), dtype=int32)",
+    "full_prefill": "ShapeDtypeStruct(shape=(1024, 2048), dtype=int32)",
+    "stage_a_decode": "ShapeDtypeStruct(shape=(64, 80, 128), dtype=float32)",
+    "stage_a_prefill": "ShapeDtypeStruct(shape=(1024, 80, 128), dtype=float32)",
+    "stage_b_decode": "ShapeDtypeStruct(shape=(64, 2048), dtype=int32)",
+    "stage_b_prefill": "ShapeDtypeStruct(shape=(1024, 2048), dtype=int32)",
+    "stage_a_decode_bkvp4_nst96": "ShapeDtypeStruct(shape=(64, 96, 128), dtype=float32)",
+    "ok": true
+  },
+  "dispatch_floors": {
+    "one_arg_scalar_us": 28.543570346530824,
+    "one_arg_iters": 261,
+    "two_arg_bigbuf_us": 30.199365031696544,
+    "two_arg_iters": 263,
+    "bigbuf_bytes": 2621440,
+    "bench_prod_recorded_us": 42.005,
+    "used_for": "NOTHING. Context only. A clamp, not an addend."
+  },
+  "bkvp_index_set_equality": [
+    {
+      "ctx": 8192,
+      "bkv_p": 2,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8191,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true,
+      "chain_perturbation_is_zero": true
+    },
+    {
+      "ctx": 8192,
+      "bkv_p": 3,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8191,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    },
+    {
+      "ctx": 8192,
+      "bkv_p": 4,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8191,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 2,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8703,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true,
+      "chain_perturbation_is_zero": true
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 3,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8703,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 4,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 8703,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 2,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 9215,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true,
+      "chain_perturbation_is_zero": true
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 3,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 9215,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 4,
+      "shape": [
+        64,
+        2048
+      ],
+      "out_0_0": 9,
+      "n_pad": 0,
+      "min_idx": 0,
+      "max_idx": 9215,
+      "rows_matching_bkvp2": 64,
+      "index_sets_match_bkvp2": true
+    }
+  ],
+  "task1": {
+    "decode": {
+      "shape": "prod_decode_b64_ctx8704",
+      "full_op": {
+        "intercept_us": 14.544575904914845,
+        "slope_us_per_call": 173.37028523990713,
+        "r2": 0.9998272031774075,
+        "points_us": {
+          "1": 189.61199979022354,
+          "2": 360.6741901170066,
+          "3": 530.785928223876,
+          "4": 710.8090378876243
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "4": 48
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 190.47402158162018,
+        "batched_median_us": 190.86505809839625,
+        "batched_iters": 137,
+        "trial_spread_frac": 0.022596195944645764,
+        "serial_best_us": 373.91018122434616
+      },
+      "stage_a_isolated": {
+        "intercept_us": 8.561563452399994,
+        "slope_us_per_call": 109.64570502640181,
+        "r2": 0.9999981498233779,
+        "points_us": {
+          "1": 118.28370730985294,
+          "2": 227.87470758582154,
+          "3": 337.2258938772162,
+          "4": 447.3189953007276
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 3,
+          "4": 15
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 118.1555171197618,
+        "batched_median_us": 119.4154495122837,
+        "batched_iters": 171,
+        "trial_spread_frac": 0.013950322102123734,
+        "serial_best_us": 269.9997276067734,
+        "num_sublanes_total": 80,
+        "bkv_p": 2,
+        "note": "ONE pallas_call: the grouped DECODE call, or the MIXED prefill call. The two companion calls the real op also issues are empty at these shapes and are NOT included here; hlo_stats does include them."
+      },
+      "stage_b_isolated": {
+        "intercept_us": 20.23102325508075,
+        "slope_us_per_call": 28.76642575471592,
+        "r2": 0.9998996335520679,
+        "points_us": {
+          "1": 48.66406931702433,
+          "2": 78.29482763491828,
+          "3": 106.46853385673415,
+          "4": 135.16091975880548
+        },
+        "marker": "sc_topk",
+        "marker_counts": {
+          "1": 18,
+          "4": 69
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 48.41845106928289,
+        "batched_median_us": 48.655588101564334,
+        "batched_iters": 238,
+        "trial_spread_frac": 0.021725259472728554,
+        "serial_best_us": 189.1949214041233,
+        "p_partition": 1,
+        "eff_len_mean": 8704.0,
+        "num_positions": 10240
+      }
+    },
+    "prefill": {
+      "shape": "prod_prefill_q1024_ctx9216",
+      "full_op": {
+        "intercept_us": 19.73035709502567,
+        "slope_us_per_call": 750.1387289868525,
+        "r2": 0.9999964486707315,
+        "points_us": {
+          "1": 771.5995978707305,
+          "2": 1517.6604501903057,
+          "3": 2269.649738445878,
+          "4": 3021.3989317417145
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "4": 48
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 772.2449954599142,
+        "batched_median_us": 772.7426709607244,
+        "batched_iters": 52,
+        "trial_spread_frac": 0.0025810467751370488,
+        "serial_best_us": 935.3887289762497
+      },
+      "stage_a_isolated": {
+        "intercept_us": 17.937153965687724,
+        "slope_us_per_call": 247.62927311033877,
+        "r2": 0.999990315364621,
+        "points_us": {
+          "1": 266.33337613914097,
+          "2": 512.583111093877,
+          "3": 759.749304292337,
+          "4": 1009.3755554407835
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 3,
+          "4": 15
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 266.33752392487486,
+        "batched_median_us": 266.40787234043216,
+        "batched_iters": 111,
+        "trial_spread_frac": 0.0008252705614425657,
+        "serial_best_us": 434.53508988022804,
+        "num_sublanes_total": 80,
+        "bkv_p": 2,
+        "note": "ONE pallas_call: the grouped DECODE call, or the MIXED prefill call. The two companion calls the real op also issues are empty at these shapes and are NOT included here; hlo_stats does include them."
+      },
+      "stage_b_isolated": {
+        "intercept_us": 81.66812880391895,
+        "slope_us_per_call": 336.48295532729645,
+        "r2": 0.9999990444613758,
+        "points_us": {
+          "1": 417.8843117274699,
+          "2": 755.2147210347202,
+          "3": 1090.7559488446284,
+          "4": 1427.6470868818224
+        },
+        "marker": "sc_topk",
+        "marker_counts": {
+          "1": 18,
+          "4": 69
+        },
+        "chain_intact": true,
+        "r2_ok": true,
+        "batched_best_us": 417.90688751129113,
+        "batched_median_us": 418.70518428523366,
+        "batched_iters": 82,
+        "trial_spread_frac": 0.009225017713842494,
+        "serial_best_us": 582.4672989547253,
+        "p_partition": 1,
+        "eff_len_mean": 8704.5,
+        "num_positions": 10240
+      }
+    }
+  },
+  "task2_full_op_grid": [
+    {
+      "ctx": 8192,
+      "bkv_p": 2,
+      "tuple": [
+        2,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 4,
+      "pages_fetched_per_seq": 8,
+      "full_op": {
+        "intercept_us": 18.846256342170438,
+        "slope_us_per_call": 149.8877741618171,
+        "r2": 0.9999886171958758,
+        "points_us": {
+          "1": 168.4420642309955,
+          "2": 319.2057372117886,
+          "3": 468.2176125546296
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 168.8565501347691,
+        "batched_median_us": 169.80315400224154,
+        "batched_iters": 147,
+        "trial_spread_frac": 0.011515599051279898,
+        "serial_best_us": 329.39109951257706
+      }
+    },
+    {
+      "ctx": 8192,
+      "bkv_p": 3,
+      "tuple": [
+        3,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 9,
+      "full_op": {
+        "intercept_us": 9.694977920373843,
+        "slope_us_per_call": 153.96782839349635,
+        "r2": 0.999456118560093,
+        "points_us": {
+          "1": 165.73647615210763,
+          "2": 313.4832950308919,
+          "3": 473.67213293910027
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 165.76383883754414,
+        "batched_median_us": 167.6586860169967,
+        "batched_iters": 150,
+        "trial_spread_frac": 0.023278292659768055,
+        "serial_best_us": 329.2979672551155
+      }
+    },
+    {
+      "ctx": 8192,
+      "bkv_p": 4,
+      "tuple": [
+        4,
+        2,
+        2
+      ],
+      "num_sublanes_total": 96,
+      "num_positions": 12288,
+      "like_for_like_with_bkvp2": false,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 8,
+      "full_op": {
+        "intercept_us": 9.456144781453087,
+        "slope_us_per_call": 142.48738935330536,
+        "r2": 0.9993627327437979,
+        "points_us": {
+          "1": 154.02090974856873,
+          "2": 290.2761722604434,
+          "3": 438.99568845517933
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 154.073458285101,
+        "batched_median_us": 155.24842385803498,
+        "batched_iters": 155,
+        "trial_spread_frac": 0.013828557598821622,
+        "serial_best_us": 315.5609592795372
+      }
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 2,
+      "tuple": [
+        2,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 5,
+      "pages_fetched_per_seq": 10,
+      "full_op": {
+        "intercept_us": 18.00231279606581,
+        "slope_us_per_call": 171.20855317698965,
+        "r2": 0.9999972443409308,
+        "points_us": {
+          "1": 189.04677746321659,
+          "2": 360.74759616972284,
+          "3": 531.4638838171959
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 189.79608675168043,
+        "batched_median_us": 190.74742601293585,
+        "batched_iters": 138,
+        "trial_spread_frac": 0.009815297072848459,
+        "serial_best_us": 358.05581137537956
+      }
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 3,
+      "tuple": [
+        3,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 9,
+      "full_op": {
+        "intercept_us": 10.264597322891733,
+        "slope_us_per_call": 155.0092601656229,
+        "r2": 0.9994222128044221,
+        "points_us": {
+          "1": 167.4256801348308,
+          "2": 315.97947236150503,
+          "3": 477.4442004660765
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 167.78500686431755,
+        "batched_median_us": 168.5239149835603,
+        "batched_iters": 145,
+        "trial_spread_frac": 0.012991256170166257,
+        "serial_best_us": 327.8539516031742
+      }
+    },
+    {
+      "ctx": 8704,
+      "bkv_p": 4,
+      "tuple": [
+        4,
+        2,
+        2
+      ],
+      "num_sublanes_total": 96,
+      "num_positions": 12288,
+      "like_for_like_with_bkvp2": false,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 12,
+      "full_op": {
+        "intercept_us": 10.041831763639664,
+        "slope_us_per_call": 177.23927445743848,
+        "r2": 0.9995321724915487,
+        "points_us": {
+          "1": 189.4949339604115,
+          "2": 360.0927251998497,
+          "3": 543.9734828752884
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 189.5530218327487,
+        "batched_median_us": 190.65357261785755,
+        "batched_iters": 135,
+        "trial_spread_frac": 0.013527650314160863,
+        "serial_best_us": 360.3678196668625
+      }
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 2,
+      "tuple": [
+        2,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 5,
+      "pages_fetched_per_seq": 10,
+      "full_op": {
+        "intercept_us": 19.21913589184652,
+        "slope_us_per_call": 171.90533033343073,
+        "r2": 0.9999990967475939,
+        "points_us": {
+          "1": 191.03013977840328,
+          "2": 363.218449452456,
+          "3": 534.8408004452646
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 190.88842015227547,
+        "batched_median_us": 191.91383330178434,
+        "batched_iters": 138,
+        "trial_spread_frac": 0.011508281190696005,
+        "serial_best_us": 358.817633241415
+      }
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 3,
+      "tuple": [
+        3,
+        2,
+        2
+      ],
+      "num_sublanes_total": 80,
+      "num_positions": 10240,
+      "like_for_like_with_bkvp2": true,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 9,
+      "full_op": {
+        "intercept_us": 10.000968679554326,
+        "slope_us_per_call": 156.3248253788586,
+        "r2": 0.9994530129617999,
+        "points_us": {
+          "1": 168.4372141587396,
+          "2": 318.42777923661833,
+          "3": 481.0868649164567
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 168.9624555152038,
+        "batched_median_us": 170.30978382661422,
+        "batched_iters": 145,
+        "trial_spread_frac": 0.010521493831985848,
+        "serial_best_us": 337.67102286219597
+      }
+    },
+    {
+      "ctx": 9216,
+      "bkv_p": 4,
+      "tuple": [
+        4,
+        2,
+        2
+      ],
+      "num_sublanes_total": 96,
+      "num_positions": 12288,
+      "like_for_like_with_bkvp2": false,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 12,
+      "full_op": {
+        "intercept_us": 10.231277295158396,
+        "slope_us_per_call": 178.337152320386,
+        "r2": 0.99955545292155,
+        "points_us": {
+          "1": 190.73981361893507,
+          "2": 362.5628139291491,
+          "3": 547.4141182597069
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true,
+        "batched_best_us": 191.04466842049186,
+        "batched_median_us": 191.85006043271105,
+        "batched_iters": 136,
+        "trial_spread_frac": 0.009305187581185153,
+        "serial_best_us": 362.7440892159939
+      }
+    }
+  ],
+  "task2_stage_a_grid": [
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8192,
+      "bkv_p": 2,
+      "sublanes_written": 64,
+      "chain": {
+        "intercept_us": 7.846709964278574,
+        "slope_us_per_call": 90.23752457723418,
+        "r2": 0.9999996364776516,
+        "points_us": {
+          "1": 98.1156462951312,
+          "2": 188.2589356115101,
+          "3": 278.5906954495995
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8192,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 7.925423662228974,
+        "slope_us_per_call": 87.65794752564817,
+        "r2": 0.9999937921853757,
+        "points_us": {
+          "1": 95.45727516524494,
+          "2": 183.4935107587898,
+          "3": 270.7731702165412
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8192,
+      "bkv_p": 4,
+      "sublanes_written": 64,
+      "chain": {
+        "intercept_us": 7.858100473879483,
+        "slope_us_per_call": 75.09481470769414,
+        "r2": 0.9999994997981385,
+        "points_us": {
+          "1": 82.92225165626942,
+          "2": 158.10905693987615,
+          "3": 233.11188107165765
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8704,
+      "bkv_p": 2,
+      "sublanes_written": 80,
+      "chain": {
+        "intercept_us": 8.200505557420533,
+        "slope_us_per_call": 109.87081665520196,
+        "r2": 0.999999581578183,
+        "points_us": {
+          "1": 118.1123548069562,
+          "2": 227.86007367915684,
+          "3": 337.8539881173601
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8704,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 8.41326681433844,
+        "slope_us_per_call": 87.4694598784483,
+        "r2": 0.9999996568378948,
+        "points_us": {
+          "1": 95.85314346526667,
+          "2": 183.4113530262753,
+          "3": 270.7920632221632
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 8704,
+      "bkv_p": 4,
+      "sublanes_written": 96,
+      "chain": {
+        "intercept_us": 8.88299506862996,
+        "slope_us_per_call": 108.49075632780254,
+        "r2": 0.9999997444039427,
+        "points_us": {
+          "1": 117.34208422740535,
+          "2": 225.92784206228933,
+          "3": 334.32359688301034
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 9216,
+      "bkv_p": 2,
+      "sublanes_written": 80,
+      "chain": {
+        "intercept_us": 8.848322072250868,
+        "slope_us_per_call": 109.58087757519982,
+        "r2": 0.9999972507398538,
+        "points_us": {
+          "1": 118.53410138024225,
+          "2": 227.80027375706743,
+          "3": 337.6958565306418
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 9216,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 8.898037841332549,
+        "slope_us_per_call": 87.33647758212273,
+        "r2": 0.9999788998138349,
+        "points_us": {
+          "1": 96.00289184324846,
+          "2": 184.03424016599143,
+          "3": 270.67584700749387
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 96,
+      "ctx": 9216,
+      "bkv_p": 4,
+      "sublanes_written": 96,
+      "chain": {
+        "intercept_us": 8.072639187177849,
+        "slope_us_per_call": 108.77679355255918,
+        "r2": 0.9999912825568843,
+        "points_us": {
+          "1": 116.66400612077929,
+          "2": 225.99707953021172,
+          "3": 334.2175932258976
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 8192,
+      "bkv_p": 2,
+      "sublanes_written": 64,
+      "chain": {
+        "intercept_us": 7.572582046238139,
+        "slope_us_per_call": 90.2754976224521,
+        "r2": 0.9999762924564626,
+        "points_us": {
+          "1": 97.59429949506415,
+          "2": 188.6311376383945,
+          "3": 278.1452947399683
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 8192,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 8.355800341305184,
+        "slope_us_per_call": 87.46528445797283,
+        "r2": 0.999984959711712,
+        "points_us": {
+          "1": 95.6252425303919,
+          "2": 183.67805379502317,
+          "3": 270.5558114463375
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 8192,
+      "bkv_p": 4,
+      "sublanes_written": 64,
+      "chain": {
+        "intercept_us": 7.224546538975013,
+        "slope_us_per_call": 75.3789861973217,
+        "r2": 0.9999934897338593,
+        "points_us": {
+          "1": 82.49248992459675,
+          "2": 158.2046045570184,
+          "3": 233.2504623192401
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 8704,
+      "bkv_p": 2,
+      "sublanes_written": 80,
+      "chain": {
+        "intercept_us": 8.378847923418594,
+        "slope_us_per_call": 109.60368550252095,
+        "r2": 0.999997665587193,
+        "points_us": {
+          "1": 118.07921726037475,
+          "2": 227.39285125959017,
+          "3": 337.2865882654165
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 8704,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 7.396785455615847,
+        "slope_us_per_call": 87.76998464034348,
+        "r2": 0.9999812751480543,
+        "points_us": {
+          "1": 94.9474902803539,
+          "2": 183.3753143675136,
+          "3": 270.48745956104085
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 9216,
+      "bkv_p": 2,
+      "sublanes_written": 80,
+      "chain": {
+        "intercept_us": 8.161055028226604,
+        "slope_us_per_call": 109.64831697800838,
+        "r2": 0.9999978785374193,
+        "points_us": {
+          "1": 117.90157807183404,
+          "2": 227.27327685304513,
+          "3": 337.1982120278508
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "num_sublanes_total": 80,
+      "ctx": 9216,
+      "bkv_p": 3,
+      "sublanes_written": 72,
+      "chain": {
+        "intercept_us": 8.422166488950058,
+        "slope_us_per_call": 87.38867418535659,
+        "r2": 0.9999831295048562,
+        "points_us": {
+          "1": 95.6036061535229,
+          "2": 183.6139839012306,
+          "3": 270.380954524236
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    }
+  ]
+}

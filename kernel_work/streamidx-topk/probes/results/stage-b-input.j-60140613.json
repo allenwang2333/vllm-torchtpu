@@ -1,0 +1,142 @@
+{
+  "modules": {
+    "streamindex_topk.py": "1e221f10cbf3573aa0d2ae78c3463532",
+    "sparsecore_topk.py": "8bc9e25b8701a53a97704564b9fbc658",
+    "bench_streamidx_topk.py": "e8e492d13e59c4a1675cc7a98c5a0813",
+    "_stage_a.py": "eea6a51bb40a2bbf7cf5b39571753b62"
+  },
+  "arms": {
+    "decode_synthetic": {
+      "phase": "decode",
+      "shape": "prod_decode_b64_ctx8704",
+      "scores_shape": [
+        64,
+        10240
+      ],
+      "dtype": "float32",
+      "row_length_mean": 8704.0,
+      "row_length_min": 8704,
+      "row_length_max": 8704,
+      "p_partition": 1,
+      "score_distribution": {
+        "n_finite": 557056,
+        "n_neg_inf": 98304,
+        "mean": 0.0011072740890085697,
+        "std": 1.0008145570755005,
+        "min": -4.733631610870361,
+        "max": 4.577361106872559,
+        "n_distinct_sample": 197624
+      },
+      "intercept_us": 20.16862921383227,
+      "slope_us_per_call": 28.806691350290965,
+      "r2": 0.9999808752803703,
+      "points_us": {
+        "1": 48.901237014140335,
+        "2": 77.77991229939518,
+        "3": 106.81515314469212,
+        "4": 135.24512790001123
+      },
+      "batched_best_us": 48.882351956398196,
+      "batched_iters": 233
+    },
+    "decode_real": {
+      "phase": "decode",
+      "shape": "prod_decode_b64_ctx8704",
+      "scores_shape": [
+        64,
+        10240
+      ],
+      "dtype": "float32",
+      "row_length_mean": 8704.0,
+      "row_length_min": 8704,
+      "row_length_max": 8704,
+      "p_partition": 1,
+      "score_distribution": {
+        "n_finite": 557056,
+        "n_neg_inf": 98304,
+        "mean": 243.9837188720703,
+        "std": 74.1186294555664,
+        "min": 23.655029296875,
+        "max": 698.84619140625,
+        "n_distinct_sample": 197692
+      },
+      "intercept_us": 20.386654502825852,
+      "slope_us_per_call": 35.388976305950365,
+      "r2": 0.9999311709555904,
+      "points_us": {
+        "1": 55.535941836868574,
+        "2": 91.68399542215325,
+        "3": 126.23387372154676,
+        "4": 161.98257009023862
+      },
+      "batched_best_us": 55.6178213044153,
+      "batched_iters": 246
+    },
+    "prefill_synthetic": {
+      "phase": "prefill",
+      "shape": "prod_prefill_q1024_ctx9216",
+      "scores_shape": [
+        1024,
+        10240
+      ],
+      "dtype": "float32",
+      "row_length_mean": 8704.5,
+      "row_length_min": 8193,
+      "row_length_max": 9216,
+      "p_partition": 1,
+      "score_distribution": {
+        "n_finite": 8913408,
+        "n_neg_inf": 1572352,
+        "mean": 5.4064305004430935e-05,
+        "std": 0.9996514320373535,
+        "min": -5.124691963195801,
+        "max": 5.220112323760986,
+        "n_distinct_sample": 197585
+      },
+      "intercept_us": 81.81703931902344,
+      "slope_us_per_call": 335.8857552373179,
+      "r2": 0.9999967649131717,
+      "points_us": {
+        "1": 417.9508945740321,
+        "2": 753.7773212874836,
+        "3": 1088.3524619902557,
+        "4": 1426.0450317975015
+      },
+      "batched_best_us": 417.8888574686079,
+      "batched_iters": 84
+    },
+    "prefill_real": {
+      "phase": "prefill",
+      "shape": "prod_prefill_q1024_ctx9216",
+      "scores_shape": [
+        1024,
+        10240
+      ],
+      "dtype": "float32",
+      "row_length_mean": 8704.5,
+      "row_length_min": 8193,
+      "row_length_max": 9216,
+      "p_partition": 1,
+      "score_distribution": {
+        "n_finite": 8913408,
+        "n_neg_inf": 1572352,
+        "mean": 244.0544891357422,
+        "std": 72.84868621826172,
+        "min": 9.28369140625,
+        "max": 759.7554931640625,
+        "n_distinct_sample": 197603
+      },
+      "intercept_us": 81.42141425522654,
+      "slope_us_per_call": 442.561641182442,
+      "r2": 0.9999997088575119,
+      "points_us": {
+        "1": 524.1165004138435,
+        "2": 966.5607453085655,
+        "3": 1408.6739054971163,
+        "4": 1851.9509176257998
+      },
+      "batched_best_us": 524.5768878294128,
+      "batched_iters": 71
+    }
+  }
+}

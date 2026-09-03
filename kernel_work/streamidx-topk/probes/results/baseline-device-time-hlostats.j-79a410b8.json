@@ -1,0 +1,952 @@
+{
+  "dec_ctx8192_bkvp2": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 149.69949574,
+      "SparseCore": 29.69779098
+    },
+    "tensorcore_total_us": 149.69949574,
+    "buckets_us": {
+      "stage_a": 92.06648266,
+      "stage_b_on_tc": 30.52943556,
+      "residual": 27.103577520000005
+    },
+    "partition_residual_us": 0.0,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.2.scores_in_hbm_ref",
+          90.23262906
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.3.scores_in_hbm_ref",
+          0.92749104
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.90636256
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          30.39687872
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09608612000000001
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.027035
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00943572
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.59061338
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.4810085199999996
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.6549820199999998
+        ],
+        [
+          "fusion.13",
+          1.3977432200000002
+        ],
+        [
+          "reduce_max.7",
+          1.3431213
+        ],
+        [
+          "slice.11",
+          1.25635048
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.24062418
+        ],
+        [
+          "pad_add_fusion",
+          1.21291704
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          29.69166874
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.00612224
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8192_bkvp2/plugins/profile/2026_09_03_00_51_18/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx8192_bkvp3": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 147.03574996000003,
+      "SparseCore": 29.707466800000002
+    },
+    "tensorcore_total_us": 147.03574996000003,
+    "buckets_us": {
+      "stage_a": 89.37349329999999,
+      "stage_b_on_tc": 30.52753886,
+      "residual": 27.1347178
+    },
+    "partition_residual_us": -2.842170943040401e-14,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.2.scores_in_hbm_ref",
+          87.57210078
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.3.scores_in_hbm_ref",
+          0.9011043999999999
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.90028812
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          30.39536608
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09613408
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.02677102
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00926768
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.65094932
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.4799039800000005
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.65467004
+        ],
+        [
+          "fusion.13",
+          1.3930133
+        ],
+        [
+          "reduce_max.7",
+          1.2953900999999999
+        ],
+        [
+          "slice.11",
+          1.25872742
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.24713078
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.21541432
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          29.7015126
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.0059542
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8192_bkvp3/plugins/profile/2026_09_03_00_51_24/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx8192_bkvp4": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 135.15728697999998,
+      "SparseCore": 29.89951956
+    },
+    "tensorcore_total_us": 135.15728697999998,
+    "buckets_us": {
+      "stage_a": 76.85939977999999,
+      "stage_b_on_tc": 30.68669866,
+      "residual": 27.611188539999997
+    },
+    "partition_residual_us": 0.0,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.2.scores_in_hbm_ref",
+          75.03246098
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.91831934
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.3.scores_in_hbm_ref",
+          0.90861946
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-done",
+          30.554405820000003
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.09611008
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.026843
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.00933976
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.56967664
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.75186078
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          2.00064826
+        ],
+        [
+          "fusion.13",
+          1.39462202
+        ],
+        [
+          "reduce_max.7",
+          1.29171672
+        ],
+        [
+          "slice.11",
+          1.2617287
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.23493386
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.21805534
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-done",
+          29.8933493
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-start",
+          0.0061702599999999995
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8192_bkvp4/plugins/profile/2026_09_03_00_51_30/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx8704_bkvp2": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 170.57879945,
+      "SparseCore": 30.92650643
+    },
+    "tensorcore_total_us": 170.57879945,
+    "buckets_us": {
+      "stage_a": 111.70750307,
+      "stage_b_on_tc": 31.730852119999998,
+      "residual": 27.14044426
+    },
+    "partition_residual_us": 0.0,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.2.scores_in_hbm_ref",
+          109.88984395
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.3.scores_in_hbm_ref",
+          0.90948384
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.9081752799999999
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          31.59836734
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09608609
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.02707103
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00932766
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.62717973
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.46771911
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.6549100300000001
+        ],
+        [
+          "fusion.13",
+          1.3903963
+        ],
+        [
+          "reduce_max.7",
+          1.35326523
+        ],
+        [
+          "slice.11",
+          1.25835527
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.23627853
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.21379372
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          30.92044417
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.006062260000000001
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8704_bkvp2/plugins/profile/2026_09_03_00_51_08/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx8704_bkvp3": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 148.1661222999999,
+      "SparseCore": 30.92535398
+    },
+    "tensorcore_total_us": 148.1661222999999,
+    "buckets_us": {
+      "stage_a": 89.48857154,
+      "stage_b_on_tc": 31.714141480000002,
+      "residual": 26.963409279999997
+    },
+    "partition_residual_us": 8.526512829121202e-14,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.2.scores_in_hbm_ref",
+          87.6659305
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.3.scores_in_hbm_ref",
+          0.9117647200000001
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.91087632
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          31.581848660000002
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09613412
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.02689098
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00926772
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.52516284
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.47675878
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.6545979199999998
+        ],
+        [
+          "fusion.13",
+          1.40300132
+        ],
+        [
+          "reduce_max.7",
+          1.2783672799999999
+        ],
+        [
+          "slice.11",
+          1.26033606
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.23068418
+        ],
+        [
+          "pad_add_fusion",
+          1.2171667800000001
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          30.91908762
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.0062663599999999995
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8704_bkvp3/plugins/profile/2026_09_03_00_51_33/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx8704_bkvp4": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 170.11342127999995,
+      "SparseCore": 31.04734684
+    },
+    "tensorcore_total_us": 170.11342127999995,
+    "buckets_us": {
+      "stage_a": 110.69282118,
+      "stage_b_on_tc": 31.84540202,
+      "residual": 27.57519808
+    },
+    "partition_residual_us": 5.684341886080802e-14,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.2.scores_in_hbm_ref",
+          108.88681874
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.9198319600000001
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.3.scores_in_hbm_ref",
+          0.88617048
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-done",
+          31.71318128
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.09611008
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.02677096
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.0093397
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.55613582
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.76849934
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.9997839
+        ],
+        [
+          "fusion.13",
+          1.3992798
+        ],
+        [
+          "slice.11",
+          1.26343324
+        ],
+        [
+          "reduce_max.7",
+          1.2591837
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.23445364
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.20854758
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-done",
+          31.04122456
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-start",
+          0.00612228
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx8704_bkvp4/plugins/profile/2026_09_03_00_51_37/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx9216_bkvp2": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 171.51992783999995,
+      "SparseCore": 32.162496780000005
+    },
+    "tensorcore_total_us": 171.51992783999995,
+    "buckets_us": {
+      "stage_a": 111.67159662000002,
+      "stage_b_on_tc": 32.905281880000004,
+      "residual": 26.943049339999998
+    },
+    "partition_residual_us": 5.684341886080802e-14,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.2.scores_in_hbm_ref",
+          109.85171668000001
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.91246094
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.3.scores_in_hbm_ref",
+          0.907419
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          32.77282108
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09608608
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.02684294
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00953178
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.5344548
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.4809364
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.65474196
+        ],
+        [
+          "fusion.13",
+          1.39779118
+        ],
+        [
+          "reduce_max.7",
+          1.30132048
+        ],
+        [
+          "slice.11",
+          1.25589424
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.23085232
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.2191838
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          32.1564946
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.00600218
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx9216_bkvp2/plugins/profile/2026_09_03_00_51_40/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx9216_bkvp3": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 149.39286918,
+      "SparseCore": 32.16132042
+    },
+    "tensorcore_total_us": 149.39286918,
+    "buckets_us": {
+      "stage_a": 89.45800732000001,
+      "stage_b_on_tc": 32.9223768,
+      "residual": 27.012485060000003
+    },
+    "partition_residual_us": 2.842170943040401e-14,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.2.scores_in_hbm_ref",
+          87.64717892
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_3.3.scores_in_hbm_ref",
+          0.90643462
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.90439378
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-done",
+          32.79034816
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.09618212
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.02674696
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.3.cloned.1.call-start",
+          0.00909956
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.54504312
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.4724609600000003
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          1.65469396
+        ],
+        [
+          "fusion.13",
+          1.39570236
+        ],
+        [
+          "reduce_max.7",
+          1.3509483800000002
+        ],
+        [
+          "slice.11",
+          1.25445374
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.24139252
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.21985608
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-done",
+          32.15524612
+        ],
+        [
+          "sc_topk_direct_b64_n10240_k2048.5.cloned.1.call-start",
+          0.0060743
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx9216_bkvp3/plugins/profile/2026_09_03_00_51_43/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "dec_ctx9216_bkvp4": {
+    "rows_total": 42,
+    "rows_kept": 42,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 171.26117642,
+      "SparseCore": 32.3715965
+    },
+    "tensorcore_total_us": 171.26117642,
+    "buckets_us": {
+      "stage_a": 110.59474193999999,
+      "stage_b_on_tc": 33.0438414,
+      "residual": 27.622593079999998
+    },
+    "partition_residual_us": 0.0,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.2.scores_in_hbm_ref",
+          108.79126056
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_4.3.scores_in_hbm_ref",
+          0.90237694
+        ],
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          0.90110444
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-done",
+          32.9114526
+        ],
+        [
+          "prepare_start_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.09606208000000001
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.02696298
+        ],
+        [
+          "prepare_done_sc_topk_direct_b64_n12288_k2048.3.cloned.1.call-start",
+          0.00936374
+        ]
+      ],
+      "residual": [
+        [
+          "cond.5.clone",
+          6.54208984
+        ],
+        [
+          "bitcast_convert_type.3",
+          3.76607438
+        ],
+        [
+          "broadcast.13.scores_in_hbm_ref",
+          2.00012006
+        ],
+        [
+          "fusion.13",
+          1.39519824
+        ],
+        [
+          "reduce_max.7",
+          1.35534216
+        ],
+        [
+          "slice.11",
+          1.2622808
+        ],
+        [
+          "slice.start_end_seq_idx_ref",
+          1.22967588
+        ],
+        [
+          "iota_compare_fusion.1",
+          1.21476604
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-done",
+          32.36549826
+        ],
+        [
+          "sc_topk_direct_b64_n12288_k2048.5.cloned.1.call-start",
+          0.00609824
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/dec_ctx9216_bkvp4/plugins/profile/2026_09_03_00_51_46/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  },
+  "pre_q1024_ctx9216": {
+    "rows_total": 27,
+    "rows_kept": 27,
+    "rows_complete": true,
+    "plane_totals_us": {
+      "TensorCore": 749.5376349200001,
+      "SparseCore": 430.83619422
+    },
+    "tensorcore_total_us": 749.5376349200001,
+    "buckets_us": {
+      "stage_a": 249.29989204000003,
+      "stage_b_on_tc": 431.15266498000005,
+      "residual": 69.0850779
+    },
+    "partition_residual_us": 0.0,
+    "top_rows": {
+      "stage_a": [
+        [
+          "StreamIdxTC-m-bq_128-bkvp_2.1",
+          246.24286918
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.2.scores_in_hbm_ref",
+          1.6188715
+        ],
+        [
+          "StreamIdxTC-d-bq_1-bkvp_2.3.scores_in_hbm_ref",
+          1.43815136
+        ]
+      ],
+      "stage_b_on_tc": [
+        [
+          "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          431.02013207000005
+        ],
+        [
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          0.09625419
+        ],
+        [
+          "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          0.02690299
+        ],
+        [
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          0.00937573
+        ]
+      ],
+      "residual": [
+        [
+          "bitcast_convert_type.3",
+          28.288571400000002
+        ],
+        [
+          "broadcast.11.scores_in_hbm_ref",
+          13.75392562
+        ],
+        [
+          "cond.5.clone",
+          6.8715366300000005
+        ],
+        [
+          "reshape.1",
+          6.345846320000001
+        ],
+        [
+          "copy-done",
+          3.1955582399999996
+        ],
+        [
+          "fusion.4",
+          1.77082824
+        ],
+        [
+          "fusion.11",
+          1.34435757
+        ],
+        [
+          "pad_add_fusion",
+          1.33782724
+        ]
+      ],
+      "sparsecore": [
+        [
+          "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          430.83015602
+        ],
+        [
+          "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          0.0060382000000000005
+        ]
+      ]
+    },
+    "xplane": "/home/annyan_google_com/cloud-devkit-data/job-outputs/j-79a410b8-46bc-4d06-862c/outputs/j-79a410b8-46bc-4d06-862c-tpu-job-0/j-79a410b8-46bc-4d06-862c-tpu-job-0-0-hngz4/command-container/bdt/trace/pre_q1024_ctx9216/plugins/profile/2026_09_03_00_51_14/j-79a410b8-46bc-4d06-862c-tpu-job-0-0.xplane.pb"
+  }
+}
