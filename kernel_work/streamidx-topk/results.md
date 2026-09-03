@@ -1,9 +1,10 @@
 # Step 3 — variants built, measured and ranked
 
-**Status: DRAFT, agents still in flight.** Options C, D, E and candidate 0 are complete and are
-reported in full, as is the recalibrated baseline (§1). **Options A and B are placeholders**, and
-three follow-ups are running: candidate 0's `p=9` sweep and reference check, and Option F (§10.2).
-Do not quote this file as final until this banner is gone.
+**Status: DRAFT — every option is measured; three follow-ups are still running.** Options A, B, C,
+D, E and candidate 0 are all complete and reported in full, as is the recalibrated baseline (§1).
+Outstanding: candidate 0's `p=9` sweep and its reference check, and Option F (§11.2). None of the
+three can change a verdict already recorded here; the sweep can *revive* Option A (§7) and close
+candidate 0's `provisional`. Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
 the GLM-5.2 DSA lightning indexer, on TPU7x. Baseline branch `annyan/streamidx-topk-opt`, incumbent
@@ -109,7 +110,7 @@ reason decode is the better target, and it is not the reason the earlier documen
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
 | **A** — 128-byte K record | halves the K record so half the bytes move | **FAILS its gate at every shippable `bkv_p`** — rank 4. But it is *complementary* to candidate 0, not competing: revisit iff `bkv_p` lands above ≈5 | §7 |
-| **B** — two-unit pipeline | | `in flight` — Flip 3 can retire it outright | |
+| **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill +16.4/+24.4%. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
 
 ---
 
@@ -323,7 +324,81 @@ and the `affine` arms were re-measured.
 
 ---
 
-## 8. Stage B is issue-bound, not output-DMA-bound
+## 8. Option B — the two-unit pipeline: passes its gate by 5–12×, and should still not be built
+
+Full write-up: `variants/option-b-pipeline/RESULTS.md`. Correctness job
+**`j-562532b4-8705-4ad2-945f`**, 4/4 shards `rc=0`, `20 passed, 14 warnings` on all three suite
+shards; gate job **`j-c397124b-3d9c-476b-a03e`**.
+
+**`overlap` = `hidden / ideal`**, where `hidden = (t_a + t_b) − t_pipe` at that chunk count `G`,
+and `ideal = min(t_a, t_b)/G × (G−1)` — the most a perfect pipeline could hide. All chain-slope
+device times, every fit r² ≥ 0.99981.
+
+| phase | G | t_a | t_b | t_pipe | **overlap** | vs G=1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| decode | 2 | 120.34 | 44.11 | 142.80 | **98.2%** | **+4.67%** |
+| decode | 4 | 133.27 | 85.85 | 157.43 | 95.8% | −5.09% |
+| prefill | 2 | 272.99 | 449.28 | 608.34 | **83.5%** | **+16.40%** |
+| prefill | 4 | 288.09 | 466.34 | 549.84 | **94.7%** | **+24.44%** |
+
+**PASS on both phases, against bars of 20% decode / 7% prefill — by ~5× and ~12×.** TensorCore and
+SparseCore genuinely overlap; P3's 41.6% is exceeded at every `G`. The design's own worry, that XLA
+would serialize chunk *g*'s stage B against chunk *g+1*'s stage A, does not materialize: chunks own
+disjoint buffers and the scheduler exploits that.
+
+The overlap was verified **structurally, not just from the times**. The scheduled HLO for all six
+(phase, G) programs passes four checks, including that the operand path from stage B back to stage A
+is `['bitcast', 'bitcast-convert']` **and nothing else** — stage B literally reads stage A's buffer,
+so there is no arithmetic that could be constant-folded. Stage-A kernels in flight per stage-B async
+window go `[0,0]` at G=1, `[1,0,1,0]` at G=2, `[3,2,1,0,…]` at G=4, matching `hidden ≈ 0` at G=1
+and near-ideal above it.
+
+### Why it should still not be built here
+
+**The production prefill shape is one sequence of 1024 tokens, and it cannot be split.** Stage A's
+grid is over *sequences* and its masking is driven by `cu_q_lens`, so a chunk boundary must fall on
+a sequence boundary. The prefill numbers above were obtained by presenting that single chunk as `G`
+**pseudo-sequences** — semantics-preserving, and measured honestly, but it is a change to **how the
+runner packs the batch**, not a kernel-local change. B's entire prize sits behind modifying
+`mla_attention_op.py`'s caller and the scheduler's packing.
+
+That puts B outside this exercise: it is not a kernel change, so it belongs to `/preflight-check`
+and an end-to-end benchmark rather than to a Pallas variant. **Recorded as a live runner-level
+candidate with a measured prize of +16–24% on the op**, which is a good position for it to be in —
+it is the largest prefill number in this document and the only one that is not a kernel edit.
+
+Three further arguments, all the agent's own:
+
+- **The chunk plan is data, and vLLM calls this op under `jax.jit`** where `cu_q_lens` and
+  `distribution` are traced, so the runner must pass the plan down as static metadata.
+- **Decode's +4.67% is inside the ±8.5% end-to-end spread**, and `t_a` there counts one stage-A
+  launch per chunk against the incumbent's three — ~23 µs unaccounted at decode G=4, which makes
+  decode *worse*, not better. Decode is a wash.
+- **Decode G=4 is blocked by the 32-row wave quantum, not by the partition cliff it was blamed on.**
+  Forcing `p=1` does remove that cliff — stage B goes 203.44 → 85.85 µs, the pipeline
+  −92.36% → −5.09% — so the gathers were binding and *are* removable. But per-chunk stage B is
+  22.06 µs at b=32 and 21.46 µs at b=16: halving the rows buys 2.7%, so `t_b` simply doubles.
+  **G ≤ num_tokens/32, i.e. G ≤ 2 at batch 64.**
+
+### Two process notes worth keeping
+
+An **in-job checker initially reported `every_B_depends_on_an_A=False`** — a false negative that
+would have killed Option B for the wrong reason. It searched for stage B as a `custom-call`, but the
+SparseCore top-k compiles to `call-start`/`call-done` into an `async_execution_thread="sparsecore"`
+computation. Both the error and the fix are on the record.
+
+The `_pick_partition` tripwire was **self-tested on hardware** rather than assumed live:
+`tripwire self-test: PASS -- tripwire fired on a deliberate sparsecore_topk call`. It never fired on
+any chunked path. An assertion nobody has proven can fire is not evidence, and this one was proven.
+
+**Honest limit, printed by the harness itself:** the suite arms route 19 of 23 traces through
+Option B's single-group path, so they prove *transparency at G=1*, not chunking — every case in that
+file has 1–3 sequences. The chunking evidence is the six shapes in shard 0, where index sets match
+the unmodified incumbent at every `G` and cross-`G` (`G1_vs_G2`, `G2_vs_G4`, all `True`).
+
+---
+
+## 9. Stage B is issue-bound, not output-DMA-bound
 
 `probes/stage-b-ksweep.md`. A 16× change in `k` moves total time **6.0%**, and `k=4096` is the
 fastest point — an output-DMA model predicts 5,176 µs against 316 observed. Length-bounding the
@@ -343,27 +418,31 @@ not 1.02.
 
 ---
 
-## 9. Open items
+## 10. Open items
 
 1. ~~Option C's `num_bkv` sweep~~ — **DONE, C is safe on prefill at every `num_bkv`** (§3.1).
-2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§10).
-3. **Option F — bf16 operands for stage A** (§10.2). Dispatched. Falls directly out of the accuracy
+2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§11).
+3. **Option F — bf16 operands for stage A** (§11.2). Dispatched. Falls directly out of the accuracy
    work, and may be the decode-side option C cannot be.
-4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched. The sweep decides
-   whether this is a constant to change or a function to write, and it is worth up to −39%
-   (`modelled`) rather than the −9.46% measured.
-4. **Options A and B** — in flight.
-5. **Decode stage B, real scores: chain slope +11.5% over `hlo_stats`** (3.7 µs). Named by the
+4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched, and the sweep now
+   decides **two** options: whether candidate 0 is a constant to change or a function to write
+   (worth up to −39%, `modelled`), and whether Option A revives (§7). R1's VMEM warning at
+   `bkv_p=6` is the thing most likely to end both.
+5. ~~Options A and B~~ — **DONE** (§7, §8).
+6. **Option B belongs to the runner, and nobody owns it.** +16.4/+24.4% on prefill, measured, and
+   it needs the scheduler to pack the batch into chunks and pass the plan down as static metadata.
+   Route to `/preflight-check` and an end-to-end benchmark, not to a Pallas variant.
+7. **Decode stage B, real scores: chain slope +11.5% over `hlo_stats`** (3.7 µs). Named by the
    measuring agent and not explained. Small, but it is the one like-for-like comparison of seven
    that did not close inside 2.6%.
-6. **`references/hardware-facts.md` has four claims this exercise showed to be wrong**, and it has
+8. **`references/hardware-facts.md` has four claims this exercise showed to be wrong**, and it has
    no measured SparseCore fact at all — which is the direct cause of the prefill gate being
    undecidable in §1. Whether to amend it is a question for the caller; it has been asked and not
    answered.
 
 ---
 
-## 10. The incumbent is correct at the top-k boundary, and the gate that said otherwise is the wrong gate
+## 11. The incumbent is correct at the top-k boundary, and the gate that said otherwise is the wrong gate
 
 Job `j-5d02a60e-2266-477c-82d6`, three seeds. The probe spies on the module-global
 `sparsecore_topk` inside a trace of the **shipping** `streamindex_topk.__wrapped__`, so it compares
@@ -388,7 +467,7 @@ scoring noise — so which of two effectively-tied items returns is arbitrary. *
 agreement against the incumbent is the right statistic**, and it is what every option in this
 document was judged by.
 
-### 10.1 Why stage A's scores carry bf16-scale error — closed, with a citation
+### 11.1 Why stage A's scores carry bf16-scale error — closed, with a citation
 
 The probe found stage A's score error to be 7.4e-04 relative median / 6.3e-03 max: roughly 10⁴×
 what f32 accumulation over 32 heads should give, on a path that reads f32 throughout
@@ -410,14 +489,14 @@ accumulator, not the input precision**; without a named `precision` the MXU disc
 before it sees the operands. The measured 7.4e-04 / 6.3e-03 straddles that 2.2e-03 characteristic
 error. `HIGHEST` would buy it back at a 4.5× throughput cliff, so this should **not** be "fixed".
 
-### 10.2 It produces a new candidate — Option F, bf16 operands
+### 11.2 It produces a new candidate — Option F, bf16 operands
 
 Stage A moves q and k as f32 and receives bf16 arithmetic for it — what `hardware-facts.md` calls
 "the worst cell in the table: bf16 accuracy at f32 bandwidth." Storing those operands as **bf16**
 gives, per the measured table, an *identical* result distribution while halving the bytes they cross
 HBM with.
 
-The accuracy argument is already discharged by §10: the true boundary gaps (2.5e-04) sit an order of
+The accuracy argument is already discharged by §11: the true boundary gaps (2.5e-04) sit an order of
 magnitude *below* the error the kernel already incurs, so selection there is arbitrary today and
 bf16 operands cannot make it meaningfully more so.
 
