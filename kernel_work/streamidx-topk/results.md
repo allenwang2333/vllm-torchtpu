@@ -110,7 +110,7 @@ reason decode is the better target, and it is not the reason the earlier documen
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent at `bkv_p=9` | one constant, on the shipping kernel | **−14.6% full op / −24.8% stage A at decode, ctx 8704. Correctness verified.** Wrong at short ctx (+38% at 4096), so it wants per-bucket dispatch | §6 |
 | **F** — bf16 operands | *proposed on a false premise* — the operands are already fp8 | **REJECTED, +4.63% prefill / +9.80% decode.** Its by-product closes the block: stage A has no roofline headroom left | §11.2–11.3 |
-| **A** — 128-byte K record | halves the K record so half the bytes move | Failed at `bkv_p` 2–4. **Re-opened**: candidate 0 lands at `bkv_p=9`, above the ≈5 revival threshold. Being measured, not extrapolated | §7 |
+| **A** — 128-byte K record | halves the K record so half the bytes move | **Gate passes at `bkv_p=9` (47.9%) and it does not matter** — 94.3% of the fetch is already hidden, so the bytes buy nothing. Net −15.30 µs vs an 18.64 µs floor. Not recommended | §7.1 |
 | **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill +16.4/+24.4%. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
 
 ---
@@ -379,6 +379,65 @@ and the `affine` arms were re-measured.
 
 ---
 
+### 7.1 Re-measured at `bkv_p=9`: the gate passes, and it does not matter
+
+Job `j-18e51a27-db20-4088-9fb4`, `Succeeded`, serial, unpinned on the whole pod, best-of-9, grid 128.
+
+| `bkv_p` | DMAs in flight | charge ratio | saved |
+| ---: | ---: | ---: | ---: |
+| 6 | 24 | 1.736 | 42.4% |
+| **8** | **32** | 1.888 | **47.0%** |
+| **9** | **36** | 1.921 | **47.9%** |
+
+**The gate passes, and R1's rank-4 verdict is reversed on that criterion.** Floor-corrected the
+ratio is 1.997 against a 1.9845 perfect-proportionality ideal: at 36 DMAs in flight the indirect,
+clamped DMA is **byte-proportional**. The `bkv_p=6` control reproduces R1's 42.7% at 42.4%. Refusing
+to inherit the ≥42.7% extrapolation was right and it was conservative — the measured value helps A.
+
+**And the pass is irrelevant, because the bytes are not what stage A waits on.** At `bkv_p=9`,
+ns/block, floor-corrected:
+
+| mode | incumbent | Option A | delta |
+| --- | ---: | ---: | ---: |
+| compute (no DMA) | 4192.9 | 3219.0 | **−973.9** |
+| fetch (no unpack) | 2656.5 | 1332.7 | −1323.8 |
+| **full** | **4345.0** | **3389.0** | **−956.1 (−22.0%)** |
+
+**94.3% of the incumbent's fetch is already hidden behind compute**, so the composite equals the
+unpack term alone to 1.8% and the byte reduction contributes **+17.8 ns/block — nothing**.
+Corroborated without the decomposition: real stage A at `p=9` runs its K fetch at 1.79e12 B/s
+against the 3.37e12 the same descriptors sustain, i.e. 47% headroom.
+
+**Option A is a relayout win wearing a byte-reduction's clothes**, and the gate above measured the
+half of the change that does not pay. The consumer worry was also backwards: A's unpack is
+**cheaper**, not more expensive.
+
+**Net stake −15.30 µs on the decode call, against a correctly recomputed floor of 18.64 µs** — A
+misses its own −13% target by ~18%, delivering 10.7% of the `p=9` call. (The design's −13/−22% was
+written against the 221.4 µs *wall clock*; at 170.58 µs device the bar is 22.18–37.53 µs, and at the
+143.39 µs `p=9` ship configuration it is 18.64–31.55 µs.) Correctness is **bit-identical** by
+checksum at both `bkv_p` and both A forms.
+
+**The remaining question, and the one thing still running.** A `/critical-review` pass found the
+mechanism attribution wrong-footed: the agent led with "it is the eliminated transpose", but the
+`a_concat` arm builds that operand a completely different way and lands within 0.6%, which points at
+the **halved payload width** instead. That distinction decides everything left:
+
+- **if the 974 ns is the transpose**, a variant captures it **without touching the cache format** —
+  no writer-side scatter, no prefill exposure — and **strictly dominates Option A**;
+- **if it is payload width**, the saving is only reachable through the cache format and A stays as
+  measured.
+
+An `/xprof-llo` static census of the two `compute` arms decides it in minutes. Dispatched.
+
+**Unreproduced, and it is the whole rest of A:** everything measured here is the **reader**.
+Producing layout A needs a changed caller-side scatter in XLA, unmeasured and unproven — and prefill
+stage A is 75.4% issue/VPU with no headroom (§11.3), where 15.30 µs of decode saving is easy to
+erase. Also absent: `start_send_scores`, stage B, and every ctx bucket other than 8704. Status
+`provisional`, `⚠️ unverified`.
+
+---
+
 ## 8. Option B — the two-unit pipeline: passes its gate by 5–12×, and should still not be built
 
 Full write-up: `variants/option-b-pipeline/RESULTS.md`. Correctness job
@@ -480,10 +539,11 @@ not 1.02.
 3. ~~Option F — bf16 operands~~ — **REJECTED, premise was false** (§11.2). Its by-product is the
    more important result: **prefill stage A has no roofline headroom left** — 75.4% issue/VPU,
    which C already attacked, and an infinitely fast score matmul would save ≤5.4% (§11.3).
-4. ~~Candidate 0's `p=9` sweep and reference check~~ — **DONE. `p=9` is −14.6% on the full op and
-   correctness is verified** (§6). It wants per-bucket dispatch, not a fixed constant.
-   **`bkv_p=9` puts Option A back in play** at 36 concurrent page DMAs, far above R1's ≈5 threshold
-   — re-dispatched to measure the charge ratio there rather than extrapolate it (§7).
+4. ~~Candidate 0's `p=9` sweep and reference check~~ — **DONE** (§6).
+5. **The one open thread: is Option A's 974 ns/block the transpose or the payload width?** (§7.1)
+   If the transpose, a variant captures it **without touching the cache format** and strictly
+   dominates A. If payload width, no such variant exists. An `/xprof-llo` static census decides it;
+   dispatched.
 5. ~~Options A and B~~ — **DONE** (§7, §8).
 6. **Option B belongs to the runner, and nobody owns it.** +16.4/+24.4% on prefill, measured, and
    it needs the scheduler to pack the batch into chunks and pass the plan down as static metadata.
