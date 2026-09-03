@@ -181,16 +181,18 @@ spec:
                       export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
                       export TPU_RAIDEN_ADVERTISE_HOST="${VLLM_HOST_IP}"
 
-                      # 1024, not the 4096 launch_dsv4_dp4_dp4.sh compiles for.
+                      # 512, not the 4096 launch_dsv4_dp4_dp4.sh compiles for.
                       # DP attention all-gathers every rank's tokens before the
                       # MoE, so the graph is sized by tokens-per-step times DP,
-                      # and only 94.74 GiB of HBM is free once the weights are
-                      # resident. At DP8 the XLA temporaries came to 114.93 GiB
-                      # for a 4096-token step and 100.96 GiB for a 2048-token
-                      # one, so neither fits. 1024 puts the gathered batch at
-                      # 8192 tokens, which is what the DP4 host compiles today
-                      # and therefore what Tier 1 was verified against.
-                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[1024],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                      # and only about 95 GiB of HBM is free once the weights
+                      # are resident. Measured at DP8, the XLA temporaries came
+                      # to 114.93 GiB for a 4096-token step, 100.96 GiB for
+                      # 2048 and 94.75 GiB for 1024, the last of these missing
+                      # the 94.74 GiB budget by ten megabytes. Halving the
+                      # step buys roughly 6 GiB, so 512 leaves a few GiB of
+                      # margin. The oracle's longest prompt is 2048 tokens and
+                      # arrives as four chunks.
+                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[512],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
 
                       echo "===== Starting DeepSeek-V4 DP8 prefill ====="
@@ -213,10 +215,10 @@ spec:
                           --max-model-len 9216 \
                           --enable-expert-parallel \
                           --disable-custom-all-reduce \
-                          --gpu-memory-utilization 0.92 \
+                          --gpu-memory-utilization 0.95 \
                           --kv-cache-dtype fp8_e4m3 \
                           --language-model-only \
-                          --max-num-batched-tokens 1024 \
+                          --max-num-batched-tokens 512 \
                           --max-num-seqs 8 \
                           --no-disable-hybrid-kv-cache-manager \
                           --attention-backend CUSTOM \
@@ -485,10 +487,10 @@ spec:
                       # launch_dsv4_dp4_dp4.sh and therefore what Tier 1 was
                       # verified against. Decode only ever runs single-token
                       # steps here, because the producer ships the prefix.
-                      # Its --max-num-batched-tokens is 1024 for the same
+                      # Its --max-num-batched-tokens is 512 for the same
                       # reason as prefill: the memory-profiling run compiles
-                      # at that size before any KV cache exists, and at DP8 a
-                      # 2048-token step does not fit in the free HBM.
+                      # at that size before any KV cache exists, and at DP8
+                      # anything larger does not fit in the free HBM.
                       COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[256],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
 
@@ -512,10 +514,10 @@ spec:
                           --max-model-len 9216 \
                           --enable-expert-parallel \
                           --disable-custom-all-reduce \
-                          --gpu-memory-utilization 0.92 \
+                          --gpu-memory-utilization 0.95 \
                           --kv-cache-dtype fp8_e4m3 \
                           --language-model-only \
-                          --max-num-batched-tokens 1024 \
+                          --max-num-batched-tokens 512 \
                           --max-num-seqs 8 \
                           --no-disable-hybrid-kv-cache-manager \
                           --attention-backend CUSTOM \
