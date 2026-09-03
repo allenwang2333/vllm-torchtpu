@@ -1,0 +1,106 @@
+{
+  "phase": "prefill",
+  "reference": "src streamindex_topk, unchunked",
+  "reference_shape": [
+    1024,
+    2048
+  ],
+  "cells": {
+    "incumbent/G1": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_minor/G1": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_minor/G2": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_minor/G4": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_major/G1": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_major/G2": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    },
+    "head_major/G4": {
+      "rows": 1024,
+      "mismatching_rows": 0,
+      "identical": true,
+      "examples": []
+    }
+  },
+  "scores": {
+    "G1": {
+      "bitwise_identical": false,
+      "max_abs_diff": 6.103515625e-05,
+      "n_differing": 36973,
+      "n_elems": 10485760,
+      "inf_pattern_identical": true
+    },
+    "G2": {
+      "bitwise_identical": false,
+      "max_abs_diff": 6.103515625e-05,
+      "n_differing": 36973,
+      "n_elems": 10485760,
+      "inf_pattern_identical": true
+    },
+    "G4": {
+      "bitwise_identical": false,
+      "max_abs_diff": 6.103515625e-05,
+      "n_differing": 36973,
+      "n_elems": 10485760,
+      "inf_pattern_identical": true
+    }
+  },
+  "overall": "PASS",
+  "module_md5s": {
+    "streamindex_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+      "md5": "1e221f10cbf3573aa0d2ae78c3463532"
+    },
+    "sparsecore_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "md5": "8bc9e25b8701a53a97704564b9fbc658"
+    },
+    "_stage_a.py": {
+      "path": "/root/kw/probes/_stage_a.py",
+      "md5": "eea6a51bb40a2bbf7cf5b39571753b62"
+    },
+    "pipeline.py": {
+      "path": "/root/kw/variants/option-b-pipeline/pipeline.py",
+      "md5": "3f783b940d31c340b1e6cfbba9f2803d"
+    },
+    "streamindex_topk_c.py": {
+      "path": "/root/kw/variants/option-c-head-major/streamindex_topk_c.py",
+      "md5": "058800b0b8b8f955ec5e361516cc385c"
+    },
+    "stage_a_c.py": {
+      "path": "/root/kw/variants/option-c-head-major/stage_a_c.py",
+      "md5": "a2bece4d69ce82bb13dd04738a2cbf5f"
+    },
+    "pipeline_c.py": {
+      "path": "/root/kw/variants/bxc/pipeline_c.py",
+      "md5": "91d1c88930c6942ab477729a197a65c2"
+    }
+  }
+}

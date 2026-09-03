@@ -1,0 +1,110 @@
+{
+  "geometry": {
+    "max_model_len": "9216",
+    "page_size": "1024",
+    "kv_packing": "4",
+    "lkv_dim": "256",
+    "h_idx": "32",
+    "d_idx": "128",
+    "k": "2048",
+    "compression_ratio": "1",
+    "bkv_p": "2",
+    "total_pages": "576",
+    "phase": "prefill",
+    "pages_per_seq": "9",
+    "num_sublanes_total": "80",
+    "num_positions": "10240",
+    "num_seqs": "1",
+    "q_len": "1024",
+    "context_len": "9216",
+    "seq_batch_size": "1",
+    "bq_per_block": "128",
+    "static_q_len": "None",
+    "case": "MlaCase.MIXED",
+    "num_tokens": "1024"
+  },
+  "chunks": {
+    "G1": {
+      "tokens_per_chunk": 1024,
+      "num_bq_per_chunk": 8,
+      "num_bkv": 5,
+      "waves_guard": {
+        "b": 1024,
+        "b_pad": 1024,
+        "num_waves": 32,
+        "lhs": 1024,
+        "ok": true
+      },
+      "incumbent_pick_partition": 1,
+      "seq_lens": [
+        9216
+      ]
+    },
+    "G2": {
+      "tokens_per_chunk": 512,
+      "num_bq_per_chunk": 4,
+      "num_bkv": 5,
+      "waves_guard": {
+        "b": 512,
+        "b_pad": 512,
+        "num_waves": 16,
+        "lhs": 512,
+        "ok": true
+      },
+      "incumbent_pick_partition": 1,
+      "seq_lens": [
+        8704,
+        9216
+      ]
+    },
+    "G4": {
+      "tokens_per_chunk": 256,
+      "num_bq_per_chunk": 2,
+      "num_bkv": 5,
+      "waves_guard": {
+        "b": 256,
+        "b_pad": 256,
+        "num_waves": 8,
+        "lhs": 256,
+        "ok": true
+      },
+      "incumbent_pick_partition": 1,
+      "seq_lens": [
+        8448,
+        8704,
+        8960,
+        9216
+      ]
+    }
+  },
+  "module_md5s": {
+    "streamindex_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+      "md5": "1e221f10cbf3573aa0d2ae78c3463532"
+    },
+    "sparsecore_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "md5": "8bc9e25b8701a53a97704564b9fbc658"
+    },
+    "_stage_a.py": {
+      "path": "/root/kw/probes/_stage_a.py",
+      "md5": "eea6a51bb40a2bbf7cf5b39571753b62"
+    },
+    "pipeline.py": {
+      "path": "/root/kw/variants/option-b-pipeline/pipeline.py",
+      "md5": "3f783b940d31c340b1e6cfbba9f2803d"
+    },
+    "streamindex_topk_c.py": {
+      "path": "/root/kw/variants/option-c-head-major/streamindex_topk_c.py",
+      "md5": "058800b0b8b8f955ec5e361516cc385c"
+    },
+    "stage_a_c.py": {
+      "path": "/root/kw/variants/option-c-head-major/stage_a_c.py",
+      "md5": "a2bece4d69ce82bb13dd04738a2cbf5f"
+    },
+    "pipeline_c.py": {
+      "path": "/root/kw/variants/bxc/pipeline_c.py",
+      "md5": "91d1c88930c6942ab477729a197a65c2"
+    }
+  }
+}
