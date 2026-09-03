@@ -52,12 +52,21 @@
 # 149 GiB snapshot is uploaded to gs://alynie-k3-scratch/ckpt/hf and passed to
 # --model as a gs:// URI, exactly as the Qwen recipes pass theirs.
 #
-# Run with:
-#   cdk recipe run examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml
+# Run it by registering the file in your cloud-devkit-recipes checkout's
+# recipes.yml under a `k8s_file:` key, then:
 #
-# Without the cdk CLI, render_cdk_recipe.py substitutes the `{{ }}` defaults and
-# adds the namespace, the Kueue labels and the name that cdk would otherwise
-# supply, and the result goes in with plain kubectl:
+#   cdk job create dsv4-pd-dp8-dp8-raiden --tags agent-jobs \
+#       --active-deadline-seconds 7200
+#
+# Note that cdk runs the whole file through Go's text/template before it parses
+# any YAML, so a comment cannot contain a bare template action; that is a parse
+# error, not a comment.
+#
+# Without the cdk CLI, render_cdk_recipe.py substitutes the placeholder defaults
+# and adds the namespace, the Kueue labels and the name cdk would otherwise
+# supply, and the result goes in with plain kubectl. Be aware that this does not
+# survive: cdk's job-manager reaps JobSets it did not create, and it took one
+# out seventeen minutes in while it was still queued.
 #
 #   python3 examples/disagg/render_cdk_recipe.py \
 #       examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml --name dsv4-pd-<you> \
