@@ -2,7 +2,7 @@
 
 **Status: DRAFT, agents still in flight.** Options C, D, E and candidate 0 are complete and are
 reported in full, as is the recalibrated baseline (§1). **Options A and B are placeholders**, and
-three follow-ups are running: candidate 0's `p=9` sweep and reference check, and Option F (§9.2).
+three follow-ups are running: candidate 0's `p=9` sweep and reference check, and Option F (§10.2).
 Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
@@ -108,7 +108,7 @@ reason decode is the better target, and it is not the reason the earlier documen
 | **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
-| **A** — 128-byte K record | | `in flight` — R1 decides rank 1 vs rank 4 | |
+| **A** — 128-byte K record | halves the K record so half the bytes move | **FAILS its gate at every shippable `bkv_p`** — rank 4. But it is *complementary* to candidate 0, not competing: revisit iff `bkv_p` lands above ≈5 | §7 |
 | **B** — two-unit pipeline | | `in flight` — Flip 3 can retire it outright | |
 
 ---
@@ -269,7 +269,61 @@ reference check**, and would pass equally if both were wrong. A numpy top-k refe
 
 ---
 
-## 7. Stage B is issue-bound, not output-DMA-bound
+## 7. Option A — the 128-byte K record: rank 4, but for a reason that keeps it alive
+
+Full write-up: `probes/R1.md`. Jobs `j-b0e33be2-7d67-41da-b724` and `j-3e588eaa-75e8-4ddb-9737`,
+both `Succeeded`, both **alone on the whole 4-chip pod, serially, no fan-out** — so these are
+absolutes, not merely ratios. Best-of-9, per-arm spread 0.1–1.4%.
+
+The gate: does halving the K record buy enough of its bytes back to be worth the change?
+
+| `bkv_p` | DMAs in flight | saving from halving the record |
+| ---: | ---: | ---: |
+| **2 — today** | 8 | **21.0%** |
+| **3 — where candidate 0 wins** | 12 | **25.4%** |
+| 4 | 16 | 32.0% |
+| 6 | 24 | **42.7%** |
+
+**A fails at every configuration the design proposes to ship**, so it ranks below C, D1 and
+candidate 0. The sturdiest form of that: **the absolute stake never reaches the design's own
+prediction at any measured `bkv_p`** — 15.2 / 17.8 / 20.3 / 26.4 µs against the 28.4–49.4 µs that
+−13 to −22% of a 221.4 µs call requires. (And that 221.4 is itself a wall clock; against the correct
+170.58 the requirement is smaller but the arms all shrink with it.)
+
+**But "A is descriptor-bound" is the wrong lesson, and this is the part worth keeping.** The
+mechanism is **per-descriptor issue cost**, and concurrency hides it: going 8→12 in flight removes
+the same ~20.5 ns/DMA at both record sizes. By 24 in flight the incumbent reaches 3.335e12 B/s —
+**99.6% of P6's contiguous read** — at which point byte reduction pays nearly in full. So **A and
+candidate 0 are complementary, not competing**: A is worth revisiting iff `bkv_p` lands above ≈5.
+Candidate 0's `p=9` sweep therefore decides two options, not one, and R1's note that **`bkv_p=6` may
+not be buildable** (12.58 MB VMEM double buffer, only 2 blocks left to pipeline against) is the
+thing most likely to kill both at once. Relayed to that agent.
+
+**Two alternative explanations were tested and refuted**, which is what licenses the mechanism
+claim above:
+
+- **Alignment.** A's 258-row page is 4 KiB-misaligned in 3 DMAs out of 4. A 264-row *aligned*
+  control is **slower**, by 0.04% of what its extra bytes predict. Padding would not rescue A.
+- **Dispatch floor.** Decided at grid 128, with grid 16 agreeing across an 8× change in work.
+
+Flip 1's other named mechanism, **address indirection, is free** — page table plus both clamps cost
+0.2–1.0%. P6's charging rule is not defeated by indirection: `affine` re-measured at `_fetch_bkv`'s
+geometry fails the gate too, at 21.4%.
+
+**The largest untested item in A's case, named by the agent and not papered over:** Option A's
+changed *consumer* is not modelled at all. Moving the scale byte out of each record forces
+`load_bkv` to gather it differently on the VPU, and the design asserts "the unpack does not change"
+— an assertion about a code path this probe never executes. Direction is against A; magnitude
+unknown. Also, the probe has **no compute and no consumer of the fetched bytes**, so its Δ is an
+*upper bound* on the call-level win — which biases toward A, and A still fails.
+
+A `critical-review` pass on the agent's own first draft caught four wrong claims, including an
+out-of-bounds `affine` offset at grid 128; the gate's own arms were always clamped and unaffected,
+and the `affine` arms were re-measured.
+
+---
+
+## 8. Stage B is issue-bound, not output-DMA-bound
 
 `probes/stage-b-ksweep.md`. A 16× change in `k` moves total time **6.0%**, and `k=4096` is the
 fastest point — an output-DMA model predicts 5,176 µs against 316 observed. Length-bounding the
@@ -289,11 +343,11 @@ not 1.02.
 
 ---
 
-## 8. Open items
+## 9. Open items
 
 1. ~~Option C's `num_bkv` sweep~~ — **DONE, C is safe on prefill at every `num_bkv`** (§3.1).
-2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§9).
-3. **Option F — bf16 operands for stage A** (§9). Dispatched. Falls directly out of the accuracy
+2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§10).
+3. **Option F — bf16 operands for stage A** (§10.2). Dispatched. Falls directly out of the accuracy
    work, and may be the decode-side option C cannot be.
 4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched. The sweep decides
    whether this is a constant to change or a function to write, and it is worth up to −39%
@@ -309,7 +363,7 @@ not 1.02.
 
 ---
 
-## 9. The incumbent is correct at the top-k boundary, and the gate that said otherwise is the wrong gate
+## 10. The incumbent is correct at the top-k boundary, and the gate that said otherwise is the wrong gate
 
 Job `j-5d02a60e-2266-477c-82d6`, three seeds. The probe spies on the module-global
 `sparsecore_topk` inside a trace of the **shipping** `streamindex_topk.__wrapped__`, so it compares
@@ -334,7 +388,7 @@ scoring noise — so which of two effectively-tied items returns is arbitrary. *
 agreement against the incumbent is the right statistic**, and it is what every option in this
 document was judged by.
 
-### 9.1 Why stage A's scores carry bf16-scale error — closed, with a citation
+### 10.1 Why stage A's scores carry bf16-scale error — closed, with a citation
 
 The probe found stage A's score error to be 7.4e-04 relative median / 6.3e-03 max: roughly 10⁴×
 what f32 accumulation over 32 heads should give, on a path that reads f32 throughout
@@ -356,14 +410,14 @@ accumulator, not the input precision**; without a named `precision` the MXU disc
 before it sees the operands. The measured 7.4e-04 / 6.3e-03 straddles that 2.2e-03 characteristic
 error. `HIGHEST` would buy it back at a 4.5× throughput cliff, so this should **not** be "fixed".
 
-### 9.2 It produces a new candidate — Option F, bf16 operands
+### 10.2 It produces a new candidate — Option F, bf16 operands
 
 Stage A moves q and k as f32 and receives bf16 arithmetic for it — what `hardware-facts.md` calls
 "the worst cell in the table: bf16 accuracy at f32 bandwidth." Storing those operands as **bf16**
 gives, per the measured table, an *identical* result distribution while halving the bytes they cross
 HBM with.
 
-The accuracy argument is already discharged by §9: the true boundary gaps (2.5e-04) sit an order of
+The accuracy argument is already discharged by §10: the true boundary gaps (2.5e-04) sit an order of
 magnitude *below* the error the kernel already incurs, so selection there is arbitrary today and
 bf16 operands cannot make it meaningfully more so.
 
