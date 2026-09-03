@@ -148,8 +148,7 @@ def _make_stage3_dsv4_kv_cache_config() -> KVCacheConfig:
 def test_stage3_transfer_groups_skips_mamba_state_groups():
     """Mamba state rides the state-class tags, not the page transfer."""
     config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
-    groups = _stage3_transfer_groups(config.kv_cache_groups,
-                                     multi_group=False)
+    groups = _stage3_transfer_groups(config.kv_cache_groups, multi_group=False)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(2, 16)]
 
@@ -189,8 +188,7 @@ def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
 def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
     """Group order is preserved and each group carries its own page size."""
     groups = _stage3_transfer_groups(
-        _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
-        multi_group=True)
+        _make_stage3_dsv4_kv_cache_config().kv_cache_groups, multi_group=True)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(0, 1024), (1, 1024), (2, 128)]
 
