@@ -69,6 +69,13 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # the control every measurement in RESULTS.md is taken against.
 Q_LAYOUTS = ("head_minor", "head_major", "head_major_hbm")
 
+# Option F: the dtype the score matmul's OPERANDS are widened to before the
+# einsum.  "native" is the incumbent -- float8_e4m3fn x float8_e4m3fn, which
+# `TpuInfo.is_matmul_supported` admits on generation 7 and which measures
+# 1419.9 Tops/s against bf16's 764.8.  The other two are strictly slower on
+# this chip and exist to measure how much of stage A the MXU actually owns.
+MM_DTYPES = ("native", "bf16", "f32")
+
 
 def cdiv(a, b):
     assert b != 0
@@ -136,10 +143,12 @@ def kernel(
     bq_sz: int,
     seq_batch_size: int,
     q_layout: str = "head_minor",
+    mm_dtype: str = "native",
 ):
     """Core kernel logic that operates on memory references."""
 
     assert q_layout in Q_LAYOUTS, q_layout
+    assert mm_dtype in MM_DTYPES, mm_dtype
     head_major = q_layout in ("head_major", "head_major_hbm")
     q_hbm_head_major = q_layout == "head_major_hbm"
 
@@ -406,6 +415,15 @@ def kernel(
                 bq_pos_compressed_vec)  # Shape: (seq_batch_size, bq_sz)
 
             # Compute in Registers
+            if mm_dtype != "native":
+                # Option F's arithmetic half.  Both operands arrive as
+                # float8_e4m3fn; widening them is EXACT (3 mantissa bits fit in
+                # bf16's 7 and in f32's 23), so this changes the MXU pass the
+                # compiler picks and nothing else.  It does not change a single
+                # byte of HBM traffic -- see RESULTS.md 10.2.
+                _t = {"bf16": jnp.bfloat16, "f32": jnp.float32}[mm_dtype]
+                bq_stacked = bq_stacked.astype(_t)
+                bkv_stacked = bkv_stacked.astype(_t)
             s = jnp.einsum(
                 "bnd,bmd->bnm",
                 bq_stacked,
@@ -621,6 +639,7 @@ STREAMINDEX_TOPK_STATIC_ARGNAMES = (
     "decode_req_batch_size",
     "enable_early_exit",
     "q_layout",
+    "mm_dtype",
 )
 
 
@@ -643,6 +662,7 @@ def streamindex_topk(
     decode_req_batch_size: int = 4,
     enable_early_exit: bool = False,
     q_layout: str = "head_minor",
+    mm_dtype: str = "native",
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -691,6 +711,8 @@ def streamindex_topk(
 
     if q_layout not in Q_LAYOUTS:
         raise ValueError(f"q_layout must be one of {Q_LAYOUTS}, got {q_layout}")
+    if mm_dtype not in MM_DTYPES:
+        raise ValueError(f"mm_dtype must be one of {MM_DTYPES}, got {mm_dtype}")
 
     max_num_seqs = seq_lens.shape[0]
 
@@ -818,7 +840,7 @@ def streamindex_topk(
             "head_minor": "",
             "head_major": "-hm",
             "head_major_hbm": "-hmhbm",
-        }[q_layout]
+        }[q_layout] + ("" if mm_dtype == "native" else f"-{mm_dtype}")
         scope_name = (
             f"StreamIdxTC{suffix}-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}")
         pallas_kernel = jax.named_scope(scope_name)(pl.pallas_call(
@@ -830,6 +852,7 @@ def streamindex_topk(
                 bkv_p=bkv_p,
                 seq_batch_size=seq_batch_size,
                 q_layout=q_layout,
+                mm_dtype=mm_dtype,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),

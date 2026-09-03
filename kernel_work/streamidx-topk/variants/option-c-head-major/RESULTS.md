@@ -10,19 +10,33 @@ optimistic `head_major` arm — q head-major in HBM — does not compile. Separa
 shipping kernel of the f64-oracle disagreement §5 turned up: those are benign near-ties, not a
 defect.**
 
+**Option F is a clean negative, and its premise is false (§9). Stage A does not move q and k as
+f32 — both operands are already `float8_e4m3fn`, so bf16 operands would *double* the bytes and
+*halve* MXU throughput. Prefill is not HBM-bound at all: 1319 FLOP/B against a 384 ridge, 7.1% of
+measured time in the HBM floor. Measured, F costs +4.63% at prefill and +9.80% at decode with HBM
+traffic held constant, and F+C is worse than C alone in both phases. The same arm bounds the score
+matmul's exposed cost at ≤5.4% of prefill stage A, so the issue axis Option C attacked is the only
+one on this kernel with anything left on it. §8.4(2) is closed but **not** on the citation offered:
+σ is the fp8 MXU pass itself — on bit-identical, exactly-representable inputs the fp8 pass measures
+1.0628 max abs where bf16, f32-DEFAULT and f32-HIGHEST all measure 3.05e-05. And §7.3's decode
+regression is now a finding rather than judgement: at `bq_sz=1`, head-major *adds* `vrot.slane`
+(2,291 → 2,915) and nearly doubles the schedule (§10.3).**
+
 ## Provenance
 
 | | |
 | --- | --- |
-| jobs | **`j-a960ad54-a0a1-4e1d-8ade`** (`Succeeded`) — timing, unpinned, whole pod<br>**`j-43359a39-0495-4602-a79b`** (`Succeeded`) — LLO dumps + first correctness attempt, 4-way fan-out. Its gate 1 is **void**, see §5<br>**`j-cf9e7189-8331-4613-9c2a`** (`Succeeded`, `FANOUT_RC=0`, 4/4 shards `rc=0`) — correctness re-run after the harness fix, plus the LLO re-read at the committed md5. **This is the correctness job.**<br>**`j-fd7b8801-fce9-46ec-bb63`** (`Succeeded`, `rc=0`) — the `num_bkv` sweep of §7, unpinned, whole pod<br>**`j-5d02a60e-2266-477c-82d6`** (`Succeeded`, `rc=0`) — the oracle-gap probe of §8; not a timing, so fan-out safe |
+| jobs | **`j-a960ad54-a0a1-4e1d-8ade`** (`Succeeded`) — timing, unpinned, whole pod<br>**`j-43359a39-0495-4602-a79b`** (`Succeeded`) — LLO dumps + first correctness attempt, 4-way fan-out. Its gate 1 is **void**, see §5<br>**`j-cf9e7189-8331-4613-9c2a`** (`Succeeded`, `FANOUT_RC=0`, 4/4 shards `rc=0`) — correctness re-run after the harness fix, plus the LLO re-read at the committed md5. **This is the correctness job.**<br>**`j-fd7b8801-fce9-46ec-bb63`** (`Succeeded`, `rc=0`) — the `num_bkv` sweep of §7, unpinned, whole pod<br>**`j-5d02a60e-2266-477c-82d6`** (`Succeeded`, `rc=0`) — the oracle-gap probe of §8; not a timing, so fan-out safe<br>**`j-8c300d39-2612-469d-8602`** (`Succeeded`, `OPTF END rc=0`) — the Option F timing of §9.4, unpinned, whole pod. Its driver ends in `exit 0`, so `JobStatus` alone proves nothing; the `rc=0` footer and the full 8-cell table are the evidence<br>**`j-e9f4996a-a2bd-4e9d-a3fc`** (`Succeeded`, `FANOUT_RC=0`, 4/4 shards, all four `OPTF … END rc=0`) — §10's MXU precision ladder plus the decode LLO dumps and the prefill `f_bf16` dump; not a timing, so fan-out safe |
 | image | `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-hning_google_com:ec4bcecf784d0bc3aeb8be37554431e3b5eef70b` (prebuilt; no image was built for this work) |
 | `RUN_CMD` (read back from `cdk job recipe j-a960ad54-a0a1-4e1d-8ade`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/timing_c.sh` |
 | `RUN_CMD` (read back from `cdk job recipe j-43359a39-0495-4602-a79b`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/fanout/tpu-fanout.sh "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh incumbent head_minor" "bash …/shard_llo_c.sh head_major" "bash …/shard_llo_c.sh head_major_hbm" "bash …/shard_correct_c.sh all"; echo FANOUT_RC=$?; echo ===== OPTC READ =====; python …/read_llo_c.py --dump …` |
 | `RUN_CMD` (read back from `cdk job recipe j-fd7b8801-fce9-46ec-bb63`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/numbkv_c.sh` |
 | `RUN_CMD` (read back from `cdk job recipe j-5d02a60e-2266-477c-82d6`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/oraclegap_c.sh` |
+| `RUN_CMD` (read back from `cdk job recipe j-8c300d39-2612-469d-8602`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/optionf_c.sh` |
+| `RUN_CMD` (read back from `cdk job recipe j-e9f4996a-a2bd-4e9d-a3fc`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/fanout/tpu-fanout.sh "bash /root/kw/variants/option-c-head-major/precision_c.sh" "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh decode incumbent" "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh decode head_major" "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh prefill f_bf16"; echo FANOUT_RC=$?` |
 | `RUN_CMD` (read back from `cdk job recipe j-cf9e7189-8331-4613-9c2a`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/fanout/tpu-fanout.sh "bash /root/kw/variants/option-c-head-major/shard_correct_c.sh all" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh incumbent" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh head_minor" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh head_major"; echo FANOUT_RC=$?; echo ===== OPTC READ =====; python /root/kw/variants/option-c-head-major/read_llo_c.py --dump incumbent=$CDK_OUTPUT_DIR/optc/pass/incumbent --dump head_minor=$CDK_OUTPUT_DIR/optc/pass/head_minor --dump head_major=$CDK_OUTPUT_DIR/optc/pass/head_major --json $CDK_OUTPUT_DIR/optc/llo_c.json` |
 | `--map-dir` | `…/vllm-torchtpu/src:tpu-job:/root/cloud-devkit/vllm-torchtpu/src`, `…/vllm-torchtpu/tests:tpu-job:/root/cloud-devkit/vllm-torchtpu/tests`, `…/kernel_work/streamidx-topk:tpu-job:/root/kw`, and (fan-out jobs only) the skill's `fanout` dir at `/root/fanout`. Every one printed a `Packaging dir` line |
-| the mapping took | `MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532` on every shard of every job — the branch's kernel at `c3a18c95`, not the image's older one. Test file `md5=becf9f23ace9424a7d67cd3b34de9afd` |
+| the mapping took | `MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532` on every shard of every job — the branch's kernel at `c3a18c95`, not the image's older one. Test file `md5=becf9f23ace9424a7d67cd3b34de9afd`. `j-8c300d39` additionally printed `md5sum` for all ten variant files and recorded `variant_md5=058800b0b8b8f955ec5e361516cc385c` (`streamindex_topk_c.py`) in its JSON; every one matches the local tree |
 | incumbent commit | `c3a18c95`; `src/.../streamindex_topk.py`, `sparsecore_topk.py` and `mla_attention_op.py` are **unmodified** — the variant is a copy |
 | pinning | timing job: **none**, one unpinned process on the whole 4-chip pod, deliberately (absolute µs must be comparable). LLO/correctness jobs: 4-way fan-out, which is fine because nothing in them is a timing |
 | hardware | `TPU7x`, jax/jaxlib `0.10.2` |
@@ -352,7 +366,8 @@ predicted a 335.1 µs stage A, delivered 246.58 µs.
    agree. "Matches the incumbent" remains the strongest correctness statement available for C, but
    the incumbent is no longer under suspicion. What *is* now known is that the absolute
    recall-vs-f64 criterion is the wrong gate for this op — see §8.4(1) — and that stage A's score
-   error is larger than the source explains (§8.4(2)).
+   error comes from the fp8 MXU pass rather than from anything in the source (§8.4(2), settled in
+   §10).
 
 ### 6.3 Recommendation
 
@@ -365,6 +380,11 @@ kernel level; the remaining unknown is call-level and end-to-end, which is not s
 microbenchmark can settle. Do not carry the −9.24%, the −7.9%, or the 335.1 µs figure forward
 anywhere; carry **−50.9 µs of stage A, −20.64% at `q1024/ctx9216`, −17.8% to −20.7% across prefill
 `num_bkv` 1–8, and +59.6% at decode.**
+
+**Do not take Option F, in either phase or in combination with C** (§9.4: +4.63% prefill, +9.80%
+decode, F+C worse than C alone in both). And do not spend further effort on the matmul or the byte
+side of stage A: §9.2 and §9.4 bound the whole available win there at roughly 5% of prefill and put
+the rest on the issue axis, which is where C already is.
 
 ---
 
@@ -436,12 +456,14 @@ head-minor's row index is `t*H + h = h` and head-major's is `h*bq_sz + t = h`; t
 predicted −0% to −2% on exactly this reasoning, and so did I. The data says +59.62%. **Reordering
 nothing is not free.**
 
-**Mechanism: not established.** No LLO dump was taken of the decode program, so what follows is
-judgement, not a finding. The plausible cause is that the degenerate `(SB,H,1,D)` intermediate puts
+**Mechanism: established in §10.3.** When this section was written no LLO dump of the decode
+program existed, and the guess recorded here was that the degenerate `(SB,H,1,D)` intermediate puts
 a length-1 axis on the sublane dimension, where Mosaic's `(8,128)` tiling pads each head's `1×128`
-row to a full tile — 8× the vector registers for the same data — turning a no-op permutation into a
-real relayout. It has a cheap test (one `shard_llo_c.sh` run against a decode launcher) and nobody
-needs to run it: the decision is the same either way.
+row to a full tile, turning a no-op permutation into a real relayout. §10.3 took the dump. The
+guess is **directionally confirmed and quantitatively different from what I expected**: head-major
+at `bq_sz=1` does not merely fail to remove rotates, it **adds** them — `vrot.slane` 2,291 → 2,915,
+`vadd` 420 → 2,020, spills 2,405 → 3,972, scheduled bundles 2,347 → 4,469 (1.90×) — at identical
+`vmatmul` (32) and an identical fp8 MXU pass on both arms. The regression is entirely issue-side.
 
 Two limits on the number. It is **stage A only** — decode stage A's share of the whole
 `streamindex_topk` call was not measured, so +59.62% of stage A is not +59.62% of the op. And it is
@@ -546,8 +568,9 @@ property of an approximate indexer, not a defect.
    `:458-472` does no quantization). The only bf16 in the path is the e8m0 scale at `:268`, and a
    power of two is lossless in bf16, so that is not it either. Candidates I cannot rule out from
    Python: the MXU's internal fp8 accumulation path, or Mosaic lowering the f32×bf16 multiply at
-   `:341` in bf16. **This is judgement, not a finding** — nothing was dumped or instrumented to
-   test it. It does not disturb the benign verdict (§8.3 is computed from the kernel's own numbers
+   `:341` in bf16. **This was judgement, not a finding, when §8 was written — §10 now settles it**:
+   the first candidate is right, the second is eliminated, and the σ is the fp8 MXU pass. It does
+   not disturb the benign verdict (§8.3 is computed from the kernel's own numbers
    and does not care where the error came from), but a 7e-04-relative indexer score is worth
    someone knowing deliberately rather than by accident.
 
@@ -566,12 +589,337 @@ unaffected either way.
 
 ---
 
-## 9. What this does not establish
+## 9. Option F — the premise is false, and the roofline says so twice
+
+Option F was proposed as: stage A moves q and k as **f32** and gets bf16 arithmetic for it — the
+"worst cell in the table" — so storing the operands as **bf16** halves the operand bytes at an
+identical result distribution. The accuracy half of that argument is sound, and §8.3 is what makes
+it sound. The bandwidth half rests on a premise about this kernel that does not hold.
+
+### 9.1 q and k are already fp8. bf16 operands would **double** the bytes, not halve them
+
+There is no f32 matmul operand anywhere in stage A. Both operands of the one einsum are
+`float8_e4m3fn`, one byte each:
+
+| operand | where it becomes fp8 | evidence |
+| --- | --- | --- |
+| q | `q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)` | `mla_attention_op.py:106`, behind `assert q_values.dtype == torch.float8_e4m3fn, "streamindex_topk expects fp8 q"` at `:153-154` |
+| k | `fp8_val = pltpu.bitcast(fp8_val, jnp.float8_e4m3fn)` in `load_bkv` | `streamindex_topk.py:266`, out of a cache written by `quantize_tensor(..., torch.float8_e4m3fn, ...)` at `mla_attention_op.py:156` |
+
+The microbenchmark agrees with production: `stage_a_c.py:126` builds q as
+`.astype(jnp.float8_e4m3fn)` and the cache record as `[fp8 × D | e8m0 scale | pad]`, the same way
+`instruments/bench_streamidx_topk.py` does.
+
+So F inverts on both axes at once, and the second is the reference file's own measurement:
+
+- **Bytes.** fp8 → bf16 is 1 byte → 2. The q + kv operand traffic at `q1024/ctx9216` goes
+  23.07 MB → 46.14 MB.
+- **MXU throughput.** `05-compute-units.md`'s measured table has `float8_e4m3fn → f32, DEFAULT` at
+  **1419.9 Tops/s** and bf16 at **764.8** — fp8 is 1.86× bf16, and it is the *only* narrow dtype on
+  generation 7 that buys anything. Moving off it cuts matmul throughput by 1.86×.
+
+`float8_e4m3fn × float8_e4m3fn` is on `TpuInfo.is_matmul_supported`'s twelve-pair native list for
+generation 7 (`hardware-facts.md#which-matmuls-are-native`), so this is not an emulated path bf16
+might beat. **Stage A is already in the best cell of the table.** It is not "bf16 accuracy at f32
+bandwidth"; it is fp8 accuracy at fp8 bandwidth on the fp8 MXU pass.
+
+### 9.2 Is stage A HBM-bound? Prefill no, decode partly — and F loses in both
+
+Modelled from the measured geometry, per TensorCore. The denominators are `get_tpu_info()` as
+reported — 3.70e12 B/s — and the measured 1419.9 Tops/s, which is the right divisor for a Pallas
+kernel because a Pallas kernel runs on one TensorCore (`hardware-facts.md`). **Everything in this
+table except the two "measured" rows is modelled.**
+
+| | prefill `q1024/ctx9216` | decode `b64/ctx8704` |
+| --- | ---: | ---: |
+| q (fp8) | 4.19 MB | 0.26 MB |
+| indexer weights (f32) | 0.13 MB | 0.01 MB |
+| kv records, 256 B/position | 18.87 MB (8 bq passes) | 142.61 MB (1 pass, 64 seqs) |
+| score output (f32) | 41.94 MB | 2.62 MB |
+| **total HBM** | **65.14 MB** | **145.50 MB** |
+| FLOP | 8.59e10 | 5.37e9 |
+| **arithmetic intensity** | **1319 FLOP/B** | **37 FLOP/B** |
+| ridge point (1419.9 Tops/s ÷ 3.70 TB/s) | 384 FLOP/B | 384 FLOP/B |
+| HBM floor | 17.61 µs | 39.32 µs |
+| MXU floor (fp8) | 60.50 µs | 3.78 µs |
+| **measured** stage A (§1, §7) | **246.35 µs** | **109.83 µs** |
+| HBM floor as a share of measured | **7.1%** | **35.8%** |
+| MXU floor as a share of measured | **24.6%** | 3.4% |
+| achieved bandwidth | 264 GB/s | 1,325 GB/s |
+
+**Prefill is 3.4× past the ridge point and runs at 7% of HBM bandwidth. It is not HBM-bound, and it
+is not close.** Even a *perfect* halving of every byte in the table — which F does not offer, since
+it doubles the operand half — would remove 8.80 µs, **3.6%** of stage A.
+
+Nor is prefill MXU-bound: the fp8 matmul is 24.6% of measured time and the remaining **75.4% is
+neither** — it is VPU and issue. That is exactly what Option C demonstrated on hardware. §2's
+`head_major` deletes 15,987 VALU operations while moving **zero** extra bytes of HBM traffic and
+doing zero less matmul work (`vmatmul` is 1,024 on every arm), and it bought −20.64%. **A change
+that touched only instruction issue moved a fifth of stage A. That is a measured proof of what this
+table models**, and it is why F could not have paid even had its premise held.
+
+For completeness, since the point of a roofline is to find the byte-side win if there is one:
+**there are two places prefill's bytes could genuinely be halved, and both are small.** The f32
+score output is 41.94 MB, 64% of all traffic — emitting it as bf16 would save 5.7 µs, **2.3%**, and
+would degrade stage B's input. The kv records are re-read once per bq block, 8 passes of 2.36 MB;
+the whole cache would fit in VMEM, and pinning it there would save 4.5 µs, **1.8%**. Neither is
+Option F, neither is worth the change, and together they are less than a tenth of what Option C
+took out of the issue side.
+
+**Decode is the memory-side case** — 37 FLOP/B, an order of magnitude *below* the ridge, 36% of
+measured time in the HBM floor, the matmul a rounding error at 3.4%. So the instinct that "F may be
+the decode-side option C cannot be" was pointed at the right phase. It still loses, for the same
+reason: 98% of decode's bytes are kv records, and F makes those records **bigger**. Modelled, bf16
+keys roughly double decode's HBM floor, 39.3 → ~76 µs.
+
+### 9.3 Pre-registered predictions, written before the jobs returned
+
+Recorded before the numbers existed, the same discipline as §8's ≤4σ threshold. The `f_bf16` arm
+widens both operands to bf16 *inside* the kernel, immediately before the einsum. The widening is
+exact — an e4m3 value has 3 mantissa bits and bf16 has 7 — so it holds HBM traffic byte-for-byte
+constant and changes only the MXU pass. That makes it a measurement of something F is not: **how
+much of stage A the score matmul actually owns.**
+
+1. **`f_bf16` at prefill: +51.8 µs, +21.0%**, if the fp8→bf16 MXU term is fully exposed. A measured
+   cost much smaller than that means the matmul is partly hidden behind VPU work and its real share
+   is below 24.6%.
+2. **`f_bf16` at decode: +3.2 µs, +2.9%.** Decode barely touches the MXU.
+3. **F as specified**, bf16 in HBM as well: **+58.1 µs, +23.6%** at prefill — +6.2 µs of extra bytes
+   on top of +51.8 µs of lost MXU throughput.
+4. **The precision ladder:** if `fp8_native` reproduces §8's median relative error of 7.4e-04 while
+   `f32_highest` lands near 1e-07, then σ is the MXU pass and the Python source is innocent.
+
+### 9.4 Measured — `j-8c300d39-2612-469d-8602`
+
+Chain slope, `R = [1, 2, 3, 4]`, best-of-7, one unpinned process on the whole pod, exactly as §1 and
+§7. `min r² = 0.999994` at prefill and `0.999998` at decode. Both control arms reproduce the earlier
+jobs to within this method's run-to-run spread: `head_major` measures −20.28% at prefill against
+§1's −20.64%, and +59.38% at decode against §7.3's +59.62%.
+
+| stage-A chain slope, µs/call | incumbent | `f_bf16` | `head_major` (C) | `f_bf16_hm` (F+C) |
+| --- | ---: | ---: | ---: | ---: |
+| prefill `q1024/ctx9216` | 246.12 | 257.53 **+4.63%** | 196.21 **−20.28%** | 202.07 **−17.93%** |
+| decode `b64/ctx8704` | 110.00 | 120.78 **+9.80%** | 175.32 **+59.38%** | 192.01 **+74.55%** |
+
+**F loses in both phases, and it loses the *arithmetic* half — the half that costs no extra bytes.**
+`f_bf16` widens the operands inside the kernel, so its HBM traffic is byte-for-byte the incumbent's
+and the whole delta is the MXU pass plus the converts. F as actually specified, bf16 in HBM, is
+strictly worse again: it adds §9.1's doubled operand bytes on top of these numbers.
+
+#### What the prefill number establishes, which is more than F
+
+Prediction 1 said +21.0% if the matmul term were fully exposed. **Measured +4.63%, 22% of that.**
+Read it as a bound. The bf16 pass is 1.86× slower than the fp8 pass (1419.9 → 764.8 Tops/s), so if
+the matmul contributes `M` µs to the critical path, this arm should cost `0.857·M` *plus* the
+widening converts. Converts cannot be negative, so
+
+    M ≤ 11.41 / 0.857 = 13.3 µs = 5.4% of stage A
+
+**An infinitely fast score matmul saves at most 5.4% of prefill stage A**, against a modelled fp8
+MXU floor of 24.6% (§9.2) — at least three quarters of the matmul is already hidden behind VPU work.
+Together with §9.2's 7.1% HBM floor, prefill stage A has **no** large term on either roofline axis
+and everything on the issue axis. That is the axis Option C attacked, and so far the only one on
+this kernel that has paid.
+
+*(§9.3 and the job's own printed footer called this delta a "lower bound" on the matmul's share.
+That is backwards, and it is corrected here: the converts are inside the delta, so it is an **upper**
+bound. The correction strengthens the conclusion rather than weakening it.)*
+
+#### The decode number is not an MXU result at all
+
+Prediction 2 said +2.9%. **Measured +9.80%** — 3.4× too large, and the model says it cannot be MXU
+throughput: decode's entire fp8 MXU floor is 3.78 µs, so the bf16 pass accounts for at most
+0.857 × 3.78 = 3.2 µs of the measured 10.78 µs. The remaining ~7.5 µs is the widening itself. At
+decode the kv block dwarfs everything else — 142.61 MB of 145.50 MB, §9.2 — so converting keys
+fp8 → bf16 is a large VPU pass over the dominant array. F-as-specified would avoid that convert by
+storing bf16 in HBM, and would pay for it by roughly doubling decode's HBM floor, 39.3 → ~76 µs on a
+110 µs baseline. **No version of F wins at decode.** The hope that "F may be the decode-side option
+C cannot be" does not survive: F regresses decode too, and unlike C it also regresses prefill.
+
+#### Composition: F and C do not cancel, they stack
+
+Multiplying the solo deltas predicts −16.6% at prefill and +75.0% at decode; measured −17.93% and
++74.55%. **Decode composes almost exactly multiplicatively.** Prefill is slightly *better* than
+multiplicative — F costs 11.41 µs on the incumbent but only 5.86 µs on top of C (+2.99% of C's
+196.21). Head-major layout apparently makes the widening cheaper, which would be consistent with
+§2's mechanism, but that is judgement; nothing in this job isolates it. Either way **F+C is worse
+than C alone in both phases**, so there is nothing to compose.
+
+#### Accuracy, and one place the reference table does not transfer
+
+The arms agree structurally and disagree numerically:
+
+| vs incumbent | `f_bf16` | `head_major` | `f_bf16_hm` |
+| --- | --- | --- | --- |
+| prefill `same_mask` / `max_abs` | `True` / **2.9157** | `True` / 1.22e-04 | `True` / **2.9157** |
+| decode `same_mask` / `max_abs` | `True` / **2.2408** | `True` / 6.10e-05 | `True` / **2.2408** |
+
+Read `same_mask` narrowly: it is agreement of the **finite/`-inf` mask** of the score tensor — every
+arm scores exactly the same set of valid (token, position) pairs. It is **not** top-k index
+agreement. This harness cannot produce that: stage A returns scores and the selection happens in
+stage B. The index-agreement check the brief asked for would need its own job, and §9.2 plus the
+table above make F a dead option before it is worth one.
+
+What `max_abs` does show is that **the equivalence quoted from `hardware-facts.md:104-116` does not
+transfer to this kernel.** That row compares f32 operands against bf16 operands and finds them
+identical — both are one bf16 MXU pass, so of course they are. The incumbent here is neither: it is
+an **fp8** pass, a different pass with different rounding, and measured against it bf16 operands
+differ by up to 2.92 absolute, about 2.7× the incumbent's own 1.0628 max deviation from the f64
+oracle (§8.3). bf16 operands are therefore not a free swap on accuracy either — they are roughly a
+3× widening of an error §8.3 already showed exceeds the rank-512 boundary gaps. The brief's
+conclusion that selection at that boundary is arbitrary today and cannot be made "meaningfully more
+arbitrary" survives qualitatively — arbitrary is arbitrary — but the premise it was drawn from
+concerns a comparison this kernel does not make.
+
+---
+
+## 10. What actually set stage A's score error — §8.4(2), closed with a correction
+
+**Closed. σ is the fp8 MXU pass itself.** `probe_precision.py`, shard 0 of
+`j-e9f4996a-a2bd-4e9d-a3fc`, `rc=0`, three seeds. Four arms receive **bit-identical** values — the
+q and k the kernel is actually handed, read back out of `_build_g2`'s own arrays — and differ only
+in which MXU pass the compiler picks. The widening is verified exact in the log rather than
+asserted: `exactness of the widening … {'q_fp8_to_bf16': 0.0, 'k_fp8_to_bf16': 0.0}`.
+
+| seed | arm | operands | matmul `max_rel` | stage-A `max_abs` | stage-A `median_rel` |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 0 | **`fp8_native`** | `float8_e4m3fn` | 1.5350e+03 | **1.0628e+00** | **9.0142e-04** |
+| 0 | `bf16` | `bfloat16` | 3.4208e-05 | 3.0510e-05 | 2.8880e-08 |
+| 0 | `f32_default` | `float32`, DEFAULT | 3.4208e-05 | 3.0510e-05 | 2.8880e-08 |
+| 0 | `f32_highest` | `float32`, HIGHEST | 3.4208e-05 | 3.0510e-05 | 2.8880e-08 |
+| 1 | **`fp8_native`** | `float8_e4m3fn` | 2.8060e+02 | 8.8749e-01 | 9.0229e-04 |
+| 1 | the other three | — | 3.3228e-05 | 2.5965e-05 | 2.8479e-08 |
+| 2 | **`fp8_native`** | `float8_e4m3fn` | 7.0000e+12 | 1.0162e+00 | 9.0048e-04 |
+| 2 | the other three | — | 1.6142e-04 | 3.1710e-05 | 2.8642e-08 |
+
+`fp8_native`'s seed-0 stage-A `max_abs` is **1.0628**, which is §8.3's σ to five significant
+figures on the same configuration. That is the fingerprint: the arm that reproduces σ is the fp8
+pass, and the other three land 31,200–31,700× lower in stage-A median relative error, on all three
+seeds, with no daylight between them. Seed 2's `matmul max_rel` of 7e+12 is a
+near-zero reference denominator, not a blow-up — its absolute error, 59.4, is in line with the
+other seeds.
+
+Prediction 4 (§9.3) is confirmed in its first half and **refuted in its second**, and the second
+half is the correction.
+
+### 10.1 The proposed answer cannot be right, and this job says so twice
+
+The brief closed §8.4(2) on `hardware-facts.md:104-116` — f32 operands at DEFAULT precision get one
+bf16 pass, so f32 storage buys no f32 arithmetic. Two independent lines here rule that out for this
+kernel:
+
+1. **There is no f32 matmul operand to demote.** Direct from the Mosaic MLIR of the decode dumps
+   (shards 1 and 2), at every one of six passes, on **both** arms:
+   `tpu.matmul … : vector<32x128xf8E4M3FN>, vector<2048x128xf8E4M3FN>, vector<32x2048xf32> ->
+   vector<32x2048xf32>`. The operands are fp8 and the accumulator is f32. The prefill `f_bf16`
+   shard shows the same line with `bf16` operands, confirming the knob does what it claims and that
+   the reader is reading the right op.
+2. **On these operands, DEFAULT *is* HIGHEST.** The table's f32 rows are bit-identical, where
+   `hardware-facts.md` reports 2.2104e-03 for DEFAULT against 1.4283e-07 for HIGHEST. That is not a
+   contradiction of the reference — it is its mechanism confirmed from the other side. DEFAULT
+   truncates f32 operands to one bf16 pass; these operands hold fp8 values, 3 mantissa bits, which
+   bf16's 7 represent **exactly**, so there is nothing for the truncation to throw away. The
+   reference's 2.2e-03 is what you get when the f32 operands carry full mantissas. Ours do not.
+
+So the cited row is sound and simply does not reach this kernel. §8.4(2)'s two Python-level
+candidates are also both eliminated: the bf16 arm runs the same ReLU, the same f32 weight multiply
+at `:341` and the same 32-head sum and lands at 2.9e-08, so neither the weight multiply's lowering
+nor the reassociation is the source. **Everything except the pass is held fixed, and the error
+follows the pass.**
+
+### 10.2 What the finding actually is
+
+**On generation 7 the fp8 MXU pass carries ~3.5e-03 median relative error on the matmul, and that
+is the price of its 1.86× throughput.** Composed through stage A that is 9.0e-04 against the bf16
+pass's 2.9e-08 on bit-identical inputs — **3.1×10⁴×**. (At the matmul level the bf16 pass's median
+error is exactly 0, so the ratio there is not finite; the stage-A figure is the quotable one.) This
+is a property of the hardware pass, not of `streamindex_topk`. The probe localises the error to the
+pass; it does **not** identify which stage inside the pass (product rounding, a reduced-precision
+accumulate tree, or both), and nothing here dumps that. The median relative matmul error is
+strikingly stable across seeds — 3.52e-03, 3.50e-03, 3.52e-03 — which is what one expects of a
+fixed datapath width rather than of input-dependent cancellation, but that inference is judgement.
+
+Two consequences worth carrying:
+
+- **No fix is warranted, and the brief is right about that even though its reason does not apply.**
+  §8.3 already showed the resulting misselections are benign near-ties, and §9.4 shows what moving
+  off the fp8 pass costs: +4.63% at prefill, +9.80% at decode, for accuracy nobody needs. Buying
+  accuracy here would be paying for a rank ordering the op does not promise.
+- **It generalises past this kernel.** Anyone reaching for `float8_e4m3fn × float8_e4m3fn` on gen 7
+  for its 1419.9 Tops/s should expect ~3e-03 relative on the product, *independently of how exactly
+  their inputs are representable in fp8*. That is the part that surprises: every input here was
+  exactly representable and the error appeared anyway.
+
+### 10.3 Decode LLO — §7.3's mechanism, now a finding
+
+Secondary to F, and cheap because the shards were already fanned out. Static, from
+`…-53-post-ra.txt` and `…-70-schedule-analysis_final_bundles.txt` of the real decode program
+(`StreamIdxTC-d-bq_1-bkvp_2.1` and `StreamIdxTC-hm-d-bq_1-bkvp_2.1`), same counters as §2 and §3.
+
+| decode, `bq_1-bkvp_2` | incumbent | `head_major` | ratio |
+| --- | ---: | ---: | ---: |
+| scheduled bundles | 2,347 | 4,469 | **1.90×** |
+| spill lines | 2,405 | 3,972 | 1.65× |
+| `vrot.slane` | 2,291 | **2,915** | **1.27×** |
+| `vadd` | 420 | 2,020 | 4.81× |
+| `vxpose` | 256 | 260 | 1.02× |
+| `vmatmul` | 32 | 32 | 1.00× |
+| **measured device time (§9.4)** | 110.00 µs | 175.32 µs | **1.594×** |
+
+**At decode, Option C does the opposite of what it does at prefill: it *adds* `vrot.slane` rather
+than removing them.** Prefill deletes all 7,936 immediate-amount rotates (§2); decode adds 624 and
+nearly doubles the schedule. `vmatmul` is 32 on both, so once again no arm won or lost on matmul
+work, and the MLIR confirms both decode arms run the identical fp8 pass — the regression is
+entirely issue-side.
+
+That is the mechanism §7.3 could only guess at, and it is now measured: **head-major's win is a
+property of the 32-head reduction being large relative to everything else, which is true at
+`bq_sz=128` and false at `bq_sz=1`.** With one query token there is almost no reduction to
+reassociate, so the layout's cost — the in-kernel transpose, the 4.8× `vadd`, the 65% more spilling
+— is paid with nothing bought. The static ratio 1.90× over-predicts the measured 1.594×, the same
+direction and rough magnitude as §3's agreement at prefill (−18.93% bundles against −20.64% time,
+under-predicting there). A bundle count is code length, not cycles; it is being used here to
+identify a mechanism, not to predict a time.
+
+**Limitation, and it is mine:** `shard_llo_f.sh` piped the dump through `tail -80`, and both decode
+arms emitted exactly 80 `MATMUL` lines, so their `[C-dump] phase … geometry …` and `arm … ok …
+finite_frac` lines were discarded at the pipe and are not recoverable from `sync-outputs`. The
+geometry is confirmed only by the artifact filenames (`-d-bq_1-bkvp_2.1`), and **the decode dumps
+carry no `finite_frac` line**, so this section rests on the two arms having compiled and run
+without a traceback, not on an in-job check of their output. The prefill `f_bf16` shard, under the
+cap, kept its full header including `finite_frac 0.850048840045929` — identical to the incumbent's
+in §9.4's JSON. The script has been fixed to `tee` rather than `tail`; the numbers above were taken
+before the fix and are not affected by it.
+
+### 10.4 One more static control for §9.4
+
+The prefill `f_bf16` shard gives the census-level counterpart of §9.4's +4.63%, against §2 and §3's
+incumbent columns:
+
+| prefill `bq_128-bkvp_2` | incumbent (§2, §3) | `f_bf16` |
+| --- | ---: | ---: |
+| `vrot.slane` | 8,960 | 8,960 |
+| `vadd` | 12,320 | 12,320 |
+| `vmatmul` | **1,024** | **2,048** |
+| scheduled bundles | 11,600 | 11,565 |
+
+**The bf16 arm changes exactly one thing in the static census: it doubles the matmul issues.** The
+VPU census is unchanged to the instruction, which is the control that makes §9.4's prefill delta
+attributable to the matmul and not to the widening converts — at prefill the converts cost nothing
+countable, which is also why the decode picture (§9.4) is different, since there the converted
+array is 55× larger. Note the schedule length barely moves (−0.3%) while measured time rises 4.63%:
++1,024 matmul issues fit into the existing bundles but still cost cycles, which is a clean reminder
+that a bundle count is not a cycle count.
+
+---
+
+## 11. What this does not establish
 
 1. **§1–§6 are prefill only, one shape** — `prod_prefill_q1024_ctx9216`, `bq_sz=128`,
    `seq_batch_size=1`, one sequence. §7 widens this to six prefill contexts and **one** decode
-   shape (`b=64, ctx=8704`); decode remains a single point, and its +59.62% mechanism is not
-   established (no LLO dump of the decode program was taken — §7.3 says why nobody needs to). Note
+   shape (`b=64, ctx=8704`); **decode remains a single point.** Its mechanism *is* now established
+   — §10.3 dumps the decode program and shows `vrot.slane` going the wrong way — but at that one
+   shape only, and the dump carries no `finite_frac` line (§10.3's limitation). Note
    `min_token_size=16` is hardcoded in `tpu_platform.py:1236-1276`, so the instrument's
    `prod_decode_b8_ctx8704` row is synthetic and no b=8 figure appears anywhere here.
 2. **Stage A only.** The −50.9 µs is a stage-A delta measured in isolation. The call-level and
@@ -592,6 +940,23 @@ unaffected either way.
    was **not** re-timed at the new md5.
 5. **`head_major_hbm` was not measured at all**, only shown not to compile. If someone makes the
    dynamic-`sz` slice work, its numbers are still open.
+6. **Option F was never built as specified, and does not need to be.** Only its arithmetic half was
+   measured (`mm_dtype="bf16"`, widening inside the kernel at constant HBM traffic). Storing bf16 in
+   the KV cache would need a change to `mla_attention_op.py`'s `quantize_tensor` call and to the
+   cache record layout, which is out of this exercise's scope and, given §9.1 and §9.4, would only
+   add doubled operand bytes to an already-negative result. The three `f_*` arms and the `f_f32`
+   knob are in the code; `f_f32` was never run.
+7. **No top-k index agreement was measured for the F arms.** §9.4's `same_mask` is finite/`-inf`
+   mask agreement of the *score* tensor, not index-set agreement — stage A does not select. §5's
+   index-set agreement covers Option C only.
+8. **§9.2's roofline is modelled**, from `get_tpu_info()`'s 3.70e12 B/s and `05-compute-units.md`'s
+   measured 1419.9 Tops/s. Only the two "measured" rows in that table are measurements. §9.4's
+   ≤5.4% bound on the matmul's exposed cost is a linear extrapolation from a single 1.86×
+   perturbation, not a measurement of the matmul in isolation.
+9. **§10's ladder is a pure-JAX reconstruction of stage A, not the shipping kernel.** It reproduces
+   §8.3's σ to five figures on `max_abs`, which is what identifies the arm, but its `median_rel` is
+   9.0e-04 where §8.3's is 7.4e-04 — the two compute over different element sets. And it says the
+   error lives in the fp8 pass; it does not say where inside the pass.
 
 ## Appendix — reproducing
 
@@ -620,8 +985,23 @@ cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-majo
 cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/oraclegap_c.sh
 ```
 
+```bash
+# §9.4 Option F timing: unpinned, whole pod (it is a timing)
+cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/optionf_c.sh
+
+# §10 precision ladder + the decode LLO dumps: not timings, fan-out safe
+bash /root/fanout/tpu-fanout.sh \
+  "bash /root/kw/variants/option-c-head-major/precision_c.sh" \
+  "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh decode incumbent" \
+  "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh decode head_major" \
+  "bash /root/kw/variants/option-c-head-major/shard_llo_f.sh prefill f_bf16"
+```
+
 Files: `streamindex_topk_c.py` (the kernel copy + `q_layout`), `stage_a_c.py` (stage-A launcher,
 four arms), `bench_headmajor.py` (chain-slope timing), `bench_numbkv.py` (§7's sweep — reuses
 `bench_headmajor`'s `run_arm`/`_fit` verbatim and swaps in a decode launcher), `dump_llo_c.py` +
 `read_llo_c.py` (static analysis), `run_correctness_c.py` (both gates), `probe_oracle_gap.py`
-(§8's stage-A-vs-stage-B localisation), and the six `*.sh` shard drivers.
+(§8's stage-A-vs-stage-B localisation), `bench_optionf.py` (§9.4), `probe_precision.py` (§10's MXU
+ladder), and the `*.sh` shard drivers. `streamindex_topk_c.py` and `stage_a_c.py` each gained one
+new knob for §9 — `mm_dtype ∈ {native, bf16, f32}` and the three `f_*` arms; both default to the
+incumbent path and leave §1–§8's arms byte-identical.

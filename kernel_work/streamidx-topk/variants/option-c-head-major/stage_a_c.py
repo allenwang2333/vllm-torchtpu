@@ -54,6 +54,22 @@ ARMS = {
     "head_minor": (sxc, "head_minor"),
     "head_major": (sxc, "head_major"),
     "head_major_hbm": (sxc, "head_major_hbm"),
+    # Option F arms.  Added after the numbers in RESULTS.md 1-8 were taken;
+    # they extend `ARMS` and change nothing about the four above -- the `kw`
+    # dict and the `scope_name` an existing arm builds are byte-for-byte what
+    # they were, because `ARM_MM_DTYPE.get(arm, "native")` suppresses both the
+    # kwarg and the name suffix.
+    "f_bf16": (sxc, "head_minor"),
+    "f_bf16_hm": (sxc, "head_major"),
+    "f_f32": (sxc, "head_minor"),
+}
+
+# arm name -> the dtype its score matmul's operands are widened to.  Absent
+# means "native", i.e. the incumbent's float8_e4m3fn x float8_e4m3fn.
+ARM_MM_DTYPE = {
+    "f_bf16": "bf16",
+    "f_bf16_hm": "bf16",
+    "f_f32": "f32",
 }
 
 
@@ -184,6 +200,9 @@ def make_stage_a_fn(
     out_dtype=jnp.float32,
 ):
     mod, q_layout = ARMS[arm]
+    mm_dtype = ARM_MM_DTYPE.get(arm, "native")
+    if mm_dtype != "native" and mod is sx:
+        raise ValueError("the src kernel has no mm_dtype knob")
     page_size = page_size_per_kv_packing * kv_packing
 
     def f(q, prepared_indexer_weights, cache_kv, scores_init, seq_lens,
@@ -249,12 +268,14 @@ def make_stage_a_fn(
         )
         if q_layout is not None:
             kw["q_layout"] = q_layout
+        if mm_dtype != "native":
+            kw["mm_dtype"] = mm_dtype
         suffix = {
             None: "",
             "head_minor": "",
             "head_major": "-hm",
             "head_major_hbm": "-hmhbm",
-        }[q_layout]
+        }[q_layout] + ("" if mm_dtype == "native" else f"-{mm_dtype}")
         scope_name = (
             f"StreamIdxTC{suffix}-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}")
         pallas_kernel = jax.named_scope(scope_name)(pl.pallas_call(
