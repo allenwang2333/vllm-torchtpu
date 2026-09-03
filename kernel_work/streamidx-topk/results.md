@@ -678,3 +678,86 @@ Also: `same_mask: True` everywhere on the F arms, but that is finite/`-inf` agre
 tensor, not top-k index agreement. Stage A does not select, so this harness structurally cannot
 produce the index statistic §11 argues for. `max_abs` vs incumbent is 2.92 / 2.24, about 2.7× the
 incumbent's own deviation from f64.
+
+---
+
+## 12. Recommendation
+
+Three changes are worth making, and they are worth making in this order. Everything else in this
+document is a measured reason **not** to do something, which was most of the value.
+
+### Adopt
+
+**1. `bkv_p = 9` — the largest win, one line, decode (§6).**
+**−14.6% on the full decode op** at ctx 8704 (chain slope; `hlo_stats` independently −16.0%),
+correctness verified against an f64 oracle with byte-identical index sets. Ship it as
+`p = cdiv(max_model_len, page_size)`, which is the cheap 90%. **Do not ship it as a bare constant
+`9`** — it is +38.0% at ctx 4096 and +14.2% at 6144, so a deployment whose `max_model_len` is small,
+or which serves short contexts through the same compiled bucket, gets slower. The full win needs
+per-bucket compilation and dispatch, because `bkv_p` is a compile-time static while `num_bkv` is
+runtime.
+
+**2. D1 — delete the early-exit `cond` (§4).** **−10.0%** on device self time, correctness verified,
+and it needs **no new code**: `enable_early_exit=False` already selects the path. XLA's ordinary CSE
+does the whole 21→1 collapse once the `cond` boundary is gone. Note the safety argument leans on
+`test_streamindex_topk_early_exit_*` — tests of the branch being removed.
+
+**3. Option C — head-major score layout, prefill only (§3).** **−17.8% to −20.7%** on prefill
+stage A across every `num_bkv`, index-identical output, mechanism confirmed instruction-for-
+instruction. **Gate it to prefill/MIXED as a hard requirement**: decode regresses **+59.62%**, now a
+finding rather than a suspicion.
+
+Call-level arithmetic for C, stated so it can be checked: prefill stage A is 249.300 µs of the
+749.538 µs call. If all three stage-A launches benefit at the measured −20.3%, that is ~50.6 µs, or
+**~6.7% of the prefill call**; if only the one launch that was measured benefits, ~2.2%. **The
+proportional case is an assumption — only a single stage-A call was measured.** That gap is the
+first thing to settle before quoting C at call level.
+
+**Composition is unmeasured.** Candidate 0 and D1 both act at decode and look orthogonal — one is a
+fetch parameter, the other a control-flow boundary — but "looks orthogonal" is what Option D's hoist
+also looked like before XLA's CSE turned a 21→1 collapse into 0.01%. Measure the pair before
+claiming −24%.
+
+### Do not adopt
+
+| | why |
+| --- | --- |
+| **A** — 128-byte K record | 17.9% short of its own floor. Passes its byte-reduction gate at `bkv_p=9` and the pass is irrelevant: 94.3% of the fetch is already hidden (§7.1) |
+| **E** — `_pick_partition` | correct, and the win lands on a bucket `min_token_size=16` makes unreachable (§5) |
+| **F** — bf16 operands | premise false; the operands are already fp8. +4.63%/+9.80% (§11.2) |
+
+### Hand off, don't drop
+
+**Option B is the largest prefill number in this document — +16.4%/+24.4% on the op, gate passed by
+5–12× — and it is not a kernel change (§8).** It needs the runner to pack the batch into chunks and
+pass the plan down as static metadata, because the production prefill shape is one sequence of 1024
+tokens and stage A's grid is over sequences. Route it to `/preflight-check` and an end-to-end
+benchmark. It is the single most valuable unowned item here.
+
+### What this block has left
+
+**Prefill stage A is done.** 1319 FLOP/B against a 384 ridge, 7.1% of measured time in the HBM
+floor, **75.4% issue/VPU** — the axis C attacked. An infinitely fast score matmul would save ≤5.4%
+(§11.3). After C there is no material headroom on either roofline axis, and further prefill stage-A
+work should be justified against that 5.4% before it is started.
+
+**Prefill as a whole is undecidable, and stage B is why.** 431 of 749 µs is SparseCore, and there is
+no first-principles SparseCore floor to divide into —`references/hardware-facts.md` contains no
+measured SparseCore fact. Defensible treatments span 53.9%–92.0% of floor. Building one is the
+highest-leverage missing input in this whole exercise, and it is a reference-file gap, not a kernel
+question.
+
+**Decode remains structural at ~45% of floor** (33–53%), so candidate 0 is unlikely to be the end of
+it.
+
+### Two methodological results worth more than any single option
+
+**A host dispatch floor is a clamp, not an addend.** Six quantities re-measured with a floor-immune
+method all came in smaller, including the baseline that a pass/fail bar was written against — a bar
+the incumbent had already cleared, so it discriminated nothing (§1). Any per-call wall clock in this
+codebase should be treated as `max(device, host)` until shown otherwise.
+
+**A data distribution is part of a benchmark's configuration.** The stage-B k-sweep was calibrated
+on synthetic N(0,1) scores and understates production by 22%, because real indexer scores are
+all-positive with few distinct exponents and the MSB-first radix select needs more passes. N(0,1) is
+not a neutral default for a radix algorithm (§1).
