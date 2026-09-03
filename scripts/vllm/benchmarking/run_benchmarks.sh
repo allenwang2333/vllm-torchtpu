@@ -223,6 +223,23 @@ if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
     mkdir -p "$PROFILE_DIR"
 fi
 
+# Local directory holding everything of the checkpoint EXCEPT the weights.
+# Echoes the path; caches across cells of one container (the copy is a few MB
+# but the arm loop would otherwise repeat it every restart).
+STAGED_METADATA_DIR="${STAGED_METADATA_DIR:-/root/k3-metadata}"
+stage_metadata_dir() {
+    if [ -f "$STAGED_METADATA_DIR/config.json" ]; then
+        echo "$STAGED_METADATA_DIR"; return 0
+    fi
+    if [ -z "$MODEL_URI" ]; then
+        echo "$MODEL"; return 0
+    fi
+    python3 "$REPO_DIR/.buildkite/scripts/stage_tokenizer.py" \
+        "$MODEL_URI" "$STAGED_METADATA_DIR" >&2 || {
+        echo "ERROR: could not stage $MODEL_URI metadata" >&2; return 1; }
+    echo "$STAGED_METADATA_DIR"
+}
+
 start_vllm_server() {
     local max_model_len=$1
     local max_num_batched_tokens=$2
@@ -266,7 +283,27 @@ start_vllm_server() {
     fi
     local kv_cache_dtype="$KV_CACHE_DTYPE"
     local serve_target="$MODEL"
-    if [ -n "$MODEL_URI" ]; then
+    if [ "${LOAD_FORMAT:-}" = "dummy" ]; then
+        # Random weights. The checkpoint's METADATA is still required (config,
+        # tokenizer, remote code) and is a few MB; the 96 safetensors shards
+        # are never opened.
+        #
+        # Prefer the gs:// URI over a staged local directory. Staging runs in
+        # the head container only, so on a multihost run the worker hosts have
+        # no such path and HuggingFace falls back to treating it as a repo id:
+        # "OSError: Repo id must be in the form 'repo_name' or
+        # 'namespace/repo_name': '/root/k3-metadata'". Build 352 lost all seven
+        # cells that way, because stage_metadata_dir() caches its result and
+        # every later arm reused the head-local path too.
+        #
+        # The URI keeps the arms one variable apart at least as well as staging
+        # did: both serve the identical gs:// target and differ only in the
+        # load format, and each container fetches its own copy of the config,
+        # tokenizer and remote code. Staging stays as the fallback for a run
+        # with no MODEL_URI.
+        serve_target="${MODEL_URI:-$(stage_metadata_dir)}"
+        extra_args="$extra_args --load-format dummy --served-model-name $MODEL"
+    elif [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
     fi
@@ -287,6 +324,23 @@ start_vllm_server() {
     if [ "$DRY_RUN" = "1" ]; then
         echo "[DRY RUN] Skipping server launch"
         return
+    fi
+
+    # 30 s here against a 300-900 s bring-up. vLLM refuses some flag
+    # combinations inside the engine core rather than in argparse -- the
+    # loader rejecting --model-loader-extra-config under load_format dummy
+    # cost three arms across two CDK jobs before this existed. Fatal on
+    # purpose: a rejected argv cannot produce a measurement.
+    if [ "${PREFLIGHT_SERVE:-1}" = "1" ]; then
+        # PIPESTATUS, not the pipeline's status: grep succeeds on a REJECTED
+        # line too, so `if ! ... | grep` would be a gate that never fires.
+        # shellcheck disable=SC2086  # deliberate word-splitting, as below
+        python3 "$SCRIPT_DIR/preflight_serve_argv.py" ${server_cmd#vllm serve } 2>&1 \
+            | grep -aE '^\[preflight\]'
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "ERROR: preflight rejected the serve command; not launching."
+            exit 1
+        fi
     fi
 
     if curl -s -o /dev/null --connect-timeout 1 "http://localhost:$PORT/health" 2>/dev/null; then
@@ -312,6 +366,17 @@ start_vllm_server() {
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo ""
             echo "ERROR: Server process died during startup."
+            # The tail is not the cause. A worker that refuses its config dies
+            # ~600 lines before the end and the tail shows only "Engine core
+            # initialization failed. See root cause above" -- which is how
+            # `--model-loader-extra-config` under load_format dummy reached a
+            # TPU (CDK j-94240ea7). Surface the FIRST real exception line, at
+            # the top, where a job log reader will see it.
+            echo "========== root cause (first exception lines) =========="
+            _exc='(ValueError|TypeError|KeyError|IndexError|RuntimeError|AssertionError|NotImplementedError|OSError|ImportError|ShapeSpecializationError):'
+            grep -aE "$_exc" "$RESULTS_DIR/server.log" \
+                | grep -avF 'Engine core initialization failed' \
+                | sed -E "s/.*($_exc.*)/\1/" | cut -c1-300 | sort -u | head -5
             echo "========== Last 200 lines of server.log =========="
             tail -200 "$RESULTS_DIR/server.log"
             echo "==================================================="
@@ -444,7 +509,11 @@ run_benchmark_once() {
 # the client falls back to MODEL.
 BENCH_TOKENIZER="${BENCH_TOKENIZER:-}"
 PULLED_TOKENIZER_DIR=""
-if [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
+if [ -z "$BENCH_TOKENIZER" ] && [ "${LOAD_FORMAT:-}" = "dummy" ]; then
+    # No runai pull happens on this path, so point the client at the same
+    # staged copy the server was given.
+    PULLED_TOKENIZER_DIR="$STAGED_METADATA_DIR"
+elif [ -z "$BENCH_TOKENIZER" ] && [ -n "$MODEL_URI" ]; then
     PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
@@ -493,6 +562,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
 {
     "model": "$MODEL",
     "model_uri": $model_uri_json,
+    "weights": "$([ "${LOAD_FORMAT:-}" = dummy ] && echo dummy || echo real)",
     "tensor_parallelism": $TENSOR_PARALLELISM,
     "data_parallelism": $DATA_PARALLELISM,
     "enable_ep": $ENABLE_EP,
@@ -636,6 +706,57 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
         fi
     done
 done
+
+# =============================================================================
+# Sanity probe: did the model actually work?
+# =============================================================================
+# `vllm bench serve --save-result` keeps metrics and no text, and every recipe
+# here passes --ignore-eos, so a request completes whatever the model emits.
+# A run therefore cannot distinguish a working model from a broken one, and
+# that is not hypothetical: dev build 299 reported 20/20 completed and a median
+# TPOT for a Kimi-K3 whose routed experts were half `torch.empty`, because a
+# merged flag bypassed its own weight-filter realignment on the streaming
+# loader. Nothing in the bundle could have shown it.
+#
+# So take one greedy completion before teardown and say, on STDOUT (the job log
+# survives a cancel; server.log does not), whether the text is degenerate.
+# BENCHMARK_SANITY_PROBE=0 opts out.
+if [ "${BENCHMARK_SANITY_PROBE:-1}" = "1" ] && [ "$exit_code" -eq 0 ] \
+   && [ "${DRY_RUN:-0}" != "1" ]; then
+    echo "--- Sanity probe"
+    if python3 "$SCRIPT_DIR/k3_completion_probe.py" \
+            --model "$MODEL" --base-url "http://$HOST:$PORT" \
+            --num-prompts 2 --words-per-prompt 600 --max-tokens 32 \
+            --out "$RESULTS_DIR/sanity_completions.json" >/dev/null 2>&1; then
+        python3 - "$RESULTS_DIR/sanity_completions.json" <<'PYEOF'
+import json, sys
+
+# A model with uninitialised expert shards still emits *tokens*; what it stops
+# emitting is variety. distinct/total over a greedy continuation separates the
+# two without needing a reference output or a tokenizer.
+worst = None
+for key, cap in sorted(json.load(open(sys.argv[1])).items()):
+    if "error" in cap:                      # the probe failed, the model did not
+        print(f"K3SANITY prompt={key} error={cap['error'][:80]!r}")
+        continue
+    text = cap.get("text") or ""
+    toks = cap.get("tokens") or text.split()
+    ratio = len(set(toks)) / len(toks) if toks else 0.0
+    worst = ratio if worst is None else min(worst, ratio)
+    print(f"K3SANITY prompt={key} n_tokens={len(toks)} distinct_ratio={ratio:.3f} "
+          f"text={text[:70]!r}")
+if worst is None:
+    print("K3SANITY verdict=NO_DATA")
+else:
+    # 0.25 is well under any healthy continuation and well over a model stuck in
+    # a short cycle; calibrate it against a known-good run before tightening.
+    print(f"K3SANITY worst_distinct_ratio={worst:.3f} "
+          f"verdict={'OK' if worst >= 0.25 else 'DEGENERATE'}")
+PYEOF
+    else
+        echo "K3SANITY verdict=PROBE_FAILED (server did not answer /v1/completions)"
+    fi
+fi
 
 # =============================================================================
 # Summary
