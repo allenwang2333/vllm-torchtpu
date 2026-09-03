@@ -181,7 +181,15 @@ spec:
                       export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
                       export TPU_RAIDEN_ADVERTISE_HOST="${VLLM_HOST_IP}"
 
-                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                      # 2048, not the 4096 launch_dsv4_dp4_dp4.sh compiles for.
+                      # DP attention all-gathers every rank's tokens before the
+                      # MoE, so the gathered batch is compile_size x DP, and at
+                      # DP8 x 4096 the XLA temporaries came to 114.93 GiB against
+                      # 94.74 GiB of HBM. 2048 puts the gathered batch back at the
+                      # 16384 tokens the DP4 host compiles today, and it is also
+                      # the real ceiling here, since --max-num-batched-tokens is
+                      # 2048 and no scheduled batch ever reaches 4096.
+                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[2048],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
 
                       echo "===== Starting DeepSeek-V4 DP8 prefill ====="
@@ -452,7 +460,11 @@ spec:
                       export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-decode-engine"
                       export TPU_RAIDEN_ADVERTISE_HOST="${VLLM_HOST_IP}"
 
-                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                      # 256 is what the decode replica is compiled for in
+                      # launch_dsv4_dp4_dp4.sh and therefore what Tier 1 was
+                      # verified against. Decode only ever runs single-token
+                      # steps here, because the producer ships the prefix.
+                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[256],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
                       KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
 
                       echo "===== Starting DeepSeek-V4 DP8 decode ====="
