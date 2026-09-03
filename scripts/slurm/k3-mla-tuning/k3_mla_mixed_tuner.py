@@ -371,11 +371,12 @@ def main() -> int:
     parser.add_argument(
         "--candidates",
         type=parse_candidates,
-        default=parse_candidates("1x8,1x16,1x32,2x8,2x16,2x32,4x8,4x16,4x32"),
+        default=parse_candidates(
+            "1x12,1x24,1x48,2x12,2x24,2x48,4x12,4x24,4x48"),
     )
     parser.add_argument("--q-splits",
                         type=parse_positive_ints,
-                        default=parse_positive_ints("1,2"))
+                        default=parse_positive_ints("1,3"))
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument(
@@ -394,7 +395,7 @@ def main() -> int:
     parser.add_argument("--pages-per-seq", type=int, default=768)
     parser.add_argument("--page-size-per-kv-packing", type=int, default=128)
     parser.add_argument("--kv-packing", type=int, default=2)
-    parser.add_argument("--local-num-heads", type=int, default=2)
+    parser.add_argument("--local-num-heads", type=int, default=3)
     parser.add_argument("--lkv-dim", type=int, default=512)
     parser.add_argument("--r-dim", type=int, default=64)
     parser.add_argument("--vmem-mib", type=int, default=60)
