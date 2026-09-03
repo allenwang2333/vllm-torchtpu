@@ -685,12 +685,6 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"topk ({topk}) must be a multiple of "
             f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing")
-    if (sparsecore_layout
-            and q.shape[0] % gather_and_attention_chunk_size != 0):
-        raise ValueError(
-            f"gather_and_attention_chunk_size "
-            f"({gather_and_attention_chunk_size}) must divide q tokens "
-            f"({q.shape[0]}) for sparsecore gather")
 
     # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)

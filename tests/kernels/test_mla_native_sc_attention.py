@@ -26,9 +26,7 @@ ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM
 
 
-def _build_problem(rng, *, k_scale):
-    query_tokens = 128
-    topk = 256
+def _build_problem(rng, *, k_scale, query_tokens=128, topk=256):
     page_size = 256
     cache_tokens = 8192
     pages = cache_tokens // page_size
@@ -177,6 +175,44 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                                        np.asarray(paged_out, dtype=np.float32),
                                        rtol=2e-2,
                                        atol=2e-2)
+
+    def test_sparsecore_layout_supports_short_query_chunk(self):
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        problem = _build_problem(np.random.default_rng(20260903),
+                                 k_scale=1.0,
+                                 query_tokens=16,
+                                 topk=2048)
+        kwargs = {
+            "sm_scale": 0.125,
+            "gather_and_attention_chunk_size": 64,
+            "attention_kernel_batch_size": 16,
+        }
+
+        tensorcore_out = sparse_mla.sparse_ragged_paged_attention(
+            problem["q"], problem["tensorcore_nope"],
+            problem["tensorcore_rope"], problem["topk"], problem["page_table"],
+            problem["cu_q_lens"], problem["distribution"], **kwargs)
+        sparsecore_out = sparse_mla.sparse_ragged_paged_attention(
+            problem["q"],
+            problem["sparsecore_nope"],
+            problem["sparsecore_rope"],
+            problem["topk"],
+            problem["page_table"],
+            problem["cu_q_lens"],
+            problem["distribution"],
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            **kwargs,
+        )
+        tensorcore_out, sparsecore_out = jax.block_until_ready(
+            (tensorcore_out, sparsecore_out))
+
+        np.testing.assert_allclose(np.asarray(sparsecore_out,
+                                              dtype=np.float32),
+                                   np.asarray(tensorcore_out,
+                                              dtype=np.float32),
+                                   rtol=2e-2,
+                                   atol=2e-2)
 
     def test_sparsecore_layout_validation(self):
         q = jnp.zeros((128, 8, HEAD_DIM), jnp.bfloat16)
