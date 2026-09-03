@@ -259,11 +259,24 @@ def _production_shapes() -> list[Shape]:
     # promise. If the per-call cost is flat in num_seqs the op is dominated by
     # the fixed full-width buffer rather than by the work, which is a different
     # optimization target.
+    # b=8 is NOT a production shape, despite the row's name and the note it
+    # used to carry. `min_token_size = 16` is hardcoded
+    # (`tpu_platform.py:1236-1276`), so the smallest token bucket vLLM ever
+    # compiles is 16 and nothing below it is reachable. The row is kept
+    # because it is a useful synthetic point for the flatness question above
+    # -- and because a stage-B probe found `_pick_partition` costs 2.91x here
+    # -- but a win measured at b=8 is a win on a shape that never runs.
+    # Under DP=16 the bucket is an all-reduce MAX, so even b=16 needs all
+    # sixteen engines at <=16 tokens at once; the nightly's steady state is 64.
     for n in (8, 32):
+        reachable = n >= 16
         out.append(
             Shape(f"prod_decode_b{n}_ctx8704", "decode", n, 1, 8704,
-                  note=f"PRODUCTION shape, batch {n} of max_num_seqs "
-                  f"{PROD_MAX_NUM_SEQS}",
+                  note=(f"PRODUCTION shape, batch {n} of max_num_seqs "
+                        f"{PROD_MAX_NUM_SEQS}" if reachable else
+                        f"SYNTHETIC, NOT PRODUCTION: batch {n} < the "
+                        f"hardcoded min_token_size 16, so this bucket is "
+                        f"never compiled. Do not quote it as a workload."),
                   max_model_len=mml))
     # Chunked prefill: one 1024-token chunk. The first chunk has almost no
     # history, the last has nearly the full context, and they are different
