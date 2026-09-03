@@ -499,7 +499,7 @@ def pair_report(results, form, bkv_p, small=132):
     }
 
 
-def interpret(pairs, results, floor):
+def interpret(pairs, results, floor, gate_bkvp=2):
     if floor:
         worst = min((r["best_s"] for r in results if r["ok"]), default=None)
         if worst is not None:
@@ -514,17 +514,17 @@ def interpret(pairs, results, floor):
                   "compressing the ratio toward 1.0 and the gate is biased "
                   "AGAINST Option A. Re-run with a larger --num-grid.")
     key = next((q for q in pairs
-                if q and q["form"] == "indirect" and q["bkv_p"] == 2
+                if q and q["form"] == "indirect" and q["bkv_p"] == gate_bkvp
                 and q.get("small_rec", 132) == 132), None)
     if key is None:
-        p("R1_VERDICT", "INCONCLUSIVE -- the indirect/bkv_p=2 pair, which is "
-          "the nightly decode configuration and the one the gate is written "
-          "about, did not produce two arms.")
+        p("R1_VERDICT", f"INCONCLUSIVE -- the indirect/bkv_p={gate_bkvp} pair, "
+          "which is the configuration the gate is being read at, did not "
+          "produce two arms.")
         return
     cr = key["charge_ratio_best"]
     saved = key["time_saved_best"] * 100
     p("R1_CHARGE_RATIO", f"{cr:.3f}  (t(262144B)/t(132096B), best-of-N, "
-      f"indirect form, bkv_p=2, same DMA count)")
+      f"indirect form, bkv_p={gate_bkvp}, same DMA count)")
     p("R1_TIME_SAVED_BY_HALVING", f"{saved:.1f}%")
     if saved <= 33.0:
         p("R1_VERDICT", "GATE FAILED -- halving the bytes saves <=33% of the "
@@ -546,7 +546,12 @@ def main():
                          "nightly-exact call, and read the dispatch-floor "
                          "line before trusting its ratio.")
     ap.add_argument("--seq-batch-size", type=int, default=4)
-    ap.add_argument("--pages-per-seq", type=int, default=10)
+    ap.add_argument("--pages-per-seq", type=int, default=None,
+                    help="page-table entries per sequence. Defaults to 10 "
+                         "(nightly decode) for the 'main' and 'followup' "
+                         "suites, and to 18 for 'deep', where bkv_p*num_bkv "
+                         "reaches 18 and a 10-entry stride would make the "
+                         "tail DMAs clamp onto the last page-table entry.")
     ap.add_argument("--num-pages", type=int, default=2048,
                     help="pages in the synthetic cache; must exceed "
                          "num_grid*seq_batch_size*pages_per_seq for the page "
@@ -554,14 +559,23 @@ def main():
     ap.add_argument("--trials", type=int, default=9,
                     help="best-of-N; >=7 is required, the pod's run-to-run "
                          "spread is +-8.5%%")
-    ap.add_argument("--suite", choices=("main", "followup"), default="main",
+    ap.add_argument("--suite", choices=("main", "followup", "deep"),
+                    default="main",
                     help="'main' is the R1 gate itself: three DMA forms at "
                          "bkv_p 2 and 3. 'followup' answers the two questions "
                          "the R1 red-team review raised -- is the residual an "
                          "ALIGNMENT artifact of Option A's 258-row page "
                          "(rec135 control), and does the saving keep climbing "
-                         "with DMA concurrency (bkv_p 4 and 6)?")
+                         "with DMA concurrency (bkv_p 4 and 6)? 'deep' reads "
+                         "the gate at the bkv_p the extended Candidate 0 "
+                         "sweep actually selects -- cdiv(ctx, page_size) = 8 "
+                         "at ctx 8192 and 9 at ctx 8704 -- which is past the "
+                         "top of the followup sweep, so the saving there was "
+                         "an extrapolation and is measured here instead. "
+                         "bkv_p 6 is repeated as an anchor against 'followup'.")
     args = ap.parse_args()
+    if args.pages_per_seq is None:
+        args.pages_per_seq = 18 if args.suite == "deep" else 10
 
     tpu_banner()
     p("hbm memory space", repr(_HBM_SPACE))
@@ -576,6 +590,12 @@ def main():
     bkvp_to_numbkv = {2: 5, 3: 4, 4: 3, 6: 2}
     if args.suite == "main":
         bkvp_to_numbkv = {2: 5, 3: 4}
+    elif args.suite == "deep":
+        # bkv_p 6 (anchor, also in `followup`), then the two the extended
+        # Candidate 0 sweep selects. num_bkv is 2 throughout so the pipeline
+        # depth is identical across the three and only the DMAs in flight per
+        # wait change: 24, 32, 36 at seq_batch_size 4.
+        bkvp_to_numbkv = {6: 2, 8: 2, 9: 2}
 
     for bkv_p, num_bkv in bkvp_to_numbkv.items():
         check_schedule(args.num_grid, num_bkv)
@@ -587,7 +607,7 @@ def main():
       f"num_grid={args.num_grid} seq_batch_size={args.seq_batch_size} "
       f"pages_per_seq={args.pages_per_seq} num_pages={args.num_pages} "
       f"trials={args.trials}")
-    recs = (256, 132) if args.suite == "main" else (256, 132, 135)
+    recs = (256, 132, 135) if args.suite == "followup" else (256, 132)
     for rec in recs:
         psp, kvp, lkv = RECORDS[rec]
         p(f"record {rec}",
@@ -626,6 +646,10 @@ def main():
             arms.append(("affine", rec, 2))
         for rec in (256, 132):
             arms.append(("indirect_dynlen", rec, 2))
+    elif args.suite == "deep":
+        for bkv_p in (6, 8, 9):
+            for rec in (256, 132):
+                arms.append(("indirect", rec, bkv_p))
     else:
         # Alignment control: 132 (misaligned) and 135 (4 KiB-aligned) against
         # the same 256 arm, in the same process, at both bkv_p the gate cares
@@ -660,6 +684,39 @@ def main():
             pair_report(results, "affine", 2),
             pair_report(results, "indirect_dynlen", 2),
         ]
+    elif args.suite == "deep":
+        pairs = [pair_report(results, "indirect", b) for b in (6, 8, 9)]
+        p("---", "concurrency sweep: per-DMA time vs DMAs in flight")
+        for rec in (256, 132):
+            row = []
+            for bkv_p in (6, 8, 9):
+                r = next((x for x in results if x["ok"] and x["rec"] == rec
+                          and x["form"] == "indirect"
+                          and x["bkv_p"] == bkv_p), None)
+                if r:
+                    row.append(f"bkvp{bkv_p}(inflight "
+                               f"{bkv_p*args.seq_batch_size}): "
+                               f"{r['best_s']/r['n_dma']*1e9:6.1f}ns/DMA "
+                               f"{r['bps']:.3e}B/s")
+            p(f"CONCURRENCY rec{rec}", "  ".join(row))
+        # The absolute stake, normalised to the nightly decode call's own DMA
+        # count (640 = 16 grid steps x 4 sequences x 10 pages). The probe moves
+        # a different number of DMAs per call, so the per-DMA saving is what
+        # transfers, not the per-call one.
+        for bkv_p in (6, 8, 9):
+            a = next((x for x in results if x["ok"] and x["rec"] == 256
+                      and x["form"] == "indirect" and x["bkv_p"] == bkv_p),
+                     None)
+            b = next((x for x in results if x["ok"] and x["rec"] == 132
+                      and x["form"] == "indirect" and x["bkv_p"] == bkv_p),
+                     None)
+            if a and b:
+                per_dma = (a["best_s"] - b["best_s"]) / a["n_dma"]
+                p(f"STAKE bkvp{bkv_p}",
+                  f"delta={per_dma*1e9:6.1f}ns/DMA -> "
+                  f"{per_dma*640*1e6:6.2f}us over the nightly call's 640 page "
+                  f"DMAs (DMA-only, no compute to overlap with, so an upper "
+                  f"bound on the call-level saving)")
     else:
         pairs = [
             pair_report(results, "indirect", 2),
@@ -717,7 +774,14 @@ def main():
               f"({ind['best_s']*1e6:.2f}us vs {aff['best_s']*1e6:.2f}us)")
 
     p("---", "interpretation")
-    interpret([q for q in pairs if q], results, floor)
+    if args.suite == "deep":
+        # Read the gate at 9 (ctx 8704) and at 8 (ctx 8192) separately: they
+        # are two different production points, not a headline and a check.
+        for gate_bkvp in (9, 8):
+            interpret([q for q in pairs if q], results, floor,
+                      gate_bkvp=gate_bkvp)
+    else:
+        interpret([q for q in pairs if q], results, floor)
 
     emit_json(f"R1_kpack_{args.suite}_grid{args.num_grid}", {
         "geometry": vars(args),
