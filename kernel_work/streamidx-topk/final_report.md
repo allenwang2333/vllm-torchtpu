@@ -1,6 +1,10 @@
 # `streamindex_topk` — final report
 
-**Status: ready for review. Not yet `/critical-review`ed, and no end-to-end benchmark has been run.**
+**Status: REOPENED 2026-09-03 — do not review as final.** The runner-side change that Option B
+needs was ruled out of scope while this was written; it has since been authorized, and Option B is
+back in the candidate set with a measured **B×C = −26.18% on the prefill op** (§5 is stale as a
+result). A runner prototype is being built and measured. `/critical-review` is running against the
+version below. No end-to-end benchmark has been run.
 
 The shipping candidate is **three changes composed into one op**, measured together, index-identical
 to the incumbent at every config tested. Detail lives in `results.md` (per-option) and
