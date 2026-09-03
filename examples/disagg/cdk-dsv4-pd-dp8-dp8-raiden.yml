@@ -36,19 +36,23 @@
 #     runner derives (1024 down to 16 tokens), and overriding block size would
 #     break the per-group geometry this PR exists to support.
 #
-# BEFORE THIS CAN RUN, two things must be staged. Neither exists in the cluster
-# today:
+# Both of this recipe's out-of-band inputs are staged in GCS, so it needs no NFS
+# and no custom image. PR #684 is unmerged and no published image carries it, so
+# each container pulls the source as a tarball, the same way the structured
+# decoding recipes pull pr596 and pr625, and puts it ahead of the image's copy on
+# PYTHONPATH. Rebuild that tarball from the PR checkout after any change:
 #
-#   1. PR #684's source, at /workspace/alynie-pr684 on the workspace NFS
-#      (10.225.237.178), mounted here at /root/torchtpu-vllm. The PR is unmerged
-#      and no published image carries it.
-#   2. The DeepSeek-V4-Flash checkpoint. It is not under gs://cloud-devkit/ckpt/hf
-#      and not on /workspace/models, which holds only Qwen. It is 149 GiB.
-#      Set MODEL to a gs:// URI once uploaded, or mount it and use a local path.
+#   git archive --format=tar.gz -o pr684.tar.gz HEAD
+#   gsutil cp pr684.tar.gz gs://alynie-k3-scratch/repos/vllm-torchtpu/prs/
+#
+# The checkpoint is the other input. DeepSeek-V4-Flash is not under
+# gs://cloud-devkit/ckpt/hf, which holds only Qwen and nvidia/GLM, and no other
+# recipe in the cluster runs a DeepSeek model, so there was nothing to reuse. The
+# 149 GiB snapshot is uploaded to gs://alynie-k3-scratch/ckpt/hf and passed to
+# --model as a gs:// URI, exactly as the Qwen recipes pass theirs.
 #
 # Run with:
-#   cdk recipe run examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml \
-#     --set MODEL=gs://<bucket>/DeepSeek-V4-Flash
+#   cdk recipe run examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml
 
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -82,11 +86,6 @@ spec:
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                - name: torchtpu-vllm-nfs
-                  nfs:
-                    server: 10.225.237.178
-                    # PR #684, staged out of band. See the header.
-                    path: /workspace/alynie-pr684
                 - name: hf-token-volume
                   secret:
                     secretName: vllm-hf-token
@@ -106,8 +105,13 @@ spec:
                       export CDK_OUTPUT_DIR
                       mkdir -p "$CDK_OUTPUT_DIR"
 
-                      # The PR checkout must win over the image's copy.
-                      export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                      # PR #684 is unmerged, so pull it from GCS and put it
+                      # ahead of the image's copy. Same mechanism the structured
+                      # decoding recipes use for pr596 and pr625.
+                      mkdir -p /workspace/vllm-torchtpu
+                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
 
                       # Preflight. Every one of these fails loudly at startup
                       # rather than silently mis-transferring later, which is
@@ -164,8 +168,10 @@ spec:
                       valueFrom:
                         fieldRef:
                           fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                    - name: PR_TARBALL
+                      value: "{{ .PR_TARBALL | default `gs://alynie-k3-scratch/repos/vllm-torchtpu/prs/pr684.tar.gz` }}"
                     - name: MODEL
-                      value: "{{ .MODEL | default `deepseek-ai/DeepSeek-V4-Flash` }}"
+                      value: "{{ .MODEL | default `gs://alynie-k3-scratch/ckpt/hf/deepseek-ai/DeepSeek-V4-Flash` }}"
                     - name: SERVED_MODEL
                       value: "deepseek-ai/DeepSeek-V4-Flash"
                     - name: VLLM_LOGGING_LEVEL
@@ -262,9 +268,6 @@ spec:
                     - name: TPU_SIDE_CHANNEL_PORT
                       value: "9600"
                   volumeMounts:
-                    - name: torchtpu-vllm-nfs
-                      mountPath: /root/torchtpu-vllm
-                      readOnly: true
                     - name: hf-token-volume
                       mountPath: /root/.cache/huggingface/token
                       subPath: token
@@ -294,9 +297,14 @@ spec:
                   command: ["/bin/bash", "-c"]
                   args:
                     - |
+                      set -eo pipefail
+                      mkdir -p /workspace/vllm-torchtpu
+                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+
                       PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
                       DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
-                      python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                      python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
                         --host 0.0.0.0 \
                         --port 10000 \
                         --prefiller-hosts $PREFILLER_DNS \
@@ -308,10 +316,8 @@ spec:
                       valueFrom:
                         fieldRef:
                           fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
-                  volumeMounts:
-                    - name: torchtpu-vllm-nfs
-                      mountPath: /root/torchtpu-vllm
-                      readOnly: true
+                    - name: PR_TARBALL
+                      value: "{{ .PR_TARBALL | default `gs://alynie-k3-scratch/repos/vllm-torchtpu/prs/pr684.tar.gz` }}"
                   ports:
                     - containerPort: 10000
                   resources:
@@ -338,10 +344,6 @@ spec:
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                - name: torchtpu-vllm-nfs
-                  nfs:
-                    server: 10.225.237.178
-                    path: /workspace/alynie-pr684
                 - name: hf-token-volume
                   secret:
                     secretName: vllm-hf-token
@@ -361,7 +363,10 @@ spec:
                       export CDK_OUTPUT_DIR
                       mkdir -p "$CDK_OUTPUT_DIR"
 
-                      export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                      mkdir -p /workspace/vllm-torchtpu
+                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
                       python3 -c "from tpu_sync.api.torch.reshard_client import ReshardClient; print('tpu_sync OK')"
                       python3 -c "
                       import vllm_torchtpu.distributed.kv_transfer.tpu_connector as c
@@ -411,9 +416,6 @@ spec:
                         2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
                   env: *dsv4-env
                   volumeMounts:
-                    - name: torchtpu-vllm-nfs
-                      mountPath: /root/torchtpu-vllm
-                      readOnly: true
                     - name: hf-token-volume
                       mountPath: /root/.cache/huggingface/token
                       subPath: token
@@ -450,11 +452,6 @@ spec:
           template:
             spec:
               restartPolicy: Never
-              volumes:
-                - name: torchtpu-vllm-nfs
-                  nfs:
-                    server: 10.225.237.178
-                    path: /workspace/alynie-pr684
               containers:
                 - name: bench
                   image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
@@ -477,7 +474,10 @@ spec:
                       done
                       [ "$code" = "200" ] || { echo "RESULT: FAIL (proxy never came up)"; exit 1; }
 
-                      cd /root/torchtpu-vllm/examples/disagg
+                      mkdir -p /workspace/vllm-torchtpu
+                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      cd /workspace/vllm-torchtpu/examples/disagg
 
                       # T1.1 and T1.2. Lengths straddle the SWA page boundary:
                       # at page_tokens 128 and window 128 the trim skips
@@ -510,10 +510,8 @@ spec:
                       valueFrom:
                         fieldRef:
                           fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
-                  volumeMounts:
-                    - name: torchtpu-vllm-nfs
-                      mountPath: /root/torchtpu-vllm
-                      readOnly: true
+                    - name: PR_TARBALL
+                      value: "{{ .PR_TARBALL | default `gs://alynie-k3-scratch/repos/vllm-torchtpu/prs/pr684.tar.gz` }}"
                   resources:
                     requests: { cpu: "4", memory: "8Gi" }
                     limits: { cpu: "8", memory: "16Gi" }

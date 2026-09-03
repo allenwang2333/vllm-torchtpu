@@ -18,6 +18,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 """
 
 import json
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -192,7 +193,8 @@ def _stage3_trim_window_pages(
     if len(set(kept)) != len(kept):
         raise ValueError(
             "Stage-3 sliding-window block table still repeats a page after "
-            f"trimming: group={group_label}, kept={kept}, "
+            f"trimming: group={group_label}, kept={kept}, ids={ids}, "
+            f"skipped={skipped}, "
             f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
             f"window={window_tokens}")
     return kept
@@ -1363,6 +1365,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                         pcp_size=pcp_size)) for group, ids in zip(
                             self._stage3_transfer_groups, group_block_ids)
             ]
+
+        if os.environ.get("TPU_RAIDEN_DEBUG_BLOCK_TABLES") == "1":
+            logger.info(
+                "STAGE3_DBG req=%s computed=%d prompt=%d num_tokens=%d "
+                "groups=%s", request.request_id, computed_tokens,
+                prompt_tokens, num_tokens,
+                [list(ids) for ids in (group_block_ids or [])])
 
         producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
                             if self.vllm_config.parallel_config else 0)

@@ -140,6 +140,21 @@ point of Tier 2 is not to re-prove correctness from scratch; it is to show
 that nothing in the transfer depends on producer and consumer sharing a host,
 which is precisely what the single-host run cannot rule out.
 
+**Staging, which is done.** The recipe is
+`examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml`. Both of its out-of-band
+inputs now exist. Unmerged PR code ships to cdk as a GCS tarball rather than
+over NFS: `gs://cloud-devkit/repos/vllm-torchtpu/prs/` holds fifteen of them,
+and each consuming recipe copies one down, untars it to
+`/workspace/vllm-torchtpu`, and puts `src` at the front of `PYTHONPATH`. This
+recipe does the same with `pr684.tar.gz`. The checkpoint had to be uploaded,
+because nothing in the cluster had ever run a DeepSeek model: the recipes draw
+models from `gs://cloud-devkit/ckpt/hf` and `gs://junyanxu-benchmark-models`,
+and between them those hold only Qwen, nvidia/GLM, gpt-oss and llama. The
+148.7 GiB snapshot now sits at
+`gs://alynie-k3-scratch/ckpt/hf/deepseek-ai/DeepSeek-V4-Flash` and is handed to
+`vllm serve --model` as a `gs://` URI, which is how every other recipe loads
+its weights.
+
 **Known risk to check first.** The image pins `tpu_sync`, and the PR calls
 `facade.register_request_blocks(..., pool_spans=...)` per tag. If the pinned
 `tpu_sync` predates multi-tag span registration, admission fails at startup
@@ -204,6 +219,37 @@ Two things follow for the PR. The connector should derive the skip from the
 same committed-token count the scheduler used rather than from the request
 length. Separately, a mis-trim should fail the request, not raise out of
 `execute_model` and kill every other request on the replica.
+
+### Why no other model hits this
+
+Qwen3.5 and GLM cannot reach the trim, and would not be affected if they
+could. `_stage3_trim_window_pages` has exactly one caller,
+`_stage3_dsv4_pool_pages`, and that has two: `_register_stage3_request_blocks_dsv4`
+on the producer and the DSv4 branch of `_submit_stage3_loads` on the consumer.
+Every other model registers its blocks through a different path. Even if one
+did call it, `window_tokens` is filled in only by `_measure_dsv4_pool_plan`,
+and it comes from the group spec's `sliding_window`. Qwen's Stage-3 pool tags
+are `("fa",)` and GLM's are `("fa", "dsa.idx")`, both full attention, so
+`_stage3_skipped_window_pages` returns on its first branch and hands the block
+table back untouched.
+
+The structural reason is worth stating separately, because it says which
+future models are at risk. A full-attention group never frees a page while its
+request is alive; its block table only grows, and every entry stays live. So
+it does not matter that the connector and the scheduler count committed tokens
+differently, because the page list is the same under either count. DSv4 is the
+first model to put groups whose pages are freed mid-request into Stage 3. Once
+pages can be freed, what the block table contains depends on when you read it
+and on which token count drove the freeing, and the two peers have to agree on
+both. That is the bug, and it is a property of windowed groups rather than of
+DeepSeek.
+
+The geometry makes DSv4 the worst case rather than a marginal one. Its
+compressor state groups run a window of 8 tokens against a 16-token page, so
+one page covers the whole live window and everything before it is dead prefix.
+The trim is not shaving an edge; on any prompt past a hundred tokens it is
+discarding the entire table but the tail. The two SWA groups, window 128
+against a 128-token page, are the mild case. Qwen has neither.
 
 ## Order and cost
 

@@ -82,6 +82,11 @@ if ! PYTHON="$(command -v "${PYTHON}")"; then
 fi
 TORCHTPU_SRC="${TORCHTPU_SRC:-$(cd "${script_dir}/../../src" && pwd)}"
 
+# Compile and scratch caches, on the attached NVMe. See the note beside
+# VLLM_CACHE_ROOT below for what happens when these land on the root disk.
+CACHE_ROOT="${CACHE_ROOT:-/mnt/disk/${USER}/cache}"
+mkdir -p "${CACHE_ROOT}"/{vllm,inductor,jax,tpu_logs,tmp}
+
 RUN_ROOT="${RUN_ROOT:-${HOME}/pd_disagg_runs}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/dsv4_pd_dp4_dp4_$(date +%Y%m%d_%H%M%S)}"
 MODEL_PATH="${MODEL_PATH:-/mnt/disk/hf_cache/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1}"
@@ -233,7 +238,16 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_VERBOSITY=error VLLM_NO_USAGE_STATS=1;
 export PYTHONPATH="${TORCHTPU_SRC}\${PYTHONPATH:+:\${PYTHONPATH}}";
 export TORCH_DIST_TIMEOUT=1200 VLLM_RPC_TIMEOUT=1200000;
 export XLA_PYTHON_CLIENT_PREALLOCATE=false VLLM_ALLOW_LONG_MAX_MODEL_LEN=1;
-unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR;
+unset VLLM_DISABLE_COMPILE_CACHE;
+# The compile cache stays on, but not on the root disk. Eight DSv4 workers
+# build several GB of it, this VM's root is 145G and shared, and when it fills
+# the workers die mid-compile with a truncated log that never names the disk.
+# Everything cacheable goes on the 2T attached NVMe instead.
+export VLLM_CACHE_ROOT='${CACHE_ROOT}/vllm';
+export TORCHINDUCTOR_CACHE_DIR='${CACHE_ROOT}/inductor';
+export JAX_COMPILATION_CACHE_DIR='${CACHE_ROOT}/jax';
+export TPU_LOG_DIR='${CACHE_ROOT}/tpu_logs';
+export TMPDIR='${CACHE_ROOT}/tmp';
 export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1000000000 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1000000000";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
@@ -251,6 +265,7 @@ export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
 # update_tpu_block_size_and_slot_config asks the DSv4 SWA backend for
 # get_kv_cache_page_size_bytes, which that backend does not implement.
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0
+export TPU_RAIDEN_DEBUG_BLOCK_TABLES=${TPU_RAIDEN_DEBUG_BLOCK_TABLES:-0}
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
 export TPU_RAIDEN_DSV4_ADMISSION=1
 export TPU_KV_RESHARD_TRANSPORT=raiden
