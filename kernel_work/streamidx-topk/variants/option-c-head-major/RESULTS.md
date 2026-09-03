@@ -1,19 +1,25 @@
 # Option C — head-major score layout, built and measured
 
-**Verdict in one line: Option C is real. Prefill stage A goes 246.58 µs → 195.69 µs, −20.64%,
-measured by chain slope at r² ≥ 0.99999; all 7,936 reduction `vrot.slane` are gone, exactly as R3
-predicted; the +4,523/+4,649 spill increase does not eat the win. Two things in the brief were
+**Verdict in one line: Option C is real, and it is a prefill-only change. Prefill stage A goes
+246.58 µs → 195.69 µs, −20.64%, measured by chain slope at r² ≥ 0.99999, and holds −17.8% to −20.7%
+across the whole prefill `num_bkv` range (§7); all 7,936 reduction `vrot.slane` are gone, exactly as
+R3 predicted; the +4,523/+4,649 spill increase does not eat the win. But **decode regresses
++59.62%** (§7.3), which nobody predicted, so C must be gated off there. Two things in the brief were
 wrong and both are corrected below: the 335.1 µs stage-A baseline is 36% too high, and R3's
-optimistic `head_major` arm — q head-major in HBM — does not compile.**
+optimistic `head_major` arm — q head-major in HBM — does not compile. Separately, §8 clears the
+shipping kernel of the f64-oracle disagreement §5 turned up: those are benign near-ties, not a
+defect.**
 
 ## Provenance
 
 | | |
 | --- | --- |
-| jobs | **`j-a960ad54-a0a1-4e1d-8ade`** (`Succeeded`) — timing, unpinned, whole pod<br>**`j-43359a39-0495-4602-a79b`** (`Succeeded`) — LLO dumps + first correctness attempt, 4-way fan-out. Its gate 1 is **void**, see §5<br>**`j-cf9e7189-8331-4613-9c2a`** (`Succeeded`, `FANOUT_RC=0`, 4/4 shards `rc=0`) — correctness re-run after the harness fix, plus the LLO re-read at the committed md5. **This is the correctness job.** |
+| jobs | **`j-a960ad54-a0a1-4e1d-8ade`** (`Succeeded`) — timing, unpinned, whole pod<br>**`j-43359a39-0495-4602-a79b`** (`Succeeded`) — LLO dumps + first correctness attempt, 4-way fan-out. Its gate 1 is **void**, see §5<br>**`j-cf9e7189-8331-4613-9c2a`** (`Succeeded`, `FANOUT_RC=0`, 4/4 shards `rc=0`) — correctness re-run after the harness fix, plus the LLO re-read at the committed md5. **This is the correctness job.**<br>**`j-fd7b8801-fce9-46ec-bb63`** (`Succeeded`, `rc=0`) — the `num_bkv` sweep of §7, unpinned, whole pod<br>**`j-5d02a60e-2266-477c-82d6`** (`Succeeded`, `rc=0`) — the oracle-gap probe of §8; not a timing, so fan-out safe |
 | image | `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-hning_google_com:ec4bcecf784d0bc3aeb8be37554431e3b5eef70b` (prebuilt; no image was built for this work) |
 | `RUN_CMD` (read back from `cdk job recipe j-a960ad54-a0a1-4e1d-8ade`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/timing_c.sh` |
 | `RUN_CMD` (read back from `cdk job recipe j-43359a39-0495-4602-a79b`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/fanout/tpu-fanout.sh "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh incumbent head_minor" "bash …/shard_llo_c.sh head_major" "bash …/shard_llo_c.sh head_major_hbm" "bash …/shard_correct_c.sh all"; echo FANOUT_RC=$?; echo ===== OPTC READ =====; python …/read_llo_c.py --dump …` |
+| `RUN_CMD` (read back from `cdk job recipe j-fd7b8801-fce9-46ec-bb63`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/numbkv_c.sh` |
+| `RUN_CMD` (read back from `cdk job recipe j-5d02a60e-2266-477c-82d6`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/oraclegap_c.sh` |
 | `RUN_CMD` (read back from `cdk job recipe j-cf9e7189-8331-4613-9c2a`) | `cd /root/cloud-devkit/vllm-torchtpu && bash /root/fanout/tpu-fanout.sh "bash /root/kw/variants/option-c-head-major/shard_correct_c.sh all" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh incumbent" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh head_minor" "bash /root/kw/variants/option-c-head-major/shard_llo_c.sh head_major"; echo FANOUT_RC=$?; echo ===== OPTC READ =====; python /root/kw/variants/option-c-head-major/read_llo_c.py --dump incumbent=$CDK_OUTPUT_DIR/optc/pass/incumbent --dump head_minor=$CDK_OUTPUT_DIR/optc/pass/head_minor --dump head_major=$CDK_OUTPUT_DIR/optc/pass/head_major --json $CDK_OUTPUT_DIR/optc/llo_c.json` |
 | `--map-dir` | `…/vllm-torchtpu/src:tpu-job:/root/cloud-devkit/vllm-torchtpu/src`, `…/vllm-torchtpu/tests:tpu-job:/root/cloud-devkit/vllm-torchtpu/tests`, `…/kernel_work/streamidx-topk:tpu-job:/root/kw`, and (fan-out jobs only) the skill's `fanout` dir at `/root/fanout`. Every one printed a `Packaging dir` line |
 | the mapping took | `MODULE /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532` on every shard of every job — the branch's kernel at `c3a18c95`, not the image's older one. Test file `md5=becf9f23ace9424a7d67cd3b34de9afd` |
@@ -23,7 +29,8 @@ optimistic `head_major` arm — q head-major in HBM — does not compile.**
 
 **Nothing here is an end-to-end model benchmark, and nothing here went to `/log-experiment`.**
 Everything in §2 and §3 is *static compile-time analysis* — instructions the compiler emitted, not
-instructions the machine executed. Only §1 is a measurement.
+instructions the machine executed. §1 and §7 are the measurements; §8 is a numerical comparison,
+not a timing.
 
 ---
 
@@ -283,8 +290,8 @@ Read it in this order:
    min_recall 0.996094 on all three arms, byte-identical across them. Per `CLAUDE.md`, a check that
    fails on the baseline as well "establishes nothing either way". This is the f64 oracle disagreeing
    with the *existing production kernel* about 10 borderline indices out of 2,560, not Option C
-   introducing an error. It is a pre-existing property of the fp8 path and is out of scope here,
-   but somebody should look at it.
+   introducing an error. It is a pre-existing property of the score path. **It was subsequently
+   investigated — see §8. The answer is benign near-ties; the shipping kernel is not wrong.**
 
 Numeric agreement on the raw scores, from `j-43359a39` (at the pre-hoist md5 `2999947a…`):
 `head_minor` vs incumbent `bit_identical: True, max_abs: 0.0`; `head_major` vs incumbent
@@ -319,49 +326,254 @@ predicted a 335.1 µs stage A, delivered 246.58 µs.
 
 ### 6.2 What argues against it, in the order I would want to hear it
 
-1. **The transpose amortizes over `num_bkv`, and `num_bkv` is 5 here.** `load_bq` runs `num_bq`=8
-   times and `compute_scores` runs `num_bq × num_bkv`=40, so the shuffle is paid once per five
-   uses. **At `context_len ≤ bkv_sz` — `num_bkv`=1 — it is paid once per use, and Option C may be
-   flat or negative.** No short-context shape was measured. This is the single most likely way C
-   disappoints, it is cheap to check, and it should be checked before C is committed to: one
-   `bench_headmajor.py` run at `num_bkv` ∈ {1,2,5} settles it.
+1. ~~**The transpose amortizes over `num_bkv`, and `num_bkv` is 5 here.**~~ **Retired — measured in
+   §7.1 and the concern does not survive.** The prefill curve is monotone and never crosses zero:
+   −17.81% at `num_bkv=1`, −20.69% at `num_bkv=8`. The whole amortisation effect is 2.9 percentage
+   points, and the worst case is still a large win.
 2. **`head_major_hbm` is not implementable, so the ceiling is lower than R3's range suggests.**
    R3's headline −9.24% call-level arm is unavailable (§4); only the −7.88% end is real, and after
    §1's baseline correction even that becomes ≈ −5.9% *modelled*.
 3. **Nothing above is a call-level or end-to-end number.** The 50.9 µs is a stage-A delta. The
    857.3 µs call figure it would be divided into is inherited and, given that the other inherited
    figure in this brief turned out 36% wrong, should be re-measured before anyone quotes −5.9%.
-4. **Decode is unexamined.** §3.2 predicts −0% to −2% because `bq_sz=1` leaves nothing to reorder.
-   Plausible, unmeasured. If C is gated to prefill this is moot; if it is not, the decode path
-   still pays the transpose's `vpack`/`vshrl` for no reduction to remove, so a decode measurement
-   is needed before enabling it there.
+4. **Decode regresses +59.62%, and this is now the strongest caveat on the list.** ~~§3.2 predicts
+   −0% to −2% because `bq_sz=1` leaves nothing to reorder.~~ Measured in §7.3: stage A goes
+   109.83 → 175.31 µs at `prod_decode_b64_ctx8704`. The prediction — mine as well as §3.2's — was
+   that the `bq_sz=1` permutation is the identity and therefore free. It is the identity and it is
+   not free. **Gating C to the prefill/MIXED call is a hard requirement, not a preference.**
 5. **The +50% spill traffic is a static count and is real.** It did not cost anything at this
    shape and at this VMEM budget. A different `bq_sz`, `bkv_sz` or `vmem_limit_bytes` moves the
    register pressure, and this is the term that would turn a win into a loss if it moved. Any
    shape C is enabled at should have its bundle count checked, which is minutes.
-6. **The oracle disagrees with the incumbent** (§5, 10 of 2,560 indices). Not caused by C — C
-   reproduces the incumbent's selections exactly — but it means "matches the incumbent" is the
-   strongest correctness statement available here, and the incumbent itself has not been shown
-   correct against f64.
+6. ~~**The oracle disagrees with the incumbent** (§5, 10 of 2,560 indices).~~ **Resolved in §8, and
+   it is not a defect in anything.** All 31 disagreements across three seeds are near-ties: every
+   one is a sign flip where the kernel's own f32 scores rank the displacer higher, every gap is
+   below one σ of the kernel's scoring error, stage B's selection is `EXACT`, and the row lengths
+   agree. "Matches the incumbent" remains the strongest correctness statement available for C, but
+   the incumbent is no longer under suspicion. What *is* now known is that the absolute
+   recall-vs-f64 criterion is the wrong gate for this op — see §8.4(1) — and that stage A's score
+   error is larger than the source explains (§8.4(2)).
 
 ### 6.3 Recommendation
 
-Take `head_major`. Keep `q_layout` as the switch so the incumbent ordering stays reachable and the
-comparison stays reproducible; do not delete the `head_minor` path. Before it lands, run the
-`num_bkv` sweep in 6.2(1) — it is the one cheap check that could still overturn this, and it is
-much cheaper than finding out at the model level. Do not carry the −9.24%, the −7.9%, or the
-335.1 µs figure forward anywhere; carry **−50.9 µs of stage A, −20.64%, at `q1024/ctx9216`**.
+Take `head_major`, **gated to the prefill/MIXED call site and explicitly off for decode**
+(§7.3: +59.62%). Keep `q_layout` as the switch so the incumbent ordering stays reachable and the
+comparison stays reproducible; do not delete the `head_minor` path — and note it is now doing a
+second job, since decode needs it. The `num_bkv` check that 6.2(1) said to run before landing has
+been run (§7) and it passes across the whole prefill range, so nothing further gates this at the
+kernel level; the remaining unknown is call-level and end-to-end, which is not something a
+microbenchmark can settle. Do not carry the −9.24%, the −7.9%, or the 335.1 µs figure forward
+anywhere; carry **−50.9 µs of stage A, −20.64% at `q1024/ctx9216`, −17.8% to −20.7% across prefill
+`num_bkv` 1–8, and +59.6% at decode.**
 
 ---
 
-## 7. What this does not establish
+## 7. Follow-up: does the win survive at small `num_bkv`? — yes in prefill, **no in decode**
 
-1. **Prefill only, one shape.** Everything is `prod_prefill_q1024_ctx9216`, `bq_sz=128`,
-   `seq_batch_size=1`, one sequence. §3.2 predicts **−0% to −2% at decode** because `bq_sz=1`
-   leaves nothing to reorder, and **that is still unexamined** — nothing here measured decode. Note
-   also the coordinator's correction that `min_token_size=16` is hardcoded in
-   `tpu_platform.py:1236-1276`, so the instrument's `prod_decode_b8_ctx8704` row is synthetic and
-   no b=8 figure should be quoted as a production effect.
+§6.2(1) named the transpose's amortisation over `num_bkv` as the likeliest way Option C
+disappoints. It was measured. Job `j-fd7b8801-fce9-46ec-bb63`, `bench_numbkv.py`, same chain-slope
+method, best-of-7, one unpinned process on the whole pod, `rc=0`, no failed arm.
+
+```
+===== OPTION C vs num_bkv (chain slope, device us/call) =====
+shape                        ph        nbkv  nbq   bq   incumbent  head_major   delta%     min r2
+prefill_q1024_ctx2048        prefill      1    8  128       52.60       43.23   -17.81   0.999834
+prefill_q1024_ctx4096        prefill      2    8  128      100.85       81.35   -19.34   0.999993
+prefill_q1024_ctx6144        prefill      3    8  128      149.31      119.23   -20.15   0.999985
+prefill_q1024_ctx8192        prefill      4    8  128      197.69      157.67   -20.25   0.999997
+prefill_q1024_ctx9216        prefill      5    8  128      246.35      196.25   -20.34   0.999996
+prefill_q1024_ctx16384       prefill      8    8  128      392.28      311.13   -20.69   0.999998
+decode_b64_ctx8704           decode       5    1    1      109.83      175.31   +59.62   0.999995
+```
+
+`bkv_sz = 2048` throughout (`num_kv_pages_per_block=(2,2,2)` at `mla_attention_op.py:119`, page
+size a literal 1024 at `attention.py:1323`) and `compression_ratio = 1`, so
+`num_bkv = cdiv(context_len, 2048)`. The prefill points up to ctx 9216 hold `max_model_len = 9216`
+— which is what all three `prod_prefill_q1024_ctx*` rows do — so `num_sublanes_total`, the score
+buffer and the output shape are **constant** across those points and `num_bkv` is the only thing
+moving. ctx 16384 is outside that control and is marked as such; ctx 32768 was deliberately not
+run (deep in the amortised regime the curve already establishes, and it costs four more Mosaic
+compiles to learn nothing).
+
+### 7.1 Prefill: the concern was real, and it is small
+
+The curve is monotone and it **never crosses zero**. Worst case is `num_bkv = 1` at **−17.81%**;
+the asymptote is about **−20.7%**. The entire amortisation effect is 2.9 percentage points.
+**§6.2(1) is retired**: there is no prefill shape at which Option C is flat, let alone negative.
+
+Two supporting checks. `numeric vs incumbent` is `same_mask: True` with `max_abs` of 6.1e-05 or
+1.22e-04 at every point, so the fast arm is not a wrong arm anywhere on the curve. And ctx 9216
+reproduces §1 across two independent jobs on different pods — 246.35 vs 246.58 µs (0.09% apart) and
+196.25 vs 195.69 µs (0.29%) — which is the best evidence in this document that the chain-slope
+method is repeatable.
+
+### 7.2 Prefill `num_bkv = 1` is mostly unreachable anyway — a second-order point, not the answer
+
+Early exit is on in production (`STREAMIDX_ENABLE_EARLY_EXIT = True`, a module-level literal at
+`mla_attention_op.py:57`, no env override) and its condition is
+`jnp.max(seq_lens) // compression_ratio <= k` (`streamindex_topk.py:859-864`), which at
+`compression_ratio = 1` is `max(seq_lens) <= k`. For GLM-5.2 `k = topk_tokens = 2048`, which is
+**exactly `bkv_sz`** — so a call whose longest sequence would give `num_bkv = 1` takes `_fast_path`
+and runs no stage A at all.
+
+Two caveats keep this from being the whole answer, which is why the point was measured rather than
+argued away: `num_bkv` is recomputed per grid step from the *group's* max
+(`streamindex_topk.py:275-276`), so a short sequence sharing a batch with a long one does execute a
+`num_bkv = 1` step; and `k` comes from the model spec (`self.indexer.topk_tokens`,
+`mla_attention_op.py:510`), so a model with `k < 2048` reaches `num_bkv = 1` for real. §7.1 covers
+both cases and says they are fine.
+
+### 7.3 Decode: **+59.62%. This is the finding, and it scopes the recommendation**
+
+Head-major must **not** be enabled on the decode call. Stage A goes 109.83 → 175.31 µs at
+`prod_decode_b64_ctx8704` — a 65.5 µs regression — with r² 0.999995 on both arms.
+
+What makes this worth saying loudly is that it contradicts an analytic prediction that was already
+written down and believed. Decode uses `num_queries_per_block[0] = 1` and `static_q_len = 1`, so
+`bq_sz = min(1,1) = 1`, and at `bq_sz = 1` the head-major permutation is **the identity**:
+head-minor's row index is `t*H + h = h` and head-major's is `h*bq_sz + t = h`; the reshape
+`(SB,1,H,D) → transpose(0,2,1,3) → (SB,H*1,D)` yields the same `(SB,H,D)` as `(SB,1*H,D)`. §3.2
+predicted −0% to −2% on exactly this reasoning, and so did I. The data says +59.62%. **Reordering
+nothing is not free.**
+
+**Mechanism: not established.** No LLO dump was taken of the decode program, so what follows is
+judgement, not a finding. The plausible cause is that the degenerate `(SB,H,1,D)` intermediate puts
+a length-1 axis on the sublane dimension, where Mosaic's `(8,128)` tiling pads each head's `1×128`
+row to a full tile — 8× the vector registers for the same data — turning a no-op permutation into a
+real relayout. It has a cheap test (one `shard_llo_c.sh` run against a decode launcher) and nobody
+needs to run it: the decision is the same either way.
+
+Two limits on the number. It is **stage A only** — decode stage A's share of the whole
+`streamindex_topk` call was not measured, so +59.62% of stage A is not +59.62% of the op. And it is
+**one decode shape**. Neither limit is load-bearing: the sign is unambiguous and the remedy is to
+not enable the layout there. Note the decode shape used is `b=64`, not the instrument's
+`prod_decode_b8_ctx8704`, which is synthetic — `min_token_size = 16` is hardcoded at
+`tpu_platform.py:1236-1276`, so bucket b=8 is never compiled.
+
+---
+
+## 8. Follow-up: the f64 oracle's disagreement with the **shipping** kernel
+
+§5 flagged that gate 2's absolute recall criterion fails on the incumbent as well as on Option C —
+`min_recall 0.996094`, 10 of 2,560 indices, byte-identical across arms — and said somebody should
+look. Job `j-5d02a60e-2266-477c-82d6`, `probe_oracle_gap.py`, three seeds, `rc=0`, no traceback.
+
+**Answer: benign near-ties. The shipping kernel is not wrong.** Every gap is smaller than the
+kernel's own scoring error, and in the kernel's own arithmetic every "missed" item genuinely ranks
+*below* the item that displaced it.
+
+### 8.1 The probe captures the shipping kernel, not a reconstruction of it
+
+`probe_oracle_gap.py` patches the module-global `streamindex_topk.sparsecore_topk` with a spy and
+calls the shipping `streamindex_topk.__wrapped__` inside one trace, so what is compared is the
+exact array production hands to stage B. No launcher is transcribed, so none can drift.
+`enable_early_exit` stays at its default `False`, which keeps `_common_path` out of a `lax.cond`
+(making the captured tracer legal to return) and changes nothing here — `max(seq_lens)//cr = 2048 >
+k = 512`, so the fast path could not have fired. Confirmed on the pod:
+`streamindex_topk.py md5=1e221f10cbf3573aa0d2ae78c3463532`, the branch's kernel.
+
+### 8.2 Three candidate causes; two are eliminated outright
+
+| candidate | result | verdict |
+| --- | --- | --- |
+| stage B picked the wrong items | `top-k of the kernel's OWN f32 scores vs returned indices: rows_differing=0/8 indices_differing=0 -> EXACT`, all 6 seed×arm runs | **eliminated.** Independently confirms probe P2 against a different reference |
+| `_effective_row_lengths` truncates the search | `_effective_row_lengths vs oracle visible count: ALL AGREE` (`[2047,2047,2047,2047,2048,2048,2048,2048]`), all 6 runs | **eliminated** |
+| stage A's f32 score | `max=1.062794e+00 p99=5.293128e-01 median=1.246159e-01 max_rel=6.320e-03` over 16,380 positions, on scores up to \|344.87\| (seed 0) | **this is the whole of it** |
+
+### 8.3 The gaps, and why they are near-ties
+
+Verbatim, seed 0, `incumbent` (head_major is identical row for row; seeds 1 and 2 are in the job
+log). `gap_f64` is the oracle's score margin between the missed item and the one that displaced it;
+`gap_f32` is the same margin computed in the kernel's own arithmetic; σ is the kernel's max score
+error, 1.0628:
+
+```
+tok    idx  orank   s_f64(missed)   s_f32(missed)   disp    s_f64(disp)      gap_f64      gap_f32  gap/sigma
+  1   1451    506    168.25961736    167.84741211    531   167.92745876    3.322e-01   -3.287e-01       0.31
+  2   1229    510    161.08455229    160.88854980   1750   160.97339869    1.112e-01   -9.030e-02       0.10
+  3    164    507    170.16551080    169.74064636   1047   169.64879879    5.167e-01   -3.555e-02       0.49
+  4    484    510    153.35880325    153.11758423     24   153.00872025    3.501e-01   -3.820e-01       0.33
+  4    975    511    153.34041163    152.97906494   1984   153.06846052    2.720e-01   -2.175e-01       0.26
+  5    676    508    166.34600592    165.75311279   1054   166.15408105    1.919e-01   -4.597e-01       0.18
+  6   1938    507    174.29222816    173.96865845   1197   173.86395270    4.283e-01   -2.676e-01       0.40
+  6   1508    511    174.01062727    173.90795898    987   173.94995540    6.067e-02   -5.011e-01       0.06
+  7    622    509    182.13083488    181.88305664   1861   181.81577235    3.151e-01   -1.804e-01       0.30
+  7   1714    511    181.99227560    181.89883423   1545   181.97142100    2.085e-02   -1.711e-01       0.02
+```
+
+Read the last two numeric columns. **`gap_f64 > 0` and `gap_f32 < 0` in all 31 disagreements across
+all three seeds, without a single exception.** The oracle says the missed item is better; the
+kernel's own scores say the displacer is better; and the kernel returned what its own scores told
+it to. Given the scores it computed, the selection is *right* — which is the same thing §8.2's
+`EXACT` row says, arrived at from the other direction.
+
+That leaves the question of whether those scores were off by an amount the kernel should be
+embarrassed by. Recomputed from the raw table (`err = |s_f64 − s_f32|` at each of the 62 positions
+involved across all three seeds):
+
+| | value |
+| --- | --- |
+| largest error at a missed item | **0.5929** |
+| largest error at a displacer | **0.6925** |
+| largest \|`gap_f64`\| anywhere | **0.6701** |
+| the kernel's own error distribution (16,380 positions) | median **0.125**, p99 **0.53**, max **1.06** |
+| positions whose error exceeds p99 of that distribution | **2 of 62**, at 1.12× and 1.33× p99, both below the max |
+
+Every score that participated in a flip is an ordinary draw from the kernel's own error
+distribution — not one outlier among them. The verdict rule was fixed in the probe's docstring
+**before any number existed** (`max|gap_f64| / σ ≤ 4` → benign), and the measured ratios are
+**0.49 / 0.58 / 0.66** across the three seeds: every gap is smaller than a *single* σ, let alone
+four.
+
+The underlying reason is structural. At rank 512 of 2,048 the true score separation is a few tenths
+on scores of ~170, while the kernel's scoring noise is the same order — the oracle itself reports
+`boundary gap min=2.525e-04`. **Items that close together are not distinguishable by this kernel at
+all**, so which of them comes back is arbitrary and no downstream consumer can tell. That is a
+property of an approximate indexer, not a defect.
+
+### 8.4 Two things this turns up that are worth acting on
+
+1. **An absolute "recall vs f64 ≥ 0.999" gate is the wrong gate for this op**, and will fail
+   forever on correct code — §5 watched it fail on the incumbent. The discriminating statistic is
+   arm-vs-arm index-set agreement, which is what `run_correctness_c.py` reports and which Option C
+   passes perfectly (0/8 rows, 0 indices). Whoever writes correctness gates for `streamindex_topk`
+   should not have to re-derive this.
+2. **The size of stage A's score error is unexplained, and I could not account for it from the
+   source.** Median relative error is 7.4e-04 and the max is 6.3e-03 — bf16-scale, roughly 10⁴×
+   what f32 accumulation over 32 heads should produce. The score path reads as f32 throughout:
+   `jnp.einsum(..., preferred_element_type=jnp.float32)` (`streamindex_topk.py:326-330`),
+   `jnp.maximum(s, 0.0)`, weights explicitly cast to f32 (`:334`, and `prepare_index_weights` at
+   `:458-472` does no quantization). The only bf16 in the path is the e8m0 scale at `:268`, and a
+   power of two is lossless in bf16, so that is not it either. Candidates I cannot rule out from
+   Python: the MXU's internal fp8 accumulation path, or Mosaic lowering the f32×bf16 multiply at
+   `:341` in bf16. **This is judgement, not a finding** — nothing was dumped or instrumented to
+   test it. It does not disturb the benign verdict (§8.3 is computed from the kernel's own numbers
+   and does not care where the error came from), but a 7e-04-relative indexer score is worth
+   someone knowing deliberately rather than by accident.
+
+### 8.5 One caveat on the `head_major` half of this job
+
+The `head_major` rows are byte-identical to the incumbent's in all three seeds — every σ, every
+gap, every row of every table. That is consistent with the reassociation being exactly
+score-preserving at this configuration (`bq_sz=8`, `T=8`, and the 32-way head sum running over the
+same `h` order in both layouts), and it matches §5's finding that the two arms select identical
+index sets. But **this job contains no line proving the two arms compiled to different programs**,
+so on its own evidence it cannot distinguish "identical output" from "the same program run twice".
+That the `head_major` path is real and distinct is established elsewhere — §7's sweep shows it
+−17.8% to −20.7% faster with non-zero `max_abs` at every prefill point, and §2 shows a different
+opcode histogram — not here. The incumbent row, which is the row this section is about, is
+unaffected either way.
+
+---
+
+## 9. What this does not establish
+
+1. **§1–§6 are prefill only, one shape** — `prod_prefill_q1024_ctx9216`, `bq_sz=128`,
+   `seq_batch_size=1`, one sequence. §7 widens this to six prefill contexts and **one** decode
+   shape (`b=64, ctx=8704`); decode remains a single point, and its +59.62% mechanism is not
+   established (no LLO dump of the decode program was taken — §7.3 says why nobody needs to). Note
+   `min_token_size=16` is hardcoded in `tpu_platform.py:1236-1276`, so the instrument's
+   `prod_decode_b8_ctx8704` row is synthetic and no b=8 figure appears anywhere here.
 2. **Stage A only.** The −50.9 µs is a stage-A delta measured in isolation. The call-level and
    end-to-end effects are not measured, and the 857.3 µs call figure they would be divided into is
    inherited, not measured here — see §1 on what happened to the other inherited figure.
@@ -400,6 +612,16 @@ python /root/kw/variants/option-c-head-major/read_llo_c.py \
   --dump head_major=$CDK_OUTPUT_DIR/optc/pass/head_major --json /tmp/llo_c.json
 ```
 
+```bash
+# §7 num_bkv sweep: one unpinned process on the whole pod (it is a timing)
+cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/numbkv_c.sh
+
+# §8 oracle-gap probe: not a timing, safe to share a pod
+cd /root/cloud-devkit/vllm-torchtpu && bash /root/kw/variants/option-c-head-major/oraclegap_c.sh
+```
+
 Files: `streamindex_topk_c.py` (the kernel copy + `q_layout`), `stage_a_c.py` (stage-A launcher,
-four arms), `bench_headmajor.py` (chain-slope timing), `dump_llo_c.py` + `read_llo_c.py` (static
-analysis), `run_correctness_c.py` (both gates), and the four `*.sh` shard drivers.
+four arms), `bench_headmajor.py` (chain-slope timing), `bench_numbkv.py` (§7's sweep — reuses
+`bench_headmajor`'s `run_arm`/`_fit` verbatim and swaps in a decode launcher), `dump_llo_c.py` +
+`read_llo_c.py` (static analysis), `run_correctness_c.py` (both gates), `probe_oracle_gap.py`
+(§8's stage-A-vs-stage-B localisation), and the six `*.sh` shard drivers.
