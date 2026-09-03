@@ -68,7 +68,12 @@ export PYTHONHASHSEED=0
 export VLLM_SERVER_DEV_MODE=1
 
 VLLM_BIN="${VLLM_BIN:-vllm}"
-PORT="${PORT:-8123}"
+
+PORT="${PORT:-$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()' 2>/dev/null || echo 8123)}"
 MODEL="${MODEL:-/mnt/pd/DeepSeek-V4-Flash-local}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
 CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-68719476736}"
