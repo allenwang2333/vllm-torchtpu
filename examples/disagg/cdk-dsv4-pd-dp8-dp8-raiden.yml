@@ -12,11 +12,23 @@
 # sharing a host.
 #
 # Derived from recipes/benchmark/vllm-torchtpu/qwen3.5-397b/
-# vllm-qwen35-397b-pd-pcp8-dp8-raiden.yml, with the image and the tpu_sync
-# preflight taken from recipes/experimental/torchtpu-vllm/disagg-offloading/
+# vllm-qwen35-397b-pd-pcp8-dp8-raiden.yml, with the tpu_sync preflight taken from
+# recipes/experimental/torchtpu-vllm/disagg-offloading/
 # qwen35-gpc-global-offloading.yml. The Qwen P/D recipe's own image is pinned at
 # 20260804-Raiden, which predates the tpu_raiden -> tpu_sync rename that PR #684
 # depends on, so it cannot run this.
+#
+# The image has to carry a Raiden that exposes the module as tpu_sync, and most
+# of the images in vllm-tpu-rdna do not. vllm-torchtpu-amylin:v3-raiden-upgrade
+# does, and it also happens to match the environment Tier 1 was verified in:
+# libtpu 0.0.44.1, torch 2.13.0+cpu and vllm 0.27.0+empty are all identical, and
+# its torch_tpu (dev20260831) and tpu_raiden_torch (dev20260827) are each about
+# two weeks newer than the local pins. The first run of this recipe used
+# vllm-torchtpu-benliangw_google_com:latest, which the gpc offloading recipe
+# names, and it died in the preflight: that tag has drifted to torch 2.11 and
+# vllm 0.23 with no Raiden installed under any name. If you retarget the image,
+# probe it for `from tpu_sync.api.torch.reshard_client import ReshardClient`
+# first, because a wrong tag costs two TPU nodes and fifteen seconds to find out.
 #
 # What differs from the Qwen recipe, and why:
 #
@@ -119,7 +131,7 @@ spec:
                         path: token
               containers:
                 - name: vllm-tpu-prefill
-                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-amylin:v3-raiden-upgrade` }}"
                   imagePullPolicy: Always
                   command: ["/bin/bash", "-c"]
                   args:
@@ -134,13 +146,26 @@ spec:
                       # ahead of the image's copy. Same mechanism the structured
                       # decoding recipes use for pr596 and pr625.
                       mkdir -p /workspace/vllm-torchtpu
-                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      # The image has no gcloud, so fetch through the JSON API
+                      # with the node's own metadata-server token.
+                      GCS_TOKEN=$(curl -sS -m 10 -H "Metadata-Flavor: Google" \
+                        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+                        | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+                      GCS_PATH=${PR_TARBALL#gs://}
+                      curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
+                        "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
                       export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
 
                       # Preflight. Every one of these fails loudly at startup
                       # rather than silently mis-transferring later, which is
                       # the whole point of checking them before a two-hour run.
+                      # $MODEL is a gs:// URI and vLLM reads object storage only
+                      # through the Run:ai streamer, which this image does not ship.
+                      # It is a 2 MB pure-python wheel plus a small .so, so installing
+                      # it here beats maintaining a fork of the image.
+                      python3 -m pip install --no-cache-dir -q \
+                        runai-model-streamer runai-model-streamer-gcs
                       python3 -c "from tpu_sync.api.torch.reshard_client import ReshardClient; print('tpu_sync OK')"
                       python3 -c "
                       import vllm_torchtpu.distributed.kv_transfer.tpu_connector as c
@@ -162,6 +187,7 @@ spec:
                       echo "===== Starting DeepSeek-V4 DP8 prefill ====="
                       exec vllm serve \
                         "$MODEL" \
+                        --load-format runai_streamer \
                         --served-model-name "$SERVED_MODEL" \
                         --trust-remote-code \
                         --seed 42 \
@@ -317,14 +343,21 @@ spec:
                     - containerPort: 8000
 
                 - name: vllm-tpu-proxy
-                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-amylin:v3-raiden-upgrade` }}"
                   imagePullPolicy: Always
                   command: ["/bin/bash", "-c"]
                   args:
                     - |
                       set -eo pipefail
                       mkdir -p /workspace/vllm-torchtpu
-                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      # The image has no gcloud, so fetch through the JSON API
+                      # with the node's own metadata-server token.
+                      GCS_TOKEN=$(curl -sS -m 10 -H "Metadata-Flavor: Google" \
+                        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+                        | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+                      GCS_PATH=${PR_TARBALL#gs://}
+                      curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
+                        "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
 
                       PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
@@ -377,7 +410,7 @@ spec:
                         path: token
               containers:
                 - name: vllm-tpu-decode
-                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-amylin:v3-raiden-upgrade` }}"
                   imagePullPolicy: Always
                   command: ["/bin/bash", "-c"]
                   args:
@@ -389,9 +422,22 @@ spec:
                       mkdir -p "$CDK_OUTPUT_DIR"
 
                       mkdir -p /workspace/vllm-torchtpu
-                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      # The image has no gcloud, so fetch through the JSON API
+                      # with the node's own metadata-server token.
+                      GCS_TOKEN=$(curl -sS -m 10 -H "Metadata-Flavor: Google" \
+                        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+                        | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+                      GCS_PATH=${PR_TARBALL#gs://}
+                      curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
+                        "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
                       export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
+                      # $MODEL is a gs:// URI and vLLM reads object storage only
+                      # through the Run:ai streamer, which this image does not ship.
+                      # It is a 2 MB pure-python wheel plus a small .so, so installing
+                      # it here beats maintaining a fork of the image.
+                      python3 -m pip install --no-cache-dir -q \
+                        runai-model-streamer runai-model-streamer-gcs
                       python3 -c "from tpu_sync.api.torch.reshard_client import ReshardClient; print('tpu_sync OK')"
                       python3 -c "
                       import vllm_torchtpu.distributed.kv_transfer.tpu_connector as c
@@ -412,6 +458,7 @@ spec:
                       echo "===== Starting DeepSeek-V4 DP8 decode ====="
                       exec vllm serve \
                         "$MODEL" \
+                        --load-format runai_streamer \
                         --served-model-name "$SERVED_MODEL" \
                         --trust-remote-code \
                         --seed 42 \
@@ -479,7 +526,7 @@ spec:
               restartPolicy: Never
               containers:
                 - name: bench
-                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-amylin:v3-raiden-upgrade` }}"
                   imagePullPolicy: Always
                   command: ["/bin/bash", "-c"]
                   args:
@@ -500,7 +547,14 @@ spec:
                       [ "$code" = "200" ] || { echo "RESULT: FAIL (proxy never came up)"; exit 1; }
 
                       mkdir -p /workspace/vllm-torchtpu
-                      gcloud storage cp "$PR_TARBALL" /tmp/pr684.tar.gz
+                      # The image has no gcloud, so fetch through the JSON API
+                      # with the node's own metadata-server token.
+                      GCS_TOKEN=$(curl -sS -m 10 -H "Metadata-Flavor: Google" \
+                        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+                        | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+                      GCS_PATH=${PR_TARBALL#gs://}
+                      curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
+                        "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
                       cd /workspace/vllm-torchtpu/examples/disagg
 
