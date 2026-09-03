@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Falcon-only Kimi-K3 DSpark throughput sweep for a fixed 32-device world.
+# Falcon-only Kimi-K3 DSpark throughput sweep with TP32 per DP replica.
 set -euo pipefail
 ulimit -c 0
 
 : "${K3_DP_SIZE:?set K3_DP_SIZE}"
 : "${K3_TP_SIZE:?set K3_TP_SIZE}"
 : "${K3_COORD_PREFIX:?set K3_COORD_PREFIX}"
-if (( K3_DP_SIZE * K3_TP_SIZE != 32 )); then
-  echo "expected K3_DP_SIZE*K3_TP_SIZE=32" >&2
+EXPECTED_WORLD=$((K3_DP_SIZE * K3_TP_SIZE / 8))
+if (( K3_TP_SIZE != 32 || K3_DP_SIZE * K3_TP_SIZE % 8 != 0 )); then
+  echo "expected TP32 and a whole number of v7x-8 Falcon workers" >&2
   exit 2
 fi
 
@@ -27,8 +28,8 @@ export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0
 export VLLM_ENGINE_READY_TIMEOUT_S=14400
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
-export TPU_HOST_BOUNDS=1,1,4
-export TORCH_TPU_TOPOLOGY=2,2,4,2
+export TPU_HOST_BOUNDS="1,1,$EXPECTED_WORLD"
+export TORCH_TPU_TOPOLOGY="2,2,$EXPECTED_WORLD,2"
 export JAX_PLATFORMS=""
 export TPU_MOE_HIERARCHICAL_EP=1
 export TPU_LATENT_PROJ_INTRA_CHIP_TP=1
@@ -61,7 +62,7 @@ DONE_MARKER="/coord/${K3_COORD_PREFIX}_DONE"
 SERVER_PID=0
 TAIL_PID=0
 
-if [[ "$WORLD" != 4 || "$RANK" -lt 0 || "$RANK" -gt 3 ]]; then
+if [[ "$WORLD" != "$EXPECTED_WORLD" || "$RANK" -lt 0 || "$RANK" -ge "$WORLD" ]]; then
   echo "unexpected Falcon topology rank=$RANK world=$WORLD" >&2
   exit 1
 fi
@@ -157,7 +158,7 @@ serve_args=(
   --data-parallel-backend mp
   --enable-expert-parallel
   --enable-ep-weight-filter
-  --nnodes 4
+  --nnodes "$WORLD"
   --node-rank "$RANK"
   --master-addr "$MASTER_ADDR"
   --master-port 29500
@@ -275,7 +276,7 @@ for point_dir in sorted((root / "benchmark").glob("c_*"), key=lambda p: int(p.na
 summary = {
     "model": "moonshotai/Kimi-K3",
     "spec_model": "Inferact/Kimi-K3-DSpark-Block5",
-    "hardware": "v7x-32",
+    "hardware": f"v7x-{dp * tp}",
     "data_parallel_size": dp,
     "tensor_parallel_size": tp,
     "expert_parallel_size": dp * tp,
