@@ -450,6 +450,40 @@ def _pallas_rpa_kernel_batched(
 # =========================================================================================
 
 
+def _pool_head_dim_is_last_axis(
+    head_size: int,
+    cache_dtype_str: str | torch.dtype,
+    *,
+    batched_rpa: bool,
+) -> bool:
+    """Whether `kv_cache.shape[-1]` is the head width.
+
+    True for the FLASH_ATTN pool and the long-context kernel's
+    HEAD_ALONG_SUBLANE pool, which are both
+    `(blocks, page, heads, packing, head_width)`. False for SEQ_ALONG_LANE,
+    `(blocks, heads, head_width / packing, packing, page)`, where the last
+    axis is the page size instead.
+
+    Mirrors the branches in
+    `PallasBatchedRPAAttentionBackend.get_kv_cache_shape`; keep the two in
+    step. Drift is loud rather than silent -- the kernel checks the pool it
+    was handed against the one the query implies, and raises.
+    """
+    if not batched_rpa:
+        return True
+    dtype_str = (cache_dtype_str.lower().strip()
+                 if isinstance(cache_dtype_str, str) else None)
+    if dtype_str == "auto":
+        return True
+    if cache_dtype_str == torch.uint8 or dtype_str in ("nvfp4", "uint8"):
+        return False
+    if head_size == 64:
+        return True
+    if not envs.USE_BATCHED_RPA_LONGCTX:
+        return False
+    return not envs.USE_BATCHED_RPA_SEQ_ON_LANE
+
+
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
@@ -720,6 +754,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # Only the batched RPA kernel implements the Q-rotation / output-unrotation
     # needed for Hadamard-transform KV cache quantization.
     _supports_hadamard: ClassVar[bool] = False
+    # Which backend allocated this layer's pool, which is what decides the
+    # pool's axis order. See `_pool_head_dim_is_last_axis`.
+    _uses_batched_rpa: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -753,6 +790,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
                                       "PallasAttentionBackendImpl")
+
+        # Kept as given, so the pool's axis order can be re-derived later from
+        # the exact value `get_kv_cache_shape` saw when the pool was allocated.
+        self.kv_cache_dtype_str = kv_cache_dtype
 
         self.kv_cache_quantized_dtype = None
         # Only set kv_cache_quantized_dtype for quantized KV cache
@@ -1122,7 +1163,28 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        pool_head_dim = kv_cache.shape[-1]
+        #
+        # `shape[-1]` is the head width only in the layouts that put it last.
+        # Under SEQ_ALONG_LANE the last axis is the page size instead, so
+        # reading it here would compare a page size against a head width. That
+        # is not a hypothetical: the batched-RPA kernel forces 256-token pages,
+        # so every model with heads narrower than 256 -- Qwen3-Coder-30B, at 128
+        # -- would look like it needed padding out to 256. The kernel then takes
+        # the head width from the padded query (batched_rpa/wrapper.py, where
+        # `head_dim = queries.shape[2]`), works out the pool such a model would
+        # need, finds it twice the size of the real one, and fails the check in
+        # batched_rpa/configs.py.
+        #
+        # TODO: a draft layer genuinely narrower than a SEQ_ALONG_LANE pool
+        # still needs reconciling, and this skips it. Fixing that needs the
+        # pool's own head width handed down from wherever the pool was created;
+        # it cannot be recovered from the array, because the stored width has
+        # been rounded up to a multiple of 32 (and, for nvfp4, halved and given
+        # extra columns for the scales), and rounding is not reversible.
+        pool_head_dim = (kv_cache.shape[-1] if _pool_head_dim_is_last_axis(
+            self.head_size,
+            self.kv_cache_dtype_str,
+            batched_rpa=self._uses_batched_rpa) else 0)
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
@@ -1224,6 +1286,7 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
     _supports_hadamard = True
+    _uses_batched_rpa = True
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
