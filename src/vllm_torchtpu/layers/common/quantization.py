@@ -114,21 +114,18 @@ def quantize_kv(
     return key, value
 
 
-# Cache of unnormalized +-1 Hadamard matrices keyed by (dim, device, dtype).
-_HADAMARD_PM1_MATRICES: dict[tuple[int, torch.device, torch.dtype],
-                             torch.Tensor] = {}
-
-
-def _hadamard_pm1_torch(dim: int, device: torch.device,
-                        dtype: torch.dtype) -> torch.Tensor:
+def _hadamard_pm1(dim: int, device: torch.device,
+                  dtype: torch.dtype) -> torch.Tensor:
     """Unnormalized +-1 Sylvester-Hadamard matrix, built in torch ops.
 
-    `apply_hadamard_transform` runs inside the traced model forward, and
-    Dynamo has no rule for `np.block`, so building the matrix through numpy
-    there aborts the `fullgraph=True` capture. The recursion is pure
-    constants, so XLA folds it away at compile time. Entries are +-1 exactly,
-    which is representable in any float dtype, so this stays bitwise identical
-    to the JAX-side
+    Torch rather than numpy because `apply_hadamard_transform` runs inside the
+    traced model forward, where Dynamo has no rule for `np.block` and building
+    the matrix through numpy aborts the `fullgraph=True` capture. Nothing is
+    cached: the recursion is pure constants, so it is traced once and XLA
+    constant-folds it away.
+
+    Entries are +-1 exactly, which is representable in any float dtype, so this
+    stays bitwise identical to the JAX-side
     `vllm_torchtpu.kernels.experimental.batched_rpa.hadamard.hadamard_pm1_np`:
     the K/V rotation applied here at quantization time is undone by the
     Q-rotation / output-unrotation the batched RPA wrapper performs with its
@@ -145,33 +142,11 @@ def _hadamard_pm1_torch(dim: int, device: torch.device,
     return h
 
 
-def hadamard_pm1_matrix(dim: int,
-                        device: torch.device | None = None,
-                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Unnormalized +-1 Hadamard matrix; exact in any float dtype.
-
-    The cache is read but never written while tracing: storing a traced
-    tensor into a module-level dict is a side effect a `fullgraph=True`
-    capture cannot replay. Under tracing the construction is inlined into the
-    graph instead, where XLA constant-folds it.
-    """
-    device = device if device is not None else torch.device("cpu")
-    key = (dim, device, dtype)
-    cached = _HADAMARD_PM1_MATRICES.get(key)
-    if cached is not None:
-        return cached
-    built = _hadamard_pm1_torch(dim, device, dtype)
-    if not torch.compiler.is_compiling():
-        _HADAMARD_PM1_MATRICES[key] = built
-    return built
-
-
 def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Rotates `x` by the normalized Hadamard matrix along the last dim.
 
     H is symmetric and orthonormal (H == H.T == inv(H)), so applying it twice
     is the identity up to float rounding.
-
 
     The +-1 matmul runs in `x`'s own floating dtype -- products with +-1
     entries are exact, so a bf16 input stays on the fast native MXU matmul
@@ -182,7 +157,7 @@ def apply_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     dim = x.shape[-1]
     if not x.is_floating_point():
         x = x.to(torch.float32)
-    h = hadamard_pm1_matrix(dim, x.device, x.dtype)
+    h = _hadamard_pm1(dim, x.device, x.dtype)
     return (x @ h).to(torch.float32) * (1.0 / math.sqrt(dim))
 
 
