@@ -103,7 +103,7 @@ reason decode is the better target, and it is not the reason the earlier documen
 
 | option | what it changes | verdict | best evidence |
 | --- | --- | --- | --- |
-| **C** — head-major score layout | transposes the q block `(bq,H,D)→(H,bq,D)` **inside** the kernel, once per bq block | **PASS, −20.64%** on prefill stage A; correctness verified, output index-identical | §3 |
+| **C** — head-major score layout | transposes the q block `(bq,H,D)→(H,bq,D)` **inside** the kernel, once per bq block | **PASS on prefill, −17.8% to −20.7%** across all `num_bkv`; correctness verified, index-identical. **Must be gated to prefill — decode regresses +59.62%** | §3 |
 | **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
@@ -152,10 +152,35 @@ to save work in `compute_scores`, which runs 40×.
    The deployable option is the in-kernel transpose, and it needs no change to q's HBM layout,
    `_fetch_bq`, or `mla_attention_op.py`.
 
-**Outstanding, dispatched:** a `num_bkv` sweep. The transpose amortizes over `num_bkv`, which is 5
-at the measured shape. At `ctx ≤ bkv_sz` (`num_bkv` = 1) it is paid once per use and C may be flat
-or negative. The builder named this itself as *"the likeliest way this disappoints"*. **C should
-not be committed to before that sweep returns.**
+### 3.1 The `num_bkv` sweep — the amortization worry is retired, and decode is not
+
+Job `j-fd7b8801-fce9-46ec-bb63`, chain slope best-of-7, `same_mask: True` and `max_abs ≤ 1.22e-04`
+at every point.
+
+| shape | phase | `num_bkv` | incumbent µs | `head_major` µs | Δ |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `q1024_ctx2048` | prefill | 1 | 52.60 | 43.23 | **−17.81%** |
+| `q1024_ctx4096` | prefill | 2 | 100.85 | 81.35 | −19.34% |
+| `q1024_ctx6144` | prefill | 3 | 149.31 | 119.23 | −20.15% |
+| `q1024_ctx8192` | prefill | 4 | 197.69 | 157.67 | −20.25% |
+| `q1024_ctx9216` | prefill | 5 | 246.35 | 196.25 | −20.34% |
+| `q1024_ctx16384` | prefill | 8 | 392.28 | 311.13 | −20.69% |
+| **`decode_b64_ctx8704`** | **decode** | 5 | **109.83** | **175.31** | **+59.62%** |
+
+**Prefill: C never crosses zero.** Monotone, worst case −17.81% at `num_bkv=1`, asymptote −20.7%.
+The whole amortization effect is 2.9 points, so the caveat that gated this recommendation is
+retired. ctx 9216 reproduced the committed measurement across two pods to 0.09% / 0.29% — the best
+repeatability evidence in the exercise.
+
+**Decode regresses +59.62%, and this is the more important half of the result.** §3.2 predicted −0
+to −2%, and so did I, from the correct observation that at `bq_sz = 1` the head-major permutation
+is *literally the identity*. It is the identity and the compiler still does not make the degenerate
+transpose free. **Gating C to the prefill/MIXED call is therefore a hard requirement, not a
+preference.** The mechanism — plausibly a length-1 sublane axis padded to Mosaic's 8-row tile — is
+**judgement, not finding**: no decode LLO dump was taken, and it is one decode shape, stage A only.
+
+This is the exercise's best argument for measuring both phases even when a mechanism argument says
+one of them cannot move.
 
 ---
 
@@ -265,15 +290,11 @@ not 1.02.
 
 ## 8. Open items
 
-1. **Option C's `num_bkv` sweep** — dispatched. Gates the C recommendation.
-2. **A pre-existing correctness question in the shipping kernel, owned by nobody.** Gate 2's 0.999
-   recall criterion fails on the **incumbent**: `min_recall 0.996094`, identical across all three of
-   C's arms, an f64 oracle disagreeing with the production kernel on **10 of 2,560 indices**. This
-   is not caused by any option here. P2 established stage B's select is bit-identical to
-   `approx_max_k(recall_target=1.0)` at max |Δscore| = 0.0, which points at stage A's f32 scoring
-   rather than the select. **Dispatched: are the 10 near-ties, or is the shipping kernel wrong?**
-   The score *gaps* at those positions discriminate; a recall number does not.
-3. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched. The sweep decides
+1. ~~Option C's `num_bkv` sweep~~ — **DONE, C is safe on prefill at every `num_bkv`** (§3.1).
+2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§9).
+3. **Option F — bf16 operands for stage A** (§9). Dispatched. Falls directly out of the accuracy
+   work, and may be the decode-side option C cannot be.
+4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched. The sweep decides
    whether this is a constant to change or a function to write, and it is worth up to −39%
    (`modelled`) rather than the −9.46% measured.
 4. **Options A and B** — in flight.
@@ -284,3 +305,69 @@ not 1.02.
    no measured SparseCore fact at all — which is the direct cause of the prefill gate being
    undecidable in §1. Whether to amend it is a question for the caller; it has been asked and not
    answered.
+
+---
+
+## 9. The incumbent is correct at the top-k boundary, and the gate that said otherwise is the wrong gate
+
+Job `j-5d02a60e-2266-477c-82d6`, three seeds. The probe spies on the module-global
+`sparsecore_topk` inside a trace of the **shipping** `streamindex_topk.__wrapped__`, so it compares
+the real kernel, not a transcription.
+
+**The 10-of-2,560 disagreement is near-ties. The shipping kernel is not wrong.**
+
+Three-way localization: `_effective_row_lengths` agrees with the oracle everywhere; **stage B is
+`EXACT`** — 0/8 rows, 0 indices differing, in all six runs, independently confirming P2 against a
+different reference. So the disagreement is entirely stage A's f32 scoring.
+
+**All 31 disagreements across three seeds are sign flips** — `gap_f64 > 0`, `gap_f32 < 0`, no
+exceptions. In the kernel's own arithmetic the "missed" item genuinely scores below its displacer,
+so the selection is correct *given the scores*. Max |gap|/σ per seed is 0.49 / 0.58 / 0.66, against
+a benign threshold of ≤4 that was **written into the probe's docstring before any number existed**.
+Every gap is under a single σ. The participating positions are not error outliers either: 2 of 62
+exceed p99, at 1.12× and 1.33×, both under the observed max.
+
+**An absolute recall-vs-f64 gate is the wrong gate for this op and will fail forever on correct
+code.** At rank 512 of 2048 the true boundary gaps are ~2.5e-04 — smaller than the kernel's own
+scoring noise — so which of two effectively-tied items returns is arbitrary. **Arm-vs-arm index
+agreement against the incumbent is the right statistic**, and it is what every option in this
+document was judged by.
+
+### 9.1 Why stage A's scores carry bf16-scale error — closed, with a citation
+
+The probe found stage A's score error to be 7.4e-04 relative median / 6.3e-03 max: roughly 10⁴×
+what f32 accumulation over 32 heads should give, on a path that reads f32 throughout
+(`preferred_element_type=jnp.float32`, weights cast to f32, no quantization in
+`prepare_index_weights`). It was recorded as an open question.
+
+It is not a defect and it is documented. `references/hardware-facts.md:104-116`, measured relative
+error:
+
+| | |
+| --- | ---: |
+| f32 operands, `DEFAULT` | 2.2104e-03 |
+| **bf16 operands, f32 accumulator** | **2.2104e-03** |
+| f32 operands, `HIGH` | 1.2995e-05 |
+| f32 operands, `HIGHEST` | 1.4283e-07 |
+
+`f32_DEFAULT / bf16_operands = 1.000×` — identical, not close. **`preferred_element_type` sets the
+accumulator, not the input precision**; without a named `precision` the MXU discards the mantissa
+before it sees the operands. The measured 7.4e-04 / 6.3e-03 straddles that 2.2e-03 characteristic
+error. `HIGHEST` would buy it back at a 4.5× throughput cliff, so this should **not** be "fixed".
+
+### 9.2 It produces a new candidate — Option F, bf16 operands
+
+Stage A moves q and k as f32 and receives bf16 arithmetic for it — what `hardware-facts.md` calls
+"the worst cell in the table: bf16 accuracy at f32 bandwidth." Storing those operands as **bf16**
+gives, per the measured table, an *identical* result distribution while halving the bytes they cross
+HBM with.
+
+The accuracy argument is already discharged by §9: the true boundary gaps (2.5e-04) sit an order of
+magnitude *below* the error the kernel already incurs, so selection there is arbitrary today and
+bf16 operands cannot make it meaningfully more so.
+
+**What decides it is whether stage A is HBM-bound at all** — R3's entire account was `vrot.slane`,
+i.e. issue-bound, in which case F buys ~nothing and is a cheap clean negative. Dispatched, with that
+question first and a stop if the answer is no, plus a composition check against C (a −20% and a −X%
+do not add if they attack the same bound) and both phases measured, since C's prefill-only gating
+must not be inherited unexamined.
