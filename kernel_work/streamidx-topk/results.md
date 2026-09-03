@@ -1,10 +1,10 @@
 # Step 3 — variants built, measured and ranked
 
-**Status: DRAFT — every option is measured; three follow-ups are still running.** Options A, B, C,
+**Status: DRAFT — every option is measured; two follow-ups are still running.** Options A, B, C,
 D, E and candidate 0 are all complete and reported in full, as is the recalibrated baseline (§1).
-Outstanding: candidate 0's `p=9` sweep and its reference check, and Option F (§11.2). None of the
-three can change a verdict already recorded here; the sweep can *revive* Option A (§7) and close
-candidate 0's `provisional`. Do not quote this file as final until this banner is gone.
+Outstanding: candidate 0's `p=9` sweep and its reference check. Neither can change a verdict
+already recorded here; the sweep can *revive* Option A (§7) and the reference check can lift
+candidate 0 out of `provisional`. Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
 the GLM-5.2 DSA lightning indexer, on TPU7x. Baseline branch `annyan/streamidx-topk-opt`, incumbent
@@ -109,6 +109,7 @@ reason decode is the better target, and it is not the reason the earlier documen
 | **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
 | **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
+| **F** — bf16 operands | *proposed on a false premise* — the operands are already fp8 | **REJECTED, +4.63% prefill / +9.80% decode.** Its by-product closes the block: stage A has no roofline headroom left | §11.2–11.3 |
 | **A** — 128-byte K record | halves the K record so half the bytes move | **FAILS its gate at every shippable `bkv_p`** — rank 4. But it is *complementary* to candidate 0, not competing: revisit iff `bkv_p` lands above ≈5 | §7 |
 | **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill +16.4/+24.4%. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
 
@@ -422,8 +423,9 @@ not 1.02.
 
 1. ~~Option C's `num_bkv` sweep~~ — **DONE, C is safe on prefill at every `num_bkv`** (§3.1).
 2. ~~The pre-existing oracle disagreement~~ — **RESOLVED, the shipping kernel is correct** (§11).
-3. **Option F — bf16 operands for stage A** (§11.2). Dispatched. Falls directly out of the accuracy
-   work, and may be the decode-side option C cannot be.
+3. ~~Option F — bf16 operands~~ — **REJECTED, premise was false** (§11.2). Its by-product is the
+   more important result: **prefill stage A has no roofline headroom left** — 75.4% issue/VPU,
+   which C already attacked, and an infinitely fast score matmul would save ≤5.4% (§11.3).
 4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched, and the sweep now
    decides **two** options: whether candidate 0 is a constant to change or a function to write
    (worth up to −39%, `modelled`), and whether Option A revives (§7). R1's VMEM warning at
@@ -467,41 +469,98 @@ scoring noise — so which of two effectively-tied items returns is arbitrary. *
 agreement against the incumbent is the right statistic**, and it is what every option in this
 document was judged by.
 
-### 11.1 Why stage A's scores carry bf16-scale error — closed, with a citation
+### 11.1 Why stage A's scores carry that error — it is the fp8 MXU pass
 
-The probe found stage A's score error to be 7.4e-04 relative median / 6.3e-03 max: roughly 10⁴×
-what f32 accumulation over 32 heads should give, on a path that reads f32 throughout
-(`preferred_element_type=jnp.float32`, weights cast to f32, no quantization in
-`prepare_index_weights`). It was recorded as an open question.
+The probe found stage A's score error to be 7.4e-04 relative median / 6.3e-03 max, roughly 10⁴×
+what f32 accumulation over 32 heads should give, and recorded it as an open question.
 
-It is not a defect and it is documented. `references/hardware-facts.md:104-116`, measured relative
-error:
+**First answer, and it was wrong.** This document previously attributed it to
+`references/hardware-facts.md:104-116` — f32 operands at `DEFAULT` precision measuring 2.2104e-03,
+identical to bf16 operands, because `preferred_element_type` sets the accumulator and not the input
+precision. That reference is sound and it **does not reach this kernel**: stage A has no f32 operand
+to demote. Both matmul operands are already `float8_e4m3fn`, confirmed in the Mosaic MLIR —
+`tpu.matmul … vector<32x128xf8E4M3FN>, vector<2048x128xf8E4M3FN>, vector<32x2048xf32>`.
 
-| | |
-| --- | ---: |
-| f32 operands, `DEFAULT` | 2.2104e-03 |
-| **bf16 operands, f32 accumulator** | **2.2104e-03** |
-| f32 operands, `HIGH` | 1.2995e-05 |
-| f32 operands, `HIGHEST` | 1.4283e-07 |
+**The precision ladder settles it** (`j-e9f4996a-a2bd-4e9d-a3fc`, 3 seeds, bit-identical
+exactly-representable inputs, widening verified at 0.0):
 
-`f32_DEFAULT / bf16_operands = 1.000×` — identical, not close. **`preferred_element_type` sets the
-accumulator, not the input precision**; without a named `precision` the MXU discards the mantissa
-before it sees the operands. The measured 7.4e-04 / 6.3e-03 straddles that 2.2e-03 characteristic
-error. `HIGHEST` would buy it back at a 4.5× throughput cliff, so this should **not** be "fixed".
+| arm | stage-A `max_abs` | `median_rel` |
+| --- | ---: | ---: |
+| **`fp8_native` — what ships** | **1.0628** | **9.01e-04** |
+| `bf16` | 3.05e-05 | 2.89e-08 |
+| `f32_default` | 3.05e-05 | 2.89e-08 |
+| `f32_highest` | 3.05e-05 | 2.89e-08 |
 
-### 11.2 It produces a new candidate — Option F, bf16 operands
+`fp8_native` reproduces the observed error to five figures; every other arm is **31,200× lower**.
+**The error is the fp8 MXU pass itself** — a hardware property, ~3.5e-03 median relative on the
+matmul, and the price of its 1.86× throughput.
 
-Stage A moves q and k as f32 and receives bf16 arithmetic for it — what `hardware-facts.md` calls
-"the worst cell in the table: bf16 accuracy at f32 bandwidth." Storing those operands as **bf16**
-gives, per the measured table, an *identical* result distribution while halving the bytes they cross
-HBM with.
+The verdict is unchanged — not a defect, nothing to fix, and forcing higher precision would cost a
+throughput cliff — but the mechanism is the one above, not the cited one. Note the elegant
+cross-check: **`f32_DEFAULT` is bit-identical to `f32_HIGHEST` here**, which confirms the
+reference's mechanism from the other side. fp8-valued operands are exactly representable in bf16, so
+`DEFAULT`'s truncation has nothing to throw away.
 
-The accuracy argument is already discharged by §11: the true boundary gaps (2.5e-04) sit an order of
-magnitude *below* the error the kernel already incurs, so selection there is arbitrary today and
-bf16 operands cannot make it meaningfully more so.
+### 11.2 Option F — bf16 operands: premise false, measured anyway, rejected
 
-**What decides it is whether stage A is HBM-bound at all** — R3's entire account was `vrot.slane`,
-i.e. issue-bound, in which case F buys ~nothing and is a cheap clean negative. Dispatched, with that
-question first and a stop if the answer is no, plus a composition check against C (a −20% and a −X%
-do not add if they attack the same bound) and both phases measured, since C's prefill-only gating
-must not be inherited unexamined.
+**Option F was proposed on the mistaken premise above** — that stage A moved q and k as f32 and got
+bf16 arithmetic for it, so bf16 storage would halve the bytes for free. Since the operands are
+already fp8, bf16 would **double** the bytes (23.07 → 46.14 MB at prefill) and **halve** MXU
+throughput (1419.9 → 764.8 Tops/s). Stage A already sits in the *best* cell of
+`05-compute-units.md`'s table, not the worst.
+
+It was measured regardless (`j-8c300d39-2612-469d-8602`, min r² 0.999994), which is what makes the
+rejection evidence rather than a retraction:
+
+| stage-A chain slope, µs | incumbent | `f_bf16` | C | F+C |
+| --- | ---: | ---: | ---: | ---: |
+| prefill q1024/ctx9216 | 246.12 | 257.53 **+4.63%** | 196.21 −20.28% | 202.07 −17.93% |
+| decode b64/ctx8704 | 110.00 | 120.78 **+9.80%** | 175.32 +59.38% | 192.01 **+74.55%** |
+
+F loses in both phases **even with HBM traffic held byte-for-byte constant**, and F+C is worse than
+C alone in both. The controls reproduce prior measurements closely (C at −20.28% vs §3's −20.64%;
+decode +59.38% vs §3.1's +59.62%), which is what licenses the new rows.
+
+### 11.3 The by-product is the most useful thing here: stage A has no roofline headroom left
+
+Answering F's gate question — *is stage A HBM-bound at all?* — produced the closing statement for
+prefill stage A:
+
+| | prefill stage A | decode stage A |
+| --- | ---: | ---: |
+| arithmetic intensity | **1319 FLOP/B** (ridge 384) | 37 FLOP/B |
+| share of measured time in the modelled HBM floor | **7.1%** | 35.8% |
+| share in the modelled MXU floor | 24.6% | — |
+| **remainder — issue / VPU** | **75.4%** | — |
+
+Prefill stage A is not HBM-bound and is not close. The 75.4% issue/VPU share is exactly what
+Option C attacked and proved on hardware: C deleted 15,987 VALU ops at **zero** byte change and
+**zero** matmul change and bought −20.64%.
+
+The static census makes the remaining ceiling exact. `f_bf16` changes **precisely one thing** —
+`vmatmul` 1,024 → 2,048, VPU census unchanged to the instruction — so its +4.63% is attributable to
+the matmul alone. Linear-extrapolated, **an infinitely fast score matmul would save ≤5.4% of prefill
+stage A.** There is nothing material left on either roofline axis. C is close to the end of the road
+for this block, and further stage-A work at prefill should be justified against that 5.4%.
+
+Decode is the memory-side phase (37 FLOP/B, 35.8% in the HBM floor), which is where a byte-reduction
+idea could still pay — but F makes the KV records, 98% of decode's bytes, *bigger*. That is Option
+A's territory (§7), not F's.
+
+### 11.4 Decode's +59.62% is now a finding, not judgement
+
+The decode LLO dump was taken. At `bq_sz = 1`, head-major **adds** work rather than removing it:
+`vrot.slane` 2,291 → 2,915, `vadd` 420 → 2,020, spills 2,405 → 3,972, bundles 2,347 → **4,469
+(1.90×)** — at identical `vmatmul` (32) and an identical fp8 pass on both arms. Entirely issue-side.
+The hard gating of C to prefill/MIXED (§3.1) is confirmed by mechanism, not just by the time.
+
+**Two limitations recorded rather than smoothed over.** The capture script piped through `tail -80`
+and both decode arms emitted exactly 80 MATMUL lines, so their geometry and `finite_frac` headers
+were eaten; geometry was recovered from artifact filenames and the script now caps only the MATMUL
+flood. And **F as originally specified — bf16 in the KV cache — was never built**: it needs an
+`mla_attention_op.py` change, and it would only add doubled bytes to an already-negative result.
+
+Also: `same_mask: True` everywhere on the F arms, but that is finite/`-inf` agreement of the *score*
+tensor, not top-k index agreement. Stage A does not select, so this harness structurally cannot
+produce the index statistic §11 argues for. `max_abs` vs incumbent is 2.92 / 2.24, about 2.7× the
+incumbent's own deviation from f64.
