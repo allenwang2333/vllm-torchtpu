@@ -6100,7 +6100,7 @@ class TPUModelRunner(GPUModelRunner):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     elif isinstance(spec, AttentionSpec):
-                        attn_backend = self._resolve_tpu_group_backend([layer_name], spec)
+                        attn_backend = self._resolve_tpu_group_backend([name], spec)
                         total_group_page_size += attn_backend.get_kv_cache_page_size_bytes(
                             spec.block_size,
                             spec.num_kv_heads,
