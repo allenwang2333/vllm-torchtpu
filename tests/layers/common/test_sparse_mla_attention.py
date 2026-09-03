@@ -52,12 +52,20 @@ NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
 ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
                                         PAGE_SIZE, ROPE_DIM, KV_PACKING)
+NOPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
+                                           KVCacheLayout.SPARSECORE,
+                                           TOTAL_PAGES, PAGE_SIZE, LKV_DIM,
+                                           KV_PACKING)
+ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
+                                           KVCacheLayout.SPARSECORE,
+                                           TOTAL_PAGES, PAGE_SIZE, ROPE_DIM,
+                                           KV_PACKING)
 
 
-def _empty_pair():
-    """Zeroed (nope, rope) caches in dsa_gather's native tiled layouts."""
-    return (jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
-            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype))
+def _empty_pair(nope_spec=NOPE_SPEC, rope_spec=ROPE_SPEC):
+    """Create zeroed (NoPE, RoPE) caches for either physical layout."""
+    return (jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
+            jnp.zeros(rope_spec.shape, rope_spec.jax_dtype))
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -115,8 +123,21 @@ class SparseMlaAttentionTest(parameterized.TestCase):
     def _empty_cache(self):
         return _empty_pair()
 
-    def _call(self, kv_cache, ql_nope, q_pe, kv_c_fp8, k_pe_fp8, topk_rows,
-              seq_lens, query_start_loc, distribution, block_tables, mesh):
+    def _call(self,
+              kv_cache,
+              ql_nope,
+              q_pe,
+              kv_c_fp8,
+              k_pe_fp8,
+              topk_rows,
+              seq_lens,
+              query_start_loc,
+              distribution,
+              block_tables,
+              mesh,
+              *,
+              nope_spec=NOPE_SPEC,
+              rope_spec=ROPE_SPEC):
         nope_cache, rope_cache, output = \
             attention_interface.sparse_mla_attention(
             ql_nope,
@@ -131,12 +152,51 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             jnp.asarray(query_start_loc, dtype=jnp.int32),
             jnp.asarray(distribution, dtype=jnp.int32),
             mesh,
-            NOPE_SPEC,
-            ROPE_SPEC,
+            nope_spec,
+            rope_spec,
             sm_scale=self.sm_scale,
             k_scale=self.k_scale,
         )
         return (nope_cache, rope_cache), output
+
+    def test_sparsecore_writer_to_attention(self):
+        """The uint32 writer feeds the SparseCore-layout mode directly."""
+        self._require_tpu()
+        q_len = 64
+        kv_c, k_pe = self._random_latents(q_len)
+        kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
+        k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
+        ql_nope, q_pe = self._random_queries(q_len)
+        topk_rows = _causal_topk(list(range(q_len)), q_len)
+
+        cache, output = self._call(
+            _empty_pair(NOPE_SC_SPEC, ROPE_SC_SPEC),
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [0, 1, 1],
+            self._block_tables(1),
+            self._make_mesh(),
+            nope_spec=NOPE_SC_SPEC,
+            rope_spec=ROPE_SC_SPEC,
+        )
+
+        self.assertEqual(cache[0].dtype, jnp.uint32)
+        self.assertEqual(cache[1].dtype, jnp.uint32)
+        expected, valid = self._reference(
+            ql_nope,
+            q_pe,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [_dequantize(kv_c_fp8, self.k_scale)],
+            [_dequantize(k_pe_fp8, self.k_scale)],
+        )
+        self._check(output, expected, valid)
 
     def _reference(self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc,
                    kv_c_deq, k_pe_deq):
