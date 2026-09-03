@@ -107,11 +107,37 @@ HBM_SPEC_BPS = 3.70e12
 # rows * KV_PACKING * lanes.
 #   inc: 256 * 4 * 256 = 262144   -- today
 #   a  : 258 * 4 * 128 = 132096   -- measurement_and_design.md:678-684
+#   w  : 257 * 4 * 256 = 263168   -- the R1c 4.1 discriminator, see below
 LAYOUTS = {
     "inc": (256, 256),
     "a": (258, 128),
+    "w": (257, 256),
 }
-CONSUMER_LAYOUT = {"inc": "inc", "a_reshape": "a", "a_concat": "a"}
+CONSUMER_LAYOUT = {"inc": "inc", "a_reshape": "a", "a_concat": "a",
+                   "w_reshape": "w"}
+
+# `w` exists to break a collinearity, not to be shipped.
+#
+# The first three arms vary scale placement and record width TOGETHER:
+#     inc         = {scale at lane 128, 256-lane record}
+#     a_reshape } = {lane-major scale rows, 128-lane record}
+#     a_concat  }
+# so they cannot say which of the two the measured 973.9 ns/block belongs to.
+# `a_concat` varies only the reader-side FORMULATION of A's scale path, not the
+# format. See `R1c.md` 4.1.
+#
+# `w` is the missing cell: **inc's 256-lane record with A's lane-major scale
+# rows**. Its payload expression is byte-identical to `_unpack_inc`'s and its
+# scale expression is a pure reshape like `_unpack_a(how="reshape")`, so
+#     XLU / transposes follow the SCALE PLACEMENT -> `w` looks like `a_reshape`
+#     XLU / transposes follow the RECORD WIDTH    -> `w` looks like `inc`
+# and the load masks stay at inc's 2 sublanes either way, which is what
+# separates the byte cost from the instruction cost.
+#
+# This is a COMPILE-ONLY arm. It is censused, never timed, and it is not a
+# proposed cache format: a 257th row per page holding 1024 scale bytes that
+# would fit in the dead pad the record already carries is not a layout anyone
+# would ship. It is a controlled compile.
 
 
 def page_bytes(layout: str) -> int:
@@ -150,6 +176,36 @@ def _unpack_inc(bkv, bkv_p):
     fp8 = pltpu.bitcast(flat[:, :D_IDX], jnp.float8_e4m3fn)
     scale = pltpu.bitcast(flat[:, D_IDX:D_IDX + 1].T,
                           jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+    return fp8.reshape(bkv_sz, D_IDX), scale
+
+
+def _unpack_w(bkv, bkv_p):
+    """The discriminator: inc's payload path, A's scale path.
+
+    `bkv` is (bkv_p*257, 4, 256) uint8. Rows 0..255 of each page are byte-for-
+    byte inc's record -- 128 payload lanes and 128 dead lanes -- and row 256
+    holds that page's 1024 e8m0 scales as (4, 256), lane-major.
+
+    The payload two lines are `_unpack_inc`'s, verbatim, including the
+    `flat[:, :D_IDX]` slice out of a 256-lane row, so the 2-sublane load and
+    the payload relayout are the incumbent's. The scale line is
+    `_unpack_a(how="reshape")`'s: a pure reshape with no lane slice and no
+    transpose. Nothing else differs from either.
+
+    Slot order: `scale.reshape(num_pages, 1, KV_PACKING, LKV_DIM)` in
+    `make_source` puts position p at (p // 256, p % 256), and this reshape
+    reads it back as k*256 + l = p. `check_slot_order_w` proves it on host.
+    """
+    bkv_sz = bkv_p * PAGE_SIZE
+    b4 = bkv.reshape(bkv_p, PSP + 1, KV_PACKING, LKV_DIM)
+
+    # --- inc's payload path, verbatim -------------------------------------
+    flat = b4[:, :PSP].reshape(bkv_sz, LKV_DIM)         # (bkv_sz, 256)
+    fp8 = pltpu.bitcast(flat[:, :D_IDX], jnp.float8_e4m3fn)
+
+    # --- a_reshape's scale path, verbatim ---------------------------------
+    su8 = b4[:, PSP:PSP + 1].reshape(1, bkv_sz)
+    scale = pltpu.bitcast(su8, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
     return fp8.reshape(bkv_sz, D_IDX), scale
 
 
@@ -206,6 +262,45 @@ def check_slot_order(bkv_p=2):
     pay = np.zeros((PSP, KV_PACKING), dtype=np.int64)
     pay[slots // KV_PACKING, slots % KV_PACKING] = slots
     assert np.array_equal(pay.reshape(-1), slots)
+    return True
+
+
+def check_slot_order_w():
+    """Same proof for layout `w`, whose scale row is (4, 256) not (2, 4, 128).
+
+    `make_source` writes position p to `srow[0, p // 256, p % 256]`; `_unpack_w`
+    reads the row back row-major as `k * 256 + l`. The two must be the identity
+    on 0..1023, or `w`'s scales are permuted against its payload and the arm
+    censuses the wrong program.
+
+    >>> THIS GATE HAS NO TEETH, AND R1c.md SECTION 7.1 SAYS SO. <<<
+
+    Review of R1c section 7 established it: what follows re-implements the
+    intended index arithmetic and checks it against itself, which is a
+    tautology of numpy's row-major reshape. It never calls `make_source` and
+    never calls `_unpack_w`, so the exact failure the paragraph above names --
+    a permutation between those two -- would still return True. It is kept
+    because the assertions document the layout contract, not because passing
+    it is evidence.
+
+    What actually caught this class of error in the fourth arm was the
+    CHECKSUM: `w_reshape` came back bit-identical to `a_reshape`
+    (2.63026688e+08), and since each score is `sum_slot s_summed*scale`, a
+    permuted scale row would have moved it. A version of this function with
+    teeth would round-trip `make_source("w", 1)` through `_unpack_w` on host
+    and compare it against `_unpack_inc` of the equivalent `inc` source.
+    """
+    slots = np.arange(PAGE_SIZE)
+    block = np.zeros((KV_PACKING, LKV_DIM), dtype=np.int64)
+    block[slots // LKV_DIM, slots % LKV_DIM] = slots
+    assert np.array_equal(block.reshape(-1), slots), (
+        "row-major flatten of w's (4,256) scale row is NOT slot order")
+    # w's payload rows are inc's: (256, 4) group/packing -> slot = g*4 + k.
+    pay = np.zeros((PSP, KV_PACKING), dtype=np.int64)
+    pay[slots // KV_PACKING, slots % KV_PACKING] = slots
+    assert np.array_equal(pay.reshape(-1), slots)
+    assert KV_PACKING * LKV_DIM == PAGE_SIZE, (
+        "w's single scale row only holds a page's scales when 4*256 == 1024")
     return True
 
 
@@ -330,6 +425,8 @@ def _make_kernel(*, consumer, mode, bkv_p, num_bkv, num_grid, pages_per_seq):
                 blk = bkv_x2_ref.at[sem_idx, b, :bkv_p * rows][...]
                 if consumer == "inc":
                     f, sc = _unpack_inc(blk, bkv_p)
+                elif consumer == "w_reshape":
+                    f, sc = _unpack_w(blk, bkv_p)
                 else:
                     f, sc = _unpack_a(
                         blk, bkv_p,
@@ -482,6 +579,16 @@ def make_source(layout: str, num_pages: int, seed: int = 0):
     if layout == "a":
         srows = scale.reshape(num_pages, 2, KV_PACKING, D_IDX)
         return jnp.concatenate([pay4, srows], axis=1)
+    if layout == "w":
+        # inc's payload record -- 128 payload lanes, 128 dead -- plus one
+        # lane-major scale row per page. Same payload bytes as `inc` in the
+        # same 256-lane rows; the scale byte at lane 128 is left zero because
+        # `_unpack_w` reads the scales from row 256 instead.
+        wpad = jnp.zeros((num_pages, PSP, KV_PACKING, LKV_DIM - D_IDX),
+                         jnp.uint8)
+        prows = jnp.concatenate([pay4, wpad], axis=-1)
+        srow = scale.reshape(num_pages, 1, KV_PACKING, LKV_DIM)
+        return jnp.concatenate([prows, srow], axis=1)
     sc4 = scale.reshape(num_pages, PSP, KV_PACKING, 1)
     pad = jnp.zeros((num_pages, PSP, KV_PACKING, LKV_DIM - D_IDX - 1),
                     jnp.uint8)

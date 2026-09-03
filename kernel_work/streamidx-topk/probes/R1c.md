@@ -16,8 +16,18 @@ with two candidates:
 The stake as posed: under **(T)** a variant might capture the saving *without touching the cache
 format*, which would strictly dominate Option A. Under **(W)** no such variant exists.
 
-> ## Verdict — **narrowed, not settled**
+> ## Verdict — **settled by the fourth arm; read §7**
 >
+> **This block records what the first three arms alone could say. One paragraph in it — "The three
+> arms cannot separate (T) from (W) at all" — is superseded by §7; the other three survive intact,
+> including the byte-axis reading of (W).** The fourth arm has since been captured (job `j-a0566857-c6f2-4667-9eed`) and
+> it breaks the collinearity: **(T) is confirmed and (W) is refuted on every instruction and
+> code-size axis.** `w_reshape` — inc's 256-lane record with A's lane-major scale rows — carries
+> inc's full byte traffic (9.79 MB/block, 2-sublane loads) and yet lands on `a_reshape` for XLU
+> occupancy (**1.04 % against 1.05 %**, versus inc's 46.24 %), transposes (0), bundles (+1.3 % of
+> the gap), spills (+0.5 %) and total ops (+0.9 %).
+>
+
 > **(T) is where the cost is.** Four independent readings agree: XLU bundle occupancy is
 > **46.24 % in the incumbent against 1.05 % in both Option A arms**; the incumbent alone carries
 > 288 `vector<128x128xi8>` tile transposes; the final-LLO delta is **+4,926 ops**, of which
@@ -29,7 +39,7 @@ format*, which would strictly dominate Option A. Under **(W)** no such variant e
 > grounds that `tpu.load` counts match (9,296 vs 9,368). **That reasoning was wrong and the
 > artifact contradicts it.** Instruction *count* is not byte count: the incumbent's loads carry
 > `sublanes [true,true,false...]` against Option A's `[true,false,...]`, so the incumbent reads
-> **9,437,184 B per grid block against Option A's 4,755,456 B — a factor of 1.985** — in the same
+> **9,437,184 B per grid block against Option A's 4,755,456 B — a factor of 1.984** — in the same
 > number of instructions. (W) costs **no extra vector instructions**; it costs **2× the VMEM read
 > bytes and 2× the landing buffer**, and this static dump cannot price either.
 >
@@ -37,7 +47,7 @@ format*, which would strictly dominate Option A. Under **(W)** no such variant e
 > perfectly collinear across them: `inc` = {lane-128 scale, 256-lane record}, both A arms =
 > {lane-major scale rows, 128-lane record}. **There is no arm with a 256-lane record and lane-major
 > scale rows.** That one arm — compile-only, minutes on the existing harness — is the experiment
-> that would settle this, and it has not been run. See §4.1.
+> that would settle this. **[run] It has since been run — §7.**
 >
 > **`R1b` §3.2's `[rev]` tilt toward payload width is NOT superseded.** On the load-width evidence
 > it was right about the bytes; what it did not have was the XLU and transpose evidence showing the
@@ -211,14 +221,14 @@ a_*  × 9,288 : tpu.load ... sublanes [true, false, false×6] : memref<1x1x2322x
 
 Two enabled sublanes × 128 lanes × 4 packed bytes = **1,024 B per load** in `inc`; **512 B** in both
 A arms. Per grid block: 9,216 × 1024 = **9,437,184 B** against 9,288 × 512 = **4,755,456 B**,
-**1.985×**. That reproduces R1b §3.2's 9.4 MB / 4.76 MB figure to the byte. The −72 count delta is
+**1.984×** (256/129). That reproduces R1b §3.2's 9.4 MB / 4.76 MB figure to the byte. The −72 count delta is
 not evidence of anything: A's buffer carries 18 extra scale rows (`2322` vs `2304`), × 4 = 72.
 
 So the correct statement about the payload width is narrow and specific:
 
 > **The 508 pad bytes ride in the same load instruction as the payload.** The width costs the
-> incumbent **zero extra vector operations**. It costs **1.985× the VMEM read bytes** and **1.98×
-> the landing buffer** (18.23 vs 9.3 MiB). Whether those extra bytes cost cycles — whether a masked
+> incumbent **zero extra vector operations**. It costs **1.984× the payload read bytes** and
+> **1.984× the landing buffer** (18.23 vs 9.3 MiB). Whether those extra bytes cost cycles — whether a masked
 > 2-sublane load retires slower than a 1-sublane one — is a hardware question **this static dump
 > cannot answer**, and it is the open channel through which (W) could still be real.
 
@@ -271,6 +281,14 @@ which is why §2.1 quotes `-0018` instead.
 ## 4. What this means for Option A
 
 ### 4.1 The experiment that is missing, and it is cheap
+
+> **[run] This section is history. The fourth arm it specifies has since been captured and it
+> answered the question — see §7.** The text below is kept as written because it is the prediction
+> the arm was designed against, and both of its branches were named before the result existed. The
+> outcome was the first branch: the census landed at `a_reshape`'s. §4.1's own framing — "(T)
+> accounts for all of the instruction-count delta; (W) for none of it, and for all of a byte delta
+> the dump cannot price" — is exactly what §7 confirms, and it is narrower than "(T) accounts for
+> the 973.9 ns". Prefer §4.1's wording.
 
 **The three arms are collinear in the two hypotheses.** Every arm pairs scale placement with record
 width: `inc` = {lane-128 scale, 256-lane record}, both A arms = {lane-major rows, 128-lane record}.
@@ -355,6 +373,16 @@ corroboration of the measured one.
 > **plausible but unproven** — candidate 3 in §4.2 is the only one that would, and it changes
 > numerics. **Before spending anything else here, run the fourth arm in §4.1.**
 
+**[run] The verdict above is left exactly as written and is not amended.** The fourth arm it asks
+for has since been run (§7). On its own axis it is decisive: **on instructions and code size, all of
+the incumbent's excess follows scale placement, not record width** — 98.7 % of the VLIW-bundle gap
+and 100 % of the XLU gap. It does **not** convert into a split of the measured 973.9 ns/block, and
+§7.2 says why. So the reader-side variant stays **"plausible but unproven"**, exactly as §4.4 has
+it: candidate 3 is the only route to it, and §7.4 now prices against it a bf16 counter-cost of the
+same order as the prize. **The verdict on Option A itself is unchanged**, because it never rested on
+the mechanism: the 17.9 % arithmetic shortfall, the unmeasured writer-side change and prefill
+exposure, and the `⚠️ unverified` status all stand.
+
 ---
 
 ## 5. Limitations
@@ -362,9 +390,12 @@ corroboration of the measured one.
 1. **All static.** No cycle counts. The bundle-ratio agreement in §3 is suggestive, is two points,
    and is contradicted in sign by `a_concat` in the same table.
 2. **(T) and (W) are collinear across all three arms** (§4.1). "Confirmed / refuted" is a
-   vocabulary this design cannot issue; "narrowed" is what it earns.
+   vocabulary *this three-arm design* cannot issue; "narrowed" is what it earns. **[run] The fourth
+   arm in §7 breaks the collinearity and does earn "confirmed / refuted", on the instruction axis
+   only.**
 3. **The dump cannot price bytes.** Whether a masked 2-sublane load retires slower than a 1-sublane
-   one decides whether (W)'s 4.68 MB/block of extra VMEM reads is free. Unanswered.
+   one decides whether (W)'s 4.68 MB/block of extra VMEM reads is free. Unanswered — **and still
+   unanswered after §7**, which is a compile, not a timing run.
 4. **`tpu.transpose` -> 20 LLO ops each is this lowering**, on jax 0.10.2 / libtpu 0.0.44.1, at this
    tiling. A different jaxlib may lower it better, which would shrink the prize.
 5. **The probe's geometry, not the model's.** `bkv_p = 9`, ctx 8704, `SEQ_BATCH_SIZE = 4`,
@@ -408,3 +439,309 @@ The review also produced two results by a method this document did not use — a
 across all three arms, and the live cone exclusive to the transposes is ~104 % of the post-DCE
 delta. Both are quoted in §2.2 with their provenance, and both rest on a hand-written regex parser
 rather than an MLIR parser, which the reviewer flagged itself.
+
+---
+
+## 7. The fourth arm — the collinearity broken
+
+§4.1 named the experiment the first three arms could not do and priced it as a compile, a census
+and a paragraph. It has been run.
+
+**Job `j-a0566857-c6f2-4667-9eed`**, `Succeeded`, serial single shard on the whole pod, not fanned
+out. Same image as the predecessor, same `simple-run-command` recipe at `2x2x1`, `ENABLE_XPROF=0`,
+same `/root/kw` mapping, jax **0.10.2** on all three arms, `CAPTURE OK` on all three, 36,330 files
+/ 3.7 GB. Census: `probes/llo_census.py --arms inc,a_reshape,w_reshape`, saved as
+`probes/R1c_census_w.txt`. **Still static compile-time analysis; the 41 min 53 s wall-clock is
+meaningless and is not a result.**
+
+### 7.1 What the arm is
+
+`w_reshape`, layout `w = (257, 256)` in `probe_kpack_consumer.py`: **the incumbent's 256-lane
+record with Option A's lane-major scale rows.** Rows 0..255 of each page carry inc's
+payload bytes in inc's 256-lane record — 128 payload lanes, 128 dead — and row 256 holds that page's
+1,024 e8m0 scales as `(4,256)`. Two qualifications review insisted on: the rows are **not**
+byte-for-byte inc's, because the scale byte at lane 128 is left zero (`_unpack_w` reads row 256
+instead); and `_unpack_w`'s payload is **not verbatim** `_unpack_inc`'s — it carries one extra
+row-axis slice, `b4[:, :PSP]`, that inc does not have. The `flat[:, :D_IDX]` lane slice out of a
+256-lane row *is* inc's. The scale line is `_unpack_a(how="reshape")`'s, a pure reshape with no lane
+slice and no transpose. §7.6 item 4 charges the residual those two differences produce.
+
+That fills the missing cell of the 2×2:
+
+| | scale at lane 128 | lane-major scale rows |
+|---|---|---|
+| **256-lane record** | `inc` | **`w_reshape`** ← new |
+| **128-lane record** | *(not built — not needed)* | `a_reshape`, `a_concat` |
+
+**It is not a proposed cache format.** A 257th row per page holding 1,024 bytes that would fit in
+the dead pad the record already carries is not a layout anyone would ship. It is a controlled
+compile whose only job is to vary one factor.
+
+**One gate has teeth, and it is not the one the arm was built with.** The job log carries three,
+and review established that two of them could not have failed:
+
+- `[llo] ran. checksum=2.63026688e+08 n_finite=34816` — **the load-bearing one.** `w_reshape`'s
+  checksum is **bit-identical to `a_reshape`'s**, and `inc`'s 2.63026624e+08 is 64 away, which at
+  2.63e8 is **4 f32 ULP** (ULP = 2⁴ there) — a reduction-order rounding difference, not a
+  correctness one. Since each score is `Σ_slot s_summed[slot]·scale[slot]`, a permuted scale row
+  would move that sum with near-certainty. This check could have failed and did not.
+- `[llo] w slot-order check: True` — **a check that could not fail.** `check_slot_order_w` builds a
+  fresh numpy array, writes `block[p // 256, p % 256] = p`, and asserts a row-major flatten equals
+  `arange(1024)`. That is a tautology of numpy's reshape. It never calls `make_source` or
+  `_unpack_w`, so the permutation it was written to catch would have sailed through it. It is
+  reported here as run, not as evidence.
+- `source_md5=b0099c0a27ad014fc814a1f543b32313` on all three arms — likewise guaranteed by
+  construction, for the reason §0 already gives.
+
+**A determinism control arrived for free.** `inc` and `a_reshape` reproduced the predecessor job
+*exactly* — 18.23 MiB / 8,417 bundles / 5,262+5,453 spills and 9.3 MiB / 6,590 / 511+657 — so the
+compilation is deterministic across jobs. §7.2 itself is single-job; what the control protects is
+the tie between §7's `inc`/`a_reshape` columns and §3's, which came from the earlier job.
+
+### 7.2 The discriminating table
+
+For any metric M where M(inc) ≠ M(a_reshape), M(w) says which factor M follows. Position is
+`(w − a_reshape) / (inc − a_reshape)`: **0.00 = follows the scale placement (T), 1.00 = follows the
+record width (W).**
+
+| metric | `inc` | `a_reshape` | `w_reshape` | position | follows |
+|---|---:|---:|---:|---:|---|
+| **XLU bundle occupancy** | **46.24 %** | **1.05 %** | **1.04 %** | **−0.000** | **scale placement** |
+| `tpu.transpose` | 288 | 0 | 0 | +0.000 | scale placement |
+| spills + fills | 10,715 | 1,168 | 1,218 | +0.005 | scale placement |
+| `tpu.sublane_shuffle` | 56,167 | 28,519 | 28,771 | +0.009 | scale placement |
+| total ops (`-0013`) | 114,653 | 68,670 | 69,093 | +0.009 | scale placement |
+| `tpu.gather` | 37,459 | 19,027 | 19,243 | +0.012 | scale placement |
+| VLIW bundles | 8,417 | 6,590 | 6,614 | +0.013 | scale placement |
+| final-LLO ops (`-0018`) | 44,562 | 39,636 | 39,792 | +0.032 | scale placement |
+| VSTORE | 43.42 % | 8.39 % | 8.75 % | +0.010 | scale placement |
+| **VMEM read bytes / block** | **9,750,528** | **5,068,800** | **9,787,392** | **+1.008** | **record width** |
+| **VMEM allocated** | **18.23 MiB** | **9.30 MiB** | **18.3 MiB** | **+1.008** | **record width** |
+| `tpu.load` sublane mask | 2 | 1 | **2** | 1.00 | record width |
+| *`tpu.load` count — excluded, see below* | *9,296* | *9,368* | *9,332* | *+0.500* | *confounded* |
+
+The op-count rows, the VMEM-read-byte row and the `tpu.load` mask come from `probes/llo_census.py`
+(saved as `R1c_census_w.txt`); XLU, VSTORE, spills, bundles and VMEM allocated come from
+`xprof-cli get_llo_fit_summary` (saved as `R1c_fit_w.txt`).
+**XLU and VSTORE are `nonzero_bundle_pct`**, not `occupancy_pct` — on
+`occupancy_pct` XLU reads 27.87 / 0.64 / 0.64 and the position is identical. Bundle counts are
+`spills.bundles`; `totals.total_bundles` runs exactly 66 lower in every arm (8,351 / 6,524 / 6,548)
+and gives the same position to three decimals.
+
+**One census row is excluded, and it is the one that would look worst: `tpu.load` count sits at
++0.500, exactly the middle.** It is excluded because it is confounded, not because of where it
+landed — `w`'s 257th row per page adds 36 loads by construction, which is all of the distance from
+`inc`'s 9,296, and a load count carries no byte information anyway (§2.3). The mask, which does, is
+the row above it. Two further fit-summary metrics are not tabulated and also fall outside the band;
+both point *away* from the record width: `VLOAD` 88.12 / 82.35 / 81.16 → **−0.206** and
+`mem-stall(MXU idle)` 77.7 / 70.6 / 69.5 → **−0.155**, i.e. `w` is marginally *better* than
+`a_reshape` on each.
+
+With those on the table: every instruction and code-size metric sits within 3.2 % of `a_reshape`,
+and every byte and footprint metric sits at or just past `inc`. The separation is clean in both
+directions.
+
+**So, on the axis the instrument actually measures:** the record width costs **1.984× the payload
+read traffic** (9,437,184 B vs 4,755,456 B on the page memref; 1.924× counting every load),
+**1.984× the landing buffer** (18,874,368 B vs 9,510,912 B; `w`'s 257th row takes it to
+18,948,096 B) and **1.3 % of the VLIW-bundle gap**. Scale placement accounts for the other
+**98.7 % of the bundle gap** and **100 % of the XLU gap**.
+
+**What that does not license is a split of R1b's measured 973.9 ns/block**, and an earlier draft of
+this section wrote exactly that — "R1b's measured 973.9 ns/block *is* the scale placement". Review
+struck it and was right to. Bundles are code size; converting a bundle share into a share of a
+nanosecond delta needs bundles ∝ time *and* the byte channel priced at zero, and this document
+supplies neither. On the first, §3's only calibration point — `inc` vs `a_reshape` — puts the
+static bundle ratio at 1.2772 against a measured 1.3025, **a 1.98 % error, larger than the 1.3 %
+effect being resolved**. On the second, §7.3 is about to say the byte channel cannot be priced at
+all. **The defensible claim is the instruction-axis one: there, all of the excess follows scale
+placement.** How the 973.9 ns divides between the instruction axis and the byte axis is
+**unmeasured** — the fourth arm was compiled, never timed.
+
+### 7.3 What (W) is still allowed to be
+
+The fourth arm does not make the extra 4.7 MB/block free — it makes them **invisible to a static
+dump**, which was already this document's position and remains its honest limit. `w_reshape` reads
+inc's bytes and compiles to `a_reshape`'s code; whether those bytes cost wall-clock is a question
+only a timing run answers, and I have not run one.
+
+**An earlier draft closed this section by saying the byte cost "is not the 973.9 ns".** That is the
+inference the paragraph above forbids, and it was circular: it used a code-size attribution, which
+is silent about bytes by construction, to prove that bytes do not matter. Struck. The honest
+statement is that **the byte channel is unbounded in both directions by this dump** — it could be
+0 ns/block or it could be most of the 973.9 — and the only thing the fourth arm establishes about
+it is that it buys no instructions.
+
+### 7.4 The reader-side variant — what it is worth, and what it costs
+
+(T) dominates, so per the stake as posed the reader-side variant is the live option. Two things
+`w_reshape` does and does not establish about it:
+
+- **It does establish that the instruction cost is reachable without the cache format.** Reaching
+  `a_reshape`'s scale path while keeping the incumbent's record recovers **98.7 % of the VLIW-bundle
+  gap and 100 % of the XLU gap**. If the whole 973.9 ns/block were instruction-side, a variant that
+  gets the scale operand lane-major without a transpose would be worth **−15.58 µs** on the
+  `bkv_p = 9` decode call. *That is a static ceiling on a measured-then-extrapolated quantity —
+  973.9 ns/block is measured, ×16 is extrapolation, and the "essentially all of it" is a static
+  attribution the dump cannot make (§7.2). It is not a prediction and not a measurement, and the
+  floor under it could be well below −15.58 µs if the byte channel is real.*
+- **It does not establish that a reader-side route exists.** `w_reshape` reaches lane-major scales
+  by **changing the cache format** (adding a row). It is a discriminator, not a variant.
+
+Of §4.2's four candidates, the fourth arm changes the ranking:
+
+**Candidate 3 is now the only one worth considering** — move the scale multiply onto the K operand.
+`_compute_scores` applies the scale after the head-sum as `s_summed * scale[1, bkv_sz]`, which is
+the *reason* the scale must be lane-major. Scaling the K rows before the matmul needs
+`scale[bkv_sz, 1]`, a **lane broadcast of a sublane-major column** — free, no transpose, no
+relayout, and **no cache-format change**. Algebraically exact: e8m0 is an unsigned exponent so the
+scale is positive and commutes through `maximum(s, 0)`, and the head-sum is linear.
+
+Candidates 1 and 2 (widen before transposing; route the transpose through the MXU) are **withdrawn
+as recommendations**. Both edit `streamindex_topk.py`, which is out of scope for this exercise
+regardless of what the dump says, and both only make the transpose cheaper where candidate 3
+removes it.
+
+**What candidate 3 costs, part 1: it promotes the matmul to bf16, and that was measured at
++9.80 % on decode stage A.** This is the finding that most changes §7.4, and an earlier draft of
+this section missed it entirely — it priced candidate 3's cost as "changes rounding" and stopped.
+The shipping K operand is `float8_e4m3fn` (`streamindex_topk.py:265-266`; the census reports
+`tpu.matmul … dtypes f8e4m3`). e4m3 tops out at 448 with a 4-bit exponent, while e8m0 spans
+2⁻¹²⁷…2¹²⁷, so **a scaled K row cannot stay in e4m3 without saturating** — the scaled operand has
+to be widened, which is why the rounding argument below says *bf16*-before-accumulation. Widening
+the operand promotes the score einsum to bf16, and that is Option F, which `results.md` §11.2
+**measured** (`j-8c300d39-2612-469d-8602`, min r² 0.999994):
+
+| stage-A chain slope | incumbent | `f_bf16` |
+|---|---:|---:|
+| decode b64/ctx8704 | 110.00 µs | 120.78 µs **+9.80 %** |
+| prefill q1024/ctx9216 | 246.12 µs | 257.53 µs **+4.63 %** |
+
+Two things make this the right number to be worried by and the wrong number to subtract. Right:
+`f_bf16` was measured **with HBM traffic held byte-for-byte constant**, which is exactly candidate
+3's situation (the cache stays fp8; the widen is in-kernel), and §11.3 attributes the prefill
++4.63 % *to the matmul alone* — `vmatmul` 1,024 → 2,048 at an unchanged VPU census. Wrong: it was
+measured at b64/ctx8704 with a different stage-A geometry from R1c's `bkv_p = 9` probe, so per this
+repo's own rule about numbers measured elsewhere it does not transfer as a literal. What transfers
+is the **mechanism and the order of magnitude: a counter-cost in (0, +9.80 %] on decode, against a
+prize whose ceiling is 10.7 % of the same call.** Candidate 3 could plausibly net to zero or worse.
+
+**What candidate 3 costs, part 2: it is not bit-identical.** The multiply moves from
+f32-after-accumulation to bf16-before-accumulation, so it changes rounding. A checksum comparison is
+the wrong instrument and would fail on a correct implementation.
+
+**So the cheapest next step is not the accuracy check — it is a compile.** Before anyone writes
+candidate 3, build the compile-only arm that folds the scale onto a bf16 K operand and census its
+`vmatmul` count against the incumbent's 144 `tpu.matmul` / f8e4m3. That is the same class of
+experiment §7 just ran, minutes on `probe_llo_capture.py` as it stands, and it decides whether the
+−15.58 µs ceiling has a −10 µs floor underneath it. **I have not built it.**
+
+**The right check, named and not run.** `results.md` §11 settles what the statistic must be: an
+absolute recall-vs-f64 gate **fails on the incumbent itself** — at rank 512 of 2048 the true
+boundary gaps are ~2.5e-04, below the kernel's own scoring noise, so which of two effectively-tied
+items returns is arbitrary. **Arm-vs-arm index agreement against the incumbent is the right
+statistic**, and it is what every option in that document was judged by. Concretely, the check
+would follow job `j-5d02a60e-2266-477c-82d6`'s pattern:
+
+1. Spy on the module-global `sparsecore_topk` inside a trace of the **shipping**
+   `streamindex_topk.__wrapped__`, so the comparison is against the real kernel and not a
+   transcription.
+2. Run the scale-on-K variant and the incumbent on identical inputs, ≥3 seeds, and compare
+   **returned top-k indices**, not scores.
+3. Classify every disagreement. A disagreement is benign when it is a sign flip at a near-tie —
+   `gap_f64 > 0`, `gap_f32 < 0` — with **max |gap|/σ ≤ 4**, the threshold `results.md` §11 recorded
+   before any number existed. **Note that this predicate needs an f64 reference for each swapped
+   pair**, so the run computes one even though the *gate* is arm-vs-arm; step 2 alone is not
+   executable. And note what the incumbent's figures are and are not: **10 of 2,560 disagreeing,
+   all 31 across three seeds sign flips, max |gap|/σ of 0.49 / 0.58 / 0.66 are §11's
+   incumbent-**vs-f64** numbers**, not arm-vs-arm ones. They are the right order-of-magnitude
+   yardstick for "how much disagreement is normal here"; they are not a bar the variant's
+   arm-vs-arm count can be compared to directly.
+4. Localize three ways, as §11 did, so a stage-B regression cannot hide inside a stage-A pass:
+   `_effective_row_lengths` against the oracle, and stage B expected `EXACT`.
+
+That is a `run-command-in-cdk` job of the kind §11 already ran, not a benchmark. **I have not run
+it and I have not built the variant.**
+
+The check has real teeth against candidate 3's actual failure modes — a permuted scale, a wrong
+broadcast axis or fp8 saturation would all move scores far past the boundary gap and show up as
+many disagreements well above the incumbent's observed 0.66. Its limitation is that it is an
+*accuracy* gate on a change whose principal risk is a *performance* regression, which is what the
+`vmatmul` census above is for.
+
+### 7.5 Option A
+
+**Unchanged, and §4.4 stands verbatim.** The fourth arm was never able to move it: A's shortfall is
+arithmetic — −15.30 µs against its own −13 % floor of 18.64 µs, 17.9 % short — and the mechanism
+was never what condemned it.
+
+What the fourth arm changes is what can be said about the *alternative*, and less than an earlier
+draft of this paragraph claimed. It **does not** show that candidate 3 dominates Option A. It shows
+that the incumbent's excess *instructions* are a scale-placement cost, that a reader-side route to
+them exists in principle, and that candidate 3 is the only named candidate on that route. Against
+that: candidate 3 carries a measured-elsewhere bf16 counter-cost of the same order as the prize
+(§7.4), the split of the 973.9 ns between instructions and bytes is unmeasured (§7.2, §7.3), and
+the variant has not been built, timed or accuracy-checked. **The alternative is a live lead with a
+known counter-cost, not a better option than A.**
+
+### 7.6 Limitations specific to §7
+
+1. **Static, all of it.** The fourth arm was compiled and censused, never timed. Nothing in §7.2 is
+   a cycle count.
+2. **A static dump cannot price bytes** (§7.3). (W) is refuted as an instruction-cost mechanism and
+   is untested as a bandwidth one.
+3. **`w_reshape` is not a shippable layout** and was never intended as one.
+4. **The +1.3 % code-size residual** is the 256-lane record's real instruction cost — the
+   `flat[:, :D_IDX]` lane slice plus the extra row. Small, but not zero, and it is charged to the
+   width in §7.2.
+5. **Candidate 3 is named, not built, not measured and not accuracy-checked.** Its algebraic
+   exactness is an argument from the properties of e8m0 and `maximum`, not a test.
+6. **The −15.58 µs ceiling assumes candidate 3 recovers what `w_reshape` recovers.** They reach the
+   same place by different routes and that assumption is untested. It is also a hybrid quantity:
+   measured (973.9 ns/block) × extrapolated (×16) × static (the attribution). Calling it "a static
+   ceiling" flattens three provenances into one.
+7. **The 98.7 / 1.3 split is a share of VLIW bundles, not of the 973.9 ns.** §7.2 says so; it is
+   repeated here because the earlier draft of this document made exactly that slip in four places
+   and it is the easiest one to make again.
+8. **Bundles are a poor proxy at this resolution.** The only calibration point in the document
+   (§3, `inc` vs `a_reshape`) is off by 1.98 %, which is larger than the 1.3 % residual the
+   discriminator resolves. The *direction* of §7.2 is not in doubt — the metrics separate by two
+   orders of magnitude, not by 1.3 % — but the third significant figure is not meaningful.
+9. **Candidate 3's bf16 counter-cost is a repo number, not one measured here.** `results.md` §11.2's
+   +9.80 % / +4.63 % were measured at b64/ctx8704 and q1024/ctx9216, geometries that are not R1c's.
+   The saturation argument that forces the widen (e4m3 max 448 vs e8m0's range) is inference from
+   dtype ranges, not a test.
+10. **The `tpu.load` count row is excluded from §7.2** on a confounding argument, and the excluded
+    row sits at exactly +0.500.
+
+### 7.7 Review of §7
+
+`/critical-review` in a clean context, against the raw dump, the job log and the recipe read-back.
+Disposition **`PARTIALLY CONFIRMED`**. It reproduced every discriminator position, every census
+figure and every fit-summary figure exactly, re-ran the reader itself (three different results for
+three arms — the negative control on `--bypass_cache`), independently re-derived the determinism
+control from job `j-a78a5081`'s own dump, and re-ran `llo_census.py` to a byte-identical artifact.
+What it broke was the layer above the numbers.
+
+| severity | finding | disposition |
+|---|---|---|
+| HIGH | "98.7 % **of the 973.9 ns** is scale placement" maps a code-size share onto a measured time delta; §3's only bundles-vs-time calibration point is off by 1.98 %, larger than the 1.3 % being resolved | **accepted.** §7.2's closing sentence struck and replaced; echoes in §7.3, §7.5 and the §4.4 `[run]` note rewritten; limitations 7–8 added |
+| HIGH | §7.3's last sentence retracted its own first: it used the code-size attribution to prove bytes do not matter | **accepted.** Struck; §7.3 now says the byte channel is unbounded in both directions |
+| HIGH | Candidate 3 forces the K operand to bf16 (e4m3 max 448 vs e8m0's 2⁻¹²⁷…2¹²⁷), which is Option F — **measured at +9.80 % decode / +4.63 % prefill** in `results.md` §11.2, with HBM held constant. §7.4 priced its cost as "changes rounding" | **accepted, and it is the largest change to §7.** §7.4 now carries the counter-cost, the caveat that it was measured at another geometry, and a compile-only `vmatmul` census as the cheap next step. §7.5 downgraded from "candidate 3 dominates A" to "a live lead with a known counter-cost" |
+| HIGH | Two of §7.1's three gates could not have failed: `check_slot_order_w` is a tautology of numpy's reshape and never calls `make_source` or `_unpack_w`; `source_md5` is guaranteed by construction | **accepted.** §7.1 rewritten to credit the one gate with teeth — the checksum |
+| MEDIUM | "There is no metric in the middle" was achieved by dropping the `tpu.load` count row, which sits at exactly +0.500 | **accepted.** Row restored to the table, marked confounded, with the confound stated; `VLOAD` −0.206 and mem-stall −0.155 disclosed too |
+| MEDIUM | §7.4's "figures to beat or match" are §11's incumbent-vs-**f64** numbers, borrowed as a bar for an arm-vs-arm gate; and step 3's predicate needs an f64 reference step 2 does not mention | **accepted.** Step 3 rewritten |
+| MEDIUM | `llo_census.py`'s byte model was 4× low for every non-`x4x` load (f32 loads, `memref<1x32x128xi8>`) | **accepted — a real bug in my code.** Fixed to a uniform `nsub × 512 B`; `R1c_census_w.txt` regenerated. Common-mode, so **every position is unchanged**; absolute per-block totals rose by 233,472 B each and the all-loads ratio corrects 1.97× → 1.924× |
+| LOW | Checksum gap is 4 f32 ULP, not 2 | accepted |
+| LOW | 1.985× should be 1.984× (256/129) | accepted, here and in §2.3 |
+| LOW | "byte-for-byte inc's record" and "`_unpack_inc`'s verbatim" are both literally false | accepted, §7.1 qualified |
+| LOW | "the cross-job comparison in §7.2" — §7.2 is single-job | accepted |
+| LOW | ~45 min is 41 m 53 s | accepted |
+
+The reviewer's own steelman against itself is worth recording: its HIGH findings 1 and 2 are one
+objection to four sentences in a document that states the correct scope in five other places, and
+its strongest substantive finding (the bf16 counter-cost) is an inference from dtype ranges rather
+than a measurement of candidate 3. I have kept all of them anyway — the four sentences were the
+ones a reader would quote, and a counter-cost of the prize's own order is worth a paragraph even
+when it is inferred. On the central question it checked hardest, it found nothing: `w_reshape` is
+the arm it claims to be, and every number reproduced.

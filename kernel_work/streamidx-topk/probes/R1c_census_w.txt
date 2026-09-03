@@ -1,0 +1,237 @@
+==============================================================================
+STATIC COMPILE-TIME OPCODE CENSUS -- not measured time
+==============================================================================
+[inc] kernel episode 1788412478879749399, 18 files (47 in dir)
+[a_reshape] kernel episode 1788413177108264091, 18 files (21 in dir)
+[w_reshape] kernel episode 1788413997880809389, 18 files (21 in dir)
+
+==============================================================================
+tpu.relayout by pass. NOTE: 0 at post-infer-vector-layout is NOT
+evidence of anything -- relayout-insertion is the NEXT pass, so
+this check cannot fail. The 4 tpu.transpose in inc ARE author-
+written; they are present in pass -0001 (original). What the
+compiler adds is the relayout that feeds them.
+==============================================================================
+pass                      inc  a_reshape  w_reshape
+------------------------  ---  ---------  ---------
+post-infer-vector-layout  0    0          0        
+post-relayout-insertion   43   43         43       
+post-apply-vector-layout  0    0          0        
+
+==============================================================================
+tpu.relayout signatures at post-relayout-insertion
+The PAYLOAD relayout is identical across arms => the width costs
+no extra vector OPS. It still costs 2x the BYTES: see the load-
+mask table below. The SCALE relayout is the only structural diff.
+==============================================================================
+  vector<32x9216xf32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=4  a_reshape=4  w_reshape=4
+  vector<9216x1xi8>
+    in  #tpu.vpad<"8,{0,128},(4,128)">
+    out #tpu.vpad<"8,{0,0},(32,128)">
+    inc=4  a_reshape=0  w_reshape=0
+  vector<1x9216xf32>
+    in  #tpu.vpad<"32,{0,0},(8,128)">
+    out #tpu.vpad<"32,{0,0},(1,128)">
+    inc=4  a_reshape=4  w_reshape=4
+  vector<9216x128xi8>
+    in  #tpu.vpad<"8,{0,0},(4,128)">
+    out #tpu.vpad<"8,{0,0},(32,128)">
+    inc=4  a_reshape=4  w_reshape=4
+  vector<9x1x4x256xi8>
+    in  #tpu.vpad<"8,{0,0},(4,128)">
+    out #tpu.vpad<"8,{0,0},(32,128)">
+    inc=0  a_reshape=0  w_reshape=4
+  vector<1x1x9216xf32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(1,128)">
+    inc=4  a_reshape=4  w_reshape=4
+  vector<9x2x4x128xi8>
+    in  #tpu.vpad<"8,{0,0},(4,128)">
+    out #tpu.vpad<"8,{0,0},(32,128)">
+    inc=0  a_reshape=4  w_reshape=0
+  vector<1x128xf32>
+    in  #tpu.vpad<"32,{*,0},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=2  a_reshape=2  w_reshape=2
+  vector<4x1x9216xi1>
+    in  #tpu.vpad<"32,{*,0},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{2,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x9216xf32>
+    in  #tpu.vpad<"32,{*,0},(8,128),-2">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{1,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x9216xi1>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(1,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128),-2">
+    out #tpu.vpad<"32,{0,0},(1,128),-2">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128),-2">
+    out #tpu.vpad<"32,{0,2},(1,128),-2">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x9216xi32>
+    in  #tpu.vpad<"32,{0,*},(1,128)">
+    out #tpu.vpad<"32,{*,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x32x9216xf32>
+    in  #tpu.vpad<"32,{0,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{3,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1x1x4x128xi8>
+    in  #tpu.vpad<"8,{*,*},(32,128)">
+    out #tpu.vpad<"8,{0,0},(4,128)">
+    inc=0  a_reshape=1  w_reshape=0
+  vector<1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128),-2">
+    out #tpu.vpad<"32,{0,1},(1,128),-2">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128),-2">
+    out #tpu.vpad<"32,{0,3},(1,128),-2">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x9216xi32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{*,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4xi32>
+    in  #tpu.vpad<"32,{0,0},(1,128),-2">
+    out #tpu.vpad<"32,{0,0},(8,128),-2">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x32x9216xf32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x32xf32>
+    in  #tpu.vpad<"32,{0,0},(1,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1xi32>
+    in  #tpu.vpad<"32,{0,0},(8,128)">
+    out #tpu.vpad<"32,{0,0},(1,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<1x1x1x4x256xi8>
+    in  #tpu.vpad<"8,{*,*},(32,128)">
+    out #tpu.vpad<"8,{0,0},(4,128)">
+    inc=1  a_reshape=0  w_reshape=1
+  vector<4x1x9216xf32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(8,128)">
+    inc=1  a_reshape=1  w_reshape=1
+  vector<4x1x9216xf32>
+    in  #tpu.vpad<"32,{*,*},(8,128)">
+    out #tpu.vpad<"32,{0,0},(1,128)">
+    inc=1  a_reshape=1  w_reshape=1
+
+==============================================================================
+opcode census at post-apply-vector-layout-SIMPLIFY (-0013)
+structural reading only -- NOT a cost model: ~9x the final-LLO
+delta below, dominated by IR that never executes
+==============================================================================
+op                      inc     a_reshape  w_reshape  inc-a_reshape
+----------------------  ------  ---------  ---------  -------------
+tpu.sublane_shuffle     56167   28519      28771      +27648       
+tpu.gather              37459   19027      19243      +18432       
+tpu.load                9296    9368       9332       -72          
+arith.constant          2408    2430       2421       -22          
+tpu.bitcast_vreg        1769    2057       2057       -288         
+arith.mulf              1440    1440       1440       +0           
+arith.maximumf          1152    1152       1152       +0           
+arith.addf              970     970        970        +0           
+arith.select            331     619        619        -288         
+arith.cmpi              584     584        584        +0           
+tpu.unpack_subelements  576     576        576        +0           
+tpu.roll_vectors        437     149        149        +288         
+tpu.unroll_vectors      432     144        144        +288         
+arith.andi              292     293        293        -1           
+tpu.all_reduce          290     290        290        +0           
+tpu.transpose           288     0          0          +288         
+arith.shrui             0       216        216        -216         
+tpu.matmul              144     144        144        +0           
+tpu.memref_slice        104     104        104        +0           
+tpu.dynamic_rotate      0       72         72         -72          
+TOTAL OPS               114653  68670      69093      +45983       
+
+==============================================================================
+op deltas by stage -- QUOTE post-finalize-llo, not the MLIR passes
+==============================================================================
+stage                              inc     a_reshape  w_reshape  inc-a_reshape
+---------------------------------  ------  ---------  ---------  -------------
+post-apply-vector-layout           185797  131657     132093     +54140       
+post-apply-vector-layout-simplify  114653  68670      69093      +45983       
+post-finalize-llo                  44562   39636      39792      +4926        
+    vcombine*                      11775   8319       8355       +3456        
+    slane*                         9435    7131       7239       +2304        
+
+==============================================================================
+tpu.load by sublane mask -- the actual (W) test
+(equal COUNTS with unequal MASKS = equal instructions, unequal bytes)
+==============================================================================
+  [inc]
+       9216 loads x 2 sublane(s)  memref<1x1x2304x4x256xi8>  ~9,437,184 B
+         36 loads x 8 sublane(s)  memref<1x1x9216xf32>  ~147,456 B
+         36 loads x 8 sublane(s)  memref<4x1x9216xf32>  ~147,456 B
+          4 loads x 8 sublane(s)  memref<1x32x128xi8>  ~16,384 B
+     approx VMEM read bytes per grid block: 9,750,528 (sum over ALL masks, not just the 4 shown)
+  [a_reshape]
+       9288 loads x 1 sublane(s)  memref<1x1x2322x4x128xi8>  ~4,755,456 B
+         36 loads x 8 sublane(s)  memref<1x1x9216xf32>  ~147,456 B
+         36 loads x 8 sublane(s)  memref<4x1x9216xf32>  ~147,456 B
+          4 loads x 8 sublane(s)  memref<1x32x128xi8>  ~16,384 B
+     approx VMEM read bytes per grid block: 5,068,800 (sum over ALL masks, not just the 4 shown)
+  [w_reshape]
+       9252 loads x 2 sublane(s)  memref<1x1x2313x4x256xi8>  ~9,474,048 B
+         36 loads x 8 sublane(s)  memref<1x1x9216xf32>  ~147,456 B
+         36 loads x 8 sublane(s)  memref<4x1x9216xf32>  ~147,456 B
+          4 loads x 8 sublane(s)  memref<1x32x128xi8>  ~16,384 B
+     approx VMEM read bytes per grid block: 9,787,392 (sum over ALL masks, not just the 4 shown)
+
+==============================================================================
+tpu.transpose shapes at post-apply-vector-layout-simplify
+==============================================================================
+  [inc] 288 transposes
+     288 x tpu.transpose %v, [1, 0] {out_layout = #tpu.vpad<"8,{0,0},(32,128)">} : vector<128x128xi8> -> vector<128x128xi8>
+  [a_reshape] 0 transposes
+  [w_reshape] 0 transposes
+
+==============================================================================
+DISCRIMINATOR -- w = {inc's 256-lane record, A's scale rows}
+  0.00 = w matches a_reshape (metric follows SCALE PLACEMENT, T)
+  1.00 = w matches inc       (metric follows RECORD WIDTH, W)
+==============================================================================
+metric               inc      a_reshape  w_reshape  w position
+-------------------  -------  ---------  ---------  ----------
+tpu.transpose        288      0          0          +0.000    
+tpu.sublane_shuffle  56167    28519      28771      +0.009    
+tpu.gather           37459    19027      19243      +0.012    
+tpu.load             9296     9368       9332       +0.500    
+TOTAL ops (-0013)    114653   68670      69093      +0.009    
+VMEM read bytes      9750528  5068800    9787392    +1.008    
+
+  `w` carries one extra 256-lane row per page (257 vs 256), so its
+  load COUNT sits ~0.4% above inc's by construction. The per-load
+  sublane MASK, not the count, is what carries the width.
+  XLU occupancy, bundles, spills and VMEM are NOT here: they come
+  from `xprof-cli get_llo_fit_summary` against each arm's jf/ dir.

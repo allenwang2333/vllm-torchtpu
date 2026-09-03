@@ -15,19 +15,27 @@ Option A attributable to
   (T) the eliminated lane transpose, or
   (W) the halved payload width?
 
-**It cannot settle that, and an earlier version of this docstring claimed a
-test that does not work.** Two corrections, both from the `/critical-review` of
-R1c's first draft:
+**The three arms cannot settle that. A FOURTH ARM CAN, and it has been run** --
+pass `--arms inc,a_reshape,w_reshape` against job `j-a0566857-c6f2-4667-9eed`'s
+dump and this script prints the DISCRIMINATOR table at the bottom. Result: on
+every instruction and code-size metric `w_reshape` lands on `a_reshape`
+(position <= +0.032), and on every byte and footprint metric it lands on `inc`
+(+1.008). (T) on instructions; (W) owns the bytes. See `R1c.md` section 7 --
+including the part section 7 is careful about, which is that a BUNDLE share is
+not a share of the measured 973.9 ns.
+
+Two corrections that got the three-arm version here, both from the
+`/critical-review` of R1c's first draft:
 
 * **Vector-load COUNT is not a test for (W).** The counts are near-equal (9,296
   vs 9,368) but the incumbent's loads carry `sublanes [true,true,...]` against
-  Option A's `[true,false,...]`: 1024 B vs 512 B per load, 1.985x the bytes in
+  Option A's `[true,false,...]`: 1024 B vs 512 B per load, 1.984x the bytes in
   the same instruction count. This script prints that mask breakdown now. (W)
-  costs no extra vector ops and 2x the VMEM read bytes; a static census cannot
+  costs no extra vector ops and ~2x the VMEM read bytes; a static census cannot
   price the bytes.
 * **The three arms are collinear** in scale placement and record width, so
-  neither hypothesis can be isolated from them at all. See `R1c.md` §4.1 for
-  the missing fourth arm.
+  neither hypothesis can be isolated from them at all. `R1c.md` section 4.1
+  specified the missing fourth arm; section 7 reports it.
 
 What the census DOES show: the entire instruction-count delta is on the scale
 path. Quote the `post-finalize-llo` delta (+4,926 ops), not the Mosaic-MLIR one
@@ -44,6 +52,7 @@ here; it comes from `xprof-cli get_llo_fit_summary --program=tpu_custom_call.1
 
 Usage:
     python3 llo_census.py --root <synced>/llo [--arms inc,a_reshape,a_concat]
+    python3 llo_census.py --root <synced>/llo --arms inc,a_reshape,w_reshape
 """
 
 import argparse
@@ -100,6 +109,22 @@ def pass_file(mosaic_dir, files, label):
         return os.path.join(mosaic_dir, exact[-1])
     hits = [f for f in files if label in f]
     return os.path.join(mosaic_dir, hits[-1]) if hits else None
+
+
+# One VMEM sublane slot is 128 lanes x 4 B, whatever the element type: an f32
+# row is 128x4 B directly, and a (4,128)(4,1)-tiled i8 row packs 4 logical rows
+# into the same 512 B. So a masked load of `nsub` sublanes moves nsub*512 B
+# regardless of dtype.
+#
+# [rev] An earlier version of this file computed `nsub * 128 * (4 if "x4x" in
+# mref else 1)`. That happened to be right for the packed-i8 PAYLOAD memrefs --
+# which is where the whole (W) argument lives -- and 4x LOW for every f32 load
+# and for `memref<1x32x128xi8>`, which lacks the literal "x4x". The error was
+# common-mode across arms (all three issue the identical 36+36+4 small loads),
+# so every discriminator POSITION was unaffected; the absolute per-block totals
+# were low by 233,472 B each and the inc/a all-loads ratio read 1.97x instead
+# of 1.92x. Caught in review of R1c section 7.
+SUBLANE_BYTES = 128 * 4
 
 
 def load_masks(path):
@@ -278,15 +303,13 @@ def main():
         p = pass_file(md, fs, "post-apply-vector-layout-simplify")
         m = load_masks(p) if p else collections.Counter()
         print(f"  [{a}]")
-        tot_b = 0
+        tot_b = sum(n * nsub * SUBLANE_BYTES for (nsub, _), n in m.items())
         for (nsub, mref), n in m.most_common(4):
-            lanes = 128
-            packed = 4 if "x4x" in mref else 1
-            b = n * nsub * lanes * packed
-            tot_b += b
+            b = n * nsub * SUBLANE_BYTES
             print(f"     {n:6d} loads x {nsub} sublane(s)  {mref}>  "
                   f"~{b:,} B")
-        print(f"     approx VMEM read bytes per grid block: {tot_b:,}")
+        print(f"     approx VMEM read bytes per grid block: {tot_b:,} "
+              f"(sum over ALL masks, not just the 4 shown)")
 
     # --- transpose shapes ---------------------------------------------------
     print("\n" + "=" * 78)
@@ -304,7 +327,56 @@ def main():
         print(f"  [{a}] {sum(c.values())} transposes")
         for k, v in c.most_common():
             print(f"     {v} x {k}")
+
+    # --- the discriminator --------------------------------------------------
+    if {"inc", "a_reshape", "w_reshape"} <= set(present):
+        discriminate(files, cnt)
     return 0
+
+
+def discriminate(files, cnt):
+    """Where does `w_reshape` land on each metric?
+
+    `w` = {inc's 256-lane record, A's lane-major scale rows}. For any metric M
+    with M(inc) != M(a_reshape), M(w) says which factor M follows:
+
+        M(w) ~ M(a_reshape)  ->  M follows the SCALE PLACEMENT   (hypothesis T)
+        M(w) ~ M(inc)        ->  M follows the RECORD WIDTH      (hypothesis W)
+
+    Reported as a position in [0, 1] from a_reshape to inc. This is STATIC
+    compile-time analysis; none of it is time, and it cannot price bytes.
+    """
+    print("\n" + "=" * 78)
+    print("DISCRIMINATOR -- w = {inc's 256-lane record, A's scale rows}")
+    print("  0.00 = w matches a_reshape (metric follows SCALE PLACEMENT, T)")
+    print("  1.00 = w matches inc       (metric follows RECORD WIDTH, W)")
+    print("=" * 78)
+
+    vals = {}
+    for k in ("tpu.transpose", "tpu.sublane_shuffle", "tpu.gather",
+              "tpu.load"):
+        vals[k] = {a: cnt[a][k] for a in cnt}
+    vals["TOTAL ops (-0013)"] = {a: sum(cnt[a].values()) for a in cnt}
+
+    lb = {}
+    for a in ("inc", "a_reshape", "w_reshape"):
+        md, fs = files[a]
+        p = pass_file(md, fs, "post-apply-vector-layout-simplify")
+        m = load_masks(p) if p else collections.Counter()
+        lb[a] = sum(n * nsub * SUBLANE_BYTES for (nsub, _), n in m.items())
+    vals["VMEM read bytes"] = lb
+
+    rows = []
+    for k, v in vals.items():
+        i, a, w = v["inc"], v["a_reshape"], v["w_reshape"]
+        pos = "n/a (inc == a_re)" if i == a else f"{(w - a) / (i - a):+.3f}"
+        rows.append([k, i, a, w, pos])
+    table(rows, ["metric", "inc", "a_reshape", "w_reshape", "w position"])
+    print("\n  `w` carries one extra 256-lane row per page (257 vs 256), so its")
+    print("  load COUNT sits ~0.4% above inc's by construction. The per-load")
+    print("  sublane MASK, not the count, is what carries the width.")
+    print("  XLU occupancy, bundles, spills and VMEM are NOT here: they come")
+    print("  from `xprof-cli get_llo_fit_summary` against each arm's jf/ dir.")
 
 
 if __name__ == "__main__":

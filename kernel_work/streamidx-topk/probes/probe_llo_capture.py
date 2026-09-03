@@ -42,6 +42,7 @@ WHAT DISCRIMINATES THEM, STATICALLY
 payload path and has a wildly different scale path.
 
 >>> POST-HOC CORRECTION (added after reading the dump; see `R1c.md`) <<<
+>>> ...and then RESOLVED by the fourth arm. Jump to the end of this block. <<<
 
 The (W) test above is WRONG and the three arms cannot settle the question at
 all. Two things this plan did not anticipate:
@@ -65,6 +66,16 @@ all. Two things this plan did not anticipate:
 What the capture DID establish: the whole instruction-count delta is on the
 scale path (XLU bundle occupancy 46.24 % vs 1.05 %, 288 `vector<128x128xi8>`
 transposes only in `inc`, `tpu.matmul` backward cone identical in all arms).
+
+>>> RESOLVED. The fourth arm was built as `w_reshape` and captured in job
+`j-a0566857-c6f2-4667-9eed`. It lands on `a_reshape` for XLU (1.04 % vs
+1.05 %), transposes, spills, bundles and total ops, and on `inc` for VMEM read
+bytes and allocated footprint. So (T) owns the instructions and (W) owns the
+bytes, and the two questions were never the same question.
+
+One thing section 7 of `R1c.md` is careful about and this driver cannot be:
+a bundle-count share is NOT a share of R1b's measured 973.9 ns/block. Nothing
+here is timed.
 
 WHAT THIS IS NOT
 ----------------
@@ -141,7 +152,9 @@ def _du(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True,
-                    help="consumer name: inc | a_reshape | a_concat")
+                    help="consumer name: inc | a_reshape | a_concat | "
+                         "w_reshape (the R1c 4.1 discriminator: inc's 256-lane "
+                         "record with A's lane-major scale rows)")
     ap.add_argument("--bkv-p", type=int, default=9)
     ap.add_argument("--num-grid", type=int, default=8,
                     help="tiny on purpose: the dump is of the compiled program, "
@@ -168,6 +181,11 @@ def main():
     print(f"[llo] jax {jax.__version__} devices={jax.devices()[:1]} "
           f"n={jax.device_count()}", flush=True)
     print(f"[llo] probe source_md5={P.source_md5()}", flush=True)
+    if args.arm == "w_reshape":
+        # w's scale row is (4,256), a different arithmetic from a's (2,4,128).
+        # If it is permuted against the payload the arm compiles fine and
+        # censuses the wrong program, so gate on it rather than trusting it.
+        print(f"[llo] w slot-order check: {P.check_slot_order_w()}", flush=True)
 
     num_bkv = P.cdiv(P.CTX, args.bkv_p * P.PAGE_SIZE)
     num_pages = 4096

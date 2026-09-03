@@ -1,0 +1,138 @@
+==============================================================================
+xprof-cli get_llo_fit_summary --program=tpu_custom_call.1 --bypass_cache=True
+job j-a0566857-c6f2-4667-9eed  (R1c fourth arm)
+STATIC COMPILE-TIME ANALYSIS -- issue slots and allocation sizes, NOT time.
+Percentages quoted in R1c.md 7.2 for XLU and VSTORE are 'nonzero_bundle_pct'.
+Bundle counts quoted are spills.bundles; totals.total_bundles is 66 lower in
+every arm (8351/6524/6548). Both are reported; R1c uses spills.bundles
+throughout for consistency with sections 2-3.
+==============================================================================
+
+########## inc ##########
+# LLO fit summary — tpu_custom_call.1 (kernel)
+VMEM: 18.23 MiB allocated (6 allocs, pass post-ra) = 57.0% of 32 MiB scoped default (43.0% headroom), 14.2% of 128 MiB HW (85.8% headroom)
+  top allocs: 18.0 MiB scratch operand, 0.14 MiB scratch operand, 0.07 MiB internal scratch
+MXU: 144 matmuls on mxu0+mxu1, dtypes f8e4m3, operand width ~256 lanes (matpush1+matpush3 present -> full 256-lane tile staging)
+Unit split (static occupancy): MXU=6.84%  VALU=90.2%  EUP=0.0%  VLOAD=60.07%  VSTORE=31.7%  SALU=2.38%
+Spills: 5262 spills + 5453 fills over 8417 bundles (1.27/bundle)
+  REGISTER-PRESSURE: VPU-active% is inflated by spill traffic — reduce live vectors (less unroll / split accumulator chain)
+Timeline: overlap(MXU+mem)=13.5%  MXU-only=0.1%  mem-stall(MXU idle)=77.7%  VPU-only=5.4%  SALU-bubble=2.5%  idle=0.8%
+Top stall runs (max 5):
+  - bundles 0x1929-0x20e0 (len 1976): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x0-0x118 (len 281): salu_bubble — hlo: ?
+  - bundles 0x17fb-0x1863 (len 105): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x1780-0x17e5 (len 102): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x1718-0x176c (len 85): mem_stall_mxu_idle — hlo: ?
+Hypotheses (INFERRED leads, ranked — not measurements):
+  1. [TUNE] overlap memory traffic with MXU: deepen multi-buffering / prefetch (VMEM headroom 43.0% of scoped default allows deeper buffering) -> <=4.48x (eliminate 77.7% MXU-idle memory-stall bundles)
+  2. [TUNE] schedule vector-only prologue/epilogue work under the matmul pipeline -> <=1.06x (5.4% bundles are VPU-only with MXU idle)
+  3. [STRUCTURAL] restructure the live-register set: less unroll / split accumulator chain (spill traffic is not a tunable) -> unquantified — no ceiling can be derived from a spill count (5262 spills + 5453 fills (absolute) over 8417 bundles; rate 1.27/bundle)  [TRACK RECORD 0/5 — 0/5. Directly refuted twice: -29% when acted on, and the canonical live-range fix measured WORSE. Prefer the operand-materialization framing below.]
+     ALTERNATIVE: Before attacking register liveness, classify each full-width array by ROLE: an operand-sized value on the memory->MXU path (a matmul operand built by a vector op rather than read straight from a VMEM ref) is reliably expensive; a result-sized value in the elementwise chain after a matmul is often free. Measured on one kernel: removing ONE operand-sized materialization (5.9M elements) gained 13.6%, while removing THREE result-sized passes (3.5M elements) gained 0.4%, sub-sigma.
+Verdict: VPU-serialized (vector ALU dominates, MXU starved) — VALU 90.2% static occupancy [class=TUNE ceiling=<=4.48x]
+Caveat: static compile-time analysis (issue slots + allocation sizes), not measured time; verify with get_llo_utilization on a kernel-profiling trace. `recommendations` are INFERRED leads, not measurements — check each lever's track_record before acting.
+Other programs in dump: add_add_fusion, add_add_fusion.1, add_maximum_fusion, broadcast_add_fusion ...
+
+units (occupancy_pct / nonzero_bundle_pct):
+  MXU                6.84     13.63
+  XLU               27.87     46.24
+  VALU              90.20     96.04
+  VPOP               8.68     14.96
+  EUP                0.00      0.00
+  VLOAD             60.07     88.12
+  VLOAD:FILL        21.60     42.12
+  VSTORE            31.70     43.42
+  VSTORE:SPILL      31.26     42.83
+  SALU               2.38      2.96
+totals: {"total_bundles": 8351, "empty_bundles": 3, "non_empty_bundles": 8348}
+spills: {"spills_total": 5262, "fills_total": 5453, "bundles": 8417, "spill_fill_per_bundle": 1.27, "flag": "REGISTER-PRESSURE: VPU-active% is inflated by spill traffic \u2014 reduce live vectors (less unroll / split accumulator chain)"}
+vmem allocs:
+   s8[2,4,2304,4,256]{4,3,2,1,0:T(4,128)(4,1)} 18874368 scratch operand
+   f32[4,1,9216]{2,1,0:T(1,128)} 147456 scratch operand
+   u32[144,128]{1,0:T(1,128)} 73728 internal scratch
+   s8[4,32,128]{2,1,0:T(32,128)(4,1)} 16384 scratch operand
+   f32[4,1,32]{2,1,0:T(1,128)} 2048 scratch operand
+   u8[1024]{0} 1024 
+
+########## a_reshape ##########
+# LLO fit summary — tpu_custom_call.1 (kernel)
+VMEM: 9.3 MiB allocated (6 allocs, pass post-ra) = 29.1% of 32 MiB scoped default (70.9% headroom), 7.3% of 128 MiB HW (92.7% headroom)
+  top allocs: 9.07 MiB scratch operand, 0.14 MiB scratch operand, 0.07 MiB internal scratch
+MXU: 144 matmuls on mxu0+mxu1, dtypes f8e4m3, operand width ~256 lanes (matpush1+matpush3 present -> full 256-lane tile staging)
+Unit split (static occupancy): MXU=8.74%  VALU=94.6%  EUP=0.0%  VLOAD=52.82%  VSTORE=4.45%  SALU=3.04%
+Spills: 511 spills + 657 fills over 6590 bundles (0.18/bundle)
+Timeline: overlap(MXU+mem)=13.6%  MXU-only=3.9%  mem-stall(MXU idle)=70.6%  VPU-only=7.7%  SALU-bubble=3.2%  idle=1.0%
+Top stall runs (max 5):
+  - bundles 0x1834-0x19bd (len 394): vpu_only_mxu_idle — hlo: ?
+  - bundles 0x0-0x10b (len 268): salu_bubble — hlo: ?
+  - bundles 0x2e0-0x31b (len 60): mem_stall_mxu_idle — hlo: ?
+  - bundles 0xf01-0xf32 (len 50): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x8fe-0x92e (len 49): mem_stall_mxu_idle — hlo: ?
+Hypotheses (INFERRED leads, ranked — not measurements):
+  1. [TUNE] overlap memory traffic with MXU: deepen multi-buffering / prefetch (VMEM headroom 70.9% of scoped default allows deeper buffering) -> <=3.40x (eliminate 70.6% MXU-idle memory-stall bundles)
+  2. [TUNE] schedule vector-only prologue/epilogue work under the matmul pipeline -> <=1.08x (7.7% bundles are VPU-only with MXU idle)
+Verdict: VPU-serialized (vector ALU dominates, MXU starved) — VALU 94.6% static occupancy [class=TUNE ceiling=<=3.40x]
+Caveat: static compile-time analysis (issue slots + allocation sizes), not measured time; verify with get_llo_utilization on a kernel-profiling trace. `recommendations` are INFERRED leads, not measurements — check each lever's track_record before acting.
+Other programs in dump: add_add_fusion, add_add_fusion.1, add_maximum_fusion, broadcast_add_fusion ...
+
+units (occupancy_pct / nonzero_bundle_pct):
+  MXU                8.74     17.48
+  XLU                0.64      1.05
+  VALU              94.60     95.02
+  VPOP               8.90     17.57
+  EUP                0.00      0.00
+  VLOAD             52.82     82.35
+  VLOAD:FILL         3.32      9.36
+  VSTORE             4.45      8.39
+  VSTORE:SPILL       3.88      7.54
+  SALU               3.04      3.78
+totals: {"total_bundles": 6524, "empty_bundles": 3, "non_empty_bundles": 6521}
+spills: {"spills_total": 511, "fills_total": 657, "bundles": 6590, "spill_fill_per_bundle": 0.18}
+vmem allocs:
+   s8[2,4,2322,4,128]{4,3,2,1,0:T(4,128)(4,1)} 9510912 scratch operand
+   f32[4,1,9216]{2,1,0:T(1,128)} 147456 scratch operand
+   u32[144,128]{1,0:T(1,128)} 73728 internal scratch
+   s8[4,32,128]{2,1,0:T(32,128)(4,1)} 16384 scratch operand
+   f32[4,1,32]{2,1,0:T(1,128)} 2048 scratch operand
+   u8[1024]{0} 1024 
+
+########## w_reshape ##########
+# LLO fit summary — tpu_custom_call.1 (kernel)
+VMEM: 18.3 MiB allocated (6 allocs, pass post-ra) = 57.2% of 32 MiB scoped default (42.8% headroom), 14.3% of 128 MiB HW (85.7% headroom)
+  top allocs: 18.07 MiB scratch operand, 0.14 MiB scratch operand, 0.07 MiB internal scratch
+MXU: 144 matmuls on mxu0+mxu1, dtypes f8e4m3, operand width ~256 lanes (matpush1+matpush3 present -> full 256-lane tile staging)
+Unit split (static occupancy): MXU=8.71%  VALU=94.66%  EUP=0.0%  VLOAD=52.57%  VSTORE=4.62%  SALU=3.03%
+Spills: 536 spills + 682 fills over 6614 bundles (0.18/bundle)
+Timeline: overlap(MXU+mem)=13.4%  MXU-only=4.1%  mem-stall(MXU idle)=69.5%  VPU-only=8.8%  SALU-bubble=3.2%  idle=1.0%
+Top stall runs (max 5):
+  - bundles 0x184a-0x19d5 (len 396): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x0-0x10b (len 268): salu_bubble — hlo: ?
+  - bundles 0x2df-0x31c (len 62): mem_stall_mxu_idle — hlo: ?
+  - bundles 0xf0f-0xf40 (len 50): mem_stall_mxu_idle — hlo: ?
+  - bundles 0x151b-0x154c (len 50): mem_stall_mxu_idle — hlo: ?
+Hypotheses (INFERRED leads, ranked — not measurements):
+  1. [TUNE] overlap memory traffic with MXU: deepen multi-buffering / prefetch (VMEM headroom 42.8% of scoped default allows deeper buffering) -> <=3.28x (eliminate 69.5% MXU-idle memory-stall bundles)
+  2. [TUNE] schedule vector-only prologue/epilogue work under the matmul pipeline -> <=1.10x (8.8% bundles are VPU-only with MXU idle)
+Verdict: VPU-serialized (vector ALU dominates, MXU starved) — VALU 94.66% static occupancy [class=TUNE ceiling=<=3.28x]
+Caveat: static compile-time analysis (issue slots + allocation sizes), not measured time; verify with get_llo_utilization on a kernel-profiling trace. `recommendations` are INFERRED leads, not measurements — check each lever's track_record before acting.
+Other programs in dump: add_add_fusion, add_add_fusion.1, add_maximum_fusion, broadcast_add_fusion ...
+
+units (occupancy_pct / nonzero_bundle_pct):
+  MXU                8.71     17.42
+  XLU                0.64      1.04
+  VALU              94.66     95.06
+  VPOP               8.87     17.54
+  EUP                0.00      0.00
+  VLOAD             52.57     81.16
+  VLOAD:FILL         3.44      9.43
+  VSTORE             4.62      8.75
+  VSTORE:SPILL       4.05      7.91
+  SALU               3.03      3.76
+totals: {"total_bundles": 6548, "empty_bundles": 3, "non_empty_bundles": 6545}
+spills: {"spills_total": 536, "fills_total": 682, "bundles": 6614, "spill_fill_per_bundle": 0.18}
+vmem allocs:
+   s8[2,4,2313,4,256]{4,3,2,1,0:T(4,128)(4,1)} 18948096 scratch operand
+   f32[4,1,9216]{2,1,0:T(1,128)} 147456 scratch operand
+   u32[144,128]{1,0:T(1,128)} 73728 internal scratch
+   s8[4,32,128]{2,1,0:T(32,128)(4,1)} 16384 scratch operand
+   f32[4,1,32]{2,1,0:T(1,128)} 2048 scratch operand
+   u8[1024]{0} 1024 
