@@ -251,7 +251,7 @@ def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
 def _stage3_transfer_groups(
     kv_cache_groups: Sequence[Any],
     *,
-    allow_multiple: bool,
+    multi_group: bool,
 ) -> tuple[_Stage3TransferGroup, ...]:
     """The KV cache groups whose pages Stage 3 transfers, in group order.
 
@@ -261,8 +261,14 @@ def _stage3_transfer_groups(
     ``page_tokens`` travels with the group index because DeepSeek-V4's groups
     page at different sizes -- its SWA group's block is an eighth of the CSA
     group's -- so a single connector-wide page size cannot validate them all.
-    Every other model here has exactly one such group, which
-    ``allow_multiple=False`` keeps enforced.
+
+    ``multi_group`` says which plan this is, and it is exact in both
+    directions. Qwen3.5 and GLM have one such group and must have one. DSv4
+    has several by construction, because the whole reason it needs its own
+    admission path is that its groups disagree about page geometry; a
+    single-group DSv4 plan would mean the scheduler sends no per-group block
+    tables while the worker's DSv4 path requires them, and the transfer would
+    fail at runtime rather than here.
     """
     groups = tuple(
         _Stage3TransferGroup(
@@ -275,10 +281,17 @@ def _stage3_transfer_groups(
         raise ValueError(
             "Stage-3 resharding requires at least one non-Mamba KV cache "
             f"group, got {len(tuple(kv_cache_groups))} group(s)")
-    if not allow_multiple and len(groups) != 1:
+    if not multi_group and len(groups) != 1:
         raise ValueError("Stage-3 Qwen3.5 resharding requires exactly one "
                          f"full-attention KV cache group, got "
                          f"{[group.cache_group_index for group in groups]}")
+    if multi_group and len(groups) < 2:
+        raise ValueError(
+            "Stage-3 DSv4 resharding expects several KV cache groups paging "
+            "at different sizes, got "
+            f"{[group.cache_group_index for group in groups]}. A model with "
+            "one group does not need DSv4 admission; run it without "
+            "TPU_RAIDEN_DSV4_ADMISSION=1")
     return groups
 
 
@@ -491,7 +504,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         if use_raiden and _use_raiden_stage3_transport():
             self._stage3_transfer_groups = _stage3_transfer_groups(
                 kv_cache_config.kv_cache_groups,
-                allow_multiple=_use_raiden_dsv4_admission())
+                multi_group=_use_raiden_dsv4_admission())
             self._stage3_fa_group_index = (
                 self._stage3_transfer_groups[0].cache_group_index)
         self._stage3_mamba_group_indices: list[int] = []
@@ -2099,7 +2112,7 @@ class TPURaidenConnectorWorker:
         indexes the block tables the scheduler sends.
         """
         transfer_groups = _stage3_transfer_groups(kv_cache_groups,
-                                                  allow_multiple=True)
+                                                  multi_group=True)
         plan_position_by_group = {
             group.cache_group_index: position
             for position, group in enumerate(transfer_groups)
