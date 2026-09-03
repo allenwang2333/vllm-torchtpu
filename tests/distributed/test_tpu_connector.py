@@ -149,7 +149,7 @@ def test_stage3_transfer_groups_skips_mamba_state_groups():
     """Mamba state rides the state-class tags, not the page transfer."""
     config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
     groups = _stage3_transfer_groups(config.kv_cache_groups,
-                                     allow_multiple=False)
+                                     multi_group=False)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(2, 16)]
 
@@ -158,7 +158,22 @@ def test_stage3_transfer_groups_rejects_several_groups_by_default():
     with pytest.raises(ValueError, match="exactly one"):
         _stage3_transfer_groups(
             _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
-            allow_multiple=False)
+            multi_group=False)
+
+
+def test_stage3_transfer_groups_rejects_a_single_group_dsv4_plan():
+    """DSv4 admission on a one-group model is rejected at startup.
+
+    The scheduler only builds per-group block tables when the plan has more
+    than one group, while the worker's DSv4 path requires them for every
+    request. A single-group DSv4 plan makes those two disagree, and without
+    this check the disagreement surfaces as a mid-transfer RuntimeError that
+    takes the engine down. There is no such model today; DSv4 has several
+    groups because its groups page at different sizes.
+    """
+    single = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
+    with pytest.raises(ValueError, match="TPU_RAIDEN_DSV4_ADMISSION"):
+        _stage3_transfer_groups(single.kv_cache_groups, multi_group=True)
 
 
 def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
@@ -168,14 +183,14 @@ def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
         if isinstance(group.kv_cache_spec, MambaSpec)
     ]
     with pytest.raises(ValueError, match="at least one non-Mamba"):
-        _stage3_transfer_groups(mamba_only, allow_multiple=True)
+        _stage3_transfer_groups(mamba_only, multi_group=True)
 
 
 def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
     """Group order is preserved and each group carries its own page size."""
     groups = _stage3_transfer_groups(
         _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
-        allow_multiple=True)
+        multi_group=True)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(0, 1024), (1, 1024), (2, 128)]
 
