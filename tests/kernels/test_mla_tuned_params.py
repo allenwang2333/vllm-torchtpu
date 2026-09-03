@@ -48,6 +48,10 @@ def _k3_tp32_fp8_8k_mixed_key() -> TuningKey:
     )
 
 
+def _k3_tp32_bf16_4k_mixed_key() -> TuningKey:
+    return replace(_k3_mixed_key(), actual_num_q_heads=3)
+
+
 def _k3_tp32_fp8_8k_page256_mixed_key() -> TuningKey:
     return replace(
         _k3_tp32_fp8_8k_mixed_key(),
@@ -62,6 +66,15 @@ def test_k3_mixed_tuned_params() -> None:
     assert tuned.num_kv_pages_per_block == 4
     assert tuned.num_queries_per_block == 256
     assert tuned.q_split == 1
+
+
+def test_k3_tp32_bf16_4k_mixed_tuned_params() -> None:
+    tuned = get_tuned_params(_k3_tp32_bf16_4k_mixed_key())
+
+    assert tuned.num_kv_pages_per_block == 2
+    assert tuned.num_queries_per_block == 768
+    assert tuned.q_split == 3
+    assert tuned.vmem_limit_bytes == 60 * 1024 * 1024
 
 
 def test_k3_tp32_fp8_8k_mixed_tuned_params() -> None:
