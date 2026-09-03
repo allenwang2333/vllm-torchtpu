@@ -176,6 +176,13 @@ the reason given under T1.3, so it is replaced by `dsv4_pd_guard_probe.py`
 against the producer's own port, followed by a second oracle pass to catch a
 producer that died just after answering.
 
+In the end the `cdk` CLI was installed on this host and used directly, so
+`render_cdk_recipe.py` and the `kubectl` route are a fallback rather than the
+path taken. The two JobSet networking settings still matter: `spec.network`
+must set `enableDNSHostnames` and `publishNotReadyAddresses`, the latter
+because the producer resolves the consumer while the consumer is still loading
+weights.
+
 **Known risk to check first.** The image pins `tpu_sync`, and the PR calls
 `facade.register_request_blocks(..., pool_spans=...)` per tag. If the pinned
 `tpu_sync` predates multi-tag span registration, admission fails at startup
@@ -314,6 +321,56 @@ one page covers the whole live window and everything before it is dead prefix.
 The trim is not shaving an edge; on any prompt past a hundred tokens it is
 discarding the entire table but the tail. The two SWA groups, window 128
 against a 128-token page, are the mild case. Qwen has neither.
+
+## Tier 2 results, run of 2026-09-03 on cdk
+
+Tier 2 is green. Job `j-685e5deb-9447-4b73-a50b` ran
+`cdk-dsv4-pd-dp8-dp8-raiden.yml` on two tpu7x `2x2x1` nodes, DP8 prefill on one
+and DP8 decode on the other, and the oracle passed 22 of 22 cases at lengths
+127, 128, 129, 512, 2048, 4096 and 8192, two repeats each. That is the result
+Tier 2 exists for: nothing in the Raiden transfer depends on producer and
+consumer sharing a host, and the single-host Tier 1 run could not have told us
+that.
+
+The guard fired in production, which is the part worth reading twice.
+`dsv4_pd_guard_probe.py` went straight at the producer's port 8000 with a
+131-token prompt at `max_tokens=48`, the shape that took the DP4/DP4 prefill
+engine down before the guard existed. The producer ran to 178 computed tokens,
+the connector noticed that the 130-token transfer prefix still listed
+sliding-window pages the allocator had recycled, and it skipped the send
+instead of crashing. The producer answered with 48 completion tokens and
+reported healthy afterwards. Three further sends carried recycled pages and
+were reported at `tpu_connector.py:1451` without being dropped. Across 27
+Stage-3 sends there were no `still repeats a page` errors, no tracebacks on
+either replica, and 27 matching 200s on the consumer. A second oracle pass
+after the probe passed 5 of 5, so the producer was still serving correctly and
+had not merely survived the request that killed it before.
+
+Getting there took ten attempts, and two of the failures are recorded in the
+recipe because they will bite the next person. The first is HBM. DP attention
+all-gathers every rank's tokens before the MoE, so the XLA graph scales with
+tokens-per-step times DP degree, and at DP8 only about 95 GiB is free once the
+weights are resident. Measured temporaries came to 114.93 GiB for a 4096-token
+step, 100.96 for 2048 and 94.75 for 1024, the last of these missing the 94.74
+GiB budget by ten megabytes. The recipe runs at 512 tokens per step with
+`--gpu-memory-utilization 0.95`. Note that the compile which OOMs is the memory
+profiling run inside `_initialize_kv_caches`, and it is sized by
+`--max-num-batched-tokens` rather than by `compile_sizes`, so lowering
+`compile_sizes` alone just moves the failure. The second is a node-release
+race: grabbing the TPU fails outright when the previous tenant has not finished
+releasing it, PjRtClient reports `Failed to start the gRPC server`, and every
+worker dies inside `init_device`. That cost two runs, so the recipe now retries
+`vllm serve` up to three times, but only when it dies within four minutes,
+since the weights are still streaming then and anything later is a real fault.
+
+One bug in the harness rather than the code is worth recording. The benchmark
+container waited for `$PROXY/v1/models` to return 200, but `toy_proxy_server.py`
+routes only `/v1/completions`, `/v1/chat/completions` and `/healthcheck`, so
+that poll returns 404 forever no matter how healthy the backends are, and
+`/healthcheck` is no better because the proxy answers it the moment its
+container starts, before either engine exists. The readiness loop now polls
+`/v1/models` on the two real engines. The run above was driven by hand through
+`cdk job exec` into the benchmark container while that loop was still spinning.
 
 ## Order and cost
 

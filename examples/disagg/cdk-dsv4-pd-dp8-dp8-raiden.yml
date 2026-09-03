@@ -594,16 +594,28 @@ spec:
                       : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
                       mkdir -p "$CDK_OUTPUT_DIR"
                       PROXY="http://${JS_NAME}-prefill-0-0.${JS_NAME}:10000"
+                      PREFILL="http://${JS_NAME}-prefill-0-0.${JS_NAME}:8000"
+                      DECODE="http://${JS_NAME}-decode-0-0.${JS_NAME}:7200"
 
-                      # Both replicas requantize MoE weights to fp4 before they
-                      # serve, which took ~16 minutes on the Tier 1 host.
+                      # Wait on the two engines, not on the proxy. The proxy is
+                      # up the moment its container starts, and toy_proxy_server
+                      # only routes /v1/completions and /v1/chat/completions, so
+                      # asking it for /v1/models gets a 404 forever no matter how
+                      # healthy the backends are. Both replicas requantize MoE
+                      # weights to fp4 before they serve, which took ~16 minutes
+                      # on the Tier 1 host and ~20 at DP8.
                       for i in $(seq 1 240); do
-                        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-                               "$PROXY/v1/models" || true)
-                        [ "$code" = "200" ] && break
+                        pcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                                "$PREFILL/v1/models" || true)
+                        dcode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                                "$DECODE/v1/models" || true)
+                        [ "$pcode" = "200" ] && [ "$dcode" = "200" ] && break
                         sleep 15
                       done
-                      [ "$code" = "200" ] || { echo "RESULT: FAIL (proxy never came up)"; exit 1; }
+                      [ "$pcode" = "200" ] && [ "$dcode" = "200" ] || {
+                        echo "RESULT: FAIL (engines never came up: prefill=$pcode decode=$dcode)"
+                        exit 1
+                      }
 
                       mkdir -p /workspace/vllm-torchtpu
                       # The image has no gcloud, so fetch through the JSON API
