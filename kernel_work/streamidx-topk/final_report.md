@@ -133,7 +133,7 @@ it was never in scope here.
 | option | verdict | why |
 | --- | --- | --- |
 | **A** — 128-byte K record | reject | −15.30 µs against its own −13% floor of 18.64 µs, **17.9% short**. 94.3% of the fetch is already hidden; byte reduction contributes +17.8 ns/block. The mechanism was settled (scale placement, not record width) and the only reader-side route needs a bf16 K operand — which *is* Option F |
-| **B** — two-unit pipeline | **defer, do not build now** | Real: +24.4% prefill on the op. But the prefill chunk is **one sequence of 1024 tokens** and cannot be split; the number came from presenting it as G pseudo-sequences, i.e. a **runner/scheduler change**. At ~0.15% of a prefill step that blast radius is not justified. Reconsider free-of-charge if the packing change happens for another reason — and take it **with D1**, not instead of it |
+| **B** — two-unit pipeline | **STALE — reopened, see banner** | Written when the runner change was out of scope. Sign convention below was also imported unconverted from Option B's document (`+` = faster there, `−` = faster here): the correct figure in this document's convention is **−24.4%** prefill on the op alone, and **−26.18%** for B×C at G=4 (`j-caf973f4-163d-42e0-89e6`). The runner change is now authorized and a prototype is being measured |
 | **E** — `_pick_partition` | reject | Correct (1 100 arms, 0 mismatches) but lands on a bucket `min_token_size=16` makes unreachable |
 | **F** — bf16 operands | reject | Premise false: both matmul operands are already `float8_e4m3fn`. bf16 doubles bytes and halves MXU throughput. Measured **+4.63% prefill / +9.80% decode** |
 

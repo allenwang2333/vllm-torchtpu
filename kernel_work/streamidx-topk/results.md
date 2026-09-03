@@ -139,7 +139,13 @@ op-level figure times the op's share, so each is an upper bound that assumes no 
 | candidate 0 (`bkv_p`) | -14.6% of op | **~0.55%** | -- |
 | D1 | -10.0% of op | **~0.38%** | -- |
 | Option C, prefill-gated | -20.6% of prefill stage A | 0 (gated off) | **~0.06%** |
-| Option B + runner change | +24.4% of prefill op | ~0 (wash) | **~0.15%** |
+| Option B + runner change | -24.4% of prefill op | ~0 (wash) | **~0.15%** |
+| Option B x C + runner change | **-26.18%** of prefill op (G=4, `j-caf973f4-163d-42e0-89e6`) | ~0 (wash) | **~0.16%** |
+
+> **Sign convention.** This table uses **`-` = faster**, matching Option C's documents. Option B's
+> own `RESULTS.md` uses the opposite convention (`+` = faster) throughout. The `+24.4%` written
+> there and the `-24.4%` here are the same measurement. Convert on import -- the collision has
+> already produced one self-contradicting summary.
 
 Prefill is worse: the op is **order 1%** of a prefill step. The `prefill_heavy` capture contains
 exactly one indexer-active step (stage A 1.813 ms, stage B 2.007 ms of 620.5 ms TC busy = 0.62%),
