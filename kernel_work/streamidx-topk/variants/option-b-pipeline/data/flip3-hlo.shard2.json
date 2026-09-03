@@ -1,0 +1,1308 @@
+{
+  "decode": {
+    "phase": "decode",
+    "R": 2,
+    "force_p1": true,
+    "cases": {
+      "G1": {
+        "num_custom_calls": 8,
+        "num_stage_a": 2,
+        "num_stage_b": 6,
+        "expected_each": 2,
+        "stage_a_names": [
+          "StreamIdxTC-d-bq_1-bkvp_2.2",
+          "StreamIdxTC-d-bq_1-bkvp_2.3"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b64_n10240_k2048.12",
+          "sc_topk_direct_b64_n10240_k2048.13",
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b64_n10240_k2048.12",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b64_n10240_k2048.13",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.2",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.3",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 4,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b64_n10240_k2048.12": [
+            [
+              "param_0.24",
+              "parameter"
+            ],
+            [
+              "param_1.20",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b64_n10240_k2048.13": [
+            [
+              "param_0.26",
+              "parameter"
+            ],
+            [
+              "param_1.22",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      },
+      "G2": {
+        "num_custom_calls": 16,
+        "num_stage_a": 4,
+        "num_stage_b": 12,
+        "expected_each": 4,
+        "stage_a_names": [
+          "StreamIdxTC-d-bq_1-bkvp_2.4",
+          "StreamIdxTC-d-bq_1-bkvp_2.5",
+          "StreamIdxTC-d-bq_1-bkvp_2.6",
+          "StreamIdxTC-d-bq_1-bkvp_2.7"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b32_n10240_k2048.24",
+          "sc_topk_direct_b32_n10240_k2048.25",
+          "sc_topk_direct_b32_n10240_k2048.26",
+          "sc_topk_direct_b32_n10240_k2048.27",
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b32_n10240_k2048.24",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b32_n10240_k2048.25",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b32_n10240_k2048.26",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b32_n10240_k2048.27",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.4",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.5",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.6",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.7",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 8,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b32_n10240_k2048.24": [
+            [
+              "param_0.48",
+              "parameter"
+            ],
+            [
+              "param_1.40",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b32_n10240_k2048.25": [
+            [
+              "param_0.50",
+              "parameter"
+            ],
+            [
+              "param_1.42",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b32_n10240_k2048.26": [
+            [
+              "param_0.52",
+              "parameter"
+            ],
+            [
+              "param_1.44",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b32_n10240_k2048.27": [
+            [
+              "param_0.54",
+              "parameter"
+            ],
+            [
+              "param_1.46",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false,
+          false,
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      },
+      "G4": {
+        "num_custom_calls": 32,
+        "num_stage_a": 8,
+        "num_stage_b": 24,
+        "expected_each": 8,
+        "stage_a_names": [
+          "StreamIdxTC-d-bq_1-bkvp_2.8",
+          "StreamIdxTC-d-bq_1-bkvp_2.9",
+          "StreamIdxTC-d-bq_1-bkvp_2.10",
+          "StreamIdxTC-d-bq_1-bkvp_2.11",
+          "StreamIdxTC-d-bq_1-bkvp_2.12",
+          "StreamIdxTC-d-bq_1-bkvp_2.13",
+          "StreamIdxTC-d-bq_1-bkvp_2.14",
+          "StreamIdxTC-d-bq_1-bkvp_2.15"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b16_n10240_k2048.48",
+          "sc_topk_direct_b16_n10240_k2048.49",
+          "sc_topk_direct_b16_n10240_k2048.50",
+          "sc_topk_direct_b16_n10240_k2048.51",
+          "sc_topk_direct_b16_n10240_k2048.52",
+          "sc_topk_direct_b16_n10240_k2048.53",
+          "sc_topk_direct_b16_n10240_k2048.54",
+          "sc_topk_direct_b16_n10240_k2048.55",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b16_n10240_k2048.48",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.49",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.50",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.51",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.52",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.53",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.54",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b16_n10240_k2048.55",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.8",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.9",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.10",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.11",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.12",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.13",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.14",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-d-bq_1-bkvp_2.15",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 16,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b16_n10240_k2048.48": [
+            [
+              "param_0.96",
+              "parameter"
+            ],
+            [
+              "param_1.80",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.49": [
+            [
+              "param_0.98",
+              "parameter"
+            ],
+            [
+              "param_1.82",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.50": [
+            [
+              "param_0.100",
+              "parameter"
+            ],
+            [
+              "param_1.84",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.51": [
+            [
+              "param_0.102",
+              "parameter"
+            ],
+            [
+              "param_1.86",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.52": [
+            [
+              "param_0.104",
+              "parameter"
+            ],
+            [
+              "param_1.88",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.53": [
+            [
+              "param_0.106",
+              "parameter"
+            ],
+            [
+              "param_1.90",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.54": [
+            [
+              "param_0.108",
+              "parameter"
+            ],
+            [
+              "param_1.92",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b16_n10240_k2048.55": [
+            [
+              "param_0.110",
+              "parameter"
+            ],
+            [
+              "param_1.94",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      }
+    }
+  },
+  "prefill": {
+    "phase": "prefill",
+    "R": 2,
+    "force_p1": true,
+    "cases": {
+      "G1": {
+        "num_custom_calls": 8,
+        "num_stage_a": 2,
+        "num_stage_b": 6,
+        "expected_each": 2,
+        "stage_a_names": [
+          "StreamIdxTC-m-bq_128-bkvp_2.2",
+          "StreamIdxTC-m-bq_128-bkvp_2.3"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b1024_n10240_k2048.12",
+          "sc_topk_direct_b1024_n10240_k2048.13",
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b1024_n10240_k2048.12",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b1024_n10240_k2048.13",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.2",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.3",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 4,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b1024_n10240_k2048.12": [
+            [
+              "param_0.24",
+              "parameter"
+            ],
+            [
+              "param_1.20",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b1024_n10240_k2048.13": [
+            [
+              "param_0.26",
+              "parameter"
+            ],
+            [
+              "param_1.22",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      },
+      "G2": {
+        "num_custom_calls": 16,
+        "num_stage_a": 4,
+        "num_stage_b": 12,
+        "expected_each": 4,
+        "stage_a_names": [
+          "StreamIdxTC-m-bq_128-bkvp_2.4",
+          "StreamIdxTC-m-bq_128-bkvp_2.5",
+          "StreamIdxTC-m-bq_128-bkvp_2.6",
+          "StreamIdxTC-m-bq_128-bkvp_2.7"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b512_n10240_k2048.24",
+          "sc_topk_direct_b512_n10240_k2048.25",
+          "sc_topk_direct_b512_n10240_k2048.26",
+          "sc_topk_direct_b512_n10240_k2048.27",
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b512_n10240_k2048.24",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b512_n10240_k2048.25",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b512_n10240_k2048.26",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b512_n10240_k2048.27",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.4",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.5",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.6",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.7",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 9,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b512_n10240_k2048.24": [
+            [
+              "param_0.48",
+              "parameter"
+            ],
+            [
+              "param_1.40",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b512_n10240_k2048.25": [
+            [
+              "param_0.50",
+              "parameter"
+            ],
+            [
+              "param_1.42",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b512_n10240_k2048.26": [
+            [
+              "param_0.52",
+              "parameter"
+            ],
+            [
+              "param_1.44",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b512_n10240_k2048.27": [
+            [
+              "param_0.54",
+              "parameter"
+            ],
+            [
+              "param_1.46",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false,
+          false,
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      },
+      "G4": {
+        "num_custom_calls": 32,
+        "num_stage_a": 8,
+        "num_stage_b": 24,
+        "expected_each": 8,
+        "stage_a_names": [
+          "StreamIdxTC-m-bq_128-bkvp_2.8",
+          "StreamIdxTC-m-bq_128-bkvp_2.9",
+          "StreamIdxTC-m-bq_128-bkvp_2.10",
+          "StreamIdxTC-m-bq_128-bkvp_2.11",
+          "StreamIdxTC-m-bq_128-bkvp_2.12",
+          "StreamIdxTC-m-bq_128-bkvp_2.13",
+          "StreamIdxTC-m-bq_128-bkvp_2.14",
+          "StreamIdxTC-m-bq_128-bkvp_2.15"
+        ],
+        "stage_b_names": [
+          "sc_topk_direct_b256_n10240_k2048.48",
+          "sc_topk_direct_b256_n10240_k2048.49",
+          "sc_topk_direct_b256_n10240_k2048.50",
+          "sc_topk_direct_b256_n10240_k2048.51",
+          "sc_topk_direct_b256_n10240_k2048.52",
+          "sc_topk_direct_b256_n10240_k2048.53",
+          "sc_topk_direct_b256_n10240_k2048.54",
+          "sc_topk_direct_b256_n10240_k2048.55",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start"
+        ],
+        "schedule_order": [
+          [
+            "sc_topk_direct_b256_n10240_k2048.48",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.49",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.50",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.51",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.52",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.53",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.54",
+            "B"
+          ],
+          [
+            "sc_topk_direct_b256_n10240_k2048.55",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.8",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.9",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.10",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.11",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.12",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.13",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.14",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "prepare_start_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start",
+            "B"
+          ],
+          [
+            "StreamIdxTC-m-bq_128-bkvp_2.15",
+            "A"
+          ],
+          [
+            "prepare_done_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start",
+            "B"
+          ]
+        ],
+        "async_starts": 19,
+        "is_scheduled": true,
+        "stage_b_operands": {
+          "sc_topk_direct_b256_n10240_k2048.48": [
+            [
+              "param_0.96",
+              "parameter"
+            ],
+            [
+              "param_1.80",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.49": [
+            [
+              "param_0.98",
+              "parameter"
+            ],
+            [
+              "param_1.82",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.50": [
+            [
+              "param_0.100",
+              "parameter"
+            ],
+            [
+              "param_1.84",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.51": [
+            [
+              "param_0.102",
+              "parameter"
+            ],
+            [
+              "param_1.86",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.52": [
+            [
+              "param_0.104",
+              "parameter"
+            ],
+            [
+              "param_1.88",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.53": [
+            [
+              "param_0.106",
+              "parameter"
+            ],
+            [
+              "param_1.90",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.54": [
+            [
+              "param_0.108",
+              "parameter"
+            ],
+            [
+              "param_1.92",
+              "parameter"
+            ]
+          ],
+          "sc_topk_direct_b256_n10240_k2048.55": [
+            [
+              "param_0.110",
+              "parameter"
+            ],
+            [
+              "param_1.94",
+              "parameter"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+              "custom-call"
+            ]
+          ],
+          "prepare_start_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start": [],
+          "prepare_done_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start": [
+            [
+              "prepare_start_sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start",
+              "custom-call"
+            ]
+          ]
+        },
+        "every_stage_b_depends_on_a_stage_a": false,
+        "stage_b_operand_reachability": [
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "stage_a_next_depends_on_stage_b_prev": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "overlap_is_legal_in_the_graph": true
+      }
+    }
+  },
+  "module_md5s": {
+    "streamindex_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+      "md5": "1e221f10cbf3573aa0d2ae78c3463532"
+    },
+    "sparsecore_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "md5": "8bc9e25b8701a53a97704564b9fbc658"
+    },
+    "_stage_a.py": {
+      "path": "/root/kw/probes/_stage_a.py",
+      "md5": "eea6a51bb40a2bbf7cf5b39571753b62"
+    },
+    "pipeline.py": {
+      "path": "/root/kw/variants/option-b-pipeline/pipeline.py",
+      "md5": "3f783b940d31c340b1e6cfbba9f2803d"
+    }
+  }
+}

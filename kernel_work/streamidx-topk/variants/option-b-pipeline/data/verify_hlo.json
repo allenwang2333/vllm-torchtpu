@@ -1,0 +1,632 @@
+{
+  "decode_G1_R2.hlo.txt": {
+    "file": "decode_G1_R2.hlo.txt",
+    "num_stage_a": 2,
+    "num_stage_b_call_start": 2,
+    "num_stage_b_call_done": 2,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.2",
+      "%sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.3"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.2"
+      ],
+      "%sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.2",
+        "%StreamIdxTC-d-bq_1-bkvp_2.3"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b64_n10240_k2048.4.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b64_n10240_k2048.7.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 0,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-d-bq_1-bkvp_2.3",
+        "prev_stage_b_dones": 1,
+        "reached": 1,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 1
+  },
+  "decode_G2_R2.hlo.txt": {
+    "file": "decode_G2_R2.hlo.txt",
+    "num_stage_a": 4,
+    "num_stage_b_call_start": 4,
+    "num_stage_b_call_done": 4,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.4",
+      "%sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.5",
+      "%sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.6",
+      "%sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.7"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.4"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.5"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.4",
+        "%StreamIdxTC-d-bq_1-bkvp_2.5",
+        "%StreamIdxTC-d-bq_1-bkvp_2.6"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.4",
+        "%StreamIdxTC-d-bq_1-bkvp_2.5",
+        "%StreamIdxTC-d-bq_1-bkvp_2.7"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b32_n10240_k2048.6.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.5"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b32_n10240_k2048.9.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b32_n10240_k2048.12.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.7"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b32_n10240_k2048.15.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 1,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-d-bq_1-bkvp_2.6",
+        "prev_stage_b_dones": 2,
+        "reached": 2,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 2
+  },
+  "decode_G4_R2.hlo.txt": {
+    "file": "decode_G4_R2.hlo.txt",
+    "num_stage_a": 8,
+    "num_stage_b_call_start": 8,
+    "num_stage_b_call_done": 8,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.8",
+      "%sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.9",
+      "%sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.10",
+      "%sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.11",
+      "%sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.12",
+      "%sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.13",
+      "%sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.14",
+      "%sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start": "%StreamIdxTC-d-bq_1-bkvp_2.15"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.8"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.9"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.10"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.11"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.8",
+        "%StreamIdxTC-d-bq_1-bkvp_2.9",
+        "%StreamIdxTC-d-bq_1-bkvp_2.10",
+        "%StreamIdxTC-d-bq_1-bkvp_2.11",
+        "%StreamIdxTC-d-bq_1-bkvp_2.12"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.8",
+        "%StreamIdxTC-d-bq_1-bkvp_2.9",
+        "%StreamIdxTC-d-bq_1-bkvp_2.10",
+        "%StreamIdxTC-d-bq_1-bkvp_2.11",
+        "%StreamIdxTC-d-bq_1-bkvp_2.13"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.8",
+        "%StreamIdxTC-d-bq_1-bkvp_2.9",
+        "%StreamIdxTC-d-bq_1-bkvp_2.10",
+        "%StreamIdxTC-d-bq_1-bkvp_2.11",
+        "%StreamIdxTC-d-bq_1-bkvp_2.14"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start": [
+        "%StreamIdxTC-d-bq_1-bkvp_2.8",
+        "%StreamIdxTC-d-bq_1-bkvp_2.9",
+        "%StreamIdxTC-d-bq_1-bkvp_2.10",
+        "%StreamIdxTC-d-bq_1-bkvp_2.11",
+        "%StreamIdxTC-d-bq_1-bkvp_2.15"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.10.cloned.1.call-start",
+        "n_stage_a_in_window": 3,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.9",
+          "%StreamIdxTC-d-bq_1-bkvp_2.10",
+          "%StreamIdxTC-d-bq_1-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.13.cloned.1.call-start",
+        "n_stage_a_in_window": 2,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.10",
+          "%StreamIdxTC-d-bq_1-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.16.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.19.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.22.cloned.1.call-start",
+        "n_stage_a_in_window": 3,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.13",
+          "%StreamIdxTC-d-bq_1-bkvp_2.14",
+          "%StreamIdxTC-d-bq_1-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.25.cloned.1.call-start",
+        "n_stage_a_in_window": 2,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.14",
+          "%StreamIdxTC-d-bq_1-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.28.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-d-bq_1-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b16_n10240_k2048.31.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 3,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-d-bq_1-bkvp_2.12",
+        "prev_stage_b_dones": 4,
+        "reached": 4,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 4
+  },
+  "prefill_G1_R2.hlo.txt": {
+    "file": "prefill_G1_R2.hlo.txt",
+    "num_stage_a": 2,
+    "num_stage_b_call_start": 2,
+    "num_stage_b_call_done": 2,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.2",
+      "%sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.3"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.2"
+      ],
+      "%sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.2",
+        "%StreamIdxTC-m-bq_128-bkvp_2.3"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b1024_n10240_k2048.4.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b1024_n10240_k2048.7.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 0,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-m-bq_128-bkvp_2.3",
+        "prev_stage_b_dones": 1,
+        "reached": 1,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 1
+  },
+  "prefill_G2_R2.hlo.txt": {
+    "file": "prefill_G2_R2.hlo.txt",
+    "num_stage_a": 4,
+    "num_stage_b_call_start": 4,
+    "num_stage_b_call_done": 4,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.4",
+      "%sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.5",
+      "%sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.6",
+      "%sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.7"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.4"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.5"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.4",
+        "%StreamIdxTC-m-bq_128-bkvp_2.5",
+        "%StreamIdxTC-m-bq_128-bkvp_2.6"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.4",
+        "%StreamIdxTC-m-bq_128-bkvp_2.5",
+        "%StreamIdxTC-m-bq_128-bkvp_2.7"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b512_n10240_k2048.6.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.5"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b512_n10240_k2048.9.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b512_n10240_k2048.12.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.7"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b512_n10240_k2048.15.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 1,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-m-bq_128-bkvp_2.6",
+        "prev_stage_b_dones": 2,
+        "reached": 2,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 2
+  },
+  "prefill_G4_R2.hlo.txt": {
+    "file": "prefill_G4_R2.hlo.txt",
+    "num_stage_a": 8,
+    "num_stage_b_call_start": 8,
+    "num_stage_b_call_done": 8,
+    "every_b_reaches_an_a": true,
+    "every_b_reaches_an_a_via_data_operand": true,
+    "pairing_is_one_to_one": true,
+    "pairing_direct": {
+      "%sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.8",
+      "%sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.9",
+      "%sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.10",
+      "%sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.11",
+      "%sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.12",
+      "%sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.13",
+      "%sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.14",
+      "%sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start": "%StreamIdxTC-m-bq_128-bkvp_2.15"
+    },
+    "pairing_transitive": {
+      "%sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.8"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.9"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.10"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.11"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.8",
+        "%StreamIdxTC-m-bq_128-bkvp_2.9",
+        "%StreamIdxTC-m-bq_128-bkvp_2.10",
+        "%StreamIdxTC-m-bq_128-bkvp_2.11",
+        "%StreamIdxTC-m-bq_128-bkvp_2.12"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.8",
+        "%StreamIdxTC-m-bq_128-bkvp_2.9",
+        "%StreamIdxTC-m-bq_128-bkvp_2.10",
+        "%StreamIdxTC-m-bq_128-bkvp_2.11",
+        "%StreamIdxTC-m-bq_128-bkvp_2.13"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.8",
+        "%StreamIdxTC-m-bq_128-bkvp_2.9",
+        "%StreamIdxTC-m-bq_128-bkvp_2.10",
+        "%StreamIdxTC-m-bq_128-bkvp_2.11",
+        "%StreamIdxTC-m-bq_128-bkvp_2.14"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start": [
+        "%StreamIdxTC-m-bq_128-bkvp_2.8",
+        "%StreamIdxTC-m-bq_128-bkvp_2.9",
+        "%StreamIdxTC-m-bq_128-bkvp_2.10",
+        "%StreamIdxTC-m-bq_128-bkvp_2.11",
+        "%StreamIdxTC-m-bq_128-bkvp_2.15"
+      ]
+    },
+    "carrier_path_opcodes": {
+      "%sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ],
+      "%sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start": [
+        "bitcast",
+        "bitcast-convert"
+      ]
+    },
+    "carrier_is_layout_only_everywhere": true,
+    "stage_a_in_flight_during_stage_b": [
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.10.cloned.1.call-start",
+        "n_stage_a_in_window": 3,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.9",
+          "%StreamIdxTC-m-bq_128-bkvp_2.10",
+          "%StreamIdxTC-m-bq_128-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.13.cloned.1.call-start",
+        "n_stage_a_in_window": 2,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.10",
+          "%StreamIdxTC-m-bq_128-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.16.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.11"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.19.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.22.cloned.1.call-start",
+        "n_stage_a_in_window": 3,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.13",
+          "%StreamIdxTC-m-bq_128-bkvp_2.14",
+          "%StreamIdxTC-m-bq_128-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.25.cloned.1.call-start",
+        "n_stage_a_in_window": 2,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.14",
+          "%StreamIdxTC-m-bq_128-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.28.cloned.1.call-start",
+        "n_stage_a_in_window": 1,
+        "stage_a_in_window": [
+          "%StreamIdxTC-m-bq_128-bkvp_2.15"
+        ]
+      },
+      {
+        "start": "%sc_topk_direct_b256_n10240_k2048.31.cloned.1.call-start",
+        "n_stage_a_in_window": 0,
+        "stage_a_in_window": []
+      }
+    ],
+    "max_stage_a_in_flight": 3,
+    "cross_copy": [
+      {
+        "copy": 1,
+        "first_stage_a": "%StreamIdxTC-m-bq_128-bkvp_2.12",
+        "prev_stage_b_dones": 4,
+        "reached": 4,
+        "all_reached": true
+      }
+    ],
+    "cross_copy_fully_serialized": true,
+    "G": 4
+  }
+}
