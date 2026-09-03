@@ -26,6 +26,108 @@ and adds **0.155% of a prefill step**, but has not yet been composed with the ot
 
 ---
 
+## 1b. The kernel result in plain numbers
+
+§7 states everything as signed deltas against a baseline. This section states the same measurements
+as **absolute times and "% faster"**, where faster always means faster, for a reader who wants the
+answer before the method. Nothing here is new data — it is §7.1 re-tabulated.
+
+- **baseline** = `inc`, the kernel in production today, unchanged.
+- **final merged** = `c_dl`, one module carrying both surviving kernel changes (Option C gated to
+  prefill/mixed + D1-lite's hoist). This is the shippable artifact.
+- All times are **microseconds of TensorCore device self time for one `streamindex_topk` call**, on
+  a 21-layer chain — GLM-5.2's real indexer depth, and the shape at which D1-lite's cross-layer CSE
+  can act. Multiply by 21 for a model step.
+- Job `j-bf290089-a5b2-417c-a900`. n=3 at the decode point, n=1 elsewhere.
+
+### What is being measured, and what is not
+
+| part of the call | what it is | production decode |
+| --- | --- | ---: |
+| stage A | the TensorCore Pallas scoring kernels (`StreamIdxTC-*`) | 111.54 µs — 66% |
+| stage B | `sparsecore_topk`, the SparseCore radix select | 32.63 µs — 19% |
+| residual | everything else in the call — metadata, reshapes, the `lax.cond` | 26.03 µs — 15% |
+| **full op** | what every table below calls the total | **170.19 µs** |
+
+**Outside these numbers**, and not improved by this change: `sc_dsa_gather` (the gather that
+*consumes* these indices — 6.0% of a decode step, **2.5× this entire op**), the KV-cache relayout
+(§5.4, a separate and larger item, not ready), Option B (§5.3, never composed with these two), and
+the ~96% of a decode step that is attention, MLP, MoE and collectives.
+
+### The result
+
+| workload | baseline | **final merged** | **result** |
+| --- | ---: | ---: | --- |
+| **Decode, production shape** (b64, ctx 8704) | 170.19 µs | **163.52 µs** | **3.9% faster** |
+| **Prefill** (q1024, ctx 16384) | 1199.59 µs | **1115.35 µs** | **7.0% faster** |
+| **Short context** (b64, ctx ≤ 2048) | 7.12 µs | **11.48 µs** | **61% SLOWER** ⚠️ |
+
+### Attribution — each change alone, then merged
+
+| workload | baseline | Option C alone | D1-lite alone | **both merged** |
+| --- | ---: | --- | --- | --- |
+| Decode (production) | 170.19 | 170.60 — *0.2% slower* | 163.38 — *4.0% faster* | **163.52 — 3.9% faster** |
+| Prefill | 1199.59 | 1118.00 — *6.8% faster* | 1195.68 — *0.3% faster* | **1115.35 — 7.0% faster** |
+| Short context | 7.12 | 10.62 — *49% slower* | 8.00 — *12% slower* | **11.48 — 61% slower** |
+
+Reading **across**: the two changes act on different phases and do not interfere — the merged column
+is essentially the better of the two arms in each row. That is what the composed run existed to
+establish, and it holds (residual −0.16% of baseline, §7.1).
+
+Reading **down the last row**: both changes cost time at short context and the costs add. Option C
+is the larger offender even though its kernel never executes there — see §7.3.
+
+### Full shape coverage — single call, 17 configurations
+
+Does anything else regress? No: range 0.25% to 7.27% faster, every config.
+
+| shape | baseline | final merged | faster by |
+| --- | ---: | ---: | ---: |
+| decode b8 ctx4096 | 76.34 | 76.15 | 0.25% |
+| decode b8 ctx16384 | 105.54 | 103.93 | 1.53% |
+| decode b8 ctx32768 | 133.04 | 131.47 | 1.18% |
+| decode b8 ctx65536 | 185.95 | 184.43 | 0.82% |
+| decode b32 ctx4096 | 66.22 | 65.39 | 1.25% |
+| decode b32 ctx16384 | 144.42 | 142.33 | 1.44% |
+| decode b32 ctx32768 | 251.59 | 249.38 | 0.88% |
+| decode b32 ctx65536 | 464.35 | 462.23 | 0.46% |
+| decode b64 ctx4096 | 99.03 | 97.30 | 1.74% |
+| decode b64 ctx16384 | 255.73 | 252.78 | 1.15% |
+| decode b64 ctx32768 | 464.95 | 462.58 | 0.51% |
+| decode b64 ctx65536 | 897.91 | 893.08 | 0.54% |
+| decode b64 ctx8704 *(production)* | 171.47 | 169.21 | 1.32% |
+| prefill q1024 ctx4096 | 381.47 | 365.85 | 4.10% |
+| prefill q1024 ctx16384 | 1194.25 | 1116.01 | 6.55% |
+| prefill q4096 ctx4096 | 1111.16 | 1036.22 | 6.74% |
+| prefill q4096 ctx16384 | 4439.28 | 4116.69 | 7.27% |
+
+Two things this table will mislead a reader about unless they are stated:
+
+- These are **single-call**, so the production row reads 1.32% where the 21-layer chain reads 3.9%.
+  D1-lite's win is the compiler sharing hoisted work *across* layers; one call at a time prices it
+  at a third of its value. **The 21-layer numbers are the ones to quote.**
+- **Short context (≤2048) is not in this grid.** It is a separate regime and it is the regression.
+
+### The scope ladder — do not skip this
+
+| level | figure | status |
+| --- | --- | --- |
+| **this op**, production decode | 3.9% faster | **measured** (`observed`) |
+| **a decode step** — the op is 4.299% of one | ≈ 0.2% faster | `derived`: arithmetic on a profile share |
+| **end-to-end throughput** | unknown | **no benchmark has been run** |
+
+A 0.2% step saving is well inside the run-to-run spread of a real serving benchmark, so it would
+likely not be *observable* end to end even if it is exactly right. Correctness is not the weak
+link here — 34,368 output rows compared against the baseline across every arm and shape, zero
+differences (§7.1). The weak link is that the third row of this ladder is empty.
+
+**Recommendation:** ship the merged version, gated off below ctx 2048 — which costs nothing, since
+neither change helps in that regime anyway. The alternative is to first confirm why Option C costs
+time when it is not running (§7.3); if the IMEM hypothesis is right, it may be fixable outright and
+the gate becomes unnecessary.
+
+---
+
 ## 2. Definitions — read these before any table
 
 | term | meaning |
@@ -46,6 +148,10 @@ and adds **0.155% of a prefill step**, but has not yet been composed with the ot
 
 **Sign convention: `−` means faster, everywhere in this document.** Option B's own `RESULTS.md` uses
 the opposite convention. Its `+24.4%` and this document's `−24.4%` are the same measurement.
+
+**The one exception is §1b**, which deliberately uses no signs at all — absolute times and the words
+"faster" / "slower" — because it is the section written to be read first. Every figure in it is the
+same measurement as the corresponding signed one in §7.1.
 
 ---
 
