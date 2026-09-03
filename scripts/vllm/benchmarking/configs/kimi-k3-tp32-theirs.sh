@@ -47,7 +47,18 @@ ENABLE_EP=true
 # config.json declares mxfp4-pack-quantized under compressed-tensors, so their
 # explicit --quantization compressed-tensors and vLLM's auto-detection resolve
 # to the same method. Passed explicitly anyway: fidelity is free here.
-QUANTIZATION="compressed-tensors"
+# Deliberately empty. Passing --quantization explicitly makes every worker
+# resolve the quantization config from the model path, and under an object
+# storage URI that path is vLLM's own head-local cache
+# (/root/.cache/vllm/assets/model_streamer/<hash>). The worker hosts have no
+# such directory, HuggingFace falls back to treating it as a repo id, and the
+# engine dies at worker init with
+#   OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name'
+# Build 356 died exactly there. Left unset, vLLM reads the scheme from the
+# checkpoint's own config.json, which the streamer has already fetched.
+# Every K3 pod build that has ever passed leaves this empty, and their
+# reported configuration does not set it either.
+QUANTIZATION=""
 
 ISL_OSL_CONFIGS="8192:1024"
 CONCURRENCY_OPTIONS="${K3_CONCURRENCY:-1 2 4 8 16 32}"
