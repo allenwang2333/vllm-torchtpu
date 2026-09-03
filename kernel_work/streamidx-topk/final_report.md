@@ -15,9 +15,14 @@ a `T(4,128)` → `T(8,128)` → `T(4,128)` relayout round trip that XLA emits ar
 KV-cache write, costing **2.21% of a prefill step** to write 1024 rows. It is removable, the fix is
 measured, and as prototyped it **buys prefill at decode's expense** and needs one more pass before it
 can land. Of the kernel work proper, what survives is **Option C** (prefill-gated head-major scores)
-and **D1-lite** (hoisting shared metadata out of the early-exit branches), together worth about
-**0.2% of a decode step and 0.04% of a prefill step**. **Option B** (runner-side chunking to overlap
-TensorCore and SparseCore) is real, integrates cleanly, and adds **0.155% of a prefill step**.
+and **D1-lite** (hoisting shared metadata out of the early-exit branches). Those two have now been
+**composed into one module and measured together in a single job** (§7.1): **−3.92% of the op at
+production decode and −7.02% at a heavy prefill shape**, index-identical to the incumbent over 34,368
+compared rows, and additive to within the job's resolution — worth about **0.20% of a decode step and
+0.05% of a prefill step**. The composed run also surfaced a regression invisible in the separate
+arms: below ctx 2048, where neither kernel executes, the pair costs **1.6× the incumbent** (§7.3).
+**Option B** (runner-side chunking to overlap TensorCore and SparseCore) is real, integrates cleanly,
+and adds **0.155% of a prefill step**, but has not yet been composed with the other two.
 
 ---
 
@@ -105,7 +110,7 @@ on the relayout, and `prefill_only`'s step has zero indexer activity (`min_kv_le
 
 Ordered by measured value, not by how much work each took.
 
-### 5.1 Option C — head-major score layout, gated to prefill/mixed · **kernel** · SHIP
+### 5.1 Option C — head-major score layout, gated to prefill/mixed · **kernel** · SHIP, with one unexplained cost
 
 −20.6% of prefill stage A, `j-a960ad54-a0a1-4e1d-8ade`, chain slope r² ≥ 0.99999. **≈0.041% of a
 prefill step** (`derived`).
@@ -115,7 +120,14 @@ decode is **+59.62%** — a 1.6× regression (`j-fd7b8801-fce9-46ec-bb63`). At `
 permutation is literally the identity and the compiler still fails to make it free; LLO confirms it
 *adds* work. The two DECODE launches take `head_minor`; only the MIXED launch takes `head_major`.
 
-Gated, it is inert at decode: **+0.034%** against a **+0.041%** port control.
+Gated, it is inert at decode **at production context**: **+0.034%** against a **+0.041%** port
+control, and +0.24% in the composed 21-layer chain (§7.1).
+
+**It is not inert at ctx ≤ 2048.** In the fast-path regime, where Option C's kernel never executes,
+it still costs **+3.5 µs/layer** — a 1.5× regression on a 7 µs call, traced to the `conditional`
+HLO's own self time and *not* to any kernel. See §7.3; the mechanism is an unconfirmed IMEM
+hypothesis. This does not block shipping at production context but it does mean the claim "the gate
+makes Option C free at decode" is now known to be false in one regime.
 
 **Its composition is now properly tested.** The earlier "three-way additivity" check was
 algebraically a two-way check — it defined Option C's term as `Δ C ≡ Δ(merged) − Δ(bkvp_d1)`, so the
@@ -312,17 +324,105 @@ draft's conclusion that it was not worth the blast radius.
 
 ## 7. Total, and the honest reading
 
+### 7.1 The composed candidate, measured as one object
+
+Everything in §5.1–§5.2 was measured as a separate arm and then added up. `variants/composed/`
+measures the two kernel changes **composed into one module** — incumbent + Option C under its
+prefill/mixed gate + D1-lite's hoist — against the incumbent in a single job, at the op level.
+
+- **Job `j-bf290089-a5b2-417c-a900`**, `simple-run-command`, tpu7x `2x2x1`, four shards `rc=0`.
+- **Arms:** `inc` (incumbent), `ctl` (incumbent re-imported through the composed module's own entry
+  point — an identity arm that isolates plumbing cost), `c`, `dl`, `c_dl`.
+- **`µs/layer`** below is device self time for one `streamindex_topk` call, TensorCore plane only,
+  from `hlo_stats` at `--top-n 4000` with `rows_kept == rows_total` verified. SparseCore rows
+  reported separately and never summed (§3). No host floor subtracted; no wall clock reported.
+- **`L21`** = the 21-layer chain, i.e. GLM-5.2's real indexer depth, which is what lets cross-layer
+  CSE act. n=3 within-job reps.
+
+| metric, `L21_dec_b64_ctx8704` | inc | `c_dl` | Δ | Δ% |
+| --- | ---: | ---: | ---: | ---: |
+| **full op** | 170.189 | 163.522 | **−6.667** | **−3.92%** |
+| stage A | 111.538 | 111.773 | +0.235 | +0.21% |
+| stage B | 32.625 | 32.623 | −0.002 | −0.01% |
+| residual (neither kernel) | 26.026 | 19.126 | **−6.900** | **−26.51%** |
+
+The entire decode win is D1-lite's residual saving (Δ`dl` −6.806); Option C contributes +0.411, i.e.
+nothing, which is what its gate is supposed to do at decode. Plumbing is Δ`ctl` +0.083 (+0.05%).
+
+At `L21_pre_q1024_ctx16384`, inc 1199.585 → **Δ`c_dl` −84.236 (−7.02%)**, of which Δ`c` is −81.584:
+Option C takes **−20.4% off stage A**, stable at 19.3–20.8% across the grid.
+
+**Composition is additive to within the job's resolution.** The genuine three-way residual
+`R = Δ(c_dl) − [Δ(c) + Δ(dl)]` is **−0.272 µs/layer, −0.160% of inc** — just outside the quadrature
+error bar (±0.260, by 5%) and inside the widest single-arm spread (0.435). Read it as 104.3% of the
+sum of parts with the 4.3% unresolvable, not as a synergy. The headline Δ is 15× the widest spread.
+
+Across the 17 single-call configs **nothing regresses on `c_dl`** (−0.25% to −7.27%). Two things
+only the 21-layer chain shows: `dl` **alone costs** time at one layer on prefill (+0.57 to +3.23 µs)
+and turns negative only at 21, and the single-call twin of the headline under-reports the composed
+decode win by 3× (−1.32% vs −3.92%).
+
+**Correctness: `rows_compared=34368, rows_differing=0, failures=0`** — `np.array_equal` against a
+separately constructed incumbent device call, every arm × 10 configs, covering six MIXED prefill
+shapes (including a partial `bq` and a non-multiple `q`), two decode points and both fast-path
+contexts. The gate itself was verified three independent ways: runtime `LAYOUTS` map, HLO census
+(`c_dl` = exactly 21×4 MIXED + 21×8 DECODE head-major launches, `inc` = 0 of 252), and hand-grep of
+the optimized HLO.
+
+### 7.2 The totals
+
 | change | layer | phase | ~% of that step | status |
 | --- | --- | --- | ---: | --- |
 | KV relayout removal | cache format | prefill | **−1.78%** | **not ready** — costs +0.79% of a decode step |
-| Option B, G=4 | runner | prefill | −0.155% | ship after re-measuring on the C-only base |
-| D1-lite | kernel | decode | **−0.19 to −0.21%** | ship |
-| Option C, gated | kernel | prefill | −0.041% | ship |
-| **shippable today** | | **decode** | **≈ −0.2%** | |
-| **shippable today** | | **prefill** | **≈ −0.20%** | |
+| Option B, G=4 | runner | prefill | −0.155% | ship after re-measuring on the `c_dl` base |
+| **`c_dl` composed** | kernel | **decode** | **−0.2015%** | **measured composed**, §7.1 |
+| — of which D1-lite | | | −0.206% | |
+| — of which Option C | | | +0.012% | gate working as intended |
+| **`c_dl` composed** | kernel | **prefill** | **≈ −0.054%** | **derived by component**, see below |
+| — of which Option C | | | −0.039 to −0.042% | |
+| — of which D1-lite | | | −0.013% | |
+| **shippable today** | | **decode** | **≈ −0.20%** | |
+| **shippable today** | | **prefill** | **≈ −0.21%** | with Option B |
 
-All rows are `derived` — op-level measurements times profile shares. **None is an observed model
+The decode row is the one arithmetic step from a composed measurement: −6.667 µs/layer × 21 layers
+= −0.140 ms/step against the 69.492 ms/step TC-plane denominator (§4). It reproduces the −0.19 to
+−0.21% previously derived from separate arms.
+
+**The prefill row is *not* the composed −7.02%, and the difference matters.** That figure was taken
+at `q1024/ctx16384`, a far heavier prefill shape than the profiled step, so scaling it directly
+would overstate the model-level saving by roughly 5×. The row above instead applies the composed
+run's *stable ratio* — Option C removes 19.3–20.8% of stage A — to the profiled stage A of
+1.2491 ms/step. Both routes are `derived`; the ratio route is the defensible one.
+
+All rows remain `derived` — op-level measurements times profile shares. **None is an observed model
 speedup**, and no end-to-end benchmark has been run.
+
+### 7.3 The composed run also found a regression
+
+At **ctx ≤ 2048 with k=2048** — the fast-path regime, where the early-exit branch fires and *no
+kernel runs at all* — the composed candidate is **1.61× the incumbent**:
+
+| config | inc | `c` | `dl` | **`c_dl`** | multiplier |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `L21_dec_b64_ctx1024` | 7.115 | 10.619 | 8.001 | **11.479** | **1.614×** |
+| `L21_dec_b64_ctx2048` | 7.227 | 10.645 | 7.988 | **11.486** | **1.589×** |
+
+D1-lite's +0.89 is the expected unconditional `metadata` computation and was already disclosed in
+§5.2. **The other +3.5 µs/layer is Option C, whose kernel never executes here** — this is new, and it
+contradicts §5.1's claim that the gate makes Option C free outside prefill.
+
+Traced: it is entirely the `conditional` HLO's own self time, `Bound by = HBM`. Per-instance,
+`inc`/`ctl`/`dl` have **1 of 21** conditionals at ~8.6 µs and the rest at ~0.3 µs; `c`/`c_dl` have
+**10 of 21** at ~8.6 µs, alternating, identically at both contexts. `c` has the *same* HLO
+instruction count as `inc` (8476), so the extra code is inside the Mosaic call, not around it.
+**Hypothesis, unconfirmed:** IMEM pressure from the larger head-major kernel body forcing a program
+fetch on alternate layers.
+
+Absolute cost is ~92 µs per 21-layer pass, **≈ +0.13% of a decode step** — small, and it applies
+only below ctx 2048. But it is a regression in a real serving regime, it was invisible until the
+changes were composed, and it may behave differently inside a program that also carries attention,
+MLP and MoE. It does not block shipping `c_dl` at production context; it does mean **Option C needs
+the IMEM hypothesis tested before it can be called free at decode**.
 
 **This is a small number, and it should be reported as one.** The op is 4.299% of a decode step; the
 changes that survive take about a twentieth of it. The exercise's most valuable output is not the
@@ -358,7 +458,18 @@ of the prefill op and blocks the TensorCore for 2× its own execution time.
 4. **The `bkv_p` and D1 withdrawals rest on a grid whose short-context points are synthetic.** No
    request-length distribution from a real GLM-5.2 server was available; the exposure is arithmetic,
    not observed traffic.
-5. **D1-lite's fast-path safety is a CSE property**, holding at 21 layers and failing at 1.
+5. **D1-lite's fast-path safety is a CSE property**, holding at 21 layers and failing at 1. The
+   composed run confirms this from the other direction: `dl` alone *costs* +0.57 to +3.23 µs at one
+   prefill layer and only turns negative at 21 (§7.1).
+5b. **The +3.5 µs/layer Option C costs at ctx ≤ 2048 is unexplained.** The IMEM-pressure hypothesis
+   in §7.3 is inferred from a per-conditional self-time distribution, not measured. Until it is
+   tested — the cheap route is `/xprof-llo` on the two kernel bodies, comparing program size — the
+   size of this cost in a full model program (which carries attention, MLP and MoE alongside) is
+   unknown, and it could be larger there rather than smaller.
+5c. **Option B has never been composed with `c_dl`.** Its +0.155% is a standalone measurement on a
+   different base, and its chunked launch touches the same per-chunk metadata D1-lite hoists, so
+   the two are the most likely pair in this exercise to be non-additive. `variants/composed/` was
+   cut short of it deliberately; the B×C×D1 measurement is the obvious next job.
 6. **Correctness everywhere is index-identity against the incumbent, not against ground truth.** It
    inherits any error the incumbent has. An absolute recall-vs-f64 gate was shown to fail forever on
    correct code (`results.md` §11).
