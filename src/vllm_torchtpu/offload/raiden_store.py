@@ -69,6 +69,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
@@ -84,6 +85,9 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract, resolve_block_major_contract)
+
+if TYPE_CHECKING:
+    import torch
 
 logger = init_logger(__name__)
 
