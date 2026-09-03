@@ -46,20 +46,56 @@ come in smaller. Six for six, all explained by the same defect:**
 | --- | ---: | ---: | --- |
 | empty-launch overhead | 5.4 µs | **0.55** | P4 |
 | Option D's claimed residual | 44.8 µs | **1.655** | R2 — the 44.8 was ~94% host dispatch |
-| stage B, prefill | 481.0 µs | **335.5** | stage-B k-sweep |
-| stage A per layer | 221.4 µs | **170.5** | R2 |
+| stage B, prefill | 481.0 µs | **431.15** | candidate-0 job, `hlo_stats` |
+| full op, decode | 221.4 µs | **170.579** | candidate-0 job; chain slope 173.37 agrees to 1.6% |
+| full op, prefill | 857.3 µs | **749.538** | candidate-0 job; chain slope 750.14 agrees to **0.08%** |
 | **stage A, prefill — the Option C baseline** | **335.1 µs** | **246.58** | Option C, chain slope, r² = 0.9999995 |
-| incumbent stage A + `bkv_p` | −11.9% (contended) | in flight | candidate 0 |
+| incumbent + `bkv_p=3` @ ctx 8704 | −11.9% (contended) | **−9.46%** | candidate 0 |
 
-The last-but-one row is the consequential one: **the ≤280 µs pass bar written for Option C was
-already cleared by the incumbent**, so as written the gate discriminated nothing. C passes anyway,
-on a like-for-like comparison against a correctly measured incumbent, but its *predicted* call-level
+The stage-A row is the consequential one: **the ≤280 µs pass bar written for Option C was already
+cleared by the incumbent**, so as written the gate discriminated nothing. C passes anyway, on a
+like-for-like comparison against a correctly measured incumbent, but its *predicted* call-level
 effect drops from −7.9% to **≈−5.9% (modelled)**.
 
-This also means `measurement_and_design.md`'s prefill roofline gate — already flagged
-`PARTIALLY FALSIFIED` in `briefs/ROOFLINE-REVIEW.md` for being circular — rests on a denominator
-that is itself ~36% too high. **Do not quote 80.4%, and do not quote 39.9%.** The honest statement
-remains the review's: a 26–57% band, structural, proceed.
+**That correction is now cross-validated by two agents and two independent methods**: Option C's
+chain slope gives 246.58, and the candidate-0 job's `hlo_stats` gives 246.243 with its own chain
+slope at 247.63 — a 0.56% spread across different harnesses. The composition also closes exactly,
+which is the strongest structural check available here: 249.300 + 431.153 + 69.085 = 749.538 at
+prefill, and 111.708 + 31.731 + 27.140 = 170.579 at decode.
+
+**One row of this table was itself wrong for one revision, and the correction runs the other way.**
+An earlier draft recorded prefill stage B as 335.5 µs from the k-sweep. That figure was measured on
+**synthetic N(0,1) scores**. Real indexer scores are all positive, in [9, 760], with std/mean ≈ 0.30
+— few distinct exponents, so the MSB-first radix select needs more passes. Fed stage A's real
+output, stage B measures **442.56 µs** (chain slope) against `hlo_stats` 431.15. The k-sweep
+understates production stage B by **22%**, and its 1.02 ns/element scan coefficient should be
+~1.37. Its *structural* conclusion — issue-bound, not output-DMA-bound — is untouched. The lesson
+generalizes past this exercise: **a data distribution is part of a benchmark's configuration**, and
+N(0,1) is not a neutral default for a radix algorithm.
+
+### What this does to the roofline gate
+
+`measurement_and_design.md`'s prefill gate was already flagged `PARTIALLY FALSIFIED` in
+`briefs/ROOFLINE-REVIEW.md` for circularity. With correct denominators it is now **undecidable**,
+and it moved in the direction that argues *against* prefill work rather than for it:
+
+| | range across defensible floor treatments | verdict |
+| --- | --- | --- |
+| **decode**, denominator 170.58 µs | 33–53%, point estimate ~45% | **structural, proceed** — unchanged |
+| **prefill**, denominator 749.54 µs | 53.9–92.0% | **undecidable** |
+
+The prefill ceiling was 63.4% in the k-sweep and is now 85.3% — *above* the skill's do-not-write
+bar — because that ceiling used a wall-clock denominator (14% too high) and a synthetic-data
+stage B (22% too low), two errors compounding in the same direction. No non-circular treatment
+*clears* 80% either (the two most defensible are 53.9% and 57.5%). **Do not quote 80.4%, do not
+quote 39.9%, and do not quote 26–57%.** The blocker is unchanged and structural: 431 of 749 µs is
+SparseCore, and there is no first-principles SparseCore floor — `references/hardware-facts.md` says
+plainly that no SparseCore fact in it is measured.
+
+**Where the headroom actually is**, measured minus modelled floor: at decode, stage A 54.3 µs (32%)
+and residual 26.3 µs (15%); at prefill, stage B 235.5 µs (31%), with stage A and residual ~55 µs
+each. Stage A sits at 51.4% of its floor at decode and 77.9% at prefill — which is the quantitative
+reason decode is the better target, and it is not the reason the earlier documents gave.
 
 ---
 
@@ -70,9 +106,9 @@ remains the review's: a 26–57% band, structural, proceed.
 | **C** — head-major score layout | transposes the q block `(bq,H,D)→(H,bq,D)` **inside** the kernel, once per bq block | **PASS, −20.64%** on prefill stage A; correctness verified, output index-identical | §3 |
 | **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
+| **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
 | **A** — 128-byte K record | | `in flight` — R1 decides rank 1 vs rank 4 | |
 | **B** — two-unit pipeline | | `in flight` — Flip 3 can retire it outright | |
-| **0** — incumbent + `bkv_p` | the incumbent, as a candidate | `in flight` — clean absolute replacing a contended ratio | |
 
 ---
 
@@ -172,7 +208,42 @@ within 0.01 µs. This retires finding F2's open question in `briefs/ROOFLINE-REV
 
 ---
 
-## 6. Stage B is issue-bound, not output-DMA-bound
+## 6. Candidate 0 — the incumbent with `bkv_p=3`: a real −9.46%, but it is a shape artifact
+
+Full write-up: `probes/baseline-device-time.md`. Correctness job **`j-79a410b8-46bc-4d06-862c`**,
+`20 passed, 14 warnings in 36.03s`.
+
+Full op, decode, device time by chain slope, `hlo_stats` confirming all nine points independently:
+
+| ctx | `p=2` (incumbent) | `p=3` | `p=4` |
+| ---: | ---: | ---: | ---: |
+| 8192 | 149.89 | 153.97 **+2.72%** | 142.49 −4.94% |
+| **8704** | 171.21 | **155.01 −9.46%** | 177.24 +3.52% |
+| **9216** | 171.91 | **156.32 −9.06%** | 178.34 +3.74% |
+
+**P7's −11.9% does not survive as an absolute; −9.46% does.** P7 was 2.4 points optimistic, exactly
+as a contended ratio would be.
+
+**The win is the `9 = 3×3` factorization, not a better setting.** Decode stage A fits
+`6.24 + 7.41·blocks + 6.65·pages` (r² 0.9967, max residual 1.3%) **with `ctx` absent from the model
+entirely**. `bkv_p=3` wins precisely where `cdiv(ctx, 1024) = 9` factors exactly as 3 blocks × 3
+pages, against `p=2`'s 5 × 10 — which overfetches. At ctx 8192 there are 8 pages, `p=2` is the exact
+one, `p=3` overfetches, and the full op inverts to +2.7%.
+
+**This is why candidate 0 is not simply "change a constant".** If the effect is exactness, the right
+change is to *derive* `p` from `cdiv(ctx, page_size)` rather than pin it — and the model extrapolates
+to `p=9` at ~67 µs, **−39% (`modelled`, unswept, VMEM untested)**, four times the measured win. Both
+the sweep and the constant-vs-function question are dispatched.
+
+**Correctness is `provisional`, and the gap was self-reported.** The suite parametrizes `bkv_p` over
+{4, 8, 16, 32} at `page_size × bkv_p = 128`; it never runs `bkv_p ∈ {2, 3}` and never
+`page_size = 1024`. The evidence at the production shape — `index_sets_match_bkvp2: true`, 64/64
+rows at all nine (ctx, `bkv_p`) points — is **self-consistency against the incumbent, not a
+reference check**, and would pass equally if both were wrong. A numpy top-k reference is dispatched.
+
+---
+
+## 7. Stage B is issue-bound, not output-DMA-bound
 
 `probes/stage-b-ksweep.md`. A 16× change in `k` moves total time **6.0%**, and `k=4096` is the
 fastest point — an output-DMA model predicts 5,176 µs against 316 observed. Length-bounding the
@@ -186,11 +257,13 @@ single point it then "predicted"):
 t_device(µs) = 8.152 + waves × (0.702 + 0.05424e-3·n + 1.01975e-3·eff_len)
 ```
 
-r² = 0.9982 over 35 points from two jobs. `modelled`.
+r² = 0.9982 over 35 points from two jobs. `modelled`. **Its scan coefficient is calibrated on
+synthetic N(0,1) data and understates real production scores by 22%** — see §1. Use ~1.37 ns/element,
+not 1.02.
 
 ---
 
-## 7. Open items
+## 8. Open items
 
 1. **Option C's `num_bkv` sweep** — dispatched. Gates the C recommendation.
 2. **A pre-existing correctness question in the shipping kernel, owned by nobody.** Gate 2's 0.999
@@ -200,6 +273,14 @@ r² = 0.9982 over 35 points from two jobs. `modelled`.
    `approx_max_k(recall_target=1.0)` at max |Δscore| = 0.0, which points at stage A's f32 scoring
    rather than the select. **Dispatched: are the 10 near-ties, or is the shipping kernel wrong?**
    The score *gaps* at those positions discriminate; a recall number does not.
-3. **Options A, B and candidate 0** — in flight.
-4. **`references/hardware-facts.md` has four claims this exercise showed to be wrong.** Whether to
-   amend it is a question for the caller; it has been asked and not answered.
+3. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched. The sweep decides
+   whether this is a constant to change or a function to write, and it is worth up to −39%
+   (`modelled`) rather than the −9.46% measured.
+4. **Options A and B** — in flight.
+5. **Decode stage B, real scores: chain slope +11.5% over `hlo_stats`** (3.7 µs). Named by the
+   measuring agent and not explained. Small, but it is the one like-for-like comparison of seven
+   that did not close inside 2.6%.
+6. **`references/hardware-facts.md` has four claims this exercise showed to be wrong**, and it has
+   no measured SparseCore fact at all — which is the direct cause of the prefill gate being
+   undecidable in §1. Whether to amend it is a question for the caller; it has been asked and not
+   answered.
