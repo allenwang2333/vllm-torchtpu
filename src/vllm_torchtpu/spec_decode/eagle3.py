@@ -202,11 +202,13 @@ class Eagle3Proposer:
             type_to_target_indices[lt].append(idx)
 
         target_prefix = "model.layers"
+        # MUST BE SORTED to prevent hash-seed desyncs across TP workers
         for name in sorted(target_attn_layer_names):
             if ".layers." in name:
                 target_prefix = name.split(".layers.")[0] + ".layers"
                 break
 
+        draft_layer_types = getattr(draft_text_config, "layer_types", [])
         for draft_idx, layer in enumerate(self.draft_model.model.layers):
             if not hasattr(layer, "self_attn"):
                 continue
@@ -214,15 +216,29 @@ class Eagle3Proposer:
             if attn is None:
                 continue
 
-            # Map to the last N layers of the target backbone (e.g., layers 56 to 59 for a 60-layer model with 4 draft layers)
-            total_target_layers = len(target_attn_layer_names)
-            target_idx = total_target_layers - len(self.draft_model.model.layers) + draft_idx
+            draft_layer_type = (
+                draft_layer_types[draft_idx]
+                if draft_idx < len(draft_layer_types)
+                else "full_attention"
+            )
+            candidates = type_to_target_indices.get(draft_layer_type, [])
+            if not candidates:
+                logger.warning(
+                    "No target layer of type '%s' for draft layer %d",
+                    draft_layer_type,
+                    draft_idx,
+                )
+                continue
+
+            # MTP layers share the LAST target layer of the matching attention type
+            target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
 
             logger.info(
-                "Gemma4 MTP (TPU): draft layer %d -> %s",
+                "Gemma4 MTP (TPU): draft layer %d (%s) -> %s",
                 draft_idx,
+                draft_layer_type,
                 target_layer_name,
             )
 
@@ -265,27 +281,38 @@ class Eagle3Proposer:
                     f"{layer_name}, got {type(spec).__name__}")
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        # Draft lm-head + greedy argmax, wrapped in one torch.compile region
-        # keyed on input shape only (mirrors the target's compute_selected_logits).
-        # Run raw, compute_logits + argmax + the int32 cast are eager ops the
-        # torch-tpu DEFER_AND_FUSE path fuses with per-step-varying neighbors in
-        # the K-step propose loop -> a fresh fused program per context. Enclosing
-        # them makes a fixed, bucketed program per [n, hidden] shape.
+    def _draft_propose_token_compiled(self, hidden: torch.Tensor) -> torch.Tensor:
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
-
         if d2t is None:
-            # No draft->target mapping table. Upstream compute_logits then asserts
-            # the head is already target-vocab-width, so plain argmax yields
-            # target ids.
-            return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(
-                torch.int32)
+            return self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
             
-        draft_logits = self.draft_model.logits_processor(self.draft_model.lm_head,
-                                                     hidden)
-
+        draft_logits = self.draft_model.logits_processor(self.draft_model.lm_head, hidden)
         draft_id = draft_logits.argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
+
+    def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
+        out = self._draft_propose_token_compiled(hidden)
+
+        # Safe diagnostic logging on Rank 0
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            is_rank0 = (get_tensor_model_parallel_rank() == 0)
+        except Exception:
+            is_rank0 = True
+
+        if is_rank0:
+            try:
+                # Lightweight non-blocking scalar checks
+                logger.info(
+                    "[TPU DIAG] HIDDEN: shape=%s | sum=%.4f | TOKENS: %s",
+                    list(hidden.shape),
+                    hidden.sum().item(),
+                    out.cpu().tolist()[:10],
+                )
+            except Exception as e:
+                logger.warning("[TPU DIAG] Could not log propose tokens: %s", e)
+
+        return out
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
@@ -333,6 +360,10 @@ class Eagle3Proposer:
         # from the per-context re-fusion. torch.cat((ids[1:], ids[-1:])) is
         # value-identical to clone()+[:-1]=ids[1:] (last slot keeps its own
         # value), and index_put is the functional twin of ids[idx] = val.
+        if getattr(self, "speculative_config", None) is not None and self.speculative_config.method == "mtp":
+            return input_ids.index_put((last_token_indices, ),
+                                     next_token_ids.to(input_ids.dtype))
+                                     
         shifted = input_ids
         if input_ids.shape[0] > 1:
             shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
@@ -431,6 +462,7 @@ class Eagle3Proposer:
                  device_seed=device_seed,
              )
             rejected_per_chunk.append(num_rejected)
+
             last_hidden, hidden = self._forward_draft(
                 chunk=chunk,
                 input_ids=input_ids,
@@ -966,6 +998,14 @@ class Eagle3Proposer:
 
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
+
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            if get_tensor_model_parallel_rank() == 0:
+                logger.info("[TPU DIAG] result metadata keys: %s", list(result.keys()))
+        except Exception:
+            pass
+        
         return result
 
     @staticmethod

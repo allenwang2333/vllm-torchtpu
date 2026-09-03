@@ -2700,6 +2700,8 @@ class TPUModelRunner(GPUModelRunner):
                         draft_token_ids = self.input_batch.token_ids_cpu[req_idx, seq_len : seq_len + num_draft].tolist()
                         tokens_no_spec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
                         tokens_no_spec_after = tokens_no_spec_before - n_placeholder + len(sampled_ids)
+
+                        logger.info("This is the entirety of draft_token_ids for req_id %s: %s", req_id, draft_token_ids)
                         
                         for d_idx, d_token_id in enumerate(draft_token_ids):
                             t_token_id = sampled_ids[d_idx] if d_idx < len(sampled_ids) else None
@@ -3615,6 +3617,15 @@ class TPUModelRunner(GPUModelRunner):
                 spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
                     input_ids, spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices)
+                if getattr(self, "is_driver", True):
+                    try:
+                        logger.info(
+                            "[DIAG ASYNC EXTRACT] raw draft_token_ids from device: %s | shape: %s",
+                            spec_decode_metadata.draft_token_ids.cpu().tolist()[:10],
+                            list(spec_decode_metadata.draft_token_ids.shape),
+                        )
+                    except Exception as e:
+                        logger.warning("[DIAG ASYNC EXTRACT] Failed to log draft_token_ids: %s", e)
             draft_input_ids_src = input_ids
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
