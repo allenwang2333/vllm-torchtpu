@@ -623,6 +623,7 @@ class TPUWorker(WorkerBase):
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
 
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
