@@ -1,10 +1,10 @@
 # Step 3 — variants built, measured and ranked
 
-**Status: DRAFT — every option is measured; two follow-ups are still running.** Options A, B, C,
+**Status: DRAFT — every option is measured. One thread is open: Option A's revival at
+`bkv_p=9`.** Options A, B, C,
 D, E and candidate 0 are all complete and reported in full, as is the recalibrated baseline (§1).
-Outstanding: candidate 0's `p=9` sweep and its reference check. Neither can change a verdict
-already recorded here; the sweep can *revive* Option A (§7) and the reference check can lift
-candidate 0 out of `provisional`. Do not quote this file as final until this banner is gone.
+Outstanding: Option A re-measured at `bkv_p=8/9`, plus the consumer-side cost A was never charged
+for. It can only *add* an option, not overturn one. Do not quote this file as final until this banner is gone.
 
 The block is `streamidx_topk_jax` (`src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py`),
 the GLM-5.2 DSA lightning indexer, on TPU7x. Baseline branch `annyan/streamidx-topk-opt`, incumbent
@@ -108,9 +108,9 @@ reason decode is the better target, and it is not the reason the earlier documen
 | **C** — head-major score layout | transposes the q block `(bq,H,D)→(H,bq,D)` **inside** the kernel, once per bq block | **PASS on prefill, −17.8% to −20.7%** across all `num_bkv`; correctness verified, index-identical. **Must be gated to prefill — decode regresses +59.62%** | §3 |
 | **D1** — delete the `cond` | drops the early-exit `lax.cond`; `enable_early_exit=False` already selects it | **PASS, −10.0%**; correctness verified | §4 |
 | **E** — `_pick_partition` | picks a better stage-B partition | **correct but not worth adopting** — the win lands on an unreachable bucket | §5 |
-| **0** — incumbent + `bkv_p=3` | one constant, on the shipping kernel | **−9.46% at decode, but only at ctx 8704/9216**; +2.72% at 8192. `provisional` | §6 |
+| **0** — incumbent at `bkv_p=9` | one constant, on the shipping kernel | **−14.6% full op / −24.8% stage A at decode, ctx 8704. Correctness verified.** Wrong at short ctx (+38% at 4096), so it wants per-bucket dispatch | §6 |
 | **F** — bf16 operands | *proposed on a false premise* — the operands are already fp8 | **REJECTED, +4.63% prefill / +9.80% decode.** Its by-product closes the block: stage A has no roofline headroom left | §11.2–11.3 |
-| **A** — 128-byte K record | halves the K record so half the bytes move | **FAILS its gate at every shippable `bkv_p`** — rank 4. But it is *complementary* to candidate 0, not competing: revisit iff `bkv_p` lands above ≈5 | §7 |
+| **A** — 128-byte K record | halves the K record so half the bytes move | Failed at `bkv_p` 2–4. **Re-opened**: candidate 0 lands at `bkv_p=9`, above the ≈5 revival threshold. Being measured, not extrapolated | §7 |
 | **B** — two-unit pipeline | overlaps TensorCore stage A with SparseCore stage B across chunks | **Gate PASSES by 5–12×; prefill +16.4/+24.4%. Do not build as a kernel change** — the prize needs the runner to repack the batch | §8 |
 
 ---
@@ -236,42 +236,96 @@ within 0.01 µs. This retires finding F2's open question in `briefs/ROOFLINE-REV
 
 ---
 
-## 6. Candidate 0 — the incumbent with `bkv_p=3`: a real −9.46%, but it is a shape artifact
+## 6. Candidate 0 — `bkv_p`: the largest decode win in the exercise, **−14.6% on the full op**
 
-Full write-up: `probes/baseline-device-time.md`. Correctness job **`j-79a410b8-46bc-4d06-862c`**,
-`20 passed, 14 warnings in 36.03s`.
+Write-ups: `probes/baseline-device-time.md` and `probes/bkvp-extended.md`. Correctness jobs
+**`j-79a410b8-46bc-4d06-862c`** (`20 passed, 14 warnings in 36.03s`) and the f64 oracle below.
 
-Full op, decode, device time by chain slope, `hlo_stats` confirming all nine points independently:
+### 6.1 What it is worth
 
-| ctx | `p=2` (incumbent) | `p=3` | `p=4` |
+At `bkv_p = 9`, ctx 8704, decode: **−24.8% stage A and −14.6% on the full op** by chain slope, with
+`hlo_stats` independently giving −24.6% / −16.0%. That is a bigger decode win than D1's −10.0%, on
+the shipping kernel, from one parameter.
+
+The first pass measured only `p ∈ {2,3,4}` and found −9.46% at `p=3`. The extended sweep supersedes
+it.
+
+### 6.2 The exactness story was wrong, and its own author falsified it
+
+The first pass explained the win as the `9 = 3×3` factorization: `p=3` giving an exact 3-block ×
+3-page cover where `p=2`'s 5 × 10 overfetches. That predicted divisibility was the mechanism.
+
+**It is not.** `p = 5` — inexact, it overfetches a page — **ties** `p = 3`: 88.72 vs 87.71 µs, 1.2%
+apart. Divisibility per se buys nothing. What governs is a two-regime trade between blocks and
+pages, refit on 31 arms:
+
+```
+blocks == 3 :  t = 27.08 + 6.77 · pages
+blocks == 2 :  t = 17.05 + 7.40 · pages
+blocks == 1 :  t =  3.49 + 8.79 · pages
+```
+
+Fewer blocks costs more per page. That, not factorization, is why the argmin moves with ctx.
+
+### 6.3 A function, not a constant — but the cheap 90% is still a constant
+
+The argmin is **`p = cdiv(ctx, page_size)` at nine ctx buckets out of nine** (2048…9216), with
+`P−1` and `P+1` measured at each so the minimum is *bracketed rather than inferred*. The one
+untested prediction, `p=8` at ctx 8192, came in at 73.98 µs against the model's 74.80.
+
+**A fixed `p=9` is measurably wrong at short context** — full op, `p ∈ {2,9}` only so both are
+`nst 80`:
+
+| ctx | `p=2` | `p=9` fixed | Δ |
 | ---: | ---: | ---: | ---: |
-| 8192 | 149.89 | 153.97 **+2.72%** | 142.49 −4.94% |
-| **8704** | 171.21 | **155.01 −9.46%** | 177.24 +3.52% |
-| **9216** | 171.91 | **156.32 −9.06%** | 178.34 +3.74% |
+| 4096 | 98.96 | 136.54 | **+38.0%** |
+| 6144 | 122.66 | 140.07 | **+14.2%** |
+| 8192 | 149.29 | 145.00 | −2.9% |
+| 8704 | 170.89 | 145.95 | **−14.6%** |
 
-**P7's −11.9% does not survive as an absolute; −9.46% does.** P7 was 2.4 points optimistic, exactly
-as a contended ratio would be.
+**Implementation constraint that shapes the recommendation:** `bkv_p` is a **compile-time static**
+(`static_argnames`, `streamindex_topk.py:514`) while `num_bkv` is runtime
+(`jnp.max(seq_lens)`, line 275). So "a function" means compiling per bucket and dispatching — not
+reading `seq_lens` at runtime. **The cheap 90% is `p = cdiv(max_model_len, page_size)` = 9**, a
+one-line constant change that captures the whole long-context win and gives up the short-context
+buckets.
 
-**The win is the `9 = 3×3` factorization, not a better setting.** Decode stage A fits
-`6.24 + 7.41·blocks + 6.65·pages` (r² 0.9967, max residual 1.3%) **with `ctx` absent from the model
-entirely**. `bkv_p=3` wins precisely where `cdiv(ctx, 1024) = 9` factors exactly as 3 blocks × 3
-pages, against `p=2`'s 5 × 10 — which overfetches. At ctx 8192 there are 8 pages, `p=2` is the exact
-one, `p=3` overfetches, and the full op inverts to +2.7%.
+### 6.4 Where it stops, and two corrected premises
 
-**This is why candidate 0 is not simply "change a constant".** If the effect is exactness, the right
-change is to *derive* `p` from `cdiv(ctx, page_size)` rather than pin it — and the model extrapolates
-to `p=9` at ~67 µs, **−39% (`modelled`, unswept, VMEM untested)**, four times the measured win. Both
-the sweep and the constant-vs-function question are dispatched.
+**It stops at `p = 32`, and raising `vmem_limit_bytes` does not move the wall** — rejected
+identically at 16, 32, 64, 100, 128 **and 256 MiB**, with `Used 85.00M of 63.94M vmem`: the physical
+TensorCore VMEM, not a scoped limit.
 
-**Correctness is `provisional`, and the gap was self-reported.** The suite parametrizes `bkv_p` over
-{4, 8, 16, 32} at `page_size × bkv_p = 128`; it never runs `bkv_p ∈ {2, 3}` and never
-`page_size = 1024`. The evidence at the production shape — `index_sets_match_bkvp2: true`, 64/64
-rows at all nine (ctx, `bkv_p`) points — is **self-consistency against the incumbent, not a
-reference check**, and would pass equally if both were wrong. A numpy top-k reference is dispatched.
+Two premises I supplied were wrong and were corrected by measurement. `streamindex_topk.py:28`
+already sets `DEFAULT_VMEM_LIMIT_BYTES = 100 MiB`, so nothing here was ever running at a 32 MiB
+scoped default; and **`p=9` needs only 32 MiB**, 3× under the production default. Timings at 100 vs
+256 MiB are noise (82.29 → 82.35, 108.69 → 108.09, 143.34 → 143.30).
+
+**Pipelining degrades but does not collapse**, so the curve does not turn up before the VMEM wall.
+Page-count-matched pairs go the right way (1-block beats 2-block by 16.9% at 4 pages, 7.5% at 6,
+2.0% at 8), the advantage shrinking because the marginal page cost rises. The **modelled** crossover
+is 9.75 pages, confirmed independently by the 2-block arm already winning at 10 pages. At
+`max_model_len 9216` demand is ≤ 9 — under the crossover, but only just.
+
+### 6.5 Correctness: verified, no longer `provisional`
+
+f64 numpy oracle at ctx 8704. **Byte-identical emitted index set at every `bkv_p` from 1 to 9, plus
+10 and 16** — the same 295 positions in the same 64 rows, `n_unique_to_this_p = 0` everywhere. All
+295 are the **incumbent's** too. Worst gap 1.1424 against σ 2.2408 = **0.51σ**, and the k-th place
+margin (median 0.017) is two orders below σ, so the boundary at k=2048 of 8704 is degenerate in f32
+— the same conclusion §11 reaches by a different route. Gate 2's `min_recall ≥ 0.999` fails on the
+*incumbent* at every `p`; it is measuring the wrong thing.
+
+**Independent confirmation:** seven xprof traces, partition residual **0.000000 on all seven**,
+`rows_kept == rows_total == 42`. Control `dec_p2` reproduces R2's 170.474 µs at 170.724 (+0.15%).
+
+Two self-corrections worth recording: the agent revised its own earlier "~67 µs / −39% `modelled`"
+to **73.5 µs / −32.9%** after finding it had dropped a 6.24 µs intercept (measured: 82.38 µs,
+−24.8%), and it **rejected** a ctx-2048 arm that fit at r² = 0.9245 rather than quoting it.
 
 ---
 
-## 7. Option A — the 128-byte K record: rank 4, but for a reason that keeps it alive
+## 7. Option A — the 128-byte K record: failed at shipping `bkv_p`, **re-opened at `bkv_p=9`**
 
 Full write-up: `probes/R1.md`. Jobs `j-b0e33be2-7d67-41da-b724` and `j-3e588eaa-75e8-4ddb-9737`,
 both `Succeeded`, both **alone on the whole 4-chip pod, serially, no fan-out** — so these are
@@ -426,10 +480,10 @@ not 1.02.
 3. ~~Option F — bf16 operands~~ — **REJECTED, premise was false** (§11.2). Its by-product is the
    more important result: **prefill stage A has no roofline headroom left** — 75.4% issue/VPU,
    which C already attacked, and an infinitely fast score matmul would save ≤5.4% (§11.3).
-4. **Candidate 0's `p=9` sweep and its numpy reference check** — both dispatched, and the sweep now
-   decides **two** options: whether candidate 0 is a constant to change or a function to write
-   (worth up to −39%, `modelled`), and whether Option A revives (§7). R1's VMEM warning at
-   `bkv_p=6` is the thing most likely to end both.
+4. ~~Candidate 0's `p=9` sweep and reference check~~ — **DONE. `p=9` is −14.6% on the full op and
+   correctness is verified** (§6). It wants per-bucket dispatch, not a fixed constant.
+   **`bkv_p=9` puts Option A back in play** at 36 concurrent page DMAs, far above R1's ≈5 threshold
+   — re-dispatched to measure the charge ratio there rather than extrapolate it (§7).
 5. ~~Options A and B~~ — **DONE** (§7, §8).
 6. **Option B belongs to the runner, and nobody owns it.** +16.4/+24.4% on prefill, measured, and
    it needs the scheduler to pack the batch into chunks and pass the plan down as static metadata.
