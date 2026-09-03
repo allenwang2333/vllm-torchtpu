@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -66,6 +67,8 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
 
 def env_with_choices(
@@ -182,6 +185,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eval config turns it on, since a prefilled assistant turn needs it.
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
+    # NoPE and RoPE KV cache layouts allocated for sparse MLA.
+    "TPU_SPARSE_MLA_NOPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
+                     ["sparsecore", "tensorcore"]),
+    "TPU_SPARSE_MLA_ROPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+                     ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
@@ -399,6 +409,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Shard Kimi K3's latent-MoE down/up projections across the cores of a
+    # chip instead of replicating them. They are unquantized [7168, 3584] and
+    # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
+    # time at TP=32; halving the bytes each core reads costs two on-package
+    # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
+    "TPU_LATENT_PROJ_INTRA_CHIP_TP":
+    env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.

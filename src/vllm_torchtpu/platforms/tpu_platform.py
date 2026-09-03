@@ -352,9 +352,9 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_pcp_v2_validation()
@@ -371,8 +371,8 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
-    _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
@@ -957,10 +957,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
-        # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # the pool's align-mode mamba state seed copies; other cache modes
-        # must be rejected up front instead of failing partway through warmup.
-        if is_hybrid and cache_config.enable_prefix_caching:
+        # Real hybrid prefix hits need pooled Mamba state seed copies.
+        # DecodeBench installs synthetic state for each request instead.
+        transfer_config = vllm_config.kv_transfer_config
+        is_decode_bench = (transfer_config is not None
+                           and transfer_config.kv_connector
+                           == "DecodeBenchConnector")
+        if (is_hybrid and cache_config.enable_prefix_caching
+                and not is_decode_bench):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -1106,10 +1110,10 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
+                "DecodeBenchConnector",
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -1119,8 +1123,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    in ("OffloadingConnector",
-                                        "TPURaidenOffloadingConnector")
+                                    == "TPURaidenOffloadingConnector"
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):

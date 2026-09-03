@@ -21,7 +21,9 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
-from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
+                                                      KVCacheType,
+                                                      SparseMLAKVCacheSpec)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
@@ -534,6 +536,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
+        if is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            raise ValueError(
+                "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'."
+            )
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -811,6 +817,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -1054,7 +1062,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        pool_head_dim = kv_cache.shape[-1]
+        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
+            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
+        else:
+            pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
@@ -1252,27 +1264,34 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
-    def get_sparse_kv_cache_shapes(
+    def get_sparse_kv_cache_specs(
         num_blocks: int,
         block_size: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Native (nope, rope) cache shapes: the kernel's paged fp8 shapes,
-        nope regrouped into dsa_gather's lane-row tiles."""
-        from vllm_torchtpu.kernels.mla.sparse import dsa_gather
-
+    ) -> tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]:
+        """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
-        lane_bytes = dsa_gather.TILE_LANE_BYTES
-        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(kv_dtype)
-        rope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, rope_dim, kv_dtype, kv_packing)
-        nope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, head_size - rope_dim, kv_dtype, kv_packing)
-        num_pages, page_size_div, kv_packing, nope_dim = nope_shape
-        return ((num_pages, page_size_div * kv_packing, nope_dim // lane_bytes,
-                 lane_bytes), rope_shape)
+        kv_packing = get_dtype_packing(
+            _resolve_kv_cache_dtype(cache_dtype_str))
+        return (
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.NOPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                num_blocks,
+                block_size,
+                head_size - rope_dim,
+                kv_packing,
+            ),
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                num_blocks,
+                block_size,
+                rope_dim,
+                kv_packing,
+            ),
+        )
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -1520,6 +1539,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -1533,6 +1553,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc,
                 request_distribution,
                 vllm_context.mesh,
+                nope_spec,
+                rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
             )
