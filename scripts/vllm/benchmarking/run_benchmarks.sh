@@ -286,11 +286,22 @@ start_vllm_server() {
     if [ "${LOAD_FORMAT:-}" = "dummy" ]; then
         # Random weights. The checkpoint's METADATA is still required (config,
         # tokenizer, remote code) and is a few MB; the 96 safetensors shards
-        # are never opened. Serving the staged metadata directory rather than
-        # the gs:// URI is what keeps the two arms one variable apart: same
-        # config, same tokenizer, same remote code, same everything vLLM reads
-        # -- differing only in whether a weight byte is loaded.
-        serve_target="$(stage_metadata_dir)"
+        # are never opened.
+        #
+        # Prefer the gs:// URI over a staged local directory. Staging runs in
+        # the head container only, so on a multihost run the worker hosts have
+        # no such path and HuggingFace falls back to treating it as a repo id:
+        # "OSError: Repo id must be in the form 'repo_name' or
+        # 'namespace/repo_name': '/root/k3-metadata'". Build 352 lost all seven
+        # cells that way, because stage_metadata_dir() caches its result and
+        # every later arm reused the head-local path too.
+        #
+        # The URI keeps the arms one variable apart at least as well as staging
+        # did: both serve the identical gs:// target and differ only in the
+        # load format, and each container fetches its own copy of the config,
+        # tokenizer and remote code. Staging stays as the fallback for a run
+        # with no MODEL_URI.
+        serve_target="${MODEL_URI:-$(stage_metadata_dir)}"
         extra_args="$extra_args --load-format dummy --served-model-name $MODEL"
     elif [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
