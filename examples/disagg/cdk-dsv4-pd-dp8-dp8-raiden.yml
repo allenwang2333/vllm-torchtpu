@@ -1,0 +1,519 @@
+# DeepSeek-V4-Flash P/D disaggregation, DP8 prefill + DP8 decode, two tpu7x nodes.
+#
+# Tier 2 of examples/disagg/VERIFICATION_DSV4_PD.md. Read that first: Tier 1 on a
+# single host is currently red, and this configuration is not worth booking nodes
+# for until the `dsv4.state.csa.g4` trim crash is fixed.
+#
+# Shape. Each `2x2x1` tpu7x node is 4 chips and 8 devices, so one node is a DP8
+# replica: prefill on the first, decode on the second, KV crossing the network
+# through Raiden in store mode. That last point is what makes this different from
+# the single-host run, which cannot rule out a producer and consumer quietly
+# sharing a host.
+#
+# Derived from recipes/benchmark/vllm-torchtpu/qwen3.5-397b/
+# vllm-qwen35-397b-pd-pcp8-dp8-raiden.yml, with the image and the tpu_sync
+# preflight taken from recipes/experimental/torchtpu-vllm/disagg-offloading/
+# qwen35-gpc-global-offloading.yml. The Qwen P/D recipe's own image is pinned at
+# 20260804-Raiden, which predates the tpu_raiden -> tpu_sync rename that PR #684
+# depends on, so it cannot run this.
+#
+# What differs from the Qwen recipe, and why:
+#
+#   - Prefill is `--data-parallel-size 8`, not `--prefill-context-parallel-size 8`.
+#     Both replicas run DP attention at TP1.
+#   - TPU_RAIDEN_TRANSFER_PARALLELISM is 1, not 8. DSv4 admission rejects anything
+#     else, because DP attention hands every rank whole requests.
+#   - TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL is 0, not 1. The unified pool yields an
+#     `aliased_raw` binding and build_dsv4_pool_manifest requires private typed
+#     tensors, so admission would reject it at startup.
+#   - TPU_RAIDEN_DSV4_ADMISSION replaces TPU_RAIDEN_QWEN35_ADMISSION.
+#   - TPU_RAIDEN_RESHARD_IMPL=store, so there is no controller sidecar at all.
+#     DSv4 requires store mode; the Qwen recipe's controller block is dropped.
+#   - The connector is TPUConnector, not TPURaidenConnector, matching
+#     launch_dsv4_dp4_dp4.sh.
+#   - No --mamba-cache-mode, no --block-size 8192, no --num-gpu-blocks-override.
+#     Those exist for Qwen3.5's Mamba fit floor; DSv4's groups page at sizes the
+#     runner derives (1024 down to 16 tokens), and overriding block size would
+#     break the per-group geometry this PR exists to support.
+#
+# BEFORE THIS CAN RUN, two things must be staged. Neither exists in the cluster
+# today:
+#
+#   1. PR #684's source, at /workspace/alynie-pr684 on the workspace NFS
+#      (10.225.237.178), mounted here at /root/torchtpu-vllm. The PR is unmerged
+#      and no published image carries it.
+#   2. The DeepSeek-V4-Flash checkpoint. It is not under gs://cloud-devkit/ckpt/hf
+#      and not on /workspace/models, which holds only Qwen. It is 149 GiB.
+#      Set MODEL to a gs:// URI once uploaded, or mount it and use a local path.
+#
+# Run with:
+#   cdk recipe run examples/disagg/cdk-dsv4-pd-dp8-dp8-raiden.yml \
+#     --set MODEL=gs://<bucket>/DeepSeek-V4-Flash
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: vllm-dsv4-pd-dp8-dp8-raiden
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  ttlSecondsAfterFinished: 1800
+  replicatedJobs:
+
+    # ---------------------------------------------------------
+    # PREFILL (DP8) + PROXY
+    # ---------------------------------------------------------
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                - name: torchtpu-vllm-nfs
+                  nfs:
+                    server: 10.225.237.178
+                    # PR #684, staged out of band. See the header.
+                    path: /workspace/alynie-pr684
+                - name: hf-token-volume
+                  secret:
+                    secretName: vllm-hf-token
+                    items:
+                      - key: HF_TOKEN
+                        path: token
+              containers:
+                - name: vllm-tpu-prefill
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  imagePullPolicy: Always
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -eo pipefail
+                      export PYTHONUNBUFFERED=1
+                      : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
+                      export CDK_OUTPUT_DIR
+                      mkdir -p "$CDK_OUTPUT_DIR"
+
+                      # The PR checkout must win over the image's copy.
+                      export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+
+                      # Preflight. Every one of these fails loudly at startup
+                      # rather than silently mis-transferring later, which is
+                      # the whole point of checking them before a two-hour run.
+                      python3 -c "from tpu_sync.api.torch.reshard_client import ReshardClient; print('tpu_sync OK')"
+                      python3 -c "
+                      import vllm_torchtpu.distributed.kv_transfer.tpu_connector as c
+                      assert hasattr(c, '_stage3_dsv4_pool_pages'), 'image lacks PR #684'
+                      from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import build_dsv4_pool_manifest
+                      print('PR #684 present, DSv4 manifest importable')
+                      "
+
+                      export VLLM_HOST_IP="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                      NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                      export TPU_KV_TRANSFER_NAMESPACE="${NS}_prefill"
+                      export TPU_RAIDEN_JOB_NAME=prefill
+                      export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
+                      export TPU_RAIDEN_ADVERTISE_HOST="${VLLM_HOST_IP}"
+
+                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                      KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer"}'
+
+                      echo "===== Starting DeepSeek-V4 DP8 prefill ====="
+                      exec vllm serve \
+                        "$MODEL" \
+                        --served-model-name "$SERVED_MODEL" \
+                        --trust-remote-code \
+                        --seed 42 \
+                        --max-model-len 9216 \
+                        --enable-expert-parallel \
+                        --disable-custom-all-reduce \
+                        --gpu-memory-utilization 0.92 \
+                        --kv-cache-dtype fp8_e4m3 \
+                        --language-model-only \
+                        --max-num-batched-tokens 2048 \
+                        --max-num-seqs 8 \
+                        --no-disable-hybrid-kv-cache-manager \
+                        --attention-backend CUSTOM \
+                        --enable-prompt-tokens-details \
+                        --no-enable-log-requests \
+                        --compilation-config "$COMPILATION_CONFIG" \
+                        --no-enable-prefix-caching \
+                        --no-async-scheduling \
+                        --tensor-parallel-size 1 \
+                        --prefill-context-parallel-size 1 \
+                        --data-parallel-size 8 \
+                        --data-parallel-size-local 8 \
+                        --host 0.0.0.0 \
+                        --port 8000 \
+                        --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                  env: &dsv4-env
+                    - name: JS_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                    - name: MODEL
+                      value: "{{ .MODEL | default `deepseek-ai/DeepSeek-V4-Flash` }}"
+                    - name: SERVED_MODEL
+                      value: "deepseek-ai/DeepSeek-V4-Flash"
+                    - name: VLLM_LOGGING_LEVEL
+                      value: "INFO"
+                    - name: HF_HUB_DISABLE_XET
+                      value: "1"
+                    # --- device / topology (8 devices on one 2x2x1 tpu7x host) ---
+                    - name: JAX_PLATFORMS
+                      value: "tpu,cpu"
+                    - name: PJRT_DEVICE
+                      value: TPU
+                    - name: TPU_BACKEND_TYPE
+                      value: "jax"
+                    - name: VLLM_TARGET_DEVICE
+                      value: "tpu"
+                    - name: TPU_TOPOLOGY
+                      value: "2x2x1"
+                    - name: TPU_CHIPS_PER_HOST_BOUNDS
+                      value: "2,2,1"
+                    - name: TPU_HOST_BOUNDS
+                      value: "1,1,1"
+                    - name: TPU_LIBRARY_PATH
+                      value: ""
+                    - name: MEGASCALE_NUM_SLICES
+                      value: ""
+                    - name: MEGASCALE_SLICE_ID
+                      value: ""
+                    - name: TPU_PROCESS_ADDRESSES
+                      value: ""
+                    - name: TPU_WORKER_HOSTNAMES
+                      value: ""
+                    - name: TPU_PROCESS_PORT
+                      value: ""
+                    - name: MEGASCALE_COORDINATOR_ADDRESS
+                      value: ""
+                    - name: MEGASCALE_PORT
+                      value: ""
+                    # --- DSv4 model / kernel config, from launch_dsv4_dp4_dp4.sh ---
+                    - name: VLLM_PLUGINS
+                      value: "torchtpu,torchtpu_layers"
+                    - name: MODEL_IMPL_TYPE
+                      value: "vllm"
+                    - name: NEW_MODEL_DESIGN
+                      value: "0"
+                    - name: SKIP_JAX_PRECOMPILE
+                      value: "1"
+                    - name: VLLM_XLA_CHECK_RECOMPILATION
+                      value: "0"
+                    - name: USE_MOE_SPARSE_CORE
+                      value: "0"
+                    - name: MOE_REQUANTIZE_WEIGHT_DTYPE
+                      value: "fp4"
+                    - name: ENABLE_QUANTIZED_MATMUL_KERNEL
+                      value: "0"
+                    - name: XLA_PYTHON_CLIENT_PREALLOCATE
+                      value: "false"
+                    - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+                      value: "1"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
+                    - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                      value: "disabled"
+                    # MoE fp4 requantization dominates startup; Tier 1 took ~16
+                    # minutes to healthy on a comparable host.
+                    - name: VLLM_ENGINE_READY_TIMEOUT_S
+                      value: "2700"
+                    # --- Raiden KV transfer ---
+                    # 0, not 1: the unified pool gives an aliased_raw binding and
+                    # build_dsv4_pool_manifest demands private typed tensors.
+                    - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                      value: "0"
+                    - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                      value: "1"
+                    - name: TPU_RAIDEN_DSV4_ADMISSION
+                      value: "1"
+                    - name: TPU_KV_RESHARD_TRANSPORT
+                      value: "raiden"
+                    - name: TPU_RAIDEN_RESHARD_IMPL
+                      value: "store"
+                    # DP attention gives every rank whole requests, so anything
+                    # other than 1 is rejected by DSv4 admission.
+                    - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                      value: "1"
+                    - name: TPU_RAIDEN_RESHARD_PORT_BASE
+                      value: "28000"
+                    - name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE
+                      value: "28100"
+                    - name: TPU_ENABLE_D2H_TRANSFER
+                      value: "1"
+                    - name: TPU_KV_SHM_POOL_GB
+                      value: "8"
+                    - name: TPU_KV_TRANSFER_PORT
+                      value: "9100"
+                    - name: TPU_SIDE_CHANNEL_PORT
+                      value: "9600"
+                  volumeMounts:
+                    - name: torchtpu-vllm-nfs
+                      mountPath: /root/torchtpu-vllm
+                      readOnly: true
+                    - name: hf-token-volume
+                      mountPath: /root/.cache/huggingface/token
+                      subPath: token
+                      readOnly: true
+                    - name: dshm
+                      mountPath: /dev/shm
+                  securityContext:
+                    privileged: true
+                    capabilities:
+                      add:
+                        - IPC_LOCK
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                      memory: "850Gi"
+                      cpu: "200"
+                    requests:
+                      google.com/tpu: "4"
+                      memory: "850Gi"
+                      cpu: "200"
+                  ports:
+                    - containerPort: 8000
+
+                - name: vllm-tpu-proxy
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  imagePullPolicy: Always
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                      DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
+                      python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                        --host 0.0.0.0 \
+                        --port 10000 \
+                        --prefiller-hosts $PREFILLER_DNS \
+                        --prefiller-ports 8000 \
+                        --decoder-hosts $DECODER_DNS \
+                        --decoder-ports 7200
+                  env:
+                    - name: JS_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                  volumeMounts:
+                    - name: torchtpu-vllm-nfs
+                      mountPath: /root/torchtpu-vllm
+                      readOnly: true
+                  ports:
+                    - containerPort: 10000
+                  resources:
+                    requests: { cpu: "8", memory: "16Gi" }
+                    limits: { cpu: "16", memory: "32Gi" }
+
+    # ---------------------------------------------------------
+    # DECODE (DP8)
+    # ---------------------------------------------------------
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                - name: torchtpu-vllm-nfs
+                  nfs:
+                    server: 10.225.237.178
+                    path: /workspace/alynie-pr684
+                - name: hf-token-volume
+                  secret:
+                    secretName: vllm-hf-token
+                    items:
+                      - key: HF_TOKEN
+                        path: token
+              containers:
+                - name: vllm-tpu-decode
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  imagePullPolicy: Always
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -eo pipefail
+                      export PYTHONUNBUFFERED=1
+                      : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
+                      export CDK_OUTPUT_DIR
+                      mkdir -p "$CDK_OUTPUT_DIR"
+
+                      export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                      python3 -c "from tpu_sync.api.torch.reshard_client import ReshardClient; print('tpu_sync OK')"
+                      python3 -c "
+                      import vllm_torchtpu.distributed.kv_transfer.tpu_connector as c
+                      assert hasattr(c, '_stage3_dsv4_pool_pages'), 'image lacks PR #684'
+                      print('PR #684 present')
+                      "
+
+                      export VLLM_HOST_IP="${JS_NAME}-decode-0-0.${JS_NAME}"
+                      NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                      export TPU_KV_TRANSFER_NAMESPACE="${NS}_decode"
+                      export TPU_RAIDEN_JOB_NAME=decode
+                      export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-decode-engine"
+                      export TPU_RAIDEN_ADVERTISE_HOST="${VLLM_HOST_IP}"
+
+                      COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+                      KV_TRANSFER_CONFIG='{"kv_connector":"TPUConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer"}'
+
+                      echo "===== Starting DeepSeek-V4 DP8 decode ====="
+                      exec vllm serve \
+                        "$MODEL" \
+                        --served-model-name "$SERVED_MODEL" \
+                        --trust-remote-code \
+                        --seed 42 \
+                        --max-model-len 9216 \
+                        --enable-expert-parallel \
+                        --disable-custom-all-reduce \
+                        --gpu-memory-utilization 0.92 \
+                        --kv-cache-dtype fp8_e4m3 \
+                        --language-model-only \
+                        --max-num-batched-tokens 2048 \
+                        --max-num-seqs 8 \
+                        --no-disable-hybrid-kv-cache-manager \
+                        --attention-backend CUSTOM \
+                        --enable-prompt-tokens-details \
+                        --no-enable-log-requests \
+                        --compilation-config "$COMPILATION_CONFIG" \
+                        --no-enable-prefix-caching \
+                        --no-async-scheduling \
+                        --tensor-parallel-size 1 \
+                        --prefill-context-parallel-size 1 \
+                        --api-server-count 1 \
+                        --data-parallel-size 8 \
+                        --data-parallel-size-local 8 \
+                        --host 0.0.0.0 \
+                        --port 7200 \
+                        --kv-transfer-config "$KV_TRANSFER_CONFIG" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/server.log"
+                  env: *dsv4-env
+                  volumeMounts:
+                    - name: torchtpu-vllm-nfs
+                      mountPath: /root/torchtpu-vllm
+                      readOnly: true
+                    - name: hf-token-volume
+                      mountPath: /root/.cache/huggingface/token
+                      subPath: token
+                      readOnly: true
+                    - name: dshm
+                      mountPath: /dev/shm
+                  securityContext:
+                    privileged: true
+                    capabilities:
+                      add:
+                        - IPC_LOCK
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                      memory: "850Gi"
+                      cpu: "200"
+                    requests:
+                      google.com/tpu: "4"
+                      memory: "850Gi"
+                      cpu: "200"
+                  ports:
+                    - containerPort: 7200
+
+    # ---------------------------------------------------------
+    # BENCHMARK: the Tier 1 oracles, unchanged, against the two-host proxy
+    # ---------------------------------------------------------
+    - name: benchmark
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              volumes:
+                - name: torchtpu-vllm-nfs
+                  nfs:
+                    server: 10.225.237.178
+                    path: /workspace/alynie-pr684
+              containers:
+                - name: bench
+                  image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-benliangw_google_com:latest` }}"
+                  imagePullPolicy: Always
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -eo pipefail
+                      : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
+                      mkdir -p "$CDK_OUTPUT_DIR"
+                      PROXY="http://${JS_NAME}-prefill-0-0.${JS_NAME}:10000"
+
+                      # Both replicas requantize MoE weights to fp4 before they
+                      # serve, which took ~16 minutes on the Tier 1 host.
+                      for i in $(seq 1 240); do
+                        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                               "$PROXY/v1/models" || true)
+                        [ "$code" = "200" ] && break
+                        sleep 15
+                      done
+                      [ "$code" = "200" ] || { echo "RESULT: FAIL (proxy never came up)"; exit 1; }
+
+                      cd /root/torchtpu-vllm/examples/disagg
+
+                      # T1.1 and T1.2. Lengths straddle the SWA page boundary:
+                      # at page_tokens 128 and window 128 the trim skips
+                      # max(0, n-127)//128 pages, so 0 at 127/128/129 and 63 of
+                      # 64 at 8192.
+                      python3 dsv4_pd_oracle.py \
+                        --base "$PROXY" \
+                        --model deepseek-ai/DeepSeek-V4-Flash \
+                        --window 128 \
+                        --lengths 127,128,129,512,2048,4096,8192 \
+                        --repeats 2 \
+                        --out "$CDK_OUTPUT_DIR/oracle.json" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/oracle.log"
+                      ORACLE_RC=${PIPESTATUS[0]}
+
+                      # Tier 1 found that a short prompt after a long sweep kills
+                      # the prefill replica. Exit 0 from this means the crash
+                      # reproduced across hosts too.
+                      python3 dsv4_pd_trim_repro.py --base "$PROXY" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/trim_repro.log" || true
+
+                      if [ "$ORACLE_RC" = "0" ]; then
+                        echo "RESULT: PASS"
+                      else
+                        echo "RESULT: FAIL (oracle had misses; see oracle.json)"
+                        exit 1
+                      fi
+                  env:
+                    - name: JS_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                  volumeMounts:
+                    - name: torchtpu-vllm-nfs
+                      mountPath: /root/torchtpu-vllm
+                      readOnly: true
+                  resources:
+                    requests: { cpu: "4", memory: "8Gi" }
+                    limits: { cpu: "8", memory: "16Gi" }
